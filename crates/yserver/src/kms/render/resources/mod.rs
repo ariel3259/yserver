@@ -1,4 +1,5 @@
 pub(crate) mod availability;
+pub(crate) mod capacity;
 pub(crate) mod commit;
 pub(crate) mod completion;
 pub(crate) mod drm_cleanup;
@@ -25,6 +26,8 @@ pub(crate) use availability::{
     AllocationEntry, AllocationKey, ObligationId, ObligationKind, ResourceError, UseId, UseKind,
     can_destroy,
 };
+#[allow(unused_imports)]
+pub(crate) use capacity::{DirectCapacity, DirectRole, RoleReservation, RoleState};
 #[allow(unused_imports)]
 pub use commit::{CommitResourceConsumer, CommitResources, GroupMember, PresentRelease};
 #[allow(unused_imports)]
@@ -114,6 +117,39 @@ impl ResourceService {
 
     pub(crate) fn contains(&self, key: &AllocationKey) -> bool {
         self.entries.contains_key(key)
+    }
+
+    pub(crate) fn has_pending_obligations(&self, key: &AllocationKey) -> bool {
+        if let Some(entry) = self.entries.get(key) {
+            !entry.availability.borrow().pending_obligations.is_empty()
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn has_pending_obligation(
+        &self,
+        key: &AllocationKey,
+        obligation: ObligationId,
+    ) -> bool {
+        if let Some(entry) = self.entries.get(key) {
+            entry
+                .availability
+                .borrow()
+                .pending_obligations
+                .contains_key(&obligation)
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_releasable(&self, key: &AllocationKey) -> bool {
+        if let Some(entry) = self.entries.get(key) {
+            let avail = entry.availability.borrow();
+            !avail.frozen && avail.pending_obligations.is_empty()
+        } else {
+            true
+        }
     }
 
     pub(crate) fn incarnation(&self) -> IncarnationId {

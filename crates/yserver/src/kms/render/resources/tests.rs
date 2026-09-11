@@ -2202,3 +2202,323 @@ fn c0_2ci_commit_grouped_skip_and_duplicate_protection() {
             .is_ok()
     );
 }
+
+#[test]
+fn c0_2ci_capacity_six_roles_and_busy_rejection() {
+    let mut capacity = DirectCapacity::new();
+    let mut held = Vec::new();
+    for role in [
+        DirectRole::Current,
+        DirectRole::Submitted,
+        DirectRole::Successor,
+        DirectRole::Preparing,
+        DirectRole::OrdinaryRetirement,
+        DirectRole::ExitRetirement,
+    ] {
+        held.push(capacity.reserve(role).unwrap());
+    }
+    assert_eq!(capacity.occupied(), 6);
+    assert!(matches!(
+        capacity.reserve(DirectRole::Preparing),
+        Err(ResourceError::Busy)
+    ));
+    assert!(!capacity.can_enter_direct());
+}
+
+#[test]
+fn c0_2ci_capacity_transitions_and_move_into_reserved() {
+    let mut capacity = DirectCapacity::new();
+    assert!(capacity.can_enter_direct());
+
+    // Preparing candidate failure: clean up candidate and cancel role
+    let prep = capacity.reserve(DirectRole::Preparing).unwrap();
+    assert_eq!(capacity.occupied(), 1);
+    assert!(!capacity.is_vacant(DirectRole::Preparing));
+    assert!(capacity.cancel_reservation(prep).is_ok());
+    assert_eq!(capacity.occupied(), 0);
+    assert!(capacity.is_vacant(DirectRole::Preparing));
+
+    // Successful candidate preparation moves to Successor
+    let mut prep = capacity.reserve(DirectRole::Preparing).unwrap();
+    let serial1 = prep.serial();
+    assert!(capacity.move_role(&mut prep, DirectRole::Successor).is_ok());
+    assert_eq!(prep.role(), DirectRole::Successor);
+    assert_eq!(prep.serial(), serial1);
+    assert!(capacity.is_vacant(DirectRole::Preparing));
+    assert!(!capacity.is_vacant(DirectRole::Successor));
+
+    // Successor moves to Submitted
+    let mut succ = prep;
+    assert!(capacity.move_role(&mut succ, DirectRole::Submitted).is_ok());
+    assert_eq!(succ.role(), DirectRole::Submitted);
+
+    // Initial commit completes: Submitted moves to Current
+    let mut cur = succ;
+    assert!(capacity.move_role(&mut cur, DirectRole::Current).is_ok());
+    assert_eq!(cur.role(), DirectRole::Current);
+
+    // Next commit preparation: reserve Preparing, attach to commit resources
+    let prep2 = capacity.reserve(DirectRole::Preparing).unwrap();
+    let res = CommitResources::new(vec![], None, None, None, vec![], vec![]);
+    let mut res = capacity.attach(prep2, res).unwrap();
+    assert!(res.direct_role.is_some());
+
+    // Replacement: reserve OrdinaryRetirement before dispatch
+    let reserved_retire = capacity.reserve(DirectRole::OrdinaryRetirement).unwrap();
+    let retire_serial = reserved_retire.serial();
+    assert!(retire_serial > cur.serial());
+
+    // On completion, old current moves into pre-reserved retirement role
+    let mut old_current = cur;
+    assert!(
+        capacity
+            .move_into_reserved(&mut old_current, reserved_retire)
+            .is_ok()
+    );
+    assert_eq!(old_current.role(), DirectRole::OrdinaryRetirement);
+    assert_eq!(old_current.serial(), retire_serial);
+    assert!(capacity.is_vacant(DirectRole::Current));
+
+    // Finish old current once release obligations are satisfied
+    assert!(capacity.finish_role(old_current).is_ok());
+    assert!(capacity.is_vacant(DirectRole::OrdinaryRetirement));
+
+    // Also finish the attached res preparing role so Preparing becomes vacant
+    assert!(
+        capacity
+            .finish_role(res.direct_role.take().unwrap())
+            .is_ok()
+    );
+    assert!(capacity.is_vacant(DirectRole::Preparing));
+
+    // Test invalid move into reserved preserves source ownership and reserved token
+    let mut same_role_occ = capacity.reserve(DirectRole::Preparing).unwrap();
+    let same_role_reserved = capacity.reserve(DirectRole::ExitRetirement).unwrap();
+    // Tamper with role
+    same_role_occ.role = DirectRole::ExitRetirement;
+    let (err, recovered) = capacity
+        .move_into_reserved(&mut same_role_occ, same_role_reserved)
+        .err()
+        .unwrap();
+    assert_eq!(err, ResourceError::InvalidState);
+    assert_eq!(recovered.role(), DirectRole::ExitRetirement);
+    // Cleanup recovered tokens
+    let _ = capacity.finish_role(recovered);
+    let _ = capacity.finish_role(same_role_occ);
+}
+
+#[test]
+fn c0_2ci_capacity_exit_retirement_and_unflip_transitions() {
+    let mut capacity = DirectCapacity::new();
+    assert!(capacity.can_enter_direct());
+
+    // A is in OrdinaryRetirement
+    let a_retire = capacity.reserve(DirectRole::OrdinaryRetirement).unwrap();
+    // B is Current
+    let mut b_current = capacity.reserve(DirectRole::Current).unwrap();
+
+    // B unflipped while A awaits release: B moves to ExitRetirement
+    let b_exit_reserve = capacity.reserve(DirectRole::ExitRetirement).unwrap();
+    assert!(
+        capacity
+            .move_into_reserved(&mut b_current, b_exit_reserve)
+            .is_ok()
+    );
+    assert_eq!(b_current.role(), DirectRole::ExitRetirement);
+
+    // Both retirement positions are now occupied: direct re-entry is blocked
+    assert_eq!(capacity.occupied(), 2);
+    assert!(!capacity.can_enter_direct());
+
+    // A finishes release obligations: OrdinaryRetirement is freed
+    assert!(capacity.finish_role(a_retire).is_ok());
+    assert_eq!(capacity.occupied(), 1);
+    // Direct re-entry is STILL blocked because ExitRetirement is occupied
+    assert!(!capacity.can_enter_direct());
+
+    // B finishes exit release obligations: ExitRetirement is freed
+    assert!(capacity.finish_role(b_current).is_ok());
+    assert_eq!(capacity.occupied(), 0);
+    // Now both retirement roles are vacant: direct re-entry is permitted
+    assert!(capacity.can_enter_direct());
+}
+
+#[test]
+fn c0_2ci_capacity_delayed_on_available_discharges_and_unblocks() {
+    let (mut service, old_alloc, drops_old) = spy_service();
+    let old_key = old_alloc.key();
+
+    let drops_new_spy = Rc::new(Cell::new(0));
+    let new_lease = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_new_spy),
+        }))
+        .unwrap();
+
+    let crtc = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
+    );
+    let member = GroupMember::new(crtc, 1, 1);
+    let commit_id = crate::kms::owner::identity::CommitId::for_tests(101);
+
+    let mut consumer = CommitResourceConsumer::new();
+
+    // 1. Ordinary retirement flow through consume and on_available
+    let old_retire_slot = consumer
+        .capacity
+        .reserve(DirectRole::OrdinaryRetirement)
+        .unwrap();
+    let old_kms = service
+        .register(old_key, ObligationKind::KmsRelease)
+        .unwrap();
+    let old_gpu = service.register(old_key, ObligationKind::Gpu).unwrap();
+
+    let old_res = CommitResources::new(
+        vec![old_alloc],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(old_key, old_kms, member)],
+    )
+    .with_direct_role(old_retire_slot);
+
+    let new_res = CommitResources::new(vec![new_lease], None, None, None, vec![member], vec![]);
+
+    // Commit accepted and retired
+    consumer.correlate_commit(commit_id, vec![member], vec![(old_key, old_kms, member)]);
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: commit_id,
+                resources: crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res])
+                    .accepted(),
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // OrdinaryRetirement is occupied
+    assert!(matches!(
+        consumer.capacity.reserve(DirectRole::OrdinaryRetirement),
+        Err(ResourceError::Busy)
+    ));
+
+    // HardwareComplete discharges KMS obligation only
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
+            &mut service,
+        )
+        .unwrap();
+
+    // GPU obligation is STILL pending, so on_available does not yet free OrdinaryRetirement
+    consumer.on_available(&[old_key], &mut service).unwrap();
+    assert!(matches!(
+        consumer.capacity.reserve(DirectRole::OrdinaryRetirement),
+        Err(ResourceError::Busy)
+    ));
+    assert_eq!(drops_old.get(), 0);
+
+    // Delayed GPU completion arrives
+    service.apply_validated_proof(old_key, old_gpu).unwrap();
+    consumer.on_available(&[old_key], &mut service).unwrap();
+    service.service_ready();
+
+    // OrdinaryRetirement is now finished and freed, direct admission scheduled
+    assert!(consumer.direct_admission_scheduled);
+    assert_eq!(drops_old.get(), 1);
+    // Reservation is now unblocked!
+    let next_retire = consumer
+        .capacity
+        .reserve(DirectRole::OrdinaryRetirement)
+        .unwrap();
+    assert!(consumer.capacity.finish_role(next_retire).is_ok());
+
+    // 2. Rejection flow through consume and on_available
+    let rej_drops = Rc::new(Cell::new(0));
+    let rej_lease = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&rej_drops),
+        }))
+        .unwrap();
+    let rej_key = rej_lease.key();
+    let rej_gpu = service.register(rej_key, ObligationKind::Gpu).unwrap();
+    let rej_kms = service
+        .register(rej_key, ObligationKind::KmsRelease)
+        .unwrap();
+
+    let rej_prep = consumer.capacity.reserve(DirectRole::Preparing).unwrap();
+    let rej_res = CommitResources::new(
+        vec![rej_lease],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(rej_key, rej_kms, member)],
+    )
+    .with_direct_role(rej_prep);
+
+    let rej_commit = crate::kms::owner::identity::CommitId::for_tests(102);
+    consumer.correlate_commit(rej_commit, vec![member], vec![(rej_key, rej_kms, member)]);
+
+    // Rejection event arrives
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::ResourcesReleased {
+                commit: rej_commit,
+                resources: vec![rej_res],
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // Preparing is occupied, so another Preparing reservation fails
+    assert!(matches!(
+        consumer.capacity.reserve(DirectRole::Preparing),
+        Err(ResourceError::Busy)
+    ));
+
+    // on_available before GPU completion does NOT free it
+    consumer.on_available(&[rej_key], &mut service).unwrap();
+    assert!(matches!(
+        consumer.capacity.reserve(DirectRole::Preparing),
+        Err(ResourceError::Busy)
+    ));
+
+    // Delayed GPU completion arrives
+    service.apply_validated_proof(rej_key, rej_gpu).unwrap();
+    consumer.on_available(&[rej_key], &mut service).unwrap();
+    service.service_ready();
+
+    // Preparing reservation is now freed and unblocked!
+    assert_eq!(rej_drops.get(), 1);
+    let next_prep = consumer.capacity.reserve(DirectRole::Preparing).unwrap();
+    assert!(consumer.capacity.finish_role(next_prep).is_ok());
+}
+
+#[test]
+fn c0_2ci_capacity_unexpected_token_drop_closes_admission() {
+    let mut capacity = DirectCapacity::new();
+    assert!(capacity.can_enter_direct());
+
+    // Reserve a role and drop it without cancel_reservation or finish_role
+    {
+        let token = capacity.reserve(DirectRole::Current).unwrap();
+        assert_eq!(capacity.occupied(), 1);
+        drop(token);
+    }
+
+    // Dropping token unexpectedly must close admission with its slot remaining charged
+    assert_eq!(capacity.occupied(), 1);
+    assert!(capacity.is_admission_closed());
+    assert!(!capacity.can_enter_direct());
+    assert!(matches!(
+        capacity.reserve(DirectRole::Preparing),
+        Err(ResourceError::Busy)
+    ));
+}

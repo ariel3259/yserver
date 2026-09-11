@@ -9,6 +9,7 @@ use crate::kms::render::{
     resources::{
         AllocationKey, ObligationId, ResourceService,
         availability::ResourceError,
+        capacity::{DirectCapacity, RoleReservation},
         lease::AllocationLease,
         present::{CompletionDisposition, PresentDisposition, PresentKey},
         storage::StorageLease,
@@ -74,6 +75,7 @@ pub struct CommitResources {
     /// One entry per displaced allocation and member, registered at dispatch;
     /// discharged by this commit's `HardwareComplete` (round-3 M-1).
     pub(crate) kms_obligations: Vec<(AllocationKey, ObligationId, GroupMember)>,
+    pub(crate) direct_role: Option<RoleReservation>,
 }
 
 impl fmt::Debug for CommitResources {
@@ -85,6 +87,7 @@ impl fmt::Debug for CommitResources {
             .field("has_present", &self.present.is_some())
             .field("crtcs", &self.crtcs)
             .field("kms_obligations", &self.kms_obligations)
+            .field("direct_role", &self.direct_role)
             .finish()
     }
 }
@@ -105,7 +108,13 @@ impl CommitResources {
             present,
             crtcs,
             kms_obligations,
+            direct_role: None,
         }
+    }
+
+    pub(crate) fn with_direct_role(mut self, role: RoleReservation) -> Self {
+        self.direct_role = Some(role);
+        self
     }
 }
 
@@ -118,8 +127,11 @@ type InFlightCorrelation = (
 pub struct CommitResourceConsumer {
     pub(crate) current_resources: Vec<CommitResources>,
     pub(crate) releasing_resources: Vec<CommitResources>,
+    pub(crate) rejected_resources: Vec<CommitResources>,
     pub(crate) in_flight: BTreeMap<crate::kms::owner::identity::CommitId, InFlightCorrelation>,
     pub(crate) present_dispositions: BTreeMap<PresentKey, PresentDisposition>,
+    pub(crate) capacity: DirectCapacity,
+    pub(crate) direct_admission_scheduled: bool,
 }
 
 impl CommitResourceConsumer {
@@ -172,7 +184,9 @@ impl CommitResourceConsumer {
                     for (key, obligation_id, member) in res.kms_obligations.drain(..) {
                         let member_matched = res.crtcs.is_empty() || res.crtcs.contains(&member);
                         if member_matched {
-                            service.apply_validated_proof(key, obligation_id)?;
+                            if service.has_pending_obligation(&key, obligation_id) {
+                                service.apply_validated_proof(key, obligation_id)?;
+                            }
                         } else {
                             remaining.push((key, obligation_id, member));
                         }
@@ -190,34 +204,40 @@ impl CommitResourceConsumer {
                 self.current_resources = new;
                 Ok(())
             }
-            crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent { commit, resources } => {
+            crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                commit,
+                mut resources,
+            } => {
                 // Rejection: cancel — do not discharge — this commit's KmsRelease registrations
                 if let Some((_, obligations)) = self.in_flight.remove(&commit) {
                     for (key, obligation_id, _) in obligations {
                         let _ = service.cancel(key, obligation_id);
                     }
                 }
-                for res in &resources {
-                    for &(key, obligation_id, _) in &res.kms_obligations {
+                for res in &mut resources {
+                    for (key, obligation_id, _) in res.kms_obligations.drain(..) {
                         let _ = service.cancel(key, obligation_id);
                     }
                 }
                 self.current_resources = resources;
                 Ok(())
             }
-            crate::kms::owner::device::OwnerEvent::ResourcesReleased { commit, resources } => {
+            crate::kms::owner::device::OwnerEvent::ResourcesReleased {
+                commit,
+                mut resources,
+            } => {
                 // Remove only the rejected/never-current KMS obligation justified by this outcome
                 if let Some((_, obligations)) = self.in_flight.remove(&commit) {
                     for (key, obligation_id, _) in obligations {
                         let _ = service.cancel(key, obligation_id);
                     }
                 }
-                for res in &resources {
-                    for &(key, obligation_id, _) in &res.kms_obligations {
+                for res in &mut resources {
+                    for (key, obligation_id, _) in res.kms_obligations.drain(..) {
                         let _ = service.cancel(key, obligation_id);
                     }
                 }
-                drop(resources);
+                self.rejected_resources.extend(resources);
                 Ok(())
             }
             crate::kms::owner::device::OwnerEvent::Quarantined { commit } => {
@@ -269,4 +289,89 @@ impl CommitResourceConsumer {
             _ => Ok(()),
         }
     }
+
+    pub(crate) fn on_available(
+        &mut self,
+        _keys: &[AllocationKey],
+        service: &mut ResourceService,
+    ) -> Result<(), ResourceError> {
+        let mut retained_releasing = Vec::new();
+        let mut freed_any = false;
+        for mut res in self.releasing_resources.drain(..) {
+            if is_resource_releasable(&res, service) {
+                if let Some(slot) = res.direct_role.take() {
+                    match self.capacity.finish_role(slot) {
+                        Ok(()) => {
+                            freed_any = true;
+                            drop(res);
+                        }
+                        Err((err, slot)) => {
+                            res.direct_role = Some(slot);
+                            retained_releasing.push(res);
+                            self.capacity.close_admission();
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    drop(res);
+                }
+            } else {
+                retained_releasing.push(res);
+            }
+        }
+        self.releasing_resources = retained_releasing;
+
+        let mut retained_rejected = Vec::new();
+        for mut res in self.rejected_resources.drain(..) {
+            if is_resource_releasable(&res, service) {
+                if let Some(slot) = res.direct_role.take() {
+                    match self.capacity.finish_role(slot) {
+                        Ok(()) => {
+                            freed_any = true;
+                            drop(res);
+                        }
+                        Err((err, slot)) => {
+                            res.direct_role = Some(slot);
+                            retained_rejected.push(res);
+                            self.capacity.close_admission();
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    drop(res);
+                }
+            } else {
+                retained_rejected.push(res);
+            }
+        }
+        self.rejected_resources = retained_rejected;
+
+        if freed_any {
+            self.direct_admission_scheduled = true;
+        }
+
+        Ok(())
+    }
+}
+
+fn is_resource_releasable(res: &CommitResources, service: &ResourceService) -> bool {
+    if !res.kms_obligations.is_empty() {
+        return false;
+    }
+    for alloc in &res.allocations {
+        if !service.is_releasable(&alloc.key()) {
+            return false;
+        }
+    }
+    if let Some(source) = &res.source
+        && !service.is_releasable(&source.allocation.key())
+    {
+        return false;
+    }
+    if let Some(fallback) = &res.fallback
+        && !service.is_releasable(&fallback.allocation.key())
+    {
+        return false;
+    }
+    true
 }
