@@ -56,6 +56,7 @@ use crate::{
         owner::identity::{ClockEpochId, IdentityAllocator, IncarnationId, SequenceArmToken},
         render::{
             engine::{RenderEngine, decode_x11_pixel_for_storage},
+            glyph_pixels::GlyphSourceFormat,
             platform::{
                 ConnectorSnapshot, CrtcKey, PlatformBackend, QualifiedScanoutPlan,
                 is_terminal_disposable_probe_error,
@@ -1220,6 +1221,15 @@ pub struct KmsBackend {
     /// `DrawableId` + validated by `content_version`. See
     /// [`crate::kms::backend::Depth1MaskCache`].
     pub(crate) depth1_mask_cache: crate::kms::backend::Depth1MaskCache,
+    /// #137 step 5 — CPU cache of tier-1 uniform glyph-source colours.
+    /// A hit skips the ordered `get_image` of
+    /// [`Self::uniform_glyph_source_premul`] and, with it, the
+    /// `CloseReason::SyncWait` frame close that readback forces — which
+    /// measured as ~75% of ALL frame closes on a text-heavy workload.
+    /// Keyed by never-recycled `DrawableId` + sampled offset and
+    /// validated by `content_version`; populated only AFTER the read.
+    /// See [`crate::kms::backend::UniformGlyphSourceCache`].
+    pub(crate) uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache,
     /// GPU snapshot of the current clip-mask pixmap for the masked CopyArea
     /// path (Task 14). Single current-clip carrier, mirroring
     /// `clip_mask_cache`'s ownership: created + eagerly populated on install,
@@ -4869,6 +4879,7 @@ impl KmsBackend {
             unknown_sequence_echoes: 0,
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
+            uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache::new(64),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active,
@@ -5827,6 +5838,7 @@ impl KmsBackend {
             unknown_sequence_echoes: 0,
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
+            uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache::new(64),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
@@ -6311,6 +6323,143 @@ impl KmsBackend {
                 ))
             }
         }
+    }
+
+    /// #137 visibility note — record a `CompositeGlyphs` this server
+    /// cannot serve: bump the counter, and log the FIRST occurrence at
+    /// `warn!` with every later one at `debug!`.
+    ///
+    /// A drop here draws nothing and returns no error, so the client
+    /// cannot tell — and neither could we. #137 was an entire class of
+    /// application (every Java/AWT one) rendering no text at all while
+    /// the server's own telemetry knew, because the only evidence sat
+    /// at `debug` in a module the usual `RUST_LOG` filters exclude.
+    /// Warning once means a silently-unsupported paint path announces
+    /// itself rather than never; reverting to `debug` after that means
+    /// a pathological client cannot flood the log.
+    ///
+    /// **Once per process**, deliberately and literally — not once per
+    /// server generation. A bare flag does not reset itself at a
+    /// generation boundary, and wiring one into the reset lifecycle
+    /// would depend on the #121 reset work, which is unmerged and
+    /// parked. Revisit if and when reset lands.
+    ///
+    /// The counter is NOT rate-limited: it advances on every drop.
+    fn record_composite_glyphs_drop(&mut self, reason: std::fmt::Arguments<'_>) {
+        self.telemetry.record_composite_glyphs_dropped_unsupported();
+        if take_first_occurrence(&COMPOSITE_GLYPHS_DROP_WARNED) {
+            log::warn!(
+                "render composite_glyphs UNSUPPORTED: {reason} — this request drew \
+                 NOTHING and returned no error. Further occurrences log at debug; \
+                 the composite_glyphs_dropped_unsupported counter keeps counting."
+            );
+        } else {
+            log::debug!("render composite_glyphs gap: {reason}");
+        }
+    }
+
+    /// #137 tier 1 — collapse a uniform drawable glyph source to the
+    /// premultiplied colour it is, by reading its single pixel.
+    ///
+    /// `Err` carries the reason the caller must log: every way this can
+    /// decline draws no text, and a client whose text silently vanishes
+    /// cannot tell.
+    ///
+    /// Two things about the read are load-bearing:
+    ///
+    /// - It goes through [`RenderEngine::get_image`], the synchronous
+    ///   readback, for its flush / close-frame / fence-wait ordering. A
+    ///   direct image map offers no such guarantee and would race the
+    ///   client's own recolouring — Java repaints this very pixmap to
+    ///   change text colour and then reuses the picture, so an unordered
+    ///   read renders the *previous* colour.
+    /// - It goes through [`Src::server_internal`], the privileged
+    ///   unclipped backing-space handle. `SourceDrawable::offset()` is
+    ///   already resolved into backing space, so a client-bounded `Src`
+    ///   would reapply a coordinate space on top of it and sample the
+    ///   wrong pixel of a redirected window's backing — precisely the
+    ///   case the domain-not-storage rule exists to get right.
+    ///
+    /// Step 5 puts [`Self::uniform_glyph_source_cache`] in front of the
+    /// read. That is not a copy-cost optimisation: the copy-out measured
+    /// at 1.5 ms/s. It is there because `get_image` must
+    /// `close_open_frame(CloseReason::SyncWait)` before it can wait, and
+    /// that close measured as ~75% of ALL frame closes on a text-heavy
+    /// workload (`opens=237 closes=238`, `sync_wait=179`), collapsing
+    /// `ops/frame_avg` to 1.6 and destroying the batching
+    /// `composite_glyphs_via_frame_builder` exists to provide. A hit
+    /// skips the read and therefore skips the close.
+    ///
+    /// The cache is populated only on the way OUT, after the pixel has
+    /// been read, and a hit requires the source's `content_version` to
+    /// be unchanged — so a client that repaints the 1x1 pixmap to
+    /// recolour its text (Java, every string) misses and re-reads.
+    fn uniform_glyph_source_premul(
+        &mut self,
+        host_src: u32,
+        src: crate::kms::render::engine::SourceDrawable,
+        repeat: Repeat,
+        mask_fmt: u32,
+    ) -> Result<[f32; 4], &'static str> {
+        use crate::kms::render::{
+            engine::{premul_from_wire_pixel, uniform_pixel_glyph_source},
+            telemetry::GetImageSite,
+        };
+        let (depth, extent, content_version) = self
+            .store
+            .get(src.id())
+            .map(|d| (d.depth, d.storage.extent, d.content_version))
+            .ok_or("source drawable is not in the store")?;
+        let rect = uniform_pixel_glyph_source(src, repeat, extent, mask_fmt)
+            .ok_or("not a one-pixel sampled domain under a plane-covering repeat (tier 1 only)")?;
+        // Step 5 — the cache lookup, and the ONLY thing that can skip
+        // the readback below. `rect.offset` is the pixel actually read,
+        // which is `src.offset()` resolved into backing space.
+        let key_offset = (rect.offset.x, rect.offset.y);
+        if let Some(premul) =
+            self.uniform_glyph_source_cache
+                .get(src.id(), content_version, key_offset)
+        {
+            self.telemetry.record_uniform_glyph_source_cache(true);
+            return Ok(premul);
+        }
+        self.telemetry.record_uniform_glyph_source_cache(false);
+        // The picture's DECLARED format, which overrides storage depth
+        // when it says the alpha byte is padding — the same precedence
+        // `resolve_force_opaque_pict_format` applies on the sampling
+        // path. Absent (a synthesized source) falls back to depth.
+        let pict_format = match self.core.pictures.get(&host_src) {
+            Some(PictureRecord::Drawable { pict_format, .. }) => *pict_format,
+            _ => 0,
+        };
+        self.telemetry
+            .record_get_image_site(GetImageSite::GlyphSource);
+        let wire = self
+            .engine
+            .get_image(
+                &mut self.store,
+                &mut self.platform,
+                Src::server_internal(src.id()),
+                rect,
+                depth,
+            )
+            .map_err(|e| {
+                log::warn!(
+                    "render composite_glyphs: uniform source readback failed for \
+                     0x{host_src:x} at {rect:?} d{depth}: {e:?}"
+                );
+                "uniform source readback failed"
+            })?;
+        let premul = premul_from_wire_pixel(&wire, depth, pict_format)
+            .ok_or("source depth has no RENDER pixel decode, or the read came back short")?;
+        // Populate AFTER the ordered read, never before — see spec
+        // invariant 4 and [`UniformGlyphSourceCache`]. The version read
+        // above is the one the bytes just returned belong to: nothing
+        // between it and here can write the source, because this thread
+        // IS the request loop and the read is fence-waited.
+        self.uniform_glyph_source_cache
+            .insert(src.id(), content_version, key_offset, premul);
+        Ok(premul)
     }
 
     /// Resolve an accumulated content clip against the storage it will be
@@ -9534,6 +9683,31 @@ impl KmsBackend {
         self.telemetry
             .lifetime
             .frame_builder_close_reason_non_ported_paint_op
+    }
+
+    /// #137 step 5: read the lifetime
+    /// `frame_builder_close_reason_sync_wait` counter after draining
+    /// pending flush outcomes and frame-close events. Same drain shape
+    /// as [`Self::telemetry_close_reason_non_ported_for_tests`].
+    ///
+    /// This is the oracle for the whole justification of the
+    /// uniform-glyph-source cache: the readback's value is not the copy
+    /// it avoids but the `CloseReason::SyncWait` frame close it avoids,
+    /// so a cache hit must leave this counter unmoved.
+    pub fn telemetry_close_reason_sync_wait_for_tests(&mut self) -> u64 {
+        for outcome in self.engine.drain_flush_outcomes() {
+            if outcome.aborted {
+                self.telemetry.record_submit_group_abort();
+            } else {
+                self.telemetry
+                    .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
+            }
+        }
+        // Close-REASON counters accumulate from frame-builder close
+        // EVENTS, not flush outcomes — without this drain the counter
+        // stays 0 no matter how many closes fired in the engine.
+        self.drain_frame_builder_telemetry();
+        self.telemetry.lifetime.frame_builder_close_reason_sync_wait
     }
 
     /// Phase B.3 Task 2 (N1, N8, N9): drive `engine.copy_area` directly
@@ -14965,6 +15139,20 @@ fn parse_gradient_stops(body: &[u8], stops_offset: usize) -> Option<Vec<Gradient
 /// the v2 record's type and `KmsCore.pictures` as the map.
 /// `body` is the full request body shape:
 /// `picture(4) + value_mask(4) + values[…]`.
+/// Has the once-per-process `CompositeGlyphs` unsupported-drop warning
+/// been said yet? See `KmsBackend::record_composite_glyphs_drop` for
+/// why this is once per PROCESS and not once per generation.
+static COMPOSITE_GLYPHS_DROP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim a one-shot: `true` exactly once per flag, for the caller that
+/// got there first. Split out from its call site so the rate limiting
+/// is testable without capturing log output, and without a test having
+/// to consume a process-wide one-shot that another test may need.
+fn take_first_occurrence(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
     if body.len() < 8 {
         return;
@@ -16091,6 +16279,186 @@ fn default_window_init_color(depth: u8) -> [f32; 4] {
     } else {
         [0.0, 0.0, 0.0, 1.0]
     }
+}
+
+/// One glyph resolved out of a `CompositeGlyphs` items stream: the
+/// glyphset it came from, its id, its size, the picture format it is
+/// **stored** in, and its dst-space top-left. Holds no borrow of the
+/// glyphset map, so the caller can drop the immutable
+/// `core.glyphsets` borrow before the `&mut self.engine` call that
+/// consumes pass 2's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ParsedGlyph {
+    pub(super) gs_xid: u32,
+    pub(super) glyph_id: u32,
+    pub(super) w: u32,
+    pub(super) h: u32,
+    /// The glyphset's picture format — protocol state, read here
+    /// from the glyphset record. The engine turns it into an
+    /// effective `GlyphLayout`
+    /// (`RenderEngine::effective_glyph_layout`), because that mapping
+    /// depends on device state the parse must not consult.
+    pub(super) source_format: GlyphSourceFormat,
+    pub(super) dst_x: i32,
+    pub(super) dst_y: i32,
+}
+
+/// What pass 1 of the items parse produced, plus the counters the
+/// caller's "nothing parsed" diagnostic reports.
+#[derive(Debug, Default)]
+pub(super) struct ParsedGlyphItems {
+    /// Every drawable glyph the stream named, **in request order**.
+    pub(super) glyphs: Vec<ParsedGlyph>,
+    pub(super) elements: usize,
+    pub(super) found: usize,
+    pub(super) missing: usize,
+}
+
+/// Pass 1 of the `CompositeGlyphs` items parse — mirrors v1's
+/// `try_vk_render_composite_glyphs` shape.
+///
+/// Element size depends on the minor opcode: `CompositeGlyphs8` (23)
+/// → 1-byte ids, 16 (24) → 2, 32 (25) → 4. Each element starts with
+/// `count(u8) pad pad pad dx(i16) dy(i16)`; if `count == 255` the
+/// same 8 bytes instead carry an inline **glyphset change**, with the
+/// new glyphset xid in the trailing u32. `x_off` / `y_off` seed the
+/// pen and each element's `dx` / `dy` accumulates onto it.
+///
+/// That inline form is why one request can mix glyph source formats:
+/// different glyphsets may have different picture formats, so the
+/// returned sequence can interleave A8 and ARGB32 glyphs — which the
+/// engine then has to record as several contiguous draw runs
+/// (`RenderEngine::split_glyph_runs`).
+///
+/// Split out of `render_composite_glyphs` for two reasons: it keeps
+/// the immutable `glyphsets` borrow off the `&mut self.engine` call
+/// that consumes the result, and it is the seam a test drives to
+/// assert that the glyphs — and their source-format tags — come out
+/// in request order across an inline glyphset change.
+pub(super) fn parse_composite_glyph_items(
+    glyphsets: &HashMap<u32, crate::kms::core::GlyphSetState>,
+    minor: u8,
+    host_gs: u32,
+    x_off: i16,
+    y_off: i16,
+    items: &[u8],
+) -> ParsedGlyphItems {
+    use crate::kms::core::GlyphSetFormat;
+
+    let id_size: usize = match minor {
+        23 => 1,
+        24 => 2,
+        _ => 4,
+    };
+    let mut out = ParsedGlyphItems::default();
+    let mut pen_x = i32::from(x_off);
+    let mut pen_y = i32::from(y_off);
+    let mut pos: usize = 0;
+    let mut active_gs_xid = host_gs;
+    while pos + 8 <= items.len() {
+        let count = items[pos] as usize;
+        if count == 255 {
+            let new_xid = u32::from_le_bytes([
+                items[pos + 4],
+                items[pos + 5],
+                items[pos + 6],
+                items[pos + 7],
+            ]);
+            if new_xid != 0 && glyphsets.contains_key(&new_xid) {
+                active_gs_xid = new_xid;
+            }
+            pos += 8;
+            continue;
+        }
+        out.elements += 1;
+        let dx = i32::from(i16::from_le_bytes([items[pos + 4], items[pos + 5]]));
+        let dy = i32::from(i16::from_le_bytes([items[pos + 6], items[pos + 7]]));
+        pen_x += dx;
+        pen_y += dy;
+
+        let payload_start = pos + 8;
+        let payload_bytes = count * id_size;
+        let padded = (payload_bytes + 3) & !3;
+        if payload_start + padded > items.len() {
+            break;
+        }
+
+        let Some(active_gs) = glyphsets.get(&active_gs_xid) else {
+            pos += 8 + padded;
+            continue;
+        };
+        let active_gs_xid_for_key = active_gs_xid;
+
+        for i in 0..count {
+            let id_off = payload_start + i * id_size;
+            let glyph_id: u32 = match id_size {
+                1 => u32::from(items[id_off]),
+                2 => u32::from(u16::from_le_bytes([items[id_off], items[id_off + 1]])),
+                _ => u32::from_le_bytes([
+                    items[id_off],
+                    items[id_off + 1],
+                    items[id_off + 2],
+                    items[id_off + 3],
+                ]),
+            };
+            let Some(glyph) = active_gs.glyphs.get(&glyph_id) else {
+                out.missing += 1;
+                continue;
+            };
+            out.found += 1;
+
+            let gw = u32::from(glyph.width);
+            let gh = u32::from(glyph.height);
+            let dst_x = pen_x - i32::from(glyph.x);
+            let dst_y = pen_y - i32::from(glyph.y);
+
+            if gw > 0 && gh > 0 {
+                let source_format = match glyph.format {
+                    GlyphSetFormat::A8 => GlyphSourceFormat::A8,
+                    // Wire A1: rows padded to a 32-bit scanline
+                    // unit, bit order = advertised `bitmap-bit-order`
+                    // (LSBFirst for the common little-endian client).
+                    // Forwarded raw; expanded on atlas miss by
+                    // `GlyphPixels::to_a8`.
+                    GlyphSetFormat::A1 => GlyphSourceFormat::A1,
+                    // Wire ARGB32: dense CARD32 rows, memory order
+                    // [B, G, R, A]. Forwarded raw; reduced to one A8
+                    // coverage plane on atlas miss by
+                    // `GlyphPixels::to_a8`. Reducing here instead
+                    // would throw away the colour channels a
+                    // subpixel-AA client puts the coverage in.
+                    GlyphSetFormat::Argb32 => GlyphSourceFormat::Argb32,
+                    // A glyphset whose picture format we never
+                    // accepted; `parse_add_glyphs` refuses to store
+                    // glyphs for it, so this is defensive.
+                    GlyphSetFormat::Other => {
+                        log::warn!(
+                            "render composite_glyphs: unexpected stored format {:?} for \
+                             glyph 0x{glyph_id:x} — skipping",
+                            glyph.format,
+                        );
+                        continue;
+                    }
+                };
+
+                out.glyphs.push(ParsedGlyph {
+                    gs_xid: active_gs_xid_for_key,
+                    glyph_id,
+                    w: gw,
+                    h: gh,
+                    source_format,
+                    dst_x,
+                    dst_y,
+                });
+            }
+
+            pen_x += i32::from(glyph.x_off);
+            pen_y += i32::from(glyph.y_off);
+        }
+
+        pos += 8 + padded;
+    }
+    out
 }
 
 /// Stage 3f.13 glyph fallback: pull the first stop's premultiplied
@@ -23622,7 +23990,7 @@ impl Backend for KmsBackend {
         op: u8,
         host_src: u32,
         host_dst: u32,
-        _mask_fmt: u32,
+        mask_fmt: u32,
         host_gs: u32,
         src_x: i16,
         src_y: i16,
@@ -23630,12 +23998,9 @@ impl Backend for KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::{
-            core::GlyphSetFormat,
-            render::{
-                engine::{CompositeGlyphInput, ResolvedSource},
-                glyph_pixels::GlyphPixels,
-            },
+        use crate::kms::render::{
+            engine::{CompositeGlyphInput, ResolvedSource},
+            glyph_pixels::GlyphPixels,
         };
 
         // Gating: op must be a standard fixed-function PictOp
@@ -23659,13 +24024,12 @@ impl Backend for KmsBackend {
         // protocol errors, not unsupported features; they log a gap
         // and return Ok without bumping the counter.
         if crate::kms::vk::render_pipeline::StdPictOp::from_u8(op).is_none() || op > 12 {
-            log::debug!(
-                "render composite_glyphs gap: op={op} (standard fixed-function ops 0..=12)"
-            );
-            self.telemetry.record_composite_glyphs_dropped_unsupported();
+            self.record_composite_glyphs_drop(format_args!(
+                "op={op} is outside the standard fixed-function family (0..=12)"
+            ));
             return Ok(Vec::new());
         }
-        let Some((src_resolved, _src_repeat, _src_xform, _src_ca)) =
+        let Some((src_resolved, src_repeat, _src_xform, _src_ca)) =
             self.resolve_picture_for_render(host_src)
         else {
             log::debug!("render composite_glyphs gap: src 0x{host_src:x} not resolvable");
@@ -23689,12 +24053,28 @@ impl Backend for KmsBackend {
                     [0.0, 0.0, 0.0, 0.0]
                 })
             }
-            ResolvedSource::Drawable(_) | ResolvedSource::None => {
-                log::debug!(
-                    "render composite_glyphs gap: src 0x{host_src:x} is not SolidFill / Gradient \
-                     (plan §3d v1-parity scope)"
-                );
-                self.telemetry.record_composite_glyphs_dropped_unsupported();
+            // #137 tier 1 — a source whose sampled domain is one pixel
+            // under a covering repeat IS a colour, so read it and take
+            // the same route as `CreateSolidFill`. Anything else stays
+            // dropped: tier 2 (general drawable sources) needs its own
+            // spec, and asserting otherwise here would assert tier 2.
+            ResolvedSource::Drawable(src_drawable) => {
+                match self.uniform_glyph_source_premul(host_src, src_drawable, src_repeat, mask_fmt)
+                {
+                    Ok(premul) => premul,
+                    Err(why) => {
+                        self.record_composite_glyphs_drop(format_args!(
+                            "src 0x{host_src:x} is a drawable ({src_drawable:?} \
+                             repeat={src_repeat:?} mask_fmt={mask_fmt}) — {why}"
+                        ));
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+            ResolvedSource::None => {
+                self.record_composite_glyphs_drop(format_args!(
+                    "src 0x{host_src:x} resolved to no source picture at all"
+                ));
                 return Ok(Vec::new());
             }
         };
@@ -23715,156 +24095,45 @@ impl Backend for KmsBackend {
             return Ok(Vec::new());
         }
 
-        // Items parser — mirrors v1's `try_vk_render_composite_glyphs`
-        // shape. Element size depends on the minor opcode:
-        // CompositeGlyphs8 (23) → 1 byte ids, 16 (24) → 2, 32 (25)
-        // → 4. Each element starts with `count(u8) pad pad pad
-        // dx(i16) dy(i16)`; if `count == 255` the same 8 bytes
-        // carry an inline glyphset change with the new gs xid in
-        // the trailing u32.
-        let id_size: usize = match minor {
-            23 => 1,
-            24 => 2,
-            _ => 4,
-        };
+        // Items parser. Pass 1 (`parse_composite_glyph_items`) walks
+        // the wire stream and resolves every glyph it names, tagging
+        // each with the picture format its glyphset stores it in;
+        // pass 2 below resolves each of those to a
+        // `CompositeGlyphInput` borrowing the glyphset's stored pixel
+        // bytes as-is (dense A8, raw A1 wire or raw ARGB32 wire).
+        // Conversion to A8 is deferred to the engine's atlas-miss
+        // branch (`GlyphPixels::to_a8`) so a resident glyph is never
+        // re-converted (#2, 2026-07-08 render-optimization gaps).
+        // The two passes also keep the immutable
+        // `self.core.glyphsets` borrow off the mutable `self.engine`
+        // call below.
+        //
         // Per X RENDER protocol, `src_x`/`src_y` are the SOURCE
-        // picture sampling origin, not the dst pen — same as v1.
-        // The first glyph-element's `dx` / `dy` sets the absolute
-        // pen position; subsequent elements accumulate.
+        // picture sampling origin, not the dst pen — same as v1. The
+        // first glyph-element's `dx` / `dy` sets the absolute pen
+        // position; subsequent elements accumulate.
         let _ = (src_x, src_y);
-        let mut pen_x = i32::from(x_off);
-        let mut pen_y = i32::from(y_off);
-        let mut pos: usize = 0;
-        let mut active_gs_xid = host_gs;
-        // Two-pass parse: pass 1 fills `parsed` with per-glyph
-        // metadata + the glyph's stored format; pass 2 resolves each
-        // to a `CompositeGlyphInput` borrowing the glyphset's stored
-        // pixel bytes as-is (dense A8 or raw A1 wire). A1→A8 expansion
-        // is deferred to the engine's atlas-miss branch
-        // (`GlyphPixels::to_a8`) so a resident glyph is never
-        // re-expanded (#2, 2026-07-08 render-optimization gaps). The
-        // split keeps the immutable `self.core.glyphsets` borrow off
-        // the mutable `self.engine` call below.
-        enum GlyphFmt {
-            A8,
-            A1,
-        }
-        struct Parsed {
-            gs_xid: u32,
-            glyph_id: u32,
-            w: u32,
-            h: u32,
-            fmt: GlyphFmt,
-            dst_x: i32,
-            dst_y: i32,
-        }
-        let mut parsed: Vec<Parsed> = Vec::new();
-        // Borrow the glyphsets map immutably for the whole parse.
-        // The engine call below takes `&mut self.engine` /
-        // `&mut self.store` but not `&self.core.glyphsets`, so a
-        // single borrow scope here is sound.
-        while pos + 8 <= items.len() {
-            let count = items[pos] as usize;
-            if count == 255 {
-                if pos + 8 <= items.len() {
-                    let new_xid = u32::from_le_bytes([
-                        items[pos + 4],
-                        items[pos + 5],
-                        items[pos + 6],
-                        items[pos + 7],
-                    ]);
-                    if new_xid != 0 && self.core.glyphsets.contains_key(&new_xid) {
-                        active_gs_xid = new_xid;
-                    }
-                }
-                pos += 8;
-                continue;
-            }
-            let dx = i32::from(i16::from_le_bytes([items[pos + 4], items[pos + 5]]));
-            let dy = i32::from(i16::from_le_bytes([items[pos + 6], items[pos + 7]]));
-            pen_x += dx;
-            pen_y += dy;
-
-            let payload_start = pos + 8;
-            let payload_bytes = count * id_size;
-            let padded = (payload_bytes + 3) & !3;
-            if payload_start + padded > items.len() {
-                break;
-            }
-
-            let Some(active_gs) = self.core.glyphsets.get(&active_gs_xid) else {
-                pos += 8 + padded;
-                continue;
-            };
-            let active_gs_xid_for_key = active_gs_xid;
-
-            for i in 0..count {
-                let id_off = payload_start + i * id_size;
-                let glyph_id: u32 = match id_size {
-                    1 => u32::from(items[id_off]),
-                    2 => u32::from(u16::from_le_bytes([items[id_off], items[id_off + 1]])),
-                    _ => u32::from_le_bytes([
-                        items[id_off],
-                        items[id_off + 1],
-                        items[id_off + 2],
-                        items[id_off + 3],
-                    ]),
-                };
-                let Some(glyph) = active_gs.glyphs.get(&glyph_id) else {
-                    continue;
-                };
-
-                let gw = u32::from(glyph.width);
-                let gh = u32::from(glyph.height);
-                let dst_x = pen_x - i32::from(glyph.x);
-                let dst_y = pen_y - i32::from(glyph.y);
-
-                if gw > 0 && gh > 0 {
-                    let fmt = match glyph.format {
-                        GlyphSetFormat::A8 => GlyphFmt::A8,
-                        // Wire A1: rows padded to a 32-bit scanline
-                        // unit, bit order = advertised `bitmap-bit-order`
-                        // (LSBFirst for the common little-endian client).
-                        // Forwarded raw; expanded on atlas miss by
-                        // `GlyphPixels::to_a8`.
-                        GlyphSetFormat::A1 => GlyphFmt::A1,
-                        // ARGB32-source glyphs are pre-converted to
-                        // A8 in `parse_add_glyphs`, so this branch
-                        // is unreachable in practice. Defensive:
-                        // skip the glyph if the stored format
-                        // somehow ended up as ARGB32 / Other.
-                        GlyphSetFormat::Argb32 | GlyphSetFormat::Other => {
-                            log::warn!(
-                                "render composite_glyphs: unexpected stored format {:?} for \
-                                 glyph 0x{glyph_id:x} — skipping",
-                                glyph.format,
-                            );
-                            continue;
-                        }
-                    };
-
-                    parsed.push(Parsed {
-                        gs_xid: active_gs_xid_for_key,
-                        glyph_id,
-                        w: gw,
-                        h: gh,
-                        fmt,
-                        dst_x,
-                        dst_y,
-                    });
-                }
-
-                pen_x += i32::from(glyph.x_off);
-                pen_y += i32::from(glyph.y_off);
-            }
-
-            pos += 8 + padded;
-        }
+        let ParsedGlyphItems {
+            glyphs: parsed,
+            elements,
+            found: found_glyphs,
+            missing: missing_glyphs,
+        } = parse_composite_glyph_items(&self.core.glyphsets, minor, host_gs, x_off, y_off, items);
 
         if parsed.is_empty() {
             // No drawable glyphs (every entry was zero-size or
             // missing from the glyphset). Not a gap; just nothing
             // to record.
+            log::debug!(
+                "render composite_glyphs: NOTHING PARSED minor={minor} gs=0x{host_gs:x} \
+                 items={} elements={elements} found={found_glyphs} missing={missing_glyphs} \
+                 glyphs_in_set={}",
+                items.len(),
+                self.core
+                    .glyphsets
+                    .get(&host_gs)
+                    .map_or(0, |g| g.glyphs.len()),
+            );
             return Ok(Vec::new());
         }
         let mut min_x = i32::MAX;
@@ -23893,6 +24162,12 @@ impl Backend for KmsBackend {
             glyph_union_local,
         );
         if cliplist_local.is_empty() {
+            log::debug!(
+                "render composite_glyphs: CLIPPED OUT minor={minor} dst=0x{host_dst:x} glyphs={} union={:?} extent={:?} clip_by_children={clip_by_children}",
+                parsed.len(),
+                glyph_union_local,
+                dst_local_extent,
+            );
             return Ok(Vec::new());
         }
         let dst_clip =
@@ -23912,9 +24187,14 @@ impl Backend for KmsBackend {
                     .get(&p.gs_xid)
                     .and_then(|gs| gs.glyphs.get(&p.glyph_id))
                     .map(|g| g.pixels.as_slice())?;
-                let pixels = match p.fmt {
-                    GlyphFmt::A8 => GlyphPixels::A8(stored),
-                    GlyphFmt::A1 => GlyphPixels::A1Wire(stored),
+                // The byte encoding IS the format tag: the engine
+                // reads it back with `GlyphPixels::source_format()`,
+                // so it can never be told "these bytes are ARGB32"
+                // and "this glyph is A8" at the same time.
+                let pixels = match p.source_format {
+                    GlyphSourceFormat::A8 => GlyphPixels::A8(stored),
+                    GlyphSourceFormat::A1 => GlyphPixels::A1Wire(stored),
+                    GlyphSourceFormat::Argb32 => GlyphPixels::Argb32Wire(stored),
                 };
                 Some(CompositeGlyphInput {
                     gs_xid: p.gs_xid,
@@ -23929,6 +24209,10 @@ impl Backend for KmsBackend {
             .collect();
 
         if inputs.is_empty() {
+            log::debug!(
+                "render composite_glyphs: NO PIXELS minor={minor} dst=0x{host_dst:x} parsed={}",
+                parsed.len(),
+            );
             return Ok(Vec::new());
         }
 
@@ -31198,6 +31482,105 @@ mod tests {
         (src_pic.as_raw(), gs_xid)
     }
 
+    /// #137 visibility note, the rate limiter itself: a one-shot is
+    /// claimed exactly once, by whoever gets there first. Tested on a
+    /// LOCAL flag rather than the process-wide one, so it neither
+    /// depends on test order nor consumes the real one-shot.
+    #[test]
+    fn the_first_occurrence_of_a_one_shot_is_claimed_once() {
+        use super::take_first_occurrence;
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        assert!(
+            take_first_occurrence(&flag),
+            "the first caller must get the one-shot"
+        );
+        for i in 0..100 {
+            assert!(
+                !take_first_occurrence(&flag),
+                "occurrence {i} must not warn again — a pathological client \
+                 would otherwise flood the log"
+            );
+        }
+    }
+
+    /// #137 visibility note: the LOG is rate-limited, the COUNTER is
+    /// not. A hundred unsupported requests bump the counter a hundred
+    /// times, so telemetry still measures how bad a gap is even after
+    /// the log has gone quiet.
+    ///
+    /// The source here is a drawable whose sampled domain is 4x4 —
+    /// admissible under tier 2, not tier 1 — so the drop is the real
+    /// remaining one, reached without a live Vk (the read is never
+    /// attempted).
+    #[test]
+    fn composite_glyphs_counts_every_unsupported_drop_not_just_the_first() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use ash::vk;
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let (_unused_solidfill, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
+
+        // A real store entry, so the picture resolves to
+        // `ResolvedSource::Drawable` rather than failing to resolve at
+        // all (which is a protocol error, not an unsupported feature,
+        // and deliberately does NOT bump the counter).
+        let src_xid = 0x5137_0001u32;
+        b.store
+            .allocate(
+                src_xid,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("allocate the source pixmap");
+        let src_pic = b
+            .render_create_picture(
+                None,
+                AnyHandle::Pixmap(PixmapHandle::from_raw(src_xid).expect("PixmapHandle")),
+                yserver_protocol::x11::RENDER_FMT_ARGB32,
+                0x0001,              // CPRepeat
+                &1u32.to_le_bytes(), // Normal
+            )
+            .expect("render_create_picture")
+            .expect("Some")
+            .as_raw();
+
+        for _ in 0..100 {
+            b.render_composite_glyphs(
+                None,
+                23, // CompositeGlyphs8
+                3,  // Over
+                src_pic,
+                0xDEAD, // host_dst — the source gate fires first
+                0,      // mask_fmt
+                gs_xid,
+                0,
+                0,
+                &[1u8, 0, 0, 0, 0, 0, 0, 0],
+                0,
+                0,
+            )
+            .expect("ok");
+        }
+        assert_eq!(
+            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 100,
+            "the counter is not rate-limited: every unsupported drop must advance it",
+        );
+        assert_eq!(
+            b.telemetry.lifetime.paint_submits, 0,
+            "no paint submit on the drop path",
+        );
+    }
+
     /// Ops outside the standard fixed-function family (0..=12) —
     /// Saturate + the Disjoint/Conjoint families — still drop with
     /// a per-call gap-log and increment the
@@ -31344,18 +31727,25 @@ mod tests {
 
     /// Per plan §3d items-parse spec: the items stream's inline
     /// `0xFF 0 0 0 new_gs_xid` element rotates the active glyphset
-    /// for subsequent glyph lookups. The test installs two
-    /// glyphsets with distinct codepoint→pixel mappings, feeds an
-    /// items stream that draws one glyph from each, and asserts
-    /// that both glyphsets contributed to the engine call — the
-    /// parser must have honoured the inline change. We can't hit
-    /// the Vk engine in this fixture (no live Vk under
-    /// `for_tests`), so the gate is "no unsupported drop fired"
-    /// AND "both glyphset lookups succeeded" (verified by reaching
-    /// the engine, which returns `NoVk` on the stub but does NOT
-    /// bump the unsupported counter).
+    /// for subsequent glyph lookups.
+    ///
+    /// **This test used to assert nothing of the sort.** Its only
+    /// gate was `composite_glyphs_dropped_unsupported == 0`, which
+    /// holds whether the inline element is honoured or silently
+    /// skipped — a parse that ignored it would resolve one glyph
+    /// instead of two and still pass. (Reported honestly by #137 step
+    /// 4b, whose own tests do catch it; fixed here rather than left
+    /// as a name that promises coverage it does not have.)
+    ///
+    /// It now drives `parse_composite_glyph_items` — the seam step 4b
+    /// factored out — and asserts the resolved glyph SEQUENCE:
+    /// glyphset, id and pen position, in request order. The negative
+    /// control at the end is what gives it teeth: point the inline
+    /// change at an unknown xid and the second glyph becomes a MISS,
+    /// because the initial glyphset does not contain its id.
     #[test]
     fn composite_glyphs_inline_glyphset_change_parsed() {
+        use super::parse_composite_glyph_items;
         use crate::kms::core::{GlyphSetFormat, GlyphSetState, StoredGlyph};
 
         let mut b = KmsBackend::for_tests();
@@ -31426,17 +31816,61 @@ mod tests {
         )
         .expect("ok");
         // Op + source were Over + SolidFill, so the unsupported
-        // counter must NOT have fired.
+        // counter must NOT have fired. (dst resolution fails — no
+        // Drawable backing for 0x4242_4242 in the store — so the
+        // engine is never reached; engine reachability is covered by
+        // the Vk-backed acceptance tests.)
         assert_eq!(
             b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 0,
             "Over + SolidFill must not hit the unsupported gate",
         );
-        // dst resolution failed (no Drawable backing for 0x4242_4242
-        // in the store), so the engine wasn't called — but the parse
-        // still walked both glyphsets without bumping the gap. The
-        // load-bearing assertion is that the inline change keeps the
-        // call in the Over+SolidFill envelope; engine reachability
-        // is covered by the Vk-backed acceptance test.
+
+        // ── what the test's name actually claims ──
+        //
+        // Element 1 draws 0x10 from gs_a at pen 0; the glyph advances
+        // the pen by its x_off of 1; element 3's dx of 1 takes it to
+        // 2, where 0x20 comes from gs_b. Two glyphs, TWO glyphsets,
+        // in request order.
+        let parsed = parse_composite_glyph_items(&b.core.glyphsets, 23, gs_a, 0, 0, &items);
+        assert_eq!(
+            parsed
+                .glyphs
+                .iter()
+                .map(|g| (g.gs_xid, g.glyph_id, g.dst_x))
+                .collect::<Vec<_>>(),
+            vec![(gs_a, 0x10, 0), (gs_b, 0x20, 2)],
+            "the inline `count == 255` element must rotate the active glyphset \
+             for every later glyph, in request order",
+        );
+        assert_eq!(
+            parsed.missing, 0,
+            "both ids must resolve in their own glyphset"
+        );
+
+        // Teeth: point the inline change at an xid no glyphset holds.
+        // The active glyphset then stays gs_a, which has no 0x20, so
+        // the second glyph is a MISS — i.e. this stream really does
+        // depend on the inline element being honoured, and a parse
+        // that skipped it would produce exactly this.
+        let mut ignored = items.clone();
+        let change_at = 12; // element 1 is 8 + 4 bytes
+        assert_eq!(
+            ignored[change_at], 255,
+            "fixture: the change element is here"
+        );
+        ignored[change_at + 4..change_at + 8].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
+        let parsed_ignored =
+            parse_composite_glyph_items(&b.core.glyphsets, 23, gs_a, 0, 0, &ignored);
+        assert_eq!(
+            parsed_ignored
+                .glyphs
+                .iter()
+                .map(|g| (g.gs_xid, g.glyph_id))
+                .collect::<Vec<_>>(),
+            vec![(gs_a, 0x10)],
+            "with the change unresolvable, only the first glyph can be found",
+        );
+        assert_eq!(parsed_ignored.missing, 1, "0x20 is not in gs_a");
     }
 
     // ─── Stage 3f.1: poly_* + fill_poly logic tests ────────────

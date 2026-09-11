@@ -189,6 +189,159 @@ impl Depth1MaskCache {
     }
 }
 
+/// CPU cache of #137 tier-1 uniform glyph-source colours: the
+/// premultiplied `[f32; 4]` a 1x1 drawable source collapsed to, keyed by
+/// the drawable it was read from.
+///
+/// **The read is not what costs.** Measured on a deliberately worst-case
+/// synthetic churn workload (32 strings recoloured every 10ms), the
+/// pixel copy-out itself is 1.5 ms/s — noise. What costs is that
+/// [`RenderEngine::get_image`](crate::kms::render::engine::RenderEngine::get_image)
+/// must close any open frame
+/// ([`CloseReason::SyncWait`](crate::kms::render::frame_builder::CloseReason::SyncWait))
+/// before it can wait on its readback fence, and that close destroys the
+/// batching `composite_glyphs_via_frame_builder` exists to provide:
+/// `frame_builder_opens=237 closes=238` per second with
+/// `close_reasons[sync_wait=179]` — ~75% of ALL frame closes were this
+/// one readback — and `ops/frame_avg` collapsed to 1.6.
+///
+/// A hit skips `get_image` entirely and therefore skips the frame close.
+/// That, not the copy, is what this buys.
+///
+/// # Keying — all three components of the spec's invariant 6
+///
+/// A hit requires `(DrawableId, content_version, offset)` to match, and
+/// each component is load-bearing:
+///
+/// - **`DrawableId`** — minted monotonically and never recycled, so a
+///   freed-and-reallocated pixmap always gets a fresh id and cannot
+///   alias a stale entry. `content_version` alone would collide across
+///   drawables: it is local to an allocation, so two unrelated 1x1
+///   sources both sitting at version 3 would share one colour.
+/// - **`content_version`** (`store.rs`, bumped by every pixel write) —
+///   this is the staleness guard, and it is the whole reason population
+///   happens only AFTER the ordered read. Java's `XRSolidSrcPict`
+///   repaints the SAME 1x1 pixmap to change text colour and then reuses
+///   the picture, so a value cached at `CreatePicture` time — or keyed
+///   on anything that does not move when the pixels do — renders every
+///   later run of text in the PREVIOUS colour. That converts a total,
+///   obvious failure into an intermittent wrong-colour one, which is
+///   strictly worse than the bug being fixed (spec invariant 4).
+/// - **`offset`** — one backing can legitimately be sampled at several
+///   content offsets at the same version (a redirected window's 1x1
+///   content domain inside a larger allocation), and those are different
+///   pixels.
+///
+/// Following [`Depth1MaskCache`]'s shape, the map key carries identity +
+/// offset while `content_version` is validated inside the entry. That is
+/// the same triple, and it has one property a three-part map key does
+/// not: only ONE version of a given `(id, offset)` is ever live, so an
+/// insert REPLACES its predecessor instead of stranding it. Keying the
+/// map on a monotonically increasing version would accumulate a dead
+/// entry per repaint — a leak in all but name, and exactly the shape
+/// Java's recolour-per-string pattern produces fastest.
+///
+/// Bounded LRU on top of that, so sources of long-gone pixmaps cannot
+/// accumulate and no free-path hook is needed.
+pub(crate) struct UniformGlyphSourceCache {
+    entries: std::collections::HashMap<UniformGlyphSourceKey, UniformGlyphSourceEntry>,
+    /// LRU order, back = most-recently-used. `touch` removes any prior
+    /// occurrence before pushing, so this stays duplicate-free and
+    /// `entries.len() == order.len()` holds.
+    order: std::collections::VecDeque<UniformGlyphSourceKey>,
+    cap: usize,
+}
+
+/// Identity + sampled origin. The version lives in the entry; see
+/// [`UniformGlyphSourceCache`] for why it is not part of the map key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UniformGlyphSourceKey {
+    id: crate::kms::render::store::DrawableId,
+    /// `SourceDrawable::offset()`, already resolved into backing space.
+    offset: (i32, i32),
+}
+
+struct UniformGlyphSourceEntry {
+    content_version: u64,
+    premul: [f32; 4],
+}
+
+impl UniformGlyphSourceCache {
+    /// `cap` = max distinct `(drawable, offset)` sources retained
+    /// (clamped to >= 1). A client typically holds exactly one such
+    /// pixmap (Java's per-`GraphicsConfiguration` `XRSolidSrcPict`), and
+    /// each entry is a key plus four floats, so this is generous.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Hit iff we hold this `(id, offset)` at the SAME `content_version`.
+    /// A hit lets the caller skip the ordered readback, and with it the
+    /// frame close that readback forces.
+    pub(crate) fn get(
+        &mut self,
+        id: crate::kms::render::store::DrawableId,
+        content_version: u64,
+        offset: (i32, i32),
+    ) -> Option<[f32; 4]> {
+        let key = UniformGlyphSourceKey { id, offset };
+        let premul = match self.entries.get(&key) {
+            Some(e) if e.content_version == content_version => e.premul,
+            _ => return None,
+        };
+        self.touch(key);
+        Some(premul)
+    }
+
+    /// Insert (or replace) this source's colour and evict LRU victims
+    /// past `cap`. Called ONLY after the ordered read has returned the
+    /// pixel — never at picture-create time.
+    pub(crate) fn insert(
+        &mut self,
+        id: crate::kms::render::store::DrawableId,
+        content_version: u64,
+        offset: (i32, i32),
+        premul: [f32; 4],
+    ) {
+        let key = UniformGlyphSourceKey { id, offset };
+        self.entries.insert(
+            key,
+            UniformGlyphSourceEntry {
+                content_version,
+                premul,
+            },
+        );
+        self.touch(key);
+        while self.entries.len() > self.cap {
+            match self.order.pop_front() {
+                Some(victim) => {
+                    self.entries.remove(&victim);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Move `key` to the MRU end, removing any stale position first so
+    /// `order` never holds duplicates.
+    fn touch(&mut self, key: UniformGlyphSourceKey) {
+        if let Some(pos) = self.order.iter().position(|&x| x == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.entries.len(), self.order.len());
+        self.entries.len()
+    }
+}
+
 /// Rasterise an X11 pixmap clip-mask against a paint-rect list.
 ///
 /// X11 GC clip-mask: a pixel paints iff the mask bit at
@@ -1082,10 +1235,20 @@ pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
             break;
         }
         let wire = &body_tail[data_off..data_off + nbytes];
-        // For ARGB32 we extract the alpha byte from each pixel into a
-        // densely-packed A8 buffer and record the stored glyph as A8.
-        // The downstream atlas + text pipeline path then handles it
-        // identically to a real A8 upload.
+        // Store each glyph in the format it arrived in. A8 is
+        // densified (its wire rows are padded to 4 bytes); A1 and
+        // ARGB32 keep their wire bytes verbatim, and the conversion
+        // to the atlas's A8 coverage plane happens on an atlas MISS
+        // in the engine (`GlyphPixels::to_a8`), so a resident glyph
+        // is never converted twice.
+        //
+        // ARGB32 in particular must NOT be reduced here: it used to
+        // be flattened to its alpha byte and recorded as A8, which is
+        // what made subpixel-antialiased text render as solid blocks
+        // (a subpixel-AA client leaves alpha at 255 across the whole
+        // glyph box and puts the coverage in R, G and B). Keeping the
+        // four channels also leaves the component-alpha path able to
+        // pack all of them later.
         let (pixels, stored_format) = match gs.format {
             GlyphSetFormat::A8 => {
                 let mut pixels = vec![0u8; w * h];
@@ -1096,18 +1259,11 @@ pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
                 (pixels, GlyphSetFormat::A8)
             }
             GlyphSetFormat::A1 => (wire.to_vec(), GlyphSetFormat::A1),
-            GlyphSetFormat::Argb32 => {
-                // Pixel bytes per X RENDER ARGB32 = little-endian
-                // CARD32 with alpha-shift=24 → memory order [B, G, R, A].
-                let mut pixels = vec![0u8; w * h];
-                for row in 0..h {
-                    let row_off = row * stride;
-                    for col in 0..w {
-                        pixels[row * w + col] = wire[row_off + col * 4 + 3];
-                    }
-                }
-                (pixels, GlyphSetFormat::A8)
-            }
+            // Memory order per pixel is [B, G, R, A] — X RENDER
+            // `PICT_a8r8g8b8` is a little-endian CARD32 with
+            // alpha-shift 24, so blue is the LOW byte. Rows are
+            // dense at `4 * w`, which is already 4-aligned.
+            GlyphSetFormat::Argb32 => (wire.to_vec(), GlyphSetFormat::Argb32),
             GlyphSetFormat::Other => return,
         };
         data_off += nbytes;
@@ -1123,6 +1279,95 @@ pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
                 pixels,
                 format: stored_format,
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_add_glyphs_tests {
+    use super::parse_add_glyphs;
+    use crate::kms::{
+        core::{GlyphSetFormat, GlyphSetState},
+        render::glyph_pixels::reduce_argb32_glyph_to_a8_coverage,
+    };
+    use std::collections::HashMap;
+
+    /// Build an `AddGlyphs` `body_tail` for a single glyph: the
+    /// bytes after the 4-byte glyphset XID.
+    fn one_glyph_body(w: u16, h: u16, pixels: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // n = 1
+        body.extend_from_slice(&7u32.to_le_bytes()); // glyph id
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&h.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes()); // x bearing
+        body.extend_from_slice(&0i16.to_le_bytes()); // y bearing
+        body.extend_from_slice(&i16::try_from(w).unwrap_or(0).to_le_bytes()); // x_off
+        body.extend_from_slice(&0i16.to_le_bytes()); // y_off
+        body.extend_from_slice(pixels);
+        body
+    }
+
+    fn ingest(format: GlyphSetFormat, w: u16, h: u16, pixels: &[u8]) -> GlyphSetState {
+        let mut gs = GlyphSetState {
+            format,
+            glyphs: HashMap::new(),
+        };
+        parse_add_glyphs(&mut gs, &one_glyph_body(w, h, pixels));
+        gs
+    }
+
+    #[test]
+    fn a8_glyphs_are_densified_and_stay_a8() {
+        // Invariant 1: the common path must not move. A8 wire rows
+        // are padded to 4 bytes; ingest strips the pad and nothing
+        // else.
+        let wire = [1u8, 2, 3, 0xEE, 4, 5, 6, 0xEE];
+        let gs = ingest(GlyphSetFormat::A8, 3, 2, &wire);
+        let g = gs.glyphs.get(&7).expect("glyph stored");
+        assert_eq!(g.format, GlyphSetFormat::A8);
+        assert_eq!(g.pixels, vec![1, 2, 3, 4, 5, 6], "row pad stripped");
+    }
+
+    #[test]
+    fn a1_glyphs_keep_their_wire_bytes_and_stay_a1() {
+        // Invariant 1 again: A1 is forwarded verbatim, expanded
+        // later on atlas miss.
+        let wire = [0b0101_0011u8, 0, 0, 0, 0b1000_0001, 0, 0, 0];
+        let gs = ingest(GlyphSetFormat::A1, 8, 2, &wire);
+        let g = gs.glyphs.get(&7).expect("glyph stored");
+        assert_eq!(g.format, GlyphSetFormat::A1);
+        assert_eq!(g.pixels, wire.to_vec(), "A1 wire bytes untouched");
+    }
+
+    #[test]
+    fn argb32_glyphs_keep_all_four_channels_and_stay_argb32() {
+        // The defect: ingest used to keep only the alpha byte and
+        // record the glyph as A8. On a subpixel-AA glyph alpha is
+        // 255 over the whole box, so the stored glyph was a solid
+        // block. Wire memory order is [B, G, R, A].
+        let wire = [
+            0x20u8, 0x60, 0xA0, 0xE0, // (0,0) B,G,R,A
+            0x10, 0x40, 0x50, 0xFF, // (1,0)
+            0x00, 0x00, 0x00, 0xFF, // (0,1)
+            0xFF, 0xFF, 0xFF, 0xFF, // (1,1)
+        ];
+        let gs = ingest(GlyphSetFormat::Argb32, 2, 2, &wire);
+        let g = gs.glyphs.get(&7).expect("glyph stored");
+        assert_eq!(
+            g.format,
+            GlyphSetFormat::Argb32,
+            "the stored format must stay ARGB32; rewriting it to A8 \
+             is what discarded the colour channels"
+        );
+        assert_eq!(g.pixels, wire.to_vec(), "all four channels retained");
+
+        // And the deferred reduction turns those bytes into real
+        // coverage rather than the alpha byte's solid 0xFF.
+        assert_eq!(
+            reduce_argb32_glyph_to_a8_coverage(&g.pixels, 2, 2),
+            vec![96u8, 53, 0, 255],
+            "coverage = mean of logical R, G, B"
         );
     }
 }
@@ -1177,5 +1422,107 @@ mod depth1_mask_cache_tests {
         assert!(c.get(b, 1, 1, 1).is_none(), "LRU entry b evicted");
         assert!(c.get(a, 1, 1, 1).is_some(), "recently-used a survives");
         assert!(c.get(d, 1, 1, 1).is_some(), "newest d survives");
+    }
+}
+
+/// #137 step 5 — the collision cases the `(DrawableId, content_version,
+/// offset)` key exists to prevent. None of them is visible without an
+/// explicit test: every one of them looks like a working cache until the
+/// wrong colour comes out.
+#[cfg(test)]
+mod uniform_glyph_source_cache_tests {
+    use super::UniformGlyphSourceCache;
+    use crate::kms::render::store::DrawableId;
+
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+    /// Spec invariant 4: a repaint bumps `content_version`, and the
+    /// entry stored at the old version must NOT satisfy the new read.
+    /// This is the staleness trap — Java repaints this very pixmap to
+    /// change text colour and reuses the picture.
+    #[test]
+    fn a_bumped_content_version_misses() {
+        let mut c = UniformGlyphSourceCache::new(8);
+        let id = DrawableId::for_tests(1);
+        assert_eq!(c.get(id, 0, (0, 0)), None, "empty cache misses");
+
+        c.insert(id, 5, (0, 0), RED);
+        assert_eq!(c.get(id, 5, (0, 0)), Some(RED), "same version hits");
+        assert_eq!(
+            c.get(id, 6, (0, 0)),
+            None,
+            "a repainted source must force a fresh ordered read"
+        );
+    }
+
+    /// `content_version` is local to an allocation, so two unrelated
+    /// drawables routinely sit at the same version. Keying on the
+    /// version alone would hand drawable 2 drawable 1's colour.
+    #[test]
+    fn two_drawables_at_the_same_content_version_do_not_share_an_entry() {
+        let mut c = UniformGlyphSourceCache::new(8);
+        let (a, b) = (DrawableId::for_tests(1), DrawableId::for_tests(2));
+        c.insert(a, 3, (0, 0), RED);
+        assert_eq!(
+            c.get(b, 3, (0, 0)),
+            None,
+            "a different drawable at the same version must not hit"
+        );
+        c.insert(b, 3, (0, 0), BLUE);
+        assert_eq!(c.get(a, 3, (0, 0)), Some(RED));
+        assert_eq!(c.get(b, 3, (0, 0)), Some(BLUE));
+    }
+
+    /// One backing can legitimately be sampled at several content
+    /// offsets at the same version — a redirected window's 1x1 content
+    /// domain inside a larger allocation. Those are different pixels.
+    #[test]
+    fn two_offsets_into_one_backing_do_not_share_an_entry() {
+        let mut c = UniformGlyphSourceCache::new(8);
+        let id = DrawableId::for_tests(1);
+        c.insert(id, 7, (0, 0), RED);
+        assert_eq!(
+            c.get(id, 7, (4, 2)),
+            None,
+            "a different sampled offset must not hit"
+        );
+        c.insert(id, 7, (4, 2), BLUE);
+        assert_eq!(c.get(id, 7, (0, 0)), Some(RED));
+        assert_eq!(c.get(id, 7, (4, 2)), Some(BLUE));
+    }
+
+    /// Only one version of a given `(id, offset)` is ever live, so a
+    /// repaint REPLACES its predecessor rather than stranding it. A map
+    /// keyed on the monotonically increasing version would leave a dead
+    /// entry per repaint — a leak, and Java's recolour-per-string
+    /// pattern produces it fastest.
+    #[test]
+    fn a_repaint_replaces_rather_than_accumulates() {
+        let mut c = UniformGlyphSourceCache::new(8);
+        let id = DrawableId::for_tests(1);
+        for v in 1..=100 {
+            c.insert(id, v, (0, 0), RED);
+        }
+        assert_eq!(c.len(), 1, "100 repaints must leave one entry");
+    }
+
+    #[test]
+    fn bounded_lru_evicts_least_recently_used() {
+        let mut c = UniformGlyphSourceCache::new(2);
+        let (a, b, d) = (
+            DrawableId::for_tests(1),
+            DrawableId::for_tests(2),
+            DrawableId::for_tests(3),
+        );
+        c.insert(a, 1, (0, 0), RED);
+        c.insert(b, 1, (0, 0), BLUE);
+        // Touch `a` so `b` becomes the LRU victim.
+        assert_eq!(c.get(a, 1, (0, 0)), Some(RED));
+        c.insert(d, 1, (0, 0), RED);
+        assert_eq!(c.len(), 2, "cap enforced");
+        assert_eq!(c.get(b, 1, (0, 0)), None, "LRU entry b evicted");
+        assert_eq!(c.get(a, 1, (0, 0)), Some(RED), "recently-used a survives");
+        assert_eq!(c.get(d, 1, (0, 0)), Some(RED), "newest d survives");
     }
 }
