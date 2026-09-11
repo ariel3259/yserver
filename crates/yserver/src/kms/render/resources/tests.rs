@@ -439,30 +439,49 @@ fn c0_2ci_drm_cleanup_fake_family_barrier_requires_all_closed() {
 
     registry.init_fake_family();
     registry.add_fake_alias();
-    registry.register_payload_alias();
+
+    // No payload alias is ever registered in this test, so the discharge
+    // callback must never run.
+    let no_payload_alias = |_: &mut DrmCleanupRegistry, _: AllocationKey| -> std::io::Result<()> {
+        panic!("no payload alias registered; discharge must not be invoked")
+    };
 
     // Fails because control is still open
-    assert!(registry.try_mint_file_family_closed().is_err());
+    assert!(
+        registry
+            .try_mint_file_family_closed(no_payload_alias)
+            .is_err()
+    );
     registry.close_fake_control();
 
     // Fails because helper is not reaped
-    assert!(registry.try_mint_file_family_closed().is_err());
+    assert!(
+        registry
+            .try_mint_file_family_closed(no_payload_alias)
+            .is_err()
+    );
     registry.reap_fake_helper();
 
     // Fails because fake alias is still open
-    assert!(registry.try_mint_file_family_closed().is_err());
+    assert!(
+        registry
+            .try_mint_file_family_closed(no_payload_alias)
+            .is_err()
+    );
     registry.remove_fake_alias();
 
-    // Fails because payload alias is still open
-    assert!(registry.try_mint_file_family_closed().is_err());
-    registry.unregister_payload_alias();
-
-    // Now succeeds
-    let proof = registry.try_mint_file_family_closed().unwrap();
+    // Now succeeds: no payload alias was ever outstanding
+    let proof = registry
+        .try_mint_file_family_closed(no_payload_alias)
+        .unwrap();
     assert!(registry.is_family_closed());
 
     // Cannot mint twice
-    assert!(registry.try_mint_file_family_closed().is_err());
+    assert!(
+        registry
+            .try_mint_file_family_closed(no_payload_alias)
+            .is_err()
+    );
 
     // Consuming right after closure fails closed
     let right = registry.register_right(40, 41, GemOwner::Right);
@@ -470,7 +489,7 @@ fn c0_2ci_drm_cleanup_fake_family_barrier_requires_all_closed() {
     assert!(calls.borrow().is_empty());
 
     // Test retirement with valid proof
-    registry.retire_closed_family(proof);
+    registry.retire_closed_family(proof).unwrap();
     assert!(registry.is_family_closed());
 }
 
@@ -505,57 +524,89 @@ fn c0_2ci_drm_cleanup_shared_gpu_dependency_persists_after_file_rights_discharge
 }
 
 #[test]
-fn c0_2ci_drm_cleanup_round3_b1_counted_alias_real_device_barrier() {
+fn c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias() {
     use crate::drm::Device;
+    use std::num::NonZeroU32;
 
-    let device = Rc::new(Device::for_tests().unwrap());
-    let weak = Rc::downgrade(&device);
-    let calls = Rc::new(RefCell::new(Vec::new()));
-    let io = MockCleanupIo::new(Rc::clone(&calls));
     let device_key = DrmDeviceKey {
         major: 226,
         minor: 0,
     };
     let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
 
-    let mut registry = DrmCleanupRegistry::new_with_device_and_io(
-        Rc::clone(&device),
-        device_key,
-        incarnation,
-        Box::new(io),
+    let device = Rc::new(Device::for_tests().unwrap());
+    let weak = Rc::downgrade(&device);
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(Rc::clone(&calls));
+    let mut registry = DrmCleanupRegistry::new_with_io(device_key, incarnation, Box::new(io));
+
+    let right = registry.register_right(60, 61, GemOwner::Right);
+    let payload = DirectFramebufferAllocation::new(
+        right,
+        None,
+        drm::control::framebuffer::Handle::from(NonZeroU32::new(60).unwrap()),
+        drm::buffer::Handle::from(NonZeroU32::new(61).unwrap()),
+        GemOwner::Right,
+        Some(Rc::clone(&device)),
     );
+    let held = service
+        .adopt(AllocationPayload::DirectFramebuffer(payload))
+        .unwrap();
+    let key = held.key();
+    registry.register_payload_alias(key);
 
-    // Payload owns a counted alias
-    let payload_device_alias = Rc::clone(&device);
-    registry.register_payload_alias();
-
-    // External control alias
-    let control_alias = Rc::clone(&device);
-
-    // Drop fixture handle so only control, payload, and registry hold references
+    // The fixture's own handle is dropped; only the payload's alias remains.
     drop(device);
 
-    // While external control alias exists, barrier cannot be minted
-    assert!(registry.try_mint_file_family_closed().is_err());
+    // The barrier is mintable *while the payload still holds its alias*
+    // (R5) — the registry does not wait for it to drop, it discharges it.
+    let proof = registry
+        .try_mint_file_family_closed(|registry, discharge_key| {
+            assert_eq!(discharge_key, key);
+            let entry = service.entries.get(&discharge_key).expect("entry present");
+            let mut payload = entry.payload.borrow_mut();
+            match payload.as_mut() {
+                Some(AllocationPayload::DirectFramebuffer(alloc)) => {
+                    alloc.discharge_file_owned(registry)
+                }
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
 
-    // Detach control alias
-    drop(control_alias);
-
-    // While payload alias exists, barrier cannot be minted
-    assert!(registry.try_mint_file_family_closed().is_err());
-
-    // Discharging payload drops the alias and unregisters
-    drop(payload_device_alias);
-    registry.unregister_payload_alias();
-
-    // Now barrier is mintable! Registry performs the description's last close
-    let proof = registry.try_mint_file_family_closed().unwrap();
     assert!(registry.is_family_closed());
-    // Weak reference confirms description's last close was performed by the registry
-    assert!(weak.upgrade().is_none());
-    assert!(calls.borrow().is_empty());
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(60), CleanupCall::CloseGem(61)]
+    );
 
-    registry.retire_closed_family(proof);
+    {
+        let entry = service.entries.get(&key).unwrap();
+        let payload = entry.payload.borrow();
+        match payload.as_ref() {
+            Some(AllocationPayload::DirectFramebuffer(alloc)) => {
+                assert!(
+                    alloc.right().is_none(),
+                    "file-owned right must be discharged by the barrier"
+                );
+                assert!(
+                    alloc.device.is_none(),
+                    "device alias must be dropped by the barrier discharge"
+                );
+            }
+            other => panic!("expected DirectFramebuffer payload, got {other:?}"),
+        }
+    }
+
+    // The registry closed the description's last alias itself.
+    assert!(weak.upgrade().is_none());
+
+    // No ioctl follows the mint.
+    let calls_before_retire = calls.borrow().len();
+    registry.retire_closed_family(proof).unwrap();
+    assert_eq!(calls.borrow().len(), calls_before_retire);
 }
 
 #[test]

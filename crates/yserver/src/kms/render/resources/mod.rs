@@ -35,10 +35,13 @@ pub(crate) use capacity::{DirectCapacity, DirectRole, RoleReservation, RoleState
 pub use commit::{CommitResourceConsumer, CommitResources, GroupMember, PresentRelease};
 #[allow(unused_imports)]
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use drm_cleanup::FakeFamilyInventory;
 #[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
     CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
-    FakeFamilyInventory, FileFamilyClosed, GemOwner, RightState,
+    FileFamilyClosed, GemOwner, RightState,
 };
 #[allow(unused_imports)]
 pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation, ValidatedGpuBatch};
@@ -387,7 +390,9 @@ impl ResourceService {
         Ok(())
     }
 
-    pub(crate) fn apply_validated_proof(
+    /// Private to `resources`: producers must correlate real evidence before
+    /// calling this (vocabulary, Task 1); it is not a public `complete` API.
+    pub(in crate::kms::render::resources) fn apply_validated_proof(
         &mut self,
         key: AllocationKey,
         obligation: ObligationId,
@@ -404,6 +409,18 @@ impl ResourceService {
         drop(avail);
         self.dirty_entries.borrow_mut().insert(key);
         Ok(())
+    }
+
+    /// Shim for `store.rs`'s tests, which live outside `resources` and drive
+    /// proof application directly to control ordering. Production code must
+    /// go through a producer adapter, never this.
+    #[cfg(test)]
+    pub(crate) fn apply_validated_proof_for_tests(
+        &mut self,
+        key: AllocationKey,
+        obligation: ObligationId,
+    ) -> Result<(), ResourceError> {
+        self.apply_validated_proof(key, obligation)
     }
 
     pub(crate) fn register_kms(
