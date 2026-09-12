@@ -14,7 +14,7 @@ use super::{
     ResourceService, RetainingSupervisor, UseKind,
     gpu::GpuObligation,
     storage::StorageBacking,
-    tests::{MockCleanupIo, spy_service},
+    tests::{CleanupCall, MockCleanupIo, spy_service},
 };
 use crate::kms::{
     owner::{
@@ -636,6 +636,18 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
         .register_managed_scanout_bo(&mut service, &mut registry, 0, 0)
         .expect("register managed scanout bo");
 
+    // F2-B1: the pool slot must root the Retain lease, not a bare key --
+    // otherwise the entry has zero live uses right after registration, is
+    // already dirty (the dropped lease marked it), and the very next tick
+    // discharges and destroys it while the pool slot still lists the husk
+    // as managed and possibly scanning out.
+    service.service_ready_with_registry(&mut registry);
+    assert!(
+        service.contains(&display_key),
+        "F2-B1: a freshly registered managed bo must not be swept by the next tick"
+    );
+    assert!(calls.borrow().is_empty());
+
     let output = CrtcKey::for_output(&platform.outputs[0]);
     let token = platform
         .acquire_managed_scanout_bo(&mut service, output)
@@ -646,6 +658,10 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
     // legacy acquire_scanout_bo can no longer hand out the same slot while
     // this managed token is live.
     assert!(platform.acquire_scanout_bo(0).is_none());
+
+    // Done proving the token itself; drop its Write-kind lease so it is not
+    // an extra live use blocking the destroy proof below.
+    drop(token);
 
     // 4.5: cancel_scanout_bo_recording ends recording but not in-flight
     // work -- a registered GPU obligation on the managed key survives it.
@@ -671,7 +687,21 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
         .unwrap()
         .detach_managed_entries();
     match platform.scanout_pools[0].as_ref().unwrap() {
-        OutputScanout::Shared(p) => assert_eq!(p.bos[0].managed_key, None),
+        OutputScanout::Shared(p) => assert_eq!(p.bos[0].managed_key(), None),
         OutputScanout::Copied(_) => panic!("expected Shared pool"),
     }
+
+    // F2-B1: detach is what actually drops the lease -- only *now* does the
+    // entry become destroyable, discharging the still-outstanding GPU
+    // obligation notwithstanding (F2-B1's test asks for the right's GEM
+    // disposition; the still-pending GPU obligation from the cancel step
+    // above additionally proves detach alone does not bypass ordinary
+    // availability gating).
+    service.apply_validated_proof(display_key, gpu_ob).unwrap();
+    service.service_ready_with_registry(&mut registry);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(9001), CleanupCall::CloseGem(9002)]
+    );
+    assert!(!service.contains(&display_key));
 }

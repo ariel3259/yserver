@@ -628,11 +628,12 @@ fn c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias() {
         GemOwner::Right,
         Some(Rc::clone(&device)),
     );
+    // F2-M1: adopt refuses a file-owned payload directly; adopt_with_registry
+    // is the only path, and it registers the alias itself.
     let held = service
-        .adopt(AllocationPayload::DirectFramebuffer(payload))
+        .adopt_with_registry(AllocationPayload::DirectFramebuffer(payload), &mut registry)
         .unwrap();
     let key = held.key();
-    registry.register_payload_alias(key);
 
     // Only the registry's own alias and the payload's alias remain.
     drop(device);
@@ -726,11 +727,12 @@ fn c0_2ci_drm_cleanup_fd_family_barrier_discharge_failure_retries() {
         GemOwner::Right,
         Some(device),
     );
+    // F2-M1: adopt refuses a file-owned payload directly; adopt_with_registry
+    // is the only path, and it registers the alias itself.
     let held = service
-        .adopt(AllocationPayload::DirectFramebuffer(payload))
+        .adopt_with_registry(AllocationPayload::DirectFramebuffer(payload), &mut registry)
         .unwrap();
     let key = held.key();
-    registry.register_payload_alias(key);
 
     let discharge = |registry: &mut DrmCleanupRegistry, discharge_key: AllocationKey| {
         let entry = service.entries.get(&discharge_key).expect("entry present");
@@ -1057,7 +1059,10 @@ fn c0_2ci_scanout_discharging_file_owned_leaves_shared_intact() {
     let alloc = ScanoutAllocation::new(Some(fo), shared);
 
     let mut service = ResourceService::new(device_key, IncarnationId::first());
-    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    // F2-M1: adopt refuses a file-owned payload directly.
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
     let key = held.key();
 
     // A pending GPU obligation belongs to the *shared* half (R4): it is
@@ -1313,12 +1318,18 @@ fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
 
     let calls = Rc::new(RefCell::new(Vec::new()));
     let io = MockCleanupIo::new(Rc::clone(&calls));
-    // No registry-held device alias (`new_with_io`): the payload's own
-    // clone is the description's only other holder, so the ordering this
-    // test cares about -- gbm_bo's real GEM_CLOSE must run while the fd is
-    // still open, i.e. before the device alias drops -- is load-bearing,
-    // not merely asserted after the fact.
-    let mut registry = DrmCleanupRegistry::new_with_io(device_key, incarnation, Box::new(io));
+    // F2-M3: the registry holds its own alias too (`new_with_device_and_io`),
+    // distinct from the payload's -- a device-less registry cannot show
+    // that the *registry* performs the description's last close (step 3);
+    // it would only show that the payload's own discharge happened to be
+    // the last one, which is the reverse of what R5 step 3 requires (this
+    // is F1-M1's exact mistake, repeated here in the real-GBM case).
+    let mut registry = DrmCleanupRegistry::new_with_device_and_io(
+        Rc::clone(&device),
+        device_key,
+        incarnation,
+        Box::new(io),
+    );
     registry.detach_fake_submitters();
     registry.reap_fake_helper();
     registry.close_fake_control();
@@ -1333,13 +1344,14 @@ fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
         None,
     );
     let alloc = ScanoutAllocation::new(Some(fo), shared);
-    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
     let key = held.key();
-    registry.register_payload_alias(key);
 
     // `gbm_device` was only ever a factory for `gbm_bo`; it holds its own
     // alias and must go, same as the test's original `device` binding, so
-    // the payload's clone is the only one left.
+    // only the registry's own alias and the payload's alias remain.
     drop(gbm_device);
     drop(device);
 
@@ -1351,12 +1363,20 @@ fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
             assert_eq!(discharge_key, key);
             let entry = service.entries.get(&discharge_key).expect("entry present");
             let mut payload = entry.payload.borrow_mut();
-            match payload.as_mut() {
-                Some(AllocationPayload::Scanout(alloc)) => {
-                    alloc.discharge_file_owned(registry).map_err(|(err, _)| err)
-                }
+            let result = match payload.as_mut() {
+                Some(AllocationPayload::Scanout(alloc)) => alloc.discharge_file_owned(registry),
                 _ => Ok(()),
-            }
+            };
+            // Step 2 (discharging the payload's alias -- the real gbm_bo's
+            // GEM_CLOSE) is not step 3 (the registry's own last close): the
+            // registry still holds its own alias right here, so the
+            // description is not yet closed. With the registry holding no
+            // alias of its own, this assertion would be checking a no-op.
+            assert!(
+                weak.upgrade().is_some(),
+                "the payload's own discharge must not be the description's last close"
+            );
+            result
         })
         .unwrap();
 
@@ -1365,13 +1385,61 @@ fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
     // right itself issues; the real gbm_bo's own drop (already run, inside
     // `discharge_file_owned` above) was the sole GEM closer.
     assert_eq!(calls.borrow().as_slice(), &[CleanupCall::RemoveFb(9101)]);
+    // F2-B2: the alias is unregistered once discharged through the barrier
+    // -- the same bookkeeping the normal path (service_ready_with_registry)
+    // performs, so a later teardown never hands this key to a callback with
+    // nothing left to look up.
+    assert_eq!(registry.payload_aliases(), 0);
 
-    // The registry performed the description's last close.
+    // Only now -- after the mint itself performs step 3 -- is the
+    // description's last alias (the registry's own) closed.
     assert!(weak.upgrade().is_none());
 
     let calls_before_retire = calls.borrow().len();
     registry.retire_closed_family(proof).unwrap();
     assert_eq!(calls.borrow().len(), calls_before_retire);
+}
+
+#[test]
+fn c0_2ci_release_fresh_adoption_reclaims_untouched_lease() {
+    // F2-M2: register_managed_scanout_bo's all-or-nothing rollback needs a
+    // way to un-adopt a payload it adopted moments ago when a paired
+    // adoption fails afterward.
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let payload = match service.release_fresh_adoption(held) {
+        Ok(payload @ AllocationPayload::Spy(_)) => payload,
+        other => panic!("expected the Spy payload back, got {other:?}"),
+    };
+    assert!(!service.contains(&key));
+    assert_eq!(
+        drops.get(),
+        0,
+        "release_fresh_adoption hands the payload back; it must not drop it"
+    );
+    drop(payload);
+    assert_eq!(
+        drops.get(),
+        1,
+        "the caller's own drop is what finally runs it"
+    );
+}
+
+#[test]
+fn c0_2ci_release_fresh_adoption_refuses_when_something_else_is_using_it() {
+    let (mut service, held, _drops) = spy_service();
+    let key = held.key();
+    let _extra_use = service.reserve(key, UseKind::Read).unwrap();
+    match service.release_fresh_adoption(held) {
+        Err(_lease) => {}
+        Ok(payload) => {
+            panic!("must not hard-reclaim while something else uses the entry, got {payload:?}")
+        }
+    }
+    assert!(
+        service.contains(&key),
+        "the lease was handed back, not consumed; the entry must still be there"
+    );
 }
 
 #[test]
@@ -1474,6 +1542,179 @@ fn c0_2ci_scanout_service_ready_with_registry_discharges_before_destroy() {
         &[CleanupCall::RemoveFb(92), CleanupCall::CloseGem(93)]
     );
     assert!(!service.contains(&key));
+    // F2-B2: the alias must be unregistered on successful discharge -- a
+    // stale key here is exactly what makes the fd-family barrier walk
+    // hand a since-destroyed key to the discharge callback at teardown.
+    assert_eq!(registry.payload_aliases(), 0);
+}
+
+#[test]
+fn c0_2ci_scanout_service_ready_with_registry_unregisters_only_the_discharged_alias() {
+    // F2-B2: releasing one payload normally must not disturb a second,
+    // still-outstanding payload's alias -- the barrier walk later must
+    // invoke its discharge callback exactly once, for that second key only.
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        device_key,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::clone(&calls))),
+    );
+    registry.detach_fake_submitters();
+    registry.reap_fake_helper();
+    registry.close_fake_control();
+
+    let make_alloc = |fb: u32, gem: u32| {
+        let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+        let right = DrmCleanupRight::new(device_key, incarnation, fb, gem, GemOwner::Right);
+        let fo = FileOwnedBacking::new(right, None, device).unwrap();
+        let shared = SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        );
+        ScanoutAllocation::new(Some(fo), shared)
+    };
+
+    let released_alloc = make_alloc(96, 97);
+    let released_held = service
+        .adopt_with_registry(AllocationPayload::Scanout(released_alloc), &mut registry)
+        .unwrap();
+
+    let outstanding_alloc = make_alloc(98, 99);
+    let outstanding_held = service
+        .adopt_with_registry(AllocationPayload::Scanout(outstanding_alloc), &mut registry)
+        .unwrap();
+    let outstanding_key = outstanding_held.key();
+    // Kept alive (not dropped): a live Retain lease is what makes this
+    // payload genuinely still outstanding when the first payload releases,
+    // rather than both becoming destroyable on the same tick.
+
+    // Release the first payload normally.
+    drop(released_held);
+    service.service_ready_with_registry(&mut registry);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(96), CleanupCall::CloseGem(97)]
+    );
+    assert_eq!(registry.payload_aliases(), 1);
+
+    // Now mint the barrier: the callback must run exactly once, for the
+    // still-outstanding key only.
+    let discharge_count = Rc::new(Cell::new(0));
+    let proof = registry
+        .try_mint_file_family_closed(|registry, discharge_key| {
+            assert_eq!(discharge_key, outstanding_key);
+            discharge_count.set(discharge_count.get() + 1);
+            let entry = service.entries.get(&discharge_key).expect("entry present");
+            let mut payload = entry.payload.borrow_mut();
+            match payload.as_mut() {
+                Some(AllocationPayload::Scanout(alloc)) => alloc.discharge_file_owned(registry),
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+    assert_eq!(discharge_count.get(), 1);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[
+            CleanupCall::RemoveFb(96),
+            CleanupCall::CloseGem(97),
+            CleanupCall::RemoveFb(98),
+            CleanupCall::CloseGem(99),
+        ]
+    );
+    registry.retire_closed_family(proof).unwrap();
+}
+
+#[test]
+fn c0_2ci_scanout_service_ready_with_registry_retries_failed_discharge() {
+    // F2-B3: a failed discharge must keep the backing in `file_owned`, not
+    // reinstall it and immediately take it right back out into the `Err`
+    // (which left `file_owned` `None` after a *failed* discharge, so the
+    // right at `FramebufferRemoved`, the device alias and, for `Gbm`, the
+    // gbm_bo were silently dropped on the very next tick).
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(Rc::clone(&calls));
+    io.fail_gem.set(true);
+    let mut registry =
+        DrmCleanupRegistry::new_with_io(device_key, incarnation, Box::new(io.clone()));
+
+    let right = DrmCleanupRight::new(device_key, incarnation, 100, 101, GemOwner::Right);
+    let fo = FileOwnedBacking::new(right, None, device).unwrap();
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let alloc = ScanoutAllocation::new(Some(fo), shared);
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
+    let key = held.key();
+    drop(held);
+
+    // First tick: discharge fails at close_gem. The entry must survive with
+    // its file-owned half intact, retryable from FramebufferRemoved.
+    service.service_ready_with_registry(&mut registry);
+    assert!(
+        service.contains(&key),
+        "entry must survive a failed discharge, not be dropped undischarged"
+    );
+    {
+        let entry = service.entries.get(&key).unwrap();
+        let payload = entry.payload.borrow();
+        match payload.as_ref() {
+            Some(AllocationPayload::Scanout(alloc)) => {
+                let fo = alloc
+                    .file_owned()
+                    .expect("file_owned must survive a failed discharge");
+                assert_eq!(fo.right().state(), RightState::FramebufferRemoved);
+            }
+            other => panic!("expected Scanout payload, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(100), CleanupCall::CloseGem(101)]
+    );
+    assert_eq!(
+        registry.payload_aliases(),
+        1,
+        "alias must not be unregistered on a failed discharge"
+    );
+
+    // Clear the failure and retry: RMFB is not re-issued, only CloseGem is
+    // retried, and the entry is now destroyed.
+    io.fail_gem.set(false);
+    service.service_ready_with_registry(&mut registry);
+    assert!(!service.contains(&key));
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[
+            CleanupCall::RemoveFb(100),
+            CleanupCall::CloseGem(101),
+            CleanupCall::CloseGem(101),
+        ]
+    );
+    assert_eq!(registry.payload_aliases(), 0);
 }
 
 #[test]
@@ -1485,6 +1726,11 @@ fn c0_2ci_scanout_apply_teardown_release_refuses_live_file_owned() {
     };
     let incarnation = IncarnationId::first();
     let mut service = ResourceService::new(device_key, incarnation);
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        device_key,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::new(RefCell::new(Vec::new())))),
+    );
 
     let right = DrmCleanupRight::new(device_key, incarnation, 94, 95, GemOwner::Right);
     let fo = FileOwnedBacking::new(right, None, device).unwrap();
@@ -1496,7 +1742,10 @@ fn c0_2ci_scanout_apply_teardown_release_refuses_live_file_owned() {
         None,
     );
     let alloc = ScanoutAllocation::new(Some(fo), shared);
-    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    // F2-M1: adopt refuses a file-owned payload directly.
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
     let key = held.key();
 
     let crtc = CrtcKey::new(

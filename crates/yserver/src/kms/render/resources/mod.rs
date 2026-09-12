@@ -77,6 +77,49 @@ pub(crate) enum AllocationPayload {
     Unused(std::convert::Infallible),
 }
 
+impl AllocationPayload {
+    /// True when this payload still holds a counted alias of the DRM open
+    /// file description that must go through the registry -- a real
+    /// barrier discharge or the normal per-payload path -- rather than an
+    /// ordinary Rust `Drop` (F2-M1): `Scanout` with `file_owned: Some`, or
+    /// `DirectFramebuffer` with its right/device not yet discharged. Every
+    /// payload kind that can carry this alias must be listed here; `adopt`,
+    /// `service_ready`/`service_ready_with_registry` and
+    /// `apply_teardown_release` all key off this one method so a new kind
+    /// cannot silently reopen the hole "additive" left for
+    /// `DirectFramebuffer` the first time (F2-M1).
+    pub(crate) fn file_owned_alias_present(&self) -> bool {
+        match self {
+            AllocationPayload::Scanout(alloc) => alloc.file_owned().is_some(),
+            AllocationPayload::DirectFramebuffer(alloc) => {
+                alloc.right().is_some() || alloc.device.is_some()
+            }
+            #[cfg(test)]
+            AllocationPayload::Spy(_) => false,
+            AllocationPayload::Storage(_) | AllocationPayload::CopiedSource(_) => false,
+            AllocationPayload::Unused(never) => match *never {},
+        }
+    }
+
+    /// Discharges the file-owned half through `registry`, for whichever
+    /// payload kind carries one; a no-op `Ok(())` for the rest. The single
+    /// dispatch point `service_ready_with_registry` calls, so a new
+    /// file-owned-carrying kind only needs its arm added here.
+    pub(crate) fn discharge_file_owned(
+        &mut self,
+        registry: &mut DrmCleanupRegistry,
+    ) -> Result<(), std::io::Error> {
+        match self {
+            AllocationPayload::Scanout(alloc) => alloc.discharge_file_owned(registry),
+            AllocationPayload::DirectFramebuffer(alloc) => alloc.discharge_file_owned(registry),
+            #[cfg(test)]
+            AllocationPayload::Spy(_) => Ok(()),
+            AllocationPayload::Storage(_) | AllocationPayload::CopiedSource(_) => Ok(()),
+            AllocationPayload::Unused(never) => match *never {},
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ResourceService {
@@ -225,8 +268,25 @@ impl ResourceService {
         poll_result.map(|_| available_keys)
     }
 
+    /// Refuses (F2-M1) any payload whose file-owned half is still live --
+    /// `Scanout` with `file_owned: Some`, or `DirectFramebuffer` with its
+    /// right/device not yet discharged -- since a plain `adopt` never
+    /// registers the alias with a registry, and this crate has no `Drop`
+    /// that would otherwise close it (M-23's whole point). Such a payload
+    /// must go through `adopt_with_registry`.
     #[allow(clippy::result_large_err)]
     pub(crate) fn adopt(
+        &mut self,
+        payload: AllocationPayload,
+    ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
+        if payload.file_owned_alias_present() {
+            return Err((ResourceError::InvalidState, payload));
+        }
+        self.adopt_unchecked(payload)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn adopt_unchecked(
         &mut self,
         payload: AllocationPayload,
     ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
@@ -279,28 +339,58 @@ impl ResourceService {
         ))
     }
 
-    /// Like `adopt`, but for a payload that may carry a counted alias of the
-    /// DRM open file description (a `Scanout` payload with
-    /// `file_owned: Some`): registers that alias with `registry` so the
+    /// The only way to adopt a payload whose file-owned half is live (`adopt`
+    /// refuses those, F2-M1): registers the alias with `registry` so the
     /// fd-family barrier can discharge it instead of waiting on it (R5,
-    /// B-2). Additive rather than a change to `adopt`'s signature, so
-    /// Tasks 1-3's `adopt(payload)` call sites -- which never carry a
-    /// file-owned alias -- are untouched.
+    /// B-2). Covers every payload kind `file_owned_alias_present` does, not
+    /// just `Scanout` (F2-M1) -- `DirectFramebuffer` carries the same kind
+    /// of alias and had the same hole open beside the original fix.
     #[allow(clippy::result_large_err)]
     pub(crate) fn adopt_with_registry(
         &mut self,
         payload: AllocationPayload,
         registry: &mut DrmCleanupRegistry,
     ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
-        let carries_file_owned_alias = matches!(
-            &payload,
-            AllocationPayload::Scanout(alloc) if alloc.file_owned().is_some()
-        );
-        let lease = self.adopt(payload)?;
+        let carries_file_owned_alias = payload.file_owned_alias_present();
+        let lease = self.adopt_unchecked(payload)?;
         if carries_file_owned_alias {
             registry.register_payload_alias(lease.key());
         }
         Ok(lease)
+    }
+
+    /// Reclaims a payload adopted moments ago, for an all-or-nothing
+    /// multi-payload adoption that must unwind when a later step fails
+    /// (F2-M2). Only succeeds if the lease is still the entry's sole use
+    /// and nothing has registered an obligation on it since; otherwise
+    /// something else is already relying on it, it is too late to safely
+    /// hard-reclaim, and the lease is handed back so the caller's ordinary
+    /// `drop` releases it through the normal lifecycle instead.
+    pub(crate) fn release_fresh_adoption(
+        &mut self,
+        lease: AllocationLease,
+    ) -> Result<AllocationPayload, AllocationLease> {
+        let key = lease.key();
+        let reclaimable = self.entries.get(&key).is_some_and(|entry| {
+            entry.live_use_count() == 1 && entry.pending_obligation_count() == 0
+        });
+        if !reclaimable {
+            return Err(lease);
+        }
+        drop(lease);
+        Ok(self
+            .entries
+            .remove(&key)
+            .and_then(|entry| entry.take_payload())
+            .expect("just-adopted entry with its sole retain use just removed has a payload"))
+    }
+
+    /// Whether `adopt`/`adopt_with_registry` would refuse for exhaustion
+    /// right now (F2-M2): lets a multi-step caller check admission before
+    /// extracting physical resources it would otherwise have nowhere to
+    /// put back cheaply.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 
     pub(crate) fn reserve(
@@ -533,9 +623,14 @@ impl ResourceService {
             // underneath it is a separate proof (the fd-family barrier's own
             // discharge, or ordinary release) that this proof does not
             // stand in for -- letting it through here is the mechanism
-            // behind B-2's ioctl-after-barrier.
-            if let Some(AllocationPayload::Scanout(alloc)) = entry.payload.borrow().as_ref()
-                && alloc.file_owned().is_some()
+            // behind B-2's ioctl-after-barrier. Checked via the same
+            // dispatcher `adopt`/`service_ready_with_registry` use (F2-M1),
+            // so it covers `DirectFramebuffer` too, not only `Scanout`.
+            if entry
+                .payload
+                .borrow()
+                .as_ref()
+                .is_some_and(AllocationPayload::file_owned_alias_present)
             {
                 return Err(ResourceError::InvalidProof);
             }
@@ -584,6 +679,21 @@ impl ResourceService {
         for key in dirty_keys {
             if let Some(entry) = self.entries.get(&key) {
                 if can_destroy(entry) {
+                    // F2-M1: this path has no registry to discharge a live
+                    // file-owned half through, so destroying the entry here
+                    // would be exactly the undischarged drop B-2 closed for
+                    // `service_ready_with_registry`. Re-dirty instead and
+                    // wait for that call.
+                    if entry
+                        .payload
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(AllocationPayload::file_owned_alias_present)
+                    {
+                        self.dirty_entries.borrow_mut().insert(key);
+                        transitions.push(key);
+                        continue;
+                    }
                     if let Some(removed) = self.entries.remove(&key) {
                         removed.take_payload();
                     }
@@ -596,14 +706,16 @@ impl ResourceService {
         transitions
     }
 
-    /// Like `service_ready`, but discharges a `Scanout` payload's file-owned
-    /// half through `registry` before dropping it (B-2): neither
-    /// `ScanoutAllocation` nor `FileOwnedBacking` has a `Drop` that closes
-    /// the DRM framebuffer/GEM handle, so an ordinary `service_ready` drop
-    /// of a still-`Some` `file_owned` is a silent leak, not a release. This
-    /// is the normal-path counterpart to the Task-9 barrier discharge: KMS
-    /// proof arrived, so the entry is destroyable, and the right closes here
-    /// rather than through the barrier.
+    /// Like `service_ready`, but discharges a payload's file-owned half
+    /// through `registry` before dropping it (B-2): neither
+    /// `ScanoutAllocation`/`FileOwnedBacking` nor `DirectFramebufferAllocation`
+    /// has a `Drop` that closes the DRM framebuffer/GEM handle, so an
+    /// ordinary `service_ready` drop of a still-live file-owned half is a
+    /// silent leak, not a release. This is the normal-path counterpart to
+    /// the Task-9 barrier discharge: KMS proof arrived, so the entry is
+    /// destroyable, and the right closes here rather than through the
+    /// barrier. Dispatches through `AllocationPayload::discharge_file_owned`
+    /// (F2-M1), so it covers every kind `file_owned_alias_present` does.
     pub(crate) fn service_ready_with_registry(
         &mut self,
         registry: &mut DrmCleanupRegistry,
@@ -617,14 +729,16 @@ impl ResourceService {
                     let discharge_result = {
                         let mut payload = entry.payload.borrow_mut();
                         match payload.as_mut() {
-                            Some(AllocationPayload::Scanout(alloc)) => {
-                                alloc.discharge_file_owned(registry)
-                            }
-                            _ => Ok(()),
+                            Some(p) => p.discharge_file_owned(registry),
+                            None => Ok(()),
                         }
                     };
                     match discharge_result {
                         Ok(()) => {
+                            // F2-B2: unregister before removing the entry --
+                            // a stale key here makes the barrier walk hand
+                            // it to a callback with nothing left to look up.
+                            registry.unregister_payload_alias(key);
                             if let Some(removed) = self.entries.remove(&key) {
                                 removed.take_payload();
                             }

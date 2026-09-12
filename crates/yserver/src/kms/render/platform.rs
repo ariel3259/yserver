@@ -5645,6 +5645,13 @@ impl PlatformBackend {
             AllocationPayload, CopiedSourceAllocation, ResourceError, ScanoutAllocation,
         };
 
+        // F2-M2: verify admission before extracting anything -- discovering
+        // Exhausted only after emptying the bo/src would leave husks with
+        // nowhere for their resources to go.
+        if service.is_exhausted() {
+            return Err(ResourceError::Exhausted);
+        }
+
         let scanout = self
             .scanout_pools
             .get_mut(output_idx)
@@ -5683,24 +5690,81 @@ impl PlatformBackend {
             .ok_or(ResourceError::InvalidState)?
             .take_physical_backing();
 
-        let renderer_key = match renderer_backing {
-            Some(backing) => {
-                let allocation = CopiedSourceAllocation::from_copied_render_source_backing(backing);
-                let lease = service
-                    .adopt(AllocationPayload::CopiedSource(allocation))
-                    .map_err(|(e, _)| e)?;
-                Some(lease.key())
+        // fb_handle/gem_handle presence was validated above, so the only
+        // error `from_scanout_bo_backing` can return cannot occur here.
+        let display_allocation =
+            ScanoutAllocation::from_scanout_bo_backing(display_backing, registry)
+                .expect("fb_handle/gem_handle presence was already validated above");
+        let renderer_allocation =
+            renderer_backing.map(CopiedSourceAllocation::from_copied_render_source_backing);
+
+        // F2-M2: display first, renderer second -- a display failure is
+        // cheap to undo (nothing else has happened yet); a renderer failure
+        // after display succeeded must undo the display adoption too, so
+        // the pair is genuinely all-or-nothing.
+        let display_lease = match service
+            .adopt_with_registry(AllocationPayload::Scanout(display_allocation), registry)
+        {
+            Ok(lease) => lease,
+            Err((error, AllocationPayload::Scanout(allocation))) => {
+                if let Some(renderer_allocation) = renderer_allocation {
+                    self.restore_renderer_backing(
+                        output_idx,
+                        bo_idx,
+                        renderer_allocation.into_copied_render_source_backing(),
+                    );
+                }
+                self.restore_display_backing(
+                    output_idx,
+                    bo_idx,
+                    allocation.into_scanout_bo_backing(),
+                );
+                return Err(error);
             }
+            Err((error, _)) => return Err(error), // unreachable: a Scanout payload was passed in
+        };
+
+        let renderer_lease = match renderer_allocation {
+            Some(allocation) => match service.adopt(AllocationPayload::CopiedSource(allocation)) {
+                Ok(lease) => Some(lease),
+                Err((error, AllocationPayload::CopiedSource(allocation))) => {
+                    self.restore_renderer_backing(
+                        output_idx,
+                        bo_idx,
+                        allocation.into_copied_render_source_backing(),
+                    );
+                    // All-or-nothing (F2-M2): undo the display adoption too.
+                    let display_key = display_lease.key();
+                    match service.release_fresh_adoption(display_lease) {
+                        Ok(AllocationPayload::Scanout(display_allocation)) => {
+                            registry.unregister_payload_alias(display_key);
+                            self.restore_display_backing(
+                                output_idx,
+                                bo_idx,
+                                display_allocation.into_scanout_bo_backing(),
+                            );
+                        }
+                        Ok(_) => unreachable!(
+                            "release_fresh_adoption returned a non-Scanout payload for a Scanout key"
+                        ),
+                        Err(_lease) => {
+                            // Something already touched it (shouldn't happen
+                            // synchronously, single-threaded); let it be
+                            // discharged normally through service_ready_with_registry
+                            // rather than force a restore that could race.
+                        }
+                    }
+                    return Err(error);
+                }
+                Err((error, _)) => return Err(error), // unreachable: a CopiedSource payload was passed in
+            },
             None => None,
         };
 
-        let allocation = ScanoutAllocation::from_scanout_bo_backing(display_backing, registry)?;
-        let display_lease = service
-            .adopt_with_registry(AllocationPayload::Scanout(allocation), registry)
-            .map_err(|(e, _)| e)?;
+        // Both halves adopted (or no renderer half needed): root the leases
+        // in the pool (F2-B1) so the entries stay alive until detach/drain
+        // drops them, not until the next tick finds zero live uses.
         let display_key = display_lease.key();
-        drop(display_lease);
-
         let scanout = self
             .scanout_pools
             .get_mut(output_idx)
@@ -5711,16 +5775,55 @@ impl PlatformBackend {
             .bos
             .get_mut(bo_idx)
             .ok_or(ResourceError::InvalidState)?
-            .set_managed_key(display_key);
-        if let Some(rkey) = renderer_key {
+            .set_managed(display_lease);
+        if let Some(renderer_lease) = renderer_lease {
             scanout
                 .copied_mut()
                 .and_then(|c| c.sources.get_mut(bo_idx))
                 .ok_or(ResourceError::InvalidState)?
-                .set_managed_key(rkey);
+                .set_managed(renderer_lease);
         }
 
         Ok(display_key)
+    }
+
+    /// F2-M2 rollback helper: restores a display bo's physical backing after
+    /// extraction but before (or instead of) a successful managed adoption.
+    /// Silently does nothing if the pool/index has meanwhile changed shape,
+    /// which cannot happen within `register_managed_scanout_bo`'s single
+    /// synchronous call but is defensive against future callers.
+    fn restore_display_backing(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        backing: crate::kms::vk::scanout::ScanoutBoBacking,
+    ) {
+        if let Some(scanout) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            && let Some(bo) = scanout.display_pool_mut().bos.get_mut(bo_idx)
+        {
+            bo.restore_physical_backing(backing);
+        }
+    }
+
+    /// See `restore_display_backing`.
+    fn restore_renderer_backing(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        backing: crate::kms::vk::scanout::CopiedRenderSourceBacking,
+    ) {
+        if let Some(src) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.copied_mut())
+            .and_then(|copied| copied.sources.get_mut(bo_idx))
+        {
+            src.restore_physical_backing(backing);
+        }
     }
 
     pub(crate) fn acquire_managed_scanout_bo(
@@ -5769,14 +5872,14 @@ impl PlatformBackend {
             .iter()
             .enumerate()
             .filter(|(_, bo)| bo.state.phase == BoPhase::Free)
-            .filter_map(|(bo_idx, bo)| bo.managed_key.map(|key| (bo_idx, key)))
+            .filter_map(|(bo_idx, bo)| bo.managed_key().map(|key| (bo_idx, key)))
             .collect();
 
         for (bo_idx, display_key) in candidates {
             let renderer_key = scanout
                 .copied()
                 .and_then(|c| c.sources.get(bo_idx))
-                .and_then(|s| s.managed_key);
+                .and_then(|s| s.managed_key());
 
             let display = match service.reserve(display_key, UseKind::Write) {
                 Ok(lease) => lease,
