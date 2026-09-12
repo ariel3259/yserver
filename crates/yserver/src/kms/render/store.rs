@@ -2790,9 +2790,8 @@ mod tests {
     fn c0_2ci_storage_no_premature_pool_return_vulkan() {
         let vk = match crate::kms::vk::device::VkContext::new() {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("skip: no Vk: {e}");
-                return;
+            Err(_) => {
+                panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
             }
         };
         let pool = Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
@@ -2870,9 +2869,8 @@ mod tests {
     fn c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan() {
         let vk = match crate::kms::vk::device::VkContext::new() {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("skip: no Vk: {e}");
-                return;
+            Err(_) => {
+                panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
             }
         };
         let mut platform = PlatformBackend::for_tests();
@@ -2982,9 +2980,8 @@ mod tests {
     fn c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan() {
         let vk = match crate::kms::vk::device::VkContext::new() {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("skip: no Vk: {e}");
-                return;
+            Err(_) => {
+                panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
             }
         };
         let platform = PlatformBackend::for_tests();
@@ -3294,9 +3291,8 @@ mod tests {
 
         let vk = match VkContext::new() {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("skip: no Vk: {e}");
-                return;
+            Err(_) => {
+                panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
             }
         };
         let mut platform = PlatformBackend::for_tests();
@@ -3306,8 +3302,7 @@ mod tests {
         let seed = match allocate_exportable(&vk, w, h, vk::Format::B8G8R8A8_UNORM) {
             Ok(img) => img,
             Err(e) if format!("{e:?}").contains("FORMAT_NOT_SUPPORTED") => {
-                eprintln!("skip: ICD cannot export dma-bufs (lavapipe on CI): {e:?}");
-                return;
+                panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
             }
             Err(e) => panic!("fixture: allocate_exportable: {e:?}"),
         };
