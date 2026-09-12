@@ -66,6 +66,10 @@ impl<R> Submitted<R> {
         held.extend(self.new);
         Quarantined { held }
     }
+
+    pub fn into_parts(self) -> (Vec<R>, Vec<R>) {
+        (self.old, self.new)
+    }
 }
 
 impl<R> Accepted<R> {

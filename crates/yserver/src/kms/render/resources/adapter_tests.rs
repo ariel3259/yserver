@@ -386,7 +386,6 @@ fn c0_2ci_adapter_rejection_accepted_skip_supersession() {
 
     let kms_ob = service.register_kms(old_key, commit, member).unwrap();
     let mut consumer = CommitResourceConsumer::new();
-    consumer.correlate_commit(commit, vec![member], vec![(old_key, kms_ob, member)]);
 
     let res = CommitResources::new(
         vec![old_lease],

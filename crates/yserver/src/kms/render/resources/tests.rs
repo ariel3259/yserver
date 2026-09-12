@@ -3184,7 +3184,6 @@ fn c0_2ci_commit_owner_integration_with_actual_leases() {
 
     let commit_id = CommitId::for_tests(1);
     let mut consumer = CommitResourceConsumer::new();
-    consumer.correlate_commit(commit_id, vec![member], vec![(old_key, old_kms, member)]);
 
     let old = CommitResources::new(
         vec![old_lease],
@@ -3270,7 +3269,6 @@ fn c0_2ci_commit_owner_integration_with_actual_leases() {
         owner.apply_host_call_event(event);
 
         let mut consumer = CommitResourceConsumer::new();
-        consumer.correlate_commit(commit, vec![member], vec![(old_key, old_kms, member)]);
 
         if order == 0 {
             // HardwareComplete before Presented
@@ -3353,36 +3351,63 @@ fn c0_2ci_commit_hardware_complete_discharges_old_only() {
     let member1 = GroupMember::new(crtc1, 1, 1);
     let member2 = GroupMember::new(crtc2, 1, 1);
 
-    // Register KMS release obligation on displaced buffers
-    let old_a_kms = service
-        .register(old_a_key, ObligationKind::KmsRelease)
-        .unwrap();
-    let old_b_kms = service
-        .register(old_b_key, ObligationKind::KmsRelease)
-        .unwrap();
-    // Register GPU obligation on old_a
-    let old_a_gpu = service.register(old_a_key, ObligationKind::Gpu).unwrap();
-    // Register KMS obligation on new_a (should never be discharged by this commit's HardwareComplete)
-    let new_a_kms = service
-        .register(new_a_key, ObligationKind::KmsRelease)
-        .unwrap();
-
     let commit_id = CommitId::for_tests(42);
-    let mut consumer = CommitResourceConsumer::new();
 
-    // Partial replacement commit: only member1 (crtc1) is included in the commit's membership!
-    // Both obligations are tracked, but member2 is not in the commit membership.
-    consumer.correlate_commit(
-        commit_id,
+    // Register KMS release obligations on old displaced buffers and on new buffer
+    let old_a_kms = service.register_kms(old_a_key, commit_id, member1).unwrap();
+    let old_b_kms = service.register_kms(old_b_key, commit_id, member2).unwrap();
+    let new_a_kms = service.register_kms(new_a_key, commit_id, member1).unwrap();
+
+    let old_res_a = CommitResources::new(
+        vec![old_a],
+        None,
+        None,
+        None,
         vec![member1],
-        vec![
-            (old_a_key, old_a_kms, member1),
-            (old_b_key, old_b_kms, member2),
-        ],
+        vec![(old_a_key, old_a_kms, member1)],
+    );
+    let old_res_b = CommitResources::new(
+        vec![old_b],
+        None,
+        None,
+        None,
+        vec![member2],
+        vec![(old_b_key, old_b_kms, member2)],
+    );
+    // new commit only updates member1 (partial replacement):
+    let new_res_a = CommitResources::new(
+        vec![new_a],
+        None,
+        None,
+        None,
+        vec![member1],
+        vec![(new_a_key, new_a_kms, member1)],
     );
 
-    // Round-3 M-1: The only KMS proof reaches the service via HardwareComplete.
-    // The test body calls NO `apply_validated_proof`!
+    let mut consumer = CommitResourceConsumer::new();
+
+    // Feed through CompletionRetired
+    let accepted =
+        crate::kms::owner::ledger::Submitted::new(vec![old_res_a, old_res_b], vec![new_res_a])
+            .accepted();
+
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: commit_id,
+                resources: accepted,
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // Before HardwareComplete, all obligations are still pending
+    assert!(service.has_pending_obligations(&old_a_key));
+    assert!(service.has_pending_obligations(&old_b_key));
+    assert!(service.has_pending_obligations(&new_a_key));
+
+    // The ONLY KMS proof reaches the service via the owner's HardwareComplete event.
+    // The test body calls NO apply_validated_proof!
     consumer
         .consume(
             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
@@ -3390,32 +3415,42 @@ fn c0_2ci_commit_hardware_complete_discharges_old_only() {
         )
         .unwrap();
 
-    // old_a (member 1, matching) had its KMS obligation discharged!
-    // But old_a still has old_a_gpu and old_a lease, so it is not dropped.
-    assert_eq!(drops_old_a.get(), 0);
+    // 1. Matching old_a (member1) had its KMS obligation discharged!
+    assert!(!service.has_pending_obligations(&old_a_key));
 
-    // Now drop old_a lease and discharge old_a_gpu. If KMS was indeed discharged by HardwareComplete,
-    // old_a will now be freed!
-    drop(old_a);
-    service.service_ready();
-    assert_eq!(drops_old_a.get(), 0); // still held by GPU obligation
-    service.apply_validated_proof(old_a_key, old_a_gpu).unwrap();
-    service.service_ready();
-    assert_eq!(drops_old_a.get(), 1); // KMS + GPU both satisfied, old_a dropped!
+    // 2. Non-matching old_b (member2) was NOT discharged: partial grouped replacement discharges ONLY matching GroupMember!
+    assert!(service.has_pending_obligations(&old_b_key));
 
-    // old_b (member 2, not matching) was NOT discharged. Dropping the lease still leaves old_b_kms pending!
-    drop(old_b);
-    service.service_ready();
-    assert_eq!(drops_old_b.get(), 0); // KMS obligation on old_b is still outstanding!
+    // 3. New set (new_a) was NEVER discharged by this commit's HardwareComplete!
+    assert!(service.has_pending_obligations(&new_a_key));
 
-    // new_a was NEVER discharged. Dropping new_a leaves new_a_kms pending!
-    drop(new_a);
+    // Run on_available on old_a_key: since its obligation was discharged and it has no other holds,
+    // on_available frees old_a from releasing_resources!
+    consumer.on_available(&[old_a_key], &mut service).unwrap();
     service.service_ready();
+    assert_eq!(drops_old_a.get(), 1); // Discharged and freed!
+
+    // old_b and new_a still held
+    consumer.on_available(&[old_b_key], &mut service).unwrap();
+    service.service_ready();
+    assert_eq!(drops_old_b.get(), 0);
     assert_eq!(drops_new_a.get(), 0);
 
-    // Clean up remaining obligations
-    service.apply_validated_proof(old_b_key, old_b_kms).unwrap();
-    service.apply_validated_proof(new_a_key, new_a_kms).unwrap();
+    // Cancel remaining obligations and verify KmsDisposition after cancel is NOT Discharged
+    service.cancel(old_b_key, old_b_kms).unwrap();
+    assert_ne!(
+        service.kms_disposition(old_b_key, old_b_kms),
+        Some(crate::kms::render::resources::handoff::KmsDisposition::Discharged)
+    );
+
+    service.cancel(new_a_key, new_a_kms).unwrap();
+    assert_ne!(
+        service.kms_disposition(new_a_key, new_a_kms),
+        Some(crate::kms::render::resources::handoff::KmsDisposition::Discharged)
+    );
+
+    // Drop consumer so remaining leases are released
+    drop(consumer);
     service.service_ready();
     assert_eq!(drops_old_b.get(), 1);
     assert_eq!(drops_new_a.get(), 1);
@@ -3436,13 +3471,10 @@ fn c0_2ci_commit_resources_still_current_cancels_not_discharges() {
         ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(10).unwrap()),
     );
     let member1 = GroupMember::new(crtc1, 1, 1);
-    let old_kms = service
-        .register(old_key, ObligationKind::KmsRelease)
-        .unwrap();
-
     let commit_id = CommitId::for_tests(7);
+    let old_kms = service.register_kms(old_key, commit_id, member1).unwrap();
+
     let mut consumer = CommitResourceConsumer::new();
-    consumer.correlate_commit(commit_id, vec![member1], vec![(old_key, old_kms, member1)]);
 
     let old_res = CommitResources::new(
         vec![old],
@@ -3468,6 +3500,10 @@ fn c0_2ci_commit_resources_still_current_cancels_not_discharges() {
     // The consumer restored old_res into current_resources.
     assert_eq!(consumer.current_resources.len(), 1);
     assert_eq!(drops_old.get(), 0);
+    assert_ne!(
+        service.kms_disposition(old_key, old_kms),
+        Some(crate::kms::render::resources::handoff::KmsDisposition::Discharged)
+    );
 
     // Dropping current_resources drops old lease; since obligation was cancelled, it frees immediately.
     consumer.current_resources.clear();
@@ -3495,20 +3531,37 @@ fn c0_2ci_commit_topology_replacement_reused_numeric_crtc() {
     let new_member = GroupMember::new(crtc1, 2, 1);
     assert_ne!(old_member, new_member);
 
+    let commit_id = CommitId::for_tests(99);
     let old_kms = service
-        .register(old_key, ObligationKind::KmsRelease)
+        .register_kms(old_key, commit_id, old_member)
         .unwrap();
 
-    let commit_id = CommitId::for_tests(99);
     let mut consumer = CommitResourceConsumer::new();
-    // Register obligation with old_member (generation 1)
-    consumer.correlate_commit(
-        commit_id,
-        vec![new_member], // commit membership has generation 2
+
+    let old_res = CommitResources::new(
+        vec![old],
+        None,
+        None,
+        None,
+        vec![old_member],
         vec![(old_key, old_kms, old_member)],
     );
+    // Commit membership is new_member (generation 2)
+    let new_res = CommitResources::new(vec![], None, None, None, vec![new_member], vec![]);
+    let accepted =
+        crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]).accepted();
 
-    // HardwareComplete arrives for commit
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: commit_id,
+                resources: accepted,
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // HardwareComplete arrives for commit (which has membership [new_member])
     consumer
         .consume(
             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
@@ -3517,9 +3570,15 @@ fn c0_2ci_commit_topology_replacement_reused_numeric_crtc() {
         .unwrap();
 
     // Because new_member != old_member, the obligation for old_member is NOT discharged!
-    drop(old);
+    assert!(service.has_pending_obligations(&old_key));
+    consumer.on_available(&[old_key], &mut service).unwrap();
     service.service_ready();
     assert_eq!(drops_old.get(), 0); // Stale evidence cannot discharge the old record!
+
+    // Even if consumer is dropped, the pending obligation keeps it alive!
+    drop(consumer);
+    service.service_ready();
+    assert_eq!(drops_old.get(), 0);
 
     // Cleaning up
     service.cancel(old_key, old_kms).unwrap();
@@ -3596,19 +3655,32 @@ fn c0_2ci_commit_grouped_skip_and_duplicate_protection() {
 
     // Grouped commit that changes ONLY crtc1 (member1).
     // member2 is retained unchanged across this grouped commit, so it registers NO KMS obligation (round-4 m-1).
-    let old_a_kms = service
-        .register(old_a_key, ObligationKind::KmsRelease)
-        .unwrap();
-
     let commit_id = CommitId::for_tests(88);
+    let old_a_kms = service.register_kms(old_a_key, commit_id, member1).unwrap();
+
     let mut consumer = CommitResourceConsumer::new();
 
-    // Only member1 registered in obligations
-    consumer.correlate_commit(
-        commit_id,
+    let old_res = CommitResources::new(
+        vec![old_a],
+        None,
+        None,
+        None,
         vec![member1, member2],
         vec![(old_a_key, old_a_kms, member1)],
     );
+    let new_res = CommitResources::new(vec![], None, None, None, vec![member1, member2], vec![]);
+    let accepted =
+        crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]).accepted();
+
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: commit_id,
+                resources: accepted,
+            },
+            &mut service,
+        )
+        .unwrap();
 
     // HardwareComplete arrives
     consumer
@@ -3619,7 +3691,7 @@ fn c0_2ci_commit_grouped_skip_and_duplicate_protection() {
         .unwrap();
 
     // old_a was discharged
-    drop(old_a);
+    consumer.on_available(&[old_a_key], &mut service).unwrap();
     service.service_ready();
     assert_eq!(drops_old_a.get(), 1);
 
@@ -3840,7 +3912,6 @@ fn c0_2ci_capacity_delayed_on_available_discharges_and_unblocks() {
     let new_res = CommitResources::new(vec![new_lease], None, None, None, vec![member], vec![]);
 
     // Commit accepted and retired
-    consumer.correlate_commit(commit_id, vec![member], vec![(old_key, old_kms, member)]);
     consumer
         .consume(
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
@@ -3914,7 +3985,6 @@ fn c0_2ci_capacity_delayed_on_available_discharges_and_unblocks() {
     .with_direct_role(rej_prep);
 
     let rej_commit = crate::kms::owner::identity::CommitId::for_tests(102);
-    consumer.correlate_commit(rej_commit, vec![member], vec![(rej_key, rej_kms, member)]);
 
     // Rejection event arrives
     consumer
@@ -4030,10 +4100,10 @@ fn c0_2ci_handoff_success_routes_late_events_and_completions() {
         None,
         vec![member],
         vec![(old_key, old_kms, member)],
-    );
+    )
+    .with_commit_id(commit_id);
 
     let mut consumer = CommitResourceConsumer::new();
-    consumer.correlate_commit(commit_id, vec![member], vec![(old_key, old_kms, member)]);
     // Old resources awaiting release
     consumer.releasing_resources.push(old_res);
 
@@ -4237,4 +4307,504 @@ fn c0_2ci_handoff_unavailable_recipient_and_duplicate_transfer() {
             .unwrap(),
         ResourceError::Detached
     );
+}
+
+fn test_crtc_key(major: u32, minor: u32, handle: u32) -> CrtcKey {
+    CrtcKey::new(
+        DrmDeviceKey { major, minor },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(handle).unwrap()),
+    )
+}
+
+#[test]
+fn c0_2ci_commit_terminal_completed_does_not_freeze_and_becomes_releasable() {
+    use crate::kms::owner::{identity::CommitId, record::TerminalState};
+
+    let (mut service, old, drops_old) = spy_service();
+    let old_key = old.key();
+
+    let (new, drops_new) = {
+        let drops = Rc::new(Cell::new(0));
+        let alloc = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        (alloc, drops)
+    };
+    let new_key = new.key();
+
+    let dev = service.device();
+    let crtc = test_crtc_key(dev.major, dev.minor, 1);
+    let member = GroupMember::new(crtc, 1, 1);
+
+    let commit_id = CommitId::for_tests(701);
+    let old_kms = service.register_kms(old_key, commit_id, member).unwrap();
+    let new_kms = service.register_kms(new_key, commit_id, member).unwrap();
+
+    let old_res = CommitResources::new(
+        vec![old],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(old_key, old_kms, member)],
+    );
+    let new_res = CommitResources::new(
+        vec![new],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(new_key, new_kms, member)],
+    );
+
+    let mut consumer = CommitResourceConsumer::new();
+
+    // 1. HardwareComplete arrives (can arrive before or after CompletionRetired)
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
+            &mut service,
+        )
+        .unwrap();
+
+    // 2. CompletionRetired arrives
+    let accepted =
+        crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]).accepted();
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: commit_id,
+                resources: accepted,
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // 3. Terminal { Completed } arrives
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::Terminal {
+                commit: commit_id,
+                terminal: TerminalState::Completed,
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // Decisive B-8 assertion: Terminal { Completed } MUST NOT freeze resources!
+    assert!(!service.is_frozen(&old_key));
+    assert!(!service.is_frozen(&new_key));
+
+    // Old KMS obligation was discharged by HardwareComplete
+    assert!(!service.has_pending_obligations(&old_key));
+
+    // Releasing resources is releasable and can be destroyed
+    consumer.on_available(&[old_key], &mut service).unwrap();
+    service.service_ready();
+    assert_eq!(drops_old.get(), 1); // Not frozen, successfully dropped!
+
+    // New resources are current, not dropped
+    assert_eq!(drops_new.get(), 0);
+    assert!(service.has_pending_obligations(&new_key));
+
+    // Clean up
+    service.cancel(new_key, new_kms).unwrap();
+    drop(consumer);
+    service.service_ready();
+    assert_eq!(drops_new.get(), 1);
+}
+
+#[test]
+fn c0_2ci_commit_terminal_failed_before_submit_does_not_freeze_current_set() {
+    use crate::kms::owner::{
+        identity::CommitId,
+        record::{FailureCause, RefusalCause, TerminalState},
+    };
+
+    let (mut service, current, drops_current) = spy_service();
+    let current_key = current.key();
+
+    let dev = service.device();
+    let crtc = test_crtc_key(dev.major, dev.minor, 1);
+    let member = GroupMember::new(crtc, 1, 1);
+
+    let commit_id = CommitId::for_tests(702);
+    let current_kms = service
+        .register_kms(current_key, commit_id, member)
+        .unwrap();
+
+    let current_res = CommitResources::new(
+        vec![current],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(current_key, current_kms, member)],
+    );
+
+    let mut consumer = CommitResourceConsumer::new();
+
+    // Terminal { FailedBeforeSubmit } arrives BEFORE ResourcesStillCurrent on rejection (device.rs:2233-2246)
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::Terminal {
+                commit: commit_id,
+                terminal: TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                    RefusalCause::Reaped,
+                )),
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // ResourcesStillCurrent arrives
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                commit: commit_id,
+                resources: vec![current_res],
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // Decisive B-8 assertion: current set is neither frozen nor cancelled-to-discharged!
+    assert!(!service.is_frozen(&current_key));
+    assert_ne!(
+        service.kms_disposition(current_key, current_kms),
+        Some(crate::kms::render::resources::handoff::KmsDisposition::Discharged)
+    );
+
+    // Current resources are still held
+    assert_eq!(consumer.current_resources.len(), 1);
+    assert_eq!(drops_current.get(), 0);
+
+    // Dropping current resources releases them without being blocked by freeze
+    drop(consumer);
+    service.service_ready();
+    assert_eq!(drops_current.get(), 1);
+}
+
+#[test]
+fn c0_2ci_commit_terminal_completion_unknown_freezes_only_that_commit() {
+    use crate::kms::owner::{
+        identity::CommitId,
+        record::{TerminalState, UnknownCause},
+    };
+
+    let (mut service, alloc1, drops1) = spy_service();
+    let key1 = alloc1.key();
+
+    let (alloc2, drops2) = {
+        let drops = Rc::new(Cell::new(0));
+        let a = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        (a, drops)
+    };
+    let key2 = alloc2.key();
+
+    let dev = service.device();
+    let crtc = test_crtc_key(dev.major, dev.minor, 1);
+    let member = GroupMember::new(crtc, 1, 1);
+
+    let commit1 = CommitId::for_tests(703);
+    let commit2 = CommitId::for_tests(704);
+
+    let res1 = CommitResources::new(vec![alloc1], None, None, None, vec![member], vec![])
+        .with_commit_id(commit1);
+    let res2 = CommitResources::new(vec![alloc2], None, None, None, vec![member], vec![])
+        .with_commit_id(commit2);
+
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.releasing_resources.push(res1);
+    consumer.releasing_resources.push(res2);
+
+    // Terminal { CompletionUnknown } for commit1 only!
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::Terminal {
+                commit: commit1,
+                terminal: TerminalState::CompletionUnknown(UnknownCause::IncompleteFenceOutput {
+                    expected: 1,
+                    returned: 0,
+                }),
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // key1 is frozen, key2 is NOT frozen!
+    assert!(service.is_frozen(&key1));
+    assert!(!service.is_frozen(&key2));
+
+    // Dropping consumer cannot free key1 because it is frozen
+    drop(consumer);
+    service.service_ready();
+    assert_eq!(drops1.get(), 0); // Frozen, stays retained!
+    assert_eq!(drops2.get(), 1); // Not frozen, drops normally!
+}
+
+#[test]
+fn c0_2ci_commit_quarantined_closes_gate_and_freezes_only_that_commit() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, alloc1, drops1) = spy_service();
+    let key1 = alloc1.key();
+
+    let (alloc2, drops2) = {
+        let drops = Rc::new(Cell::new(0));
+        let a = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        (a, drops)
+    };
+    let key2 = alloc2.key();
+
+    let dev = service.device();
+    let crtc = test_crtc_key(dev.major, dev.minor, 1);
+    let member = GroupMember::new(crtc, 1, 1);
+
+    let gate = TransportGate::new_legacy(
+        dev,
+        IncarnationId::first(),
+        Box::new(FakeDirectOwnershipState::default()),
+    );
+    let gate_handle = gate.handle();
+
+    let mut consumer = CommitResourceConsumer::new().with_gate_handle(gate_handle.clone());
+    assert!(!gate_handle.is_closed());
+
+    let commit1 = CommitId::for_tests(705);
+    let commit2 = CommitId::for_tests(706);
+
+    let res1 = CommitResources::new(vec![alloc1], None, None, None, vec![member], vec![])
+        .with_commit_id(commit1);
+    let res2 = CommitResources::new(vec![alloc2], None, None, None, vec![member], vec![])
+        .with_commit_id(commit2);
+
+    consumer.releasing_resources.push(res1);
+    consumer.releasing_resources.push(res2);
+
+    // Quarantined arrives for commit1
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::Quarantined { commit: commit1 },
+            &mut service,
+        )
+        .unwrap();
+
+    // M-15: Gate MUST be closed!
+    assert!(gate_handle.is_closed());
+    assert_eq!(gate.state(), TransportState::Closed);
+
+    // M-15: Only commit1's entries are frozen!
+    assert!(service.is_frozen(&key1));
+    assert!(!service.is_frozen(&key2));
+
+    drop(consumer);
+    service.service_ready();
+    assert_eq!(drops1.get(), 0); // key1 retained
+    assert_eq!(drops2.get(), 1); // key2 dropped
+}
+
+#[test]
+fn c0_2ci_commit_presented_selects_reference_crtc_sample() {
+    use crate::kms::owner::{clock::ClockSample, identity::CommitId};
+
+    let dev = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let commit = CommitId::for_tests(707);
+    let key = PresentKey::new(dev, incarnation, commit, 1);
+
+    let mut consumer = CommitResourceConsumer::new();
+
+    // Record disposition with reference CRTC = 2
+    let ref_crtc = 2;
+    consumer.record_present_disposition_with_reference(
+        key,
+        PresentDisposition::pending(),
+        ref_crtc,
+    );
+
+    let mut samples = BTreeMap::new();
+    let sample1 = ClockSample {
+        msc: 100,
+        ust: 1000,
+    };
+    let sample2 = ClockSample {
+        msc: 200,
+        ust: 2000,
+    };
+    samples.insert(1, sample1);
+    samples.insert(2, sample2);
+
+    let mut service = ResourceService::new(dev, incarnation);
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::Presented { commit, samples },
+            &mut service,
+        )
+        .unwrap();
+
+    let disp = consumer
+        .present_dispositions
+        .get(&key)
+        .expect("present disposition");
+    assert_eq!(disp.completion, CompletionDisposition::Emitted);
+    assert_eq!(disp.sample, Some(sample2)); // Selected CRTC 2 sample!
+}
+
+#[test]
+fn c0_2ci_commit_register_dependencies_and_pre_ipc_cancellation() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old_alloc, drops_old) = spy_service();
+    let old_key = old_alloc.key();
+
+    let (new_alloc, drops_new) = {
+        let drops = Rc::new(Cell::new(0));
+        let a = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        (a, drops)
+    };
+    let _new_key = new_alloc.key();
+
+    let dev = service.device();
+    let crtc = test_crtc_key(dev.major, dev.minor, 1);
+    let member = GroupMember::new(crtc, 1, 1);
+
+    let commit = CommitId::for_tests(708);
+
+    let old_res = CommitResources::new(vec![old_alloc], None, None, None, vec![member], vec![]);
+    let new_res = CommitResources::new(vec![new_alloc], None, None, None, vec![member], vec![]);
+
+    // 1. register_commit_dependencies registers displaced pairs before Submitted::new
+    let submitted =
+        register_commit_dependencies(commit, vec![old_res], vec![new_res], &mut service)
+            .expect("register_commit_dependencies");
+
+    // Old allocation has a registered KMS obligation
+    assert!(service.has_pending_obligations(&old_key));
+
+    // 2. Pre-IPC failure / cancel returns ownership of resources and cancels registrations
+    let (old_returned, new_returned) = cancel_pre_ipc_commit(submitted, &mut service);
+
+    assert_eq!(old_returned.len(), 1);
+    assert_eq!(new_returned.len(), 1);
+
+    // Obligation cancelled (not pending, not discharged)
+    assert!(!service.has_pending_obligations(&old_key));
+
+    // Dropping returned resources drops leases
+    drop(old_returned);
+    drop(new_returned);
+    service.service_ready();
+    assert_eq!(drops_old.get(), 1);
+    assert_eq!(drops_new.get(), 1);
+}
+
+#[test]
+fn c0_2ci_commit_group_member_validate_unique() {
+    use crate::kms::owner::identity::CommitId;
+
+    let dev = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let crtc1 = CrtcKey::new(
+        dev,
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
+    );
+    let crtc2 = CrtcKey::new(
+        dev,
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(2).unwrap()),
+    );
+
+    let m1 = GroupMember::new(crtc1, 1, 1);
+    let m2 = GroupMember::new(crtc2, 1, 1);
+    let m1_dup = GroupMember::new(crtc1, 1, 1);
+
+    assert!(GroupMember::validate_unique(&[m1, m2]));
+    assert!(!GroupMember::validate_unique(&[m1, m2, m1_dup]));
+
+    // Validation failure in register_commit_dependencies returns ResourceError::InvalidProof
+    let mut service = ResourceService::new(dev, IncarnationId::first());
+    let old_res = CommitResources::new(vec![], None, None, None, vec![m1, m1_dup], vec![]);
+    let new_res = CommitResources::new(vec![], None, None, None, vec![m2], vec![]);
+    let err = register_commit_dependencies(
+        CommitId::for_tests(709),
+        vec![old_res],
+        vec![new_res],
+        &mut service,
+    );
+    assert!(matches!(err, Err((ResourceError::InvalidProof, _, _))));
+}
+
+#[test]
+fn c0_2ci_commit_discharge_atomic_validate_then_apply_failure_rolls_back() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old, drops_old) = spy_service();
+    let old_key = old.key();
+
+    let dev = service.device();
+    let crtc = test_crtc_key(dev.major, dev.minor, 1);
+    let member = GroupMember::new(crtc, 1, 1);
+
+    let commit = CommitId::for_tests(710);
+    let ob1 = service.register_kms(old_key, commit, member).unwrap();
+    let ob2_invalid = ObligationId(999999);
+
+    let old_res = CommitResources::new(
+        vec![old],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(old_key, ob1, member), (old_key, ob2_invalid, member)],
+    );
+    let new_res = CommitResources::new(vec![], None, None, None, vec![member], vec![]);
+    let accepted =
+        crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]).accepted();
+
+    let mut consumer = CommitResourceConsumer::new();
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit,
+                resources: accepted,
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // HardwareComplete arrives - atomic validate-all encounters ob2_invalid!
+    let err = consumer.consume(
+        crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
+        &mut service,
+    );
+    assert_eq!(err, Err(ResourceError::InvalidProof));
+
+    // M-4: Atomic validate-then-apply rolls back: ob1 was NOT applied and remains pending!
+    assert!(service.has_pending_obligations(&old_key));
+    assert_eq!(consumer.releasing_resources[0].kms_obligations.len(), 2);
+
+    // Clean up
+    service.cancel(old_key, ob1).unwrap();
+    drop(consumer);
+    service.service_ready();
+    assert_eq!(drops_old.get(), 1);
 }

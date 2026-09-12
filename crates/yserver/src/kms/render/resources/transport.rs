@@ -208,6 +208,21 @@ impl DirectOwnershipState for FakeDirectOwnershipState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct TransportGateHandle {
+    forced_closed: Rc<Cell<bool>>,
+}
+
+impl TransportGateHandle {
+    pub(crate) fn close_gate(&self) {
+        self.forced_closed.set(true);
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.forced_closed.get()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TransportGate {
     device: DrmDeviceKey,
@@ -218,6 +233,7 @@ pub(crate) struct TransportGate {
     next_serial: u64,
     issued_serials: BTreeSet<u64>,
     closed_admission: Rc<Cell<bool>>,
+    forced_closed: Rc<Cell<bool>>,
 }
 
 impl TransportGate {
@@ -235,6 +251,7 @@ impl TransportGate {
             next_serial: 0,
             issued_serials: BTreeSet::new(),
             closed_admission: Rc::new(Cell::new(false)),
+            forced_closed: Rc::new(Cell::new(false)),
         }
     }
 
@@ -271,6 +288,7 @@ impl TransportGate {
     /// is the graceful path and refuses while grants are outstanding
     /// (M-14).
     fn force_close(&mut self) {
+        self.forced_closed.set(true);
         self.state = TransportState::Closed;
     }
 
@@ -286,12 +304,22 @@ impl TransportGate {
         Ok(())
     }
 
+    pub(crate) fn handle(&self) -> TransportGateHandle {
+        TransportGateHandle {
+            forced_closed: Rc::clone(&self.forced_closed),
+        }
+    }
+
     pub(crate) fn state(&self) -> TransportState {
-        self.state
+        if self.forced_closed.get() {
+            TransportState::Closed
+        } else {
+            self.state
+        }
     }
 
     pub(crate) fn allows_legacy(&self, _class: WriterClass) -> bool {
-        self.state == TransportState::Legacy
+        self.state() == TransportState::Legacy
     }
 
     /// B-10/R11: the single check every real DRM/helper write sink performs
@@ -313,7 +341,7 @@ impl TransportGate {
         class: WriterClass,
         grant: Option<OwnerWriteGrant>,
     ) -> Result<(), ResourceError> {
-        match self.state {
+        match self.state() {
             TransportState::Legacy => Ok(()),
             TransportState::Quiescing => Err(ResourceError::Busy),
             TransportState::Closed => Err(ResourceError::Detached),

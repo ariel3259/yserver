@@ -32,7 +32,10 @@ pub(crate) use availability::{
 #[allow(unused_imports)]
 pub(crate) use capacity::{DirectCapacity, DirectRole, RoleReservation, RoleState};
 #[allow(unused_imports)]
-pub use commit::{CommitResourceConsumer, CommitResources, GroupMember, PresentRelease};
+pub(crate) use commit::{
+    CommitResourceConsumer, CommitResources, GroupMember, PresentRelease, cancel_pre_ipc_commit,
+    register_commit_dependencies,
+};
 #[allow(unused_imports)]
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
 #[allow(unused_imports)]
@@ -71,7 +74,7 @@ pub(crate) use transport::FakeDirectOwnershipState;
 #[allow(unused_imports)]
 pub(crate) use transport::{
     DirectOwnershipState, HandoverPermit, OwnerWriteGrant, RecipientReservation, TransportGate,
-    TransportState, WriterClass, WriterCoverageProof,
+    TransportGateHandle, TransportState, WriterClass, WriterCoverageProof,
 };
 
 #[allow(dead_code, clippy::large_enum_variant)]
@@ -532,6 +535,10 @@ impl ResourceService {
         Ok(())
     }
 
+    pub(crate) fn is_frozen(&self, key: &AllocationKey) -> bool {
+        self.entries.get(key).map(|e| e.frozen()).unwrap_or(false)
+    }
+
     pub(crate) fn cancel(
         &mut self,
         key: AllocationKey,
@@ -547,6 +554,22 @@ impl ResourceService {
         }
         drop(avail);
         self.dirty_entries.borrow_mut().insert(key);
+        Ok(())
+    }
+
+    pub(in crate::kms::render::resources) fn validate_proof_target(
+        &self,
+        key: AllocationKey,
+        obligation: ObligationId,
+    ) -> Result<(), ResourceError> {
+        if key.device != self.device || key.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let avail = entry.availability.borrow();
+        if !avail.pending_obligations.contains_key(&obligation) {
+            return Err(ResourceError::InvalidProof);
+        }
         Ok(())
     }
 
@@ -597,6 +620,20 @@ impl ResourceService {
             .kms_dispositions
             .insert(id, (member, commit, KmsDisposition::Outstanding));
         Ok(id)
+    }
+
+    pub(crate) fn kms_disposition(
+        &self,
+        key: AllocationKey,
+        obligation: ObligationId,
+    ) -> Option<handoff::KmsDisposition> {
+        let entry = self.entries.get(&key)?;
+        entry
+            .availability
+            .borrow()
+            .kms_dispositions
+            .get(&obligation)
+            .map(|(_, _, disp)| *disp)
     }
 
     pub(crate) fn record_kms_discharged(
