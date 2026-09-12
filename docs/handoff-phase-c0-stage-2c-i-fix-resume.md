@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-12,
-after F-5b.** If you are resuming this work cold — a new
+after F-5b (F-6a dispatched).** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -42,12 +42,14 @@ stand so nothing is re-derived.
 | F-4, F-4b, F-4c | Task 5 (GPU/read adapters) | **ACCEPTED** (write half → F-4d) | `17384ae6`, `f475b04c`, `4e870930` (+fold-backs) | F4/F4b/F4c-review |
 | F-5a | Task 6, resources half (per-batch deadline, gate sealing, B-6) | **ACCEPTED** (M-13 real impl → F-5b) | `5f025fed`/`265b228e` | F5a-review |
 | F-5b | Task 6, sinks half (B-10 at 7 sinks, 6.5a/6.5b, grant consumed at executor send, real `DirectOwnershipState`) | **ACCEPTED** (gamma `_drm` test → F-9) | `842745a3`/`4eb05029` | F5b-review |
-| **F-6** | Task 7 (`Terminal` by cause, one keyed release path, 7.6) | **NEXT** | — | — |
+| **F-6a** | Task 7, consumer half (B-8, B-9, M-2..M-5, M-15) | **RUNNING** | — | — |
+| F-6b | Task 7, Present half (M-6: 7.5/7.5a, `PresentRelease`, COW test) | pending | — | — |
 | F-7 | Task 8 (role transitions, `on_available`) | pending | — | — |
 | F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | pending | — | — |
 | F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | pending | — | — |
 | F-4d | Task 5 write half (5.3/5.5: managed branch in `scene.rs` `submit_shared_scanout_frame`, `PendingAck` batch, `drain_pending_pool_releases`) | after F-9 | — | ruled in F4c-review |
 | F-10..F-12 | M-19 (180 `Storage` Deref accessor sites → lease accessors; 3 sessions: read-mostly consumers → `engine.rs` → `backend.rs`) + M-20 promotion half + F3-M1/F3-m1 | after F-4d | — | ruled in F3-review |
+| Final | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | after F-12 | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the
@@ -114,6 +116,45 @@ session are the models; the essentials are:
 Then review: read the diff, run the gate, mutate the decisive assertion,
 write `…-Fn-review.md`, commit it, update this file's table, dispatch
 the next.
+
+## If the implementer or reviewer is not Claude (codex, a local model)
+
+Everything above holds; only the mechanics change.
+
+- **Skills**: nothing loads the Superpowers skills for a non-Claude
+  harness. Cite them by path instead of by name:
+  `~/.claude/plugins/cache/claude-plugins-official/superpowers/6.3.0/skills/executing-plans/SKILL.md`
+  and `…/test-driven-development/SKILL.md` (plain markdown; read before
+  writing code). The version directory may differ — `ls` the parent.
+- **codex as implementer**: run it with `< /dev/null` and
+  `--sandbox workspace-write` (the review dispatcher's read-only sandbox
+  is for reviewing, not implementing). Stage 2b-i's Tasks 6–7 were done
+  this way (`docs/handoff-phase-c0-stage-2b-i-tasks-6-7.md` is the
+  model). The prompt shape in the recipe above is otherwise identical;
+  replace the `Co-Authored-By` trailer with the tool's own.
+- **codex as reviewer**: `docs/superpowers/review/review.sh` and its
+  frozen `brief.md` are for **spec/plan** review; do not use them for
+  code. For the per-session code review, dispatch codex read-only
+  (`--sandbox read-only < /dev/null`) with the review prompt the
+  round-1 implementation review used (three scopes, the rulings, the
+  plan's contracts, "verify every claim with file:line", the severity
+  calibration) — `docs/superpowers/findings/2026-09-11-stage-2c-i-implementation-review-round1.md`
+  records the shape and the output format. The **mutation checks** are
+  what made the reviews in this round catch what reading missed
+  (F1-M1, F2-B2, F4c): delete the mechanism under test, run the decisive
+  test, it must fail; restore. A reviewer that cannot run cargo cannot
+  do that step — then the coordinator does it by hand before accepting.
+- **Local model (Qwen etc.)**: only for F-10..F-12 (M-19), with a
+  one-page recipe (before/after pattern, the site list from
+  `grep -n "\.storage\." crates/yserver/src/kms/render/*.rs`, `cargo
+  check` after every file) rather than the document stack — an 8k
+  context cannot hold the contracts the mechanism sessions need. Not
+  for F-6..F-9 or F-4d.
+- **Budget**: Claude Pro's 5-hour window cut three mechanism sessions
+  (F-4, F-4c, F-5b) around 350k tokens; each was resumed from the dirty
+  tree by a fresh session told exactly what it inherited. If a session
+  is cut, do not discard the tree: `git diff`, keep what compiles or
+  make it compile, finish, commit.
 
 ## Upstream notes for the maintainer (not ours to fix)
 
