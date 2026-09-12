@@ -777,6 +777,73 @@ The two pre-existing, out-of-scope sibling tests on the same fixture (`root_get_
 
 **Status: EXECUTED at `72a91c27`.** **Review round 1 (2026-09-11): REJECTED** — see the findings and `docs/handoff-phase-c0-stage-2c-i-fix.md`; unchecked steps below are not done or not proven.
 
+**Fix round 1 (F-5a): `5f025fed`.** Session F-5a, the smaller half of F-5,
+closing B-11, M-16, M-13, M-14, B-6 (`docs/superpowers/findings/2026-09-11-
+stage-2c-i-implementation-review-round1.md`) per
+`docs/handoff-phase-c0-stage-2c-i-fix.md`'s "F-5 — Task 6" section, scoped
+to `resources/{transport,completion,mod,tests}.rs`, `handoff.rs` (B-6 only)
+and the VT/DPMS seams in `backend.rs`. B-10 (gating the twelve DRM sinks,
+6.5a/6.5b) and the minor `consume_owner_write` accounting item are **NOT
+this session's** — they are F-5b's, per the resume doc's split, and
+`c0_2ci_transport_gate_writer_boundary_enforcement` was kept exactly as
+instructed (only its `TransportGate::new_legacy` call site updated for the
+new constructor signature; F-5b replaces its body).
+
+| Finding | Verdict |
+| --- | --- |
+| B-11 (serviced-time deadline is service-global and never reset) | **RESOLVED (test: `c0_2ci_serviced_deadline_is_per_batch_not_global`, `c0_2ci_serviced_deadline_not_expired_on_first_poll_after_prior_service`, `c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires`)** — `CoreRetirementBatch` now carries `serviced_deadline: Option<Duration>`, stamped by `ResourceService::register_batch` as `serviced_elapsed.checked_add(max_serviced_duration)` at registration time. `service_completions` filters `pending_batches` for entries whose own deadline has passed, quarantines only those, and never sets `exhausted`. `set_seat_active` is now driven from `on_vt_release`/`on_vt_acquire` and both `set_dpms_power` transitions in `backend.rs` (inert without a `resource_service`, per R8). Mutation check performed: reverting `register_batch`/`service_completions` to the pre-fix single `self.serviced_elapsed >= self.max_serviced_duration` global comparison makes `c0_2ci_serviced_deadline_is_per_batch_not_global` fail (batch 2 would expire alongside batch 1 at t=55ms instead of surviving to t=90ms) |
+| M-16 (`next_deadline` returns `None` while the seat is inactive, suppressing progress rather than only the budget) | **RESOLVED (test: `c0_2ci_progress_no_composition` (updated), `c0_2ci_progress_no_composition_on_core_loop_fake_backend` in `backend.rs`)** — `next_deadline` no longer checks `seat_active`; only `service_completions`'s `serviced_elapsed` advance is gated on it. The new backend-level test drives the real `KmsBackend::for_tests()` fixture (the `Backend` implementor `run_core` actually calls) with VT Suspended, DPMS off and no scene damage, asserts `next_wakeup()` still schedules the pending ticket's deadline, drives the real `before_block` completion callback twice (unsignaled, then signalled), and asserts the allocation becomes available with no scene submission (`composite_and_flip`/`maybe_composite` never called; `scanout_allowed()`/`kms_outputs_active`/`scene_structure_dirty` all confirm every composition gate stayed closed throughout) |
+| M-13 (`begin_quiescing`'s Busy inputs are free-floating setters) | **RESOLVED (test: `c0_2ci_transport_gate_direct_scanout_precondition`)** — `set_direct_scanout_active`/`set_unflip_pending` are deleted; `TransportGate` now takes a `Box<dyn DirectOwnershipState>` at construction (`new_legacy`'s third argument) and `begin_quiescing` queries `direct_ownership_busy()`/`unflip_outstanding()` live on every call. `#[cfg(test)] FakeDirectOwnershipState` records a query count per method so the test can assert the gate actually consulted live state rather than a cached value. The real, non-test implementor is `DirectOwnershipSignal` (shared `Rc<Cell<bool>>` pair) — a correctly-typed adapter with no production caller yet, exactly like `OwnerWriteGrant`'s issuer (R8): wiring its `set_direct_ownership_busy`/`set_unflip_outstanding` calls into the real direct-scanout/unflip transition sites (`backend.rs`'s `ScanoutM2State`) is DRM-sink territory and belongs to F-5b or later, not this session. Mutation check performed: reverting to the pre-fix setters would still pass the busy/unblocked assertions by construction, but `ownership.busy_query_count()`/`unflip_query_count()` would stay 0, failing the test |
+| M-14 (`close()` doesn't refuse with outstanding grants; `issue_handover_permit` takes neither `LegacyDrained` nor final dispositions; `try_finish_legacy_transport` unconnected) | **RESOLVED (test: `c0_2ci_transport_gate_close_refuses_outstanding_grants`, `c0_2ci_transport_gate_handover_validates_proof_and_dispositions`, `legacy_transport_gate_permits_finish_inert_without_a_gate_and_refuses_past_legacy` in `platform.rs`)** — `close()` now returns `Result<(), ResourceError>` and refuses with `Busy` while `outstanding_owner_writes() != 0` (the foreign-proof emergency path in `consume_owner_write` uses a new private `force_close()` instead, since that closure must be unconditional). `issue_handover_permit` takes the real `platform::LegacyDrained` proof and `&[backend::LegacyEventDisposition]`, refusing `WrongIncarnation` for a foreign incarnation and `InvalidProof` for any `BackendFailure` disposition. `try_finish_legacy_transport` (`backend.rs`) now calls the new `PlatformBackend::legacy_transport_gate_permits_finish` before calling `owner.finish_legacy_transport`, refusing when an installed gate has already progressed past `Legacy`/`Quiescing`; inert under Legacy since no gate is installed in production (R8). Full end-to-end coverage of `try_finish_legacy_transport` itself (with a live `DeviceCommitOwner`/backend fixture) does not exist as a baseline and was not built this session — the new test instead proves the gate-check predicate directly and confirms by inspection that it gates the real call site; building the full integration fixture is judged out of proportion for this finding and is flagged here rather than silently left uncovered |
+| B-6 (`RecipientReservation::new_for_tests` is a production constructor) | **RESOLVED (test: existing `c0_2ci_handoff_*` tests plus the whole `c0_2ci` suite compiling with `RetainingSupervisor` under `#[cfg(test)]`)** — `RecipientReservation::new_for_tests` is back under `#[cfg(test)]`; `RetainingSupervisor` (struct, `Default`, and its whole `impl` including `reserve_slot`/`issue_teardown_release`) moves under `#[cfg(test)]` in `handoff.rs`, per the plan's own description of it as a test fixture. Nothing else in `handoff.rs` was touched (Task 9 is F-8's). Mutation check performed: reverting `RetainingSupervisor`'s `#[cfg(test)]` gate alone does not fail a test by itself (it is a visibility fix, not a behavior change) — the decisive check is that `cargo check -p yserver --lib` (no `--tests`, no `cfg(test)`) still compiles with `RecipientReservation::new_for_tests` gone; it does, since nothing outside `#[cfg(test)]` code calls it any more |
+
+Also fixed in this session: a pre-existing test-ordering bug in
+`adapter_tests.rs`'s `c0_2ci_adapter_vt_away_dpms_off_idle_service_progress`,
+surfaced (not introduced) by the B-11 change — it set
+`max_serviced_duration` **after** `register_batch`, which the old
+global-comparison code tolerated (it re-read the field on every poll) but
+the new per-batch-deadline-at-registration design does not; reordered to
+set the budget first, matching the fixed contract.
+
+Ticked: 6.1 (`c0_2ci_progress_no_composition_on_core_loop_fake_backend`),
+6.3 (per-batch serviced deadline + VT/DPMS `set_seat_active` wiring +
+already-existing unconditional `before_block`/`next_wakeup` chaining,
+proven by the B-11 tests above), 6.5
+(`c0_2ci_transport_gate_direct_scanout_precondition`,
+`c0_2ci_transport_gate_close_refuses_outstanding_grants`,
+`c0_2ci_transport_gate_handover_validates_proof_and_dispositions`,
+`legacy_transport_gate_permits_finish_inert_without_a_gate_and_refuses_past_legacy`).
+6.5a/6.5b remain unticked — F-5b's.
+
+Gate for this round: `cargo +nightly fmt --check` clean; `cargo clippy
+--all-targets -- -D warnings` clean; `cargo test -p yserver --lib c0_2ci`
+93 passed/0 failed/10 ignored on a clean run and on twelve consecutive
+runs (zero flakes); `cargo test -p yserver --lib c0_2ci -- --ignored` 10
+passed/0 failed (this box's real DRM node + NVIDIA/RADV ICDs); full
+`cargo test -p yserver --lib` 1630 passed/1 failed — the one failure is
+`kms::executor::device_lock::tests::the_lock_is_released_when_the_holder_dies`,
+one of R2's three pre-existing executor flakes (unrelated file, this
+session touches no code under `kms/executor/`); `cargo check -p yserver
+--target x86_64-unknown-linux-musl` and `--target x86_64-unknown-freebsd`
+both clean.
+
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 10 tests
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1703 filtered out; finished in 0.77s
+```
+
 **Files:** Create `resources/completion.rs` and `resources/transport.rs`; modify `backend.rs` and `platform.rs`. Extend `crates/yserver-core/src/core_loop/run.rs` tests only if needed to observe the existing completion callback.
 
 **Consumes:** Service pending tickets; current `before_block`, `on_owner_completion_ready`, `next_wakeup`, `owner_completion_deadline`, `service_owner_completions`, scanout completion registrations and executor-control processing.
@@ -829,11 +896,11 @@ impl ResourceService {
 - **Revocation and ordering.** `begin_quiescing`, `close` and handover refuse while `outstanding_owner_writes() != 0`; `revoke_owner_writes` is the explicit resolution and returns the count it invalidated. This extends the existing rule that Owner cannot publish while a helper permission or disposition is outstanding. `WriterClass::HelperMutation` grants additionally resolve or revoke the issued helper permission before handover.
 - **Scope.** Concrete stage-3/4 producers of these grants remain deferred; this stage supplies the vocabulary, the validation site and the tests only.
 
-- [ ] **6.1 Add a no-composition progress test.** Use the existing core-loop fake backend completion tests. Register one unsignaled ticket, set VT-away/DPMS-off and no damage, then signal it through the adapter and verify the service runs, its allocation becomes available and no scene submission occurs. Assert a pending ticket schedules a future deadline, and a failed ticket closes the route without repeated immediate deadlines.
+- [x] **6.1 Add a no-composition progress test.** Use the existing core-loop fake backend completion tests. Register one unsignaled ticket, set VT-away/DPMS-off and no damage, then signal it through the adapter and verify the service runs, its allocation becomes available and no scene submission occurs. Assert a pending ticket schedules a future deadline, and a failed ticket closes the route without repeated immediate deadlines.
 - [x] **6.2 Run** `cargo test -p yserver --lib c0_2ci_progress` and the core-loop completion tests.
-- [ ] **6.3 Move service polling outside composition gates.** Invoke service work from the established completion callback and `before_block`, before any scene/VT/DPMS early return. Chain `ResourceService::next_deadline()` unconditionally in `next_wakeup`. For tickets without exportable FDs use a **1 ms** positive retry interval, coalesced to one service deadline; successful evidence services availability in the same wake. Each such ticket carries a bounded pending deadline derived with checked arithmetic (round-3 m-1), measured in **serviced** time: it pauses while the seat is inactive (VT-away, DPMS-off) and resumes on return, so a long VT switch is not a route-closing event (round-4 m-2). On expiry the batch is frozen, converted admission closes and the retry is not re-armed. Expiry is never a completion proof: the batch stays rooted for teardown like a failed ticket. Checked time overflow closes managed admission and retains work. Failed/device-lost tickets are retained for teardown rather than polled forever. Keep existing FD pollers; the serialized inbox does not need a new OS thread or synthetic ready FD.
+- [x] **6.3 Move service polling outside composition gates.** Invoke service work from the established completion callback and `before_block`, before any scene/VT/DPMS early return. Chain `ResourceService::next_deadline()` unconditionally in `next_wakeup`. For tickets without exportable FDs use a **1 ms** positive retry interval, coalesced to one service deadline; successful evidence services availability in the same wake. Each such ticket carries a bounded pending deadline derived with checked arithmetic (round-3 m-1), measured in **serviced** time: it pauses while the seat is inactive (VT-away, DPMS-off) and resumes on return, so a long VT switch is not a route-closing event (round-4 m-2). On expiry the batch is frozen, converted admission closes and the retry is not re-armed. Expiry is never a completion proof: the batch stays rooted for teardown like a failed ticket. Checked time overflow closes managed admission and retains work. Failed/device-lost tickets are retained for teardown rather than polled forever. Keep existing FD pollers; the serialized inbox does not need a new OS thread or synthetic ready FD.
 - [x] **6.4 Register waiter before rechecking availability.** A waiter is keyed by allocation generation and consumer (`Pool`, `DirectCapacity`); define this two-variant enum in `completion.rs`. Store a set to coalesce wake notifications. On reserve failure register the consumer and recheck in the same service turn. On an eligibility edge enqueue one consumer wake and clear its registration; consumer retries reserve, not an unchecked index acquisition. Completion arriving during registration must either be observed by recheck or produce the wake.
-- [ ] **6.5 Implement and test the gate.** Gate initial state is Legacy. Quiescing revokes all new legacy writer permissions before issuing the drain; Owner cannot publish while any helper permission or disposition is outstanding. **Precondition (round-3 M-2):** `begin_quiescing` returns `ResourceError::Busy` while any direct ownership unit is `Current`, `Submitted` or `Successor`, or while an unflip is requested and not retired. Exiting direct scanout is the last legacy write and precedes quiescing; `Unflip` is not a class `Quiescing` permits, so the all-classes-false assertions stand unchanged and no sink gains a bypass. Add a test that `begin_quiescing` under active direct scanout refuses without changing state, and succeeds after the unflip retires. Closed cannot return to Legacy on the same incarnation. Add table-driven tests:
+- [x] **6.5 Implement and test the gate.** Gate initial state is Legacy. Quiescing revokes all new legacy writer permissions before issuing the drain; Owner cannot publish while any helper permission or disposition is outstanding. **Precondition (round-3 M-2):** `begin_quiescing` returns `ResourceError::Busy` while any direct ownership unit is `Current`, `Submitted` or `Successor`, or while an unflip is requested and not retired. Exiting direct scanout is the last legacy write and precedes quiescing; `Unflip` is not a class `Quiescing` permits, so the all-classes-false assertions stand unchanged and no sink gains a bypass. Add a test that `begin_quiescing` under active direct scanout refuses without changing state, and succeeds after the unflip retires. Closed cannot return to Legacy on the same incarnation. Add table-driven tests:
 
 ```rust
 for class in [WriterClass::Primary, WriterClass::Unflip, WriterClass::Modeset,
