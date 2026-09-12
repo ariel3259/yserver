@@ -1,13 +1,9 @@
 [workspace]
 resolver = "3"
-members = [
-  "crates/yserver",
-  "crates/yserver-core",
-  "crates/yserver-protocol",
-]
+members = ["crates/yserver", "crates/yserver-core", "crates/yserver-protocol"]
 
 [workspace.package]
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 repository = "https://github.com/joske/yserver"
 license = "MIT"
@@ -21,7 +17,7 @@ freetype-rs = "0.38"
 gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 gpu-allocator = { version = "0.28", default-features = false, features = [
   "std",
-  "vulkan"
+  "vulkan",
 ] }
 input = "0.10"
 libc = "0.2"
@@ -35,7 +31,7 @@ nix = { version = "0.31", features = [
   "poll",
   "signal",
   "socket",
-  "term"
+  "term",
 ] }
 signal-hook = "0.4"
 thiserror = "2"

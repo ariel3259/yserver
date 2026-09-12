@@ -3523,6 +3523,184 @@ fn set_redirected_target_routes_fill_to_backing() {
     );
 }
 
+/// Xorg's unredirect points the window back at the SCREEN pixmap
+/// (`compSetParentPixmap`, `composite/compalloc.c:649`) and copies
+/// NOTHING — it does not need to, because the pixels the compositor
+/// was showing are already in that pixmap. The redirect direction is
+/// the one that copies (`compNewPixmap` seeds the new backing with
+/// `CopyArea(parent, …, IncludeInferiors)`, `compalloc.c:556`), so
+/// Xorg's invariant is that a window's pixels stay CONTINUOUS with
+/// the screen across both transitions.
+///
+/// yserver keeps a private per-window leaf instead, which has been
+/// stale since the redirect — `process_request.rs:889` says so
+/// outright while declining a copy in the other direction: "W's
+/// storage which under Manual is empty". `release_redirected_backing`
+/// then ran `sync_window_leaf_storage_to_geometry`, re-initialising
+/// that leaf from the background. So every window a compositor
+/// unredirected lost its content.
+///
+/// Measured on HW (bee, sonicDE/KWin, 2026-09-11): mpv going
+/// fullscreen sets `_NET_WM_BYPASS_COMPOSITOR`, KWin suspends
+/// compositing for the whole screen, and dolphin's content blanked.
+/// The blank tracked the LEAF's init colour — white before the
+/// `background_none` fix, black after — which is what proves the
+/// blank is this leaf and not a missing Expose.
+/// `mpv --x11-bypass-compositor=no` suppressed it entirely, and
+/// totem never triggered it because it does not set the property.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn unredirect_restores_the_window_leaf_from_the_backing() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    let w = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            16,
+            16,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            // Background None — dolphin's shape, and the largest
+            // category in the KWin trace (37 windows).
+            None,
+            None,
+        )
+        .expect("create W");
+    let w_xid = w.as_raw();
+    // The restore walks the plan `plan_backing_inferiors` builds, and
+    // that walk prunes unmapped subtrees (X11: an unmapped window is
+    // invisible), so W has to be mapped for any of this to be reached.
+    b.map_subwindow(None, w_xid).expect("map W");
+
+    // Redirect through the production path: allocates the backing,
+    // seeds it parent → B and installs the route.
+    let backing = b
+        .allocate_redirected_backing(None, w, 16, 16, 32)
+        .expect("allocate backing");
+
+    // The client paints green. Under redirect this lands in the
+    // BACKING, not in W's leaf — that is what the route is for, and
+    // precisely why the leaf is stale when the compositor lets go.
+    b.fill_rectangle(None, w_xid, 0xFF00FF00, 0, 0, 16, 16)
+        .expect("redirected fill");
+
+    // Unredirect. Both `UnredirectSubwindows` and a compositor crash
+    // reach here via `teardown_redirect_for_window`.
+    b.release_redirected_backing(None, backing)
+        .expect("release backing");
+
+    // The route is gone, so this reads W's own leaf. Xorg would still
+    // be showing the green, because the window is back to reading the
+    // screen pixmap the compositor had been painting.
+    let leaf = b
+        .get_image_pixels_for_tests(w_xid, 2, 0, 0, 16, 16, !0)
+        .expect("get_image W")
+        .expect("Some W bytes");
+    let mut distinct = std::collections::BTreeMap::<[u8; 4], usize>::new();
+    for px in leaf.chunks_exact(4) {
+        *distinct.entry([px[0], px[1], px[2], px[3]]).or_default() += 1;
+    }
+    assert_eq!(
+        distinct.keys().copied().collect::<Vec<_>>(),
+        vec![[0x00, 0xFF, 0x00, 0xFF]],
+        "after unredirect W's leaf must hold the content the compositor \
+         was showing (green, BGRA), not a background re-init: {distinct:?}",
+    );
+}
+
+/// The HW case the per-window restore missed. A compositor redirects
+/// with `RedirectSubwindows(root)`, so the windows that own a backing
+/// are the WM's FRAMES; the client's own window is reparented inside
+/// one and is a GRANDCHILD of root. Its pixels live in the frame's
+/// backing at an offset, and its own leaf is stale from the moment the
+/// route is installed.
+///
+/// Measured on HW (bee, sonicDE/KWin, 2026-09-11): restoring only the
+/// redirected window's leaf brought the frame back and left dolphin's
+/// content black — and it repainted in full on hover, i.e. the client
+/// could rebuild exactly what the server had dropped. So the restore
+/// has to walk the subtree, which is what seeding already does in the
+/// other direction (`overlay_backing_inferiors`).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn unredirect_restores_a_reparented_child_leaf_not_just_the_frame() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    let visual = HostSubwindowVisual::Explicit {
+        depth: 32,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    // The frame, as a WM would create it under root.
+    let frame = b
+        .create_subwindow(None, root, 0, 0, 16, 16, 0, visual, None, None)
+        .expect("create frame");
+    let frame_xid = frame.as_raw();
+    b.map_subwindow(None, frame_xid).expect("map frame");
+    // The client's window, reparented inside the frame at (2, 3) —
+    // background None, dolphin's shape.
+    let client = b
+        .create_subwindow(None, frame, 2, 3, 8, 8, 0, visual, None, None)
+        .expect("create client");
+    let client_xid = client.as_raw();
+    b.map_subwindow(None, client_xid).expect("map client");
+
+    // The compositor redirects the FRAME, not the client window.
+    let backing = b
+        .allocate_redirected_backing(None, frame, 16, 16, 32)
+        .expect("allocate backing");
+
+    // The client paints itself green. This resolves through the
+    // frame's route into the backing at (2, 3) — never into the
+    // client's own leaf.
+    b.fill_rectangle(None, client_xid, 0xFF00FF00, 0, 0, 8, 8)
+        .expect("redirected child fill");
+
+    b.release_redirected_backing(None, backing)
+        .expect("release backing");
+
+    // The client window's OWN leaf must now hold the green. Before the
+    // subtree walk this read transparent black across all 64 px, which
+    // is the dolphin symptom exactly.
+    let leaf = b
+        .get_image_pixels_for_tests(client_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image client")
+        .expect("Some client bytes");
+    let mut distinct = std::collections::BTreeMap::<[u8; 4], usize>::new();
+    for px in leaf.chunks_exact(4) {
+        *distinct.entry([px[0], px[1], px[2], px[3]]).or_default() += 1;
+    }
+    assert_eq!(
+        distinct.keys().copied().collect::<Vec<_>>(),
+        vec![[0x00, 0xFF, 0x00, 0xFF]],
+        "after unredirect the reparented child's leaf must hold its own \
+         content (green, BGRA), not a stale/blank leaf: {distinct:?}",
+    );
+}
+
 /// Set up parent-W with a sub-child C at position (2, 3). Redirect
 /// W to backing B. A fill rect at (1, 1, 4, 4) against C's xid must
 /// land at (3, 4, 4, 4) in B — the C-relative offset accumulated
@@ -13871,10 +14049,9 @@ fn the_awesome_wezterm_grow_keeps_the_client_below_the_titlebar() {
 /// #133 investigation — the initial clear of window storage created with
 /// NO background attribute.
 ///
-/// **This test currently FAILS, and that is the point: it is the
-/// reproduction of a defect, not a regression guard.** It is `#[ignore]`d
-/// with the rest of the Vk-gated suite, so `cargo test` stays green;
-/// run it with `--ignored` to see the finding.
+/// Wrote the defect down as a failing test on 2026-09-11 and fixed it
+/// the same day; it is a regression guard now. Kept `#[ignore]`d with
+/// the rest of the Vk-gated suite, so `cargo test` stays green.
 ///
 /// Measured, on this box, for a fresh window that is mapped and never
 /// painted:
@@ -13887,13 +14064,28 @@ fn the_awesome_wezterm_grow_keeps_the_client_below_the_titlebar() {
 /// | `background-pixel = 0x00ff0000` | 32 | `0000ff00` | `0000ff00` ✓ |
 /// | `background-pixel = 0xff00ff00` | 32 | `00ff00ff` | `00ff00ff` ✓ |
 ///
-/// Note `bg_pixel = Some(0)` and `bg_pixel = None` at depth 32 hand
-/// `fill_rect` the **identical** `[0.0, 0.0, 0.0, 0.0]`
-/// (`default_window_init_color`, `decode_x11_pixel_for_storage`), and
-/// only one of them lands — so the colour is not the discriminator, the
-/// code path is. In both failing rows RGB is `0xFF` (the fresh
-/// allocation) while ALPHA is exactly the init colour's alpha, i.e.
-/// something writes the alpha channel and leaves RGB untouched.
+/// The CAUSE, measured by logging the colour that actually reached the
+/// fill: `bg_pixel` arrived as `Some(0x00ff_ffff)` — WHITE — for both
+/// failing rows, and the fill landed all four channels faithfully.
+/// `create_window` stores `0x00ff_ffff` as a PLACEHOLDER when a request
+/// carries no background attribute (`resources.rs`), records the real
+/// state separately in `background_none`, and
+/// `window_resolved_background` honours it by returning `None` — but
+/// the CreateWindow path then defeated that with
+/// `.or_else(|| local.map(|w| w.background_pixel))`, resurrecting the
+/// placeholder. `default_window_init_color`'s `None` branch was
+/// therefore dead for every client window.
+///
+/// Two earlier readings of the same numbers were WRONG, and the trap is
+/// worth keeping on file. Alpha looked meaningful — exactly the init
+/// colour's alpha in both rows, suggesting "something writes alpha and
+/// leaves RGB untouched", and a write-mask hunt followed. It is an
+/// artifact of the placeholder: `decode_x11_pixel_for_storage` takes
+/// alpha from the pixel's top byte, so `0x00ff_ffff` gives `ffffffff` at
+/// depth 24 and `ffffff00` at depth 32 in one pass. And `bg_pixel =
+/// Some(0)` vs `None` at depth 32 do NOT hand `fill_rect` the same
+/// colour, as this comment used to claim: `Some(0)` gives
+/// `[0.0, 0.0, 0.0, 0.0]`, `None` gave white.
 ///
 /// Why it shows as WHITE rather than as transparency: the scene draws
 /// windows with `alpha_passthrough = false`, whose shader forces
