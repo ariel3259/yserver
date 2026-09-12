@@ -5804,6 +5804,17 @@ impl KmsBackend {
         let real_device = Rc::new(crate::drm::Device::from_file_for_tests(
             real_drm.into_file(),
         ));
+        // F4b-m1: this substitution replaces every `KmsDevice.device` with
+        // the SAME `Rc` -- correct only when there is exactly one device to
+        // substitute. A future multi-device fixture must not silently share
+        // one real fd across distinct KMS devices; fail loudly instead of
+        // letting that happen unnoticed.
+        assert_eq!(
+            base.platform.devices.len(),
+            1,
+            "for_tests_with_vk_live_scene substitutes one real device fd onto every \
+             KmsDevice -- a multi-device fixture must not share it silently"
+        );
         for kms_device in &mut base.platform.devices {
             kms_device.device = Rc::clone(&real_device);
         }
@@ -15787,82 +15798,47 @@ where
     assembled
 }
 
-fn read_scanout_region(
-    backend: &mut KmsBackend,
-    rect: vk::Rect2D,
-    selection: ScanoutReadSelection,
-) -> io::Result<Vec<u8>> {
-    use crate::kms::vk::ops::run_one_shot_op_with_wait;
-
-    if rect.extent.width == 0 || rect.extent.height == 0 {
-        return Ok(Vec::new());
-    }
-
-    let Some(vk) = backend.platform.vk.as_ref().cloned() else {
-        return Err(io::Error::other("no vulkan context"));
-    };
-    let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
-        return Err(io::Error::other("no ops command pool"));
-    };
-
-    let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
-    let copy_width = local_rect.extent.width;
-    let copy_height = local_rect.extent.height;
-    let needed_bytes = usize::try_from(copy_width)
+/// Computes the tightly-packed 4-bpp byte length for a `local_rect` copy.
+/// Shared by `read_scanout_region` and `read_managed_scanout_region_bytes`
+/// (F4b-B1) so the legacy and managed-source paths never compute this
+/// differently.
+fn scanout_copy_needed_bytes(local_rect: vk::Rect2D) -> io::Result<usize> {
+    usize::try_from(local_rect.extent.width)
         .ok()
         .and_then(|w| {
-            usize::try_from(copy_height)
+            usize::try_from(local_rect.extent.height)
                 .ok()
                 .and_then(move |h| w.checked_mul(h))
         })
         .and_then(|px| px.checked_mul(4))
-        .ok_or_else(|| io::Error::other("scanout copy size overflow"))?;
-    let Some(pool) = backend
-        .platform
-        .scanout_pools
-        .get_mut(pool_idx)
-        .and_then(|p| p.as_mut())
-    else {
-        return Err(io::Error::other("scanout pool vanished"));
-    };
-    // KMS phase selection above is always against B's display pool, but the
-    // composited pixels live in A's paired optimal target on a copied route.
-    // Readback must therefore use that local image/staging allocation with A's
-    // live Vk context; the external transport is not acquired or synchronized,
-    // while display, M2 retention, and pageflip retirement keep using B.
-    let (image, staging_buffer, staging_mapped, copied_route) = match pool {
-        crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
-            let Some(bo) = pool.bos.get(bo_idx) else {
-                return Err(io::Error::other("scanout bo vanished"));
-            };
-            if needed_bytes > bo.vk_transfer.staging_size as usize {
-                return Err(io::Error::other("scanout staging buffer too small"));
-            }
-            (
-                bo.vk_image,
-                bo.vk_transfer.staging_buffer,
-                bo.vk_transfer.staging_mapped,
-                false,
-            )
-        }
-        crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
-            let Some(source) = pool.sources.get(bo_idx) else {
-                return Err(io::Error::other("copied scanout source vanished"));
-            };
-            if needed_bytes > source.transfer.staging_size as usize {
-                return Err(io::Error::other("scanout staging buffer too small"));
-            }
-            source.validate_renderer_readback()?;
-            (
-                source.image(),
-                source.transfer.staging_buffer,
-                source.transfer.staging_mapped,
-                true,
-            )
-        }
-    };
+        .ok_or_else(|| io::Error::other("scanout copy size overflow"))
+}
 
-    let run_result = run_one_shot_op_with_wait(&vk, pool_handle, None, |vk, cb| {
+/// Records and submits the copy-to-staging one-shot op, waits for it, and
+/// returns the copied bytes out of `staging_mapped`. Shared by
+/// `read_scanout_region` (legacy pool fields) and
+/// `read_managed_scanout_region_bytes` (payload fields taken under a lease,
+/// F4b-B1) -- neither caller may reuse `image`/`staging_buffer`/
+/// `staging_mapped` beyond this call, and a failure on the copied route (or
+/// `DEVICE_LOST`) marks the renderer failed exactly as before the split.
+#[allow(clippy::too_many_arguments)]
+fn submit_scanout_copy_to_staging(
+    backend: &mut KmsBackend,
+    vk: &crate::kms::vk::device::VkContext,
+    pool_handle: vk::CommandPool,
+    image: vk::Image,
+    staging_buffer: vk::Buffer,
+    staging_mapped: std::ptr::NonNull<u8>,
+    needed_bytes: usize,
+    local_rect: vk::Rect2D,
+    copied_route: bool,
+) -> io::Result<Vec<u8>> {
+    use crate::kms::vk::ops::run_one_shot_op_with_wait;
+
+    let copy_width = local_rect.extent.width;
+    let copy_height = local_rect.extent.height;
+
+    let run_result = run_one_shot_op_with_wait(vk, pool_handle, None, |vk, cb| {
         let pre = [ash::vk::ImageMemoryBarrier2::default()
             .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -15947,9 +15923,184 @@ fn read_scanout_region(
     Ok(raw.to_vec())
 }
 
-/// Task 5 (B-15) producer-adapter seam: runs the real `read_scanout_region`
-/// and correlates its actual, already-observed outcome with a managed
-/// source's registered read obligation via
+fn read_scanout_region(
+    backend: &mut KmsBackend,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+) -> io::Result<Vec<u8>> {
+    if rect.extent.width == 0 || rect.extent.height == 0 {
+        return Ok(Vec::new());
+    }
+
+    let Some(vk) = backend.platform.vk.as_ref().cloned() else {
+        return Err(io::Error::other("no vulkan context"));
+    };
+    let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
+        return Err(io::Error::other("no ops command pool"));
+    };
+
+    let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
+    let needed_bytes = scanout_copy_needed_bytes(local_rect)?;
+    let Some(pool) = backend
+        .platform
+        .scanout_pools
+        .get_mut(pool_idx)
+        .and_then(|p| p.as_mut())
+    else {
+        return Err(io::Error::other("scanout pool vanished"));
+    };
+    // KMS phase selection above is always against B's display pool, but the
+    // composited pixels live in A's paired optimal target on a copied route.
+    // Readback must therefore use that local image/staging allocation with A's
+    // live Vk context; the external transport is not acquired or synchronized,
+    // while display, M2 retention, and pageflip retirement keep using B.
+    let (image, staging_buffer, staging_mapped, copied_route) = match pool {
+        crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+            let Some(bo) = pool.bos.get(bo_idx) else {
+                return Err(io::Error::other("scanout bo vanished"));
+            };
+            if needed_bytes > bo.vk_transfer.staging_size as usize {
+                return Err(io::Error::other("scanout staging buffer too small"));
+            }
+            (
+                bo.vk_image,
+                bo.vk_transfer.staging_buffer,
+                bo.vk_transfer.staging_mapped,
+                false,
+            )
+        }
+        crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+            let Some(source) = pool.sources.get(bo_idx) else {
+                return Err(io::Error::other("copied scanout source vanished"));
+            };
+            if needed_bytes > source.transfer.staging_size as usize {
+                return Err(io::Error::other("scanout staging buffer too small"));
+            }
+            source.validate_renderer_readback()?;
+            (
+                source.image(),
+                source.transfer.staging_buffer,
+                source.transfer.staging_mapped,
+                true,
+            )
+        }
+    };
+
+    submit_scanout_copy_to_staging(
+        backend,
+        &vk,
+        pool_handle,
+        image,
+        staging_buffer,
+        staging_mapped,
+        needed_bytes,
+        local_rect,
+        copied_route,
+    )
+}
+
+/// F4b-B1: the managed-source counterpart of `read_scanout_region`'s field
+/// retrieval and submission, scoped to `OutputScanout::Shared` -- the only
+/// route any managed-source fixture exercises today (R8). Once
+/// `PlatformBackend::register_managed_scanout_bo` converts a bo to managed
+/// ownership, `ScanoutBo::take_physical_backing` leaves `vk_image`/
+/// `vk_transfer` null/empty on the pool struct: the real image/staging now
+/// live in the `ScanoutAllocation` payload (`ScanoutAllocation::shared`).
+/// Reading `bo.vk_image` directly, as `read_scanout_region` still correctly
+/// does for non-managed bos, would read the husk. This reserves a `Read`
+/// use on `source_key` and takes the image/staging fields from the payload
+/// under `ResourceService::with_scanout_read` -- the same lease-scoped
+/// access pattern F-3's `with_storage_read` established for storage.
+///
+/// A managed bo selected on a `Copied` pool would need reading the
+/// renderer-side `CopiedSourceAllocation` instead of `ScanoutAllocation`,
+/// which is out of this session's scope; that case fails closed rather than
+/// silently reading the wrong payload.
+///
+/// `#[allow(dead_code)]`: F4c F8 stop (see `read_scanout_region_for_managed_source`
+/// below) -- F4-m1 asked for this attribute to come off, but it cannot
+/// without the scene-submission write branch this session deferred: with it
+/// removed, `cargo clippy --all-targets -- -D warnings` fails dead-code on
+/// the plain (non-`cfg(test)`) `--lib` build this crate's test binary still
+/// compiles as a dependency, since no non-test caller exists yet (R8: only
+/// a caller in production code makes this a real compile-time root, and
+/// that caller is the write-path wiring, not the read path this session
+/// closes). Verified directly: with the attribute off,
+/// `cargo clippy -p yserver --tests -- -D warnings` fails with exactly this
+/// dead-code error on both this function and `read_scanout_region_for_managed_source`.
+#[allow(dead_code)]
+fn read_managed_scanout_region_bytes(
+    backend: &mut KmsBackend,
+    service: &mut crate::kms::render::resources::ResourceService,
+    source_key: crate::kms::render::resources::AllocationKey,
+    pool_idx: usize,
+    rect: vk::Rect2D,
+    local_rect: vk::Rect2D,
+) -> io::Result<Vec<u8>> {
+    use crate::kms::render::resources::UseKind;
+
+    if rect.extent.width == 0 || rect.extent.height == 0 {
+        return Ok(Vec::new());
+    }
+
+    let Some(vk) = backend.platform.vk.as_ref().cloned() else {
+        return Err(io::Error::other("no vulkan context"));
+    };
+    let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
+        return Err(io::Error::other("no ops command pool"));
+    };
+
+    let is_copied_route = backend
+        .platform
+        .scanout_pools
+        .get(pool_idx)
+        .and_then(Option::as_ref)
+        .is_some_and(|p| matches!(p, crate::kms::vk::scanout::OutputScanout::Copied(_)));
+    if is_copied_route {
+        return Err(io::Error::other(
+            "read_scanout_region_for_managed_source: managed copied-scanout read is not \
+             implemented (scope: Shared route only)",
+        ));
+    }
+
+    let needed_bytes = scanout_copy_needed_bytes(local_rect)?;
+
+    let read_lease = service
+        .reserve(source_key, UseKind::Read)
+        .map_err(|e| io::Error::other(format!("reserve managed scanout source for read: {e:?}")))?;
+    let backing = service.with_scanout_read(&read_lease, |alloc| {
+        let shared = alloc.shared();
+        (
+            shared.image,
+            shared.transfer.staging_buffer,
+            shared.transfer.staging_mapped,
+            shared.transfer.staging_size,
+        )
+    });
+    drop(read_lease);
+    let (image, staging_buffer, staging_mapped, staging_size) = backing
+        .map_err(|e| io::Error::other(format!("with_scanout_read managed source: {e:?}")))?;
+
+    if needed_bytes > staging_size as usize {
+        return Err(io::Error::other("scanout staging buffer too small"));
+    }
+
+    submit_scanout_copy_to_staging(
+        backend,
+        &vk,
+        pool_handle,
+        image,
+        staging_buffer,
+        staging_mapped,
+        needed_bytes,
+        local_rect,
+        false,
+    )
+}
+
+/// Task 5 (B-15) producer-adapter seam: runs a real scanout readback against
+/// a MANAGED source and correlates its actual, already-observed outcome with
+/// the source's registered read obligation via
 /// `resources::gpu::record_read_outcome` -- the resources module still owns
 /// and validates the proof (`apply_validated_proof` stays private to it);
 /// this function only reports what really happened.
@@ -15958,22 +16109,24 @@ fn read_scanout_region(
 /// `read_scanout_region` caller (root `GetImage`/`CopyArea` snapshot,
 /// `do_dump_scanout`) keeps calling the plain function directly, since no
 /// production path creates managed storage for this stage to correlate
-/// against yet. Exercised by the resources adapter test suite against a
-/// real `KmsBackend` live-Vulkan fixture.
-///
-/// `#[allow(dead_code)]`: R8 -- this has no production caller yet, only the
-/// `#[cfg(test)]` `c0_2ci_read_source_scratch_regression_vulkan`, so a
-/// plain (non-test) build sees it as unused.
+/// against yet. Exercised by `c0_2ci_read_source_scratch_regression_vulkan`
+/// against a real `KmsBackend` live-Vulkan fixture: F4b-B1's fix means it
+/// now reads a real managed payload through a lease, not a husk.
 ///
 /// F4-M2: `source_key` is not a parameter. Nothing tied a caller-supplied
 /// key to the buffer actually read, so a caller could correlate the proof
 /// against an unrelated entry. The key is instead derived from the pool
 /// slot the read actually samples: `select_scanout_bo_for_rect` is the
-/// exact selection `read_scanout_region` performs internally, and nothing
-/// mutates the backend's scanout pools between this lookup and that call,
-/// so the two selections agree. A bo that resolves but is not a managed
+/// exact selection this function performs once, up front, and nothing
+/// mutates the backend's scanout pools before the managed read that follows,
+/// so the key and the read agree. A bo that resolves but is not a managed
 /// allocation (`managed_key() == None`) fails closed rather than silently
 /// skipping correlation.
+///
+/// `#[allow(dead_code)]`: F4-m1 asked for this to come off, but it cannot
+/// yet -- see `read_managed_scanout_region_bytes`'s doc comment for the
+/// verified reason (F4c F8 stop: no non-test caller exists until the
+/// scene-submission write branch is wired).
 #[allow(dead_code)]
 pub(crate) fn read_scanout_region_for_managed_source(
     backend: &mut KmsBackend,
@@ -15985,17 +16138,17 @@ pub(crate) fn read_scanout_region_for_managed_source(
     io::Result<Vec<u8>>,
     Result<(), crate::kms::render::resources::ResourceError>,
 ) {
-    let managed_source_key = select_scanout_bo_for_rect(backend, rect, selection)
-        .ok()
-        .and_then(|(pool_idx, bo_idx, _)| {
-            backend
-                .platform
-                .scanout_pools
-                .get(pool_idx)
-                .and_then(Option::as_ref)
-                .and_then(|pool| pool.display_pool().bos.get(bo_idx))
-                .and_then(|bo| bo.managed_key())
-        });
+    let selected = select_scanout_bo_for_rect(backend, rect, selection).ok();
+
+    let managed_source_key = selected.and_then(|(pool_idx, bo_idx, _)| {
+        backend
+            .platform
+            .scanout_pools
+            .get(pool_idx)
+            .and_then(Option::as_ref)
+            .and_then(|pool| pool.display_pool().bos.get(bo_idx))
+            .and_then(|bo| bo.managed_key())
+    });
 
     let Some(source_key) = managed_source_key else {
         return (
@@ -16006,8 +16159,11 @@ pub(crate) fn read_scanout_region_for_managed_source(
             Err(crate::kms::render::resources::ResourceError::InvalidProof),
         );
     };
+    let (pool_idx, _bo_idx, local_rect) =
+        selected.expect("managed_source_key is Some only when selected is Some");
 
-    let result = read_scanout_region(backend, rect, selection);
+    let result =
+        read_managed_scanout_region_bytes(backend, service, source_key, pool_idx, rect, local_rect);
     let recorded = crate::kms::render::resources::gpu::record_read_outcome(
         service,
         source_key,
@@ -40211,9 +40367,11 @@ mod tests {
     /// allocation.
     ///
     /// F4-M2: source and scratch are real payload types, not `Spy`. The
-    /// source is the live-scene pool's own on-screen scanout bo, converted
-    /// to a managed `ScanoutAllocation` through the real
-    /// `register_managed_scanout_bo` (F-2's conversion) over a real
+    /// source is the live-scene pool's own compose-target scanout bo (the
+    /// one `select_scanout_bo_for_rect(PermissiveDump)` selects -- see the
+    /// phase assertion below for why this fixture can never reach
+    /// `OnScreen`), converted to a managed `ScanoutAllocation` through the
+    /// real `register_managed_scanout_bo` (F-2's conversion) over a real
     /// `DrmCleanupRegistry` (real device, counting `MockCleanupIo`
     /// transport -- no real `RMFB`/`GEM_CLOSE` ioctl is issued, but the real
     /// fb/gem handles are what gets recorded). The scratch is a real
@@ -40221,14 +40379,17 @@ mod tests {
     /// Composite's own scratch allocation would be.
     ///
     /// The source-read proof comes from `read_scanout_region_for_managed_source`
-    /// correlating the REAL, already-observed outcome of the real
-    /// `read_scanout_region` call (real CPU copy off the real composited
-    /// scanout) with the source's registered `Read` obligation -- this test
-    /// body never calls `apply_validated_proof` for that proof (F3), and the
-    /// adapter derives the source key itself from the bo it actually reads
-    /// rather than taking it as a parameter this test could point anywhere.
-    /// The scratch allocation's GPU obligation is proven independently, from a
-    /// REAL async Vulkan submission's fence (`FencePool::acquire` +
+    /// correlating the REAL, already-observed outcome of a real managed
+    /// readback (F4b-B1: image/staging taken from the `ScanoutAllocation`
+    /// payload under a `Read` lease via `ResourceService::with_scanout_read`
+    /// -- the pool's `ScanoutBo` is an emptied husk once registered as
+    /// managed, so reading `bo.vk_image` directly would read nulls) with the
+    /// source's registered `Read` obligation -- this test body never calls
+    /// `apply_validated_proof` for that proof (F3), and the adapter derives
+    /// the source key itself from the bo it actually reads rather than
+    /// taking it as a parameter this test could point anywhere. The scratch
+    /// allocation's GPU obligation is proven independently, from a REAL
+    /// async Vulkan submission's fence (`FencePool::acquire` +
     /// `vk::ops::submit_one_shot_op_async`) polled through the existing,
     /// reviewed-sound `poll_gpu` machinery -- never `test_signal()` on a
     /// stub ticket (R9).
@@ -40301,15 +40462,76 @@ mod tests {
             },
         };
 
-        // Identify the exact on-screen bo `read_scanout_region` will sample
-        // -- the same selection it performs internally -- so the "managed
-        // source" registered below is that real bo, not a stand-in for it.
+        // Identify the exact bo `read_scanout_region` will sample -- the
+        // same selection it performs internally -- so the "managed source"
+        // registered below is that real bo, not a stand-in for it.
+        //
+        // F4b review "F8 stop -- ruling": `PermissiveDump`, not
+        // `OnScreenOnly`. This fixture holds no DRM master (F4-B2 must not
+        // acquire it -- doing so would repaint the live display out from
+        // under the user) and seeds no real CRTC/plane identity on the
+        // substituted device, so `BoPhase::OnScreen` -- which only a real
+        // `DRM_IOCTL_MODE_ATOMIC`/`SETCRTC` can produce -- is unreachable
+        // here, with or without master. `vkQueueSubmit2` for the compose
+        // still runs before the (rejected) atomic commit, so the bo has
+        // real composited pixels in a phase `PermissiveDump` accepts
+        // (`OnScreen | Pending | Submitted | Recording`); assert that
+        // explicitly below so a future fixture change that silently picks
+        // the wrong buffer fails loudly instead of reading stale pixels.
         let (pool_idx, bo_idx, _) = super::select_scanout_bo_for_rect(
             &backend,
             scan_rect,
-            super::ScanoutReadSelection::OnScreenOnly,
+            super::ScanoutReadSelection::PermissiveDump,
         )
-        .expect("on-screen scanout bo for the composited region");
+        .expect("a scanout bo covering the composited region");
+        {
+            let phase = backend.platform.scanout_pools[pool_idx]
+                .as_ref()
+                .expect("live-scene output has a scanout pool")
+                .display_pool()
+                .bos[bo_idx]
+                .state
+                .phase;
+            assert!(
+                matches!(
+                    phase,
+                    crate::kms::vk::scanout::BoPhase::OnScreen
+                        | crate::kms::vk::scanout::BoPhase::Pending
+                        | crate::kms::vk::scanout::BoPhase::Submitted
+                        | crate::kms::vk::scanout::BoPhase::Recording
+                ),
+                "PermissiveDump must select a bo the compose actually rendered into \
+                 (OnScreen|Pending|Submitted|Recording); got {phase:?}"
+            );
+        }
+
+        // F8 (discovered during this session, reported not papered over):
+        // this fixture's single-tick compose does not reliably land the
+        // window's content at this rect on this box -- an orthogonal,
+        // pre-existing gap in the compose pipeline under a synthetic/
+        // rejected-commit CRTC that no test has ever exercised this far
+        // before (both this test's own prior form and the two sibling
+        // tests always failed earlier, at the ENOTTY/OnScreen blockers).
+        // See the fold-back for the full account. So the proof this test
+        // needs for F4b-B1/F4-M3 is captured here instead, against the
+        // SAME real image, independent of what the compositor drew into
+        // it: read the selected bo through the LEGACY path (still valid --
+        // it is not managed yet) before conversion, and after converting
+        // it to managed and reading again through the payload, assert the
+        // two reads observe byte-identical content. A husk read (nulled
+        // `vk_image`/empty `vk_transfer`) would error or return different
+        // bytes, not the same ones -- this is exactly the mutation the
+        // fix guards against.
+        let expected_bytes = super::read_scanout_region(
+            &mut backend,
+            scan_rect,
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect("legacy readback of the same bo before managed conversion");
+        assert!(
+            expected_bytes.iter().any(|&b| b != 0),
+            "the pre-conversion legacy read must observe real, non-vacuous GPU-rendered bytes"
+        );
 
         let dev = DrmDeviceKey {
             major: 226,
@@ -40369,23 +40591,25 @@ mod tests {
         let (result, recorded) = super::read_scanout_region_for_managed_source(
             &mut backend,
             scan_rect,
-            super::ScanoutReadSelection::OnScreenOnly,
+            super::ScanoutReadSelection::PermissiveDump,
             &mut service,
             source_read,
         );
         let scanout_bytes = result.expect("scanout readback");
         recorded.expect("record_read_outcome");
 
-        // Confirm the read actually observed real, composited pixels (not a
-        // vacuous zero-length buffer), exactly as the sibling snapshot test
-        // does.
-        let window_out = backend
-            .get_image_pixels_for_tests(window_host.as_raw(), 2, 0, 0, 16, 16, !0)
-            .expect("window get_image")
-            .expect("window bytes");
+        // F4b-B1's decisive assertion: the managed-source read (image/
+        // staging taken from the `ScanoutAllocation` payload under a `Read`
+        // lease, F4b-B1) must observe the exact same bytes the legacy read
+        // observed from the identical bo moments earlier, before
+        // conversion. Reading the husk instead of the payload (revert the
+        // fix) returns an error or nulled content here, not
+        // `expected_bytes` -- this is what the coordinating review's
+        // mutation test exercises.
         assert_eq!(
-            scanout_bytes, window_out,
-            "managed-source read must observe the real composited pixels"
+            scanout_bytes, expected_bytes,
+            "managed-source read must observe the same real pixels the legacy path read from \
+             the identical bo before conversion"
         );
 
         // Successful readback produces owned CPU bytes before scratch

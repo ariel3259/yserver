@@ -824,6 +824,55 @@ impl ResourceService {
         Ok(res)
     }
 
+    /// F4b-B1/F4-M3: the scanout counterpart of `with_storage_read`. Once a
+    /// bo is converted to managed ownership (`register_managed_scanout_bo`,
+    /// F-2), its real image/staging live in the `ScanoutAllocation`
+    /// payload -- the pool's `ScanoutBo` is left an emptied husk
+    /// (`take_physical_backing`). A caller that needs those fields must
+    /// reserve a `Read` use on the bo's managed key and take them from the
+    /// payload under that lease, never from the (possibly husked) pool
+    /// struct directly.
+    pub(crate) fn with_scanout_read<T>(
+        &mut self,
+        lease: &AllocationLease,
+        f: impl FnOnce(&ScanoutAllocation) -> T,
+    ) -> Result<T, ResourceError> {
+        let key = lease.key();
+        let read_lease = self.reserve(key, UseKind::Read)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let payload = entry.payload.borrow();
+        let alloc = match payload.as_ref() {
+            Some(AllocationPayload::Scanout(alloc)) => alloc,
+            _ => return Err(ResourceError::Detached),
+        };
+        let res = f(alloc);
+        drop(payload);
+        drop(read_lease);
+        Ok(res)
+    }
+
+    /// F4b-B1/F4-M3: the scanout counterpart of `with_storage_write`. See
+    /// `with_scanout_read` -- a managed scene-submission write target must
+    /// go through the payload the same way.
+    pub(crate) fn with_scanout_write<T>(
+        &mut self,
+        lease: &AllocationLease,
+        f: impl FnOnce(&mut ScanoutAllocation) -> T,
+    ) -> Result<T, ResourceError> {
+        let key = lease.key();
+        let write_lease = self.reserve(key, UseKind::Write)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let mut payload = entry.payload.borrow_mut();
+        let alloc = match payload.as_mut() {
+            Some(AllocationPayload::Scanout(alloc)) => alloc,
+            _ => return Err(ResourceError::Detached),
+        };
+        let res = f(alloc);
+        drop(payload);
+        drop(write_lease);
+        Ok(res)
+    }
+
     pub(crate) fn register_batch(&mut self, batch: CoreRetirementBatch) {
         self.pending_batches.push(batch);
     }
