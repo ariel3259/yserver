@@ -103,3 +103,14 @@ nothing else changes. Plan step 3.3 stays unticked until F-12.
 
 1. F3-B1 — the five `eprintln`+`return` arms become `panic!`. Nothing
    else. Fold back with the verdict line. Then F-4.
+
+## F-3b re-review (`36ab74a7` + fold-back `5c10f7ee`) — ACCEPTED
+
+The five arms are `panic!`s; `grep 'eprintln!("skip'` in `store.rs` is
+zero; diff is 9/14 lines in one file. Gate here: clippy clean, `c0_2ci`
+96/96 with `--include-ignored` (89 deterministic + 7 hardware). Nit,
+not worth a cycle: the fifth arm (dma-buf export unsupported) now says
+"no live Vulkan ICD" — the message could name the real condition. F3-M1,
+F3-m1 and M-19/M-20-promotion remain scheduled for F-10..F-12.
+
+F-4 may start.
