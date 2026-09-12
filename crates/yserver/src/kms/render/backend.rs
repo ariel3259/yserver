@@ -529,7 +529,33 @@ struct DirectPresentFrame {
 /// causes direct/composed atomic thrash.
 const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
 
+/// F5a-M1: the real `DirectOwnershipState` implementor for
+/// `resources::transport::TransportGate`'s M-13 precondition. A clone of
+/// `ScanoutM2State`'s own live cells, kept in sync by `sync_ownership`
+/// (called at `ScanoutM2State`'s own `current`/`pending`/
+/// `queued_successor`/`unflip_requested` mutation sites) -- unlike the
+/// deleted `DirectOwnershipSignal`, nothing outside `ScanoutM2State` ever
+/// needs to remember to publish into this: it is the shadow of fields this
+/// same struct already owns and mutates. Installing a `TransportGate`
+/// against a clone of this handle in production is later work (R8).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScanoutM2OwnershipHandle {
+    busy: Rc<Cell<bool>>,
+    unflip_outstanding: Rc<Cell<bool>>,
+}
+
+impl crate::kms::render::resources::DirectOwnershipState for ScanoutM2OwnershipHandle {
+    fn direct_ownership_busy(&self) -> bool {
+        self.busy.get()
+    }
+
+    fn unflip_outstanding(&self) -> bool {
+        self.unflip_outstanding.get()
+    }
+}
+
 struct ScanoutM2State {
+    ownership: ScanoutM2OwnershipHandle,
     pending: Option<DirectPresentFrame>,
     /// One eligible direct successor, retained while `pending` owns the
     /// hardware transaction. Newer successors replace this slot (latest
@@ -569,6 +595,7 @@ struct ScanoutM2State {
 impl ScanoutM2State {
     fn new() -> Self {
         Self {
+            ownership: ScanoutM2OwnershipHandle::default(),
             pending: None,
             queued_successor: None,
             current: None,
@@ -619,6 +646,19 @@ impl ScanoutM2State {
 
     fn reset_eligible_root_probation(&mut self) {
         self.eligible_root_streak = 0;
+    }
+
+    /// F5a-M1: re-derive the `DirectOwnershipState` answer from this
+    /// struct's own fields and publish it into `ownership`. Called at every
+    /// site that mutates `current`/`pending`/`queued_successor`/
+    /// `unflip_requested`, so a clone of `ownership` held elsewhere (e.g. a
+    /// `TransportGate`) never reads a value this struct itself did not just
+    /// derive from its own truth.
+    fn sync_ownership(&self) {
+        self.ownership.busy.set(
+            self.current.is_some() || self.pending.is_some() || self.queued_successor.is_some(),
+        );
+        self.ownership.unflip_outstanding.set(self.unflip_requested);
     }
 }
 
@@ -1810,6 +1850,16 @@ impl KmsBackend {
         self.resource_service.as_ref()
     }
 
+    /// F5a-M1: a clone of this backend's live direct-ownership cells, for
+    /// installing a `resources::transport::TransportGate` against this
+    /// backend's real `ScanoutM2State` occupancy and unflip lifecycle
+    /// rather than a value nobody keeps current (`DirectOwnershipSignal`,
+    /// deleted). No production caller installs a gate from this yet (R8).
+    #[allow(dead_code)]
+    pub(crate) fn direct_ownership_handle(&self) -> ScanoutM2OwnershipHandle {
+        self.scanout_m2.ownership.clone()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn resource_service_mut(
         &mut self,
@@ -1841,6 +1891,7 @@ impl KmsBackend {
         self.scanout_m2.unflip_requested = true;
         self.scanout_m2.unflip_last_reason = Some(reason);
         self.scanout_m2.hold_direct = false;
+        self.scanout_m2.sync_ownership();
     }
 
     fn direct_frame_references_host_drawable(&self, host_xid: u32) -> bool {
@@ -2037,7 +2088,18 @@ impl KmsBackend {
         let primary = self.platform.primary_device().ok_or_else(|| {
             io::Error::other("direct scanout submitted without an opened KMS device")
         })?;
-        crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)?;
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8).
+        let legacy_write_permitted = self.platform.allows_legacy(
+            &primary.key,
+            crate::kms::render::resources::WriterClass::Primary,
+        );
+        crate::drm::modeset::submit_direct_scanout(
+            &primary.device,
+            fb,
+            &plane_states,
+            legacy_write_permitted,
+        )?;
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
         Ok(())
     }
@@ -2062,6 +2124,7 @@ impl KmsBackend {
                 );
                 self.scanout_m2.pending = Some(successor);
                 self.scanout_m2.hold_direct = true;
+                self.scanout_m2.sync_ownership();
             }
             Err(error) => {
                 log::warn!(
@@ -2102,6 +2165,7 @@ impl KmsBackend {
             self.defer_direct_successor_skip(superseded);
         }
         self.scanout_m2.hold_direct = true;
+        self.scanout_m2.sync_ownership();
         log::debug!(
             "scanout_m2: queued latest direct successor present_id={}",
             self.scanout_m2
@@ -2141,6 +2205,7 @@ impl KmsBackend {
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
         self.scanout_m2.degraded_composed_unflip = false;
+        self.scanout_m2.sync_ownership();
         self.finish_deferred_cow_release();
         log::info!("scanout_m2: stopped after scanout replacement: {reason}");
     }
@@ -2440,7 +2505,17 @@ impl KmsBackend {
         let primary = self.platform.primary_device().ok_or_else(|| {
             io::Error::other("scanout M2: composed unflip requested without a KMS device")
         })?;
-        crate::drm::modeset::submit_composed_scanout(&primary.device, &planes)?;
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8).
+        let legacy_write_permitted = self.platform.allows_legacy(
+            &primary.key,
+            crate::kms::render::resources::WriterClass::Unflip,
+        );
+        crate::drm::modeset::submit_composed_scanout(
+            &primary.device,
+            &planes,
+            legacy_write_permitted,
+        )?;
         self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
             (
@@ -2528,6 +2603,7 @@ impl KmsBackend {
             if let Some(previous) = self.scanout_m2.current.replace(presented) {
                 self.release_direct_frame(previous);
             }
+            self.scanout_m2.sync_ownership();
             log::info!(
                 "scanout_m2: direct frame retired on all outputs source_id={}",
                 self.scanout_m2
@@ -4994,6 +5070,7 @@ impl KmsBackend {
             &crate::drm::Device,
             &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
+            bool,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
         let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
@@ -17514,6 +17591,15 @@ impl KmsBackend {
         let Some(device) = self.platform.device_for_key(device_key) else {
             return Ok(());
         };
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8), checked immediately before the `set_gamma`
+        // ioctl below.
+        if !self.platform.allows_legacy(
+            &device_key,
+            crate::kms::render::resources::WriterClass::Gamma,
+        ) {
+            return Err(crate::drm::transport_gate_refusal("gamma"));
+        }
         device
             .device
             .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
@@ -18984,6 +19070,7 @@ impl Backend for KmsBackend {
         self.scanout_m2.unflip_last_reason = None;
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
+        self.scanout_m2.sync_ownership();
         log::info!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),
@@ -43526,7 +43613,58 @@ mod tests {
             b.scanout_m2.pending = Some(frame);
         }
         b.scanout_m2.hold_direct = true;
+        b.scanout_m2.sync_ownership();
         (source_id, fallback_id, source_pin, fallback_target_pin)
+    }
+
+    /// F5a-M1 decisive test: `direct_ownership_handle()` is a live view of
+    /// this backend's own `ScanoutM2State`, not a value nobody publishes
+    /// (the deleted `DirectOwnershipSignal`). Driving `current` occupied and
+    /// an unflip requested through the real production functions
+    /// (`install_direct_frame_for_target_test` mirrors the real "direct
+    /// frame retired" assignment, `request_direct_unflip`,
+    /// `stop_direct_after_scanout_replaced`) must be visible to a
+    /// `TransportGate` built from a clone of the handle, with no setter
+    /// call on the gate or the handle itself. Mutation check: reverting any
+    /// of the `sync_ownership()` call sites this session added would leave
+    /// `direct_ownership_busy()`/`unflip_outstanding()` stuck at their
+    /// `Default` (`false`) values, and `begin_quiescing()` below would
+    /// wrongly succeed while `current` is still occupied.
+    #[test]
+    fn c0_2ci_scanout_m2_ownership_handle_reflects_real_backend_state() {
+        use crate::kms::render::resources::{ResourceError, TransportGate, TransportState};
+
+        let mut b = super::KmsBackend::for_tests();
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let target_xid = 0x7100;
+        seed_window(&mut b, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        let device = test_device_key(0);
+        let incarnation = IncarnationId::first();
+        let mut gate =
+            TransportGate::new_legacy(device, incarnation, Box::new(b.direct_ownership_handle()));
+
+        // The real unit is `Current`: begin_quiescing refuses without
+        // changing state (R7).
+        assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
+        assert_eq!(gate.state(), TransportState::Legacy);
+
+        // Also request an unflip while still occupied -- a second,
+        // independent real reason to stay Busy.
+        b.request_direct_unflip("c0_2ci_ownership_handle_test");
+        assert!(b.scanout_m2.unflip_requested);
+        assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
+        assert_eq!(gate.state(), TransportState::Legacy);
+
+        // Retire through the real stop path: current vacates and the
+        // unflip retires in the same call.
+        b.stop_direct_after_scanout_replaced("c0_2ci_ownership_handle_test retirement");
+        assert!(!b.scanout_m2.active());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(gate.begin_quiescing().is_ok());
+        assert_eq!(gate.state(), TransportState::Quiescing);
     }
 
     #[test]

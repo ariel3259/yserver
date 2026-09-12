@@ -4568,6 +4568,14 @@ fn tick_one_output(
                 output_key
             ))))
         })?;
+    // B-10/R11: `WriterClass::Primary` for this device -- `true` on every
+    // production device today (no gate installed, R8). Computed here,
+    // before `pool` takes a mutable borrow of `platform.scanout_pools`,
+    // since `allows_legacy` needs `&platform` as a whole.
+    let legacy_write_permitted = platform.allows_legacy(
+        &output_key.device_key,
+        crate::kms::render::resources::WriterClass::Primary,
+    );
     let pool = platform
         .scanout_pools
         .get_mut(output_idx)
@@ -4616,6 +4624,7 @@ fn tick_one_output(
                 &overlay_ops,
                 xor_pipeline,
                 xor_layout,
+                legacy_write_permitted,
             )
             .map(|submitted| {
                 compose_complete = compose_submit_was_complete(submitted, render_scene.draws.len());
@@ -7665,6 +7674,7 @@ fn submit_shared_scanout_frame(
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
+    legacy_write_permitted: bool,
 ) -> Result<ComposeSubmit, PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
@@ -7695,8 +7705,14 @@ fn submit_shared_scanout_frame(
     bo.state.transition_to_submitted(fd);
 
     let mut out_fence: i32 = -1;
-    match crate::drm::page_flip::submit_flip_with_fences(drm, output, fb_handle, fd, &mut out_fence)
-    {
+    match crate::drm::page_flip::submit_flip_with_fences(
+        drm,
+        output,
+        fb_handle,
+        fd,
+        &mut out_fence,
+        legacy_write_permitted,
+    ) {
         Ok(()) => {
             if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
                 // SAFETY: `reclaimed` was inserted by

@@ -884,6 +884,7 @@ fn activate_initial_scanout_outputs(
         &crate::drm::Device,
         &crate::platform::drm::Output,
         ::drm::control::framebuffer::Handle,
+        bool,
     ) -> io::Result<()>,
 ) -> io::Result<Vec<PlatformInitOutput>> {
     let outputs = crate::platform::drm::discover_outputs(device)?;
@@ -919,7 +920,9 @@ fn activate_initial_scanout_outputs(
             break;
         }
         let initial_fb = buffers[0].fb_id();
-        if let Err(err) = commit(device, &output, initial_fb) {
+        // B-10/R11: `true` -- no `PlatformBackend` (and so no transport
+        // gate) exists yet during this construction-time bring-up (R8).
+        if let Err(err) = commit(device, &output, initial_fb, true) {
             bring_up_err = Some(err);
             break;
         }
@@ -931,7 +934,9 @@ fn activate_initial_scanout_outputs(
     }
     if let Some(err) = bring_up_err {
         for done in layouts.iter_mut().rev() {
-            if let Err(disable_err) = drm::modeset::disable_output(device, &done.output) {
+            // B-10/R11: `true` -- no `PlatformBackend` exists yet during
+            // this construction-time rollback either (R8).
+            if let Err(disable_err) = drm::modeset::disable_output(device, &done.output, true) {
                 log::warn!(
                     "initial scanout rollback: failed to disable {}: {disable_err}; \
                      leaving its buffers for DRM-fd close",
@@ -986,6 +991,7 @@ pub(crate) fn platform_init(
         &crate::drm::Device,
         &crate::platform::drm::Output,
         ::drm::control::framebuffer::Handle,
+        bool,
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
     let mut devices = Vec::with_capacity(device_paths.len());
@@ -1123,6 +1129,7 @@ mod platform_init_tests {
         _device: &crate::drm::Device,
         _output: &crate::platform::drm::Output,
         _fb: ::drm::control::framebuffer::Handle,
+        _legacy_write_permitted: bool,
     ) -> io::Result<()> {
         unreachable!("a zero-device platform must not commit an output")
     }

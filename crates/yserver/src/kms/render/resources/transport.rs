@@ -141,64 +141,22 @@ impl HandoverPermit {
 /// over its own real state can influence the answer, and the gate queries
 /// it live on every `begin_quiescing` call rather than caching a value.
 ///
-/// The real backend owner is a small adapter over its own authoritative
-/// state (e.g. the existing direct-scanout `current`/`pending`/
-/// `queued_successor` occupancy and its `unflip_requested` flag) -- wiring
-/// that adapter's update calls into the real scanout/unflip transition
-/// sites, and installing a gate against it in production, is later work
-/// (R8: there is no production issuer of Owner in this stage, so no gate is
-/// installed in production yet either). `#[cfg(test)]` code implements this
-/// trait with an explicit fake that records every query it was asked so a
-/// test can assert the gate actually consulted live state.
+/// The real implementor (F5a-M1) is `backend::ScanoutM2OwnershipHandle`: a
+/// clone of the live cells `ScanoutM2State` itself keeps in sync at its own
+/// `current`/`pending`/`queued_successor`/`unflip_requested` mutation
+/// sites (`sync_ownership`, called after every one of them) -- never a
+/// value some unrelated caller must remember to publish. Installing a gate
+/// against it in production is later work (R8: there is no production
+/// issuer of Owner in this stage, so no gate is installed in production yet
+/// either). `#[cfg(test)]` code implements this trait with an explicit fake
+/// that records every query it was asked so a test can assert the gate
+/// actually consulted live state.
 pub(crate) trait DirectOwnershipState: fmt::Debug {
     /// True while any direct ownership unit (`Current`/`Submitted`/
     /// `Successor`) is occupied for this gate's device.
     fn direct_ownership_busy(&self) -> bool;
     /// True while an unflip has been requested and has not yet retired.
     fn unflip_outstanding(&self) -> bool;
-}
-
-/// Shared live cells a real owner can publish into and keep a clone of, so
-/// it can push its own authoritative transitions in without exposing any
-/// setter on `TransportGate` itself. Not `#[cfg(test)]`: this is the "the
-/// backend implements it" half of M-13's contract -- a real, correctly
-/// typed adapter over shared state, ready for a later stage to construct
-/// from its own direct-scanout/unflip bookkeeping and keep updated at its
-/// own mutation sites. Nothing in this crate installs one against a
-/// production `TransportGate` yet (R8), so it has no non-test caller today,
-/// exactly like `OwnerWriteGrant`'s issuer and `RecipientReservation`.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct DirectOwnershipSignal {
-    busy: Rc<Cell<bool>>,
-    unflip_outstanding: Rc<Cell<bool>>,
-}
-
-impl DirectOwnershipSignal {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Publishes the real direct-ownership occupancy the owner just
-    /// observed (e.g. `any of Current/Submitted/Successor occupied`).
-    pub(crate) fn set_direct_ownership_busy(&self, busy: bool) {
-        self.busy.set(busy);
-    }
-
-    /// Publishes the real unflip-lifecycle state the owner just observed
-    /// (`requested and not yet retired`).
-    pub(crate) fn set_unflip_outstanding(&self, outstanding: bool) {
-        self.unflip_outstanding.set(outstanding);
-    }
-}
-
-impl DirectOwnershipState for DirectOwnershipSignal {
-    fn direct_ownership_busy(&self) -> bool {
-        self.busy.get()
-    }
-
-    fn unflip_outstanding(&self) -> bool {
-        self.unflip_outstanding.get()
-    }
 }
 
 /// Test-only fake (M-13/F4): records how many times each query was asked,
@@ -336,6 +294,39 @@ impl TransportGate {
         self.state == TransportState::Legacy
     }
 
+    /// B-10/R11: the single check every real DRM/helper write sink performs
+    /// immediately before it actually dispatches, composing `allows_legacy`
+    /// with the Owner-writer authority contract (plan-review round-2 M-1)
+    /// so a sink does not have to re-derive it. `Legacy` permits
+    /// unconditionally -- the only route any production caller can reach
+    /// today (R8), so `grant` is always `None` there in practice. `Quiescing`
+    /// and `Closed` refuse every write, matching R7 ("Quiescing permits no
+    /// writer class"). `Owner` requires a `grant` whose own `class` matches
+    /// `class`; a class mismatch refuses without consuming anything (the
+    /// caller's now-unused grant then closes admission when it is dropped,
+    /// per the lost-role-token rule); a matching grant is consumed through
+    /// `consume_owner_write`, which independently enforces device/
+    /// incarnation and force-closes the transport on a foreign one.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn authorize_write(
+        &mut self,
+        class: WriterClass,
+        grant: Option<OwnerWriteGrant>,
+    ) -> Result<(), ResourceError> {
+        match self.state {
+            TransportState::Legacy => Ok(()),
+            TransportState::Quiescing => Err(ResourceError::Busy),
+            TransportState::Closed => Err(ResourceError::Detached),
+            TransportState::Owner => {
+                let grant = grant.ok_or(ResourceError::Detached)?;
+                if grant.class() != class {
+                    return Err(ResourceError::InvalidProof);
+                }
+                self.consume_owner_write(grant).map_err(|(err, _grant)| err)
+            }
+        }
+    }
+
     pub(crate) fn authorize_owner_write(
         &mut self,
         class: WriterClass,
@@ -377,15 +368,32 @@ impl TransportGate {
         if !self.issued_serials.remove(&grant.serial) {
             return Err((ResourceError::InvalidProof, grant));
         }
-        if self.outstanding_owner_writes > 0 {
-            self.outstanding_owner_writes -= 1;
-        }
+        // Minor (round-1 review): a plain `if outstanding > 0 { -= 1 }` masks
+        // an accounting bug (a serial issued and removed above with nothing
+        // to decrement) by silently doing nothing instead of surfacing it.
+        // `issued_serials` and `outstanding_owner_writes` are supposed to
+        // move together; a mismatch here means they already diverged, and
+        // hiding that would let a stuck admission-closed gate look healthy.
+        self.outstanding_owner_writes = match self.outstanding_owner_writes.checked_sub(1) {
+            Some(remaining) => remaining,
+            None => return Err((ResourceError::InvalidState, grant)),
+        };
         grant.consumed.set(true);
         Ok(())
     }
 
     pub(crate) fn outstanding_owner_writes(&self) -> usize {
         self.outstanding_owner_writes
+    }
+
+    /// Test-only: force a desync between `outstanding_owner_writes` and
+    /// `issued_serials` that the normal `authorize_owner_write`/
+    /// `consume_owner_write` pairing can never produce, so the checked-
+    /// subtraction accounting fix (round-1 review minor) is reachable from a
+    /// test at all.
+    #[cfg(test)]
+    pub(crate) fn set_outstanding_owner_writes_for_tests(&mut self, value: usize) {
+        self.outstanding_owner_writes = value;
     }
 
     pub(crate) fn revoke_owner_writes(&mut self) -> usize {

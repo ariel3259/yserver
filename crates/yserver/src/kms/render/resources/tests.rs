@@ -2664,6 +2664,51 @@ fn c0_2ci_transport_gate_owner_write_contract() {
     assert_eq!(gate2.state(), TransportState::Closed);
 }
 
+/// Minor (round-1 review) decisive test: `consume_owner_write`'s
+/// bookkeeping used `if outstanding_owner_writes > 0 { -= 1 }`, which
+/// silently does nothing -- instead of surfacing a bug -- when a serial is
+/// legitimately consumed but the counter has already desynced from
+/// `issued_serials`. That desync cannot happen through the normal
+/// `authorize_owner_write`/`consume_owner_write` pairing, so this test
+/// forces it with the test-only `set_outstanding_owner_writes_for_tests`
+/// backdoor. Mutation check: reverting to the pre-fix
+/// `if outstanding_owner_writes > 0 { -= 1 }` makes this test fail (it
+/// would return `Ok(())` instead of `Err((InvalidState, _))`).
+#[test]
+fn c0_2ci_transport_gate_consume_owner_write_checked_subtraction() {
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
+
+    let grant = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    // Force the desync: the serial above is legitimately issued and about
+    // to be legitimately consumed, but the counter is already at 0.
+    gate.set_outstanding_owner_writes_for_tests(0);
+
+    let (err, returned_grant) = gate.consume_owner_write(grant).unwrap_err();
+    assert_eq!(err, ResourceError::InvalidState);
+    drop(returned_grant);
+    // The counter never wrapped around to `usize::MAX`.
+    assert_eq!(gate.outstanding_owner_writes(), 0);
+}
+
 /// M-14 decisive test: `close()` refuses while a grant is outstanding and
 /// succeeds once the charge is actually resolved (consumed or revoked).
 /// Mutation check: reverting `close()` to unconditionally set `Closed`
@@ -2769,40 +2814,315 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
     assert!(gate.publish_owner(permit).is_ok());
 }
 
-#[test]
-fn c0_2ci_transport_gate_writer_boundary_enforcement() {
-    let device_a = DrmDeviceKey {
-        major: 226,
-        minor: 0,
-    };
-    let device_b = DrmDeviceKey {
-        major: 226,
-        minor: 1,
-    };
-    let incarnation = IncarnationId::first();
+// B-10/R11 (F-5b): `c0_2ci_transport_gate_writer_boundary_enforcement` stood
+// here -- it drove no entry point, asserted `allows_legacy` directly, and
+// its device-B "unrelated device unaffected" claim proved nothing about any
+// real sink. Deleted per the fix handoff; the real per-sink tests
+// (`c0_2ci_sink_*`) beneath the real entry points replace it.
 
-    let mut platform = crate::kms::render::platform::PlatformBackend::for_tests();
-    // Default without gate: allows legacy
-    assert!(platform.allows_legacy(&device_a, WriterClass::Primary));
-    assert!(platform.allows_legacy(&device_b, WriterClass::Primary));
-
-    // Install gate on device_a and quiesce
-    let mut gate_a = TransportGate::new_legacy(
-        device_a,
+/// B-10/R11: a `TransportGate` for `device`/`incarnation`, driven all the
+/// way to `Owner` (Legacy -> Quiescing -> handover -> publish), for tests
+/// that need to mint a real `OwnerWriteGrant` matching a specific device/
+/// incarnation identity.
+fn owner_gate_for_tests(device: DrmDeviceKey, incarnation: IncarnationId) -> TransportGate {
+    let mut gate = TransportGate::new_legacy(
+        device,
         incarnation,
         Box::new(FakeDirectOwnershipState::new()),
     );
-    gate_a.begin_quiescing().unwrap();
-    platform.install_transport_gate(gate_a);
+    gate.begin_quiescing().unwrap();
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
+    gate
+}
 
-    // device_a is now blocked for all legacy writes
-    assert!(!platform.allows_legacy(&device_a, WriterClass::Primary));
-    assert!(!platform.allows_legacy(&device_a, WriterClass::Modeset));
-    assert!(!platform.allows_legacy(&device_a, WriterClass::Cursor));
+/// B-10/R11: a `TransportGate` at `target`, independent of any
+/// `PlatformBackend`. The five `crate::drm::{page_flip,modeset}` sinks
+/// below take a plain `legacy_write_permitted: bool` rather than the gate
+/// itself (R8: no production issuer of `OwnerWriteGrant` exists for these
+/// classes in this stage -- only the executor's "helper mutation" sink,
+/// tested separately, actually consumes a grant), so the gate's own
+/// device/incarnation identity never has to match anything; only
+/// `allows_legacy(class)` -- which is state-only -- is read from it.
+fn sink_gate_at_state(target: TransportState) -> TransportGate {
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    if target == TransportState::Legacy {
+        return gate;
+    }
+    gate.begin_quiescing().unwrap();
+    if target == TransportState::Quiescing {
+        return gate;
+    }
+    if target == TransportState::Owner {
+        let permit = gate
+            .issue_handover_permit(
+                legacy_drained_for_tests(incarnation),
+                &[],
+                &WriterCoverageProof::new_for_tests(),
+                RecipientReservation::new_for_tests(),
+            )
+            .unwrap();
+        gate.publish_owner(permit).unwrap();
+        return gate;
+    }
+    debug_assert_eq!(target, TransportState::Closed);
+    gate.close().unwrap();
+    gate
+}
 
-    // Unrelated device_b remains unchanged (allows legacy)
-    assert!(platform.allows_legacy(&device_b, WriterClass::Primary));
-    assert!(platform.allows_legacy(&device_b, WriterClass::Modeset));
+/// B-10/R11, 6.5a/6.5b: drives `sink` (a real `crate::drm` entry point,
+/// wrapped so every call site here shares one shape) through all four gate
+/// states and asserts the ioctl was reached (real device fd error,
+/// `raw_os_error().is_some()`, since `PlatformBackend::for_tests()`'s
+/// device is a `UnixStream`, not a DRM node) iff the state is `Legacy`.
+/// Mutation check (performed for `disable_output`, representative of all
+/// five): deleting the sink's `if !legacy_write_permitted { return ... }`
+/// makes the non-Legacy assertions fail (`raw_os_error()` becomes `Some`
+/// there too, since the call falls through to the real ioctl).
+fn assert_sink_gated_four_states(
+    class: WriterClass,
+    mut sink: impl FnMut(bool) -> std::io::Result<()>,
+) {
+    for state in [
+        TransportState::Legacy,
+        TransportState::Quiescing,
+        TransportState::Owner,
+        TransportState::Closed,
+    ] {
+        let gate = sink_gate_at_state(state);
+        let permitted = gate.allows_legacy(class);
+        let err = sink(permitted).expect_err("Device::for_tests() never succeeds a real commit");
+        let reached_ioctl = err.raw_os_error().is_some();
+        assert_eq!(
+            reached_ioctl,
+            state == TransportState::Legacy,
+            "state={state:?} class={class:?} permitted={permitted} err={err}",
+        );
+    }
+}
+
+#[test]
+fn c0_2ci_sink_legacy_page_flip_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    assert_sink_gated_four_states(WriterClass::Primary, |permitted| {
+        let mut out_fence = -1;
+        crate::drm::page_flip::submit_flip_with_fences(
+            &device,
+            output,
+            fb,
+            -1,
+            &mut out_fence,
+            permitted,
+        )
+    });
+}
+
+#[test]
+fn c0_2ci_sink_direct_atomic_flip_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    let plane_states = [crate::drm::modeset::DirectScanoutPlaneState {
+        output,
+        src_x: 0,
+        src_y: 0,
+        src_w: 800,
+        src_h: 600,
+    }];
+    assert_sink_gated_four_states(WriterClass::Primary, |permitted| {
+        crate::drm::modeset::submit_direct_scanout(&device, fb, &plane_states, permitted)
+    });
+}
+
+#[test]
+fn c0_2ci_sink_composed_unflip_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    let planes = [crate::drm::modeset::ComposedScanoutPlaneState { output, fb }];
+    assert_sink_gated_four_states(WriterClass::Unflip, |permitted| {
+        crate::drm::modeset::submit_composed_scanout(&device, &planes, permitted)
+    });
+}
+
+#[test]
+fn c0_2ci_sink_modeset_install_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    assert_sink_gated_four_states(WriterClass::Modeset, |permitted| {
+        crate::drm::modeset::commit_modeset(&device, output, fb, permitted)
+    });
+}
+
+#[test]
+fn c0_2ci_sink_output_disable_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    assert_sink_gated_four_states(WriterClass::Modeset, |permitted| {
+        crate::drm::modeset::disable_output(&device, output, permitted)
+    });
+}
+
+/// B-10/R11 (helper mutation): unlike the five DRM sinks above, this sink
+/// is the one this stage actually wires an `OwnerWriteGrant` through --
+/// `KmsIoExecutor::send_authorized`, called via the private
+/// `pub(crate)` wrapper because its signature names the `pub(crate)`
+/// `TransportGate`/`OwnerWriteGrant` types (the public `send`/
+/// `dispatch_blocking_at_boundary` always pass `None`, so no production or
+/// external caller changed shape). Drives the real function four ways
+/// through a real spawned helper subprocess, observing "was the request
+/// actually put on the wire" via `poll_reply()` (a refused
+/// `send_authorized` never touches `in_flight`, so `poll_reply()` returns
+/// `None` immediately -- see `KmsIoExecutor::poll_reply`, line ~865: `let
+/// in_flight = self.in_flight.as_ref()?;`) versus a real accepted outcome
+/// from the helper. Mutation checks: (1) deleting the `authorize_write`
+/// call in `send_authorized` makes the Quiescing case actually dispatch
+/// (`poll_reply()` stops returning `None`); (2) making
+/// `consume_owner_write` not consume (e.g. skip `grant.consumed.set(true)`)
+/// makes the Owner-with-matching-grant case's
+/// `outstanding_owner_writes() == 0` assertion fail.
+#[test]
+fn c0_2ci_sink_helper_mutation_gate_four_way() {
+    use crate::kms::executor::{
+        HostCallReservation, SendError, SubmittingProof,
+        test_support::{self, ScriptedReply},
+    };
+
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let request = test_support::small_atomic_request_for_tests();
+    let reservation = || HostCallReservation::Submitting(SubmittingProof::for_tests());
+
+    // 1. Legacy: `owner_write = None` (what every real call site passes,
+    // R8) -- permitted, the real helper subprocess actually processes it.
+    let mut executor =
+        test_support::spawn_scripted_helper_for_tests(ScriptedReply::Accepted { mask: 0, fds: 0 });
+    executor
+        .send_authorized(&request, reservation(), None)
+        .expect("Legacy (no gate) permits");
+    test_support::wait_readable(
+        executor.control_fd().expect("fd"),
+        std::time::Duration::from_secs(30),
+    );
+    match executor.poll_reply().expect("the real helper replied") {
+        crate::kms::executor::HostCallEvent::Outcome { outcome, .. } => {
+            assert!(
+                matches!(
+                    outcome,
+                    crate::kms::executor::HostCallOutcome::Accepted { .. }
+                ),
+                "expected the real helper to have processed the request: {outcome:?}"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // 2. Quiescing: refused before the wire -- the helper never sees it.
+    let mut executor =
+        test_support::spawn_scripted_helper_for_tests(ScriptedReply::Accepted { mask: 0, fds: 0 });
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+    let dummy_grant =
+        OwnerWriteGrant::reconstruct_for_tests(device, incarnation, WriterClass::HelperMutation, 1);
+    let err = executor
+        .send_authorized(&request, reservation(), Some((&mut gate, dummy_grant)))
+        .unwrap_err();
+    assert_eq!(err, SendError::TransportGateRefused);
+    assert!(
+        executor.poll_reply().is_none(),
+        "a refused send must never have touched `in_flight`"
+    );
+
+    // 3. Owner + matching grant: permitted, and the grant is consumed at
+    // this exact send boundary (R7).
+    let mut executor =
+        test_support::spawn_scripted_helper_for_tests(ScriptedReply::Accepted { mask: 0, fds: 0 });
+    let mut gate = owner_gate_for_tests(device, incarnation);
+    let grant = gate
+        .authorize_owner_write(WriterClass::HelperMutation)
+        .unwrap();
+    assert_eq!(gate.outstanding_owner_writes(), 1);
+    executor
+        .send_authorized(&request, reservation(), Some((&mut gate, grant)))
+        .expect("Owner + matching grant permits");
+    assert_eq!(
+        gate.outstanding_owner_writes(),
+        0,
+        "the grant must be consumed at send, not merely authorized"
+    );
+    test_support::wait_readable(
+        executor.control_fd().expect("fd"),
+        std::time::Duration::from_secs(30),
+    );
+    match executor.poll_reply().expect("the real helper replied") {
+        crate::kms::executor::HostCallEvent::Outcome { outcome, .. } => {
+            assert!(
+                matches!(
+                    outcome,
+                    crate::kms::executor::HostCallOutcome::Accepted { .. }
+                ),
+                "expected the real helper to have processed the request: {outcome:?}"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // 4. Owner + a grant of the wrong class ("without [a valid] grant" for
+    // this class): refused, not consumed -- and per the lost-role-token
+    // rule, dropping the unconsumed grant closes admission.
+    let mut executor =
+        test_support::spawn_scripted_helper_for_tests(ScriptedReply::Accepted { mask: 0, fds: 0 });
+    let mut gate = owner_gate_for_tests(device, incarnation);
+    let wrong_class_grant = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    let err = executor
+        .send_authorized(
+            &request,
+            reservation(),
+            Some((&mut gate, wrong_class_grant)),
+        )
+        .unwrap_err();
+    assert_eq!(err, SendError::TransportGateRefused);
+    assert!(
+        executor.poll_reply().is_none(),
+        "a refused send must never have touched `in_flight`"
+    );
+    assert_eq!(
+        gate.authorize_owner_write(WriterClass::HelperMutation)
+            .unwrap_err(),
+        ResourceError::Detached,
+        "the dropped, unconsumed grant must have closed admission"
+    );
 }
 
 struct TestFenceQuery<F>(F);

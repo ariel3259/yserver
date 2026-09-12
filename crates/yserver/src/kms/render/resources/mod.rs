@@ -70,8 +70,8 @@ pub(crate) use storage::{
 pub(crate) use transport::FakeDirectOwnershipState;
 #[allow(unused_imports)]
 pub(crate) use transport::{
-    DirectOwnershipSignal, DirectOwnershipState, HandoverPermit, OwnerWriteGrant,
-    RecipientReservation, TransportGate, TransportState, WriterClass, WriterCoverageProof,
+    DirectOwnershipState, HandoverPermit, OwnerWriteGrant, RecipientReservation, TransportGate,
+    TransportState, WriterClass, WriterCoverageProof,
 };
 
 #[allow(dead_code, clippy::large_enum_variant)]

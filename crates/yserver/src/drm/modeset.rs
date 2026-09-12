@@ -1129,7 +1129,18 @@ impl PropMap {
     }
 }
 
-pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
+/// B-10/R11: `legacy_write_permitted` is the transport gate's answer for
+/// `WriterClass::Modeset` on this device (disabling an output is a
+/// modesetting write -- it zeroes ACTIVE/MODE_ID), checked immediately
+/// before the atomic commit -- see `crate::drm::transport_gate_refusal`.
+pub fn disable_output(
+    device: &Device,
+    output: &Output,
+    legacy_write_permitted: bool,
+) -> io::Result<()> {
+    if !legacy_write_permitted {
+        return Err(crate::drm::transport_gate_refusal("output-disable"));
+    }
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
 
@@ -1150,11 +1161,18 @@ pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
         })
 }
 
+/// B-10/R11: `legacy_write_permitted` is the transport gate's answer for
+/// `WriterClass::Modeset` on this device, checked immediately before the
+/// atomic commit -- see `crate::drm::transport_gate_refusal`.
 pub fn commit_modeset(
     device: &Device,
     output: &Output,
     fb_id: framebuffer::Handle,
+    legacy_write_permitted: bool,
 ) -> io::Result<()> {
+    if !legacy_write_permitted {
+        return Err(crate::drm::transport_gate_refusal("modeset"));
+    }
     finish_best_effort_modeset(modeset_with_flags(
         device,
         output,
@@ -1626,11 +1644,18 @@ pub(crate) fn probe_direct_scanout_test_only(
 /// The single atomic request is the ownership boundary for M2: before success
 /// the caller retains its Copy fallback; after success it must retain the
 /// client source until every emitted CRTC page-flip event has retired.
+/// B-10/R11: `legacy_write_permitted` is the transport gate's answer for
+/// `WriterClass::Primary` on this device, checked immediately before the
+/// atomic commit below -- see `crate::drm::transport_gate_refusal`.
 pub(crate) fn submit_direct_scanout(
     device: &Device,
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
+    legacy_write_permitted: bool,
 ) -> io::Result<()> {
+    if !legacy_write_permitted {
+        return Err(crate::drm::transport_gate_refusal("direct-scanout"));
+    }
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty plane transaction"));
     }
@@ -1690,10 +1715,18 @@ pub(crate) fn submit_direct_scanout(
 /// Keeping the CRTCs active avoids the visible blackout and cursor-plane
 /// teardown caused by a disable/modeset cycle. The caller retains the direct
 /// source until the page-flip event from every CRTC has arrived.
+/// B-10/R11: `legacy_write_permitted` is the transport gate's answer for
+/// `WriterClass::Unflip` on this device (this is the composed-return write
+/// that ends direct scanout), checked immediately before the atomic commit
+/// below -- see `crate::drm::transport_gate_refusal`.
 pub(crate) fn submit_composed_scanout(
     device: &Device,
     planes: &[ComposedScanoutPlaneState<'_>],
+    legacy_write_permitted: bool,
 ) -> io::Result<()> {
+    if !legacy_write_permitted {
+        return Err(crate::drm::transport_gate_refusal("composed-unflip"));
+    }
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty composed transaction"));
     }
