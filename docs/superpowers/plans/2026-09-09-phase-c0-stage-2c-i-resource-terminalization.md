@@ -1033,11 +1033,37 @@ These are baseline anchors, not permission to stop searching: follow each sink's
 | M-3 (`in_flight` and `correlate_commit` duplicate state; unkeyed `crtcs` loop) | **RESOLVED** — deleted `in_flight` and `correlate_commit` entirely. KMS obligations are tracked solely via `(AllocationKey, ObligationId, GroupMember)` triples on `CommitResources::kms_obligations` and discharged strictly by matching `GroupMember` |
 | M-4 (`discharge_commit_kms_obligations` applies mid-loop with `?` without pre-validation) | **RESOLVED (test: `c0_2ci_commit_discharge_atomic_validate_then_apply_failure_rolls_back`)** — atomic two-pass check: `validate_proof_target` checks all obligations before `apply_validated_proof` applies any of them; failure rolls back cleanly without leaving partial discharges |
 | M-5 (Missing displaced-pair registration adapter before IPC; missing `take_current()`) | **RESOLVED (test: `c0_2ci_commit_register_dependencies_and_pre_ipc_cancellation`)** — implemented `register_commit_dependencies` matching `(allocation, member)` where `new[member] != old[member]`, `cancel_pre_ipc_commit` for exact resource return and registration ownership cancellation on pre-IPC failure, and `take_current()` |
-| M-6 (Task 7.5 / 7.5a Present release half) | **DEFERRED TO F-6b** — per fix-round split, Task 7.5/7.5a (`release_present_source`, `retained_present_wakes`, COW tests in `backend.rs`) is assigned to session F-6b |
+| M-6 (Task 7.5 / 7.5a Present release half) | **RESOLVED (tests: `c0_2ci_present_split_source_fallback_pin_ownership_and_release`, `c0_2ci_present_retained_wakes_move_into_present_release_and_signal`, `c0_2ci_present_release_consumption_and_completion_suppression`, `c0_2ci_cow_deferred_release_and_reclaim_with_physical_contracts`)** — `PresentPinEntry` owns `Option<StorageLease>` and `id: DrawableId`; `release_present_source` drops pin once with `store_decref_with_invalidate`; `retained_present_wakes` moves pinned wake into `PresentRelease` without XID re-lookup; `CommitResourceConsumer` wires `Presented` to emit completion with release retained, `FailedBeforeSubmit` suppresses completion with release retained, and `on_available` drains releasable `PresentRelease` as released; verified complete 6-part physical retirement and re-claim contract without boolean hand-setting |
 | M-15 (`Quarantined` must freeze only this commit's entries and close gate) | **RESOLVED (test: `c0_2ci_commit_quarantined_closes_gate_and_freezes_only_that_commit`)** — `Quarantined { commit }` closes the consumer's `gate_handle` and freezes strictly the entries where `commit_id == Some(commit)` |
 | Minor (`GroupMember::validate_unique` missing) | **RESOLVED (test: `c0_2ci_commit_group_member_validate_unique`)** — `GroupMember::validate_unique` validates CRTC key uniqueness within member sets |
 
-Mutation checks performed and reverted:
+**Fix round 2 (F-6b): `8b0e00d6`.** Session F-6b, Present release half of Task 7, closing M-6 (Tasks 7.5 and 7.5a) per `docs/handoff-phase-c0-stage-2c-i-fix.md` and `docs/superpowers/findings/2026-09-12-stage-2c-i-fix-F6a-review.md`.
+
+Mutation checks performed and reverted in F-6b:
+1. Mutating `release_present_source` by omitting `store_decref_with_invalidate` caused `c0_2ci_present_split_source_fallback_pin_ownership_and_release` to fail (`assertion left == right failed: left: 2, right: 1`).
+2. Mutating `make_present_release` by returning `None` wake instead of removing from `retained_present_wakes` caused `c0_2ci_present_retained_wakes_move_into_present_release_and_signal` to fail (`assertion failed: release.wake.is_some()`).
+3. Mutating `consume` for `Terminal::FailedBeforeSubmit` to set `disp.release = ReleaseDisposition::Released` caused `c0_2ci_present_release_consumption_and_completion_suppression` to fail (`assertion left == right failed: left: Released, right: Retained`).
+
+Gate for F-6b: `cargo +nightly fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test -p yserver --lib c0_2ci` 112 passed/0 failed/10 ignored on clean run and twelve consecutive runs (zero flakes); `cargo test -p yserver --lib c0_2ci -- --ignored` 10 passed/0 failed (hardware run); full `cargo test -p yserver --lib` 1650 passed/0 failed/82 ignored; `cargo check -p yserver --target x86_64-unknown-linux-musl` and `--target x86_64-unknown-freebsd` both clean.
+
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 10 tests
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1722 filtered out; finished in 0.79s
+```
+
+Mutation checks performed and reverted in F-6a:
 1. Mutating `Terminal::Completed` to freeze entries caused `c0_2ci_commit_terminal_completed_does_not_freeze_and_becomes_releasable` to fail (`assertion failed: !service.is_frozen(&old_key)`).
 2. Mutating `Quarantined` to omit `gate.close_gate()` caused `c0_2ci_commit_quarantined_closes_gate_and_freezes_only_that_commit` to fail (`assertion failed: gate_handle.is_closed()`).
 3. Mutating `HardwareComplete` to a no-op discharge caused `c0_2ci_commit_hardware_complete_discharges_old_only` to fail (`assertion failed: !service.has_pending_obligations(&old_a_key)`).
@@ -1132,8 +1158,8 @@ Register the old KMS/GPU dependencies and the consumer's commit correlation befo
 | `Presented` | Consume completion disposition using selected/reference CRTC sample; do not release source, fallback or wake. |
 | `Terminal` | Complete/suppress protocol bookkeeping exactly once according to cause; uncertainty keeps release retained. |
 
-- [ ] **7.5 Split source/fallback pin ownership from numeric protocol handles.** For managed pins the table entry owns `StorageLease` and an invalidation-aware logical decref obligation. `release_present_source` removes that entry once and lets the service run the appropriate cleanup. `retained_present_wakes` moves the actual pinned object into `PresentRelease`. Never look up a reused XID to reconstruct it. Completion suppression consumes FIFO bookkeeping but cannot signal release.
-- [ ] **7.5a Preserve core-owned overlay claims.** `ServerState::cow_claims` is the only logical claim authority; `KmsCore::cow_refcount` no longer exists. Backend overlay methods receive only 0→1 and 1→0 edges. Managed COW/source/fallback leases retain physical allocation after a final logical release until safe unflip/replacement. Do not infer a protocol claim from a surviving lease, and do not clear the sticky failure or duplicate claim counts in the resource consumer.
+- [x] **7.5 Split source/fallback pin ownership from numeric protocol handles.** For managed pins the table entry owns `StorageLease` and an invalidation-aware logical decref obligation. `release_present_source` removes that entry once and lets the service run the appropriate cleanup. `retained_present_wakes` moves the actual pinned object into `PresentRelease`. Never look up a reused XID to reconstruct it. Completion suppression consumes FIFO bookkeeping but cannot signal release.
+- [x] **7.5a Preserve core-owned overlay claims.** `ServerState::cow_claims` is the only logical claim authority; `KmsCore::cow_refcount` no longer exists. Backend overlay methods receive only 0→1 and 1→0 edges. Managed COW/source/fallback leases retain physical allocation after a final logical release until safe unflip/replacement. Do not infer a protocol claim from a surviving lease, and do not clear the sticky failure or duplicate claim counts in the resource consumer.
 
 **Physical-retirement transition (plan-review round-2 M-2).** The baseline already owns this edge in `KmsBackend::deferred_cow_release` ([backend.rs:1164](../../../crates/yserver/src/kms/render/backend.rs:1164)); keep it as the single transition, keyed by the retained identity (`cow_id`/allocation key) rather than by a generation counter, and add no second one in `CommitResourceConsumer`:
 
