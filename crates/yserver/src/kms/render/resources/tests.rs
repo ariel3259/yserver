@@ -2171,9 +2171,17 @@ fn c0_2ci_progress_no_composition() {
     // Active seat with unsignaled ticket: schedules a future deadline (~1ms)
     assert!(service.next_deadline().is_some());
 
-    // Seat inactive (VT-away / DPMS-off): pauses deadline
+    // M-16: seat inactive (VT-away / DPMS-off) pauses the serviced-time
+    // *budget*, not progress -- a real submission can still complete while
+    // the display is dark, and the core loop must keep polling for it or it
+    // is never observed until an unrelated fd happens to wake the loop. The
+    // pre-fix behaviour returned `None` here (conflating "don't count this
+    // time" with "don't look"); the deadline must still be scheduled.
     service.set_seat_active(false, Instant::now());
-    assert!(service.next_deadline().is_none());
+    assert!(
+        service.next_deadline().is_some(),
+        "a pending ticket must still be polled while the seat is inactive (M-16)"
+    );
 
     // Seat returns active
     service.set_seat_active(true, Instant::now());
@@ -2215,21 +2223,26 @@ fn c0_2ci_progress_no_composition() {
     assert!(service.next_deadline().is_none());
 }
 
-#[test]
-fn c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires() {
-    let (mut service, held, drops) = spy_service();
+fn unsignaled_batch(service: &mut ResourceService, held: AllocationLease) {
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
-
     let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
     let mut batch =
         CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
     batch.bind_ticket(GpuObligation::for_tests_stub(vec![(key, gpu)], ticket));
     batch.test_ticket_status = Some(Ok(false));
     service.register_batch(batch);
+}
+
+#[test]
+fn c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires() {
+    let (mut service, held, drops) = spy_service();
 
     let base = Instant::now();
+    // Set the budget BEFORE registering (B-11: the deadline is stamped at
+    // registration from whatever `max_serviced_duration` is then).
     service.max_serviced_duration = std::time::Duration::from_millis(50);
+    unsignaled_batch(&mut service, held);
 
     // Seat goes inactive (VT-away) for 500ms
     service.set_seat_active(false, base);
@@ -2246,6 +2259,108 @@ fn c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires() {
     assert_eq!(exp, Err(ResourceError::Frozen));
     assert_eq!(service.quarantined_batches().len(), 1);
     assert_eq!(service.pending_batches().len(), 0);
+    // B-11: expiry never flips a service-wide `exhausted` -- new admission
+    // must still work after this batch's own deadline passed.
+    assert!(!service.is_exhausted());
+}
+
+/// B-11 decisive test: two batches registered at different points on the
+/// serviced-time timeline expire independently -- each carries its OWN
+/// deadline from its OWN registration, never a single global accumulator
+/// compared against one shared threshold (which would expire every pending
+/// batch in the service at once, regardless of when each actually
+/// registered). Mutation check: replacing the per-batch deadline with the
+/// pre-fix global `serviced_elapsed >= max_serviced_duration` check makes
+/// batch 2 expire alongside batch 1 at t=55ms, failing this test.
+#[test]
+fn c0_2ci_serviced_deadline_is_per_batch_not_global() {
+    let (mut service, held_a, drops_a) = spy_service();
+    let drops_b = Rc::new(Cell::new(0));
+    let held_b = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_b),
+        }))
+        .unwrap();
+
+    let base = Instant::now();
+    service.max_serviced_duration = std::time::Duration::from_millis(50);
+
+    // Batch 1 registers at serviced_elapsed = 0 -> deadline = 50ms.
+    unsignaled_batch(&mut service, held_a);
+
+    // Prime `last_serviced` at t=base (no prior sample to diff against yet,
+    // so this call itself must not advance `serviced_elapsed`).
+    let _ = service.service_completions(base);
+    assert_eq!(service.pending_batches().len(), 1);
+
+    // Advance serviced time by 40ms (batch 1 not yet expired: 40 < 50).
+    let _ = service.service_completions(base + std::time::Duration::from_millis(40));
+    assert_eq!(service.pending_batches().len(), 1);
+    assert_eq!(service.quarantined_batches().len(), 0);
+
+    // Batch 2 registers now, at serviced_elapsed = 40ms -> deadline = 90ms.
+    unsignaled_batch(&mut service, held_b);
+    assert_eq!(service.pending_batches().len(), 2);
+
+    // Advance cumulative serviced time to 55ms: batch 1's 50ms deadline has
+    // passed, batch 2's 90ms deadline has not.
+    let result = service.service_completions(base + std::time::Duration::from_millis(55));
+    assert_eq!(result, Err(ResourceError::Frozen));
+    assert_eq!(
+        service.pending_batches().len(),
+        1,
+        "only batch 2 should remain pending"
+    );
+    assert_eq!(
+        service.quarantined_batches().len(),
+        1,
+        "only batch 1 should have expired"
+    );
+    assert_eq!(drops_a.get(), 0, "quarantine does not drop the allocation");
+    assert_eq!(drops_b.get(), 0);
+    assert!(
+        !service.is_exhausted(),
+        "one batch's expiry must never flip a service-wide exhausted flag"
+    );
+
+    // Advance to 95ms cumulative: batch 2's 90ms deadline has now passed.
+    let result2 = service.service_completions(base + std::time::Duration::from_millis(95));
+    assert_eq!(result2, Err(ResourceError::Frozen));
+    assert_eq!(service.pending_batches().len(), 0);
+    assert_eq!(service.quarantined_batches().len(), 2);
+    assert!(!service.is_exhausted());
+}
+
+/// B-11 decisive test: a batch registered only after 5s of PRIOR service
+/// (some other batch/servicing already consumed that serviced time) is not
+/// expired on its first poll -- its deadline is relative to its OWN
+/// registration, not to when the service started running. Mutation check:
+/// comparing against the pre-fix `serviced_elapsed >= max_serviced_duration`
+/// (a single global counter never reset per batch) would expire this batch
+/// immediately, since `serviced_elapsed` is already past `max_serviced_duration`
+/// by the time it registers.
+#[test]
+fn c0_2ci_serviced_deadline_not_expired_on_first_poll_after_prior_service() {
+    let (mut service, held, drops) = spy_service();
+    let base = Instant::now();
+
+    // Run 5s of prior serviced time with nothing pending.
+    let _ = service.service_completions(base);
+    let _ = service.service_completions(base + std::time::Duration::from_secs(5));
+
+    // Now register a batch; its deadline is 5s (elapsed so far) + 5s
+    // (default max_serviced_duration) = 10s, not `max_serviced_duration`
+    // measured from zero.
+    unsignaled_batch(&mut service, held);
+
+    // First poll, barely after registration: must not be expired.
+    let result = service.service_completions(
+        base + std::time::Duration::from_secs(5) + std::time::Duration::from_millis(1),
+    );
+    assert!(result.is_ok());
+    assert_eq!(service.pending_batches().len(), 1);
+    assert_eq!(service.quarantined_batches().len(), 0);
+    assert_eq!(drops.get(), 0);
 }
 
 #[test]
@@ -2285,6 +2400,18 @@ fn c0_2ci_completion_waiter_registration_and_recheck() {
     assert!(wakes.contains(&ResourceConsumer::DirectCapacity));
 }
 
+/// M-14: a real-shaped `LegacyDrained` proof for `issue_handover_permit`,
+/// matching `incarnation` the way the backend's genuine
+/// `issue_legacy_drained` output would.
+fn legacy_drained_for_tests(
+    incarnation: IncarnationId,
+) -> crate::kms::render::platform::LegacyDrained {
+    crate::kms::render::platform::LegacyDrained {
+        incarnation,
+        lifecycle: LifecycleEpochId::first(),
+    }
+}
+
 #[test]
 fn c0_2ci_transport_gate_vocabulary_and_table() {
     let device = DrmDeviceKey {
@@ -2292,7 +2419,11 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
         minor: 0,
     };
     let incarnation = IncarnationId::first();
-    let mut gate = TransportGate::new_legacy(device, incarnation);
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
 
     // 1. In Legacy: all classes allowed
     for class in [
@@ -2329,6 +2460,8 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
     // 3. In test-only Owner: all classes false
     let permit = gate
         .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
             &WriterCoverageProof::new_for_tests(),
             RecipientReservation::new_for_tests(),
         )
@@ -2350,7 +2483,7 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
     }
 
     // 4. In Closed: all classes false
-    gate.close();
+    gate.close().unwrap();
     assert_eq!(gate.state(), TransportState::Closed);
     for class in [
         WriterClass::Primary,
@@ -2370,6 +2503,16 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
     assert_eq!(gate.begin_quiescing(), Err(ResourceError::Detached));
 }
 
+/// M-13 decisive test: `begin_quiescing`'s Busy precondition reads the real
+/// direct-ownership/unflip state through the `DirectOwnershipState` trait
+/// supplied at construction, not a setter on the gate itself (there is no
+/// `set_direct_scanout_active`/`set_unflip_pending` on `TransportGate` any
+/// more). The fake records every query it was asked, so this test also
+/// proves the gate consults live state on each call rather than a value
+/// cached once. Mutation check: reverting to the pre-fix free-floating
+/// setters would still pass the busy/unblocked assertions below by
+/// construction, but the `busy_query_count`/`unflip_query_count`
+/// assertions would fail (nothing on the gate would ever call them).
 #[test]
 fn c0_2ci_transport_gate_direct_scanout_precondition() {
     let device = DrmDeviceKey {
@@ -2377,23 +2520,31 @@ fn c0_2ci_transport_gate_direct_scanout_precondition() {
         minor: 0,
     };
     let incarnation = IncarnationId::first();
-    let mut gate = TransportGate::new_legacy(device, incarnation);
+    let ownership = FakeDirectOwnershipState::new();
+    let mut gate = TransportGate::new_legacy(device, incarnation, Box::new(ownership.clone()));
 
     // Active direct scanout blocks quiescing
-    gate.set_direct_scanout_active(true);
+    ownership.set_busy(true);
     assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
     assert_eq!(gate.state(), TransportState::Legacy);
 
-    gate.set_direct_scanout_active(false);
+    ownership.set_busy(false);
     // Pending unflip blocks quiescing
-    gate.set_unflip_pending(true);
+    ownership.set_unflip_outstanding(true);
     assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
     assert_eq!(gate.state(), TransportState::Legacy);
 
     // After unflip retires, begin_quiescing succeeds
-    gate.set_unflip_pending(false);
+    ownership.set_unflip_outstanding(false);
     assert!(gate.begin_quiescing().is_ok());
     assert_eq!(gate.state(), TransportState::Quiescing);
+
+    // The gate asked the real state on every attempt (3 calls to
+    // begin_quiescing above; `direct_ownership_busy` is queried every call,
+    // `unflip_outstanding` on every call where busy was already false since
+    // `||` short-circuits), never a cached value.
+    assert!(ownership.busy_query_count() >= 3);
+    assert!(ownership.unflip_query_count() >= 2);
 }
 
 #[test]
@@ -2407,7 +2558,11 @@ fn c0_2ci_transport_gate_owner_write_contract() {
         minor: 1,
     };
     let incarnation = IncarnationId::first();
-    let mut gate = TransportGate::new_legacy(device, incarnation);
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
 
     // Legacy cannot authorize owner write
     assert_eq!(
@@ -2419,6 +2574,8 @@ fn c0_2ci_transport_gate_owner_write_contract() {
     gate.begin_quiescing().unwrap();
     let permit = gate
         .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
             &WriterCoverageProof::new_for_tests(),
             RecipientReservation::new_for_tests(),
         )
@@ -2455,10 +2612,16 @@ fn c0_2ci_transport_gate_owner_write_contract() {
     assert_eq!(gate.state(), TransportState::Closed);
 
     // 3. Test dropped grant leaves charge and closes admission
-    let mut gate2 = TransportGate::new_legacy(device, incarnation);
+    let mut gate2 = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
     gate2.begin_quiescing().unwrap();
     let permit2 = gate2
         .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
             &WriterCoverageProof::new_for_tests(),
             RecipientReservation::new_for_tests(),
         )
@@ -2479,14 +2642,131 @@ fn c0_2ci_transport_gate_owner_write_contract() {
         ResourceError::Detached
     );
 
-    // Outstanding writes block begin_quiescing, close, handover
+    // M-14: outstanding writes block begin_quiescing AND close.
     assert_eq!(gate2.begin_quiescing(), Err(ResourceError::Busy));
+    assert_eq!(gate2.close(), Err(ResourceError::Busy));
+    assert_eq!(
+        gate2.state(),
+        TransportState::Owner,
+        "a refused close must not change state"
+    );
 
     // revoke_owner_writes clears the charge and restores admission
     let revoked = gate2.revoke_owner_writes();
     assert_eq!(revoked, 1);
     assert_eq!(gate2.outstanding_owner_writes(), 0);
-    assert!(gate2.authorize_owner_write(WriterClass::Cursor).is_ok());
+    let grant3 = gate2.authorize_owner_write(WriterClass::Cursor).unwrap();
+    // Consuming it (rather than dropping it) leaves nothing outstanding, so
+    // close() succeeds.
+    gate2.consume_owner_write(grant3).unwrap();
+    assert_eq!(gate2.outstanding_owner_writes(), 0);
+    assert!(gate2.close().is_ok());
+    assert_eq!(gate2.state(), TransportState::Closed);
+}
+
+/// M-14 decisive test: `close()` refuses while a grant is outstanding and
+/// succeeds once the charge is actually resolved (consumed or revoked).
+/// Mutation check: reverting `close()` to unconditionally set `Closed`
+/// (its pre-fix shape) makes the first assertion below fail.
+#[test]
+fn c0_2ci_transport_gate_close_refuses_outstanding_grants() {
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
+
+    let grant = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    assert_eq!(gate.outstanding_owner_writes(), 1);
+
+    // Refuses while the grant is outstanding, and does not change state.
+    assert_eq!(gate.close(), Err(ResourceError::Busy));
+    assert_eq!(gate.state(), TransportState::Owner);
+
+    // Consuming the grant clears the charge; close now succeeds.
+    gate.consume_owner_write(grant).unwrap();
+    assert_eq!(gate.outstanding_owner_writes(), 0);
+    assert!(gate.close().is_ok());
+    assert_eq!(gate.state(), TransportState::Closed);
+}
+
+/// M-14 decisive test: `issue_handover_permit` refuses a `LegacyDrained`
+/// proof for a foreign incarnation, and refuses when the final drain
+/// dispositions include a backend failure -- it no longer accepts whatever
+/// the caller claims (R9: proofs are never fabricated). Mutation check:
+/// dropping either check makes the corresponding assertion below fail.
+#[test]
+fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
+    use crate::kms::render::backend::{LegacyEventCancellation, LegacyEventDisposition};
+
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let foreign_incarnation = IncarnationId::from_raw(incarnation.get() + 1);
+
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+
+    // Foreign incarnation's proof is refused.
+    let err = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(foreign_incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap_err();
+    assert_eq!(err, ResourceError::WrongIncarnation);
+    assert_eq!(
+        gate.state(),
+        TransportState::Quiescing,
+        "a refused permit must not change state"
+    );
+
+    // A backend failure among the final dispositions is refused too.
+    let err2 = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[LegacyEventDisposition::Cancelled(
+                LegacyEventCancellation::BackendFailure,
+            )],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap_err();
+    assert_eq!(err2, ResourceError::InvalidProof);
+
+    // The real proof with only non-failure dispositions succeeds.
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[LegacyEventDisposition::Applied],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    assert!(gate.publish_owner(permit).is_ok());
 }
 
 #[test]
@@ -2507,7 +2787,11 @@ fn c0_2ci_transport_gate_writer_boundary_enforcement() {
     assert!(platform.allows_legacy(&device_b, WriterClass::Primary));
 
     // Install gate on device_a and quiesce
-    let mut gate_a = TransportGate::new_legacy(device_a, incarnation);
+    let mut gate_a = TransportGate::new_legacy(
+        device_a,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
     gate_a.begin_quiescing().unwrap();
     platform.install_transport_gate(gate_a);
 

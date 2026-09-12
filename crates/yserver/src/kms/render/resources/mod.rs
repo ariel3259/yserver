@@ -47,8 +47,13 @@ pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation};
 #[allow(unused_imports)]
 pub(crate) use handoff::{
     CompletionIngress, DeviceBarrier, HandoffRouter, IncarnationBundle, KmsDisposition,
-    RecipientSlot, RetainingSupervisor, TeardownRelease,
+    RecipientSlot, TeardownRelease,
 };
+// B-6: `RetainingSupervisor` is a test fixture (handoff.rs) -- only visible
+// under `#[cfg(test)]`, same as everything that constructs one.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use handoff::RetainingSupervisor;
 pub(crate) use lease::AllocationLease;
 #[allow(unused_imports)]
 pub use present::{CompletionDisposition, PresentDisposition, PresentKey, ReleaseDisposition};
@@ -60,10 +65,13 @@ pub(crate) use scanout::{
 pub(crate) use storage::{
     PixelIdentity, StorageAccessError, StorageAllocation, StorageBacking, StorageLease,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use transport::FakeDirectOwnershipState;
 #[allow(unused_imports)]
 pub(crate) use transport::{
-    HandoverPermit, OwnerWriteGrant, RecipientReservation, TransportGate, TransportState,
-    WriterClass, WriterCoverageProof,
+    DirectOwnershipSignal, DirectOwnershipState, HandoverPermit, OwnerWriteGrant,
+    RecipientReservation, TransportGate, TransportState, WriterClass, WriterCoverageProof,
 };
 
 #[allow(dead_code, clippy::large_enum_variant)]
@@ -228,8 +236,22 @@ impl ResourceService {
         &mut self.waiters
     }
 
+    /// M-16: progress (polling an already-signalled ticket) is never
+    /// suppressed by seat inactivity -- only the serviced-time *budget*
+    /// pauses (`service_completions` below gates its `serviced_elapsed`
+    /// advance on `seat_active`). A pending batch's deadline is therefore
+    /// returned regardless of `seat_active`: without it, `next_wakeup`
+    /// (which chains this unconditionally) would return `None` while
+    /// VT-away/DPMS-off with nothing else pending, and the core loop could
+    /// block in `poll()` with no timeout -- so a ticket that signals during
+    /// that window is never observed until an unrelated fd wakes the loop.
+    /// The pre-fix behaviour (`None` while inactive) is exactly the defect:
+    /// it conflated "don't count this time toward the expiry budget" with
+    /// "don't bother looking again," which are different things (R9: the
+    /// pending deadline counts serviced time and pauses while the seat is
+    /// inactive -- servicing itself does not).
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        if self.pending_batches.is_empty() || !self.seat_active {
+        if self.pending_batches.is_empty() {
             return None;
         }
         Some(Instant::now() + std::time::Duration::from_millis(1))
@@ -247,15 +269,26 @@ impl ResourceService {
             self.last_serviced = Some(now);
         }
 
-        // Check timeout on pending batches
-        if self.serviced_elapsed >= self.max_serviced_duration && !self.pending_batches.is_empty() {
-            // Expiry in serviced time: freeze all pending batches, close converted admission
-            let expired_batches = std::mem::take(&mut self.pending_batches);
-            for batch in expired_batches {
-                self.quarantine_gpu_batch(batch, ResourceError::Frozen);
+        // B-11: each pending batch carries its own serviced-time deadline,
+        // computed from its own registration (`register_batch`). Expiry
+        // quarantines only that batch -- never a service-wide `exhausted`
+        // flip, and never by comparing a single global accumulator against
+        // one shared threshold, which would expire every batch in the
+        // service at once regardless of when each was actually registered.
+        let mut still_pending = Vec::with_capacity(self.pending_batches.len());
+        let mut expired = Vec::new();
+        for batch in std::mem::take(&mut self.pending_batches) {
+            match batch.serviced_deadline {
+                Some(deadline) if self.serviced_elapsed >= deadline => expired.push(batch),
+                _ => still_pending.push(batch),
             }
-            self.exhausted = true;
-            return Err(ResourceError::Frozen);
+        }
+        self.pending_batches = still_pending;
+        let any_expired = !expired.is_empty();
+        for batch in expired {
+            // Expiry is never a completion proof (R9): the batch stays
+            // rooted for teardown, exactly like a failed ticket.
+            self.quarantine_gpu_batch(batch, ResourceError::Frozen);
         }
 
         let poll_result = self.poll_gpu(now);
@@ -265,6 +298,10 @@ impl ResourceService {
 
         for key in &available_keys {
             self.waiters.notify_eligible(key.generation);
+        }
+
+        if any_expired {
+            return Err(ResourceError::Frozen);
         }
 
         poll_result.map(|_| available_keys)
@@ -873,8 +910,27 @@ impl ResourceService {
         Ok(res)
     }
 
-    pub(crate) fn register_batch(&mut self, batch: CoreRetirementBatch) {
-        self.pending_batches.push(batch);
+    /// B-11: stamps `batch` with its own serviced-time deadline --
+    /// `serviced_elapsed` (this service's cumulative *serviced* time, as of
+    /// right now) plus `max_serviced_duration`, both with checked
+    /// arithmetic. That deadline is fixed at registration and never
+    /// re-derived from a shared/global counter later, so this batch's
+    /// expiry depends only on how much serviced time passes *after* it
+    /// registers -- never on how much service time other, earlier batches
+    /// already consumed. A checked-add overflow (an unrepresentable
+    /// deadline) fails closed: the batch is quarantined immediately rather
+    /// than admitted to `pending_batches` to be polled forever.
+    pub(crate) fn register_batch(&mut self, mut batch: CoreRetirementBatch) {
+        match self
+            .serviced_elapsed
+            .checked_add(self.max_serviced_duration)
+        {
+            Some(deadline) => {
+                batch.serviced_deadline = Some(deadline);
+                self.pending_batches.push(batch);
+            }
+            None => self.quarantine_gpu_batch(batch, ResourceError::Frozen),
+        }
     }
 
     pub(crate) fn pending_batches(&self) -> &[CoreRetirementBatch] {

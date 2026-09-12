@@ -17818,6 +17818,16 @@ impl KmsBackend {
         }
 
         let proof = proof_res?;
+        // Task 6.5/M-14: connect to the transport gate, inert under Legacy
+        // (no gate installed -> always permits) since nothing installs one
+        // in production yet (R8). A refusal here happens before the owner
+        // route changes below.
+        if !self.platform.legacy_transport_gate_permits_finish(&key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "transport gate has already progressed past legacy for this device",
+            ));
+        }
         let owner = self.platform.owner_for(key).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "device owner not found")
         })?;
@@ -19479,6 +19489,13 @@ impl Backend for KmsBackend {
         self.pause_input_thread();
         log::info!("kms: VT release — input paused; run_suspend");
         self.drive_vt_event(state, VtEventKind::Disable);
+        // B-11: pause the resource service's serviced-time budget for the
+        // duration of the VT switch -- a long switch must not count toward
+        // any pending batch's deadline (R9). Inert when no service exists
+        // (R8: nothing installs one in production yet).
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(false, std::time::Instant::now());
+        }
         log::info!("kms: VT release — suspended; drmDropMaster");
         for device in &self.platform.devices {
             if let Err(err) = device.device.release_master_lock() {
@@ -19546,6 +19563,13 @@ impl Backend for KmsBackend {
                 self.vt_state
             );
             return;
+        }
+        // B-11: resume the resource service's serviced-time budget now that
+        // the VT switch is genuinely done (Active reached above) -- pending
+        // batches' deadlines start counting again from here, not from
+        // whenever the fd happened to signal. Inert when no service exists.
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(true, std::time::Instant::now());
         }
         log::info!("kms: VT acquire — resumed; resume input");
         self.resume_input_thread();
@@ -27154,6 +27178,11 @@ impl Backend for KmsBackend {
             self.scene.wake_for_damage();
             if res.is_ok() {
                 self.kms_outputs_active = !self.platform.outputs.is_empty();
+                // B-11: outputs are back on -- resume the resource service's
+                // serviced-time budget. Inert when no service exists (R8).
+                if let Some(service) = self.resource_service.as_mut() {
+                    service.set_seat_active(true, std::time::Instant::now());
+                }
             }
             res
         } else {
@@ -27203,6 +27232,12 @@ impl Backend for KmsBackend {
                 return Err(error);
             }
             self.kms_outputs_active = false;
+            // B-11: outputs are dark -- pause the resource service's
+            // serviced-time budget (R9: a batch's deadline must not count
+            // display-dark time). Inert when no service exists (R8).
+            if let Some(service) = self.resource_service.as_mut() {
+                service.set_seat_active(false, std::time::Instant::now());
+            }
             if let Some(error) = direct_shadow_error {
                 log::error!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}; exiting");
                 self.request_exit();
@@ -28821,6 +28856,94 @@ mod tests {
         assert!(
             b.next_wakeup().is_none(),
             "dirty scene must not busy-wake while scanout is disallowed",
+        );
+    }
+
+    /// M-16/6.1 decisive test, on the real core-loop backend fixture
+    /// (`KmsBackend::for_tests()` is the `Backend` implementor `run_core`
+    /// drives): with VT-away, DPMS-off and no damage -- every composition
+    /// gate closed -- a registered, unsignaled ticket must still be polled
+    /// through the real `before_block`/`next_wakeup` completion callbacks,
+    /// and signalling it must make the allocation available, with no scene
+    /// submission ever occurring. Mutation check: reverting
+    /// `ResourceService::next_deadline` to return `None` while the seat is
+    /// inactive (the pre-fix shape) makes the first assertion below fail.
+    #[test]
+    fn c0_2ci_progress_no_composition_on_core_loop_fake_backend() {
+        use crate::{
+            kms::render::resources::{
+                AllocationPayload, CoreRetirementBatch, GpuObligation, ObligationKind,
+                ResourceService, tests::SpyAllocation,
+            },
+            platform::drm::DrmDeviceKey,
+            vt::state::VtState,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        let mut b = KmsBackend::for_tests();
+
+        // Every composition gate closed: VT-away, DPMS-off, no damage.
+        b.vt_state = VtState::Suspended;
+        b.kms_outputs_active = false;
+        b.scene.scene_structure_dirty = false;
+
+        let device = DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device, incarnation);
+
+        let drops = Rc::new(Cell::new(0));
+        let held = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        let key = held.key();
+        let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+        let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+        let mut batch = CoreRetirementBatch::new(vec![held], Vec::new(), true);
+        batch.bind_ticket(GpuObligation::for_tests_stub(vec![(key, gpu)], ticket));
+        batch.test_ticket_status = Some(Ok(false));
+        service.register_batch(batch);
+        b.install_resource_service(service);
+
+        // M-16: progress must not be suppressed by seat inactivity -- only
+        // the serviced-time budget pauses. `next_wakeup` chains
+        // `ResourceService::next_deadline` unconditionally.
+        assert!(
+            b.next_wakeup().is_some(),
+            "a pending ticket must still be polled while composition is gated off (M-16)"
+        );
+
+        // `before_block` is the real production completion callback (also
+        // driven every core-loop iteration by `run_core`'s block handler).
+        // The allocation is not yet available: the ticket has not signalled.
+        b.before_block();
+        assert!(b.resource_service().unwrap().contains(&key));
+        assert_eq!(drops.get(), 0);
+
+        // Signal the ticket and drive the same real callback again.
+        b.resource_service_mut().unwrap().pending_batches_mut()[0].test_ticket_status =
+            Some(Ok(true));
+        b.before_block();
+
+        assert!(!b.resource_service().unwrap().contains(&key));
+        assert_eq!(
+            drops.get(),
+            1,
+            "the allocation must be destroyed exactly once"
+        );
+
+        // No scene submission occurred: every composition gate stayed
+        // closed the whole time, and nothing here ever called
+        // `composite_and_flip`/`maybe_composite`.
+        assert!(!b.scanout_allowed(), "VT must still be Suspended");
+        assert!(!b.kms_outputs_active, "DPMS must still be off");
+        assert!(
+            !b.scene.scene_structure_dirty,
+            "no damage was ever armed, so nothing needed composing"
         );
     }
 

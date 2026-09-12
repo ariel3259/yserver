@@ -312,10 +312,13 @@ fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress() {
         ticket,
     ));
     batch.test_ticket_status = Some(Ok(false));
-    dummy_service.register_batch(batch);
 
     let start = Instant::now();
+    // B-11: the budget must be set BEFORE registering -- the batch's
+    // deadline is stamped from `max_serviced_duration` as of its own
+    // registration, not re-read from a mutable field on every poll.
     dummy_service.max_serviced_duration = Duration::from_millis(50);
+    dummy_service.register_batch(batch);
 
     // VT away pauses serviced elapsed time
     dummy_service.set_seat_active(false, start);

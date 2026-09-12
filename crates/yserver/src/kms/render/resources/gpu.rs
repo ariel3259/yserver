@@ -147,6 +147,21 @@ pub(crate) struct CoreRetirementBatch {
     pub(crate) obligation: Option<GpuObligation>,
     pub(crate) read_obligation: Option<ReadObligation>,
     pub(crate) possibly_dispatched: bool,
+    /// B-11: this batch's own serviced-time expiry, an absolute point on
+    /// the service's cumulative `serviced_elapsed` timeline computed with
+    /// checked arithmetic at registration (`ResourceService::register_batch`)
+    /// as `serviced_elapsed_at_registration + max_serviced_duration`. Never
+    /// compared against wall-clock time and never a second, independent
+    /// `serviced_elapsed` counter: `service_completions` advances the one
+    /// service-wide `serviced_elapsed` (paused while the seat is inactive,
+    /// R9) and then checks each pending batch's own deadline against it, so
+    /// two batches registered at different serviced times expire
+    /// independently and expiry quarantines only the batch whose deadline
+    /// passed -- never a service-wide `exhausted` flip. `None` means the
+    /// checked addition overflowed at registration (unrepresentable
+    /// deadline): such a batch is quarantined immediately rather than
+    /// polled forever.
+    pub(crate) serviced_deadline: Option<std::time::Duration>,
     /// Test hook for controlled mock ticket status query.
     #[cfg(test)]
     pub(crate) test_ticket_status: Option<Result<bool, ash::vk::Result>>,
@@ -165,6 +180,7 @@ impl fmt::Debug for CoreRetirementBatch {
             .field("has_obligation", &self.obligation.is_some())
             .field("has_read_obligation", &self.read_obligation.is_some())
             .field("possibly_dispatched", &self.possibly_dispatched)
+            .field("serviced_deadline", &self.serviced_deadline)
             .finish()
     }
 }
@@ -181,6 +197,7 @@ impl CoreRetirementBatch {
             obligation: None,
             read_obligation: None,
             possibly_dispatched,
+            serviced_deadline: None,
             #[cfg(test)]
             test_ticket_status: None,
             #[cfg(test)]

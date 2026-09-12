@@ -3185,6 +3185,30 @@ impl PlatformBackend {
             .unwrap_or(true)
     }
 
+    /// Task 6.5/M-14: whether `try_finish_legacy_transport` may finish an
+    /// ordinary legacy drain for `device` here. A device with no installed
+    /// gate is implicitly `Legacy` and always drainable -- this is
+    /// currently every production device (R8: nothing installs a gate in
+    /// production yet, so this check is inert there). An installed gate
+    /// (test-only today) that has already progressed to `Owner` or
+    /// `Closed` means the owner route has moved on without all production
+    /// prerequisites having gone through this call, and finishing a legacy
+    /// drain again here would change that route out from under it -- so
+    /// this returns a refusal instead.
+    pub(crate) fn legacy_transport_gate_permits_finish(
+        &self,
+        device: &crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        match self.transport_gates.get(device) {
+            None => true,
+            Some(gate) => matches!(
+                gate.state(),
+                crate::kms::render::resources::TransportState::Legacy
+                    | crate::kms::render::resources::TransportState::Quiescing
+            ),
+        }
+    }
+
     /// Attach a live Vulkan context to the headless test fixture while
     /// preserving the renderer-inventory invariant used by production.
     pub(crate) fn attach_test_vk_context(&mut self, vk: Arc<VkContext>) {
@@ -7650,6 +7674,59 @@ mod tests {
             owner.finish_legacy_transport(repeated),
             Err(DispatchError::InvalidLegacyDrainProof)
         ));
+    }
+
+    /// M-14/6.5 decisive test: `legacy_transport_gate_permits_finish` is
+    /// inert (always `true`) for a device with no installed gate -- the
+    /// production case today (R8) -- and refuses once an installed gate has
+    /// progressed past `Legacy`/`Quiescing`. Mutation check: reverting
+    /// `try_finish_legacy_transport` to skip this check entirely would let
+    /// it proceed regardless, which this unit test on the underlying
+    /// predicate would still catch since it exercises the predicate
+    /// directly.
+    #[test]
+    fn legacy_transport_gate_permits_finish_inert_without_a_gate_and_refuses_past_legacy() {
+        use crate::kms::{
+            owner::identity::IncarnationId,
+            render::resources::{FakeDirectOwnershipState, TransportGate},
+        };
+
+        let device = drm_key(9);
+        let incarnation = IncarnationId::first();
+        let platform = PlatformBackend::for_tests();
+
+        // No gate installed: inert, always permits (today's production
+        // shape -- R8, nothing installs a gate yet).
+        assert!(platform.legacy_transport_gate_permits_finish(&device));
+
+        let mut platform = PlatformBackend::for_tests();
+        let gate = TransportGate::new_legacy(
+            device,
+            incarnation,
+            Box::new(FakeDirectOwnershipState::new()),
+        );
+        // Legacy: permits.
+        platform.install_transport_gate(gate);
+        assert!(platform.legacy_transport_gate_permits_finish(&device));
+
+        // Quiescing: still permits (drain still in progress).
+        platform
+            .transport_gate_mut(&device)
+            .unwrap()
+            .begin_quiescing()
+            .unwrap();
+        assert!(platform.legacy_transport_gate_permits_finish(&device));
+
+        // Closed: refuses -- the route has already moved on.
+        platform
+            .transport_gate_mut(&device)
+            .unwrap()
+            .close()
+            .unwrap();
+        assert!(!platform.legacy_transport_gate_permits_finish(&device));
+
+        // An unrelated device with no gate remains unaffected.
+        assert!(platform.legacy_transport_gate_permits_finish(&drm_key(10)));
     }
 
     #[test]
