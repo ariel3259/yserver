@@ -3587,38 +3587,158 @@ fn c0_2ci_commit_topology_replacement_reused_numeric_crtc() {
 }
 
 #[test]
-fn c0_2ci_cow_deferred_release_and_reclaim() {
-    use yserver_core::backend::Backend;
+fn c0_2ci_present_release_consumption_and_completion_suppression() {
+    use crate::kms::{
+        owner::{
+            device::OwnerEvent,
+            identity::{CommitId, IncarnationId},
+            record::TerminalState,
+        },
+        render::{
+            platform::CrtcKey,
+            present_completion::PinnedWake,
+            resources::{
+                commit::{CommitResourceConsumer, CommitResources, GroupMember, PresentRelease},
+                present::{
+                    CompletionDisposition, PresentDisposition, PresentKey, ReleaseDisposition,
+                },
+            },
+        },
+    };
+    use yserver_core::backend::{CompletedPresentEvent, PresentWake};
 
-    let mut backend = crate::kms::render::KmsBackend::for_tests();
+    let (mut service, old_alloc, _drops_old) = spy_service();
+    let old_key = old_alloc.key();
 
-    // 0 -> 1 claim edge allocates COW
-    assert!(backend.cow_id.is_none());
-    assert!(
-        backend
-            .get_overlay_window(None)
-            .expect("get_overlay_window")
+    let drops_new = Rc::new(Cell::new(0));
+    let new_alloc = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_new),
+        }))
+        .unwrap();
+
+    let crtc = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
     );
-    let first_id = backend.cow_id.expect("cow_id allocated");
-    assert!(!backend.deferred_cow_release);
+    let member = GroupMember::new(crtc, 1, 1);
+    let commit_1 = CommitId::for_tests(10);
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::from_raw(1);
 
-    // Simulate direct scanout holding frame: 1 -> 0 edge defers release
-    backend.deferred_cow_release = true;
+    let event1 = CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(1),
+        serial: 1,
+        host_xid: 0x100,
+        dst_host_xid: 0x200,
+        options: 0,
+        present_id: 101,
+        window_generation: 0,
+        crtc_id: 1,
+        crtc_epoch: 1,
+        msc_offset: 0,
+        completion_clock: None,
+        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        completion_mode: 0,
+        emit_idle: true,
+    };
+    let release1 = PresentRelease::new(event1, Some(PinnedWake::None));
+    let present_key1 = PresentKey::new(device_key, incarnation, commit_1, 101);
 
-    // Subsequent 0 -> 1 while deferred_cow_release holds:
-    // Reuses the retained cow_id / StorageLease identity without new allocation
-    assert!(
-        backend
-            .get_overlay_window(None)
-            .expect("get_overlay_window re-claim")
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.record_present_disposition(present_key1, PresentDisposition::pending());
+
+    let old_res = CommitResources::new(
+        vec![old_alloc],
+        None,
+        None,
+        Some(release1),
+        vec![member],
+        vec![],
     );
-    let second_id = backend.cow_id.expect("cow_id retained");
-    assert_eq!(first_id, second_id);
-    assert!(!backend.deferred_cow_release);
+    let new_res = CommitResources::new(vec![new_alloc], None, None, None, vec![member], vec![]);
 
-    // Release overlay window
-    backend.release_overlay_window(None).expect("release");
-    assert!(backend.cow_id.is_none());
+    let submitted = crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]);
+    consumer
+        .consume(
+            OwnerEvent::CompletionRetired {
+                commit: commit_1,
+                resources: submitted.accepted(),
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // 1. Presented: marks completion Emitted, but keeps release Retained
+    consumer
+        .consume(
+            OwnerEvent::Presented {
+                commit: commit_1,
+                samples: std::collections::BTreeMap::new(),
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    let disp1 = consumer
+        .present_disposition(&present_key1)
+        .expect("disposition exists");
+    assert_eq!(disp1.completion, CompletionDisposition::Emitted);
+    assert_eq!(disp1.release, ReleaseDisposition::Retained);
+    assert!(
+        consumer.take_released_presents().is_empty(),
+        "Presented must not release wake or source"
+    );
+
+    // 2. Terminal { FailedBeforeSubmit }: suppresses completion, release remains Retained
+    let commit_2 = CommitId::for_tests(20);
+    let present_key2 = PresentKey::new(device_key, incarnation, commit_2, 202);
+    consumer.record_present_disposition(present_key2, PresentDisposition::pending());
+
+    consumer
+        .consume(
+            OwnerEvent::Terminal {
+                commit: commit_2,
+                terminal: TerminalState::FailedBeforeSubmit(
+                    crate::kms::owner::record::FailureCause::IoctlRejected { errno: libc::EBUSY },
+                ),
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    let disp2 = consumer
+        .present_disposition(&present_key2)
+        .expect("disposition 2 exists");
+    assert_eq!(disp2.completion, CompletionDisposition::Suppressed);
+    assert_eq!(disp2.release, ReleaseDisposition::Retained);
+    assert!(
+        consumer.take_released_presents().is_empty(),
+        "FailedBeforeSubmit cannot signal release"
+    );
+
+    // 3. on_available: when resources become releasable, present release is extracted
+    // and disposition becomes Released
+    assert!(service.is_releasable(&old_key));
+    consumer.on_available(&[old_key], &mut service).unwrap();
+
+    let disp1_after = consumer
+        .present_disposition(&present_key1)
+        .expect("disposition 1 after");
+    assert_eq!(disp1_after.completion, CompletionDisposition::Emitted);
+    assert_eq!(disp1_after.release, ReleaseDisposition::Released);
+
+    let released = consumer.take_released_presents();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].event.present_id, 101);
+    assert!(released[0].wake.is_some());
+    assert!(consumer.take_released_presents().is_empty());
 }
 
 #[test]

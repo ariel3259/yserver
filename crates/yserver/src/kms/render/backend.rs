@@ -1135,6 +1135,46 @@ fn reconcile_connector_probe(
     delta
 }
 
+/// One pinned Present source entry (Task 7.5).
+///
+/// For managed pins the table entry owns `StorageLease` and an
+/// invalidation-aware logical decref obligation. `release_present_source`
+/// removes that entry once and lets the service run the appropriate cleanup.
+#[derive(Debug)]
+pub(crate) struct PresentPinEntry {
+    pub(crate) id: crate::kms::render::store::DrawableId,
+    pub(crate) lease: Option<crate::kms::render::resources::StorageLease>,
+}
+
+impl PresentPinEntry {
+    pub(crate) fn new(
+        id: crate::kms::render::store::DrawableId,
+        lease: Option<crate::kms::render::resources::StorageLease>,
+    ) -> Self {
+        Self { id, lease }
+    }
+}
+
+impl PartialEq for PresentPinEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for PresentPinEntry {}
+
+impl PartialEq<crate::kms::render::store::DrawableId> for PresentPinEntry {
+    fn eq(&self, other: &crate::kms::render::store::DrawableId) -> bool {
+        self.id == *other
+    }
+}
+
+impl PartialEq<PresentPinEntry> for crate::kms::render::store::DrawableId {
+    fn eq(&self, other: &PresentPinEntry) -> bool {
+        *self == other.id
+    }
+}
+
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
@@ -1202,7 +1242,7 @@ pub struct KmsBackend {
     /// Final COW release accepted while direct scanout still owns a frame.
     /// The protocol resource is logically gone, but the backend identity and
     /// storage stay alive until the composed replacement retires.
-    pub(crate) deferred_cow_release: bool,
+    deferred_cow_release: bool,
 
     /// M0 direct-scanout telemetry. Purely observational: it never owns a
     /// drawable pin, submits DRM work, or affects Present capabilities.
@@ -1411,12 +1451,10 @@ pub struct KmsBackend {
         HashMap<u64, crate::kms::render::present_source_wait::PendingPresentSourceWait>,
     pub(crate) next_present_source_wait_id: u64,
 
-    /// `pin_present_source` tokens: the xid is resolved to a `DrawableId`
-    /// ONCE at pin time and held here, incref'd, so a later `FreePixmap` /
-    /// xid reuse on `store.by_xid` cannot re-point an already-pinned
-    /// present source out from under a parked entry. Released by
-    /// `release_present_source`.
-    pub(crate) present_source_pins: HashMap<u64, crate::kms::render::store::DrawableId>,
+    /// `pin_present_source` tokens: for managed pins the entry owns
+    /// `StorageLease` and an invalidation-aware logical decref obligation.
+    /// Released by `release_present_source`.
+    pub(crate) present_source_pins: HashMap<u64, PresentPinEntry>,
     pub(crate) next_present_source_pin_id: u64,
 
     /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
@@ -2044,10 +2082,78 @@ impl KmsBackend {
 
     fn pin_direct_source(&mut self, id: DrawableId) -> u64 {
         self.store.incref(id);
+        let lease = self
+            .store
+            .get(id)
+            .and_then(|d| d.storage.managed_lease())
+            .and_then(|l| {
+                self.resource_service
+                    .as_mut()
+                    .and_then(|s| s.share_storage_read(l).ok())
+            });
         let pin_id = self.next_present_source_pin_id;
         self.next_present_source_pin_id = self.next_present_source_pin_id.wrapping_add(1).max(1);
-        self.present_source_pins.insert(pin_id, id);
+        self.present_source_pins
+            .insert(pin_id, PresentPinEntry::new(id, lease));
         pin_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn present_source_pin_id(&self, pin_id: u64) -> Option<DrawableId> {
+        self.present_source_pins.get(&pin_id).map(|e| e.id)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn present_source_pin_lease(
+        &self,
+        pin_id: u64,
+    ) -> Option<&crate::kms::render::resources::StorageLease> {
+        self.present_source_pins
+            .get(&pin_id)
+            .and_then(|e| e.lease.as_ref())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn make_present_release(
+        &mut self,
+        event: yserver_core::backend::CompletedPresentEvent,
+    ) -> crate::kms::render::resources::PresentRelease {
+        let wake = self.retained_present_wakes.remove(&event.present_id);
+        crate::kms::render::resources::PresentRelease::new(event, wake)
+    }
+
+    pub(crate) fn dispatch_pinned_wake(
+        &mut self,
+        pin: crate::kms::render::present_completion::PinnedWake,
+    ) {
+        use crate::kms::render::present_completion::PinnedWake;
+        match pin {
+            PinnedWake::Pixmap(h) => {
+                if let Err(e) = self.dri3_trigger_fence_via_handle(&h) {
+                    log::warn!("dispatch_pinned_wake: dri3_trigger_fence_via_handle failed: {e}");
+                }
+            }
+            PinnedWake::PixmapSynced { handle, value } => {
+                if let Err(e) = self.dri3_signal_syncobj_via_handle(&handle, value) {
+                    log::warn!("dispatch_pinned_wake: dri3_signal_syncobj_via_handle failed: {e}");
+                }
+            }
+            PinnedWake::PixmapSyncedFencePublished {
+                handle: _handle,
+                value: _value,
+            } => {}
+            PinnedWake::None => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn signal_present_release(
+        &mut self,
+        release: crate::kms::render::resources::PresentRelease,
+    ) {
+        if let Some(pin) = release.wake {
+            self.dispatch_pinned_wake(pin);
+        }
     }
 
     fn retain_direct_present_wake(&mut self, event: &yserver_core::backend::CompletedPresentEvent) {
@@ -19511,17 +19617,28 @@ impl Backend for KmsBackend {
     fn pin_present_source(&mut self, host_xid: u32) -> Option<u64> {
         let id = self.store.lookup(host_xid)?;
         self.store.incref(id);
+        let lease = self
+            .store
+            .get(id)
+            .and_then(|d| d.storage.managed_lease())
+            .and_then(|l| {
+                self.resource_service
+                    .as_mut()
+                    .and_then(|s| s.share_storage_read(l).ok())
+            });
         let pin_id = self.next_present_source_pin_id;
         self.next_present_source_pin_id = self.next_present_source_pin_id.wrapping_add(1).max(1);
-        self.present_source_pins.insert(pin_id, id);
+        self.present_source_pins
+            .insert(pin_id, PresentPinEntry::new(id, lease));
         Some(pin_id)
     }
 
     fn release_present_source(&mut self, pin_id: u64) {
-        let Some(id) = self.present_source_pins.remove(&pin_id) else {
+        let Some(entry) = self.present_source_pins.remove(&pin_id) else {
             return;
         };
-        self.store_decref_with_invalidate(id);
+        drop(entry.lease);
+        self.store_decref_with_invalidate(entry.id);
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
@@ -26471,29 +26588,8 @@ impl Backend for KmsBackend {
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {
-        use crate::kms::render::present_completion::PinnedWake;
-        let Some(pin) = self.retained_present_wakes.remove(&present_id) else {
-            return;
-        };
-        match pin {
-            PinnedWake::Pixmap(h) => {
-                if let Err(e) = self.dri3_trigger_fence_via_handle(&h) {
-                    log::warn!("signal_present_wake: dri3_trigger_fence_via_handle failed: {e}");
-                }
-            }
-            PinnedWake::PixmapSynced { handle, value } => {
-                if let Err(e) = self.dri3_signal_syncobj_via_handle(&handle, value) {
-                    log::warn!("signal_present_wake: dri3_signal_syncobj_via_handle failed: {e}");
-                }
-            }
-            // The release point already carries the GPU completion fence.
-            // Consuming the pin here drops its retained handle without
-            // advancing the timeline from the host.
-            PinnedWake::PixmapSyncedFencePublished {
-                handle: _handle,
-                value: _value,
-            } => {}
-            PinnedWake::None => {}
+        if let Some(pin) = self.retained_present_wakes.remove(&present_id) {
+            self.dispatch_pinned_wake(pin);
         }
     }
 
@@ -43702,8 +43798,8 @@ mod tests {
         assert!(b.store.get(unrelated_id).is_none());
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43725,8 +43821,8 @@ mod tests {
         assert!(b.scanout_m2.current.is_none());
         assert!(b.scanout_m2.completed.is_empty());
         assert!(b.scanout_m2.idled.is_empty());
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
         assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
         assert!(
             b.store.get(target_id).is_none(),
@@ -43756,8 +43852,8 @@ mod tests {
         assert!(!b.scanout_m2.hold_direct);
         assert!(b.scanout_m2.current.is_some());
         assert!(b.scanout_m2.idled.is_empty());
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
         assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
         assert!(b.store.get(target_id).is_none());
         assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
@@ -43799,8 +43895,8 @@ mod tests {
         assert!(b.scanout_m2.current.is_some());
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
         assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
 
         b.stop_direct_after_scanout_replaced("final COW release test replacement");
@@ -43838,10 +43934,10 @@ mod tests {
         assert!(b.scanout_m2.current.is_some());
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
         assert_eq!(
-            b.present_source_pins.get(&fallback_pin),
-            Some(&redirected_fallback)
+            b.present_source_pin_id(fallback_pin),
+            Some(redirected_fallback)
         );
     }
 
@@ -43882,8 +43978,8 @@ mod tests {
         assert!(!b.windows[&target_xid].mapped);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43904,8 +44000,8 @@ mod tests {
         assert!(!b.windows[&unrelated_xid].mapped);
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43928,8 +44024,8 @@ mod tests {
         assert!(b.windows[&target_xid].mapped);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43954,8 +44050,8 @@ mod tests {
         assert!(b.windows[&unrelated_xid].mapped);
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43988,8 +44084,8 @@ mod tests {
         assert_eq!(b.windows[&target_xid].x, 12);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -44024,8 +44120,8 @@ mod tests {
         assert_eq!(b.windows[&unrelated_xid].x, 12);
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -44048,8 +44144,8 @@ mod tests {
         assert_ne!(new_cow_id, old_cow_id);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&old_cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(old_cow_id));
         assert_eq!(
             b.store.get(old_cow_id).map(|d| d.refcount),
             Some(1),
@@ -44096,10 +44192,10 @@ mod tests {
         assert!(b.store.get(old_cow_id).is_some());
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
         assert_eq!(
-            b.present_source_pins.get(&fallback_pin),
-            Some(&redirected_fallback)
+            b.present_source_pin_id(fallback_pin),
+            Some(redirected_fallback)
         );
     }
 
@@ -45303,6 +45399,200 @@ mod tests {
             backend.drained_host_call_events_for_tests().len(),
             2,
             "a single-read implementation would report 1"
+        );
+    }
+
+    #[test]
+    fn c0_2ci_present_split_source_fallback_pin_ownership_and_release() {
+        use crate::kms::{
+            owner::identity::IncarnationId,
+            render::resources::{
+                AllocationPayload, ResourceService,
+                storage::{PixelIdentity, StorageBacking, StorageLease},
+                tests::SpyAllocation,
+            },
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        let mut b = super::KmsBackend::for_tests();
+        let inc_id = IncarnationId::from_raw(1);
+        let device_key = b.platform.primary_device().unwrap().key;
+        let mut service = ResourceService::new(device_key, inc_id);
+
+        let target_xid = 0x6a00;
+        let drawable_id = seed_window(&mut b, target_xid, None, 0, 0);
+
+        let drops = Rc::new(Cell::new(0));
+        let alloc_lease = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        let alloc_key = alloc_lease.key();
+
+        let pixels = PixelIdentity {
+            target: PaintTarget::new(drawable_id, (0, 0), None, 24),
+            allocation: alloc_key,
+            content_offset: (0, 0),
+            extent: ash::vk::Extent2D {
+                width: 100,
+                height: 100,
+            },
+        };
+        let storage_lease = StorageLease {
+            allocation: alloc_lease,
+            pixels,
+        };
+
+        b.store.get_mut(drawable_id).unwrap().storage =
+            Storage::from_backing(StorageBacking::Managed(storage_lease));
+        b.resource_service = Some(service);
+
+        let initial_refcount = b.store.get(drawable_id).unwrap().refcount;
+
+        // 1. pin_present_source creates a PresentPinEntry with StorageLease
+        let pin = b
+            .pin_present_source(target_xid)
+            .expect("pin present source");
+        assert_eq!(b.present_source_pin_id(pin), Some(drawable_id));
+        assert!(b.present_source_pin_lease(pin).is_some());
+        assert_eq!(
+            b.store.get(drawable_id).unwrap().refcount,
+            initial_refcount + 1
+        );
+
+        // 2. release_present_source removes entry once and cleans up
+        b.release_present_source(pin);
+        assert!(!b.present_source_pins.contains_key(&pin));
+        assert_eq!(b.present_source_pin_id(pin), None);
+        assert!(b.present_source_pin_lease(pin).is_none());
+        assert_eq!(b.store.get(drawable_id).unwrap().refcount, initial_refcount);
+
+        // 3. Second release_present_source is a no-op (removes once)
+        b.release_present_source(pin);
+        assert_eq!(b.store.get(drawable_id).unwrap().refcount, initial_refcount);
+    }
+
+    #[test]
+    fn c0_2ci_present_retained_wakes_move_into_present_release_and_signal() {
+        use crate::kms::render::present_completion::PinnedWake;
+        use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+
+        let mut b = super::KmsBackend::for_tests();
+
+        let present_id = 991;
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: 1,
+            host_xid: 0x200,
+            dst_host_xid: 0x300,
+            options: 0,
+            present_id,
+            window_generation: 0,
+            crtc_id: 1,
+            crtc_epoch: 1,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: 0,
+            emit_idle: true,
+        };
+
+        // Retain a wake
+        b.retained_present_wakes
+            .insert(present_id, PinnedWake::None);
+        assert!(b.retained_present_wakes.contains_key(&present_id));
+
+        // make_present_release moves the actual pinned wake into PresentRelease without XID lookup
+        let release = b.make_present_release(event);
+        assert_eq!(release.event.present_id, present_id);
+        assert!(release.wake.is_some());
+        assert!(!b.retained_present_wakes.contains_key(&present_id));
+
+        // signal_present_release consumes and signals the wake
+        b.signal_present_release(release);
+    }
+
+    #[test]
+    fn c0_2ci_cow_deferred_release_and_reclaim_with_physical_contracts() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x6b00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+
+        // 1. 0 -> 1 claim edge allocates COW
+        assert!(b.cow_id.is_none());
+        assert!(b.get_overlay_window(None).expect("materialize COW"));
+        let cow_id = b.cow_id.expect("COW id");
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
+
+        // 2. Direct frame installed
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+        b.scanout_m2.unflip_shadow_ready = true;
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+
+        // 3. 1 -> 0 edge with direct active defers release
+        let deferred = b.release_overlay_window(None).expect("release overlay");
+        assert!(deferred);
+        assert!(b.deferred_cow_release);
+        // Deferred release drops no lease and decrefs no storage
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+
+        // 4. 0 -> 1 edge while deferred_cow_release holds (re-claim)
+        let reclaimed = b.get_overlay_window(None).expect("re-claim COW");
+        assert!(reclaimed);
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+
+        // 5. Unflip replacement stop path after re-claim: flag is cleared, so it frees nothing!
+        b.stop_direct_after_scanout_replaced("replacement after re-claim");
+        assert_eq!(b.cow_id, Some(cow_id));
+        // Direct fallback pin was released, but protocol COW survives with refcount 1
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
+
+        // 6. No-re-claim ordering: 1 -> 0 release without active direct scanout decrefs to 0
+        assert!(
+            b.release_overlay_window(None)
+                .expect("final release without direct")
+        );
+        assert!(b.cow_id.is_none());
+        assert!(b.store.get(cow_id).is_none());
+
+        // 7. Fresh 0 -> 1 allocation after completed release gets fresh identity
+        assert!(b.get_overlay_window(None).expect("fresh COW allocation"));
+        let fresh_cow_id = b.cow_id.expect("fresh cow id");
+        assert_ne!(fresh_cow_id, cow_id);
+
+        // Stale stop-path / unflip evidence for the old identity does not retire the new identity
+        b.stop_direct_after_scanout_replaced("stale stop path for old unflip");
+        assert_eq!(b.cow_id, Some(fresh_cow_id));
+        assert!(b.store.get(fresh_cow_id).is_some());
+
+        // 8. Failure route: materialization failure keeps COW and pins
+        let fail_target_xid = 0x6b40;
+        let _ = seed_window(&mut b, fail_target_xid, None, 0, 0);
+        let redirected_fallback = seed_window(&mut b, 0x6b10, None, 0, 0);
+        let (_, _, _, fail_fallback_pin) = install_direct_frame_for_target_test(
+            &mut b,
+            fail_target_xid,
+            redirected_fallback,
+            true,
+        );
+        b.scanout_m2.unflip_shadow_ready = false;
+        let err = b
+            .release_overlay_window(None)
+            .expect_err("unflip shadow not ready");
+        assert!(err.to_string().contains("NoVk"), "{err}");
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(fresh_cow_id));
+        assert_eq!(
+            b.present_source_pin_id(fail_fallback_pin),
+            Some(redirected_fallback)
         );
     }
 }

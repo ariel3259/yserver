@@ -11,7 +11,7 @@ use crate::kms::render::{
         availability::ResourceError,
         capacity::{DirectCapacity, RoleReservation},
         lease::AllocationLease,
-        present::{CompletionDisposition, PresentDisposition, PresentKey},
+        present::{CompletionDisposition, PresentDisposition, PresentKey, ReleaseDisposition},
         storage::StorageLease,
         transport::TransportGateHandle,
     },
@@ -139,6 +139,7 @@ pub struct CommitResourceConsumer {
     pub(crate) capacity: DirectCapacity,
     pub(crate) direct_admission_scheduled: bool,
     pub(crate) gate_handle: Option<TransportGateHandle>,
+    pub(crate) released_presents: Vec<PresentRelease>,
 }
 
 impl CommitResourceConsumer {
@@ -148,6 +149,14 @@ impl CommitResourceConsumer {
 
     pub(crate) fn take_current(&mut self) -> Vec<CommitResources> {
         std::mem::take(&mut self.current_resources)
+    }
+
+    pub(crate) fn take_released_presents(&mut self) -> Vec<PresentRelease> {
+        std::mem::take(&mut self.released_presents)
+    }
+
+    pub(crate) fn present_disposition(&self, key: &PresentKey) -> Option<PresentDisposition> {
+        self.present_dispositions.get(key).copied()
     }
 
     pub(crate) fn with_gate_handle(mut self, gate: TransportGateHandle) -> Self {
@@ -282,8 +291,18 @@ impl CommitResourceConsumer {
             }
             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => {
                 match terminal {
-                    crate::kms::owner::record::TerminalState::Completed
-                    | crate::kms::owner::record::TerminalState::FailedBeforeSubmit(_) => Ok(()),
+                    crate::kms::owner::record::TerminalState::Completed => Ok(()),
+                    crate::kms::owner::record::TerminalState::FailedBeforeSubmit(_) => {
+                        for (key, disp) in &mut self.present_dispositions {
+                            if key.commit == commit
+                                && disp.completion == CompletionDisposition::Pending
+                            {
+                                disp.completion = CompletionDisposition::Suppressed;
+                                disp.release = ReleaseDisposition::Retained;
+                            }
+                        }
+                        Ok(())
+                    }
                     crate::kms::owner::record::TerminalState::CompletionUnknown(_) => {
                         self.freeze_commit_entries(commit, service);
                         Ok(())
@@ -294,6 +313,7 @@ impl CommitResourceConsumer {
                 for (key, disp) in &mut self.present_dispositions {
                     if key.commit == commit && disp.completion == CompletionDisposition::Pending {
                         disp.completion = CompletionDisposition::Emitted;
+                        disp.release = ReleaseDisposition::Retained;
                         if let Some(&ref_crtc) = self.reference_crtcs.get(key) {
                             disp.sample = samples
                                 .get(&ref_crtc)
@@ -323,6 +343,17 @@ impl CommitResourceConsumer {
                     match self.capacity.finish_role(slot) {
                         Ok(()) => {
                             freed_any = true;
+                            if let Some(present_rel) = res.present.take() {
+                                let pid = present_rel.event.present_id;
+                                for (k, disp) in &mut self.present_dispositions {
+                                    if k.present_id == pid
+                                        && res.commit_id.is_none_or(|c| k.commit == c)
+                                    {
+                                        disp.release = ReleaseDisposition::Released;
+                                    }
+                                }
+                                self.released_presents.push(present_rel);
+                            }
                             drop(res);
                         }
                         Err((err, slot)) => {
@@ -333,6 +364,15 @@ impl CommitResourceConsumer {
                         }
                     }
                 } else {
+                    if let Some(present_rel) = res.present.take() {
+                        let pid = present_rel.event.present_id;
+                        for (k, disp) in &mut self.present_dispositions {
+                            if k.present_id == pid && res.commit_id.is_none_or(|c| k.commit == c) {
+                                disp.release = ReleaseDisposition::Released;
+                            }
+                        }
+                        self.released_presents.push(present_rel);
+                    }
                     drop(res);
                 }
             } else {
@@ -348,6 +388,17 @@ impl CommitResourceConsumer {
                     match self.capacity.finish_role(slot) {
                         Ok(()) => {
                             freed_any = true;
+                            if let Some(present_rel) = res.present.take() {
+                                let pid = present_rel.event.present_id;
+                                for (k, disp) in &mut self.present_dispositions {
+                                    if k.present_id == pid
+                                        && res.commit_id.is_none_or(|c| k.commit == c)
+                                    {
+                                        disp.release = ReleaseDisposition::Released;
+                                    }
+                                }
+                                self.released_presents.push(present_rel);
+                            }
                             drop(res);
                         }
                         Err((err, slot)) => {
@@ -358,6 +409,15 @@ impl CommitResourceConsumer {
                         }
                     }
                 } else {
+                    if let Some(present_rel) = res.present.take() {
+                        let pid = present_rel.event.present_id;
+                        for (k, disp) in &mut self.present_dispositions {
+                            if k.present_id == pid && res.commit_id.is_none_or(|c| k.commit == c) {
+                                disp.release = ReleaseDisposition::Released;
+                            }
+                        }
+                        self.released_presents.push(present_rel);
+                    }
                     drop(res);
                 }
             } else {
@@ -369,7 +429,6 @@ impl CommitResourceConsumer {
         if freed_any {
             self.direct_admission_scheduled = true;
         }
-
         Ok(())
     }
 }

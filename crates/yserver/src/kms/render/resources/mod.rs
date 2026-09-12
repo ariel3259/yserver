@@ -860,6 +860,18 @@ impl ResourceService {
         })
     }
 
+    pub(crate) fn share_storage_read(
+        &mut self,
+        source: &StorageLease,
+    ) -> Result<StorageLease, ResourceError> {
+        let key = source.allocation.key();
+        let new_alloc_lease = self.reserve(key, UseKind::Read)?;
+        Ok(StorageLease {
+            allocation: new_alloc_lease,
+            pixels: source.pixels.clone(),
+        })
+    }
+
     pub(crate) fn with_storage_read<T>(
         &mut self,
         lease: &StorageLease,
