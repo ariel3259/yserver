@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-12,
-after F-5a.** If you are resuming this work cold — a new
+after F-5b.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -41,11 +41,11 @@ stand so nothing is re-derived.
 | F-3, F-3b | Task 3 (storage) | **ACCEPTED** (M-19 deferred) | `12c5926c`/`3677e4b6`, `36ab74a7`/`5c10f7ee` | F3-review |
 | F-4, F-4b, F-4c | Task 5 (GPU/read adapters) | **ACCEPTED** (write half → F-4d) | `17384ae6`, `f475b04c`, `4e870930` (+fold-backs) | F4/F4b/F4c-review |
 | F-5a | Task 6, resources half (per-batch deadline, gate sealing, B-6) | **ACCEPTED** (M-13 real impl → F-5b) | `5f025fed`/`265b228e` | F5a-review |
-| **F-5b** | Task 6, sinks half (B-10: gate beneath the 12 DRM sinks, 6.5a/6.5b, `consume_owner_write` at send; F5a-M1) | **NEXT** | — | — |
-| F-6 | Task 7 (`Terminal` by cause, one keyed release path, 7.6) | pending | — | — |
+| F-5b | Task 6, sinks half (B-10 at 7 sinks, 6.5a/6.5b, grant consumed at executor send, real `DirectOwnershipState`) | **ACCEPTED** (gamma `_drm` test → F-9) | `842745a3`/`4eb05029` | F5b-review |
+| **F-6** | Task 7 (`Terminal` by cause, one keyed release path, 7.6) | **NEXT** | — | — |
 | F-7 | Task 8 (role transitions, `on_available`) | pending | — | — |
 | F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | pending | — | — |
-| F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md) | pending | — | — |
+| F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | pending | — | — |
 | F-4d | Task 5 write half (5.3/5.5: managed branch in `scene.rs` `submit_shared_scanout_frame`, `PendingAck` batch, `drain_pending_pool_releases`) | after F-9 | — | ruled in F4c-review |
 | F-10..F-12 | M-19 (180 `Storage` Deref accessor sites → lease accessors; 3 sessions: read-mostly consumers → `engine.rs` → `backend.rs`) + M-20 promotion half + F3-M1/F3-m1 | after F-4d | — | ruled in F3-review |
 
