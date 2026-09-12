@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-12,
-after F-6a (F-6b next).** If you are resuming this work cold — a new
+after F-6b (F-7 next).** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -43,8 +43,8 @@ stand so nothing is re-derived.
 | F-5a | Task 6, resources half (per-batch deadline, gate sealing, B-6) | **ACCEPTED** (M-13 real impl → F-5b) | `5f025fed`/`265b228e` | F5a-review |
 | F-5b | Task 6, sinks half (B-10 at 7 sinks, 6.5a/6.5b, grant consumed at executor send, real `DirectOwnershipState`) | **ACCEPTED** (gamma `_drm` test → F-9) | `842745a3`/`4eb05029` | F5b-review |
 | F-6a | Task 7, consumer half (B-8, B-9, M-2..M-5, M-15) | **ACCEPTED** | `c35af190`/`e40d0cb9` | F6a-review |
-| **F-6b** | Task 7, Present half (M-6: 7.5/7.5a, `PresentRelease`, COW test) | pending | — | — |
-| F-7 | Task 8 (role transitions, `on_available`) | pending | — | — |
+| F-6b | Task 7, Present half (M-6: 7.5/7.5a, `PresentRelease`, COW test) | **ACCEPTED** | `8b0e00d6`/`a242a9da` | F6b-review |
+| **F-7** | Task 8 (role transitions, `on_available`) | pending | — | — |
 | F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | pending | — | — |
 | F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | pending | — | — |
 | F-4d | Task 5 write half (5.3/5.5: managed branch in `scene.rs` `submit_shared_scanout_frame`, `PendingAck` batch, `drain_pending_pool_releases`) | after F-9 | — | ruled in F4c-review |
