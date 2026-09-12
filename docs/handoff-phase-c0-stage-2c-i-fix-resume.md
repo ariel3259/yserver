@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-12,
-after F-4c (`8c552f43`).** If you are resuming this work cold — a new
+after F-5a.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -40,7 +40,8 @@ stand so nothing is re-derived.
 | F-2, F-2b | Task 4 (scanout payloads, pool) | **ACCEPTED** | `fea5c043`/`08cb7b91`, `05555b03`/`98328b85` | F2-review |
 | F-3, F-3b | Task 3 (storage) | **ACCEPTED** (M-19 deferred) | `12c5926c`/`3677e4b6`, `36ab74a7`/`5c10f7ee` | F3-review |
 | F-4, F-4b, F-4c | Task 5 (GPU/read adapters) | **ACCEPTED** (write half → F-4d) | `17384ae6`, `f475b04c`, `4e870930` (+fold-backs) | F4/F4b/F4c-review |
-| **F-5** | Task 6 (transport gate at sinks, serviced deadline) | **NEXT** | — | — |
+| F-5a | Task 6, resources half (per-batch deadline, gate sealing, B-6) | **ACCEPTED** (M-13 real impl → F-5b) | `5f025fed`/`265b228e` | F5a-review |
+| **F-5b** | Task 6, sinks half (B-10: gate beneath the 12 DRM sinks, 6.5a/6.5b, `consume_owner_write` at send; F5a-M1) | **NEXT** | — | — |
 | F-6 | Task 7 (`Terminal` by cause, one keyed release path, 7.6) | pending | — | — |
 | F-7 | Task 8 (role transitions, `on_available`) | pending | — | — |
 | F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | pending | — | — |
