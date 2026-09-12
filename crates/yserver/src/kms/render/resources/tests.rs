@@ -1,4 +1,6 @@
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
+
+use ash::vk::{self, Handle};
 
 use super::*;
 use crate::{
@@ -9,9 +11,24 @@ use crate::{
             lifecycle::LifecycleEpochId,
         },
         render::platform::CrtcKey,
+        vk::device::VkContext,
     },
     platform::drm::DrmDeviceKey,
 };
+
+/// Task 5 (M-23): `GpuObligation.context` is `Arc<VkContext>` by value, so
+/// even a test that never actually queries `ticket_status()` for real (it
+/// overrides via `test_ticket_status`) still needs a genuine, live device
+/// to construct one at all -- there is no deterministic fixture. R12: an
+/// absent ICD is an honest `panic!`, never a silent pass.
+fn real_vk_context() -> Arc<VkContext> {
+    match VkContext::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            panic!("environmental skip: no live Vulkan ICD available ({e:?}); not claiming pass")
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct SpyAllocation {
@@ -1774,63 +1791,16 @@ fn c0_2ci_scanout_apply_teardown_release_refuses_live_file_owned() {
     );
 }
 
-#[test]
-fn c0_2ci_read_source_scratch_regression() {
-    let (mut service, source_held, _source_drops) = spy_service();
-    let source_key = source_held.key();
-    let source_read = service.register(source_key, ObligationKind::Read).unwrap();
-
-    let (scratch_held, scratch_drops) = {
-        let drops = Rc::new(Cell::new(0));
-        let held = service
-            .adopt(AllocationPayload::Spy(SpyAllocation {
-                drops: Rc::clone(&drops),
-            }))
-            .unwrap();
-        (held, drops)
-    };
-    let scratch_key = scratch_held.key();
-    let scratch_gpu = service.register(scratch_key, ObligationKind::Gpu).unwrap();
-
-    let scratch_ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-
-    // 1. Successful readback produces owned CPU bytes before scratch upload.
-    // Source read completion is recorded then.
-    service
-        .apply_validated_proof(source_key, source_read)
-        .unwrap();
-    drop(source_held);
-
-    let source_entry = service.entries.get(&source_key).unwrap();
-    let source_read_pending = source_entry
-        .availability
-        .borrow()
-        .pending_obligations
-        .values()
-        .filter(|k| matches!(k, ObligationKind::Read))
-        .count();
-
-    assert_eq!(source_read_pending, 0);
-    assert_eq!(scratch_drops.get(), 0);
-    assert!(!scratch_ticket.poll_signaled_result_opt(None).unwrap());
-
-    // Scratch cleanup remains behind its own upload/Composite ticket
-    let mut batch = CoreRetirementBatch::new(vec![scratch_held], vec![1], true);
-    let ob =
-        GpuObligation::for_tests_stub(vec![(scratch_key, scratch_gpu)], scratch_ticket.clone());
-    batch.bind_ticket(ob);
-    service.register_batch(batch);
-
-    // Poll while ticket is false: nothing completed
-    service.poll_gpu(Instant::now()).unwrap();
-    assert_eq!(scratch_drops.get(), 0);
-
-    // Ticket signals
-    scratch_ticket.test_signal();
-    service.poll_gpu(Instant::now()).unwrap();
-    service.service_ready();
-    assert_eq!(scratch_drops.get(), 1);
-}
+// B-15's decisive test -- real `read_scanout_region` readback (the root
+// IncludeInferiors snapshot path) plus a real async Vulkan submission
+// polled through `poll_gpu`, never a fabricated
+// `apply_validated_proof`/`test_signal` pair. It needs `KmsBackend`'s
+// private `mod tests` fixtures (`for_tests_with_vk_live_scene`,
+// `create_live_window`, `fill_rectangle`) that only that module's own test
+// tree can reach, so it lives in `backend.rs`'s `mod tests` as
+// `c0_2ci_read_source_scratch_regression_vulkan`, next to
+// `root_get_image_reads_scanout_pixels_not_root_storage`, whose fixture it
+// extends with managed source/scratch allocations.
 
 #[test]
 fn c0_2ci_read_uncertain_submission_leaves_source_and_staging_retained() {
@@ -1871,8 +1841,27 @@ fn c0_2ci_read_uncertain_submission_leaves_source_and_staging_retained() {
     assert!(service.entries.get(&staging_key).unwrap().frozen());
 }
 
+// M-23: `GpuObligation.context` is `Arc<VkContext>` by value (no
+// `#[cfg(test)]` shim constructs one with an absent context), so every test
+// below that binds a `GpuObligation` at all -- even ones that never let a
+// real ticket touch the device, because `test_ticket_status` intercepts
+// `ticket_status()` first -- needs a genuine live device just to build the
+// value. There is no deterministic fixture (session handoff); each such
+// test is `_vulkan`/`#[ignore]` per R12. Determinism where the original
+// tests drove a ticket's own `signaled_cache` via `test_signal()` now comes
+// from flipping `test_ticket_status` in place through
+// `ResourceService::pending_batches_mut()` instead -- the mechanism under
+// test (`poll_gpu`/`validate_gpu_batch`/`commit_gpu_batch`/
+// `quarantine_gpu_batch`) only ever consults `ticket_status()`'s return
+// value, never how a real ticket reached it, so this preserves the exact
+// same branches under test without touching a null fence with a real
+// device (which `poll_signaled_result` would do unsafely once
+// `signaled_cache` is false).
+
 #[test]
-fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic() {
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic_vulkan() {
+    let vk = real_vk_context();
     let (mut service, held_a, drops_a) = spy_service();
     let key_a = held_a.key();
     let gpu_a = service.register(key_a, ObligationKind::Gpu).unwrap();
@@ -1890,11 +1879,16 @@ fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic() {
     let invalid_gpu_b = ObligationId(9999);
 
     let batch_drop_counter = Rc::new(Cell::new(0));
-    let mut batch = CoreRetirementBatch::new(vec![held_a, held_b], vec![0], true);
+    let mut batch = CoreRetirementBatch::new(
+        vec![held_a, held_b],
+        vec![vk::DescriptorSet::from_raw(0)],
+        true,
+    );
     batch.drop_counter = Some(Rc::clone(&batch_drop_counter));
-    batch.bind_ticket(GpuObligation::for_tests_stub(
+    batch.bind_ticket(GpuObligation::new(
         vec![(key_a, gpu_a), (key_b, invalid_gpu_b)],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        Arc::clone(&vk),
     ));
     batch.test_ticket_status = Some(Ok(true));
 
@@ -1928,10 +1922,12 @@ fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic() {
         generation: 9999,
     };
 
-    let mut batch2 = CoreRetirementBatch::new(vec![held_c], vec![0], true);
-    batch2.bind_ticket(GpuObligation::for_tests_stub(
+    let mut batch2 =
+        CoreRetirementBatch::new(vec![held_c], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch2.bind_ticket(GpuObligation::new(
         vec![(invalid_key, ObligationId(1)), (key_c, gpu_c)],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        Arc::clone(&vk),
     ));
     batch2.test_ticket_status = Some(Ok(true));
 
@@ -1951,7 +1947,9 @@ fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic() {
 }
 
 #[test]
-fn c0_2ci_gpu_batch_freeze_lookup_failure_handled() {
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_gpu_batch_freeze_lookup_failure_handled_vulkan() {
+    let vk = real_vk_context();
     let (mut service, held, drops) = spy_service();
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
@@ -1962,10 +1960,12 @@ fn c0_2ci_gpu_batch_freeze_lookup_failure_handled() {
         generation: 8888,
     };
 
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::new(
         vec![(key, gpu), (stale_key, ObligationId(1))],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        Arc::clone(&vk),
     ));
     batch.test_ticket_status = Some(Ok(true));
 
@@ -1982,15 +1982,19 @@ fn c0_2ci_gpu_batch_freeze_lookup_failure_handled() {
 }
 
 #[test]
-fn c0_2ci_gpu_ticket_error_quarantines_batch() {
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_gpu_ticket_error_quarantines_batch_vulkan() {
+    let vk = real_vk_context();
     let (mut service, held, drops) = spy_service();
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::new(
         vec![(key, gpu)],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        Arc::clone(&vk),
     ));
     batch.test_ticket_status = Some(Err(ash::vk::Result::ERROR_DEVICE_LOST));
 
@@ -2008,7 +2012,7 @@ fn c0_2ci_gpu_empty_ticket_when_possibly_dispatched_quarantines_batch() {
     let (mut service, held, drops) = spy_service();
     let _key = held.key();
 
-    let batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    let batch = CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
     service.register_batch(batch);
 
     // Empty ticket when possibly_dispatched = true returns Err(ERROR_UNKNOWN)
@@ -2019,17 +2023,22 @@ fn c0_2ci_gpu_empty_ticket_when_possibly_dispatched_quarantines_batch() {
 }
 
 #[test]
-fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket() {
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan() {
+    let vk = real_vk_context();
     let (mut service, held, drops) = spy_service();
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::new(
         vec![(key, gpu)],
-        ticket.clone(),
+        ticket,
+        Arc::clone(&vk),
     ));
+    batch.test_ticket_status = Some(Ok(false));
 
     service.register_batch(batch);
 
@@ -2041,7 +2050,7 @@ fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket() {
     assert_eq!(service.pending_batches().len(), 1);
 
     // Now ticket signals
-    ticket.test_signal();
+    service.pending_batches_mut()[0].test_ticket_status = Some(Ok(true));
     service.poll_gpu(Instant::now()).unwrap();
     service.service_ready();
     assert_eq!(drops.get(), 1);
@@ -2061,43 +2070,56 @@ fn c0_2ci_scratch_free_after_composite_error() {
 }
 
 #[test]
-fn c0_2ci_descriptor_reset_exclusion_until_gpu_signaled() {
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan() {
+    let vk = real_vk_context();
     let (mut service, held, _drops) = spy_service();
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![42], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let descriptor = vk::DescriptorSet::from_raw(42);
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![descriptor], true);
+    batch.bind_ticket(GpuObligation::new(
         vec![(key, gpu)],
-        ticket.clone(),
+        ticket,
+        Arc::clone(&vk),
     ));
+    batch.test_ticket_status = Some(Ok(false));
 
     service.register_batch(batch);
 
     // Polling while unsignaled does not retire the batch, retaining descriptor slot 42
     service.poll_gpu(Instant::now()).unwrap();
     assert_eq!(service.pending_batches().len(), 1);
-    assert_eq!(service.pending_batches()[0].descriptor_slots(), &[42]);
+    assert_eq!(
+        service.pending_batches()[0].descriptor_slots(),
+        &[descriptor]
+    );
 
     // When signaled, polling retires and releases descriptor slot ownership
-    ticket.test_signal();
+    service.pending_batches_mut()[0].test_ticket_status = Some(Ok(true));
     service.poll_gpu(Instant::now()).unwrap();
     assert_eq!(service.pending_batches().len(), 0);
 }
 
 #[test]
-fn c0_2ci_progress_no_composition() {
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_progress_no_composition_vulkan() {
+    let vk = real_vk_context();
     let (mut service, held, drops) = spy_service();
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::new(
         vec![(key, gpu)],
-        ticket.clone(),
+        ticket,
+        Arc::clone(&vk),
     ));
+    batch.test_ticket_status = Some(Ok(false));
     service.register_batch(batch);
 
     // Active seat with unsignaled ticket: schedules a future deadline (~1ms)
@@ -2112,7 +2134,7 @@ fn c0_2ci_progress_no_composition() {
     assert!(service.next_deadline().is_some());
 
     // Signal the ticket
-    ticket.test_signal();
+    service.pending_batches_mut()[0].test_ticket_status = Some(Ok(true));
 
     // Service completions runs outside composition, allocation completes
     let ready = service.service_completions(Instant::now()).unwrap();
@@ -2130,10 +2152,12 @@ fn c0_2ci_progress_no_composition() {
             .unwrap();
         (held, drops)
     };
-    let mut batch2 = CoreRetirementBatch::new(vec![held2], vec![0], true);
-    batch2.bind_ticket(GpuObligation::for_tests_stub(
+    let mut batch2 =
+        CoreRetirementBatch::new(vec![held2], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch2.bind_ticket(GpuObligation::new(
         vec![],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        Arc::clone(&vk),
     ));
     batch2.test_ticket_status = Some(Err(ash::vk::Result::ERROR_DEVICE_LOST));
     service.register_batch(batch2);
@@ -2147,17 +2171,22 @@ fn c0_2ci_progress_no_composition() {
 }
 
 #[test]
-fn c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires() {
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires_vulkan() {
+    let vk = real_vk_context();
     let (mut service, held, drops) = spy_service();
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::new(
         vec![(key, gpu)],
-        ticket.clone(),
+        ticket,
+        Arc::clone(&vk),
     ));
+    batch.test_ticket_status = Some(Ok(false));
     service.register_batch(batch);
 
     let base = Instant::now();

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ash::vk;
+use ash::vk::{self, Handle};
 
 use super::{
     AllocationPayload, CommitResourceConsumer, CommitResources, CompletionIngress,
@@ -286,20 +286,35 @@ fn c0_2ci_adapter_uncertain_gpu_read_submit_retention() {
 }
 
 // ── 6. VT-away / DPMS-off / idle scene ──────────────────────────────────────
+//
+// M-23: `GpuObligation.context` is `Arc<VkContext>` by value -- there is no
+// `#[cfg(test)]` shim that builds one without a live device, so this test
+// needs `live_platform()` just to construct the obligation at all, even
+// though (like the pre-fix version) it never lets a real ticket reach the
+// device: `test_ticket_status` intercepts `ticket_status()` first.
 #[test]
-fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress() {
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress_vulkan() {
+    let platform = match live_platform() {
+        Some(p) => p,
+        None => panic!("environmental skip: no live Vulkan ICD available; not claiming pass"),
+    };
+    let vk = platform.vk.clone().expect("live_platform installs vk");
+
     let (mut dummy_service, dummy_lease, dummy_drops) = spy_service();
     let dummy_key = dummy_lease.key();
     let dummy_gpu = dummy_service
         .register(dummy_key, ObligationKind::Gpu)
         .unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![dummy_lease], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
-        vec![(dummy_key, dummy_gpu)],
-        ticket,
-    ));
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let mut batch = CoreRetirementBatch::new(
+        vec![dummy_lease],
+        vec![vk::DescriptorSet::from_raw(0)],
+        true,
+    );
+    batch.bind_ticket(GpuObligation::new(vec![(dummy_key, dummy_gpu)], ticket, vk));
+    batch.test_ticket_status = Some(Ok(false));
     dummy_service.register_batch(batch);
 
     let start = Instant::now();

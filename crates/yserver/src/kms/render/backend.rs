@@ -15555,7 +15555,7 @@ fn dump_cursor_record_to_ppm(
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ScanoutReadSelection {
+pub(crate) enum ScanoutReadSelection {
     OnScreenOnly,
     PermissiveDump,
 }
@@ -15907,6 +15907,45 @@ fn read_scanout_region(
 
     let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
     Ok(raw.to_vec())
+}
+
+/// Task 5 (B-15) producer-adapter seam: runs the real `read_scanout_region`
+/// and correlates its actual, already-observed outcome with a managed
+/// source's registered read obligation via
+/// `resources::gpu::record_read_outcome` -- the resources module still owns
+/// and validates the proof (`apply_validated_proof` stays private to it);
+/// this function only reports what really happened.
+///
+/// R8: not called by any production route. Every production
+/// `read_scanout_region` caller (root `GetImage`/`CopyArea` snapshot,
+/// `do_dump_scanout`) keeps calling the plain function directly, since no
+/// production path creates managed storage for this stage to correlate
+/// against yet. Exercised by the resources adapter test suite against a
+/// real `KmsBackend` live-Vulkan fixture.
+///
+/// `#[allow(dead_code)]`: R8 -- this has no production caller yet, only the
+/// `#[cfg(test)]` `c0_2ci_read_source_scratch_regression_vulkan`, so a
+/// plain (non-test) build sees it as unused.
+#[allow(dead_code)]
+pub(crate) fn read_scanout_region_for_managed_source(
+    backend: &mut KmsBackend,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+    service: &mut crate::kms::render::resources::ResourceService,
+    source_key: crate::kms::render::resources::AllocationKey,
+    source_obligation: crate::kms::render::resources::ObligationId,
+) -> (
+    io::Result<Vec<u8>>,
+    Result<(), crate::kms::render::resources::ResourceError>,
+) {
+    let result = read_scanout_region(backend, rect, selection);
+    let recorded = crate::kms::render::resources::gpu::record_read_outcome(
+        service,
+        source_key,
+        source_obligation,
+        result.is_ok(),
+    );
+    (result, recorded)
 }
 
 fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
@@ -40096,6 +40135,213 @@ mod tests {
             root_out, window_out,
             "root GetImage must match the visible window pixels"
         );
+    }
+
+    /// B-15's decisive test (Task 5, 5.1): extends the root IncludeInferiors
+    /// snapshot path above with a managed source and a managed scratch
+    /// allocation.
+    ///
+    /// The source-read proof comes from `read_scanout_region_for_managed_source`
+    /// correlating the REAL, already-observed outcome of the real
+    /// `read_scanout_region` call (real CPU copy off the real composited
+    /// scanout) with the source's registered `Read` obligation -- this test
+    /// body never calls `apply_validated_proof` for that proof (F3). The
+    /// scratch allocation's GPU obligation is proven independently, from a
+    /// REAL async Vulkan submission's fence (`FencePool::acquire` +
+    /// `vk::ops::submit_one_shot_op_async`) polled through the existing,
+    /// reviewed-sound `poll_gpu` machinery -- never `test_signal()` on a
+    /// stub ticket (R9).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_read_source_scratch_regression_vulkan() {
+        use ash::vk;
+        use std::{cell::Cell, sync::Arc};
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        use crate::kms::render::resources::{
+            AllocationPayload, CoreRetirementBatch, GpuObligation, ObligationKind, ResourceService,
+            tests::SpyAllocation,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
+            Ok(b) => b,
+            Err(e) => {
+                panic!("environmental skip: no live Vulkan ICD available ({e}); not claiming pass")
+            }
+        };
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let (root_w, root_h) = {
+            let root = state.resources.window(ROOT_WINDOW).expect("root window");
+            (root.width, root.height)
+        };
+        let window = ResourceId(0x2005);
+        let window_host = create_live_window(
+            &mut state,
+            &mut backend,
+            window,
+            ROOT_WINDOW,
+            40,
+            40,
+            16,
+            16,
+        );
+
+        let root_color = 0x0022_3344;
+        let window_color = 0x00bb_6600;
+        backend
+            .fill_rectangle(
+                None,
+                backend.core.window_id,
+                root_color,
+                0,
+                0,
+                root_w,
+                root_h,
+            )
+            .expect("fill root");
+        backend
+            .fill_rectangle(None, window_host.as_raw(), window_color, 0, 0, 16, 16)
+            .expect("fill window");
+        backend.tick_maybe_composite_for_tests();
+
+        let dev = DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let inc = IncarnationId::first();
+        let mut service = ResourceService::new(dev, inc);
+
+        // "Managed source": stands in for the retained root snapshot source
+        // being read -- what the read obligation gates is its lifecycle,
+        // independent of what physically backs it.
+        let source_drops = Rc::new(Cell::new(0));
+        let source_lease = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&source_drops),
+            }))
+            .unwrap();
+        let source_key = source_lease.key();
+        let source_read = service.register(source_key, ObligationKind::Read).unwrap();
+
+        // Managed scratch: retained by its own GPU obligation/ticket only.
+        let scratch_drops = Rc::new(Cell::new(0));
+        let scratch_lease = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&scratch_drops),
+            }))
+            .unwrap();
+        let scratch_key = scratch_lease.key();
+        let scratch_gpu = service.register(scratch_key, ObligationKind::Gpu).unwrap();
+
+        let scan_rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 40, y: 40 },
+            extent: vk::Extent2D {
+                width: 16,
+                height: 16,
+            },
+        };
+
+        // Real read, real proof: the adapter correlates the real
+        // `read_scanout_region`'s actual `Ok`/`Err` with the source's
+        // registered obligation -- this test body supplies no proof itself.
+        let (result, recorded) = super::read_scanout_region_for_managed_source(
+            &mut backend,
+            scan_rect,
+            super::ScanoutReadSelection::OnScreenOnly,
+            &mut service,
+            source_key,
+            source_read,
+        );
+        let scanout_bytes = result.expect("scanout readback");
+        recorded.expect("record_read_outcome");
+
+        // Confirm the read actually observed real, composited pixels (not a
+        // vacuous zero-length buffer), exactly as the sibling snapshot test
+        // does.
+        let window_out = backend
+            .get_image_pixels_for_tests(window_host.as_raw(), 2, 0, 0, 16, 16, !0)
+            .expect("window get_image")
+            .expect("window bytes");
+        assert_eq!(
+            scanout_bytes, window_out,
+            "managed-source read must observe the real composited pixels"
+        );
+
+        // Successful readback produces owned CPU bytes before scratch
+        // upload; source-read completion is recorded then.
+        assert!(
+            !service.has_pending_obligation(&source_key, source_read),
+            "source_read_pending must be 0: the real read already discharged it"
+        );
+        // Scratch cleanup remains behind its own upload/Composite ticket --
+        // untouched by the source read that just completed.
+        assert_eq!(scratch_drops.get(), 0);
+
+        drop(source_lease);
+        service.service_ready();
+        assert_eq!(
+            source_drops.get(),
+            1,
+            "source retention is not extended by scratch use"
+        );
+        assert_eq!(scratch_drops.get(), 0);
+
+        // Scratch's own GPU proof: a REAL async submission against a REAL
+        // fence, never a fabricated `test_signal()`.
+        let vk_ctx = backend.platform.vk.clone().expect("live scene installs vk");
+        let ops_pool = backend
+            .platform
+            .ops_command_pool_handle()
+            .expect("live scene installs ops pool");
+        let scratch_ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live scene installs fence pool")
+            .acquire()
+            .expect("acquire real fence ticket");
+
+        crate::kms::vk::ops::submit_one_shot_op_async(
+            &vk_ctx,
+            ops_pool,
+            &scratch_ticket,
+            |_vk, _cb| Ok(()),
+        )
+        .expect("submit scratch no-op");
+
+        // Immediately after submission the real fence is not yet observed
+        // signaled -- `queue_submit2` only enqueues the work.
+        assert!(!scratch_ticket.poll_signaled_result(&vk_ctx).unwrap());
+
+        let mut batch = CoreRetirementBatch::new(vec![scratch_lease], Vec::new(), true);
+        batch.bind_ticket(GpuObligation::new(
+            vec![(scratch_key, scratch_gpu)],
+            scratch_ticket.clone(),
+            Arc::clone(&vk_ctx),
+        ));
+        service.register_batch(batch);
+
+        // Poll while genuinely unsignaled: nothing completed.
+        service.poll_gpu(std::time::Instant::now()).unwrap();
+        assert_eq!(scratch_drops.get(), 0);
+
+        // Wait for the real submission to retire, then observe the genuine
+        // signal through the same ticket and release the scratch's final
+        // logical lease.
+        scratch_ticket
+            .wait(&vk_ctx)
+            .expect("wait for scratch ticket");
+        service.poll_gpu(std::time::Instant::now()).unwrap();
+        service.service_ready();
+        assert_eq!(scratch_drops.get(), 1);
     }
 
     #[test]

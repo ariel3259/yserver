@@ -41,7 +41,9 @@ pub(crate) use drm_cleanup::{
     FamilyInventory, FileFamilyClosed, GemOwner, RightState,
 };
 #[allow(unused_imports)]
-pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation, ValidatedGpuBatch};
+use gpu::ValidatedGpuBatch;
+#[allow(unused_imports)]
+pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation};
 #[allow(unused_imports)]
 pub(crate) use handoff::{
     CompletionIngress, DeviceBarrier, HandoffRouter, IncarnationBundle, KmsDisposition,
@@ -830,6 +832,19 @@ impl ResourceService {
         &self.pending_batches
     }
 
+    /// Test-only (F4): lets a `_vulkan` mechanism test flip a registered
+    /// batch's `test_ticket_status` in place, without needing to fabricate
+    /// a second, independently-signaled real ticket for every step of a
+    /// multi-poll scenario. `GpuObligation.context` still requires a real
+    /// `Arc<VkContext>` to construct at all (M-23) -- this only controls
+    /// what `ticket_status()`'s `#[cfg(test)]` override reports, exactly as
+    /// `CoreRetirementBatch::test_ticket_status` already does before
+    /// registration.
+    #[cfg(test)]
+    pub(crate) fn pending_batches_mut(&mut self) -> &mut [CoreRetirementBatch] {
+        &mut self.pending_batches
+    }
+
     pub(crate) fn quarantined_batches(&self) -> &[(CoreRetirementBatch, ResourceError)] {
         &self.quarantined_batches
     }
@@ -864,8 +879,14 @@ impl ResourceService {
         }
     }
 
+    // `pub(in ...)`, not `pub(crate)` (M-23/F7): `ValidatedGpuBatch` itself
+    // is private to `resources` (`gpu.rs`'s `pub(super)`), and nothing
+    // outside this module ever calls this directly -- only `poll_gpu`
+    // does. A `pub(crate)` signature returning a type callers outside
+    // `resources` cannot even name is exactly the private-interface
+    // mismatch rustc's `private_interfaces` lint (`-D warnings`) catches.
     #[allow(clippy::result_large_err)]
-    pub(crate) fn validate_gpu_batch(
+    pub(in crate::kms::render::resources) fn validate_gpu_batch(
         &self,
         batch: CoreRetirementBatch,
     ) -> Result<ValidatedGpuBatch, (ResourceError, CoreRetirementBatch)> {
@@ -935,7 +956,10 @@ impl ResourceService {
         })
     }
 
-    pub(crate) fn commit_gpu_batch(&mut self, prepared: ValidatedGpuBatch) {
+    pub(in crate::kms::render::resources) fn commit_gpu_batch(
+        &mut self,
+        prepared: ValidatedGpuBatch,
+    ) {
         let ValidatedGpuBatch {
             batch,
             confirmed_entries,

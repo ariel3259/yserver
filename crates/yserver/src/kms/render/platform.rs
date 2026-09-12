@@ -165,21 +165,16 @@ impl FenceTicket {
 
     /// Non-blocking status query that preserves Vulkan errors for callers
     /// owning resources gated by this ticket.
+    ///
+    /// F5: no `Option<&VkContext>` fallback -- a missing context used to
+    /// mean "report pending" (`Ok(false)`), which is exactly the invented
+    /// platform status the Global Constraints forbid. A caller with no real
+    /// context to query has no business asking whether a real submission
+    /// signaled.
     pub(crate) fn poll_signaled_result(&self, vk: &VkContext) -> Result<bool, vk::Result> {
-        self.poll_signaled_result_opt(Some(vk))
-    }
-
-    /// Non-blocking status query with optional VkContext (None supported for stub tickets).
-    pub(crate) fn poll_signaled_result_opt(
-        &self,
-        vk: Option<&VkContext>,
-    ) -> Result<bool, vk::Result> {
         if self.inner.signaled_cache.get() {
             return Ok(true);
         }
-        let Some(vk) = vk else {
-            return Ok(false);
-        };
         match unsafe { vk.device.get_fence_status(self.inner.fence) } {
             Ok(true) => {
                 self.inner.signaled_cache.set(true);
@@ -445,7 +440,11 @@ impl FencePool {
         }
     }
 
-    fn acquire(&self) -> Result<FenceTicket, vk::Result> {
+    /// Task 5 (B-15): `pub(crate)` so a producer adapter outside this module
+    /// (e.g. a test driving a real async submission through
+    /// `vk::ops::submit_one_shot_op_async`) can obtain a genuine ticket
+    /// backed by a real device fence, instead of a `#[cfg(test)]` stub.
+    pub(crate) fn acquire(&self) -> Result<FenceTicket, vk::Result> {
         let mut pool = self.inner.borrow_mut();
         let fence = if let Some(f) = pool.free.pop() {
             f
