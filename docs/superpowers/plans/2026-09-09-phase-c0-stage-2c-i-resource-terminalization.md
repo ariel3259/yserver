@@ -465,6 +465,38 @@ M-19's stale call-site count (memory note for F-3: #142 added more
 does not touch anything F-2 built or fixed. No code change; this entry
 records the confirmation.
 
+**Fix round 2: `05555b03`** (session F-2b, `docs/superpowers/findings/2026-09-12-stage-2c-i-fix-F2-review.md`, which reviewed fix round 1 and found 3 blocking, 3 major, 2 minor). Verdicts:
+
+| Finding | Verdict |
+| --- | --- |
+| F2-B1 (blocking: a registered managed bo had no root; the next tick discharged it) | **RESOLVED** — `ScanoutBo`/`CopiedRenderSource` now store `managed: Option<AllocationLease>` (the lease itself, not a bare `AllocationKey`); `managed_key()` derives the key, `set_managed`/`take_managed` replace the old key-only setter, and `detach_managed_entries` drops the lease (the actual release) instead of clearing a field. Test: extended `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan` with a tick right after registration (entry survives, no ioctl) and a tick right after `detach_managed_entries` (now discharges for real). Mutation-verified: reverting to a bare `drop(display_lease)` with no root fails the post-registration assertion |
+| F2-B2 (blocking: `service_ready_with_registry` never unregistered the alias on normal release) | **RESOLVED** — unregisters on successful discharge. Tests: `c0_2ci_scanout_service_ready_with_registry_discharges_before_destroy` (extended with `payload_aliases() == 0`) and new `c0_2ci_scanout_service_ready_with_registry_unregisters_only_the_discharged_alias` (release one payload, mint the barrier with a second outstanding — callback runs exactly once, for the second key). Mutation-verified: dropping the `unregister_payload_alias` call fails both |
+| F2-B3 (blocking, F6: a failed discharge destroyed the right it claimed to retain) | **RESOLVED** — `ScanoutAllocation::discharge_file_owned` now matches `DirectFramebufferAllocation`'s existing correct shape (keeps the backing in `self.file_owned` on failure, returns only `io::Error`). New test `c0_2ci_scanout_service_ready_with_registry_retries_failed_discharge` (fail `close_gem`, tick, assert `file_owned` survives at `FramebufferRemoved` and the alias stays registered; clear, tick, assert one more `CloseGem` and the entry gone). Mutation-verified against the exact reinstall-then-take-back-out shape the finding names |
+| F2-M1 (major: the pre-fix leak paths still existed beside the fixes; `DirectFramebuffer` uncovered) | **RESOLVED** — `AllocationPayload::file_owned_alias_present`/`discharge_file_owned` are the single dispatch point `adopt` (now refuses), `adopt_with_registry`, `service_ready` (re-dirties instead of destroying), `service_ready_with_registry` and `apply_teardown_release` all key off, covering `DirectFramebuffer` as well as `Scanout`. Every existing test that adopted a file-owned `DirectFramebuffer`/`Scanout` payload via plain `adopt` (F-1's `c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias`/`..._discharge_failure_retries`, F-2's `..._discharging_file_owned_leaves_shared_intact`/`..._apply_teardown_release_refuses_live_file_owned`, and 9.5) switched to `adopt_with_registry`, dropping their now-redundant manual `register_payload_alias` calls |
+| F2-M2 (major: admission checked after extraction; renderer adopted before display; no rollback) | **RESOLVED** — `ResourceService::is_exhausted` checked before extracting anything; adoption order reversed to display-first/renderer-second; `ScanoutBo`/`CopiedRenderSource::restore_physical_backing` (inverse of `take_physical_backing`) plus `ScanoutAllocation::into_scanout_bo_backing`/`CopiedSourceAllocation::into_copied_render_source_backing` restore full legacy ownership on any post-extraction failure; a renderer failure after the display succeeded releases the display adoption too via new `ResourceService::release_fresh_adoption` (all-or-nothing). Tests: `c0_2ci_release_fresh_adoption_reclaims_untouched_lease`, `c0_2ci_release_fresh_adoption_refuses_when_something_else_is_using_it` (the new primitive, deterministic); the full extraction/restoration round-trip through a real bo is exercised end-to-end by the B-13/F2-B1 hardware test (a dedicated failure-injection test through a live `PlatformBackend` was not written — see note below) |
+| F2-M3 (major, repeats F1-M1: device-less registry couldn't show the registry performs the last close) | **RESOLVED** — `c0_2ci_fd_family_barrier_real_gbm_payload_drm` rebuilt on `new_with_device_and_io`, with `weak.upgrade().is_some()` asserted inside the discharge closure (after the payload's own alias drops) and `is_none()` only after the mint; the inverted justification comment is gone |
+| F2-m1 (minor: the husk keeps a counted alias — `take_physical_backing` clones `drm`, so the pool husk still holds an `Rc<Device>`) | Noted in Task 9's text below for F-8, not lost |
+| F2-m2 (minor: `Option<Arc<VkContext>>` stays; ruling accepted as-is) | No further action, per the review's own ruling |
+
+**Note on F2-M2 test coverage:** the fix's *mechanism* (`is_exhausted`, `restore_physical_backing`, `into_*_backing`, `release_fresh_adoption`) is real and the two new deterministic tests cover `release_fresh_adoption` directly, but a full `register_managed_scanout_bo` failure-injection test (drive `service` to exhaustion, or fail the renderer adopt with the display already committed, through a live `PlatformBackend`/hardware bo) was not written this session — doing so needs either a way to force `ResourceService::exhausted` from outside `resources` (not currently exposed) or a second real bo to construct a genuine renderer-adopt-fails-after-display-succeeds scenario, both of which are more fixture work than this round's remaining budget covered. Flagging rather than silently claiming full coverage.
+
+Gate for this round: `cargo +nightly fmt` clean, `cargo clippy --all-targets -- -D warnings` clean, `c0_2ci` 85/85 (81 baseline + 4 new deterministic) on twelve runs with no flakes, all three portable targets check clean. Hardware re-run (per the dispatch's explicit ask, after F2-M3):
+
+```
+$ cargo test -p yserver --lib c0_2ci_fd_family_barrier_real_gbm_payload_drm -- --ignored --nocapture
+running 1 test
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1696 filtered out; finished in 0.02s
+
+$ cargo test -p yserver --lib -- --ignored --nocapture   (all hardware tests)
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 1622 filtered out; finished in 23.45s
+```
+
+(also re-run standalone 5 times with no flakes.)
+
 ## Task 5: GPU, descriptors and readback lifetime
 
 **Status: EXECUTED at `4dca7392`.** **Review round 1 (2026-09-11): REJECTED** — see the findings and `docs/handoff-phase-c0-stage-2c-i-fix.md`; unchecked steps below are not done or not proven.
@@ -772,6 +804,8 @@ The `held` vector deliberately retains reservation tokens. Add real import/destr
 ## Task 9: Reserved teardown recipient and late-completion handoff
 
 **Status: EXECUTED at `604d572a`.** **Review round 1 (2026-09-11): REJECTED** — see the findings and `docs/handoff-phase-c0-stage-2c-i-fix.md`; unchecked steps below are not done or not proven.
+
+**F-8 must account for F2-m1** (`docs/superpowers/findings/2026-09-12-stage-2c-i-fix-F2-review.md`): `ScanoutBo`/`CopiedRenderSource::take_physical_backing` clones `self.drm` rather than taking it (these fields are not `Option`), so the emptied husk left in the pool after a managed conversion still holds its own `Rc<crate::drm::Device>` — a non-payload alias of the same open file description that `try_mint_file_family_closed`'s `non_payload_aliases` precondition must account for, or the pool must be drained (dropping every husk) before the barrier is attempted. Decide which and implement it; whichever is chosen, 9.5's deterministic test (the fake-inventory half, not the real-GBM `_drm` case already covered in F-2/F-2b) should include a pool husk in its fixture so this alias is exercised, not just the payload's own.
 
 **Files:** Create `resources/handoff.rs`; modify platform/backend detach seams and test support. The stage-3 recovery process itself is not implemented here.
 
