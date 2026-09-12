@@ -358,28 +358,81 @@ impl Storage {
     /// True when this storage's memory is already dma-buf-exportable
     /// (DRI3-imported, or previously promoted). Used to avoid
     /// re-promoting an already-exportable drawable.
+    ///
+    /// Legacy-only: every current caller (engine/backend promotion paths)
+    /// only ever reaches Legacy backing, since managed adoption has no
+    /// production producer yet (R8). Panics on `Managed`, matching
+    /// [`Self::adopt_exportable`]'s existing wrong-arm contract, rather
+    /// than reading `AllocationEntry.payload` directly and bypassing the
+    /// usage-reservation protocol (M-18) -- use
+    /// [`Self::is_exportable_managed`] once a caller actually holds a
+    /// `&mut ResourceService`.
     pub(crate) fn is_exportable(&self) -> bool {
         match &self.backing {
             StorageBacking::Legacy(alloc) => alloc.is_exportable(),
-            StorageBacking::Managed(lease) => {
-                let payload = lease.allocation.entry.payload.borrow();
-                match payload.as_ref() {
-                    Some(AllocationPayload::Storage(alloc)) => alloc.is_exportable(),
-                    _ => false,
-                }
+            StorageBacking::Managed(_) => {
+                panic!(
+                    "Storage::is_exportable called on managed storage; use is_exportable_managed"
+                );
             }
         }
     }
 
+    /// Managed-storage counterpart of [`Self::is_exportable`] (M-18):
+    /// reserves a `Read` use via `ResourceService::with_storage_read`
+    /// instead of reaching into `AllocationEntry.payload` directly, so a
+    /// concurrent incompatible reservation is caught by
+    /// `EntryAvailability::is_compatible` instead of silently racing the
+    /// backing `RefCell`. No production or test caller reaches managed
+    /// storage through this path yet (R8); it exists so a future caller
+    /// need not reintroduce the porous access this replaces.
+    pub(crate) fn is_exportable_managed(
+        &self,
+        service: &mut ResourceService,
+    ) -> Result<bool, ResourceError> {
+        match &self.backing {
+            StorageBacking::Managed(lease) => {
+                service.with_storage_read(lease, StorageAllocation::is_exportable)
+            }
+            StorageBacking::Legacy(_) => Err(ResourceError::Detached),
+        }
+    }
+
+    /// Adopts this storage's backing into `service`. Real (non-stub)
+    /// physical memory needs a live `Arc<VkContext>` (and pool, if the
+    /// image is pool-eligible) so `StorageAllocation::cleanup_handles`
+    /// can actually release it later instead of finding `vk: None` and
+    /// silently returning (B-14: pre-fix, `into_managed` never touched
+    /// `vk`/`pixmap_pool`, so every real allocation it adopted leaked its
+    /// Vulkan handles on eventual `service_ready`). `platform` supplies
+    /// both; adoption of a non-stub allocation is refused when
+    /// `platform.vk` is `None` rather than adopting a payload nothing can
+    /// ever clean up. A stub allocation (`is_test_stub`) has no real
+    /// handles to leak, so it is exempt from the refusal.
     #[allow(clippy::result_large_err)]
     pub(crate) fn into_managed(
         self,
         service: &mut ResourceService,
+        platform: &PlatformBackend,
         target: PaintTarget,
         content_offset: (i32, i32),
     ) -> Result<StorageLease, (ResourceError, Storage)> {
         match self.backing {
-            StorageBacking::Legacy(alloc) => {
+            StorageBacking::Legacy(mut alloc) => {
+                if !alloc.is_test_stub && platform.vk.is_none() {
+                    return Err((
+                        ResourceError::InvalidState,
+                        Storage {
+                            backing: StorageBacking::Legacy(alloc),
+                        },
+                    ));
+                }
+                if alloc.vk.is_none() {
+                    alloc.vk = platform.vk.clone();
+                }
+                if alloc.pixmap_pool.is_none() {
+                    alloc.pixmap_pool = platform.pixmap_pool.clone();
+                }
                 let extent = alloc.extent;
                 match service.adopt(AllocationPayload::Storage(alloc)) {
                     Ok(allocation_lease) => {
@@ -529,10 +582,53 @@ impl Storage {
         Ok(old_lease)
     }
 
+    /// Idempotent, like the Legacy path: repeat calls are safe (the
+    /// second finds an inert Legacy stub and no-ops through
+    /// `StorageAllocation::destroy`'s own null-guards).
+    ///
+    /// Managed storage's real Vk handles are the `ResourceService`'s to
+    /// reclaim once every use/obligation clears
+    /// (`service_ready`/`service_ready_with_registry`, via
+    /// `StorageAllocation::Drop`), not this synchronous call's job (R4)
+    /// -- but `destroy()` still detaches THIS drawable's own Retain use
+    /// right here (M-20), rather than leaving it to whatever the caller
+    /// does with `self` afterward. Both current callers
+    /// (`DrawableStore::destroy_now`/`shutdown_destroy_all`) happen to
+    /// drop `self` immediately after, which made the pre-fix `{}` net
+    /// out the same by accident of caller behaviour; a bare `{}` is not
+    /// correct on its own terms, and a future caller that keeps `self`
+    /// alive past `destroy()` must not depend on that accident.
     pub(crate) fn destroy(&mut self, platform: &PlatformBackend) {
         match &mut self.backing {
             StorageBacking::Legacy(alloc) => alloc.destroy(platform),
-            StorageBacking::Managed(_) => {}
+            StorageBacking::Managed(_) => {
+                // Overwriting `self.backing` drops the old value first
+                // (the Managed lease), releasing the Retain use and
+                // marking the entry dirty for the service's own
+                // servicing walk -- now, not later.
+                self.backing = StorageBacking::Legacy(StorageAllocation {
+                    image: vk::Image::null(),
+                    memory: vk::DeviceMemory::null(),
+                    image_view: vk::ImageView::null(),
+                    sample_view: vk::ImageView::null(),
+                    extent: vk::Extent2D {
+                        width: 0,
+                        height: 0,
+                    },
+                    format: vk::Format::UNDEFINED,
+                    depth: 0,
+                    current_layout: vk::ImageLayout::UNDEFINED,
+                    is_test_stub: true,
+                    imported_drawable: None,
+                    imported_dmabuf: None,
+                    promoted_exportable: false,
+                    export_stride: 0,
+                    export_size: 0,
+                    export_modifier: 0,
+                    vk: None,
+                    pixmap_pool: None,
+                });
+            }
         }
     }
 }
@@ -792,6 +888,14 @@ impl Drawable {
     /// is. Reading or writing `current_layout` outside this
     /// method is a layered correctness hazard — see Risk 11
     /// in the Stage 2 plan.
+    ///
+    /// Legacy-only, like [`Storage::is_exportable`]: every current caller
+    /// only ever reaches Legacy backing. Panics on `Managed` rather than
+    /// mutating `AllocationEntry.payload` directly under a Retain lease
+    /// without reserving `Write` first (M-18) — use
+    /// [`Self::record_layout_transition_managed`], which routes the same
+    /// barrier through `ResourceService::with_storage_write` so a
+    /// concurrent incompatible reservation is refused instead of raced.
     pub(crate) fn record_layout_transition(
         &mut self,
         vk: &crate::kms::vk::device::VkContext,
@@ -831,36 +935,64 @@ impl Drawable {
                 unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
                 alloc.current_layout = target_layout;
             }
-            StorageBacking::Managed(lease) => {
-                let mut payload = lease.allocation.entry.payload.borrow_mut();
-                if let Some(AllocationPayload::Storage(alloc)) = payload.as_mut() {
-                    if alloc.is_test_stub {
-                        alloc.current_layout = target_layout;
-                        return;
-                    }
-                    let barrier = vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(src_stage)
-                        .src_access_mask(src_access)
-                        .dst_stage_mask(dst_stage)
-                        .dst_access_mask(dst_access)
-                        .old_layout(alloc.current_layout)
-                        .new_layout(target_layout)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(alloc.image)
-                        .subresource_range(
-                            vk::ImageSubresourceRange::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .level_count(1)
-                                .layer_count(1),
-                        );
-                    let dep = vk::DependencyInfo::default()
-                        .image_memory_barriers(std::slice::from_ref(&barrier));
-                    unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
-                    alloc.current_layout = target_layout;
-                }
+            StorageBacking::Managed(_) => {
+                panic!(
+                    "Drawable::record_layout_transition called on managed storage; use record_layout_transition_managed"
+                );
             }
         }
+    }
+
+    /// Managed-storage counterpart of [`Self::record_layout_transition`]
+    /// (M-18). Reserves a `Write` use via
+    /// `ResourceService::with_storage_write` before touching
+    /// `current_layout` or recording the barrier, instead of the
+    /// pre-fix code's direct `lease.allocation.entry.payload.borrow_mut()`
+    /// under the storage's own Retain lease — which mutated
+    /// `current_layout` with no reservation at all, so a concurrent
+    /// incompatible use (e.g. a live reader) went undetected. No
+    /// production or test caller reaches managed storage through this
+    /// path yet (R8).
+    pub(crate) fn record_layout_transition_managed(
+        &mut self,
+        service: &mut ResourceService,
+        vk: &crate::kms::vk::device::VkContext,
+        cb: vk::CommandBuffer,
+        target_layout: vk::ImageLayout,
+        src_stage: vk::PipelineStageFlags2,
+        src_access: vk::AccessFlags2,
+        dst_stage: vk::PipelineStageFlags2,
+        dst_access: vk::AccessFlags2,
+    ) -> Result<(), ResourceError> {
+        let StorageBacking::Managed(lease) = &self.storage.backing else {
+            return Err(ResourceError::Detached);
+        };
+        service.with_storage_write(lease, |alloc| {
+            if alloc.is_test_stub {
+                alloc.current_layout = target_layout;
+                return;
+            }
+            let barrier = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access)
+                .old_layout(alloc.current_layout)
+                .new_layout(target_layout)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(alloc.image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            let dep =
+                vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
+            alloc.current_layout = target_layout;
+        })
     }
 }
 
@@ -1964,7 +2096,7 @@ mod tests {
         };
 
         let old_lease = Storage::from_backing(StorageBacking::Legacy(old_legacy))
-            .into_managed(&mut service, old_target, (10, 20))
+            .into_managed(&mut service, &platform, old_target, (10, 20))
             .map_err(|(e, _)| e)
             .unwrap();
 
@@ -2401,6 +2533,7 @@ mod tests {
         };
         let incarnation = crate::kms::owner::identity::IncarnationId::first();
         let mut service = ResourceService::new(device_key, incarnation);
+        let platform = PlatformBackend::for_tests();
 
         let storage = Storage::for_tests_null(
             vk::Extent2D {
@@ -2411,7 +2544,7 @@ mod tests {
         );
         let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
         let lease = storage
-            .into_managed(&mut service, target, (0, 0))
+            .into_managed(&mut service, &platform, target, (0, 0))
             .map_err(|(e, _)| e)
             .unwrap();
 
@@ -2454,6 +2587,7 @@ mod tests {
         };
         let incarnation = crate::kms::owner::identity::IncarnationId::first();
         let mut service = ResourceService::new(device_key, incarnation);
+        let platform = PlatformBackend::for_tests();
 
         // Old bordered window: width 100, bw 2 -> storage 104, content_offset (2, 2)
         let old_storage = Storage::for_tests_null(
@@ -2465,7 +2599,7 @@ mod tests {
         );
         let old_target = PaintTarget::new(DrawableId::for_tests(1), (2, 2), None, 24);
         let old_lease = old_storage
-            .into_managed(&mut service, old_target, (2, 2))
+            .into_managed(&mut service, &platform, old_target, (2, 2))
             .map_err(|(e, _)| e)
             .unwrap();
 
@@ -2485,7 +2619,7 @@ mod tests {
         );
         let new_target = PaintTarget::new(DrawableId::for_tests(1), (4, 4), None, 24);
         let new_lease = new_storage
-            .into_managed(&mut service, new_target, (4, 4))
+            .into_managed(&mut service, &platform, new_target, (4, 4))
             .map_err(|(e, _)| e)
             .unwrap();
 
@@ -2511,6 +2645,7 @@ mod tests {
         };
         let incarnation = crate::kms::owner::identity::IncarnationId::first();
         let mut service = ResourceService::new(device_key, incarnation);
+        let platform = PlatformBackend::for_tests();
 
         let mut s = DrawableStore::new();
         let id = s
@@ -2521,7 +2656,7 @@ mod tests {
         let target = PaintTarget::new(id, (0, 0), None, 24);
         let old_storage = std::mem::replace(&mut s.get_mut(id).unwrap().storage, stub_storage());
         let lease = old_storage
-            .into_managed(&mut service, target, (0, 0))
+            .into_managed(&mut service, &platform, target, (0, 0))
             .map_err(|(e, _)| e)
             .unwrap();
         let old_key = lease.allocation.key();
@@ -2600,6 +2735,7 @@ mod tests {
         };
         let incarnation = crate::kms::owner::identity::IncarnationId::first();
         let mut service = ResourceService::new(device_key, incarnation);
+        let platform = PlatformBackend::for_tests();
 
         // Target has x11_depth 24
         let target = PaintTarget::new(DrawableId::for_tests(10), (0, 0), None, 24);
@@ -2614,7 +2750,7 @@ mod tests {
         assert_eq!(storage.depth, 32);
 
         let lease = storage
-            .into_managed(&mut service, target, (0, 0))
+            .into_managed(&mut service, &platform, target, (0, 0))
             .map_err(|(e, _)| e)
             .unwrap();
 
@@ -2644,6 +2780,407 @@ mod tests {
         promoted.destroy(&platform);
     }
 
+    /// M-21: the deterministic test above never wires a real pool, so
+    /// "must not pool-return" was unobservable -- `is_test_stub` makes
+    /// `cleanup_handles` return before reaching the pool-return branch at
+    /// all. This drives the real, non-stub path with a live `PixmapPool`
+    /// and asserts the pool's own acceptance counter, not just "no panic".
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_storage_no_premature_pool_return_vulkan() {
+        let vk = match crate::kms::vk::device::VkContext::new() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        let pool = Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
+            &vk,
+        )));
+        let mut platform = PlatformBackend::for_tests();
+        platform.vk = Some(Arc::clone(&vk));
+        platform.pixmap_pool = Some(Arc::clone(&pool));
+
+        let mut storage = platform
+            .allocate_drawable_storage(64, 64, 32)
+            .expect("allocate_drawable_storage");
+        if let StorageBacking::Legacy(ref mut alloc) = storage.backing {
+            alloc.promoted_exportable = true;
+        }
+        storage.destroy(&platform);
+
+        let stats = pool.stats();
+        assert_eq!(
+            stats.total_returns_accepted, 0,
+            "a promoted (exportable) storage's handles must never re-enter the pixmap pool",
+        );
+        pool.drain();
+    }
+
+    /// B-14: `into_managed` must refuse to adopt a real (non-stub)
+    /// allocation when no `VkContext` is available to eventually clean it
+    /// up, rather than silently adopting it and leaking its Vulkan
+    /// handles the first time the service actually destroys the entry.
+    /// Fully deterministic: the null-handle, non-stub `Storage` never
+    /// needs a real context to construct, only to prove `into_managed`
+    /// checks for one.
+    #[test]
+    fn c0_2ci_storage_into_managed_refuses_non_stub_without_vk_context() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+        // No Vk, no pool -- the precondition into_managed must refuse for
+        // a non-stub allocation.
+        let platform = PlatformBackend::for_tests();
+
+        let storage = Storage::new_server_owned(
+            vk::Image::null(),
+            vk::DeviceMemory::null(),
+            vk::ImageView::null(),
+            vk::ImageView::null(),
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+            24,
+        );
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let err = storage.into_managed(&mut service, &platform, target, (0, 0));
+        assert!(
+            matches!(err, Err((ResourceError::InvalidState, _))),
+            "non-stub adoption without a Vk context must be refused, not \
+             silently adopted with vk left None -- the payload's eventual \
+             StorageAllocation::Drop would then find vk == None and skip \
+             cleanup_handles entirely",
+        );
+    }
+
+    /// B-14 live half: when a real `VkContext` IS available, `into_managed`
+    /// must pin it onto the adopted allocation so `cleanup_handles` can
+    /// actually run against it later, instead of leaving `vk: None`
+    /// forever (the pre-fix signature had no `platform` parameter at all
+    /// and never touched `vk`/`pixmap_pool`).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan() {
+        let vk = match crate::kms::vk::device::VkContext::new() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        let mut platform = PlatformBackend::for_tests();
+        platform.vk = Some(Arc::clone(&vk));
+
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        let storage = platform
+            .allocate_drawable_storage(64, 64, 32)
+            .expect("allocate_drawable_storage");
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let lease = storage
+            .into_managed(&mut service, &platform, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .expect("adopt real, non-stub storage");
+        let key = lease.allocation.key();
+
+        let has_context = service
+            .with_storage_read(&lease, |alloc| alloc.vk.is_some())
+            .unwrap();
+        assert!(
+            has_context,
+            "into_managed must pin the real VkContext so cleanup_handles \
+             can run instead of finding vk == None and leaking",
+        );
+
+        // Real cleanup: dropping the lease and servicing must actually
+        // destroy the live Vulkan handles (StorageAllocation::Drop),
+        // not merely remove the bookkeeping entry.
+        drop(lease);
+        let _ = service.service_ready();
+        assert!(
+            !service.contains(&key),
+            "managed storage reclaimed once the retain lease drops",
+        );
+    }
+
+    /// M-18: proves `is_exportable_managed` reserves a `Read` use through
+    /// `ResourceService::with_storage_read` instead of reading
+    /// `AllocationEntry.payload` directly. Pre-fix, `Storage::is_exportable`
+    /// returned a bare `bool` computed from an unreserved
+    /// `RefCell::borrow()`, so a live incompatible writer could not make it
+    /// fail -- there was no `Result` to fail with.
+    #[test]
+    fn c0_2ci_storage_is_exportable_managed_reserves_read_and_refuses_when_written() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+        let platform = PlatformBackend::for_tests();
+
+        let mut storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        if let StorageBacking::Legacy(ref mut alloc) = storage.backing {
+            alloc.promoted_exportable = true;
+        }
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let lease = storage
+            .into_managed(&mut service, &platform, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let key = lease.allocation.key();
+        let managed = Storage::from_backing(StorageBacking::Managed(lease));
+
+        assert_eq!(
+            managed.is_exportable_managed(&mut service),
+            Ok(true),
+            "read reservation succeeds and observes the real payload flag",
+        );
+
+        // A live writer makes a Read reservation incompatible
+        // (`EntryAvailability::is_compatible`); the pre-fix direct
+        // `.borrow()` had no reservation at all and could not observe this.
+        let _writer = service.reserve(key, UseKind::Write).unwrap();
+        assert_eq!(
+            managed.is_exportable_managed(&mut service),
+            Err(ResourceError::Busy),
+            "is_exportable must go through the reservation protocol, not read \
+             AllocationEntry.payload directly",
+        );
+    }
+
+    /// M-18: proves `record_layout_transition_managed` reserves a `Write`
+    /// use before mutating `current_layout`, refusing (and leaving the
+    /// layout untouched) while an incompatible reader is live. Pre-fix,
+    /// the Managed arm mutated `current_layout` through a direct
+    /// `lease.allocation.entry.payload.borrow_mut()` under the storage's
+    /// own Retain lease, with no reservation check at all -- this
+    /// scenario would have silently mutated the layout instead of
+    /// refusing. `is_test_stub` keeps this deterministic (no real
+    /// barrier is recorded), but the type still requires a live
+    /// `VkContext` to construct at all.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan() {
+        let vk = match crate::kms::vk::device::VkContext::new() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        let platform = PlatformBackend::for_tests();
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        let mut s = DrawableStore::new();
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let lease = storage
+            .into_managed(&mut service, &platform, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let key = lease.allocation.key();
+        let id = s
+            .allocate(
+                0x1,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::from_backing(StorageBacking::Managed(lease)),
+            )
+            .unwrap();
+
+        // No competing reservation: the transition succeeds and the stub
+        // path (no real barrier recorded) still updates current_layout.
+        s.get_mut(id)
+            .unwrap()
+            .record_layout_transition_managed(
+                &mut service,
+                &vk,
+                vk::CommandBuffer::null(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            )
+            .expect("no competing reservation");
+        let layout_after_success = {
+            let StorageBacking::Managed(lease) = &s.get(id).unwrap().storage.backing else {
+                panic!("still managed");
+            };
+            service
+                .with_storage_read(lease, |alloc| alloc.current_layout)
+                .unwrap()
+        };
+        assert_eq!(layout_after_success, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+
+        // A live reader makes Write incompatible.
+        let _reader = service.reserve(key, UseKind::Read).unwrap();
+        let refusal = s.get_mut(id).unwrap().record_layout_transition_managed(
+            &mut service,
+            &vk,
+            vk::CommandBuffer::null(),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        );
+        assert_eq!(
+            refusal,
+            Err(ResourceError::Busy),
+            "record_layout_transition_managed must reserve Write, not mutate \
+             current_layout directly under an outstanding reader",
+        );
+        let layout_after_refusal = {
+            let StorageBacking::Managed(lease) = &s.get(id).unwrap().storage.backing else {
+                panic!("still managed");
+            };
+            service
+                .with_storage_read(lease, |alloc| alloc.current_layout)
+                .unwrap()
+        };
+        assert_eq!(
+            layout_after_refusal,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            "a refused write must not mutate current_layout",
+        );
+    }
+
+    /// M-20: `Storage::destroy`'s Managed arm must detach the Retain use
+    /// AT THE CALL, not merely whenever the surrounding `Storage`
+    /// eventually drops. Pre-fix, the arm was a bare `{}`: this only
+    /// looked correct because both current callers happen to drop the
+    /// whole `Drawable` immediately afterward. This test calls
+    /// `destroy()` and inspects service state WHILE the `Storage` value
+    /// is still alive (not yet dropped) -- pre-fix, the retain use would
+    /// still be held at that point, so `service_ready()` could not have
+    /// reclaimed the entry yet.
+    #[test]
+    fn c0_2ci_storage_managed_destroy_detaches_before_drop() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+        let platform = PlatformBackend::for_tests();
+
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let lease = storage
+            .into_managed(&mut service, &platform, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let key = lease.allocation.key();
+        let mut managed_storage = Storage::from_backing(StorageBacking::Managed(lease));
+
+        managed_storage.destroy(&platform);
+        // `managed_storage` is still alive here -- deliberately not
+        // dropped yet. If `destroy()` had not released the retain use
+        // itself, this `service_ready()` would find `can_destroy` false
+        // (live_use_count() == 1) and leave the entry rooted.
+        let _ = service.service_ready();
+        assert!(
+            !service.contains(&key),
+            "destroy() must detach the retain use immediately, not only when \
+             the Storage value later drops",
+        );
+
+        // Idempotent: destroying twice (now an inert Legacy stub) must
+        // not panic.
+        managed_storage.destroy(&platform);
+        drop(managed_storage);
+    }
+
+    /// M-20 integration: the same guarantee through the actual
+    /// `DrawableStore` retirement seam (`decref` → `destroy_now`), which
+    /// is what `FreePixmap`/window teardown actually calls in production.
+    #[test]
+    fn c0_2ci_storage_managed_drawable_decref_reclaims_via_service() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+        let mut platform = PlatformBackend::for_tests();
+
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let lease = storage
+            .into_managed(&mut service, &platform, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let key = lease.allocation.key();
+
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(
+                0x77,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::from_backing(StorageBacking::Managed(lease)),
+            )
+            .unwrap();
+
+        // No fence ticket attached, so decref-to-zero destroys
+        // immediately (FreePixmap with nothing in flight).
+        let decision = s.decref(&mut platform, id, |_| {});
+        assert_eq!(decision, RetireDecision::Destroyed);
+        assert!(s.get(id).is_none());
+
+        let _ = service.service_ready();
+        assert!(
+            !service.contains(&key),
+            "destroy_now's Storage::destroy must release the retain use so \
+             service_ready can reclaim the managed allocation",
+        );
+    }
+
     #[test]
     fn c0_2ci_storage_dri3_lease_regressions() {
         let device_key = crate::platform::drm::DrmDeviceKey {
@@ -2652,6 +3189,7 @@ mod tests {
         };
         let incarnation = crate::kms::owner::identity::IncarnationId::first();
         let mut service = ResourceService::new(device_key, incarnation);
+        let platform = PlatformBackend::for_tests();
 
         // 1. Explicit modifier
         let explicit_metadata = ImportedDmabufMetadata {
@@ -2680,7 +3218,7 @@ mod tests {
         }
         let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
         let explicit_lease = explicit_storage
-            .into_managed(&mut service, target, (0, 0))
+            .into_managed(&mut service, &platform, target, (0, 0))
             .map_err(|(e, _)| e)
             .unwrap();
 
@@ -2721,7 +3259,7 @@ mod tests {
         }
         let target2 = PaintTarget::new(DrawableId::for_tests(2), (0, 0), None, 24);
         let implicit_lease = implicit_storage
-            .into_managed(&mut service, target2, (0, 0))
+            .into_managed(&mut service, &platform, target2, (0, 0))
             .map_err(|(e, _)| e)
             .unwrap();
 
@@ -2732,5 +3270,223 @@ mod tests {
                 assert_eq!(meta.planes[0].offset, 0);
             })
             .unwrap();
+    }
+
+    /// 3.5b (M-21): the metadata-only regression above never drives a real
+    /// import/export round trip, a logical FreePixmap or deferred
+    /// retirement -- it is unobservable whether managed adoption changes
+    /// any of upstream's DRI3 export guarantees
+    /// (`dri3_imported_pixmap_exports_the_clients_own_description` in
+    /// `backend.rs`). This extends that same contract across managed
+    /// adoption: a real dma-buf is imported, wrapped as managed
+    /// `Storage`, exported back out through `dri3::export_dmabuf` while
+    /// still owned by the service, and only actually destroyed once a
+    /// simulated FreePixmap's retirement is no longer deferred by an
+    /// outstanding KMS obligation.
+    #[test]
+    #[ignore = "needs a Vulkan ICD that can export dma-bufs (not lavapipe)"]
+    fn c0_2ci_storage_dri3_lease_regressions_vulkan() {
+        use crate::kms::vk::{
+            device::VkContext,
+            dri3::{self, DRM_FORMAT_MOD_INVALID, DmabufPlane},
+            target::allocate_exportable,
+        };
+
+        let vk = match VkContext::new() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        let mut platform = PlatformBackend::for_tests();
+        platform.vk = Some(Arc::clone(&vk));
+
+        let (w, h) = (256u32, 64u32);
+        let seed = match allocate_exportable(&vk, w, h, vk::Format::B8G8R8A8_UNORM) {
+            Ok(img) => img,
+            Err(e) if format!("{e:?}").contains("FORMAT_NOT_SUPPORTED") => {
+                eprintln!("skip: ICD cannot export dma-bufs (lavapipe on CI): {e:?}");
+                return;
+            }
+            Err(e) => panic!("fixture: allocate_exportable: {e:?}"),
+        };
+        let seed_export = dri3::export_backing(&vk, &seed).expect("fixture: export seed");
+        assert!(
+            seed_export.size > 0 && seed_export.stride > 0,
+            "fixture: seed export must describe a real buffer, got size={} stride={}",
+            seed_export.size,
+            seed_export.stride,
+        );
+        let stride = seed_export.stride;
+        let seed_modifier = seed_export.modifier;
+        // Deliberately NOT the seed's own size: a distinguishable value is
+        // what gives "the client-stated size round-trips" assertion teeth.
+        let stated_size = seed_export.size + 4096;
+
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        // `vk_import_modifier` is what Vulkan is told to import with
+        // (production always forces LINEAR for an implicit layout -- it
+        // has nothing else to resolve it to, per `dri3_import_pixmap`);
+        // `reported_modifier` is what `DrawableImage.drm_modifier` (and
+        // hence `dri3::export_dmabuf`) tells the CLIENT back. The two
+        // diverge exactly for the implicit case -- conflating them is
+        // what made the initial version of this test assert LINEAR
+        // where the contract requires `DRM_FORMAT_MOD_INVALID`.
+        for (
+            case,
+            vk_import_modifier,
+            reported_modifier,
+            implicit_layout,
+            client_size,
+            expected_modifier,
+            expected_size,
+        ) in [
+            (
+                "implicit",
+                dri3::DRM_FORMAT_MOD_LINEAR,
+                DRM_FORMAT_MOD_INVALID,
+                true,
+                Some(stated_size),
+                DRM_FORMAT_MOD_INVALID,
+                stated_size,
+            ),
+            (
+                "explicit",
+                seed_modifier,
+                seed_modifier,
+                false,
+                None,
+                seed_modifier,
+                seed_export.size,
+            ),
+        ] {
+            // Once-only FD ownership: each case dups its own handle from
+            // the seed; `import_dmabuf_reporting` takes ownership of
+            // exactly this dup, never the seed's own fd.
+            let fd = seed_export
+                .fd
+                .try_clone()
+                .unwrap_or_else(|e| panic!("{case}: dup seed fd: {e}"));
+            let drawable = dri3::import_dmabuf_reporting(
+                Arc::clone(&vk),
+                fd,
+                w,
+                h,
+                vk::Format::B8G8R8A8_UNORM,
+                vk_import_modifier,
+                Some(reported_modifier),
+                client_size,
+                &[DmabufPlane {
+                    offset: 0,
+                    pitch: stride,
+                }],
+            )
+            .unwrap_or_else(|e| panic!("{case}: import failed: {e:?}"));
+
+            let sample_view =
+                PlatformBackend::build_sample_view(&vk, drawable.vk_image, drawable.format, 24)
+                    .unwrap_or_else(|e| panic!("{case}: build_sample_view: {e:?}"));
+
+            let storage = Storage::from_imported_drawable_image(
+                drawable,
+                sample_view,
+                24,
+                ImportedDmabufMetadata {
+                    fourcc: u32::from_le_bytes(*b"XR24"),
+                    vk_format: vk::Format::B8G8R8A8_UNORM,
+                    modifier: vk_import_modifier,
+                    implicit_layout,
+                    planes: vec![ImportedDmabufPlane {
+                        offset: 0,
+                        pitch: stride,
+                    }],
+                    width: u16::try_from(w).unwrap(),
+                    height: u16::try_from(h).unwrap(),
+                    depth: 24,
+                    bpp: 32,
+                },
+            );
+
+            let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+            let lease = storage
+                .into_managed(&mut service, &platform, target, (0, 0))
+                .map_err(|(e, _)| e)
+                .unwrap_or_else(|e| panic!("{case}: into_managed: {e:?}"));
+            let key = lease.allocation.key();
+
+            // Export path round-trips the client's own description even
+            // through managed adoption -- not a re-derived Vulkan view.
+            let export = service
+                .with_storage_read(&lease, |alloc| {
+                    dri3::export_dmabuf(&vk, alloc.imported_drawable.as_ref().unwrap())
+                })
+                .unwrap_or_else(|e| panic!("{case}: with_storage_read: {e:?}"))
+                .unwrap_or_else(|e| panic!("{case}: export_dmabuf: {e:?}"));
+            assert_eq!(
+                export.modifier, expected_modifier,
+                "{case}: exported modifier must be what the client's buffer is described by \
+                 -- reporting LINEAR for an unnamed layout is #138",
+            );
+            assert_eq!(
+                export.stride, stride,
+                "{case}: the client's own stride must survive the round trip",
+            );
+            assert_eq!(export.offset, 0, "{case}: no client fd offset change");
+            assert_eq!(
+                export.size, expected_size,
+                "{case}: the client's stated buffer size must be reported verbatim",
+            );
+
+            // Logical FreePixmap + deferred retirement (3.5b): a still-
+            // outstanding KMS obligation must keep the managed allocation
+            // alive across a decref-to-zero, and release it only once
+            // that obligation is discharged -- not merely whenever the
+            // Drawable/Storage happens to drop.
+            let kms_ob = service
+                .register(key, ObligationKind::KmsRelease)
+                .unwrap_or_else(|e| panic!("{case}: register KMS obligation: {e:?}"));
+
+            let mut drawables = DrawableStore::new();
+            let id = drawables
+                .allocate(
+                    0x99,
+                    DrawableKind::Pixmap,
+                    24,
+                    false,
+                    Storage::from_backing(StorageBacking::Managed(lease)),
+                )
+                .unwrap();
+            let mut decref_platform = PlatformBackend::for_tests();
+            let decision = drawables.decref(&mut decref_platform, id, |_| {});
+            assert_eq!(
+                decision,
+                RetireDecision::Destroyed,
+                "{case}: no fence ticket attached, so FreePixmap destroys immediately",
+            );
+            let _ = service.service_ready();
+            assert!(
+                service.contains(&key),
+                "{case}: retirement is deferred while the KMS obligation is outstanding",
+            );
+
+            service
+                .apply_validated_proof_for_tests(key, kms_ob)
+                .unwrap_or_else(|e| panic!("{case}: discharge KMS obligation: {e:?}"));
+            let _ = service.service_ready();
+            assert!(
+                !service.contains(&key),
+                "{case}: managed storage reclaimed once the obligation clears",
+            );
+            // Idempotent: servicing again must not attempt to close the
+            // dma-buf fd or destroy the sample view a second time.
+            let _ = service.service_ready();
+        }
     }
 }

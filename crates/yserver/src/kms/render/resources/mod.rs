@@ -393,6 +393,16 @@ impl ResourceService {
         self.exhausted
     }
 
+    /// F2b-m1: real exhaustion only happens after `u64::MAX` generations/
+    /// uses/obligations or a serviced-time expiry, neither reachable in a
+    /// unit test. This forces the same flag directly so
+    /// `register_managed_scanout_bo`'s pre-extraction `is_exhausted()`
+    /// guard (F2-M2) can be exercised deterministically.
+    #[cfg(test)]
+    pub(crate) fn force_exhausted_for_tests(&mut self) {
+        self.exhausted = true;
+    }
+
     pub(crate) fn reserve(
         &mut self,
         key: AllocationKey,

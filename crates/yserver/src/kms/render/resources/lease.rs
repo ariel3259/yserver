@@ -9,7 +9,7 @@ use super::availability::{AllocationEntry, AllocationKey, UseId, UseKind};
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct AllocationLease {
-    pub(crate) entry: Rc<AllocationEntry>,
+    pub(in crate::kms::render::resources) entry: Rc<AllocationEntry>,
     pub(crate) use_id: UseId,
     pub(crate) kind: UseKind,
     pub(crate) dirty_queue: Weak<RefCell<BTreeSet<AllocationKey>>>,
@@ -17,7 +17,7 @@ pub(crate) struct AllocationLease {
 
 #[allow(dead_code)]
 impl AllocationLease {
-    pub(crate) fn new(
+    pub(in crate::kms::render::resources) fn new(
         entry: Rc<AllocationEntry>,
         use_id: UseId,
         kind: UseKind,

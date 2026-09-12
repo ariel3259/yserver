@@ -704,4 +704,60 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
         &[CleanupCall::RemoveFb(9001), CleanupCall::CloseGem(9002)]
     );
     assert!(!service.contains(&display_key));
+
+    // F2b-m1: register_managed_scanout_bo's pre-extraction Exhausted guard
+    // (F2-M2) had no end-to-end test -- only the mid-function
+    // release_fresh_adoption rollback (the renderer-adoption-fails-after-
+    // display-succeeds case) was covered. This drives a SECOND bo into
+    // the Exhausted branch and asserts it comes back exactly as it went
+    // in: not a partially emptied husk with nowhere for its resources to
+    // go.
+    let mut second_bo = ScanoutBo::for_tests(
+        Rc::new(crate::drm::Device::for_tests().expect("test drm device")),
+        platform.vk.clone().expect("live_platform installs vk"),
+    );
+    let second_fb =
+        ::drm::control::framebuffer::Handle::from(std::num::NonZeroU32::new(9101).unwrap());
+    let second_gem = ::drm::buffer::Handle::from(std::num::NonZeroU32::new(9102).unwrap());
+    second_bo.fb_handle = Some(second_fb);
+    second_bo.gem_handle = Some(second_gem);
+    match platform.scanout_pools[0].as_mut().unwrap() {
+        OutputScanout::Shared(p) => p.bos.push(second_bo),
+        OutputScanout::Copied(_) => panic!("expected Shared pool"),
+    }
+    platform.bo_generations[0].push(Default::default());
+
+    let aliases_before = registry.payload_aliases();
+    let calls_before = calls.borrow().len();
+    service.force_exhausted_for_tests();
+    let err = platform
+        .register_managed_scanout_bo(&mut service, &mut registry, 0, 1)
+        .expect_err("exhausted service must refuse registration");
+    assert_eq!(err, ResourceError::Exhausted);
+    match platform.scanout_pools[0].as_ref().unwrap() {
+        OutputScanout::Shared(p) => {
+            assert_eq!(
+                p.bos[1].fb_handle,
+                Some(second_fb),
+                "fb_handle must survive an exhausted registration attempt untouched"
+            );
+            assert_eq!(
+                p.bos[1].gem_handle,
+                Some(second_gem),
+                "gem_handle must survive an exhausted registration attempt untouched"
+            );
+            assert_eq!(p.bos[1].managed_key(), None);
+        }
+        OutputScanout::Copied(_) => panic!("expected Shared pool"),
+    }
+    assert_eq!(
+        registry.payload_aliases(),
+        aliases_before,
+        "an exhausted registration attempt must not register a new alias"
+    );
+    assert_eq!(
+        calls.borrow().len(),
+        calls_before,
+        "an exhausted registration attempt must issue no ioctl"
+    );
 }
