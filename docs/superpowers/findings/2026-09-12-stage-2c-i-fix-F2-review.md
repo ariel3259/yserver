@@ -180,3 +180,33 @@ guards are then unreachable in production. No further action.
 5. F2-M2 — admission before extraction; ordered adoption with rollback.
 6. F2-M3 — the `_drm` test over `new_with_device_and_io`.
 7. Fold back; note F2-m1 for F-8 in Task 9's text now, so it is not lost.
+
+## F-2b re-review (`05555b03` + fold-back `98328b85`) — ACCEPTED
+
+All six items resolved as specified; F2-m1 recorded in Task 9's text for
+F-8; F2-m2 closed by ruling. Four mutation checks run here, all killed:
+(A) `unregister_payload_alias` removed from `service_ready_with_registry`
+→ 3 tests fail; (B) `set_managed(display_lease)` replaced by a drop →
+`c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan` fails;
+(C) `discharge_file_owned` drops the returned backing on `Err` →
+`..._retries_failed_discharge` fails; (D) the mint's `self.device = None`
+deleted → `c0_2ci_fd_family_barrier_real_gbm_payload_drm` fails. Gate:
+clippy clean, `c0_2ci` 85/85 on twelve runs, three hardware tests pass,
+musl and freebsd check. The plain `adopt` now refuses file-owned payloads,
+`service_ready` re-dirties instead of destroying them, and
+`DirectFramebuffer` is covered through the single dispatch point.
+
+One residual, honestly reported in the fold-back, carried into F-3:
+
+**F2b-m1 — `register_managed_scanout_bo`'s rollback path has no
+end-to-end test.** The mechanism (`is_exhausted`, `restore_physical_backing`,
+`into_*_backing`, `release_fresh_adoption`) is real and the two
+`release_fresh_adoption` tests cover the service half, but no test drives
+`register_managed_scanout_bo` into a failed adoption and asserts the bo
+got its handles back and the pool holds no dangling half. Fix in F-3: add
+`#[cfg(test)] ResourceService::force_exhausted_for_tests()`, then in the
+`_vulkan` adapter test register a second bo under exhaustion and assert
+`Err(Exhausted)`, `bo.fb_handle`/`gem_handle` restored, `managed_key() ==
+None`, `payload_aliases()` unchanged, `calls` empty.
+
+F-3 may start.
