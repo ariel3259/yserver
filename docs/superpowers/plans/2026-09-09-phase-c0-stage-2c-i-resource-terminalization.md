@@ -346,6 +346,30 @@ test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 1698 filtered out; f
 
 All four `_vulkan` tests this session added are new; the other three (`c0_2ci_fd_family_barrier_real_gbm_payload_drm`, `c0_2ci_live_lifetime_adapters_vulkan`, `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`) predate this session and are unaffected by it except the last, which this session extended for F2b-m1.
 
+**Fix round 2: `36ab74a7`.** Session F-3b, closing F3-B1 (`docs/superpowers/findings/2026-09-12-stage-2c-i-fix-F3-review.md`), per that finding's "What F-3b must do" list.
+
+| Finding | Verdict |
+| --- | --- |
+| F3-B1 (four new `_vulkan` tests in `store.rs` reported an environmental skip as a pass: `Err(e) => { eprintln!("skip: no Vk: {e}"); return; }` on a failed `VkContext::new()`, five occurrences total — `c0_2ci_storage_no_premature_pool_return_vulkan`, `c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan`, `c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan` each had one such arm, and `c0_2ci_storage_dri3_lease_regressions_vulkan` had two — one on `VkContext::new()`, one on `allocate_exportable`'s lavapipe/`FORMAT_NOT_SUPPORTED` case) | **RESOLVED** — all five arms now `panic!("environmental skip: no live Vulkan ICD available; not claiming pass")`, matching the shape already used by `c0_2ci_live_lifetime_adapters_vulkan` (`resources/adapter_tests.rs`). Nothing else in `store.rs` was touched |
+
+Gate for this round: `cargo +nightly fmt` clean; `cargo clippy --all-targets -- -D warnings` clean; `c0_2ci` 89 passed/0 failed/7 ignored on twelve consecutive runs, zero flakes. Hardware run (`--ignored`, this box has a real DRM node and NVIDIA/RADV ICDs):
+
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 7 tests
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 1698 filtered out; finished in 0.51s
+```
+
+No steps ticked or unticked by this round; F3-B1 was procedural only.
+
 ## Task 4: Shared/copied scanout backing and pool reuse
 
 **Files:** Create `resources/scanout.rs`; modify `kms/vk/scanout.rs`, `kms/render/platform.rs` and the resource payload enum.
