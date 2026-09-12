@@ -9,7 +9,7 @@ use crate::kms::render::{
     resources::{
         AllocationKey, ObligationId, ResourceService,
         availability::ResourceError,
-        capacity::{DirectCapacity, RoleReservation},
+        capacity::{DirectCapacity, DirectRole, RoleReservation},
         lease::AllocationLease,
         present::{CompletionDisposition, PresentDisposition, PresentKey, ReleaseDisposition},
         storage::StorageLease,
@@ -140,11 +140,21 @@ pub struct CommitResourceConsumer {
     pub(crate) direct_admission_scheduled: bool,
     pub(crate) gate_handle: Option<TransportGateHandle>,
     pub(crate) released_presents: Vec<PresentRelease>,
+    pub(crate) reserved_retirements:
+        BTreeMap<crate::kms::owner::identity::CommitId, RoleReservation>,
 }
 
 impl CommitResourceConsumer {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn prereserve_retirement(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        slot: RoleReservation,
+    ) {
+        self.reserved_retirements.insert(commit, slot);
     }
 
     pub(crate) fn take_current(&mut self) -> Vec<CommitResources> {
@@ -233,7 +243,7 @@ impl CommitResourceConsumer {
                 Ok(())
             }
             crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
-                let (mut old, new) = resources.into_parts();
+                let (mut old, mut new) = resources.into_parts();
                 let mut members: Vec<GroupMember> =
                     new.iter().flat_map(|r| r.crtcs.iter().copied()).collect();
                 if members.is_empty() {
@@ -245,9 +255,40 @@ impl CommitResourceConsumer {
                     if hw_completed {
                         discharge_commit_kms_obligations(res, &members, service)?;
                     }
+                    // M-7: old current moves into pre-reserved retirement role
+                    if let Some(ref mut role) = res.direct_role
+                        && role.role == DirectRole::Current
+                    {
+                        if let Some(reserved) = self.reserved_retirements.remove(&commit) {
+                            if let Err((err, recovered)) =
+                                self.capacity.move_into_reserved(role, reserved)
+                            {
+                                self.reserved_retirements.insert(commit, recovered);
+                                self.capacity.close_admission();
+                                return Err(err);
+                            }
+                        } else if self.capacity.is_vacant(DirectRole::OrdinaryRetirement)
+                            && let Err(err) = self
+                                .capacity
+                                .move_role(role, DirectRole::OrdinaryRetirement)
+                        {
+                            self.capacity.close_admission();
+                            return Err(err);
+                        }
+                    }
                 }
                 if !hw_completed {
                     self.commit_members.insert(commit, members);
+                }
+                // M-7: new submitted moves into Current
+                for res in &mut new {
+                    if let Some(ref mut role) = res.direct_role
+                        && role.role == DirectRole::Submitted
+                        && let Err(err) = self.capacity.move_role(role, DirectRole::Current)
+                    {
+                        self.capacity.close_admission();
+                        return Err(err);
+                    }
                 }
                 self.releasing_resources.extend(old);
                 self.current_resources = new;
@@ -259,6 +300,9 @@ impl CommitResourceConsumer {
             } => {
                 self.hardware_completed_commits.remove(&commit);
                 self.commit_members.remove(&commit);
+                if let Some(reserved) = self.reserved_retirements.remove(&commit) {
+                    let _ = self.capacity.cancel_reservation(reserved);
+                }
                 for res in &mut resources {
                     for (key, obligation_id, _) in res.kms_obligations.drain(..) {
                         let _ = service.cancel(key, obligation_id);
@@ -273,6 +317,9 @@ impl CommitResourceConsumer {
             } => {
                 self.hardware_completed_commits.remove(&commit);
                 self.commit_members.remove(&commit);
+                if let Some(reserved) = self.reserved_retirements.remove(&commit) {
+                    let _ = self.capacity.cancel_reservation(reserved);
+                }
                 for res in &mut resources {
                     for (key, obligation_id, _) in res.kms_obligations.drain(..) {
                         let _ = service.cancel(key, obligation_id);
@@ -335,9 +382,14 @@ impl CommitResourceConsumer {
         _keys: &[AllocationKey],
         service: &mut ResourceService,
     ) -> Result<(), ResourceError> {
-        let mut retained_releasing = Vec::new();
         let mut freed_any = false;
-        for mut res in self.releasing_resources.drain(..) {
+        let mut transition_error = None;
+
+        let releasing = std::mem::take(&mut self.releasing_resources);
+        let mut retained_releasing = Vec::with_capacity(releasing.len());
+        let mut releasing_iter = releasing.into_iter();
+
+        while let Some(mut res) = releasing_iter.next() {
             if is_resource_releasable(&res, service) {
                 if let Some(slot) = res.direct_role.take() {
                     match self.capacity.finish_role(slot) {
@@ -359,8 +411,10 @@ impl CommitResourceConsumer {
                         Err((err, slot)) => {
                             res.direct_role = Some(slot);
                             retained_releasing.push(res);
+                            retained_releasing.extend(releasing_iter);
                             self.capacity.close_admission();
-                            return Err(err);
+                            transition_error = Some(err);
+                            break;
                         }
                     }
                 } else {
@@ -380,9 +434,15 @@ impl CommitResourceConsumer {
             }
         }
         self.releasing_resources = retained_releasing;
+        if let Some(err) = transition_error {
+            return Err(err);
+        }
 
-        let mut retained_rejected = Vec::new();
-        for mut res in self.rejected_resources.drain(..) {
+        let rejected = std::mem::take(&mut self.rejected_resources);
+        let mut retained_rejected = Vec::with_capacity(rejected.len());
+        let mut rejected_iter = rejected.into_iter();
+
+        while let Some(mut res) = rejected_iter.next() {
             if is_resource_releasable(&res, service) {
                 if let Some(slot) = res.direct_role.take() {
                     match self.capacity.finish_role(slot) {
@@ -404,8 +464,10 @@ impl CommitResourceConsumer {
                         Err((err, slot)) => {
                             res.direct_role = Some(slot);
                             retained_rejected.push(res);
+                            retained_rejected.extend(rejected_iter);
                             self.capacity.close_admission();
-                            return Err(err);
+                            transition_error = Some(err);
+                            break;
                         }
                     }
                 } else {
@@ -425,6 +487,9 @@ impl CommitResourceConsumer {
             }
         }
         self.rejected_resources = retained_rejected;
+        if let Some(err) = transition_error {
+            return Err(err);
+        }
 
         if freed_any {
             self.direct_admission_scheduled = true;

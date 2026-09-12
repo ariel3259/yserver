@@ -465,7 +465,7 @@ fn c0_2ci_adapter_unflip_ordinary_retirement_occupied() {
 
     // Clean up
     let _ = capacity.finish_role(current);
-    let _ = capacity.finish_role(ordinary);
+    let _ = capacity.cancel_reservation(ordinary);
 }
 
 // ── 11. Unknown -> detach -> late reply -> helper reap ──────────────────────

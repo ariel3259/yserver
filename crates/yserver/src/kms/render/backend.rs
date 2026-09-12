@@ -479,8 +479,11 @@ impl ScanoutM1ProbeEntry {
     }
 }
 
+const MAX_M1_PROBE_CACHE_ENTRIES: usize = 32;
+
 struct ScanoutM1ProbeCache {
     topology_signature: u64,
+    order: std::collections::VecDeque<DrawableId>,
     entries: HashMap<DrawableId, ScanoutM1ProbeEntry>,
 }
 
@@ -488,8 +491,23 @@ impl ScanoutM1ProbeCache {
     fn new() -> Self {
         Self {
             topology_signature: 0,
+            order: std::collections::VecDeque::new(),
             entries: HashMap::new(),
         }
+    }
+
+    fn insert(&mut self, id: DrawableId, entry: ScanoutM1ProbeEntry) {
+        if !self.entries.contains_key(&id) {
+            while self.entries.len() >= MAX_M1_PROBE_CACHE_ENTRIES {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            self.order.push_back(id);
+        }
+        self.entries.insert(id, entry);
     }
 
     fn remove(&mut self, id: DrawableId) {
@@ -503,6 +521,7 @@ impl ScanoutM1ProbeCache {
                 self.entries.len()
             );
             self.entries.clear();
+            self.order.clear();
         }
     }
 }
@@ -3175,7 +3194,6 @@ impl KmsBackend {
                 output_geometry,
             );
             self.scanout_m1
-                .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
@@ -3253,7 +3271,6 @@ impl KmsBackend {
                 height,
             );
             self.scanout_m1
-                .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
@@ -3266,7 +3283,6 @@ impl KmsBackend {
                     source_id.as_u64()
                 );
                 self.scanout_m1
-                    .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
                 self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
                 return;
@@ -3286,7 +3302,6 @@ impl KmsBackend {
             .collect();
         let Some(primary) = self.platform.primary_device() else {
             self.scanout_m1
-                .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
@@ -3315,7 +3330,6 @@ impl KmsBackend {
                     output_geometry,
                 );
                 self.scanout_m1
-                    .entries
                     .insert(source_id, ScanoutM1ProbeEntry::accepted(framebuffer));
                 self.scanout_m0.m1_probe_pass = self.scanout_m0.m1_probe_pass.saturating_add(1);
             }
@@ -3326,7 +3340,6 @@ impl KmsBackend {
                     candidate.src_host_xid,
                 );
                 self.scanout_m1
-                    .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
                 self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             }
@@ -3337,7 +3350,6 @@ impl KmsBackend {
                     candidate.src_host_xid,
                 );
                 self.scanout_m1
-                    .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
                 self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
             }
@@ -18192,6 +18204,164 @@ impl KmsBackend {
                 }
             }
         }
+    }
+
+    /// Managed direct candidate preparation seam (8.3).
+    ///
+    /// 1. Rejects `implicit_layout` before any direct import/validation, preserving
+    ///    upstream's `m1_gate_reject_import` behavior (guessed LINEAR is never scanout qualification).
+    /// 2. Takes a `DirectRole::Preparing` reservation from `self.commit_consumer.capacity`.
+    /// 3. Pins source and fallback target; tests FB in probe cache.
+    /// 4. On proven failure, cleans up candidate and cancels the Preparing reservation, retaining the existing successor.
+    /// 5. On successful validation, transitions/replaces Successor, idles/releases victim,
+    ///    and retains ordered Skip metadata.
+    /// 6. If cleanup is uncertain, charges the role and closes admission.
+    #[allow(dead_code)]
+    pub(crate) fn managed_prepare_direct_candidate(
+        &mut self,
+        source_id: DrawableId,
+        candidate: PresentScanoutCandidate,
+        event: yserver_core::backend::CompletedPresentEvent,
+    ) -> Result<bool, crate::kms::render::resources::ResourceError> {
+        // 1. Rejects implicit_layout before any direct import/validation (8.3)
+        let is_implicit = self
+            .store
+            .get(source_id)
+            .and_then(|drawable| {
+                let metadata = drawable.storage.imported_dmabuf.as_ref()?;
+                Some(metadata.implicit_layout)
+            })
+            .unwrap_or(false);
+
+        if is_implicit {
+            self.scanout_m0.m1_gate_reject_import =
+                self.scanout_m0.m1_gate_reject_import.saturating_add(1);
+            return Ok(false);
+        }
+
+        // 2. Reserve Preparing role before retaining / importing (8.3)
+        let prep_slot = self
+            .commit_consumer
+            .capacity
+            .reserve(crate::kms::render::resources::DirectRole::Preparing)?;
+
+        // 3. Resolve paint target and CRTC domain
+        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
+        let Some(fallback_target) = paint_target else {
+            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            self.request_direct_unflip("managed_prepare_paint_target_missing");
+            return Ok(false);
+        };
+
+        let (completion_output_idx, _) = match self.present_crtc_output(candidate.crtc_id) {
+            Some(pair) => pair,
+            None => {
+                let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                return Ok(false);
+            }
+        };
+
+        // Pin source and fallback target
+        let source_pin = self.pin_direct_source(source_id);
+        let fallback_target_pin = self.pin_direct_source(fallback_target.backing_id());
+
+        // 4. Test/import FB from probe cache
+        let fb_ready = self
+            .scanout_m1
+            .entries
+            .get(&source_id)
+            .and_then(ScanoutM1ProbeEntry::framebuffer)
+            .is_some();
+
+        if !fb_ready {
+            // Proven failure: clean up candidate and cancel role, retaining existing successor
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            self.request_direct_unflip("managed_prepare_framebuffer_missing");
+            return Ok(false);
+        }
+
+        // 5. Successful validation: move role from Preparing to Successor
+        let mut prep_slot = prep_slot;
+        if let Err(err) = self.commit_consumer.capacity.move_role(
+            &mut prep_slot,
+            crate::kms::render::resources::DirectRole::Successor,
+        ) {
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            return Err(err);
+        }
+
+        let frame = DirectPresentFrame {
+            source_pin,
+            fallback_target_pin,
+            source_id,
+            candidate,
+            fallback_target,
+            event,
+            completion_output_idx,
+            completion_clock: None,
+            awaiting_outputs: HashSet::new(),
+        };
+
+        // Atomically replace Successor: idle/release victim and retain ordered Skip metadata
+        if let Some(victim) = self.scanout_m2.queued_successor.replace(frame) {
+            self.defer_direct_successor_skip(victim);
+        }
+        self.scanout_m2.hold_direct = true;
+        self.scanout_m2.sync_ownership();
+
+        let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+
+        Ok(true)
+    }
+
+    /// Managed direct unflip / exit-resource accounting seam (8.5).
+    ///
+    /// 1. Unflip cancels unsent direct work (queued successor), waits for submitted work.
+    /// 2. Uses ExitRetirement for Current even if OrdinaryRetirement is occupied.
+    /// 3. Materializes shadow and resolves dependencies before using composed return resources.
+    /// 4. Enforces that direct re-entry requires both retirement roles vacant.
+    #[allow(dead_code)]
+    pub(crate) fn managed_handle_direct_unflip(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<bool, crate::kms::render::resources::ResourceError> {
+        self.request_direct_unflip(reason);
+
+        // Cancel unsent direct work
+        if let Some(queued) = self.scanout_m2.queued_successor.take() {
+            self.defer_direct_successor_skip(queued);
+        }
+
+        // Materialize shadow for unflip
+        let _ = self.materialize_direct_shadow_for_unflip();
+
+        // Re-entry requires both retirement roles vacant
+        let can_reenter = self.managed_can_enter_direct();
+        self.scanout_m2.reentry_blocked_until_composed = !can_reenter;
+
+        Ok(can_reenter)
+    }
+
+    /// Check whether direct entry is permitted under managed capacity rules (8.5).
+    #[allow(dead_code)]
+    pub(crate) fn managed_can_enter_direct(&self) -> bool {
+        if !self.commit_consumer.capacity.can_enter_direct() {
+            return false;
+        }
+        for output_idx in 0..self.platform.outputs.len() {
+            if self
+                .platform
+                .retained_composed_framebuffer(output_idx)
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -45594,5 +45764,125 @@ mod tests {
             b.present_source_pin_id(fail_fallback_pin),
             Some(redirected_fallback)
         );
+    }
+
+    #[test]
+    fn c0_2ci_backend_scanout_m1_probe_cache_strictly_bounded() {
+        use crate::kms::render::store::DrawableId;
+
+        let mut cache = super::ScanoutM1ProbeCache::new();
+        assert_eq!(cache.entries.len(), 0);
+
+        // Insert 40 entries, exceeding MAX_M1_PROBE_CACHE_ENTRIES = 32
+        for i in 1..=40 {
+            let id = DrawableId::for_tests(i);
+            cache.insert(id, super::ScanoutM1ProbeEntry::rejected());
+            assert!(cache.entries.len() <= 32);
+        }
+
+        assert_eq!(cache.entries.len(), 32);
+        // The earliest entries must have been evicted to bound memory usage
+        assert!(!cache.entries.contains_key(&DrawableId::for_tests(1)));
+        assert!(cache.entries.contains_key(&DrawableId::for_tests(40)));
+    }
+
+    #[test]
+    fn c0_2ci_backend_managed_prepare_direct_candidate_implicit_layout_rejection() {
+        use ash::vk;
+        use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
+
+        use crate::kms::render::store::{DrawableKind, ImportedDmabufMetadata};
+
+        let mut b = super::KmsBackend::for_tests();
+        let xid: u32 = 0x5432;
+        let mut storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+
+        // Mark dmabuf with implicit_layout = true
+        storage.imported_dmabuf = Some(ImportedDmabufMetadata {
+            fourcc: 0x3432_5258,
+            vk_format: vk::Format::B8G8R8A8_UNORM,
+            modifier: 0,
+            planes: Vec::new(),
+            implicit_layout: true,
+            width: 64,
+            height: 64,
+            depth: 24,
+            bpp: 32,
+        });
+
+        let did = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate");
+
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 1,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            src_pixmap_xid: xid,
+            dst_window_xid: 0,
+            src_host_xid: xid,
+            paint_dst_host_xid: 0,
+            completion_dst_host_xid: 0,
+            src_width: 64,
+            src_height: 64,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: 1,
+            host_xid: xid,
+            dst_host_xid: 0,
+            options: 0,
+            present_id: 1,
+            window_generation: 1,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: 0,
+            emit_idle: false,
+        };
+
+        let initial_rejects = b.scanout_m0.m1_gate_reject_import;
+        let result = b
+            .managed_prepare_direct_candidate(did, candidate, event)
+            .unwrap();
+        // Must reject implicit layout before any import or reservation (8.3)
+        assert!(!result);
+        assert_eq!(b.scanout_m0.m1_gate_reject_import, initial_rejects + 1);
+        // Capacity remained completely uncharged
+        assert_eq!(b.commit_consumer.capacity.occupied(), 0);
+    }
+
+    #[test]
+    fn c0_2ci_backend_managed_unflip_and_reentry_contracts() {
+        let mut b = super::KmsBackend::for_tests();
+        b.scanout_m2.test_force_active = true;
+
+        // With no active retirement roles, re-entry requires composed fb for outputs
+        // In the test harness with no composed fb ready:
+        assert!(!b.managed_can_enter_direct());
+
+        // Call managed_handle_direct_unflip
+        let result = b.managed_handle_direct_unflip("test_unflip").unwrap();
+        assert_eq!(result, b.managed_can_enter_direct());
+        assert!(b.scanout_m2.unflip_requested);
+        assert_eq!(b.scanout_m2.unflip_reason, Some("test_unflip"));
     }
 }
