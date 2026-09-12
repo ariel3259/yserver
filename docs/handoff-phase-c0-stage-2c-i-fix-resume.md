@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-12,
-after F-5b (F-6a dispatched).** If you are resuming this work cold — a new
+after F-6a (F-6b next).** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -42,8 +42,8 @@ stand so nothing is re-derived.
 | F-4, F-4b, F-4c | Task 5 (GPU/read adapters) | **ACCEPTED** (write half → F-4d) | `17384ae6`, `f475b04c`, `4e870930` (+fold-backs) | F4/F4b/F4c-review |
 | F-5a | Task 6, resources half (per-batch deadline, gate sealing, B-6) | **ACCEPTED** (M-13 real impl → F-5b) | `5f025fed`/`265b228e` | F5a-review |
 | F-5b | Task 6, sinks half (B-10 at 7 sinks, 6.5a/6.5b, grant consumed at executor send, real `DirectOwnershipState`) | **ACCEPTED** (gamma `_drm` test → F-9) | `842745a3`/`4eb05029` | F5b-review |
-| **F-6a** | Task 7, consumer half (B-8, B-9, M-2..M-5, M-15) | **RUNNING** | — | — |
-| F-6b | Task 7, Present half (M-6: 7.5/7.5a, `PresentRelease`, COW test) | pending | — | — |
+| F-6a | Task 7, consumer half (B-8, B-9, M-2..M-5, M-15) | **ACCEPTED** | `c35af190`/`e40d0cb9` | F6a-review |
+| **F-6b** | Task 7, Present half (M-6: 7.5/7.5a, `PresentRelease`, COW test) | pending | — | — |
 | F-7 | Task 8 (role transitions, `on_available`) | pending | — | — |
 | F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | pending | — | — |
 | F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | pending | — | — |
