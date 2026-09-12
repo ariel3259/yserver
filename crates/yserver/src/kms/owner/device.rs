@@ -1492,6 +1492,7 @@ impl<R> DeviceCommitOwner<R> {
                     SendError::AlreadyInFlight => RefusalCause::AlreadyInFlight,
                     SendError::ReservationMismatch => RefusalCause::ReservationMismatch,
                     SendError::BoundaryViolation => RefusalCause::BoundaryViolation,
+                    SendError::TransportGateRefused => RefusalCause::TransportGateRefused,
                     SendError::Ipc => unreachable!("handled above"),
                 };
                 let terminal =
@@ -1525,6 +1526,7 @@ impl<R> DeviceCommitOwner<R> {
             SendError::AlreadyInFlight => RefusalCause::AlreadyInFlight,
             SendError::ReservationMismatch => RefusalCause::ReservationMismatch,
             SendError::BoundaryViolation => RefusalCause::BoundaryViolation,
+            SendError::TransportGateRefused => RefusalCause::TransportGateRefused,
             SendError::Ipc => unreachable!("handled by the caller"),
         }
     }

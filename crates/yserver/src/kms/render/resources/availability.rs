@@ -122,7 +122,7 @@ impl EntryAvailability {
 #[allow(dead_code)]
 pub(crate) struct AllocationEntry {
     pub(crate) key: AllocationKey,
-    pub(crate) payload: RefCell<Option<super::AllocationPayload>>,
+    pub(in crate::kms::render::resources) payload: RefCell<Option<super::AllocationPayload>>,
     pub(crate) availability: RefCell<EntryAvailability>,
 }
 

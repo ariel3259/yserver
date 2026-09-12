@@ -52,6 +52,10 @@ pub enum RefusalCause {
     AlreadyInFlight,
     ReservationMismatch,
     BoundaryViolation,
+    /// B-10/R11: the transport gate refused this write before `send`
+    /// touched the wire (no production issuer exists yet, R8, so this is
+    /// unreachable in production today).
+    TransportGateRefused,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

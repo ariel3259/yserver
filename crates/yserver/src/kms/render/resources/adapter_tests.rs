@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ash::vk;
+use ash::vk::{self, Handle};
 
 use super::{
     AllocationPayload, CommitResourceConsumer, CommitResources, CompletionIngress,
@@ -14,7 +14,7 @@ use super::{
     ResourceService, RetainingSupervisor, UseKind,
     gpu::GpuObligation,
     storage::StorageBacking,
-    tests::{MockCleanupIo, spy_service},
+    tests::{CleanupCall, MockCleanupIo, spy_service},
 };
 use crate::kms::{
     owner::{
@@ -286,6 +286,13 @@ fn c0_2ci_adapter_uncertain_gpu_read_submit_retention() {
 }
 
 // ── 6. VT-away / DPMS-off / idle scene ──────────────────────────────────────
+//
+// F4-B1: `GpuObligation.context` is `Option<Arc<VkContext>>` and
+// `#[cfg(test)] for_tests_stub` builds one with `context: None` -- legal
+// here because, as before, this test never lets a real ticket reach the
+// device: `test_ticket_status` intercepts `ticket_status()` first. No live
+// device is needed to construct the value any more, so this is deterministic
+// again.
 #[test]
 fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress() {
     let (mut dummy_service, dummy_lease, dummy_drops) = spy_service();
@@ -294,16 +301,24 @@ fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress() {
         .register(dummy_key, ObligationKind::Gpu)
         .unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![dummy_lease], vec![0], true);
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let mut batch = CoreRetirementBatch::new(
+        vec![dummy_lease],
+        vec![vk::DescriptorSet::from_raw(0)],
+        true,
+    );
     batch.bind_ticket(GpuObligation::for_tests_stub(
         vec![(dummy_key, dummy_gpu)],
         ticket,
     ));
-    dummy_service.register_batch(batch);
+    batch.test_ticket_status = Some(Ok(false));
 
     let start = Instant::now();
+    // B-11: the budget must be set BEFORE registering -- the batch's
+    // deadline is stamped from `max_serviced_duration` as of its own
+    // registration, not re-read from a mutable field on every poll.
     dummy_service.max_serviced_duration = Duration::from_millis(50);
+    dummy_service.register_batch(batch);
 
     // VT away pauses serviced elapsed time
     dummy_service.set_seat_active(false, start);
@@ -636,6 +651,18 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
         .register_managed_scanout_bo(&mut service, &mut registry, 0, 0)
         .expect("register managed scanout bo");
 
+    // F2-B1: the pool slot must root the Retain lease, not a bare key --
+    // otherwise the entry has zero live uses right after registration, is
+    // already dirty (the dropped lease marked it), and the very next tick
+    // discharges and destroys it while the pool slot still lists the husk
+    // as managed and possibly scanning out.
+    service.service_ready_with_registry(&mut registry);
+    assert!(
+        service.contains(&display_key),
+        "F2-B1: a freshly registered managed bo must not be swept by the next tick"
+    );
+    assert!(calls.borrow().is_empty());
+
     let output = CrtcKey::for_output(&platform.outputs[0]);
     let token = platform
         .acquire_managed_scanout_bo(&mut service, output)
@@ -646,6 +673,10 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
     // legacy acquire_scanout_bo can no longer hand out the same slot while
     // this managed token is live.
     assert!(platform.acquire_scanout_bo(0).is_none());
+
+    // Done proving the token itself; drop its Write-kind lease so it is not
+    // an extra live use blocking the destroy proof below.
+    drop(token);
 
     // 4.5: cancel_scanout_bo_recording ends recording but not in-flight
     // work -- a registered GPU obligation on the managed key survives it.
@@ -671,7 +702,77 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
         .unwrap()
         .detach_managed_entries();
     match platform.scanout_pools[0].as_ref().unwrap() {
-        OutputScanout::Shared(p) => assert_eq!(p.bos[0].managed_key, None),
+        OutputScanout::Shared(p) => assert_eq!(p.bos[0].managed_key(), None),
         OutputScanout::Copied(_) => panic!("expected Shared pool"),
     }
+
+    // F2-B1: detach is what actually drops the lease -- only *now* does the
+    // entry become destroyable, discharging the still-outstanding GPU
+    // obligation notwithstanding (F2-B1's test asks for the right's GEM
+    // disposition; the still-pending GPU obligation from the cancel step
+    // above additionally proves detach alone does not bypass ordinary
+    // availability gating).
+    service.apply_validated_proof(display_key, gpu_ob).unwrap();
+    service.service_ready_with_registry(&mut registry);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(9001), CleanupCall::CloseGem(9002)]
+    );
+    assert!(!service.contains(&display_key));
+
+    // F2b-m1: register_managed_scanout_bo's pre-extraction Exhausted guard
+    // (F2-M2) had no end-to-end test -- only the mid-function
+    // release_fresh_adoption rollback (the renderer-adoption-fails-after-
+    // display-succeeds case) was covered. This drives a SECOND bo into
+    // the Exhausted branch and asserts it comes back exactly as it went
+    // in: not a partially emptied husk with nowhere for its resources to
+    // go.
+    let mut second_bo = ScanoutBo::for_tests(
+        Rc::new(crate::drm::Device::for_tests().expect("test drm device")),
+        platform.vk.clone().expect("live_platform installs vk"),
+    );
+    let second_fb =
+        ::drm::control::framebuffer::Handle::from(std::num::NonZeroU32::new(9101).unwrap());
+    let second_gem = ::drm::buffer::Handle::from(std::num::NonZeroU32::new(9102).unwrap());
+    second_bo.fb_handle = Some(second_fb);
+    second_bo.gem_handle = Some(second_gem);
+    match platform.scanout_pools[0].as_mut().unwrap() {
+        OutputScanout::Shared(p) => p.bos.push(second_bo),
+        OutputScanout::Copied(_) => panic!("expected Shared pool"),
+    }
+    platform.bo_generations[0].push(Default::default());
+
+    let aliases_before = registry.payload_aliases();
+    let calls_before = calls.borrow().len();
+    service.force_exhausted_for_tests();
+    let err = platform
+        .register_managed_scanout_bo(&mut service, &mut registry, 0, 1)
+        .expect_err("exhausted service must refuse registration");
+    assert_eq!(err, ResourceError::Exhausted);
+    match platform.scanout_pools[0].as_ref().unwrap() {
+        OutputScanout::Shared(p) => {
+            assert_eq!(
+                p.bos[1].fb_handle,
+                Some(second_fb),
+                "fb_handle must survive an exhausted registration attempt untouched"
+            );
+            assert_eq!(
+                p.bos[1].gem_handle,
+                Some(second_gem),
+                "gem_handle must survive an exhausted registration attempt untouched"
+            );
+            assert_eq!(p.bos[1].managed_key(), None);
+        }
+        OutputScanout::Copied(_) => panic!("expected Shared pool"),
+    }
+    assert_eq!(
+        registry.payload_aliases(),
+        aliases_before,
+        "an exhausted registration attempt must not register a new alias"
+    );
+    assert_eq!(
+        calls.borrow().len(),
+        calls_before,
+        "an exhausted registration attempt must issue no ioctl"
+    );
 }

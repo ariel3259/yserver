@@ -817,8 +817,58 @@ impl TestDevice {
         None
     }
 
+    /// Open the real primary node whose `st_rdev` matches `key`, rather than
+    /// the first `/dev/dri/cardN` found (F4-B2).
+    ///
+    /// On a multi-GPU box the first enumerable primary node is not
+    /// necessarily the one `VkContext::new()` selected: `ADDFB2` on a
+    /// framebuffer built from another GPU's PRIME export fails with EINVAL
+    /// (observed on this box: NVIDIA discrete + AMD integrated -- Vulkan
+    /// picks the discrete NVIDIA device, `open_real_drm_or_ignore` picks
+    /// AMD's `card0`). Callers that need the node paired with a live
+    /// `VkContext` should pass `vk.selected_drm_identity.and_then(|id|
+    /// id.primary)` here instead of calling `open_real_drm_or_ignore`.
+    pub fn open_real_drm_matching(key: crate::platform::drm::DrmDeviceKey) -> Option<Self> {
+        for minor in 0..64 {
+            let path = format!("/dev/dri/card{minor}");
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            else {
+                continue;
+            };
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(file.as_raw_fd(), &mut stat) };
+            if rc < 0 {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let (major, minor_no) = (
+                libc::major(stat.st_rdev) as u32,
+                libc::minor(stat.st_rdev) as u32,
+            );
+            if major == key.major && minor_no == key.minor {
+                return Some(Self {
+                    file,
+                    is_stub: false,
+                });
+            }
+        }
+        None
+    }
+
     pub fn is_stub(&self) -> bool {
         self.is_stub
+    }
+
+    /// Consume this holder and return the underlying file.
+    ///
+    /// F4-B2: callers that need a real primary node behind
+    /// `crate::drm::Device::from_file_for_tests` (no `SET_MASTER`) take the
+    /// file directly rather than duplicating the fd through `AsFd`.
+    pub fn into_file(self) -> std::fs::File {
+        self.file
     }
 }
 

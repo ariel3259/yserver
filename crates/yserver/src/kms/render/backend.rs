@@ -529,7 +529,33 @@ struct DirectPresentFrame {
 /// causes direct/composed atomic thrash.
 const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
 
+/// F5a-M1: the real `DirectOwnershipState` implementor for
+/// `resources::transport::TransportGate`'s M-13 precondition. A clone of
+/// `ScanoutM2State`'s own live cells, kept in sync by `sync_ownership`
+/// (called at `ScanoutM2State`'s own `current`/`pending`/
+/// `queued_successor`/`unflip_requested` mutation sites) -- unlike the
+/// deleted `DirectOwnershipSignal`, nothing outside `ScanoutM2State` ever
+/// needs to remember to publish into this: it is the shadow of fields this
+/// same struct already owns and mutates. Installing a `TransportGate`
+/// against a clone of this handle in production is later work (R8).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScanoutM2OwnershipHandle {
+    busy: Rc<Cell<bool>>,
+    unflip_outstanding: Rc<Cell<bool>>,
+}
+
+impl crate::kms::render::resources::DirectOwnershipState for ScanoutM2OwnershipHandle {
+    fn direct_ownership_busy(&self) -> bool {
+        self.busy.get()
+    }
+
+    fn unflip_outstanding(&self) -> bool {
+        self.unflip_outstanding.get()
+    }
+}
+
 struct ScanoutM2State {
+    ownership: ScanoutM2OwnershipHandle,
     pending: Option<DirectPresentFrame>,
     /// One eligible direct successor, retained while `pending` owns the
     /// hardware transaction. Newer successors replace this slot (latest
@@ -569,6 +595,7 @@ struct ScanoutM2State {
 impl ScanoutM2State {
     fn new() -> Self {
         Self {
+            ownership: ScanoutM2OwnershipHandle::default(),
             pending: None,
             queued_successor: None,
             current: None,
@@ -619,6 +646,19 @@ impl ScanoutM2State {
 
     fn reset_eligible_root_probation(&mut self) {
         self.eligible_root_streak = 0;
+    }
+
+    /// F5a-M1: re-derive the `DirectOwnershipState` answer from this
+    /// struct's own fields and publish it into `ownership`. Called at every
+    /// site that mutates `current`/`pending`/`queued_successor`/
+    /// `unflip_requested`, so a clone of `ownership` held elsewhere (e.g. a
+    /// `TransportGate`) never reads a value this struct itself did not just
+    /// derive from its own truth.
+    fn sync_ownership(&self) {
+        self.ownership.busy.set(
+            self.current.is_some() || self.pending.is_some() || self.queued_successor.is_some(),
+        );
+        self.ownership.unflip_outstanding.set(self.unflip_requested);
     }
 }
 
@@ -1810,6 +1850,16 @@ impl KmsBackend {
         self.resource_service.as_ref()
     }
 
+    /// F5a-M1: a clone of this backend's live direct-ownership cells, for
+    /// installing a `resources::transport::TransportGate` against this
+    /// backend's real `ScanoutM2State` occupancy and unflip lifecycle
+    /// rather than a value nobody keeps current (`DirectOwnershipSignal`,
+    /// deleted). No production caller installs a gate from this yet (R8).
+    #[allow(dead_code)]
+    pub(crate) fn direct_ownership_handle(&self) -> ScanoutM2OwnershipHandle {
+        self.scanout_m2.ownership.clone()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn resource_service_mut(
         &mut self,
@@ -1841,6 +1891,7 @@ impl KmsBackend {
         self.scanout_m2.unflip_requested = true;
         self.scanout_m2.unflip_last_reason = Some(reason);
         self.scanout_m2.hold_direct = false;
+        self.scanout_m2.sync_ownership();
     }
 
     fn direct_frame_references_host_drawable(&self, host_xid: u32) -> bool {
@@ -2037,7 +2088,18 @@ impl KmsBackend {
         let primary = self.platform.primary_device().ok_or_else(|| {
             io::Error::other("direct scanout submitted without an opened KMS device")
         })?;
-        crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)?;
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8).
+        let legacy_write_permitted = self.platform.allows_legacy(
+            &primary.key,
+            crate::kms::render::resources::WriterClass::Primary,
+        );
+        crate::drm::modeset::submit_direct_scanout(
+            &primary.device,
+            fb,
+            &plane_states,
+            legacy_write_permitted,
+        )?;
         frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
         Ok(())
     }
@@ -2062,6 +2124,7 @@ impl KmsBackend {
                 );
                 self.scanout_m2.pending = Some(successor);
                 self.scanout_m2.hold_direct = true;
+                self.scanout_m2.sync_ownership();
             }
             Err(error) => {
                 log::warn!(
@@ -2102,6 +2165,7 @@ impl KmsBackend {
             self.defer_direct_successor_skip(superseded);
         }
         self.scanout_m2.hold_direct = true;
+        self.scanout_m2.sync_ownership();
         log::debug!(
             "scanout_m2: queued latest direct successor present_id={}",
             self.scanout_m2
@@ -2141,6 +2205,7 @@ impl KmsBackend {
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
         self.scanout_m2.degraded_composed_unflip = false;
+        self.scanout_m2.sync_ownership();
         self.finish_deferred_cow_release();
         log::info!("scanout_m2: stopped after scanout replacement: {reason}");
     }
@@ -2440,7 +2505,17 @@ impl KmsBackend {
         let primary = self.platform.primary_device().ok_or_else(|| {
             io::Error::other("scanout M2: composed unflip requested without a KMS device")
         })?;
-        crate::drm::modeset::submit_composed_scanout(&primary.device, &planes)?;
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8).
+        let legacy_write_permitted = self.platform.allows_legacy(
+            &primary.key,
+            crate::kms::render::resources::WriterClass::Unflip,
+        );
+        crate::drm::modeset::submit_composed_scanout(
+            &primary.device,
+            &planes,
+            legacy_write_permitted,
+        )?;
         self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
         let describe_frame = |frame: &DirectPresentFrame| {
             (
@@ -2528,6 +2603,7 @@ impl KmsBackend {
             if let Some(previous) = self.scanout_m2.current.replace(presented) {
                 self.release_direct_frame(previous);
             }
+            self.scanout_m2.sync_ownership();
             log::info!(
                 "scanout_m2: direct frame retired on all outputs source_id={}",
                 self.scanout_m2
@@ -4994,6 +5070,7 @@ impl KmsBackend {
             &crate::drm::Device,
             &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
+            bool,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
         let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
@@ -5770,6 +5847,55 @@ impl KmsBackend {
         })?;
         let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
         base.platform.attach_test_vk_context(Arc::clone(&vk));
+
+        // F4-B2: `Device::for_tests()` is a Unix-socket stand-in and cannot
+        // service `PRIME_FD_TO_HANDLE`/`ADDFB2`/`RMFB` -- every scanout-pool
+        // allocation below fails with `ENOTTY`. Those three ioctls carry no
+        // `DRM_AUTH`/`DRM_MASTER` requirement in the kernel (flags `0` and
+        // `DRM_RENDER_ALLOW` respectively), so a real primary node opened
+        // WITHOUT master is sufficient and safe to hold alongside whatever
+        // display server already owns master on this box; the fixture never
+        // commits. Substitute it for every KMS owner the fixture seeded (R12:
+        // an environmental `panic!`, not a silent skip, when no node exists).
+        //
+        // On a multi-GPU box the first enumerable primary node need not be
+        // the one this `vk` was built against: `ADDFB2` on a framebuffer
+        // from another GPU's PRIME export fails closed with EINVAL
+        // (observed here: NVIDIA discrete + AMD integrated -- Vulkan scores
+        // the discrete device higher, blind `card0` is the integrated
+        // one). Prefer the node `VK_EXT_physical_device_drm` reports for the
+        // physical device this `vk` actually selected; fall back to any
+        // real node only when that extension is unavailable.
+        let real_drm = vk
+            .selected_drm_identity
+            .and_then(|identity| identity.primary)
+            .and_then(crate::kms::executor::test_support::TestDevice::open_real_drm_matching)
+            .or_else(crate::kms::executor::test_support::TestDevice::open_real_drm_or_ignore)
+            .unwrap_or_else(|| {
+                panic!(
+                    "environmental skip: no real DRM primary node (/dev/dri/cardN) available; \
+                     for_tests_with_vk_live_scene needs one for PRIME_FD_TO_HANDLE/ADDFB2/RMFB \
+                     scanout pool allocation"
+                )
+            });
+        let real_device = Rc::new(crate::drm::Device::from_file_for_tests(
+            real_drm.into_file(),
+        ));
+        // F4b-m1: this substitution replaces every `KmsDevice.device` with
+        // the SAME `Rc` -- correct only when there is exactly one device to
+        // substitute. A future multi-device fixture must not silently share
+        // one real fd across distinct KMS devices; fail loudly instead of
+        // letting that happen unnoticed.
+        assert_eq!(
+            base.platform.devices.len(),
+            1,
+            "for_tests_with_vk_live_scene substitutes one real device fd onto every \
+             KmsDevice -- a multi-device fixture must not share it silently"
+        );
+        for kms_device in &mut base.platform.devices {
+            kms_device.device = Rc::clone(&real_device);
+        }
+
         let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
         let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
         for (i, layout) in base.platform.outputs.iter().enumerate() {
@@ -15555,7 +15681,7 @@ fn dump_cursor_record_to_ppm(
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ScanoutReadSelection {
+pub(crate) enum ScanoutReadSelection {
     OnScreenOnly,
     PermissiveDump,
 }
@@ -15749,82 +15875,47 @@ where
     assembled
 }
 
-fn read_scanout_region(
-    backend: &mut KmsBackend,
-    rect: vk::Rect2D,
-    selection: ScanoutReadSelection,
-) -> io::Result<Vec<u8>> {
-    use crate::kms::vk::ops::run_one_shot_op_with_wait;
-
-    if rect.extent.width == 0 || rect.extent.height == 0 {
-        return Ok(Vec::new());
-    }
-
-    let Some(vk) = backend.platform.vk.as_ref().cloned() else {
-        return Err(io::Error::other("no vulkan context"));
-    };
-    let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
-        return Err(io::Error::other("no ops command pool"));
-    };
-
-    let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
-    let copy_width = local_rect.extent.width;
-    let copy_height = local_rect.extent.height;
-    let needed_bytes = usize::try_from(copy_width)
+/// Computes the tightly-packed 4-bpp byte length for a `local_rect` copy.
+/// Shared by `read_scanout_region` and `read_managed_scanout_region_bytes`
+/// (F4b-B1) so the legacy and managed-source paths never compute this
+/// differently.
+fn scanout_copy_needed_bytes(local_rect: vk::Rect2D) -> io::Result<usize> {
+    usize::try_from(local_rect.extent.width)
         .ok()
         .and_then(|w| {
-            usize::try_from(copy_height)
+            usize::try_from(local_rect.extent.height)
                 .ok()
                 .and_then(move |h| w.checked_mul(h))
         })
         .and_then(|px| px.checked_mul(4))
-        .ok_or_else(|| io::Error::other("scanout copy size overflow"))?;
-    let Some(pool) = backend
-        .platform
-        .scanout_pools
-        .get_mut(pool_idx)
-        .and_then(|p| p.as_mut())
-    else {
-        return Err(io::Error::other("scanout pool vanished"));
-    };
-    // KMS phase selection above is always against B's display pool, but the
-    // composited pixels live in A's paired optimal target on a copied route.
-    // Readback must therefore use that local image/staging allocation with A's
-    // live Vk context; the external transport is not acquired or synchronized,
-    // while display, M2 retention, and pageflip retirement keep using B.
-    let (image, staging_buffer, staging_mapped, copied_route) = match pool {
-        crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
-            let Some(bo) = pool.bos.get(bo_idx) else {
-                return Err(io::Error::other("scanout bo vanished"));
-            };
-            if needed_bytes > bo.vk_transfer.staging_size as usize {
-                return Err(io::Error::other("scanout staging buffer too small"));
-            }
-            (
-                bo.vk_image,
-                bo.vk_transfer.staging_buffer,
-                bo.vk_transfer.staging_mapped,
-                false,
-            )
-        }
-        crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
-            let Some(source) = pool.sources.get(bo_idx) else {
-                return Err(io::Error::other("copied scanout source vanished"));
-            };
-            if needed_bytes > source.transfer.staging_size as usize {
-                return Err(io::Error::other("scanout staging buffer too small"));
-            }
-            source.validate_renderer_readback()?;
-            (
-                source.image(),
-                source.transfer.staging_buffer,
-                source.transfer.staging_mapped,
-                true,
-            )
-        }
-    };
+        .ok_or_else(|| io::Error::other("scanout copy size overflow"))
+}
 
-    let run_result = run_one_shot_op_with_wait(&vk, pool_handle, None, |vk, cb| {
+/// Records and submits the copy-to-staging one-shot op, waits for it, and
+/// returns the copied bytes out of `staging_mapped`. Shared by
+/// `read_scanout_region` (legacy pool fields) and
+/// `read_managed_scanout_region_bytes` (payload fields taken under a lease,
+/// F4b-B1) -- neither caller may reuse `image`/`staging_buffer`/
+/// `staging_mapped` beyond this call, and a failure on the copied route (or
+/// `DEVICE_LOST`) marks the renderer failed exactly as before the split.
+#[allow(clippy::too_many_arguments)]
+fn submit_scanout_copy_to_staging(
+    backend: &mut KmsBackend,
+    vk: &crate::kms::vk::device::VkContext,
+    pool_handle: vk::CommandPool,
+    image: vk::Image,
+    staging_buffer: vk::Buffer,
+    staging_mapped: std::ptr::NonNull<u8>,
+    needed_bytes: usize,
+    local_rect: vk::Rect2D,
+    copied_route: bool,
+) -> io::Result<Vec<u8>> {
+    use crate::kms::vk::ops::run_one_shot_op_with_wait;
+
+    let copy_width = local_rect.extent.width;
+    let copy_height = local_rect.extent.height;
+
+    let run_result = run_one_shot_op_with_wait(vk, pool_handle, None, |vk, cb| {
         let pre = [ash::vk::ImageMemoryBarrier2::default()
             .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -15907,6 +15998,256 @@ fn read_scanout_region(
 
     let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
     Ok(raw.to_vec())
+}
+
+fn read_scanout_region(
+    backend: &mut KmsBackend,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+) -> io::Result<Vec<u8>> {
+    if rect.extent.width == 0 || rect.extent.height == 0 {
+        return Ok(Vec::new());
+    }
+
+    let Some(vk) = backend.platform.vk.as_ref().cloned() else {
+        return Err(io::Error::other("no vulkan context"));
+    };
+    let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
+        return Err(io::Error::other("no ops command pool"));
+    };
+
+    let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
+    let needed_bytes = scanout_copy_needed_bytes(local_rect)?;
+    let Some(pool) = backend
+        .platform
+        .scanout_pools
+        .get_mut(pool_idx)
+        .and_then(|p| p.as_mut())
+    else {
+        return Err(io::Error::other("scanout pool vanished"));
+    };
+    // KMS phase selection above is always against B's display pool, but the
+    // composited pixels live in A's paired optimal target on a copied route.
+    // Readback must therefore use that local image/staging allocation with A's
+    // live Vk context; the external transport is not acquired or synchronized,
+    // while display, M2 retention, and pageflip retirement keep using B.
+    let (image, staging_buffer, staging_mapped, copied_route) = match pool {
+        crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+            let Some(bo) = pool.bos.get(bo_idx) else {
+                return Err(io::Error::other("scanout bo vanished"));
+            };
+            if needed_bytes > bo.vk_transfer.staging_size as usize {
+                return Err(io::Error::other("scanout staging buffer too small"));
+            }
+            (
+                bo.vk_image,
+                bo.vk_transfer.staging_buffer,
+                bo.vk_transfer.staging_mapped,
+                false,
+            )
+        }
+        crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+            let Some(source) = pool.sources.get(bo_idx) else {
+                return Err(io::Error::other("copied scanout source vanished"));
+            };
+            if needed_bytes > source.transfer.staging_size as usize {
+                return Err(io::Error::other("scanout staging buffer too small"));
+            }
+            source.validate_renderer_readback()?;
+            (
+                source.image(),
+                source.transfer.staging_buffer,
+                source.transfer.staging_mapped,
+                true,
+            )
+        }
+    };
+
+    submit_scanout_copy_to_staging(
+        backend,
+        &vk,
+        pool_handle,
+        image,
+        staging_buffer,
+        staging_mapped,
+        needed_bytes,
+        local_rect,
+        copied_route,
+    )
+}
+
+/// F4b-B1: the managed-source counterpart of `read_scanout_region`'s field
+/// retrieval and submission, scoped to `OutputScanout::Shared` -- the only
+/// route any managed-source fixture exercises today (R8). Once
+/// `PlatformBackend::register_managed_scanout_bo` converts a bo to managed
+/// ownership, `ScanoutBo::take_physical_backing` leaves `vk_image`/
+/// `vk_transfer` null/empty on the pool struct: the real image/staging now
+/// live in the `ScanoutAllocation` payload (`ScanoutAllocation::shared`).
+/// Reading `bo.vk_image` directly, as `read_scanout_region` still correctly
+/// does for non-managed bos, would read the husk. This reserves a `Read`
+/// use on `source_key` and takes the image/staging fields from the payload
+/// under `ResourceService::with_scanout_read` -- the same lease-scoped
+/// access pattern F-3's `with_storage_read` established for storage.
+///
+/// A managed bo selected on a `Copied` pool would need reading the
+/// renderer-side `CopiedSourceAllocation` instead of `ScanoutAllocation`,
+/// which is out of this session's scope; that case fails closed rather than
+/// silently reading the wrong payload.
+///
+/// `#[allow(dead_code)]`: F4c F8 stop (see `read_scanout_region_for_managed_source`
+/// below) -- F4-m1 asked for this attribute to come off, but it cannot
+/// without the scene-submission write branch this session deferred: with it
+/// removed, `cargo clippy --all-targets -- -D warnings` fails dead-code on
+/// the plain (non-`cfg(test)`) `--lib` build this crate's test binary still
+/// compiles as a dependency, since no non-test caller exists yet (R8: only
+/// a caller in production code makes this a real compile-time root, and
+/// that caller is the write-path wiring, not the read path this session
+/// closes). Verified directly: with the attribute off,
+/// `cargo clippy -p yserver --tests -- -D warnings` fails with exactly this
+/// dead-code error on both this function and `read_scanout_region_for_managed_source`.
+#[allow(dead_code)]
+fn read_managed_scanout_region_bytes(
+    backend: &mut KmsBackend,
+    service: &mut crate::kms::render::resources::ResourceService,
+    source_key: crate::kms::render::resources::AllocationKey,
+    pool_idx: usize,
+    rect: vk::Rect2D,
+    local_rect: vk::Rect2D,
+) -> io::Result<Vec<u8>> {
+    use crate::kms::render::resources::UseKind;
+
+    if rect.extent.width == 0 || rect.extent.height == 0 {
+        return Ok(Vec::new());
+    }
+
+    let Some(vk) = backend.platform.vk.as_ref().cloned() else {
+        return Err(io::Error::other("no vulkan context"));
+    };
+    let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
+        return Err(io::Error::other("no ops command pool"));
+    };
+
+    let is_copied_route = backend
+        .platform
+        .scanout_pools
+        .get(pool_idx)
+        .and_then(Option::as_ref)
+        .is_some_and(|p| matches!(p, crate::kms::vk::scanout::OutputScanout::Copied(_)));
+    if is_copied_route {
+        return Err(io::Error::other(
+            "read_scanout_region_for_managed_source: managed copied-scanout read is not \
+             implemented (scope: Shared route only)",
+        ));
+    }
+
+    let needed_bytes = scanout_copy_needed_bytes(local_rect)?;
+
+    let read_lease = service
+        .reserve(source_key, UseKind::Read)
+        .map_err(|e| io::Error::other(format!("reserve managed scanout source for read: {e:?}")))?;
+    let backing = service.with_scanout_read(&read_lease, |alloc| {
+        let shared = alloc.shared();
+        (
+            shared.image,
+            shared.transfer.staging_buffer,
+            shared.transfer.staging_mapped,
+            shared.transfer.staging_size,
+        )
+    });
+    drop(read_lease);
+    let (image, staging_buffer, staging_mapped, staging_size) = backing
+        .map_err(|e| io::Error::other(format!("with_scanout_read managed source: {e:?}")))?;
+
+    if needed_bytes > staging_size as usize {
+        return Err(io::Error::other("scanout staging buffer too small"));
+    }
+
+    submit_scanout_copy_to_staging(
+        backend,
+        &vk,
+        pool_handle,
+        image,
+        staging_buffer,
+        staging_mapped,
+        needed_bytes,
+        local_rect,
+        false,
+    )
+}
+
+/// Task 5 (B-15) producer-adapter seam: runs a real scanout readback against
+/// a MANAGED source and correlates its actual, already-observed outcome with
+/// the source's registered read obligation via
+/// `resources::gpu::record_read_outcome` -- the resources module still owns
+/// and validates the proof (`apply_validated_proof` stays private to it);
+/// this function only reports what really happened.
+///
+/// R8: not called by any production route. Every production
+/// `read_scanout_region` caller (root `GetImage`/`CopyArea` snapshot,
+/// `do_dump_scanout`) keeps calling the plain function directly, since no
+/// production path creates managed storage for this stage to correlate
+/// against yet. Exercised by `c0_2ci_read_source_scratch_regression_vulkan`
+/// against a real `KmsBackend` live-Vulkan fixture: F4b-B1's fix means it
+/// now reads a real managed payload through a lease, not a husk.
+///
+/// F4-M2: `source_key` is not a parameter. Nothing tied a caller-supplied
+/// key to the buffer actually read, so a caller could correlate the proof
+/// against an unrelated entry. The key is instead derived from the pool
+/// slot the read actually samples: `select_scanout_bo_for_rect` is the
+/// exact selection this function performs once, up front, and nothing
+/// mutates the backend's scanout pools before the managed read that follows,
+/// so the key and the read agree. A bo that resolves but is not a managed
+/// allocation (`managed_key() == None`) fails closed rather than silently
+/// skipping correlation.
+///
+/// `#[allow(dead_code)]`: F4-m1 asked for this to come off, but it cannot
+/// yet -- see `read_managed_scanout_region_bytes`'s doc comment for the
+/// verified reason (F4c F8 stop: no non-test caller exists until the
+/// scene-submission write branch is wired).
+#[allow(dead_code)]
+pub(crate) fn read_scanout_region_for_managed_source(
+    backend: &mut KmsBackend,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+    service: &mut crate::kms::render::resources::ResourceService,
+    source_obligation: crate::kms::render::resources::ObligationId,
+) -> (
+    io::Result<Vec<u8>>,
+    Result<(), crate::kms::render::resources::ResourceError>,
+) {
+    let selected = select_scanout_bo_for_rect(backend, rect, selection).ok();
+
+    let managed_source_key = selected.and_then(|(pool_idx, bo_idx, _)| {
+        backend
+            .platform
+            .scanout_pools
+            .get(pool_idx)
+            .and_then(Option::as_ref)
+            .and_then(|pool| pool.display_pool().bos.get(bo_idx))
+            .and_then(|bo| bo.managed_key())
+    });
+
+    let Some(source_key) = managed_source_key else {
+        return (
+            Err(io::Error::other(
+                "read_scanout_region_for_managed_source: selected scanout bo is not a managed \
+                 allocation",
+            )),
+            Err(crate::kms::render::resources::ResourceError::InvalidProof),
+        );
+    };
+    let (pool_idx, _bo_idx, local_rect) =
+        selected.expect("managed_source_key is Some only when selected is Some");
+
+    let result =
+        read_managed_scanout_region_bytes(backend, service, source_key, pool_idx, rect, local_rect);
+    let recorded = crate::kms::render::resources::gpu::record_read_outcome(
+        service,
+        source_key,
+        source_obligation,
+        result.is_ok(),
+    );
+    (result, recorded)
 }
 
 fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
@@ -17250,6 +17591,15 @@ impl KmsBackend {
         let Some(device) = self.platform.device_for_key(device_key) else {
             return Ok(());
         };
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8), checked immediately before the `set_gamma`
+        // ioctl below.
+        if !self.platform.allows_legacy(
+            &device_key,
+            crate::kms::render::resources::WriterClass::Gamma,
+        ) {
+            return Err(crate::drm::transport_gate_refusal("gamma"));
+        }
         device
             .device
             .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
@@ -17554,6 +17904,16 @@ impl KmsBackend {
         }
 
         let proof = proof_res?;
+        // Task 6.5/M-14: connect to the transport gate, inert under Legacy
+        // (no gate installed -> always permits) since nothing installs one
+        // in production yet (R8). A refusal here happens before the owner
+        // route changes below.
+        if !self.platform.legacy_transport_gate_permits_finish(&key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "transport gate has already progressed past legacy for this device",
+            ));
+        }
         let owner = self.platform.owner_for(key).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "device owner not found")
         })?;
@@ -18710,6 +19070,7 @@ impl Backend for KmsBackend {
         self.scanout_m2.unflip_last_reason = None;
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
+        self.scanout_m2.sync_ownership();
         log::info!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),
@@ -19215,6 +19576,13 @@ impl Backend for KmsBackend {
         self.pause_input_thread();
         log::info!("kms: VT release — input paused; run_suspend");
         self.drive_vt_event(state, VtEventKind::Disable);
+        // B-11: pause the resource service's serviced-time budget for the
+        // duration of the VT switch -- a long switch must not count toward
+        // any pending batch's deadline (R9). Inert when no service exists
+        // (R8: nothing installs one in production yet).
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(false, std::time::Instant::now());
+        }
         log::info!("kms: VT release — suspended; drmDropMaster");
         for device in &self.platform.devices {
             if let Err(err) = device.device.release_master_lock() {
@@ -19282,6 +19650,13 @@ impl Backend for KmsBackend {
                 self.vt_state
             );
             return;
+        }
+        // B-11: resume the resource service's serviced-time budget now that
+        // the VT switch is genuinely done (Active reached above) -- pending
+        // batches' deadlines start counting again from here, not from
+        // whenever the fd happened to signal. Inert when no service exists.
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(true, std::time::Instant::now());
         }
         log::info!("kms: VT acquire — resumed; resume input");
         self.resume_input_thread();
@@ -26890,6 +27265,11 @@ impl Backend for KmsBackend {
             self.scene.wake_for_damage();
             if res.is_ok() {
                 self.kms_outputs_active = !self.platform.outputs.is_empty();
+                // B-11: outputs are back on -- resume the resource service's
+                // serviced-time budget. Inert when no service exists (R8).
+                if let Some(service) = self.resource_service.as_mut() {
+                    service.set_seat_active(true, std::time::Instant::now());
+                }
             }
             res
         } else {
@@ -26939,6 +27319,12 @@ impl Backend for KmsBackend {
                 return Err(error);
             }
             self.kms_outputs_active = false;
+            // B-11: outputs are dark -- pause the resource service's
+            // serviced-time budget (R9: a batch's deadline must not count
+            // display-dark time). Inert when no service exists (R8).
+            if let Some(service) = self.resource_service.as_mut() {
+                service.set_seat_active(false, std::time::Instant::now());
+            }
             if let Some(error) = direct_shadow_error {
                 log::error!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}; exiting");
                 self.request_exit();
@@ -28557,6 +28943,94 @@ mod tests {
         assert!(
             b.next_wakeup().is_none(),
             "dirty scene must not busy-wake while scanout is disallowed",
+        );
+    }
+
+    /// M-16/6.1 decisive test, on the real core-loop backend fixture
+    /// (`KmsBackend::for_tests()` is the `Backend` implementor `run_core`
+    /// drives): with VT-away, DPMS-off and no damage -- every composition
+    /// gate closed -- a registered, unsignaled ticket must still be polled
+    /// through the real `before_block`/`next_wakeup` completion callbacks,
+    /// and signalling it must make the allocation available, with no scene
+    /// submission ever occurring. Mutation check: reverting
+    /// `ResourceService::next_deadline` to return `None` while the seat is
+    /// inactive (the pre-fix shape) makes the first assertion below fail.
+    #[test]
+    fn c0_2ci_progress_no_composition_on_core_loop_fake_backend() {
+        use crate::{
+            kms::render::resources::{
+                AllocationPayload, CoreRetirementBatch, GpuObligation, ObligationKind,
+                ResourceService, tests::SpyAllocation,
+            },
+            platform::drm::DrmDeviceKey,
+            vt::state::VtState,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        let mut b = KmsBackend::for_tests();
+
+        // Every composition gate closed: VT-away, DPMS-off, no damage.
+        b.vt_state = VtState::Suspended;
+        b.kms_outputs_active = false;
+        b.scene.scene_structure_dirty = false;
+
+        let device = DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device, incarnation);
+
+        let drops = Rc::new(Cell::new(0));
+        let held = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        let key = held.key();
+        let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+        let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+        let mut batch = CoreRetirementBatch::new(vec![held], Vec::new(), true);
+        batch.bind_ticket(GpuObligation::for_tests_stub(vec![(key, gpu)], ticket));
+        batch.test_ticket_status = Some(Ok(false));
+        service.register_batch(batch);
+        b.install_resource_service(service);
+
+        // M-16: progress must not be suppressed by seat inactivity -- only
+        // the serviced-time budget pauses. `next_wakeup` chains
+        // `ResourceService::next_deadline` unconditionally.
+        assert!(
+            b.next_wakeup().is_some(),
+            "a pending ticket must still be polled while composition is gated off (M-16)"
+        );
+
+        // `before_block` is the real production completion callback (also
+        // driven every core-loop iteration by `run_core`'s block handler).
+        // The allocation is not yet available: the ticket has not signalled.
+        b.before_block();
+        assert!(b.resource_service().unwrap().contains(&key));
+        assert_eq!(drops.get(), 0);
+
+        // Signal the ticket and drive the same real callback again.
+        b.resource_service_mut().unwrap().pending_batches_mut()[0].test_ticket_status =
+            Some(Ok(true));
+        b.before_block();
+
+        assert!(!b.resource_service().unwrap().contains(&key));
+        assert_eq!(
+            drops.get(),
+            1,
+            "the allocation must be destroyed exactly once"
+        );
+
+        // No scene submission occurred: every composition gate stayed
+        // closed the whole time, and nothing here ever called
+        // `composite_and_flip`/`maybe_composite`.
+        assert!(!b.scanout_allowed(), "VT must still be Suspended");
+        assert!(!b.kms_outputs_active, "DPMS must still be off");
+        assert!(
+            !b.scene.scene_structure_dirty,
+            "no damage was ever armed, so nothing needed composing"
         );
     }
 
@@ -40098,6 +40572,334 @@ mod tests {
         );
     }
 
+    /// B-15's decisive test (Task 5, 5.1): extends the root IncludeInferiors
+    /// snapshot path above with a managed source and a managed scratch
+    /// allocation.
+    ///
+    /// F4-M2: source and scratch are real payload types, not `Spy`. The
+    /// source is the live-scene pool's own compose-target scanout bo (the
+    /// one `select_scanout_bo_for_rect(PermissiveDump)` selects -- see the
+    /// phase assertion below for why this fixture can never reach
+    /// `OnScreen`), converted to a managed `ScanoutAllocation` through the
+    /// real `register_managed_scanout_bo` (F-2's conversion) over a real
+    /// `DrmCleanupRegistry` (real device, counting `MockCleanupIo`
+    /// transport -- no real `RMFB`/`GEM_CLOSE` ioctl is issued, but the real
+    /// fb/gem handles are what gets recorded). The scratch is a real
+    /// `StorageAllocation`, adopted via `Storage::into_managed` exactly as
+    /// Composite's own scratch allocation would be.
+    ///
+    /// The source-read proof comes from `read_scanout_region_for_managed_source`
+    /// correlating the REAL, already-observed outcome of a real managed
+    /// readback (F4b-B1: image/staging taken from the `ScanoutAllocation`
+    /// payload under a `Read` lease via `ResourceService::with_scanout_read`
+    /// -- the pool's `ScanoutBo` is an emptied husk once registered as
+    /// managed, so reading `bo.vk_image` directly would read nulls) with the
+    /// source's registered `Read` obligation -- this test body never calls
+    /// `apply_validated_proof` for that proof (F3), and the adapter derives
+    /// the source key itself from the bo it actually reads rather than
+    /// taking it as a parameter this test could point anywhere. The scratch
+    /// allocation's GPU obligation is proven independently, from a REAL
+    /// async Vulkan submission's fence (`FencePool::acquire` +
+    /// `vk::ops::submit_one_shot_op_async`) polled through the existing,
+    /// reviewed-sound `poll_gpu` machinery -- never `test_signal()` on a
+    /// stub ticket (R9).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_read_source_scratch_regression_vulkan() {
+        use ash::vk;
+        use std::{cell::RefCell, sync::Arc};
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        use crate::kms::render::resources::{
+            CoreRetirementBatch, DrmCleanupRegistry, GpuObligation, ObligationKind,
+            ResourceService, tests::MockCleanupIo,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
+            Ok(b) => b,
+            Err(e) => {
+                panic!("environmental skip: no live Vulkan ICD available ({e}); not claiming pass")
+            }
+        };
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let (root_w, root_h) = {
+            let root = state.resources.window(ROOT_WINDOW).expect("root window");
+            (root.width, root.height)
+        };
+        let window = ResourceId(0x2005);
+        let window_host = create_live_window(
+            &mut state,
+            &mut backend,
+            window,
+            ROOT_WINDOW,
+            40,
+            40,
+            16,
+            16,
+        );
+
+        let root_color = 0x0022_3344;
+        let window_color = 0x00bb_6600;
+        backend
+            .fill_rectangle(
+                None,
+                backend.core.window_id,
+                root_color,
+                0,
+                0,
+                root_w,
+                root_h,
+            )
+            .expect("fill root");
+        backend
+            .fill_rectangle(None, window_host.as_raw(), window_color, 0, 0, 16, 16)
+            .expect("fill window");
+        backend.tick_maybe_composite_for_tests();
+
+        let scan_rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 40, y: 40 },
+            extent: vk::Extent2D {
+                width: 16,
+                height: 16,
+            },
+        };
+
+        // Identify the exact bo `read_scanout_region` will sample -- the
+        // same selection it performs internally -- so the "managed source"
+        // registered below is that real bo, not a stand-in for it.
+        //
+        // F4b review "F8 stop -- ruling": `PermissiveDump`, not
+        // `OnScreenOnly`. This fixture holds no DRM master (F4-B2 must not
+        // acquire it -- doing so would repaint the live display out from
+        // under the user) and seeds no real CRTC/plane identity on the
+        // substituted device, so `BoPhase::OnScreen` -- which only a real
+        // `DRM_IOCTL_MODE_ATOMIC`/`SETCRTC` can produce -- is unreachable
+        // here, with or without master. `vkQueueSubmit2` for the compose
+        // still runs before the (rejected) atomic commit, so the bo has
+        // real composited pixels in a phase `PermissiveDump` accepts
+        // (`OnScreen | Pending | Submitted | Recording`); assert that
+        // explicitly below so a future fixture change that silently picks
+        // the wrong buffer fails loudly instead of reading stale pixels.
+        let (pool_idx, bo_idx, _) = super::select_scanout_bo_for_rect(
+            &backend,
+            scan_rect,
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect("a scanout bo covering the composited region");
+        {
+            let phase = backend.platform.scanout_pools[pool_idx]
+                .as_ref()
+                .expect("live-scene output has a scanout pool")
+                .display_pool()
+                .bos[bo_idx]
+                .state
+                .phase;
+            assert!(
+                matches!(
+                    phase,
+                    crate::kms::vk::scanout::BoPhase::OnScreen
+                        | crate::kms::vk::scanout::BoPhase::Pending
+                        | crate::kms::vk::scanout::BoPhase::Submitted
+                        | crate::kms::vk::scanout::BoPhase::Recording
+                ),
+                "PermissiveDump must select a bo the compose actually rendered into \
+                 (OnScreen|Pending|Submitted|Recording); got {phase:?}"
+            );
+        }
+
+        // F8 (discovered during this session, reported not papered over):
+        // this fixture's single-tick compose does not reliably land the
+        // window's content at this rect on this box -- an orthogonal,
+        // pre-existing gap in the compose pipeline under a synthetic/
+        // rejected-commit CRTC that no test has ever exercised this far
+        // before (both this test's own prior form and the two sibling
+        // tests always failed earlier, at the ENOTTY/OnScreen blockers).
+        // See the fold-back for the full account. So the proof this test
+        // needs for F4b-B1/F4-M3 is captured here instead, against the
+        // SAME real image, independent of what the compositor drew into
+        // it: read the selected bo through the LEGACY path (still valid --
+        // it is not managed yet) before conversion, and after converting
+        // it to managed and reading again through the payload, assert the
+        // two reads observe byte-identical content. A husk read (nulled
+        // `vk_image`/empty `vk_transfer`) would error or return different
+        // bytes, not the same ones -- this is exactly the mutation the
+        // fix guards against.
+        let expected_bytes = super::read_scanout_region(
+            &mut backend,
+            scan_rect,
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect("legacy readback of the same bo before managed conversion");
+        assert!(
+            expected_bytes.iter().any(|&b| b != 0),
+            "the pre-conversion legacy read must observe real, non-vacuous GPU-rendered bytes"
+        );
+
+        let dev = DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let inc = IncarnationId::first();
+        let mut service = ResourceService::new(dev, inc);
+
+        let device_key = backend.platform.outputs[pool_idx].key.device_key;
+        let kms_device_rc = backend
+            .platform
+            .device_for_key(device_key)
+            .expect("live-scene fixture output has a KMS owner")
+            .device
+            .clone();
+        let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
+        let mut registry = DrmCleanupRegistry::new_with_device_and_io(
+            kms_device_rc,
+            device_key,
+            inc,
+            Box::new(MockCleanupIo::new(Rc::clone(&cleanup_calls))),
+        );
+
+        // "Managed source": the real on-screen scanout bo, converted from
+        // legacy to managed ownership (B-13's consuming extraction) rather
+        // than a `Spy` standing in for it.
+        let source_key = backend
+            .platform
+            .register_managed_scanout_bo(&mut service, &mut registry, pool_idx, bo_idx)
+            .expect("register the on-screen scanout bo as a managed source");
+        let source_read = service.register(source_key, ObligationKind::Read).unwrap();
+
+        // Managed scratch: a real `StorageAllocation`, adopted the way
+        // Composite's own scratch allocation would be, retained by its own
+        // GPU obligation/ticket only.
+        let scratch_storage = backend
+            .platform
+            .allocate_drawable_storage(16, 16, 24)
+            .expect("allocate real scratch storage");
+        let scratch_target = PaintTarget::new(
+            crate::kms::render::store::DrawableId::for_tests(0x5c_a7c4),
+            (0, 0),
+            None,
+            24,
+        );
+        let scratch_lease = scratch_storage
+            .into_managed(&mut service, &backend.platform, scratch_target, (0, 0))
+            .map_err(|(e, _)| e)
+            .expect("adopt real scratch storage")
+            .allocation;
+        let scratch_key = scratch_lease.key();
+        let scratch_gpu = service.register(scratch_key, ObligationKind::Gpu).unwrap();
+
+        // Real read, real proof: the adapter correlates the real
+        // `read_scanout_region`'s actual `Ok`/`Err` with the source's
+        // registered obligation -- this test body supplies no proof itself.
+        let (result, recorded) = super::read_scanout_region_for_managed_source(
+            &mut backend,
+            scan_rect,
+            super::ScanoutReadSelection::PermissiveDump,
+            &mut service,
+            source_read,
+        );
+        let scanout_bytes = result.expect("scanout readback");
+        recorded.expect("record_read_outcome");
+
+        // F4b-B1's decisive assertion: the managed-source read (image/
+        // staging taken from the `ScanoutAllocation` payload under a `Read`
+        // lease, F4b-B1) must observe the exact same bytes the legacy read
+        // observed from the identical bo moments earlier, before
+        // conversion. Reading the husk instead of the payload (revert the
+        // fix) returns an error or nulled content here, not
+        // `expected_bytes` -- this is what the coordinating review's
+        // mutation test exercises.
+        assert_eq!(
+            scanout_bytes, expected_bytes,
+            "managed-source read must observe the same real pixels the legacy path read from \
+             the identical bo before conversion"
+        );
+
+        // Successful readback produces owned CPU bytes before scratch
+        // upload; source-read completion is recorded then.
+        assert!(
+            !service.has_pending_obligation(&source_key, source_read),
+            "source_read_pending must be 0: the real read already discharged it"
+        );
+        // Scratch cleanup remains behind its own upload/Composite ticket --
+        // untouched by the source read that just completed.
+        assert!(service.contains(&scratch_key));
+        assert!(
+            cleanup_calls.borrow().is_empty(),
+            "source read completion is not itself a file-owned discharge"
+        );
+
+        // Drop the pool's retain lease on the source -- the source's read
+        // obligation is already discharged and nothing else holds it, so
+        // this is what actually makes it destroyable.
+        backend.platform.scanout_pools[pool_idx]
+            .as_mut()
+            .expect("live-scene output has a scanout pool")
+            .detach_managed_entries();
+        service.service_ready_with_registry(&mut registry);
+        assert!(
+            !service.contains(&source_key),
+            "source retention is not extended by scratch use"
+        );
+        assert_eq!(
+            cleanup_calls.borrow().len(),
+            2,
+            "source destruction must discharge file_owned through the registry \
+             (one RemoveFb, one CloseGem)"
+        );
+        assert!(service.contains(&scratch_key));
+
+        // Scratch's own GPU proof: a REAL async submission against a REAL
+        // fence, never a fabricated `test_signal()`.
+        let vk_ctx = backend.platform.vk.clone().expect("live scene installs vk");
+        let ops_pool = backend
+            .platform
+            .ops_command_pool_handle()
+            .expect("live scene installs ops pool");
+        let scratch_ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live scene installs fence pool")
+            .acquire()
+            .expect("acquire real fence ticket");
+
+        crate::kms::vk::ops::submit_one_shot_op_async(
+            &vk_ctx,
+            ops_pool,
+            &scratch_ticket,
+            |_vk, _cb| Ok(()),
+        )
+        .expect("submit scratch no-op");
+
+        // F4-M1: no assertion about the fence's state immediately after
+        // submission -- a no-op submission can already be signalled by the
+        // time it is polled (R2). The only evidence is the deterministic
+        // sequence below: wait for real retirement, poll the real ticket,
+        // service the entry, and observe it destroyed exactly once.
+        let mut batch = CoreRetirementBatch::new(vec![scratch_lease], Vec::new(), true);
+        batch.bind_ticket(GpuObligation::new(
+            vec![(scratch_key, scratch_gpu)],
+            scratch_ticket.clone(),
+            Arc::clone(&vk_ctx),
+        ));
+        service.register_batch(batch);
+
+        scratch_ticket
+            .wait(&vk_ctx)
+            .expect("wait for scratch ticket");
+        service.poll_gpu(std::time::Instant::now()).unwrap();
+        service.service_ready();
+        assert!(!service.contains(&scratch_key));
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn root_overlay_xor_pass_reaches_scanout() {
@@ -42811,7 +43613,58 @@ mod tests {
             b.scanout_m2.pending = Some(frame);
         }
         b.scanout_m2.hold_direct = true;
+        b.scanout_m2.sync_ownership();
         (source_id, fallback_id, source_pin, fallback_target_pin)
+    }
+
+    /// F5a-M1 decisive test: `direct_ownership_handle()` is a live view of
+    /// this backend's own `ScanoutM2State`, not a value nobody publishes
+    /// (the deleted `DirectOwnershipSignal`). Driving `current` occupied and
+    /// an unflip requested through the real production functions
+    /// (`install_direct_frame_for_target_test` mirrors the real "direct
+    /// frame retired" assignment, `request_direct_unflip`,
+    /// `stop_direct_after_scanout_replaced`) must be visible to a
+    /// `TransportGate` built from a clone of the handle, with no setter
+    /// call on the gate or the handle itself. Mutation check: reverting any
+    /// of the `sync_ownership()` call sites this session added would leave
+    /// `direct_ownership_busy()`/`unflip_outstanding()` stuck at their
+    /// `Default` (`false`) values, and `begin_quiescing()` below would
+    /// wrongly succeed while `current` is still occupied.
+    #[test]
+    fn c0_2ci_scanout_m2_ownership_handle_reflects_real_backend_state() {
+        use crate::kms::render::resources::{ResourceError, TransportGate, TransportState};
+
+        let mut b = super::KmsBackend::for_tests();
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let target_xid = 0x7100;
+        seed_window(&mut b, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        let device = test_device_key(0);
+        let incarnation = IncarnationId::first();
+        let mut gate =
+            TransportGate::new_legacy(device, incarnation, Box::new(b.direct_ownership_handle()));
+
+        // The real unit is `Current`: begin_quiescing refuses without
+        // changing state (R7).
+        assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
+        assert_eq!(gate.state(), TransportState::Legacy);
+
+        // Also request an unflip while still occupied -- a second,
+        // independent real reason to stay Busy.
+        b.request_direct_unflip("c0_2ci_ownership_handle_test");
+        assert!(b.scanout_m2.unflip_requested);
+        assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
+        assert_eq!(gate.state(), TransportState::Legacy);
+
+        // Retire through the real stop path: current vacates and the
+        // unflip retires in the same call.
+        b.stop_direct_after_scanout_replaced("c0_2ci_ownership_handle_test retirement");
+        assert!(!b.scanout_m2.active());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(gate.begin_quiescing().is_ok());
+        assert_eq!(gate.state(), TransportState::Quiescing);
     }
 
     #[test]

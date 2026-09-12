@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::{cell::Cell, collections::BTreeSet, rc::Rc};
+use std::{cell::Cell, collections::BTreeSet, fmt, rc::Rc};
 
 use crate::{
     kms::{owner::identity::IncarnationId, render::resources::availability::ResourceError},
@@ -90,7 +90,14 @@ pub(crate) struct RecipientReservation {
 }
 
 impl RecipientReservation {
-    #[doc(hidden)]
+    // B-6/F4: this was briefly `#[doc(hidden)] pub(crate)` so that a
+    // non-test `RetainingSupervisor::reserve_slot` would compile -- that
+    // was the bug (R8: no production `RecipientReservation`), not a
+    // reason to keep the constructor reachable outside tests.
+    // `RetainingSupervisor` (and the `reserve_slot` that called this) is
+    // back under `#[cfg(test)]` in `handoff.rs`, so this constructor can
+    // live under `#[cfg(test)]` again with no production caller needing it.
+    #[cfg(test)]
     pub(crate) fn new_for_tests() -> Self {
         Self { _private: () }
     }
@@ -109,6 +116,7 @@ impl WriterCoverageProof {
 }
 
 /// Non-Clone permit issued privately after drain dispositions, consumed to publish Owner.
+#[derive(Debug)]
 pub(crate) struct HandoverPermit {
     device: DrmDeviceKey,
     incarnation: IncarnationId,
@@ -124,13 +132,88 @@ impl HandoverPermit {
     }
 }
 
+/// Real direct-ownership and unflip state that `begin_quiescing` consults
+/// for its R7 precondition (M-13). Supplied to the gate once, at
+/// construction: `TransportGate`'s own public surface no longer has any
+/// setter that can flip Busy directly (`set_direct_scanout_active` /
+/// `set_unflip_pending` are gone -- they had no non-test caller and could
+/// be driven by anything in the crate). Only whoever implements this trait
+/// over its own real state can influence the answer, and the gate queries
+/// it live on every `begin_quiescing` call rather than caching a value.
+///
+/// The real implementor (F5a-M1) is `backend::ScanoutM2OwnershipHandle`: a
+/// clone of the live cells `ScanoutM2State` itself keeps in sync at its own
+/// `current`/`pending`/`queued_successor`/`unflip_requested` mutation
+/// sites (`sync_ownership`, called after every one of them) -- never a
+/// value some unrelated caller must remember to publish. Installing a gate
+/// against it in production is later work (R8: there is no production
+/// issuer of Owner in this stage, so no gate is installed in production yet
+/// either). `#[cfg(test)]` code implements this trait with an explicit fake
+/// that records every query it was asked so a test can assert the gate
+/// actually consulted live state.
+pub(crate) trait DirectOwnershipState: fmt::Debug {
+    /// True while any direct ownership unit (`Current`/`Submitted`/
+    /// `Successor`) is occupied for this gate's device.
+    fn direct_ownership_busy(&self) -> bool;
+    /// True while an unflip has been requested and has not yet retired.
+    fn unflip_outstanding(&self) -> bool;
+}
+
+/// Test-only fake (M-13/F4): records how many times each query was asked,
+/// alongside the answer to give, so a test can assert `begin_quiescing`
+/// actually consulted live state rather than a value cached at
+/// construction. Never reachable outside `#[cfg(test)]` code.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FakeDirectOwnershipState {
+    busy: Rc<Cell<bool>>,
+    unflip_outstanding: Rc<Cell<bool>>,
+    busy_queries: Rc<Cell<usize>>,
+    unflip_queries: Rc<Cell<usize>>,
+}
+
+#[cfg(test)]
+impl FakeDirectOwnershipState {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn set_busy(&self, busy: bool) {
+        self.busy.set(busy);
+    }
+
+    pub(crate) fn set_unflip_outstanding(&self, outstanding: bool) {
+        self.unflip_outstanding.set(outstanding);
+    }
+
+    pub(crate) fn busy_query_count(&self) -> usize {
+        self.busy_queries.get()
+    }
+
+    pub(crate) fn unflip_query_count(&self) -> usize {
+        self.unflip_queries.get()
+    }
+}
+
+#[cfg(test)]
+impl DirectOwnershipState for FakeDirectOwnershipState {
+    fn direct_ownership_busy(&self) -> bool {
+        self.busy_queries.set(self.busy_queries.get() + 1);
+        self.busy.get()
+    }
+
+    fn unflip_outstanding(&self) -> bool {
+        self.unflip_queries.set(self.unflip_queries.get() + 1);
+        self.unflip_outstanding.get()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TransportGate {
     device: DrmDeviceKey,
     incarnation: IncarnationId,
     state: TransportState,
-    direct_scanout_active: bool,
-    unflip_pending: bool,
+    ownership: Box<dyn DirectOwnershipState>,
     outstanding_owner_writes: usize,
     next_serial: u64,
     issued_serials: BTreeSet<u64>,
@@ -138,13 +221,16 @@ pub(crate) struct TransportGate {
 }
 
 impl TransportGate {
-    pub(crate) fn new_legacy(device: DrmDeviceKey, incarnation: IncarnationId) -> Self {
+    pub(crate) fn new_legacy(
+        device: DrmDeviceKey,
+        incarnation: IncarnationId,
+        ownership: Box<dyn DirectOwnershipState>,
+    ) -> Self {
         Self {
             device,
             incarnation,
             state: TransportState::Legacy,
-            direct_scanout_active: false,
-            unflip_pending: false,
+            ownership,
             outstanding_owner_writes: 0,
             next_serial: 0,
             issued_serials: BTreeSet::new(),
@@ -160,27 +246,44 @@ impl TransportGate {
         self.incarnation
     }
 
-    pub(crate) fn set_direct_scanout_active(&mut self, active: bool) {
-        self.direct_scanout_active = active;
-    }
-
-    pub(crate) fn set_unflip_pending(&mut self, pending: bool) {
-        self.unflip_pending = pending;
-    }
-
+    /// R7 precondition: `Busy` while any direct ownership unit is
+    /// `Current`/`Submitted`/`Successor`, or while an unflip is requested
+    /// and not retired -- read live from the real state given at
+    /// construction (M-13), never from a setter on this gate.
     pub(crate) fn begin_quiescing(&mut self) -> Result<(), ResourceError> {
         if self.state == TransportState::Closed {
             return Err(ResourceError::Detached);
         }
-        if self.direct_scanout_active || self.unflip_pending || self.outstanding_owner_writes != 0 {
+        if self.ownership.direct_ownership_busy()
+            || self.ownership.unflip_outstanding()
+            || self.outstanding_owner_writes != 0
+        {
             return Err(ResourceError::Busy);
         }
         self.state = TransportState::Quiescing;
         Ok(())
     }
 
-    pub(crate) fn close(&mut self) {
+    /// Unconditional closure used only for the foreign-proof emergency path
+    /// (a mismatched `consume_owner_write` must close immediately,
+    /// regardless of any other outstanding grant -- that grant's owner is
+    /// already quarantined by the same mismatch). The public `close` below
+    /// is the graceful path and refuses while grants are outstanding
+    /// (M-14).
+    fn force_close(&mut self) {
         self.state = TransportState::Closed;
+    }
+
+    /// M-14: refuses while `outstanding_owner_writes() != 0` -- closing
+    /// (and thereby the handover it precedes) must not silently orphan a
+    /// dispatch whose outcome is still unknown.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn close(&mut self) -> Result<(), ResourceError> {
+        if self.outstanding_owner_writes != 0 {
+            return Err(ResourceError::Busy);
+        }
+        self.force_close();
+        Ok(())
     }
 
     pub(crate) fn state(&self) -> TransportState {
@@ -189,6 +292,39 @@ impl TransportGate {
 
     pub(crate) fn allows_legacy(&self, _class: WriterClass) -> bool {
         self.state == TransportState::Legacy
+    }
+
+    /// B-10/R11: the single check every real DRM/helper write sink performs
+    /// immediately before it actually dispatches, composing `allows_legacy`
+    /// with the Owner-writer authority contract (plan-review round-2 M-1)
+    /// so a sink does not have to re-derive it. `Legacy` permits
+    /// unconditionally -- the only route any production caller can reach
+    /// today (R8), so `grant` is always `None` there in practice. `Quiescing`
+    /// and `Closed` refuse every write, matching R7 ("Quiescing permits no
+    /// writer class"). `Owner` requires a `grant` whose own `class` matches
+    /// `class`; a class mismatch refuses without consuming anything (the
+    /// caller's now-unused grant then closes admission when it is dropped,
+    /// per the lost-role-token rule); a matching grant is consumed through
+    /// `consume_owner_write`, which independently enforces device/
+    /// incarnation and force-closes the transport on a foreign one.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn authorize_write(
+        &mut self,
+        class: WriterClass,
+        grant: Option<OwnerWriteGrant>,
+    ) -> Result<(), ResourceError> {
+        match self.state {
+            TransportState::Legacy => Ok(()),
+            TransportState::Quiescing => Err(ResourceError::Busy),
+            TransportState::Closed => Err(ResourceError::Detached),
+            TransportState::Owner => {
+                let grant = grant.ok_or(ResourceError::Detached)?;
+                if grant.class() != class {
+                    return Err(ResourceError::InvalidProof);
+                }
+                self.consume_owner_write(grant).map_err(|(err, _grant)| err)
+            }
+        }
     }
 
     pub(crate) fn authorize_owner_write(
@@ -223,7 +359,7 @@ impl TransportGate {
         grant: OwnerWriteGrant,
     ) -> Result<(), (ResourceError, OwnerWriteGrant)> {
         if grant.device != self.device || grant.incarnation != self.incarnation {
-            self.close();
+            self.force_close();
             return Err((ResourceError::WrongIncarnation, grant));
         }
         if self.state != TransportState::Owner {
@@ -232,15 +368,32 @@ impl TransportGate {
         if !self.issued_serials.remove(&grant.serial) {
             return Err((ResourceError::InvalidProof, grant));
         }
-        if self.outstanding_owner_writes > 0 {
-            self.outstanding_owner_writes -= 1;
-        }
+        // Minor (round-1 review): a plain `if outstanding > 0 { -= 1 }` masks
+        // an accounting bug (a serial issued and removed above with nothing
+        // to decrement) by silently doing nothing instead of surfacing it.
+        // `issued_serials` and `outstanding_owner_writes` are supposed to
+        // move together; a mismatch here means they already diverged, and
+        // hiding that would let a stuck admission-closed gate look healthy.
+        self.outstanding_owner_writes = match self.outstanding_owner_writes.checked_sub(1) {
+            Some(remaining) => remaining,
+            None => return Err((ResourceError::InvalidState, grant)),
+        };
         grant.consumed.set(true);
         Ok(())
     }
 
     pub(crate) fn outstanding_owner_writes(&self) -> usize {
         self.outstanding_owner_writes
+    }
+
+    /// Test-only: force a desync between `outstanding_owner_writes` and
+    /// `issued_serials` that the normal `authorize_owner_write`/
+    /// `consume_owner_write` pairing can never produce, so the checked-
+    /// subtraction accounting fix (round-1 review minor) is reachable from a
+    /// test at all.
+    #[cfg(test)]
+    pub(crate) fn set_outstanding_owner_writes_for_tests(&mut self, value: usize) {
+        self.outstanding_owner_writes = value;
     }
 
     pub(crate) fn revoke_owner_writes(&mut self) -> usize {
@@ -251,8 +404,20 @@ impl TransportGate {
         count
     }
 
+    /// M-14: takes the real `LegacyDrained` proof the backend obtained from
+    /// draining the legacy route, plus the final dispositions of that
+    /// drain, rather than trusting a caller to have applied them
+    /// beforehand. A proof for a foreign device/incarnation, or any
+    /// disposition that shows a backend failure, refuses the permit --
+    /// mirroring the same fail-closed rule `try_finish_legacy_transport`
+    /// already applies before it ever reaches this call (R9: proofs are
+    /// never fabricated, and a malformed one closes the route rather than
+    /// being silently accepted).
+    #[allow(clippy::result_large_err)]
     pub(crate) fn issue_handover_permit(
         &mut self,
+        proof: crate::kms::render::platform::LegacyDrained,
+        dispositions: &[crate::kms::render::backend::LegacyEventDisposition],
         _coverage: &WriterCoverageProof,
         _reservation: RecipientReservation,
     ) -> Result<HandoverPermit, ResourceError> {
@@ -261,6 +426,20 @@ impl TransportGate {
         }
         if self.outstanding_owner_writes != 0 {
             return Err(ResourceError::Busy);
+        }
+        if proof.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        let backend_failure = dispositions.iter().any(|d| {
+            matches!(
+                d,
+                crate::kms::render::backend::LegacyEventDisposition::Cancelled(
+                    crate::kms::render::backend::LegacyEventCancellation::BackendFailure
+                )
+            )
+        });
+        if backend_failure {
+            return Err(ResourceError::InvalidProof);
         }
         Ok(HandoverPermit {
             device: self.device,

@@ -1,7 +1,8 @@
 #[allow(unused_imports)]
-use std::{fmt, io, os::fd::OwnedFd, rc::Rc, sync::Arc};
+use std::{fmt, io, num::NonZeroU32, os::fd::OwnedFd, rc::Rc, sync::Arc};
 
 use ash::vk;
+use drm::{buffer::Handle as DrmBufferHandle, control::framebuffer};
 
 use super::{
     AllocationLease, ResourceError,
@@ -244,17 +245,75 @@ impl ScanoutAllocation {
         &mut self.shared
     }
 
+    /// F2-B3: on failure, keeps the backing in `self.file_owned` (matching
+    /// `DirectFramebufferAllocation::discharge_file_owned`) rather than
+    /// reinstalling it and immediately taking it right back out into the
+    /// `Err` -- which left `self.file_owned` `None` after a *failed*
+    /// discharge, so the caller's retry found nothing to retry and the
+    /// entry's next tick destroyed it with the right (at
+    /// `FramebufferRemoved`), the gbm_bo and the device alias silently
+    /// dropped.
     pub(crate) fn discharge_file_owned(
         &mut self,
         registry: &mut DrmCleanupRegistry,
-    ) -> Result<(), (io::Error, FileOwnedBacking)> {
-        if let Some(fo) = self.file_owned.take()
-            && let Err((err, returned)) = fo.discharge(registry)
-        {
-            self.file_owned = Some(returned);
-            return Err((err, self.file_owned.take().unwrap()));
+    ) -> Result<(), io::Error> {
+        if let Some(fo) = self.file_owned.take() {
+            match fo.discharge(registry) {
+                Ok(()) => {}
+                Err((err, returned)) => {
+                    self.file_owned = Some(returned);
+                    return Err(err);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Inverse of `from_scanout_bo_backing`, for the F2-M2 rollback when a
+    /// paired managed adoption fails after this side already succeeded.
+    /// Never touches the registry: `register_right` has no persistent
+    /// side effect until `consume`/`register_payload_alias` observes the
+    /// right, and neither has happened yet for a payload that was only
+    /// ever adopted, never discharged.
+    pub(crate) fn into_scanout_bo_backing(mut self) -> ScanoutBoBacking {
+        // `SharedBacking` has a `Drop`, so it (and this whole struct) cannot
+        // be destructured by value; extract each field via replace/take
+        // instead, same as `take_physical_backing` does on `&mut self`. The
+        // leftover `self` (image/memory/view null, transfer empty, vk
+        // `None`) drops normally at the end of this function -- its `Drop`
+        // guards make that a safe no-op, with nothing left to close.
+        let FileOwnedBacking {
+            right,
+            gbm_bo,
+            device,
+        } = self
+            .file_owned
+            .take()
+            .expect("rollback is only ever called on a file-owned scanout allocation");
+        let image = std::mem::replace(&mut self.shared.image, vk::Image::null());
+        let memory = std::mem::replace(&mut self.shared.memory, vk::DeviceMemory::null());
+        let view = std::mem::replace(&mut self.shared.view, vk::ImageView::null());
+        let transfer = std::mem::replace(&mut self.shared.transfer, TransferResources::empty());
+        let vk = self
+            .shared
+            .vk
+            .take()
+            .expect("a real (non-mock) allocation's shared half always has Some(vk)");
+        ScanoutBoBacking {
+            fb_handle: Some(framebuffer::Handle::from(
+                NonZeroU32::new(right.fb()).expect("a registered right has a nonzero fb id"),
+            )),
+            gem_handle: Some(DrmBufferHandle::from(
+                NonZeroU32::new(right.gem()).expect("a registered right has a nonzero gem id"),
+            )),
+            gbm_bo,
+            drm: device,
+            image,
+            memory,
+            view,
+            transfer,
+            vk,
+        }
     }
 
     /// Consuming conversion from a live `ScanoutBo` (B-13): mints the FB/GEM
@@ -415,6 +474,49 @@ impl CopiedSourceAllocation {
             last_gpu_render_ns,
             render_vk: Some(render_vk),
             sink_vk: Some(sink_vk),
+            sink_wait_semaphore,
+            renderer_wait_semaphore,
+            renderer_return_completion,
+            ownership,
+        }
+    }
+
+    /// Inverse of `from_copied_render_source_backing`, for the F2-M2
+    /// rollback when a paired managed adoption fails.
+    pub(crate) fn into_copied_render_source_backing(mut self) -> CopiedRenderSourceBacking {
+        // `Self` has a `Drop`, so extract fields via replace/take instead of
+        // destructuring by value (same reasoning as
+        // `ScanoutAllocation::into_scanout_bo_backing`).
+        let imported_on_sink = self.imported_on_sink.take();
+        let transport_on_renderer = self.transport_on_renderer.take();
+        let render_target = self.render_target.take();
+        let completion_semaphore =
+            std::mem::replace(&mut self.completion_semaphore, vk::Semaphore::null());
+        let completion_semaphore_reuse = self.completion_semaphore_reuse;
+        let transfer = std::mem::replace(&mut self.transfer, TransferResources::empty());
+        let last_gpu_render_ns = self.last_gpu_render_ns.take();
+        let render_vk = self
+            .render_vk
+            .take()
+            .expect("a real (non-mock) allocation always has Some(render_vk)");
+        let sink_vk = self
+            .sink_vk
+            .take()
+            .expect("a real (non-mock) allocation always has Some(sink_vk)");
+        let sink_wait_semaphore = self.sink_wait_semaphore.take();
+        let renderer_wait_semaphore = self.renderer_wait_semaphore.take();
+        let renderer_return_completion = self.renderer_return_completion.take();
+        let ownership = self.ownership;
+        CopiedRenderSourceBacking {
+            imported_on_sink,
+            transport_on_renderer,
+            render_target,
+            completion_semaphore,
+            completion_semaphore_reuse,
+            transfer,
+            last_gpu_render_ns,
+            render_vk,
+            sink_vk,
             sink_wait_semaphore,
             renderer_wait_semaphore,
             renderer_return_completion,

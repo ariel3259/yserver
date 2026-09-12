@@ -1,4 +1,6 @@
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
+
+use ash::vk::{self, Handle};
 
 use super::*;
 use crate::{
@@ -9,9 +11,23 @@ use crate::{
             lifecycle::LifecycleEpochId,
         },
         render::platform::CrtcKey,
+        vk::device::VkContext,
     },
     platform::drm::DrmDeviceKey,
 };
+
+/// Used only by the `_vulkan` tests that bind a real `GpuObligation` (via
+/// `GpuObligation::new`) to exercise the real `poll_signaled_result` path,
+/// or that otherwise need a genuine live device. R12: an absent ICD is an
+/// honest `panic!`, never a silent pass.
+fn real_vk_context() -> Arc<VkContext> {
+    match VkContext::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            panic!("environmental skip: no live Vulkan ICD available ({e:?}); not claiming pass")
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct SpyAllocation {
@@ -628,11 +644,12 @@ fn c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias() {
         GemOwner::Right,
         Some(Rc::clone(&device)),
     );
+    // F2-M1: adopt refuses a file-owned payload directly; adopt_with_registry
+    // is the only path, and it registers the alias itself.
     let held = service
-        .adopt(AllocationPayload::DirectFramebuffer(payload))
+        .adopt_with_registry(AllocationPayload::DirectFramebuffer(payload), &mut registry)
         .unwrap();
     let key = held.key();
-    registry.register_payload_alias(key);
 
     // Only the registry's own alias and the payload's alias remain.
     drop(device);
@@ -726,11 +743,12 @@ fn c0_2ci_drm_cleanup_fd_family_barrier_discharge_failure_retries() {
         GemOwner::Right,
         Some(device),
     );
+    // F2-M1: adopt refuses a file-owned payload directly; adopt_with_registry
+    // is the only path, and it registers the alias itself.
     let held = service
-        .adopt(AllocationPayload::DirectFramebuffer(payload))
+        .adopt_with_registry(AllocationPayload::DirectFramebuffer(payload), &mut registry)
         .unwrap();
     let key = held.key();
-    registry.register_payload_alias(key);
 
     let discharge = |registry: &mut DrmCleanupRegistry, discharge_key: AllocationKey| {
         let entry = service.entries.get(&discharge_key).expect("entry present");
@@ -1057,7 +1075,10 @@ fn c0_2ci_scanout_discharging_file_owned_leaves_shared_intact() {
     let alloc = ScanoutAllocation::new(Some(fo), shared);
 
     let mut service = ResourceService::new(device_key, IncarnationId::first());
-    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    // F2-M1: adopt refuses a file-owned payload directly.
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
     let key = held.key();
 
     // A pending GPU obligation belongs to the *shared* half (R4): it is
@@ -1313,12 +1334,18 @@ fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
 
     let calls = Rc::new(RefCell::new(Vec::new()));
     let io = MockCleanupIo::new(Rc::clone(&calls));
-    // No registry-held device alias (`new_with_io`): the payload's own
-    // clone is the description's only other holder, so the ordering this
-    // test cares about -- gbm_bo's real GEM_CLOSE must run while the fd is
-    // still open, i.e. before the device alias drops -- is load-bearing,
-    // not merely asserted after the fact.
-    let mut registry = DrmCleanupRegistry::new_with_io(device_key, incarnation, Box::new(io));
+    // F2-M3: the registry holds its own alias too (`new_with_device_and_io`),
+    // distinct from the payload's -- a device-less registry cannot show
+    // that the *registry* performs the description's last close (step 3);
+    // it would only show that the payload's own discharge happened to be
+    // the last one, which is the reverse of what R5 step 3 requires (this
+    // is F1-M1's exact mistake, repeated here in the real-GBM case).
+    let mut registry = DrmCleanupRegistry::new_with_device_and_io(
+        Rc::clone(&device),
+        device_key,
+        incarnation,
+        Box::new(io),
+    );
     registry.detach_fake_submitters();
     registry.reap_fake_helper();
     registry.close_fake_control();
@@ -1333,13 +1360,14 @@ fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
         None,
     );
     let alloc = ScanoutAllocation::new(Some(fo), shared);
-    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
     let key = held.key();
-    registry.register_payload_alias(key);
 
     // `gbm_device` was only ever a factory for `gbm_bo`; it holds its own
     // alias and must go, same as the test's original `device` binding, so
-    // the payload's clone is the only one left.
+    // only the registry's own alias and the payload's alias remain.
     drop(gbm_device);
     drop(device);
 
@@ -1351,12 +1379,20 @@ fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
             assert_eq!(discharge_key, key);
             let entry = service.entries.get(&discharge_key).expect("entry present");
             let mut payload = entry.payload.borrow_mut();
-            match payload.as_mut() {
-                Some(AllocationPayload::Scanout(alloc)) => {
-                    alloc.discharge_file_owned(registry).map_err(|(err, _)| err)
-                }
+            let result = match payload.as_mut() {
+                Some(AllocationPayload::Scanout(alloc)) => alloc.discharge_file_owned(registry),
                 _ => Ok(()),
-            }
+            };
+            // Step 2 (discharging the payload's alias -- the real gbm_bo's
+            // GEM_CLOSE) is not step 3 (the registry's own last close): the
+            // registry still holds its own alias right here, so the
+            // description is not yet closed. With the registry holding no
+            // alias of its own, this assertion would be checking a no-op.
+            assert!(
+                weak.upgrade().is_some(),
+                "the payload's own discharge must not be the description's last close"
+            );
+            result
         })
         .unwrap();
 
@@ -1365,13 +1401,61 @@ fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
     // right itself issues; the real gbm_bo's own drop (already run, inside
     // `discharge_file_owned` above) was the sole GEM closer.
     assert_eq!(calls.borrow().as_slice(), &[CleanupCall::RemoveFb(9101)]);
+    // F2-B2: the alias is unregistered once discharged through the barrier
+    // -- the same bookkeeping the normal path (service_ready_with_registry)
+    // performs, so a later teardown never hands this key to a callback with
+    // nothing left to look up.
+    assert_eq!(registry.payload_aliases(), 0);
 
-    // The registry performed the description's last close.
+    // Only now -- after the mint itself performs step 3 -- is the
+    // description's last alias (the registry's own) closed.
     assert!(weak.upgrade().is_none());
 
     let calls_before_retire = calls.borrow().len();
     registry.retire_closed_family(proof).unwrap();
     assert_eq!(calls.borrow().len(), calls_before_retire);
+}
+
+#[test]
+fn c0_2ci_release_fresh_adoption_reclaims_untouched_lease() {
+    // F2-M2: register_managed_scanout_bo's all-or-nothing rollback needs a
+    // way to un-adopt a payload it adopted moments ago when a paired
+    // adoption fails afterward.
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let payload = match service.release_fresh_adoption(held) {
+        Ok(payload @ AllocationPayload::Spy(_)) => payload,
+        other => panic!("expected the Spy payload back, got {other:?}"),
+    };
+    assert!(!service.contains(&key));
+    assert_eq!(
+        drops.get(),
+        0,
+        "release_fresh_adoption hands the payload back; it must not drop it"
+    );
+    drop(payload);
+    assert_eq!(
+        drops.get(),
+        1,
+        "the caller's own drop is what finally runs it"
+    );
+}
+
+#[test]
+fn c0_2ci_release_fresh_adoption_refuses_when_something_else_is_using_it() {
+    let (mut service, held, _drops) = spy_service();
+    let key = held.key();
+    let _extra_use = service.reserve(key, UseKind::Read).unwrap();
+    match service.release_fresh_adoption(held) {
+        Err(_lease) => {}
+        Ok(payload) => {
+            panic!("must not hard-reclaim while something else uses the entry, got {payload:?}")
+        }
+    }
+    assert!(
+        service.contains(&key),
+        "the lease was handed back, not consumed; the entry must still be there"
+    );
 }
 
 #[test]
@@ -1474,6 +1558,179 @@ fn c0_2ci_scanout_service_ready_with_registry_discharges_before_destroy() {
         &[CleanupCall::RemoveFb(92), CleanupCall::CloseGem(93)]
     );
     assert!(!service.contains(&key));
+    // F2-B2: the alias must be unregistered on successful discharge -- a
+    // stale key here is exactly what makes the fd-family barrier walk
+    // hand a since-destroyed key to the discharge callback at teardown.
+    assert_eq!(registry.payload_aliases(), 0);
+}
+
+#[test]
+fn c0_2ci_scanout_service_ready_with_registry_unregisters_only_the_discharged_alias() {
+    // F2-B2: releasing one payload normally must not disturb a second,
+    // still-outstanding payload's alias -- the barrier walk later must
+    // invoke its discharge callback exactly once, for that second key only.
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        device_key,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::clone(&calls))),
+    );
+    registry.detach_fake_submitters();
+    registry.reap_fake_helper();
+    registry.close_fake_control();
+
+    let make_alloc = |fb: u32, gem: u32| {
+        let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+        let right = DrmCleanupRight::new(device_key, incarnation, fb, gem, GemOwner::Right);
+        let fo = FileOwnedBacking::new(right, None, device).unwrap();
+        let shared = SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        );
+        ScanoutAllocation::new(Some(fo), shared)
+    };
+
+    let released_alloc = make_alloc(96, 97);
+    let released_held = service
+        .adopt_with_registry(AllocationPayload::Scanout(released_alloc), &mut registry)
+        .unwrap();
+
+    let outstanding_alloc = make_alloc(98, 99);
+    let outstanding_held = service
+        .adopt_with_registry(AllocationPayload::Scanout(outstanding_alloc), &mut registry)
+        .unwrap();
+    let outstanding_key = outstanding_held.key();
+    // Kept alive (not dropped): a live Retain lease is what makes this
+    // payload genuinely still outstanding when the first payload releases,
+    // rather than both becoming destroyable on the same tick.
+
+    // Release the first payload normally.
+    drop(released_held);
+    service.service_ready_with_registry(&mut registry);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(96), CleanupCall::CloseGem(97)]
+    );
+    assert_eq!(registry.payload_aliases(), 1);
+
+    // Now mint the barrier: the callback must run exactly once, for the
+    // still-outstanding key only.
+    let discharge_count = Rc::new(Cell::new(0));
+    let proof = registry
+        .try_mint_file_family_closed(|registry, discharge_key| {
+            assert_eq!(discharge_key, outstanding_key);
+            discharge_count.set(discharge_count.get() + 1);
+            let entry = service.entries.get(&discharge_key).expect("entry present");
+            let mut payload = entry.payload.borrow_mut();
+            match payload.as_mut() {
+                Some(AllocationPayload::Scanout(alloc)) => alloc.discharge_file_owned(registry),
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+    assert_eq!(discharge_count.get(), 1);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[
+            CleanupCall::RemoveFb(96),
+            CleanupCall::CloseGem(97),
+            CleanupCall::RemoveFb(98),
+            CleanupCall::CloseGem(99),
+        ]
+    );
+    registry.retire_closed_family(proof).unwrap();
+}
+
+#[test]
+fn c0_2ci_scanout_service_ready_with_registry_retries_failed_discharge() {
+    // F2-B3: a failed discharge must keep the backing in `file_owned`, not
+    // reinstall it and immediately take it right back out into the `Err`
+    // (which left `file_owned` `None` after a *failed* discharge, so the
+    // right at `FramebufferRemoved`, the device alias and, for `Gbm`, the
+    // gbm_bo were silently dropped on the very next tick).
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(Rc::clone(&calls));
+    io.fail_gem.set(true);
+    let mut registry =
+        DrmCleanupRegistry::new_with_io(device_key, incarnation, Box::new(io.clone()));
+
+    let right = DrmCleanupRight::new(device_key, incarnation, 100, 101, GemOwner::Right);
+    let fo = FileOwnedBacking::new(right, None, device).unwrap();
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let alloc = ScanoutAllocation::new(Some(fo), shared);
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
+    let key = held.key();
+    drop(held);
+
+    // First tick: discharge fails at close_gem. The entry must survive with
+    // its file-owned half intact, retryable from FramebufferRemoved.
+    service.service_ready_with_registry(&mut registry);
+    assert!(
+        service.contains(&key),
+        "entry must survive a failed discharge, not be dropped undischarged"
+    );
+    {
+        let entry = service.entries.get(&key).unwrap();
+        let payload = entry.payload.borrow();
+        match payload.as_ref() {
+            Some(AllocationPayload::Scanout(alloc)) => {
+                let fo = alloc
+                    .file_owned()
+                    .expect("file_owned must survive a failed discharge");
+                assert_eq!(fo.right().state(), RightState::FramebufferRemoved);
+            }
+            other => panic!("expected Scanout payload, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(100), CleanupCall::CloseGem(101)]
+    );
+    assert_eq!(
+        registry.payload_aliases(),
+        1,
+        "alias must not be unregistered on a failed discharge"
+    );
+
+    // Clear the failure and retry: RMFB is not re-issued, only CloseGem is
+    // retried, and the entry is now destroyed.
+    io.fail_gem.set(false);
+    service.service_ready_with_registry(&mut registry);
+    assert!(!service.contains(&key));
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[
+            CleanupCall::RemoveFb(100),
+            CleanupCall::CloseGem(101),
+            CleanupCall::CloseGem(101),
+        ]
+    );
+    assert_eq!(registry.payload_aliases(), 0);
 }
 
 #[test]
@@ -1485,6 +1742,11 @@ fn c0_2ci_scanout_apply_teardown_release_refuses_live_file_owned() {
     };
     let incarnation = IncarnationId::first();
     let mut service = ResourceService::new(device_key, incarnation);
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        device_key,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::new(RefCell::new(Vec::new())))),
+    );
 
     let right = DrmCleanupRight::new(device_key, incarnation, 94, 95, GemOwner::Right);
     let fo = FileOwnedBacking::new(right, None, device).unwrap();
@@ -1496,7 +1758,10 @@ fn c0_2ci_scanout_apply_teardown_release_refuses_live_file_owned() {
         None,
     );
     let alloc = ScanoutAllocation::new(Some(fo), shared);
-    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    // F2-M1: adopt refuses a file-owned payload directly.
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
     let key = held.key();
 
     let crtc = CrtcKey::new(
@@ -1525,63 +1790,16 @@ fn c0_2ci_scanout_apply_teardown_release_refuses_live_file_owned() {
     );
 }
 
-#[test]
-fn c0_2ci_read_source_scratch_regression() {
-    let (mut service, source_held, _source_drops) = spy_service();
-    let source_key = source_held.key();
-    let source_read = service.register(source_key, ObligationKind::Read).unwrap();
-
-    let (scratch_held, scratch_drops) = {
-        let drops = Rc::new(Cell::new(0));
-        let held = service
-            .adopt(AllocationPayload::Spy(SpyAllocation {
-                drops: Rc::clone(&drops),
-            }))
-            .unwrap();
-        (held, drops)
-    };
-    let scratch_key = scratch_held.key();
-    let scratch_gpu = service.register(scratch_key, ObligationKind::Gpu).unwrap();
-
-    let scratch_ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-
-    // 1. Successful readback produces owned CPU bytes before scratch upload.
-    // Source read completion is recorded then.
-    service
-        .apply_validated_proof(source_key, source_read)
-        .unwrap();
-    drop(source_held);
-
-    let source_entry = service.entries.get(&source_key).unwrap();
-    let source_read_pending = source_entry
-        .availability
-        .borrow()
-        .pending_obligations
-        .values()
-        .filter(|k| matches!(k, ObligationKind::Read))
-        .count();
-
-    assert_eq!(source_read_pending, 0);
-    assert_eq!(scratch_drops.get(), 0);
-    assert!(!scratch_ticket.poll_signaled_result_opt(None).unwrap());
-
-    // Scratch cleanup remains behind its own upload/Composite ticket
-    let mut batch = CoreRetirementBatch::new(vec![scratch_held], vec![1], true);
-    let ob =
-        GpuObligation::for_tests_stub(vec![(scratch_key, scratch_gpu)], scratch_ticket.clone());
-    batch.bind_ticket(ob);
-    service.register_batch(batch);
-
-    // Poll while ticket is false: nothing completed
-    service.poll_gpu(Instant::now()).unwrap();
-    assert_eq!(scratch_drops.get(), 0);
-
-    // Ticket signals
-    scratch_ticket.test_signal();
-    service.poll_gpu(Instant::now()).unwrap();
-    service.service_ready();
-    assert_eq!(scratch_drops.get(), 1);
-}
+// B-15's decisive test -- real `read_scanout_region` readback (the root
+// IncludeInferiors snapshot path) plus a real async Vulkan submission
+// polled through `poll_gpu`, never a fabricated
+// `apply_validated_proof`/`test_signal` pair. It needs `KmsBackend`'s
+// private `mod tests` fixtures (`for_tests_with_vk_live_scene`,
+// `create_live_window`, `fill_rectangle`) that only that module's own test
+// tree can reach, so it lives in `backend.rs`'s `mod tests` as
+// `c0_2ci_read_source_scratch_regression_vulkan`, next to
+// `root_get_image_reads_scanout_pixels_not_root_storage`, whose fixture it
+// extends with managed source/scratch allocations.
 
 #[test]
 fn c0_2ci_read_uncertain_submission_leaves_source_and_staging_retained() {
@@ -1622,6 +1840,19 @@ fn c0_2ci_read_uncertain_submission_leaves_source_and_staging_retained() {
     assert!(service.entries.get(&staging_key).unwrap().frozen());
 }
 
+// F4-B1: `GpuObligation.context` is `Option<Arc<VkContext>>` (the F5
+// amendment at F2-m2) -- `#[cfg(test)] GpuObligation::for_tests_stub` builds
+// one with `context: None`, which is legal *only* because every test below
+// binds it through `CoreRetirementBatch::test_ticket_status`, which
+// intercepts `ticket_status()` before it ever touches `context`. That
+// restores these to deterministic, unignored `c0_2ci_` tests: the mechanism
+// under test (`poll_gpu`/`validate_gpu_batch`/`commit_gpu_batch`/
+// `quarantine_gpu_batch`) only ever consults `ticket_status()`'s return
+// value, never how a real ticket reached it, so flipping
+// `test_ticket_status` in place through `ResourceService::pending_batches_mut()`
+// exercises the exact same branches as a real ticket would without needing a
+// live device to construct the value at all.
+
 #[test]
 fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic() {
     let (mut service, held_a, drops_a) = spy_service();
@@ -1641,7 +1872,11 @@ fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic() {
     let invalid_gpu_b = ObligationId(9999);
 
     let batch_drop_counter = Rc::new(Cell::new(0));
-    let mut batch = CoreRetirementBatch::new(vec![held_a, held_b], vec![0], true);
+    let mut batch = CoreRetirementBatch::new(
+        vec![held_a, held_b],
+        vec![vk::DescriptorSet::from_raw(0)],
+        true,
+    );
     batch.drop_counter = Some(Rc::clone(&batch_drop_counter));
     batch.bind_ticket(GpuObligation::for_tests_stub(
         vec![(key_a, gpu_a), (key_b, invalid_gpu_b)],
@@ -1679,7 +1914,8 @@ fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic() {
         generation: 9999,
     };
 
-    let mut batch2 = CoreRetirementBatch::new(vec![held_c], vec![0], true);
+    let mut batch2 =
+        CoreRetirementBatch::new(vec![held_c], vec![vk::DescriptorSet::from_raw(0)], true);
     batch2.bind_ticket(GpuObligation::for_tests_stub(
         vec![(invalid_key, ObligationId(1)), (key_c, gpu_c)],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
@@ -1713,7 +1949,8 @@ fn c0_2ci_gpu_batch_freeze_lookup_failure_handled() {
         generation: 8888,
     };
 
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
     batch.bind_ticket(GpuObligation::for_tests_stub(
         vec![(key, gpu), (stale_key, ObligationId(1))],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
@@ -1738,7 +1975,8 @@ fn c0_2ci_gpu_ticket_error_quarantines_batch() {
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
     batch.bind_ticket(GpuObligation::for_tests_stub(
         vec![(key, gpu)],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
@@ -1759,7 +1997,7 @@ fn c0_2ci_gpu_empty_ticket_when_possibly_dispatched_quarantines_batch() {
     let (mut service, held, drops) = spy_service();
     let _key = held.key();
 
-    let batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    let batch = CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
     service.register_batch(batch);
 
     // Empty ticket when possibly_dispatched = true returns Err(ERROR_UNKNOWN)
@@ -1775,12 +2013,11 @@ fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket() {
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
-        vec![(key, gpu)],
-        ticket.clone(),
-    ));
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(vec![(key, gpu)], ticket));
+    batch.test_ticket_status = Some(Ok(false));
 
     service.register_batch(batch);
 
@@ -1792,7 +2029,51 @@ fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket() {
     assert_eq!(service.pending_batches().len(), 1);
 
     // Now ticket signals
-    ticket.test_signal();
+    service.pending_batches_mut()[0].test_ticket_status = Some(Ok(true));
+    service.poll_gpu(Instant::now()).unwrap();
+    service.service_ready();
+    assert_eq!(drops.get(), 1);
+    assert_eq!(service.pending_batches().len(), 0);
+}
+
+// F4-B1: real-fence variant. The deterministic test above proves the state
+// machine (retained while unsignaled, released once signaled) via
+// `test_ticket_status`; this proves the actual `ticket_status()` ->
+// `poll_signaled_result(&Arc<VkContext>)` path with a genuine submission and
+// fence driving it, with no `test_ticket_status` override at all. It waits
+// for the real submission to retire before polling, so it makes no claim
+// about the unsignaled window (that would race a no-op submission -- see
+// F4-M1) -- its evidence is that the real path retires the batch and
+// releases the allocation once the device genuinely signals.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan() {
+    let vk = real_vk_context();
+    let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).expect("ops pool");
+    let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
+
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    let ticket = fence_pool.acquire().expect("acquire real fence ticket");
+    crate::kms::vk::ops::submit_one_shot_op_async(&vk, ops_pool.handle(), &ticket, |_vk, _cb| {
+        Ok(())
+    })
+    .expect("submit real no-op");
+
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::new(
+        vec![(key, gpu)],
+        ticket.clone(),
+        Arc::clone(&vk),
+    ));
+    service.register_batch(batch);
+
+    // Wait for the real submission to retire, then let the service observe
+    // the genuine signal through the real `poll_signaled_result` path.
+    ticket.wait(&vk).expect("wait for real ticket");
     service.poll_gpu(Instant::now()).unwrap();
     service.service_ready();
     assert_eq!(drops.get(), 1);
@@ -1817,22 +2098,59 @@ fn c0_2ci_descriptor_reset_exclusion_until_gpu_signaled() {
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![42], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
-        vec![(key, gpu)],
-        ticket.clone(),
-    ));
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let descriptor = vk::DescriptorSet::from_raw(42);
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![descriptor], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(vec![(key, gpu)], ticket));
+    batch.test_ticket_status = Some(Ok(false));
 
     service.register_batch(batch);
 
     // Polling while unsignaled does not retire the batch, retaining descriptor slot 42
     service.poll_gpu(Instant::now()).unwrap();
     assert_eq!(service.pending_batches().len(), 1);
-    assert_eq!(service.pending_batches()[0].descriptor_slots(), &[42]);
+    assert_eq!(
+        service.pending_batches()[0].descriptor_slots(),
+        &[descriptor]
+    );
 
     // When signaled, polling retires and releases descriptor slot ownership
-    ticket.test_signal();
+    service.pending_batches_mut()[0].test_ticket_status = Some(Ok(true));
+    service.poll_gpu(Instant::now()).unwrap();
+    assert_eq!(service.pending_batches().len(), 0);
+}
+
+// F4-B1: real-fence variant, same rationale as the dropped-frame-metadata
+// variant above -- proves the real `ticket_status()`/`poll_signaled_result`
+// path retires a batch and releases its descriptor slot once a genuine
+// submission genuinely signals, without racing the unsignaled window.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan() {
+    let vk = real_vk_context();
+    let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).expect("ops pool");
+    let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
+
+    let (mut service, held, _drops) = spy_service();
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    let ticket = fence_pool.acquire().expect("acquire real fence ticket");
+    let descriptor = vk::DescriptorSet::from_raw(42);
+    crate::kms::vk::ops::submit_one_shot_op_async(&vk, ops_pool.handle(), &ticket, |_vk, _cb| {
+        Ok(())
+    })
+    .expect("submit real no-op");
+
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![descriptor], true);
+    batch.bind_ticket(GpuObligation::new(
+        vec![(key, gpu)],
+        ticket.clone(),
+        Arc::clone(&vk),
+    ));
+    service.register_batch(batch);
+
+    ticket.wait(&vk).expect("wait for real ticket");
     service.poll_gpu(Instant::now()).unwrap();
     assert_eq!(service.pending_batches().len(), 0);
 }
@@ -1843,27 +2161,34 @@ fn c0_2ci_progress_no_composition() {
     let key = held.key();
     let gpu = service.register(key, ObligationKind::Gpu).unwrap();
 
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
-        vec![(key, gpu)],
-        ticket.clone(),
-    ));
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(vec![(key, gpu)], ticket));
+    batch.test_ticket_status = Some(Ok(false));
     service.register_batch(batch);
 
     // Active seat with unsignaled ticket: schedules a future deadline (~1ms)
     assert!(service.next_deadline().is_some());
 
-    // Seat inactive (VT-away / DPMS-off): pauses deadline
+    // M-16: seat inactive (VT-away / DPMS-off) pauses the serviced-time
+    // *budget*, not progress -- a real submission can still complete while
+    // the display is dark, and the core loop must keep polling for it or it
+    // is never observed until an unrelated fd happens to wake the loop. The
+    // pre-fix behaviour returned `None` here (conflating "don't count this
+    // time" with "don't look"); the deadline must still be scheduled.
     service.set_seat_active(false, Instant::now());
-    assert!(service.next_deadline().is_none());
+    assert!(
+        service.next_deadline().is_some(),
+        "a pending ticket must still be polled while the seat is inactive (M-16)"
+    );
 
     // Seat returns active
     service.set_seat_active(true, Instant::now());
     assert!(service.next_deadline().is_some());
 
     // Signal the ticket
-    ticket.test_signal();
+    service.pending_batches_mut()[0].test_ticket_status = Some(Ok(true));
 
     // Service completions runs outside composition, allocation completes
     let ready = service.service_completions(Instant::now()).unwrap();
@@ -1881,7 +2206,8 @@ fn c0_2ci_progress_no_composition() {
             .unwrap();
         (held, drops)
     };
-    let mut batch2 = CoreRetirementBatch::new(vec![held2], vec![0], true);
+    let mut batch2 =
+        CoreRetirementBatch::new(vec![held2], vec![vk::DescriptorSet::from_raw(0)], true);
     batch2.bind_ticket(GpuObligation::for_tests_stub(
         vec![],
         crate::kms::render::platform::FenceTicket::for_tests_stub(),
@@ -1897,22 +2223,26 @@ fn c0_2ci_progress_no_composition() {
     assert!(service.next_deadline().is_none());
 }
 
+fn unsignaled_batch(service: &mut ResourceService, held: AllocationLease) {
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_stub();
+    let mut batch =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(vec![(key, gpu)], ticket));
+    batch.test_ticket_status = Some(Ok(false));
+    service.register_batch(batch);
+}
+
 #[test]
 fn c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires() {
     let (mut service, held, drops) = spy_service();
-    let key = held.key();
-    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
-
-    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
-    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
-    batch.bind_ticket(GpuObligation::for_tests_stub(
-        vec![(key, gpu)],
-        ticket.clone(),
-    ));
-    service.register_batch(batch);
 
     let base = Instant::now();
+    // Set the budget BEFORE registering (B-11: the deadline is stamped at
+    // registration from whatever `max_serviced_duration` is then).
     service.max_serviced_duration = std::time::Duration::from_millis(50);
+    unsignaled_batch(&mut service, held);
 
     // Seat goes inactive (VT-away) for 500ms
     service.set_seat_active(false, base);
@@ -1929,6 +2259,108 @@ fn c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires() {
     assert_eq!(exp, Err(ResourceError::Frozen));
     assert_eq!(service.quarantined_batches().len(), 1);
     assert_eq!(service.pending_batches().len(), 0);
+    // B-11: expiry never flips a service-wide `exhausted` -- new admission
+    // must still work after this batch's own deadline passed.
+    assert!(!service.is_exhausted());
+}
+
+/// B-11 decisive test: two batches registered at different points on the
+/// serviced-time timeline expire independently -- each carries its OWN
+/// deadline from its OWN registration, never a single global accumulator
+/// compared against one shared threshold (which would expire every pending
+/// batch in the service at once, regardless of when each actually
+/// registered). Mutation check: replacing the per-batch deadline with the
+/// pre-fix global `serviced_elapsed >= max_serviced_duration` check makes
+/// batch 2 expire alongside batch 1 at t=55ms, failing this test.
+#[test]
+fn c0_2ci_serviced_deadline_is_per_batch_not_global() {
+    let (mut service, held_a, drops_a) = spy_service();
+    let drops_b = Rc::new(Cell::new(0));
+    let held_b = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_b),
+        }))
+        .unwrap();
+
+    let base = Instant::now();
+    service.max_serviced_duration = std::time::Duration::from_millis(50);
+
+    // Batch 1 registers at serviced_elapsed = 0 -> deadline = 50ms.
+    unsignaled_batch(&mut service, held_a);
+
+    // Prime `last_serviced` at t=base (no prior sample to diff against yet,
+    // so this call itself must not advance `serviced_elapsed`).
+    let _ = service.service_completions(base);
+    assert_eq!(service.pending_batches().len(), 1);
+
+    // Advance serviced time by 40ms (batch 1 not yet expired: 40 < 50).
+    let _ = service.service_completions(base + std::time::Duration::from_millis(40));
+    assert_eq!(service.pending_batches().len(), 1);
+    assert_eq!(service.quarantined_batches().len(), 0);
+
+    // Batch 2 registers now, at serviced_elapsed = 40ms -> deadline = 90ms.
+    unsignaled_batch(&mut service, held_b);
+    assert_eq!(service.pending_batches().len(), 2);
+
+    // Advance cumulative serviced time to 55ms: batch 1's 50ms deadline has
+    // passed, batch 2's 90ms deadline has not.
+    let result = service.service_completions(base + std::time::Duration::from_millis(55));
+    assert_eq!(result, Err(ResourceError::Frozen));
+    assert_eq!(
+        service.pending_batches().len(),
+        1,
+        "only batch 2 should remain pending"
+    );
+    assert_eq!(
+        service.quarantined_batches().len(),
+        1,
+        "only batch 1 should have expired"
+    );
+    assert_eq!(drops_a.get(), 0, "quarantine does not drop the allocation");
+    assert_eq!(drops_b.get(), 0);
+    assert!(
+        !service.is_exhausted(),
+        "one batch's expiry must never flip a service-wide exhausted flag"
+    );
+
+    // Advance to 95ms cumulative: batch 2's 90ms deadline has now passed.
+    let result2 = service.service_completions(base + std::time::Duration::from_millis(95));
+    assert_eq!(result2, Err(ResourceError::Frozen));
+    assert_eq!(service.pending_batches().len(), 0);
+    assert_eq!(service.quarantined_batches().len(), 2);
+    assert!(!service.is_exhausted());
+}
+
+/// B-11 decisive test: a batch registered only after 5s of PRIOR service
+/// (some other batch/servicing already consumed that serviced time) is not
+/// expired on its first poll -- its deadline is relative to its OWN
+/// registration, not to when the service started running. Mutation check:
+/// comparing against the pre-fix `serviced_elapsed >= max_serviced_duration`
+/// (a single global counter never reset per batch) would expire this batch
+/// immediately, since `serviced_elapsed` is already past `max_serviced_duration`
+/// by the time it registers.
+#[test]
+fn c0_2ci_serviced_deadline_not_expired_on_first_poll_after_prior_service() {
+    let (mut service, held, drops) = spy_service();
+    let base = Instant::now();
+
+    // Run 5s of prior serviced time with nothing pending.
+    let _ = service.service_completions(base);
+    let _ = service.service_completions(base + std::time::Duration::from_secs(5));
+
+    // Now register a batch; its deadline is 5s (elapsed so far) + 5s
+    // (default max_serviced_duration) = 10s, not `max_serviced_duration`
+    // measured from zero.
+    unsignaled_batch(&mut service, held);
+
+    // First poll, barely after registration: must not be expired.
+    let result = service.service_completions(
+        base + std::time::Duration::from_secs(5) + std::time::Duration::from_millis(1),
+    );
+    assert!(result.is_ok());
+    assert_eq!(service.pending_batches().len(), 1);
+    assert_eq!(service.quarantined_batches().len(), 0);
+    assert_eq!(drops.get(), 0);
 }
 
 #[test]
@@ -1968,6 +2400,18 @@ fn c0_2ci_completion_waiter_registration_and_recheck() {
     assert!(wakes.contains(&ResourceConsumer::DirectCapacity));
 }
 
+/// M-14: a real-shaped `LegacyDrained` proof for `issue_handover_permit`,
+/// matching `incarnation` the way the backend's genuine
+/// `issue_legacy_drained` output would.
+fn legacy_drained_for_tests(
+    incarnation: IncarnationId,
+) -> crate::kms::render::platform::LegacyDrained {
+    crate::kms::render::platform::LegacyDrained {
+        incarnation,
+        lifecycle: LifecycleEpochId::first(),
+    }
+}
+
 #[test]
 fn c0_2ci_transport_gate_vocabulary_and_table() {
     let device = DrmDeviceKey {
@@ -1975,7 +2419,11 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
         minor: 0,
     };
     let incarnation = IncarnationId::first();
-    let mut gate = TransportGate::new_legacy(device, incarnation);
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
 
     // 1. In Legacy: all classes allowed
     for class in [
@@ -2012,6 +2460,8 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
     // 3. In test-only Owner: all classes false
     let permit = gate
         .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
             &WriterCoverageProof::new_for_tests(),
             RecipientReservation::new_for_tests(),
         )
@@ -2033,7 +2483,7 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
     }
 
     // 4. In Closed: all classes false
-    gate.close();
+    gate.close().unwrap();
     assert_eq!(gate.state(), TransportState::Closed);
     for class in [
         WriterClass::Primary,
@@ -2053,6 +2503,16 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
     assert_eq!(gate.begin_quiescing(), Err(ResourceError::Detached));
 }
 
+/// M-13 decisive test: `begin_quiescing`'s Busy precondition reads the real
+/// direct-ownership/unflip state through the `DirectOwnershipState` trait
+/// supplied at construction, not a setter on the gate itself (there is no
+/// `set_direct_scanout_active`/`set_unflip_pending` on `TransportGate` any
+/// more). The fake records every query it was asked, so this test also
+/// proves the gate consults live state on each call rather than a value
+/// cached once. Mutation check: reverting to the pre-fix free-floating
+/// setters would still pass the busy/unblocked assertions below by
+/// construction, but the `busy_query_count`/`unflip_query_count`
+/// assertions would fail (nothing on the gate would ever call them).
 #[test]
 fn c0_2ci_transport_gate_direct_scanout_precondition() {
     let device = DrmDeviceKey {
@@ -2060,23 +2520,31 @@ fn c0_2ci_transport_gate_direct_scanout_precondition() {
         minor: 0,
     };
     let incarnation = IncarnationId::first();
-    let mut gate = TransportGate::new_legacy(device, incarnation);
+    let ownership = FakeDirectOwnershipState::new();
+    let mut gate = TransportGate::new_legacy(device, incarnation, Box::new(ownership.clone()));
 
     // Active direct scanout blocks quiescing
-    gate.set_direct_scanout_active(true);
+    ownership.set_busy(true);
     assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
     assert_eq!(gate.state(), TransportState::Legacy);
 
-    gate.set_direct_scanout_active(false);
+    ownership.set_busy(false);
     // Pending unflip blocks quiescing
-    gate.set_unflip_pending(true);
+    ownership.set_unflip_outstanding(true);
     assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
     assert_eq!(gate.state(), TransportState::Legacy);
 
     // After unflip retires, begin_quiescing succeeds
-    gate.set_unflip_pending(false);
+    ownership.set_unflip_outstanding(false);
     assert!(gate.begin_quiescing().is_ok());
     assert_eq!(gate.state(), TransportState::Quiescing);
+
+    // The gate asked the real state on every attempt (3 calls to
+    // begin_quiescing above; `direct_ownership_busy` is queried every call,
+    // `unflip_outstanding` on every call where busy was already false since
+    // `||` short-circuits), never a cached value.
+    assert!(ownership.busy_query_count() >= 3);
+    assert!(ownership.unflip_query_count() >= 2);
 }
 
 #[test]
@@ -2090,7 +2558,11 @@ fn c0_2ci_transport_gate_owner_write_contract() {
         minor: 1,
     };
     let incarnation = IncarnationId::first();
-    let mut gate = TransportGate::new_legacy(device, incarnation);
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
 
     // Legacy cannot authorize owner write
     assert_eq!(
@@ -2102,6 +2574,8 @@ fn c0_2ci_transport_gate_owner_write_contract() {
     gate.begin_quiescing().unwrap();
     let permit = gate
         .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
             &WriterCoverageProof::new_for_tests(),
             RecipientReservation::new_for_tests(),
         )
@@ -2138,10 +2612,16 @@ fn c0_2ci_transport_gate_owner_write_contract() {
     assert_eq!(gate.state(), TransportState::Closed);
 
     // 3. Test dropped grant leaves charge and closes admission
-    let mut gate2 = TransportGate::new_legacy(device, incarnation);
+    let mut gate2 = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
     gate2.begin_quiescing().unwrap();
     let permit2 = gate2
         .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
             &WriterCoverageProof::new_for_tests(),
             RecipientReservation::new_for_tests(),
         )
@@ -2162,46 +2642,487 @@ fn c0_2ci_transport_gate_owner_write_contract() {
         ResourceError::Detached
     );
 
-    // Outstanding writes block begin_quiescing, close, handover
+    // M-14: outstanding writes block begin_quiescing AND close.
     assert_eq!(gate2.begin_quiescing(), Err(ResourceError::Busy));
+    assert_eq!(gate2.close(), Err(ResourceError::Busy));
+    assert_eq!(
+        gate2.state(),
+        TransportState::Owner,
+        "a refused close must not change state"
+    );
 
     // revoke_owner_writes clears the charge and restores admission
     let revoked = gate2.revoke_owner_writes();
     assert_eq!(revoked, 1);
     assert_eq!(gate2.outstanding_owner_writes(), 0);
-    assert!(gate2.authorize_owner_write(WriterClass::Cursor).is_ok());
+    let grant3 = gate2.authorize_owner_write(WriterClass::Cursor).unwrap();
+    // Consuming it (rather than dropping it) leaves nothing outstanding, so
+    // close() succeeds.
+    gate2.consume_owner_write(grant3).unwrap();
+    assert_eq!(gate2.outstanding_owner_writes(), 0);
+    assert!(gate2.close().is_ok());
+    assert_eq!(gate2.state(), TransportState::Closed);
 }
 
+/// Minor (round-1 review) decisive test: `consume_owner_write`'s
+/// bookkeeping used `if outstanding_owner_writes > 0 { -= 1 }`, which
+/// silently does nothing -- instead of surfacing a bug -- when a serial is
+/// legitimately consumed but the counter has already desynced from
+/// `issued_serials`. That desync cannot happen through the normal
+/// `authorize_owner_write`/`consume_owner_write` pairing, so this test
+/// forces it with the test-only `set_outstanding_owner_writes_for_tests`
+/// backdoor. Mutation check: reverting to the pre-fix
+/// `if outstanding_owner_writes > 0 { -= 1 }` makes this test fail (it
+/// would return `Ok(())` instead of `Err((InvalidState, _))`).
 #[test]
-fn c0_2ci_transport_gate_writer_boundary_enforcement() {
-    let device_a = DrmDeviceKey {
+fn c0_2ci_transport_gate_consume_owner_write_checked_subtraction() {
+    let device = DrmDeviceKey {
         major: 226,
         minor: 0,
     };
-    let device_b = DrmDeviceKey {
+    let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
+
+    let grant = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    // Force the desync: the serial above is legitimately issued and about
+    // to be legitimately consumed, but the counter is already at 0.
+    gate.set_outstanding_owner_writes_for_tests(0);
+
+    let (err, returned_grant) = gate.consume_owner_write(grant).unwrap_err();
+    assert_eq!(err, ResourceError::InvalidState);
+    drop(returned_grant);
+    // The counter never wrapped around to `usize::MAX`.
+    assert_eq!(gate.outstanding_owner_writes(), 0);
+}
+
+/// M-14 decisive test: `close()` refuses while a grant is outstanding and
+/// succeeds once the charge is actually resolved (consumed or revoked).
+/// Mutation check: reverting `close()` to unconditionally set `Closed`
+/// (its pre-fix shape) makes the first assertion below fail.
+#[test]
+fn c0_2ci_transport_gate_close_refuses_outstanding_grants() {
+    let device = DrmDeviceKey {
         major: 226,
-        minor: 1,
+        minor: 0,
     };
     let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
 
-    let mut platform = crate::kms::render::platform::PlatformBackend::for_tests();
-    // Default without gate: allows legacy
-    assert!(platform.allows_legacy(&device_a, WriterClass::Primary));
-    assert!(platform.allows_legacy(&device_b, WriterClass::Primary));
+    let grant = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    assert_eq!(gate.outstanding_owner_writes(), 1);
 
-    // Install gate on device_a and quiesce
-    let mut gate_a = TransportGate::new_legacy(device_a, incarnation);
-    gate_a.begin_quiescing().unwrap();
-    platform.install_transport_gate(gate_a);
+    // Refuses while the grant is outstanding, and does not change state.
+    assert_eq!(gate.close(), Err(ResourceError::Busy));
+    assert_eq!(gate.state(), TransportState::Owner);
 
-    // device_a is now blocked for all legacy writes
-    assert!(!platform.allows_legacy(&device_a, WriterClass::Primary));
-    assert!(!platform.allows_legacy(&device_a, WriterClass::Modeset));
-    assert!(!platform.allows_legacy(&device_a, WriterClass::Cursor));
+    // Consuming the grant clears the charge; close now succeeds.
+    gate.consume_owner_write(grant).unwrap();
+    assert_eq!(gate.outstanding_owner_writes(), 0);
+    assert!(gate.close().is_ok());
+    assert_eq!(gate.state(), TransportState::Closed);
+}
 
-    // Unrelated device_b remains unchanged (allows legacy)
-    assert!(platform.allows_legacy(&device_b, WriterClass::Primary));
-    assert!(platform.allows_legacy(&device_b, WriterClass::Modeset));
+/// M-14 decisive test: `issue_handover_permit` refuses a `LegacyDrained`
+/// proof for a foreign incarnation, and refuses when the final drain
+/// dispositions include a backend failure -- it no longer accepts whatever
+/// the caller claims (R9: proofs are never fabricated). Mutation check:
+/// dropping either check makes the corresponding assertion below fail.
+#[test]
+fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
+    use crate::kms::render::backend::{LegacyEventCancellation, LegacyEventDisposition};
+
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let foreign_incarnation = IncarnationId::from_raw(incarnation.get() + 1);
+
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+
+    // Foreign incarnation's proof is refused.
+    let err = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(foreign_incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap_err();
+    assert_eq!(err, ResourceError::WrongIncarnation);
+    assert_eq!(
+        gate.state(),
+        TransportState::Quiescing,
+        "a refused permit must not change state"
+    );
+
+    // A backend failure among the final dispositions is refused too.
+    let err2 = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[LegacyEventDisposition::Cancelled(
+                LegacyEventCancellation::BackendFailure,
+            )],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap_err();
+    assert_eq!(err2, ResourceError::InvalidProof);
+
+    // The real proof with only non-failure dispositions succeeds.
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[LegacyEventDisposition::Applied],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    assert!(gate.publish_owner(permit).is_ok());
+}
+
+// B-10/R11 (F-5b): `c0_2ci_transport_gate_writer_boundary_enforcement` stood
+// here -- it drove no entry point, asserted `allows_legacy` directly, and
+// its device-B "unrelated device unaffected" claim proved nothing about any
+// real sink. Deleted per the fix handoff; the real per-sink tests
+// (`c0_2ci_sink_*`) beneath the real entry points replace it.
+
+/// B-10/R11: a `TransportGate` for `device`/`incarnation`, driven all the
+/// way to `Owner` (Legacy -> Quiescing -> handover -> publish), for tests
+/// that need to mint a real `OwnerWriteGrant` matching a specific device/
+/// incarnation identity.
+fn owner_gate_for_tests(device: DrmDeviceKey, incarnation: IncarnationId) -> TransportGate {
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
+    gate
+}
+
+/// B-10/R11: a `TransportGate` at `target`, independent of any
+/// `PlatformBackend`. The five `crate::drm::{page_flip,modeset}` sinks
+/// below take a plain `legacy_write_permitted: bool` rather than the gate
+/// itself (R8: no production issuer of `OwnerWriteGrant` exists for these
+/// classes in this stage -- only the executor's "helper mutation" sink,
+/// tested separately, actually consumes a grant), so the gate's own
+/// device/incarnation identity never has to match anything; only
+/// `allows_legacy(class)` -- which is state-only -- is read from it.
+fn sink_gate_at_state(target: TransportState) -> TransportGate {
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    if target == TransportState::Legacy {
+        return gate;
+    }
+    gate.begin_quiescing().unwrap();
+    if target == TransportState::Quiescing {
+        return gate;
+    }
+    if target == TransportState::Owner {
+        let permit = gate
+            .issue_handover_permit(
+                legacy_drained_for_tests(incarnation),
+                &[],
+                &WriterCoverageProof::new_for_tests(),
+                RecipientReservation::new_for_tests(),
+            )
+            .unwrap();
+        gate.publish_owner(permit).unwrap();
+        return gate;
+    }
+    debug_assert_eq!(target, TransportState::Closed);
+    gate.close().unwrap();
+    gate
+}
+
+/// B-10/R11, 6.5a/6.5b: drives `sink` (a real `crate::drm` entry point,
+/// wrapped so every call site here shares one shape) through all four gate
+/// states and asserts the ioctl was reached (real device fd error,
+/// `raw_os_error().is_some()`, since `PlatformBackend::for_tests()`'s
+/// device is a `UnixStream`, not a DRM node) iff the state is `Legacy`.
+/// Mutation check (performed for `disable_output`, representative of all
+/// five): deleting the sink's `if !legacy_write_permitted { return ... }`
+/// makes the non-Legacy assertions fail (`raw_os_error()` becomes `Some`
+/// there too, since the call falls through to the real ioctl).
+fn assert_sink_gated_four_states(
+    class: WriterClass,
+    mut sink: impl FnMut(bool) -> std::io::Result<()>,
+) {
+    for state in [
+        TransportState::Legacy,
+        TransportState::Quiescing,
+        TransportState::Owner,
+        TransportState::Closed,
+    ] {
+        let gate = sink_gate_at_state(state);
+        let permitted = gate.allows_legacy(class);
+        let err = sink(permitted).expect_err("Device::for_tests() never succeeds a real commit");
+        let reached_ioctl = err.raw_os_error().is_some();
+        assert_eq!(
+            reached_ioctl,
+            state == TransportState::Legacy,
+            "state={state:?} class={class:?} permitted={permitted} err={err}",
+        );
+    }
+}
+
+#[test]
+fn c0_2ci_sink_legacy_page_flip_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    assert_sink_gated_four_states(WriterClass::Primary, |permitted| {
+        let mut out_fence = -1;
+        crate::drm::page_flip::submit_flip_with_fences(
+            &device,
+            output,
+            fb,
+            -1,
+            &mut out_fence,
+            permitted,
+        )
+    });
+}
+
+#[test]
+fn c0_2ci_sink_direct_atomic_flip_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    let plane_states = [crate::drm::modeset::DirectScanoutPlaneState {
+        output,
+        src_x: 0,
+        src_y: 0,
+        src_w: 800,
+        src_h: 600,
+    }];
+    assert_sink_gated_four_states(WriterClass::Primary, |permitted| {
+        crate::drm::modeset::submit_direct_scanout(&device, fb, &plane_states, permitted)
+    });
+}
+
+#[test]
+fn c0_2ci_sink_composed_unflip_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    let planes = [crate::drm::modeset::ComposedScanoutPlaneState { output, fb }];
+    assert_sink_gated_four_states(WriterClass::Unflip, |permitted| {
+        crate::drm::modeset::submit_composed_scanout(&device, &planes, permitted)
+    });
+}
+
+#[test]
+fn c0_2ci_sink_modeset_install_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    assert_sink_gated_four_states(WriterClass::Modeset, |permitted| {
+        crate::drm::modeset::commit_modeset(&device, output, fb, permitted)
+    });
+}
+
+#[test]
+fn c0_2ci_sink_output_disable_gate_four_states() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    assert_sink_gated_four_states(WriterClass::Modeset, |permitted| {
+        crate::drm::modeset::disable_output(&device, output, permitted)
+    });
+}
+
+/// B-10/R11 (helper mutation): unlike the five DRM sinks above, this sink
+/// is the one this stage actually wires an `OwnerWriteGrant` through --
+/// `KmsIoExecutor::send_authorized`, called via the private
+/// `pub(crate)` wrapper because its signature names the `pub(crate)`
+/// `TransportGate`/`OwnerWriteGrant` types (the public `send`/
+/// `dispatch_blocking_at_boundary` always pass `None`, so no production or
+/// external caller changed shape). Drives the real function four ways
+/// through a real spawned helper subprocess, observing "was the request
+/// actually put on the wire" via `poll_reply()` (a refused
+/// `send_authorized` never touches `in_flight`, so `poll_reply()` returns
+/// `None` immediately -- see `KmsIoExecutor::poll_reply`, line ~865: `let
+/// in_flight = self.in_flight.as_ref()?;`) versus a real accepted outcome
+/// from the helper. Mutation checks: (1) deleting the `authorize_write`
+/// call in `send_authorized` makes the Quiescing case actually dispatch
+/// (`poll_reply()` stops returning `None`); (2) making
+/// `consume_owner_write` not consume (e.g. skip `grant.consumed.set(true)`)
+/// makes the Owner-with-matching-grant case's
+/// `outstanding_owner_writes() == 0` assertion fail.
+#[test]
+fn c0_2ci_sink_helper_mutation_gate_four_way() {
+    use crate::kms::executor::{
+        HostCallReservation, SendError, SubmittingProof,
+        test_support::{self, ScriptedReply},
+    };
+
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let request = test_support::small_atomic_request_for_tests();
+    let reservation = || HostCallReservation::Submitting(SubmittingProof::for_tests());
+
+    // 1. Legacy: `owner_write = None` (what every real call site passes,
+    // R8) -- permitted, the real helper subprocess actually processes it.
+    let mut executor =
+        test_support::spawn_scripted_helper_for_tests(ScriptedReply::Accepted { mask: 0, fds: 0 });
+    executor
+        .send_authorized(&request, reservation(), None)
+        .expect("Legacy (no gate) permits");
+    test_support::wait_readable(
+        executor.control_fd().expect("fd"),
+        std::time::Duration::from_secs(30),
+    );
+    match executor.poll_reply().expect("the real helper replied") {
+        crate::kms::executor::HostCallEvent::Outcome { outcome, .. } => {
+            assert!(
+                matches!(
+                    outcome,
+                    crate::kms::executor::HostCallOutcome::Accepted { .. }
+                ),
+                "expected the real helper to have processed the request: {outcome:?}"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // 2. Quiescing: refused before the wire -- the helper never sees it.
+    let mut executor =
+        test_support::spawn_scripted_helper_for_tests(ScriptedReply::Accepted { mask: 0, fds: 0 });
+    let mut gate = TransportGate::new_legacy(
+        device,
+        incarnation,
+        Box::new(FakeDirectOwnershipState::new()),
+    );
+    gate.begin_quiescing().unwrap();
+    let dummy_grant =
+        OwnerWriteGrant::reconstruct_for_tests(device, incarnation, WriterClass::HelperMutation, 1);
+    let err = executor
+        .send_authorized(&request, reservation(), Some((&mut gate, dummy_grant)))
+        .unwrap_err();
+    assert_eq!(err, SendError::TransportGateRefused);
+    assert!(
+        executor.poll_reply().is_none(),
+        "a refused send must never have touched `in_flight`"
+    );
+
+    // 3. Owner + matching grant: permitted, and the grant is consumed at
+    // this exact send boundary (R7).
+    let mut executor =
+        test_support::spawn_scripted_helper_for_tests(ScriptedReply::Accepted { mask: 0, fds: 0 });
+    let mut gate = owner_gate_for_tests(device, incarnation);
+    let grant = gate
+        .authorize_owner_write(WriterClass::HelperMutation)
+        .unwrap();
+    assert_eq!(gate.outstanding_owner_writes(), 1);
+    executor
+        .send_authorized(&request, reservation(), Some((&mut gate, grant)))
+        .expect("Owner + matching grant permits");
+    assert_eq!(
+        gate.outstanding_owner_writes(),
+        0,
+        "the grant must be consumed at send, not merely authorized"
+    );
+    test_support::wait_readable(
+        executor.control_fd().expect("fd"),
+        std::time::Duration::from_secs(30),
+    );
+    match executor.poll_reply().expect("the real helper replied") {
+        crate::kms::executor::HostCallEvent::Outcome { outcome, .. } => {
+            assert!(
+                matches!(
+                    outcome,
+                    crate::kms::executor::HostCallOutcome::Accepted { .. }
+                ),
+                "expected the real helper to have processed the request: {outcome:?}"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // 4. Owner + a grant of the wrong class ("without [a valid] grant" for
+    // this class): refused, not consumed -- and per the lost-role-token
+    // rule, dropping the unconsumed grant closes admission.
+    let mut executor =
+        test_support::spawn_scripted_helper_for_tests(ScriptedReply::Accepted { mask: 0, fds: 0 });
+    let mut gate = owner_gate_for_tests(device, incarnation);
+    let wrong_class_grant = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    let err = executor
+        .send_authorized(
+            &request,
+            reservation(),
+            Some((&mut gate, wrong_class_grant)),
+        )
+        .unwrap_err();
+    assert_eq!(err, SendError::TransportGateRefused);
+    assert!(
+        executor.poll_reply().is_none(),
+        "a refused send must never have touched `in_flight`"
+    );
+    assert_eq!(
+        gate.authorize_owner_write(WriterClass::HelperMutation)
+            .unwrap_err(),
+        ResourceError::Detached,
+        "the dropped, unconsumed grant must have closed admission"
+    );
 }
 
 struct TestFenceQuery<F>(F);

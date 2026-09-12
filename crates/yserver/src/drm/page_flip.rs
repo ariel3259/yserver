@@ -125,13 +125,21 @@ pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle)
 /// commit (rc=0). On `-EBUSY` (or any other error) the caller still
 /// owns the fd and must close it. `out_fence_holder` is written with
 /// the new fence fd that the caller owns.
+///
+/// B-10/R11: `legacy_write_permitted` is the transport gate's answer for
+/// `WriterClass::Primary` on this device, checked immediately before the
+/// atomic commit below -- see `crate::drm::transport_gate_refusal`.
 pub fn submit_flip_with_fences(
     device: &Device,
     output: &Output,
     fb_id: framebuffer::Handle,
     in_fence_fd: i32,
     out_fence_holder: &mut i32,
+    legacy_write_permitted: bool,
 ) -> io::Result<()> {
+    if !legacy_write_permitted {
+        return Err(crate::drm::transport_gate_refusal("page-flip"));
+    }
     submit_flip_inner(
         device,
         output,

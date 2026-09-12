@@ -226,6 +226,73 @@ where
     result
 }
 
+/// Non-blocking counterpart to [`run_one_shot_op`] (Task 5, B-15): allocates
+/// a one-shot primary CB, records `record`, and submits it signalling
+/// `ticket`'s own fence -- then returns immediately without waiting. The
+/// caller polls `ticket` (`FenceTicket::poll_signaled_result`) for the real
+/// completion status; this exists so a `GpuObligation`'s ticket reflects
+/// genuine driver state instead of a test-injected signal (R9: proofs are
+/// never fabricated).
+///
+/// The allocated CB is intentionally never freed here: freeing a CB while
+/// it may still be executing is invalid usage (mirrors path 2 of
+/// [`run_one_shot_op_with_wait`]'s taxonomy, except here "in flight" is the
+/// *expected* return state, not a failure). `pool`'s owner is responsible
+/// for the CB's eventual lifetime, exactly as it already is for every other
+/// CB allocated from it; `OpsCommandPool::drop` waits the queue idle before
+/// destroying the pool (and, transitively, every CB allocated from it).
+///
+/// `#[allow(dead_code)]`: R8 -- no production wiring yet (5.3/5.5 remain
+/// unimplemented), only the `#[cfg(test)]`
+/// `c0_2ci_read_source_scratch_regression_vulkan` calls this, so a plain
+/// (non-test) build sees it as unused.
+#[allow(dead_code)]
+pub(crate) fn submit_one_shot_op_async<F>(
+    vk: &VkContext,
+    pool: vk::CommandPool,
+    ticket: &crate::kms::render::platform::FenceTicket,
+    record: F,
+) -> Result<(), vk::Result>
+where
+    F: FnOnce(&VkContext, vk::CommandBuffer) -> Result<(), vk::Result>,
+{
+    let alloc_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let cb = unsafe { vk.device.allocate_command_buffers(&alloc_info)?[0] };
+
+    let begin =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    let recorded = (|| -> Result<(), vk::Result> {
+        crate::vk_count!(begin_command_buffer);
+        unsafe { vk.device.begin_command_buffer(cb, &begin)? };
+        record(vk, cb)?;
+        crate::vk_count!(end_command_buffer);
+        unsafe { vk.device.end_command_buffer(cb)? };
+        Ok(())
+    })();
+    if let Err(e) = recorded {
+        // Pre-submit failure: the CB was never queued, so freeing it here is
+        // safe (mirrors paths 0a-0c above).
+        unsafe { vk.device.free_command_buffers(pool, &[cb]) };
+        return Err(e);
+    }
+
+    let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+    let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
+    crate::vk_count!(queue_submit2);
+    if let Err(e) = unsafe {
+        vk.device
+            .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
+    } {
+        // Never queued: safe to free.
+        unsafe { vk.device.free_command_buffers(pool, &[cb]) };
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Host-mapped, growable staging buffer used by image-transfer ops
 /// (`PutImage`, `GetImage`, `MitShmPutImage`, `MitShmGetImage`,
 /// `MitShmCreatePixmap`). One per backend, reused across ops.

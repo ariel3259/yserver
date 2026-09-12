@@ -219,16 +219,25 @@ impl HandoffRouter {
     }
 }
 
+// B-6: `RetainingSupervisor` is a test fixture (the plan's own words) --
+// `reserve_slot` below is the production code that needed
+// `RecipientReservation::new_for_tests` to be reachable outside
+// `#[cfg(test)]`, which was the actual bug (R8: no production
+// `RecipientReservation`). The fixture, not the constructor, moves under
+// `#[cfg(test)]`.
+#[cfg(test)]
 pub(crate) struct RetainingSupervisor {
     pub(crate) router: HandoffRouter,
 }
 
+#[cfg(test)]
 impl Default for RetainingSupervisor {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl RetainingSupervisor {
     pub(crate) fn new() -> Self {
         Self {

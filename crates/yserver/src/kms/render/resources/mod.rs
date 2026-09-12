@@ -41,12 +41,19 @@ pub(crate) use drm_cleanup::{
     FamilyInventory, FileFamilyClosed, GemOwner, RightState,
 };
 #[allow(unused_imports)]
-pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation, ValidatedGpuBatch};
+use gpu::ValidatedGpuBatch;
+#[allow(unused_imports)]
+pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation};
 #[allow(unused_imports)]
 pub(crate) use handoff::{
     CompletionIngress, DeviceBarrier, HandoffRouter, IncarnationBundle, KmsDisposition,
-    RecipientSlot, RetainingSupervisor, TeardownRelease,
+    RecipientSlot, TeardownRelease,
 };
+// B-6: `RetainingSupervisor` is a test fixture (handoff.rs) -- only visible
+// under `#[cfg(test)]`, same as everything that constructs one.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use handoff::RetainingSupervisor;
 pub(crate) use lease::AllocationLease;
 #[allow(unused_imports)]
 pub use present::{CompletionDisposition, PresentDisposition, PresentKey, ReleaseDisposition};
@@ -58,10 +65,13 @@ pub(crate) use scanout::{
 pub(crate) use storage::{
     PixelIdentity, StorageAccessError, StorageAllocation, StorageBacking, StorageLease,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use transport::FakeDirectOwnershipState;
 #[allow(unused_imports)]
 pub(crate) use transport::{
-    HandoverPermit, OwnerWriteGrant, RecipientReservation, TransportGate, TransportState,
-    WriterClass, WriterCoverageProof,
+    DirectOwnershipState, HandoverPermit, OwnerWriteGrant, RecipientReservation, TransportGate,
+    TransportState, WriterClass, WriterCoverageProof,
 };
 
 #[allow(dead_code, clippy::large_enum_variant)]
@@ -75,6 +85,49 @@ pub(crate) enum AllocationPayload {
     CopiedSource(scanout::CopiedSourceAllocation),
     #[doc(hidden)]
     Unused(std::convert::Infallible),
+}
+
+impl AllocationPayload {
+    /// True when this payload still holds a counted alias of the DRM open
+    /// file description that must go through the registry -- a real
+    /// barrier discharge or the normal per-payload path -- rather than an
+    /// ordinary Rust `Drop` (F2-M1): `Scanout` with `file_owned: Some`, or
+    /// `DirectFramebuffer` with its right/device not yet discharged. Every
+    /// payload kind that can carry this alias must be listed here; `adopt`,
+    /// `service_ready`/`service_ready_with_registry` and
+    /// `apply_teardown_release` all key off this one method so a new kind
+    /// cannot silently reopen the hole "additive" left for
+    /// `DirectFramebuffer` the first time (F2-M1).
+    pub(crate) fn file_owned_alias_present(&self) -> bool {
+        match self {
+            AllocationPayload::Scanout(alloc) => alloc.file_owned().is_some(),
+            AllocationPayload::DirectFramebuffer(alloc) => {
+                alloc.right().is_some() || alloc.device.is_some()
+            }
+            #[cfg(test)]
+            AllocationPayload::Spy(_) => false,
+            AllocationPayload::Storage(_) | AllocationPayload::CopiedSource(_) => false,
+            AllocationPayload::Unused(never) => match *never {},
+        }
+    }
+
+    /// Discharges the file-owned half through `registry`, for whichever
+    /// payload kind carries one; a no-op `Ok(())` for the rest. The single
+    /// dispatch point `service_ready_with_registry` calls, so a new
+    /// file-owned-carrying kind only needs its arm added here.
+    pub(crate) fn discharge_file_owned(
+        &mut self,
+        registry: &mut DrmCleanupRegistry,
+    ) -> Result<(), std::io::Error> {
+        match self {
+            AllocationPayload::Scanout(alloc) => alloc.discharge_file_owned(registry),
+            AllocationPayload::DirectFramebuffer(alloc) => alloc.discharge_file_owned(registry),
+            #[cfg(test)]
+            AllocationPayload::Spy(_) => Ok(()),
+            AllocationPayload::Storage(_) | AllocationPayload::CopiedSource(_) => Ok(()),
+            AllocationPayload::Unused(never) => match *never {},
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -183,8 +236,22 @@ impl ResourceService {
         &mut self.waiters
     }
 
+    /// M-16: progress (polling an already-signalled ticket) is never
+    /// suppressed by seat inactivity -- only the serviced-time *budget*
+    /// pauses (`service_completions` below gates its `serviced_elapsed`
+    /// advance on `seat_active`). A pending batch's deadline is therefore
+    /// returned regardless of `seat_active`: without it, `next_wakeup`
+    /// (which chains this unconditionally) would return `None` while
+    /// VT-away/DPMS-off with nothing else pending, and the core loop could
+    /// block in `poll()` with no timeout -- so a ticket that signals during
+    /// that window is never observed until an unrelated fd wakes the loop.
+    /// The pre-fix behaviour (`None` while inactive) is exactly the defect:
+    /// it conflated "don't count this time toward the expiry budget" with
+    /// "don't bother looking again," which are different things (R9: the
+    /// pending deadline counts serviced time and pauses while the seat is
+    /// inactive -- servicing itself does not).
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        if self.pending_batches.is_empty() || !self.seat_active {
+        if self.pending_batches.is_empty() {
             return None;
         }
         Some(Instant::now() + std::time::Duration::from_millis(1))
@@ -202,15 +269,26 @@ impl ResourceService {
             self.last_serviced = Some(now);
         }
 
-        // Check timeout on pending batches
-        if self.serviced_elapsed >= self.max_serviced_duration && !self.pending_batches.is_empty() {
-            // Expiry in serviced time: freeze all pending batches, close converted admission
-            let expired_batches = std::mem::take(&mut self.pending_batches);
-            for batch in expired_batches {
-                self.quarantine_gpu_batch(batch, ResourceError::Frozen);
+        // B-11: each pending batch carries its own serviced-time deadline,
+        // computed from its own registration (`register_batch`). Expiry
+        // quarantines only that batch -- never a service-wide `exhausted`
+        // flip, and never by comparing a single global accumulator against
+        // one shared threshold, which would expire every batch in the
+        // service at once regardless of when each was actually registered.
+        let mut still_pending = Vec::with_capacity(self.pending_batches.len());
+        let mut expired = Vec::new();
+        for batch in std::mem::take(&mut self.pending_batches) {
+            match batch.serviced_deadline {
+                Some(deadline) if self.serviced_elapsed >= deadline => expired.push(batch),
+                _ => still_pending.push(batch),
             }
-            self.exhausted = true;
-            return Err(ResourceError::Frozen);
+        }
+        self.pending_batches = still_pending;
+        let any_expired = !expired.is_empty();
+        for batch in expired {
+            // Expiry is never a completion proof (R9): the batch stays
+            // rooted for teardown, exactly like a failed ticket.
+            self.quarantine_gpu_batch(batch, ResourceError::Frozen);
         }
 
         let poll_result = self.poll_gpu(now);
@@ -222,11 +300,32 @@ impl ResourceService {
             self.waiters.notify_eligible(key.generation);
         }
 
+        if any_expired {
+            return Err(ResourceError::Frozen);
+        }
+
         poll_result.map(|_| available_keys)
     }
 
+    /// Refuses (F2-M1) any payload whose file-owned half is still live --
+    /// `Scanout` with `file_owned: Some`, or `DirectFramebuffer` with its
+    /// right/device not yet discharged -- since a plain `adopt` never
+    /// registers the alias with a registry, and this crate has no `Drop`
+    /// that would otherwise close it (M-23's whole point). Such a payload
+    /// must go through `adopt_with_registry`.
     #[allow(clippy::result_large_err)]
     pub(crate) fn adopt(
+        &mut self,
+        payload: AllocationPayload,
+    ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
+        if payload.file_owned_alias_present() {
+            return Err((ResourceError::InvalidState, payload));
+        }
+        self.adopt_unchecked(payload)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn adopt_unchecked(
         &mut self,
         payload: AllocationPayload,
     ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
@@ -279,28 +378,68 @@ impl ResourceService {
         ))
     }
 
-    /// Like `adopt`, but for a payload that may carry a counted alias of the
-    /// DRM open file description (a `Scanout` payload with
-    /// `file_owned: Some`): registers that alias with `registry` so the
+    /// The only way to adopt a payload whose file-owned half is live (`adopt`
+    /// refuses those, F2-M1): registers the alias with `registry` so the
     /// fd-family barrier can discharge it instead of waiting on it (R5,
-    /// B-2). Additive rather than a change to `adopt`'s signature, so
-    /// Tasks 1-3's `adopt(payload)` call sites -- which never carry a
-    /// file-owned alias -- are untouched.
+    /// B-2). Covers every payload kind `file_owned_alias_present` does, not
+    /// just `Scanout` (F2-M1) -- `DirectFramebuffer` carries the same kind
+    /// of alias and had the same hole open beside the original fix.
     #[allow(clippy::result_large_err)]
     pub(crate) fn adopt_with_registry(
         &mut self,
         payload: AllocationPayload,
         registry: &mut DrmCleanupRegistry,
     ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
-        let carries_file_owned_alias = matches!(
-            &payload,
-            AllocationPayload::Scanout(alloc) if alloc.file_owned().is_some()
-        );
-        let lease = self.adopt(payload)?;
+        let carries_file_owned_alias = payload.file_owned_alias_present();
+        let lease = self.adopt_unchecked(payload)?;
         if carries_file_owned_alias {
             registry.register_payload_alias(lease.key());
         }
         Ok(lease)
+    }
+
+    /// Reclaims a payload adopted moments ago, for an all-or-nothing
+    /// multi-payload adoption that must unwind when a later step fails
+    /// (F2-M2). Only succeeds if the lease is still the entry's sole use
+    /// and nothing has registered an obligation on it since; otherwise
+    /// something else is already relying on it, it is too late to safely
+    /// hard-reclaim, and the lease is handed back so the caller's ordinary
+    /// `drop` releases it through the normal lifecycle instead.
+    pub(crate) fn release_fresh_adoption(
+        &mut self,
+        lease: AllocationLease,
+    ) -> Result<AllocationPayload, AllocationLease> {
+        let key = lease.key();
+        let reclaimable = self.entries.get(&key).is_some_and(|entry| {
+            entry.live_use_count() == 1 && entry.pending_obligation_count() == 0
+        });
+        if !reclaimable {
+            return Err(lease);
+        }
+        drop(lease);
+        Ok(self
+            .entries
+            .remove(&key)
+            .and_then(|entry| entry.take_payload())
+            .expect("just-adopted entry with its sole retain use just removed has a payload"))
+    }
+
+    /// Whether `adopt`/`adopt_with_registry` would refuse for exhaustion
+    /// right now (F2-M2): lets a multi-step caller check admission before
+    /// extracting physical resources it would otherwise have nowhere to
+    /// put back cheaply.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// F2b-m1: real exhaustion only happens after `u64::MAX` generations/
+    /// uses/obligations or a serviced-time expiry, neither reachable in a
+    /// unit test. This forces the same flag directly so
+    /// `register_managed_scanout_bo`'s pre-extraction `is_exhausted()`
+    /// guard (F2-M2) can be exercised deterministically.
+    #[cfg(test)]
+    pub(crate) fn force_exhausted_for_tests(&mut self) {
+        self.exhausted = true;
     }
 
     pub(crate) fn reserve(
@@ -533,9 +672,14 @@ impl ResourceService {
             // underneath it is a separate proof (the fd-family barrier's own
             // discharge, or ordinary release) that this proof does not
             // stand in for -- letting it through here is the mechanism
-            // behind B-2's ioctl-after-barrier.
-            if let Some(AllocationPayload::Scanout(alloc)) = entry.payload.borrow().as_ref()
-                && alloc.file_owned().is_some()
+            // behind B-2's ioctl-after-barrier. Checked via the same
+            // dispatcher `adopt`/`service_ready_with_registry` use (F2-M1),
+            // so it covers `DirectFramebuffer` too, not only `Scanout`.
+            if entry
+                .payload
+                .borrow()
+                .as_ref()
+                .is_some_and(AllocationPayload::file_owned_alias_present)
             {
                 return Err(ResourceError::InvalidProof);
             }
@@ -584,6 +728,21 @@ impl ResourceService {
         for key in dirty_keys {
             if let Some(entry) = self.entries.get(&key) {
                 if can_destroy(entry) {
+                    // F2-M1: this path has no registry to discharge a live
+                    // file-owned half through, so destroying the entry here
+                    // would be exactly the undischarged drop B-2 closed for
+                    // `service_ready_with_registry`. Re-dirty instead and
+                    // wait for that call.
+                    if entry
+                        .payload
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(AllocationPayload::file_owned_alias_present)
+                    {
+                        self.dirty_entries.borrow_mut().insert(key);
+                        transitions.push(key);
+                        continue;
+                    }
                     if let Some(removed) = self.entries.remove(&key) {
                         removed.take_payload();
                     }
@@ -596,14 +755,16 @@ impl ResourceService {
         transitions
     }
 
-    /// Like `service_ready`, but discharges a `Scanout` payload's file-owned
-    /// half through `registry` before dropping it (B-2): neither
-    /// `ScanoutAllocation` nor `FileOwnedBacking` has a `Drop` that closes
-    /// the DRM framebuffer/GEM handle, so an ordinary `service_ready` drop
-    /// of a still-`Some` `file_owned` is a silent leak, not a release. This
-    /// is the normal-path counterpart to the Task-9 barrier discharge: KMS
-    /// proof arrived, so the entry is destroyable, and the right closes here
-    /// rather than through the barrier.
+    /// Like `service_ready`, but discharges a payload's file-owned half
+    /// through `registry` before dropping it (B-2): neither
+    /// `ScanoutAllocation`/`FileOwnedBacking` nor `DirectFramebufferAllocation`
+    /// has a `Drop` that closes the DRM framebuffer/GEM handle, so an
+    /// ordinary `service_ready` drop of a still-live file-owned half is a
+    /// silent leak, not a release. This is the normal-path counterpart to
+    /// the Task-9 barrier discharge: KMS proof arrived, so the entry is
+    /// destroyable, and the right closes here rather than through the
+    /// barrier. Dispatches through `AllocationPayload::discharge_file_owned`
+    /// (F2-M1), so it covers every kind `file_owned_alias_present` does.
     pub(crate) fn service_ready_with_registry(
         &mut self,
         registry: &mut DrmCleanupRegistry,
@@ -617,14 +778,16 @@ impl ResourceService {
                     let discharge_result = {
                         let mut payload = entry.payload.borrow_mut();
                         match payload.as_mut() {
-                            Some(AllocationPayload::Scanout(alloc)) => {
-                                alloc.discharge_file_owned(registry)
-                            }
-                            _ => Ok(()),
+                            Some(p) => p.discharge_file_owned(registry),
+                            None => Ok(()),
                         }
                     };
                     match discharge_result {
                         Ok(()) => {
+                            // F2-B2: unregister before removing the entry --
+                            // a stale key here makes the barrier walk hand
+                            // it to a callback with nothing left to look up.
+                            registry.unregister_payload_alias(key);
                             if let Some(removed) = self.entries.remove(&key) {
                                 removed.take_payload();
                             }
@@ -698,12 +861,92 @@ impl ResourceService {
         Ok(res)
     }
 
-    pub(crate) fn register_batch(&mut self, batch: CoreRetirementBatch) {
-        self.pending_batches.push(batch);
+    /// F4b-B1/F4-M3: the scanout counterpart of `with_storage_read`. Once a
+    /// bo is converted to managed ownership (`register_managed_scanout_bo`,
+    /// F-2), its real image/staging live in the `ScanoutAllocation`
+    /// payload -- the pool's `ScanoutBo` is left an emptied husk
+    /// (`take_physical_backing`). A caller that needs those fields must
+    /// reserve a `Read` use on the bo's managed key and take them from the
+    /// payload under that lease, never from the (possibly husked) pool
+    /// struct directly.
+    pub(crate) fn with_scanout_read<T>(
+        &mut self,
+        lease: &AllocationLease,
+        f: impl FnOnce(&ScanoutAllocation) -> T,
+    ) -> Result<T, ResourceError> {
+        let key = lease.key();
+        let read_lease = self.reserve(key, UseKind::Read)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let payload = entry.payload.borrow();
+        let alloc = match payload.as_ref() {
+            Some(AllocationPayload::Scanout(alloc)) => alloc,
+            _ => return Err(ResourceError::Detached),
+        };
+        let res = f(alloc);
+        drop(payload);
+        drop(read_lease);
+        Ok(res)
+    }
+
+    /// F4b-B1/F4-M3: the scanout counterpart of `with_storage_write`. See
+    /// `with_scanout_read` -- a managed scene-submission write target must
+    /// go through the payload the same way.
+    pub(crate) fn with_scanout_write<T>(
+        &mut self,
+        lease: &AllocationLease,
+        f: impl FnOnce(&mut ScanoutAllocation) -> T,
+    ) -> Result<T, ResourceError> {
+        let key = lease.key();
+        let write_lease = self.reserve(key, UseKind::Write)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let mut payload = entry.payload.borrow_mut();
+        let alloc = match payload.as_mut() {
+            Some(AllocationPayload::Scanout(alloc)) => alloc,
+            _ => return Err(ResourceError::Detached),
+        };
+        let res = f(alloc);
+        drop(payload);
+        drop(write_lease);
+        Ok(res)
+    }
+
+    /// B-11: stamps `batch` with its own serviced-time deadline --
+    /// `serviced_elapsed` (this service's cumulative *serviced* time, as of
+    /// right now) plus `max_serviced_duration`, both with checked
+    /// arithmetic. That deadline is fixed at registration and never
+    /// re-derived from a shared/global counter later, so this batch's
+    /// expiry depends only on how much serviced time passes *after* it
+    /// registers -- never on how much service time other, earlier batches
+    /// already consumed. A checked-add overflow (an unrepresentable
+    /// deadline) fails closed: the batch is quarantined immediately rather
+    /// than admitted to `pending_batches` to be polled forever.
+    pub(crate) fn register_batch(&mut self, mut batch: CoreRetirementBatch) {
+        match self
+            .serviced_elapsed
+            .checked_add(self.max_serviced_duration)
+        {
+            Some(deadline) => {
+                batch.serviced_deadline = Some(deadline);
+                self.pending_batches.push(batch);
+            }
+            None => self.quarantine_gpu_batch(batch, ResourceError::Frozen),
+        }
     }
 
     pub(crate) fn pending_batches(&self) -> &[CoreRetirementBatch] {
         &self.pending_batches
+    }
+
+    /// Test-only (F4): lets a mechanism test flip a registered batch's
+    /// `test_ticket_status` in place, without needing to fabricate a second,
+    /// independently-signaled ticket for every step of a multi-poll
+    /// scenario. `GpuObligation.context` is `Option<Arc<VkContext>>`
+    /// (F4-B1); this only controls what `ticket_status()`'s `#[cfg(test)]`
+    /// override reports, exactly as `CoreRetirementBatch::test_ticket_status`
+    /// already does before registration.
+    #[cfg(test)]
+    pub(crate) fn pending_batches_mut(&mut self) -> &mut [CoreRetirementBatch] {
+        &mut self.pending_batches
     }
 
     pub(crate) fn quarantined_batches(&self) -> &[(CoreRetirementBatch, ResourceError)] {
@@ -740,8 +983,14 @@ impl ResourceService {
         }
     }
 
+    // `pub(in ...)`, not `pub(crate)` (M-23/F7): `ValidatedGpuBatch` itself
+    // is private to `resources` (`gpu.rs`'s `pub(super)`), and nothing
+    // outside this module ever calls this directly -- only `poll_gpu`
+    // does. A `pub(crate)` signature returning a type callers outside
+    // `resources` cannot even name is exactly the private-interface
+    // mismatch rustc's `private_interfaces` lint (`-D warnings`) catches.
     #[allow(clippy::result_large_err)]
-    pub(crate) fn validate_gpu_batch(
+    pub(in crate::kms::render::resources) fn validate_gpu_batch(
         &self,
         batch: CoreRetirementBatch,
     ) -> Result<ValidatedGpuBatch, (ResourceError, CoreRetirementBatch)> {
@@ -811,7 +1060,10 @@ impl ResourceService {
         })
     }
 
-    pub(crate) fn commit_gpu_batch(&mut self, prepared: ValidatedGpuBatch) {
+    pub(in crate::kms::render::resources) fn commit_gpu_batch(
+        &mut self,
+        prepared: ValidatedGpuBatch,
+    ) {
         let ValidatedGpuBatch {
             batch,
             confirmed_entries,

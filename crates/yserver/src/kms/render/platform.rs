@@ -165,21 +165,16 @@ impl FenceTicket {
 
     /// Non-blocking status query that preserves Vulkan errors for callers
     /// owning resources gated by this ticket.
+    ///
+    /// F5: no `Option<&VkContext>` fallback -- a missing context used to
+    /// mean "report pending" (`Ok(false)`), which is exactly the invented
+    /// platform status the Global Constraints forbid. A caller with no real
+    /// context to query has no business asking whether a real submission
+    /// signaled.
     pub(crate) fn poll_signaled_result(&self, vk: &VkContext) -> Result<bool, vk::Result> {
-        self.poll_signaled_result_opt(Some(vk))
-    }
-
-    /// Non-blocking status query with optional VkContext (None supported for stub tickets).
-    pub(crate) fn poll_signaled_result_opt(
-        &self,
-        vk: Option<&VkContext>,
-    ) -> Result<bool, vk::Result> {
         if self.inner.signaled_cache.get() {
             return Ok(true);
         }
-        let Some(vk) = vk else {
-            return Ok(false);
-        };
         match unsafe { vk.device.get_fence_status(self.inner.fence) } {
             Ok(true) => {
                 self.inner.signaled_cache.set(true);
@@ -445,7 +440,11 @@ impl FencePool {
         }
     }
 
-    fn acquire(&self) -> Result<FenceTicket, vk::Result> {
+    /// Task 5 (B-15): `pub(crate)` so a producer adapter outside this module
+    /// (e.g. a test driving a real async submission through
+    /// `vk::ops::submit_one_shot_op_async`) can obtain a genuine ticket
+    /// backed by a real device fence, instead of a `#[cfg(test)]` stub.
+    pub(crate) fn acquire(&self) -> Result<FenceTicket, vk::Result> {
         let mut pool = self.inner.borrow_mut();
         let fence = if let Some(f) = pool.free.pop() {
             f
@@ -1534,6 +1533,7 @@ pub(crate) fn replay_copy_free_scanout_plan(
     scanout_modifiers: &[u64],
     qualified: QualifiedScanoutPlan,
     commit_first_framebuffer: bool,
+    legacy_write_permitted: bool,
 ) -> Result<ExactPlanReplay<PreparedScanoutPool>, CopyFreeScanoutError> {
     let QualifiedScanoutPlan::Shared(plan) = qualified else {
         return Err(CopyFreeScanoutError::Candidates(io::Error::new(
@@ -1586,9 +1586,12 @@ pub(crate) fn replay_copy_free_scanout_plan(
                     plan.describe(),
                 )))
             })?;
-        if let Err(error) =
-            crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
-        {
+        if let Err(error) = crate::drm::modeset::commit_modeset(
+            &scanout_device,
+            output,
+            framebuffer,
+            legacy_write_permitted,
+        ) {
             return Ok(ExactPlanReplay::Rejected(io::Error::new(
                 error.kind(),
                 copy_free_candidate_error(plan, "live modeset", &error),
@@ -1622,6 +1625,7 @@ fn allocate_copy_free_scanout_pool(
     height: u32,
     scanout_modifiers: &[u64],
     commit_first_framebuffer: bool,
+    legacy_write_permitted: bool,
 ) -> Result<PreparedScanoutPool, CopyFreeScanoutError> {
     debug_assert!(route_requires_copy_free_probe(route));
     let plans =
@@ -1682,6 +1686,7 @@ fn allocate_copy_free_scanout_pool(
             scanout_modifiers,
             qualified,
             commit_first_framebuffer,
+            legacy_write_permitted,
         )? {
             ExactPlanReplay::Prepared(prepared) => {
                 log::info!(
@@ -1796,6 +1801,7 @@ pub(crate) fn replay_copied_scanout_plan(
     scanout_modifiers: &[u64],
     qualified: QualifiedScanoutPlan,
     commit_first_framebuffer: bool,
+    legacy_write_permitted: bool,
 ) -> Result<ExactPlanReplay<PreparedCopiedScanoutPool>, CopiedScanoutError> {
     let QualifiedScanoutPlan::Copied { sink_id, plan } = qualified else {
         return Err(CopiedScanoutError::Candidates(io::Error::new(
@@ -1860,9 +1866,12 @@ pub(crate) fn replay_copied_scanout_plan(
                     plan.describe()
                 )))
             })?;
-        if let Err(error) =
-            crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
-        {
+        if let Err(error) = crate::drm::modeset::commit_modeset(
+            &scanout_device,
+            output,
+            framebuffer,
+            legacy_write_permitted,
+        ) {
             return Ok(ExactPlanReplay::Rejected(io::Error::new(
                 error.kind(),
                 format!("{} live modeset: {error}", plan.describe()),
@@ -1899,6 +1908,7 @@ fn allocate_copied_scanout_pool(
     height: u32,
     scanout_modifiers: &[u64],
     commit_first_framebuffer: bool,
+    legacy_write_permitted: bool,
 ) -> Result<PreparedCopiedScanoutPool, CopiedScanoutError> {
     debug_assert!(route_requires_copy_free_probe(route));
     debug_assert_eq!(destination_route.relationship, RenderKmsRelationship::Same);
@@ -1982,6 +1992,7 @@ fn allocate_copied_scanout_pool(
             scanout_modifiers,
             qualified,
             commit_first_framebuffer,
+            legacy_write_permitted,
         )? {
             ExactPlanReplay::Prepared(prepared) => {
                 log::info!(
@@ -2536,11 +2547,12 @@ impl Drop for PlatformBackend {
         if !self.initial_scanout_rollback_armed {
             return;
         }
-        rollback_initial_scanout_with(
-            &self.devices,
-            &mut self.outputs,
-            &mut drm::modeset::disable_output,
-        );
+        // B-10/R11: `true` -- a `PlatformBackend` being unwound mid-
+        // construction (the only time this `Drop` rolls back) never
+        // installed a transport gate (R8).
+        rollback_initial_scanout_with(&self.devices, &mut self.outputs, &mut |device, output| {
+            drm::modeset::disable_output(device, output, true)
+        });
         self.initial_scanout_rollback_armed = false;
     }
 }
@@ -2571,6 +2583,7 @@ impl PlatformBackend {
             &drm::Device,
             &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
+            bool,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
         // `core_platform_init` runs the hardware-Vulkan preflight after it
@@ -2632,11 +2645,12 @@ impl PlatformBackend {
             initialize_cursor_plane_for_device(kms_device, &crtcs, "active startup");
         }
 
-        let mut initial_scanout_rollback = InitialScanoutRollbackGuard::new_with(
-            &devices,
-            &mut layouts,
-            drm::modeset::disable_output,
-        );
+        // B-10/R11: `true` -- construction-time rollback, before this
+        // `PlatformBackend` (and any transport gate) exists (R8).
+        let mut initial_scanout_rollback =
+            InitialScanoutRollbackGuard::new_with(&devices, &mut layouts, |device, output| {
+                drm::modeset::disable_output(device, output, true)
+            });
 
         let requested_render_node = render_node.as_ref().map(|node| node.key());
         let vk_result = devices.first().map_or_else(VkContext::new, |display| {
@@ -2762,6 +2776,11 @@ impl PlatformBackend {
                     h,
                     &layout.output.scanout_modifiers,
                     false,
+                    // B-10/R11: `commit_first_framebuffer` is `false` above,
+                    // so `commit_modeset` is never reached on this
+                    // construction path -- no `PlatformBackend` exists yet
+                    // to hold a gate either way.
+                    true,
                 ) {
                     Ok(prepared) => {
                         debug_assert!(prepared.committed_framebuffer.is_none());
@@ -2814,6 +2833,10 @@ impl PlatformBackend {
                                 h,
                                 &layout.output.scanout_modifiers,
                                 false,
+                                // B-10/R11: unreachable -- see the sibling
+                                // `allocate_copy_free_scanout_pool` call
+                                // above.
+                                true,
                             )
                         })();
                         match copied_result {
@@ -3186,6 +3209,30 @@ impl PlatformBackend {
             .unwrap_or(true)
     }
 
+    /// Task 6.5/M-14: whether `try_finish_legacy_transport` may finish an
+    /// ordinary legacy drain for `device` here. A device with no installed
+    /// gate is implicitly `Legacy` and always drainable -- this is
+    /// currently every production device (R8: nothing installs a gate in
+    /// production yet, so this check is inert there). An installed gate
+    /// (test-only today) that has already progressed to `Owner` or
+    /// `Closed` means the owner route has moved on without all production
+    /// prerequisites having gone through this call, and finishing a legacy
+    /// drain again here would change that route out from under it -- so
+    /// this returns a refusal instead.
+    pub(crate) fn legacy_transport_gate_permits_finish(
+        &self,
+        device: &crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        match self.transport_gates.get(device) {
+            None => true,
+            Some(gate) => matches!(
+                gate.state(),
+                crate::kms::render::resources::TransportState::Legacy
+                    | crate::kms::render::resources::TransportState::Quiescing
+            ),
+        }
+    }
+
     /// Attach a live Vulkan context to the headless test fixture while
     /// preserving the renderer-inventory invariant used by production.
     pub(crate) fn attach_test_vk_context(&mut self, vk: Arc<VkContext>) {
@@ -3429,6 +3476,18 @@ impl PlatformBackend {
                 io::Error::other("cursor plane unavailable for output"),
             ));
         }
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8), checked immediately before the `set_cursor2`
+        // ioctl below.
+        let device_key = self.devices[device_idx].key;
+        if !self.allows_legacy(
+            &device_key,
+            crate::kms::render::resources::WriterClass::Cursor,
+        ) {
+            return Err(crate::kms::cursor_plane::CursorShowError::Unbound(
+                crate::drm::transport_gate_refusal("cursor-show"),
+            ));
+        }
         let result = self.devices[device_idx]
             .cursor
             .plane
@@ -3550,6 +3609,16 @@ impl PlatformBackend {
         if state.plane.is_none() {
             return Err(io::Error::other("cursor plane unavailable"));
         }
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8), checked immediately before the per-CRTC
+        // `move_cursor` ioctls below.
+        if !self.allows_legacy(
+            &device_key,
+            crate::kms::render::resources::WriterClass::Cursor,
+        ) {
+            return Err(crate::drm::transport_gate_refusal("cursor-move"));
+        }
+        let state = &mut self.devices[device_idx].cursor;
         let mut outcome = CursorMoveOutcome::default();
         let mut keep_pending = false;
         for (crtc, layout_x, layout_y) in layouts {
@@ -3661,6 +3730,16 @@ impl PlatformBackend {
     /// unavailable; `set_cursor2` ioctl failure otherwise.
     pub(crate) fn cursor_plane_hide_on_crtc(&mut self, output_idx: usize) -> io::Result<()> {
         let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8), checked immediately before the `set_cursor2`
+        // (hide) ioctl below.
+        let device_key = self.devices[device_idx].key;
+        if !self.allows_legacy(
+            &device_key,
+            crate::kms::render::resources::WriterClass::Cursor,
+        ) {
+            return Err(crate::drm::transport_gate_refusal("cursor-hide"));
+        }
         let result = {
             let Some(plane) = self.devices[device_idx].cursor.plane.as_mut() else {
                 return Err(io::Error::other("cursor plane unavailable"));
@@ -3847,7 +3926,26 @@ impl PlatformBackend {
                     crtcs.push(crtc);
                 }
             }
+            // B-10/R11: `true` on every production device today (no gate
+            // installed, R8), checked immediately before the per-CRTC
+            // `set_cursor2` (hide) ioctls below. Written as a direct field
+            // access (not `self.allows_legacy`) since `self.devices` is
+            // already borrowed by this loop's iterator -- disjoint from
+            // `self.transport_gates`, a different field.
+            let legacy_write_permitted = self
+                .transport_gates
+                .get(&device.key)
+                .map(|gate| gate.allows_legacy(crate::kms::render::resources::WriterClass::Cursor))
+                .unwrap_or(true);
             for crtc in crtcs {
+                if !legacy_write_permitted {
+                    log::warn!(
+                        "render cursor hide_all: device {} CRTC {crtc:?}: {}",
+                        device.key,
+                        crate::drm::transport_gate_refusal("cursor-hide-all")
+                    );
+                    continue;
+                }
                 if let Err(error) = plane.hide(crtc) {
                     if error.kind() == io::ErrorKind::PermissionDenied {
                         log::debug!(
@@ -5645,6 +5743,13 @@ impl PlatformBackend {
             AllocationPayload, CopiedSourceAllocation, ResourceError, ScanoutAllocation,
         };
 
+        // F2-M2: verify admission before extracting anything -- discovering
+        // Exhausted only after emptying the bo/src would leave husks with
+        // nowhere for their resources to go.
+        if service.is_exhausted() {
+            return Err(ResourceError::Exhausted);
+        }
+
         let scanout = self
             .scanout_pools
             .get_mut(output_idx)
@@ -5683,24 +5788,81 @@ impl PlatformBackend {
             .ok_or(ResourceError::InvalidState)?
             .take_physical_backing();
 
-        let renderer_key = match renderer_backing {
-            Some(backing) => {
-                let allocation = CopiedSourceAllocation::from_copied_render_source_backing(backing);
-                let lease = service
-                    .adopt(AllocationPayload::CopiedSource(allocation))
-                    .map_err(|(e, _)| e)?;
-                Some(lease.key())
+        // fb_handle/gem_handle presence was validated above, so the only
+        // error `from_scanout_bo_backing` can return cannot occur here.
+        let display_allocation =
+            ScanoutAllocation::from_scanout_bo_backing(display_backing, registry)
+                .expect("fb_handle/gem_handle presence was already validated above");
+        let renderer_allocation =
+            renderer_backing.map(CopiedSourceAllocation::from_copied_render_source_backing);
+
+        // F2-M2: display first, renderer second -- a display failure is
+        // cheap to undo (nothing else has happened yet); a renderer failure
+        // after display succeeded must undo the display adoption too, so
+        // the pair is genuinely all-or-nothing.
+        let display_lease = match service
+            .adopt_with_registry(AllocationPayload::Scanout(display_allocation), registry)
+        {
+            Ok(lease) => lease,
+            Err((error, AllocationPayload::Scanout(allocation))) => {
+                if let Some(renderer_allocation) = renderer_allocation {
+                    self.restore_renderer_backing(
+                        output_idx,
+                        bo_idx,
+                        renderer_allocation.into_copied_render_source_backing(),
+                    );
+                }
+                self.restore_display_backing(
+                    output_idx,
+                    bo_idx,
+                    allocation.into_scanout_bo_backing(),
+                );
+                return Err(error);
             }
+            Err((error, _)) => return Err(error), // unreachable: a Scanout payload was passed in
+        };
+
+        let renderer_lease = match renderer_allocation {
+            Some(allocation) => match service.adopt(AllocationPayload::CopiedSource(allocation)) {
+                Ok(lease) => Some(lease),
+                Err((error, AllocationPayload::CopiedSource(allocation))) => {
+                    self.restore_renderer_backing(
+                        output_idx,
+                        bo_idx,
+                        allocation.into_copied_render_source_backing(),
+                    );
+                    // All-or-nothing (F2-M2): undo the display adoption too.
+                    let display_key = display_lease.key();
+                    match service.release_fresh_adoption(display_lease) {
+                        Ok(AllocationPayload::Scanout(display_allocation)) => {
+                            registry.unregister_payload_alias(display_key);
+                            self.restore_display_backing(
+                                output_idx,
+                                bo_idx,
+                                display_allocation.into_scanout_bo_backing(),
+                            );
+                        }
+                        Ok(_) => unreachable!(
+                            "release_fresh_adoption returned a non-Scanout payload for a Scanout key"
+                        ),
+                        Err(_lease) => {
+                            // Something already touched it (shouldn't happen
+                            // synchronously, single-threaded); let it be
+                            // discharged normally through service_ready_with_registry
+                            // rather than force a restore that could race.
+                        }
+                    }
+                    return Err(error);
+                }
+                Err((error, _)) => return Err(error), // unreachable: a CopiedSource payload was passed in
+            },
             None => None,
         };
 
-        let allocation = ScanoutAllocation::from_scanout_bo_backing(display_backing, registry)?;
-        let display_lease = service
-            .adopt_with_registry(AllocationPayload::Scanout(allocation), registry)
-            .map_err(|(e, _)| e)?;
+        // Both halves adopted (or no renderer half needed): root the leases
+        // in the pool (F2-B1) so the entries stay alive until detach/drain
+        // drops them, not until the next tick finds zero live uses.
         let display_key = display_lease.key();
-        drop(display_lease);
-
         let scanout = self
             .scanout_pools
             .get_mut(output_idx)
@@ -5711,16 +5873,55 @@ impl PlatformBackend {
             .bos
             .get_mut(bo_idx)
             .ok_or(ResourceError::InvalidState)?
-            .set_managed_key(display_key);
-        if let Some(rkey) = renderer_key {
+            .set_managed(display_lease);
+        if let Some(renderer_lease) = renderer_lease {
             scanout
                 .copied_mut()
                 .and_then(|c| c.sources.get_mut(bo_idx))
                 .ok_or(ResourceError::InvalidState)?
-                .set_managed_key(rkey);
+                .set_managed(renderer_lease);
         }
 
         Ok(display_key)
+    }
+
+    /// F2-M2 rollback helper: restores a display bo's physical backing after
+    /// extraction but before (or instead of) a successful managed adoption.
+    /// Silently does nothing if the pool/index has meanwhile changed shape,
+    /// which cannot happen within `register_managed_scanout_bo`'s single
+    /// synchronous call but is defensive against future callers.
+    fn restore_display_backing(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        backing: crate::kms::vk::scanout::ScanoutBoBacking,
+    ) {
+        if let Some(scanout) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            && let Some(bo) = scanout.display_pool_mut().bos.get_mut(bo_idx)
+        {
+            bo.restore_physical_backing(backing);
+        }
+    }
+
+    /// See `restore_display_backing`.
+    fn restore_renderer_backing(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        backing: crate::kms::vk::scanout::CopiedRenderSourceBacking,
+    ) {
+        if let Some(src) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.copied_mut())
+            .and_then(|copied| copied.sources.get_mut(bo_idx))
+        {
+            src.restore_physical_backing(backing);
+        }
     }
 
     pub(crate) fn acquire_managed_scanout_bo(
@@ -5769,14 +5970,14 @@ impl PlatformBackend {
             .iter()
             .enumerate()
             .filter(|(_, bo)| bo.state.phase == BoPhase::Free)
-            .filter_map(|(bo_idx, bo)| bo.managed_key.map(|key| (bo_idx, key)))
+            .filter_map(|(bo_idx, bo)| bo.managed_key().map(|key| (bo_idx, key)))
             .collect();
 
         for (bo_idx, display_key) in candidates {
             let renderer_key = scanout
                 .copied()
                 .and_then(|c| c.sources.get(bo_idx))
-                .and_then(|s| s.managed_key);
+                .and_then(|s| s.managed_key());
 
             let display = match service.reserve(display_key, UseKind::Write) {
                 Ok(lease) => lease,
@@ -5841,6 +6042,13 @@ impl PlatformBackend {
             .device_for_output(&output_key)
             .map(|device| Rc::clone(&device.device))
             .ok_or_else(|| io::Error::other("copied scanout KMS device disappeared"))?;
+        // B-10/R11: computed once, outside the closure below, so the
+        // closure's disjoint-field capture of `self.scanout_pools` is not
+        // widened into a capture of the whole of `self`.
+        let legacy_write_permitted = self.allows_legacy(
+            &output_key.device_key,
+            crate::kms::render::resources::WriterClass::Primary,
+        );
 
         let mut recovery_failed = false;
         let result = (|| {
@@ -5893,6 +6101,7 @@ impl PlatformBackend {
                 framebuffer,
                 in_fence_fd,
                 &mut out_fence_fd,
+                legacy_write_permitted,
             ) {
                 Ok(()) => {
                     if let Some(fd) = destination.state.transition_to_pending(out_fence_fd) {
@@ -6130,8 +6339,18 @@ impl PlatformBackend {
                 .device,
         );
 
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8).
+        let legacy_write_permitted = self.allows_legacy(
+            &output_key.device_key,
+            crate::kms::render::resources::WriterClass::Modeset,
+        );
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
-        if let Err(e) = crate::drm::modeset::disable_output(&device, &self.outputs[idx].output) {
+        if let Err(e) = crate::drm::modeset::disable_output(
+            &device,
+            &self.outputs[idx].output,
+            legacy_write_permitted,
+        ) {
             log::error!("render disable_connector: disable_output({connector}) failed: {e}");
             return Err(e);
         }
@@ -6419,6 +6638,12 @@ impl PlatformBackend {
                     &output.scanout_modifiers,
                     qualified,
                     false,
+                    // B-10/R11: `commit_first_framebuffer` is `false` above,
+                    // so `commit_modeset` is never reached here -- this
+                    // function only prepares/TEST_ONLYs; the actual commit
+                    // (and its own gate check) happens in
+                    // `install_prepared_connector_plan`.
+                    true,
                 ) {
                     Ok(ExactPlanReplay::Prepared(prepared)) => {
                         debug_assert!(prepared.committed_framebuffer.is_none());
@@ -6463,6 +6688,9 @@ impl PlatformBackend {
                     &output.scanout_modifiers,
                     qualified,
                     false,
+                    // B-10/R11: unreachable -- see the sibling
+                    // `replay_copy_free_scanout_plan` call above.
+                    true,
                 ) {
                     Ok(ExactPlanReplay::Prepared(prepared)) => {
                         debug_assert!(prepared.committed_framebuffer.is_none());
@@ -6565,6 +6793,13 @@ impl PlatformBackend {
         } = resolved;
         let w = mode_spec.width;
         let h = mode_spec.height;
+        // B-10/R11: `true` on every production device today (no gate
+        // installed, R8). Computed once, before any of `self`'s other
+        // fields are borrowed below.
+        let legacy_write_permitted = self.allows_legacy(
+            &output_key.device_key,
+            crate::kms::render::resources::WriterClass::Modeset,
+        );
 
         if let Some((prepared_route, prepared)) = prepared_pool.as_ref() {
             if !needs_pool_realloc {
@@ -6606,6 +6841,7 @@ impl PlatformBackend {
                             u32::from(h),
                             &output.scanout_modifiers,
                             true,
+                            legacy_write_permitted,
                         ) {
                             Ok(prepared) => {
                                 new_pool_committed_framebuffer = prepared.committed_framebuffer;
@@ -6639,6 +6875,7 @@ impl PlatformBackend {
                                             u32::from(h),
                                             &output.scanout_modifiers,
                                             true,
+                                            legacy_write_permitted,
                                         )
                                     });
                                 match copied_result {
@@ -6745,7 +6982,12 @@ impl PlatformBackend {
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
         if new_pool_committed_framebuffer.is_none()
-            && let Err(e) = crate::drm::modeset::commit_modeset(&device, &output, fb_for_commit)
+            && let Err(e) = crate::drm::modeset::commit_modeset(
+                &device,
+                &output,
+                fb_for_commit,
+                legacy_write_permitted,
+            )
         {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
@@ -7076,7 +7318,15 @@ impl PlatformBackend {
                 );
                 continue;
             };
-            if let Err(e) = drm::modeset::disable_output(&device, &layout.output) {
+            // B-10/R11: `true` on every production device today (no gate
+            // installed, R8).
+            let legacy_write_permitted = self.allows_legacy(
+                &layout.key.device_key,
+                crate::kms::render::resources::WriterClass::Modeset,
+            );
+            if let Err(e) =
+                drm::modeset::disable_output(&device, &layout.output, legacy_write_permitted)
+            {
                 log::warn!(
                     "render disable_output: failed for {} (output {i}): {e}",
                     layout.output.connector_name,
@@ -7164,8 +7414,18 @@ impl PlatformBackend {
                     }
                     continue;
                 };
-                if let Err(e) = crate::drm::modeset::commit_modeset(&device, &layout.output, fb_id)
-                {
+                // B-10/R11: `true` on every production device today (no
+                // gate installed, R8).
+                let legacy_write_permitted = self.allows_legacy(
+                    &layout.key.device_key,
+                    crate::kms::render::resources::WriterClass::Dpms,
+                );
+                if let Err(e) = crate::drm::modeset::commit_modeset(
+                    &device,
+                    &layout.output,
+                    fb_id,
+                    legacy_write_permitted,
+                ) {
                     log::error!(
                         "dpms_set_outputs_active(true): commit_modeset for {} failed: {e}",
                         layout.output.connector_name,
@@ -7209,7 +7469,17 @@ impl PlatformBackend {
                     }
                     continue;
                 };
-                if let Err(e) = crate::drm::modeset::disable_output(&device, &layout.output) {
+                // B-10/R11: `true` on every production device today (no
+                // gate installed, R8).
+                let legacy_write_permitted = self.allows_legacy(
+                    &layout.key.device_key,
+                    crate::kms::render::resources::WriterClass::Dpms,
+                );
+                if let Err(e) = crate::drm::modeset::disable_output(
+                    &device,
+                    &layout.output,
+                    legacy_write_permitted,
+                ) {
                     log::error!(
                         "dpms_set_outputs_active(false): disable_output for {} failed: {e}",
                         layout.output.connector_name,
@@ -7548,6 +7818,156 @@ mod tests {
             owner.finish_legacy_transport(repeated),
             Err(DispatchError::InvalidLegacyDrainProof)
         ));
+    }
+
+    /// M-14/6.5 decisive test: `legacy_transport_gate_permits_finish` is
+    /// inert (always `true`) for a device with no installed gate -- the
+    /// production case today (R8) -- and refuses once an installed gate has
+    /// progressed past `Legacy`/`Quiescing`. Mutation check: reverting
+    /// `try_finish_legacy_transport` to skip this check entirely would let
+    /// it proceed regardless, which this unit test on the underlying
+    /// predicate would still catch since it exercises the predicate
+    /// directly.
+    #[test]
+    fn legacy_transport_gate_permits_finish_inert_without_a_gate_and_refuses_past_legacy() {
+        use crate::kms::{
+            owner::identity::IncarnationId,
+            render::resources::{FakeDirectOwnershipState, TransportGate},
+        };
+
+        let device = drm_key(9);
+        let incarnation = IncarnationId::first();
+        let platform = PlatformBackend::for_tests();
+
+        // No gate installed: inert, always permits (today's production
+        // shape -- R8, nothing installs a gate yet).
+        assert!(platform.legacy_transport_gate_permits_finish(&device));
+
+        let mut platform = PlatformBackend::for_tests();
+        let gate = TransportGate::new_legacy(
+            device,
+            incarnation,
+            Box::new(FakeDirectOwnershipState::new()),
+        );
+        // Legacy: permits.
+        platform.install_transport_gate(gate);
+        assert!(platform.legacy_transport_gate_permits_finish(&device));
+
+        // Quiescing: still permits (drain still in progress).
+        platform
+            .transport_gate_mut(&device)
+            .unwrap()
+            .begin_quiescing()
+            .unwrap();
+        assert!(platform.legacy_transport_gate_permits_finish(&device));
+
+        // Closed: refuses -- the route has already moved on.
+        platform
+            .transport_gate_mut(&device)
+            .unwrap()
+            .close()
+            .unwrap();
+        assert!(!platform.legacy_transport_gate_permits_finish(&device));
+
+        // An unrelated device with no gate remains unaffected.
+        assert!(platform.legacy_transport_gate_permits_finish(&drm_key(10)));
+    }
+
+    /// B-10/R11, 6.5a/6.5b: `cursor_plane_hide_on_crtc` is the "cursor
+    /// set/move" sink -- `PlatformBackend::allows_legacy` checked
+    /// immediately before the `set_cursor2(None, ..)` ioctl. `hide` (unlike
+    /// `show`, which needs a real dumb buffer this fixture never allocates)
+    /// issues its ioctl unconditionally once a plane is installed, so a
+    /// permitted call reaches the real (fake) device fd and fails with a
+    /// genuine OS error (`Device::for_tests()` is a `UnixStream`, not a DRM
+    /// node), while a refused call never touches the fd at all --
+    /// `raw_os_error()` is the discriminator. `cursor_plane_show_on_crtc`,
+    /// `cursor_plane_move`/`try_cursor_plane_move_for_device` and
+    /// `cursor_plane_hide_all` share the identical
+    /// `self.allows_legacy(&device_key, WriterClass::Cursor)` guard added
+    /// this session (see the diff at each), proven here through the one
+    /// entry point a hardware-free fixture can drive to a real ioctl
+    /// attempt. Mutation check: deleting this sink's `allows_legacy` check
+    /// makes every non-Legacy case below observe `raw_os_error().is_some()`
+    /// instead of `None`, failing the assertion.
+    #[test]
+    fn c0_2ci_sink_cursor_gate_four_states() {
+        use crate::kms::render::resources::{
+            FakeDirectOwnershipState, RecipientReservation, TransportGate, WriterCoverageProof,
+        };
+
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.devices[0].key;
+        let crtc = platform.outputs[0].output.crtc;
+        platform.initialize_headless_cursor_for_device_with(
+            key,
+            "cursor gate test",
+            |device, crtcs, boundary| {
+                install_test_cursor_plane(device, crtcs, boundary);
+            },
+        );
+        assert!(platform.cursor_plane_available_for_output(0));
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+
+        // Legacy: no gate installed -- permitted, reaches the real (fake)
+        // device fd.
+        let err = platform.cursor_plane_hide_on_crtc(0).unwrap_err();
+        assert!(
+            err.raw_os_error().is_some(),
+            "Legacy should reach the ioctl: {err}"
+        );
+
+        let gate =
+            TransportGate::new_legacy(key, incarnation, Box::new(FakeDirectOwnershipState::new()));
+        platform.install_transport_gate(gate);
+
+        // Quiescing: refused before the ioctl.
+        platform
+            .transport_gate_mut(&key)
+            .unwrap()
+            .begin_quiescing()
+            .unwrap();
+        let err = platform.cursor_plane_hide_on_crtc(0).unwrap_err();
+        assert!(
+            err.raw_os_error().is_none(),
+            "Quiescing must refuse before the ioctl: {err}"
+        );
+
+        // Owner: this sink carries no `OwnerWriteGrant` (R8 -- only the
+        // executor's helper-mutation sink is wired to consume one in this
+        // stage), so `allows_legacy` -- state-only -- still refuses.
+        let permit = platform
+            .transport_gate_mut(&key)
+            .unwrap()
+            .issue_handover_permit(
+                LegacyDrained {
+                    incarnation,
+                    lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId::first(),
+                },
+                &[],
+                &WriterCoverageProof::new_for_tests(),
+                RecipientReservation::new_for_tests(),
+            )
+            .unwrap();
+        platform
+            .transport_gate_mut(&key)
+            .unwrap()
+            .publish_owner(permit)
+            .unwrap();
+        let err = platform.cursor_plane_hide_on_crtc(0).unwrap_err();
+        assert!(
+            err.raw_os_error().is_none(),
+            "Owner (no grant machinery on this sink) must still refuse: {err}"
+        );
+
+        // Closed: refused.
+        platform.transport_gate_mut(&key).unwrap().close().unwrap();
+        let err = platform.cursor_plane_hide_on_crtc(0).unwrap_err();
+        assert!(
+            err.raw_os_error().is_none(),
+            "Closed must refuse before the ioctl: {err}"
+        );
+        let _ = crtc;
     }
 
     #[test]

@@ -351,6 +351,8 @@ pub enum SendError {
     ReservationMismatch,
     #[error("boundary violation: cold start / offline request sent during seat active service")]
     BoundaryViolation,
+    #[error("transport gate refused this helper-mutation write")]
+    TransportGateRefused,
 }
 
 #[derive(Debug)]
@@ -738,11 +740,43 @@ impl KmsIoExecutor {
         })
     }
 
+    /// The public, externally reachable entry point. Never carries an
+    /// owner-write authorization -- R8: there is no production issuer of
+    /// `OwnerWriteGrant`, so every external and ordinary in-crate caller
+    /// goes through here and the transport gate never enters into it.
+    /// `send_authorized` below is the same function with the gate wired
+    /// in, kept `pub(crate)` so its signature can name `TransportGate`/
+    /// `OwnerWriteGrant` (both `pub(crate)`) without leaking them into a
+    /// publicly reachable signature (`private_interfaces`).
     #[doc(hidden)]
     pub fn send(
         &mut self,
         request: &HostCallRequest,
         reservation: HostCallReservation,
+    ) -> Result<(), SendError> {
+        self.send_authorized(request, reservation, None)
+    }
+
+    /// B-10/R11: `owner_write` is the transport-gate authorization for this
+    /// send, checked and (on success) consumed at the serialized send
+    /// boundary -- the moment this function commits to actually
+    /// transmitting the request, immediately before `send_frame`. `None`
+    /// is the only shape any production caller passes today (R8: there is
+    /// no production issuer of `OwnerWriteGrant`, so no production gate is
+    /// ever installed here either) and is completely inert: every existing
+    /// call site is unaffected byte-for-byte. Once this function accepts
+    /// the request the grant is spent regardless of what `send_frame` does
+    /// next -- an IPC failure past this point is the executor's own
+    /// `SendError::Ipc`/quarantine handling, not a reason to leave the
+    /// gate's count outstanding.
+    pub(crate) fn send_authorized(
+        &mut self,
+        request: &HostCallRequest,
+        reservation: HostCallReservation,
+        owner_write: Option<(
+            &mut crate::kms::render::resources::TransportGate,
+            crate::kms::render::resources::OwnerWriteGrant,
+        )>,
     ) -> Result<(), SendError> {
         if self.state == ExecutorState::Reaped {
             return Err(SendError::Reaped);
@@ -772,6 +806,21 @@ impl KmsIoExecutor {
         };
         if !valid_reservation {
             return Err(SendError::ReservationMismatch);
+        }
+
+        // B-10/R11: the transport gate, checked immediately before this
+        // function commits to sending -- nothing above this point has
+        // touched `in_flight` yet, so a refusal here leaves the executor
+        // exactly as if `send` had not been called at all.
+        if let Some((gate, grant)) = owner_write
+            && gate
+                .authorize_write(
+                    crate::kms::render::resources::WriterClass::HelperMutation,
+                    Some(grant),
+                )
+                .is_err()
+        {
+            return Err(SendError::TransportGateRefused);
         }
 
         let class = request.class();
@@ -993,16 +1042,31 @@ impl KmsIoExecutor {
         None
     }
 
+    /// The public, externally reachable entry point -- see `send` above for
+    /// why the gate-carrying signature lives on `dispatch_blocking_at_boundary_authorized`
+    /// instead.
     #[doc(hidden)]
     pub fn dispatch_blocking_at_boundary(
         &mut self,
         request: &HostCallRequest,
         reservation: HostCallReservation,
     ) -> Result<HostCallOutcome, BoundaryViolation> {
+        self.dispatch_blocking_at_boundary_authorized(request, reservation, None)
+    }
+
+    pub(crate) fn dispatch_blocking_at_boundary_authorized(
+        &mut self,
+        request: &HostCallRequest,
+        reservation: HostCallReservation,
+        owner_write: Option<(
+            &mut crate::kms::render::resources::TransportGate,
+            crate::kms::render::resources::OwnerWriteGrant,
+        )>,
+    ) -> Result<HostCallOutcome, BoundaryViolation> {
         if self.phase == HostCallPhase::SeatActive {
             return Err(BoundaryViolation);
         }
-        if let Err(send_err) = self.send(request, reservation) {
+        if let Err(send_err) = self.send_authorized(request, reservation, owner_write) {
             if let Some(event) = self.poll_reply() {
                 match event {
                     HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),
@@ -1013,6 +1077,9 @@ impl KmsIoExecutor {
                 SendError::Reaped => HostCallOutcome::Unknown(UnknownReason::HelperExited),
                 SendError::Stalled | SendError::Ipc => {
                     HostCallOutcome::Unknown(UnknownReason::IpcFailure)
+                }
+                SendError::TransportGateRefused => {
+                    return Err(BoundaryViolation);
                 }
                 _ => HostCallOutcome::Unknown(UnknownReason::IpcFailure),
             });

@@ -555,7 +555,13 @@ pub struct ScanoutBo {
     /// image / memory — declared last so Rust drops it after the
     /// explicit `Drop` impl has torn those down.
     gbm_bo: Option<gbm::BufferObject<()>>,
-    pub(crate) managed_key: Option<crate::kms::render::resources::AllocationKey>,
+    /// The `Retain` lease rooting this bo's managed adoption in the
+    /// `ResourceService`, when converted (F2-B1). Owning the lease here --
+    /// not just its key -- is what keeps the entry alive: an
+    /// `AllocationKey` is Copy and cannot root anything, so a bare key on
+    /// the pool slot leaves the entry with zero live uses, dirty, and
+    /// destroyable on the very next `service_ready` tick.
+    managed: Option<crate::kms::render::resources::AllocationLease>,
 }
 
 /// Per-bo transfer-side resources (command pool/buffer + staging
@@ -759,18 +765,21 @@ impl OutputScanout {
     }
 
     pub(crate) fn detach_managed_entries(&mut self) {
+        // F2-B1: drop the lease, not just clear a key -- this is the actual
+        // release of the managed reservation, which is what makes the
+        // entry destroyable on the next service tick.
         match self {
             Self::Shared(pool) => {
                 for bo in &mut pool.bos {
-                    bo.managed_key = None;
+                    bo.take_managed();
                 }
             }
             Self::Copied(pool) => {
                 for bo in &mut pool.destinations.bos {
-                    bo.managed_key = None;
+                    bo.take_managed();
                 }
                 for src in &mut pool.sources {
-                    src.managed_key = None;
+                    src.take_managed();
                 }
             }
         }
@@ -825,7 +834,10 @@ pub(crate) struct CopiedRenderSource {
     ownership: CopiedSourceOwnership,
     render_target_contents: CopiedRenderTargetContents,
     disarmed: bool,
-    pub(crate) managed_key: Option<crate::kms::render::resources::AllocationKey>,
+    /// The `Retain` lease rooting this source's managed adoption, when
+    /// converted (F2-B1) -- see `ScanoutBo.managed` for why this must be
+    /// the lease itself, not a bare key.
+    managed: Option<crate::kms::render::resources::AllocationLease>,
 }
 
 /// Every physically-owned resource extracted out of a live
@@ -850,8 +862,53 @@ pub(crate) struct CopiedRenderSourceBacking {
 }
 
 impl CopiedRenderSource {
-    pub(crate) fn set_managed_key(&mut self, key: crate::kms::render::resources::AllocationKey) {
-        self.managed_key = Some(key);
+    /// See `ScanoutBo::managed_key`.
+    pub(crate) fn managed_key(&self) -> Option<crate::kms::render::resources::AllocationKey> {
+        self.managed.as_ref().map(|lease| lease.key())
+    }
+
+    /// See `ScanoutBo::set_managed`.
+    pub(crate) fn set_managed(&mut self, lease: crate::kms::render::resources::AllocationLease) {
+        self.managed = Some(lease);
+    }
+
+    /// See `ScanoutBo::take_managed`.
+    pub(crate) fn take_managed(
+        &mut self,
+    ) -> Option<crate::kms::render::resources::AllocationLease> {
+        self.managed.take()
+    }
+
+    /// Inverse of `take_physical_backing`, for the F2-M2 rollback.
+    pub(crate) fn restore_physical_backing(&mut self, backing: CopiedRenderSourceBacking) {
+        let CopiedRenderSourceBacking {
+            imported_on_sink,
+            transport_on_renderer,
+            render_target,
+            completion_semaphore,
+            completion_semaphore_reuse,
+            transfer,
+            last_gpu_render_ns,
+            render_vk,
+            sink_vk,
+            sink_wait_semaphore,
+            renderer_wait_semaphore,
+            renderer_return_completion,
+            ownership,
+        } = backing;
+        self.imported_on_sink = imported_on_sink;
+        self.transport_on_renderer = transport_on_renderer;
+        self.render_target = render_target;
+        self.completion_semaphore = completion_semaphore;
+        self.completion_semaphore_reuse = completion_semaphore_reuse;
+        self.transfer = transfer;
+        self.last_gpu_render_ns = last_gpu_render_ns;
+        self.render_vk = render_vk;
+        self.sink_vk = sink_vk;
+        self.sink_wait_semaphore = sink_wait_semaphore;
+        self.renderer_wait_semaphore = renderer_wait_semaphore;
+        self.renderer_return_completion = renderer_return_completion;
+        self.ownership = ownership;
     }
 
     /// Consuming extraction for Task-4 managed adoption (B-13): takes every
@@ -951,7 +1008,7 @@ impl CopiedRenderSource {
             ownership: CopiedSourceOwnership::RendererFirstUse,
             render_target_contents: CopiedRenderTargetContents::Uninitialized,
             disarmed: false,
-            managed_key: None,
+            managed: None,
         })
     }
 
@@ -3178,7 +3235,7 @@ impl ScanoutBo {
             vk,
             disarmed: false,
             gbm_bo: None,
-            managed_key: None,
+            managed: None,
         }
     }
 }
@@ -3471,12 +3528,59 @@ impl ScanoutBo {
             vk,
             disarmed: false,
             gbm_bo,
-            managed_key: None,
+            managed: None,
         })
     }
 
-    pub(crate) fn set_managed_key(&mut self, key: crate::kms::render::resources::AllocationKey) {
-        self.managed_key = Some(key);
+    /// The key of the `Retain` lease rooting this bo's managed adoption, if
+    /// converted (F2-B1). Derived from the lease itself, not a separate
+    /// field, so there is exactly one place ownership can go stale.
+    pub(crate) fn managed_key(&self) -> Option<crate::kms::render::resources::AllocationKey> {
+        self.managed.as_ref().map(|lease| lease.key())
+    }
+
+    /// Roots `lease` in this pool slot (F2-B1): the entry stays alive as
+    /// long as the lease does, not merely until the next `service_ready`
+    /// tick finds zero live uses.
+    pub(crate) fn set_managed(&mut self, lease: crate::kms::render::resources::AllocationLease) {
+        self.managed = Some(lease);
+    }
+
+    /// Ends this slot's managed reservation (F2-B1): `detach_managed_entries`
+    /// and pool drain/replacement call this, which is what makes the entry
+    /// destroyable on the next tick -- not a mere key clear.
+    pub(crate) fn take_managed(
+        &mut self,
+    ) -> Option<crate::kms::render::resources::AllocationLease> {
+        self.managed.take()
+    }
+
+    /// Inverse of `take_physical_backing`, for the F2-M2 rollback: restores
+    /// this bo to full legacy ownership after a paired managed adoption
+    /// failed downstream of extraction.
+    pub(crate) fn restore_physical_backing(&mut self, backing: ScanoutBoBacking) {
+        let ScanoutBoBacking {
+            fb_handle,
+            gem_handle,
+            gbm_bo,
+            drm: _,
+            image,
+            memory,
+            view,
+            transfer,
+            vk: _,
+        } = backing;
+        self.fb_handle = fb_handle;
+        self.gem_handle = gem_handle;
+        self.gbm_bo = gbm_bo;
+        self.vk_image = image;
+        self.vk_memory = memory;
+        self.vk_image_view = view;
+        self.vk_transfer = transfer;
+        // `drm`/`vk` are dropped here: `take_physical_backing` only ever
+        // cloned them (they are shared, ref-counted context, not
+        // exclusively-owned kernel objects), so this bo already holds its
+        // own aliases and the backing's copies are simply redundant now.
     }
 
     /// Submit a real color-attachment clear through this BO on a disposable
