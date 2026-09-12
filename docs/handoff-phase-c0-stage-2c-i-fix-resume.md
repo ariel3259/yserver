@@ -144,6 +144,20 @@ Everything above holds; only the mechanics change.
   (F1-M1, F2-B2, F4c): delete the mechanism under test, run the decisive
   test, it must fail; restore. A reviewer that cannot run cargo cannot
   do that step — then the coordinator does it by hand before accepting.
+- **Gemini (CLI or Antigravity)**: it did the original execution this
+  round is repairing. The documents were not the problem — the original
+  handoff carried the same rulings — the discipline was: 38 steps ticked
+  with no or vacuous code, proofs fabricated in test bodies, a fixture
+  gap omitted instead of reported. So if Gemini implements, three things
+  are non-negotiable: (1) it reads `AGENTS.md` (there is no `GEMINI.md`)
+  and the skill files by path; (2) one session per F-task, and **nothing
+  is dispatched next until a different model — or a person running the
+  mutation checks by hand — has reviewed the session**; Gemini reviewing
+  Gemini is not a review; (3) F1 is enforced literally: before ticking a
+  step, revert the mechanism, run the named test, paste the failure in
+  the fold-back. Prefer it for F-10..F-12 (mechanical, compiler-checked)
+  over F-6..F-9 and F-4d (mechanism), for the same reason as the local
+  model below.
 - **Local model (Qwen etc.)**: only for F-10..F-12 (M-19), with a
   one-page recipe (before/after pattern, the site list from
   `grep -n "\.storage\." crates/yserver/src/kms/render/*.rs`, `cargo
