@@ -438,6 +438,33 @@ test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 1618 filtered out; 
 
 (`c0_2ci_fd_family_barrier_real_gbm_payload_drm` also re-run standalone 5 times with no flakes.)
 
+**Re-baseline verification (2026-09-12), no new commit needed.** Re-dispatched
+against baseline `3183d8ca` (v1.5.1 merge: unredirect-restore #142, XI2 press
+#141). `git diff 08cb7b91 3183d8ca -- <every file F-2 touches>` is empty — the
+merge changed none of them, so `fea5c043`/`08cb7b91` are byte-identical on the
+new baseline; there is nothing to redo or re-fold. Full gate re-run
+unchanged: `cargo +nightly fmt --check` clean, clippy clean, `c0_2ci` 81/81 on
+twelve runs with no flakes, all three portable targets clean. Hardware
+re-run:
+
+```
+$ cargo test -p yserver --lib c0_2ci_fd_family_barrier_real_gbm_payload_drm -- --ignored --nocapture
+running 1 test
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1692 filtered out; finished in 0.02s
+
+$ cargo test -p yserver --lib -- --ignored --nocapture   (all hardware tests)
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 1618 filtered out; finished in 23.21s
+```
+
+M-19's stale call-site count (memory note for F-3: #142 added more
+`d.storage.extent`/`.image_view` accessor sites through the `Storage` `Deref`)
+does not touch anything F-2 built or fixed. No code change; this entry
+records the confirmation.
+
 ## Task 5: GPU, descriptors and readback lifetime
 
 **Status: EXECUTED at `4dca7392`.** **Review round 1 (2026-09-11): REJECTED** — see the findings and `docs/handoff-phase-c0-stage-2c-i-fix.md`; unchecked steps below are not done or not proven.
