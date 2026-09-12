@@ -844,6 +844,97 @@ test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1703 filtered out; finished in 0.77s
 ```
 
+**Fix round 2 (F-5b): `842745a3`.** Session F-5b, the sinks half of F-5,
+closing B-10 and F5a-M1 (`docs/superpowers/findings/2026-09-11-stage-2c-i-
+implementation-review-round1.md`, `docs/superpowers/findings/2026-09-12-
+stage-2c-i-fix-F5a-review.md`) per `docs/handoff-phase-c0-stage-2c-i-fix.md`'s
+"F-5 — Task 6" section. This session resumed a prior attempt that left the
+tree dirty and non-compiling (`KmsIoExecutor::send`/
+`dispatch_blocking_at_boundary` had grown a third parameter naming the
+`pub(crate)` `TransportGate`/`OwnerWriteGrant` types, but the two calls in
+`tests/executor_async.rs` — an external integration-test crate — were
+never updated, and the same types leaking into a publicly reachable
+signature is itself a `private_interfaces` warning that `-D warnings`
+turns into a build failure). Fixed by keeping `send`/
+`dispatch_blocking_at_boundary` at their original 2-arg public signature
+(every real and test call site outside this file is unchanged, including
+`tests/executor_async.rs`) and moving the gate-carrying body to new
+`pub(crate)` `send_authorized`/`dispatch_blocking_at_boundary_authorized`,
+called with `None` from the public wrappers.
+
+| Finding | Verdict |
+| --- | --- |
+| B-10 (Task 6, R11 — the transport gate is enforced at zero sinks) | **RESOLVED (tests: `c0_2ci_sink_legacy_page_flip_gate_four_states`, `c0_2ci_sink_direct_atomic_flip_gate_four_states`, `c0_2ci_sink_composed_unflip_gate_four_states`, `c0_2ci_sink_modeset_install_gate_four_states`, `c0_2ci_sink_output_disable_gate_four_states`, `c0_2ci_sink_cursor_gate_four_states` in `platform.rs`, `c0_2ci_sink_helper_mutation_gate_four_way`)** for six of the eight code-bearing rows in the R11 inventory below; **DEFERRED** for gamma (code done, test not built — see the inventory's Gamma row and the note beneath it) |
+| F5a-M1 (`DirectOwnershipState`'s only implementor is a free-floating `Cell` pair nobody sets) | **RESOLVED (test: `c0_2ci_scanout_m2_ownership_handle_reflects_real_backend_state` in `backend.rs`)** — `DirectOwnershipSignal` deleted; `ScanoutM2OwnershipHandle` (a clone of `ScanoutM2State`'s own live cells) is the real implementor, kept in sync by `sync_ownership()` called at every `current`/`pending`/`queued_successor`/`unflip_requested` mutation site. `FakeDirectOwnershipState` (test-only) is unchanged |
+| Minor (`consume_owner_write` masks accounting bugs with `if outstanding > 0 { -= 1 }`) | **RESOLVED (test: `c0_2ci_transport_gate_consume_owner_write_checked_subtraction`)** — checked subtraction, `ResourceError::InvalidState` on underflow instead of silently doing nothing |
+
+Mutation checks performed and reverted: (1) deleting `disable_output`'s
+`if !legacy_write_permitted { return Err(...) }` makes
+`c0_2ci_sink_output_disable_gate_four_states` fail (Quiescing/Owner/Closed
+all start reaching the real ioctl); (2) deleting the `authorize_write` call
+in `send_authorized` makes `c0_2ci_sink_helper_mutation_gate_four_way` fail
+(the Quiescing case dispatches instead of refusing); (3) making
+`consume_owner_write` return `Ok(())` without decrementing
+`outstanding_owner_writes` makes the same test's
+"grant must be consumed at send" assertion fail (`left: 1, right: 0`).
+
+### R11 sink inventory (this session's; supersedes the reviewer's table)
+
+| Sink | Real entry point(s) | Class | Gated/Observational/Cleanup | Test |
+| --- | --- | --- | --- | --- |
+| Legacy page flip (composed) | `drm/page_flip.rs::submit_flip_with_fences` | `Primary` | **Gated** — checked immediately before `atomic_commit`; callers `scene.rs::submit_shared_scanout_frame`, `platform.rs::submit_copied_scanout` compute the real check via `PlatformBackend::allows_legacy` | `c0_2ci_sink_legacy_page_flip_gate_four_states` |
+| Direct atomic flip | `drm/modeset.rs::submit_direct_scanout` | `Primary` | **Gated** — caller `backend.rs::submit_direct_frame` | `c0_2ci_sink_direct_atomic_flip_gate_four_states` |
+| Composed unflip | `drm/modeset.rs::submit_composed_scanout` | `Unflip` | **Gated** — caller `backend.rs::submit_composed_unflip` | `c0_2ci_sink_composed_unflip_gate_four_states` |
+| Modeset install | `drm/modeset.rs::commit_modeset` | `Modeset`/`Dpms` | **Gated** — callers: `platform.rs::replay_copy_free_scanout_plan`/`replay_copied_scanout_plan` (via `allocate_copy_free_scanout_pool`/`allocate_copied_scanout_pool`, reached with `commit_first_framebuffer=true` only from `enable_connector_inner`; the `PlatformBackend::new` bring-up and `prepare_qualified_connector_plan` call sites pass `commit_first_framebuffer=false`, so `commit_modeset` — and the `bool` value passed for it — is unreachable there, documented at each site), `enable_connector_inner`'s own direct commit, `dpms_set_outputs_active(true)` | `c0_2ci_sink_modeset_install_gate_four_states` |
+| Test-only modeset | `drm/modeset.rs::{test_modeset, test_modeset_strict}` | — | **Observational, no gate** — `TEST_ONLY` atomic commits never latch hardware state (probe-only, per the plan's own 6.5a table: "read-only probe portions may run; installation cannot") | — |
+| Output disable | `drm/modeset.rs::disable_output` | `Modeset`/`Dpms` | **Gated** — callers `platform.rs::disable_connector`, `PlatformBackend::disable_output` (post-loop teardown), `dpms_set_outputs_active(false)` | `c0_2ci_sink_output_disable_gate_four_states` |
+| Startup rollback | same `disable_output` | — | **Gated at the sink** (identical check) — callers `kms/backend.rs::activate_initial_scanout_outputs`'s bring-up rollback loop, `PlatformBackend`'s `Drop` impl and `open_with_commit`'s `InitialScanoutRollbackGuard`: all three run before any `PlatformBackend` (hence any transport gate) exists, so they pass `true` literally, with a comment at each site citing R8 | covered by `disable_output`'s test above (same function; these callers are construction-time-only and cannot install a gate to exercise) |
+| Cursor set/move | `kms/cursor_plane.rs::CursorPlane::{show,hide,move_to}`, gated at their `PlatformBackend` callers `cursor_plane_show_on_crtc`, `try_cursor_plane_move_for_device` (shared by `cursor_plane_move`/`cursor_plane_drain_pending_move_for_output`), `cursor_plane_hide_on_crtc`, `cursor_plane_hide_all` | `Cursor` | **Gated** — all four share the identical `self.allows_legacy(&device_key, WriterClass::Cursor)` guard immediately before their ioctl | `c0_2ci_sink_cursor_gate_four_states` drives `cursor_plane_hide_on_crtc` (the one entry point whose ioctl doesn't need a real dumb buffer or pre-marked-visible CRTC to reach a real fd) through all four states; show/move/hide_all are covered by code inspection of the identical guard, not a separate four-way run |
+| Gamma | `backend.rs::apply_gamma_to_live_output` (called by `set_crtc_gamma`, `reapply_gamma_for_output`, `reapply_gamma_for_live_outputs`) | `Gamma` | **Gated in code**, immediately before `Device::set_gamma` — **no deterministic test**: `apply_gamma_to_live_output` requires `live_crtc_and_gamma_size` to succeed first, and that function's own `device.get_crtc(crtc)` read fails on `Device::for_tests()`'s socket fd (confirmed empirically: `Custom { kind: Other, error: "... Inappropriate ioctl for device (os error 25)" }`) *regardless of gate state*, so the gate check is unreachable through this fixture in any state, not just the refused ones. A `_drm` hardware test would need to acquire real DRM master on this box's live display to get `get_crtc` past that first read, which is unsafe/disruptive to attempt from an unattended fix session — **F8: stopping here rather than shipping a fabricated pass.** | none |
+| Helper mutation (owner atomic) | `executor/mod.rs::send_authorized` (the `pub(crate)` body of the public `send`/`dispatch_blocking_at_boundary`) | `HelperMutation` | **Gated, and the only sink that actually consumes an `OwnerWriteGrant`** at the serialized send boundary (R7) — every real production call site (`owner/device.rs`'s four producers) passes `None`, per R8 | `c0_2ci_sink_helper_mutation_gate_four_way` |
+| Vblank sequence arm | `drm/page_flip.rs::drm_crtc_queue_sequence` | — | **Observational, no gate** — `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` is a read (queries a future vblank sequence number), not a state mutation; not in the plan's 6.5a table | — |
+| FB removal / GEM close | `drm_cleanup.rs`, `buffer.rs`, `vk/scanout.rs`, `modeset.rs` payload destructors | — | **Cleanup class, governed by Task-2 rights** (`DrmCleanupRight`/`GemOwner`), not the transport gate — per R11's own text | — (Task 2's own tests) |
+
+Left unticked (F1/F8): 6.5a and 6.5b stay `- [ ]` because gamma's proof is
+deferred, not because the mechanism is missing — six of eight code-bearing
+rows are proven with a test that would fail on the pre-fix tree, gamma's
+code is done and its check is real (the row is not "ungated," it is
+"unproven" for a fixture reason, not a design one) but has no test, and a
+step with even one unproven row does not get ticked. 6.5b's content (the
+`c0_2ci_sink_helper_mutation_gate_four_way` grant-consumption test above is
+6.5b's four-way — "no grant"/"wrong class" collapse into the same
+`ResourceError::InvalidProof` path since a class mismatch is the only way
+this stage's fixtures can present "no valid grant"; a foreign device/
+incarnation case is already covered by the pre-existing
+`c0_2ci_transport_gate_owner_write_contract`, unchanged this session).
+
+Gate for this round: `cargo +nightly fmt --check` clean; `cargo clippy
+--all-targets -- -D warnings` clean; `cargo test -p yserver --lib c0_2ci`
+101 passed/0 failed/10 ignored on a clean run and on twelve consecutive
+runs (zero flakes); `cargo test -p yserver --lib c0_2ci -- --ignored` 10
+passed/0 failed (this box's real DRM node + NVIDIA/RADV ICDs, unchanged
+from F-5a's run); full `cargo test -p yserver --lib` 1639 passed/0 failed
+(no R2 flake observed this run); `cargo check -p yserver --target
+x86_64-unknown-linux-musl` and `--target x86_64-unknown-freebsd` both
+clean.
+
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 10 tests
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1711 filtered out; finished in 0.75s
+```
+
 **Files:** Create `resources/completion.rs` and `resources/transport.rs`; modify `backend.rs` and `platform.rs`. Extend `crates/yserver-core/src/core_loop/run.rs` tests only if needed to observe the existing completion callback.
 
 **Consumes:** Service pending tickets; current `before_block`, `on_owner_completion_ready`, `next_wakeup`, `owner_completion_deadline`, `service_owner_completions`, scanout completion registrations and executor-control processing.
