@@ -5770,6 +5770,44 @@ impl KmsBackend {
         })?;
         let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
         base.platform.attach_test_vk_context(Arc::clone(&vk));
+
+        // F4-B2: `Device::for_tests()` is a Unix-socket stand-in and cannot
+        // service `PRIME_FD_TO_HANDLE`/`ADDFB2`/`RMFB` -- every scanout-pool
+        // allocation below fails with `ENOTTY`. Those three ioctls carry no
+        // `DRM_AUTH`/`DRM_MASTER` requirement in the kernel (flags `0` and
+        // `DRM_RENDER_ALLOW` respectively), so a real primary node opened
+        // WITHOUT master is sufficient and safe to hold alongside whatever
+        // display server already owns master on this box; the fixture never
+        // commits. Substitute it for every KMS owner the fixture seeded (R12:
+        // an environmental `panic!`, not a silent skip, when no node exists).
+        //
+        // On a multi-GPU box the first enumerable primary node need not be
+        // the one this `vk` was built against: `ADDFB2` on a framebuffer
+        // from another GPU's PRIME export fails closed with EINVAL
+        // (observed here: NVIDIA discrete + AMD integrated -- Vulkan scores
+        // the discrete device higher, blind `card0` is the integrated
+        // one). Prefer the node `VK_EXT_physical_device_drm` reports for the
+        // physical device this `vk` actually selected; fall back to any
+        // real node only when that extension is unavailable.
+        let real_drm = vk
+            .selected_drm_identity
+            .and_then(|identity| identity.primary)
+            .and_then(crate::kms::executor::test_support::TestDevice::open_real_drm_matching)
+            .or_else(crate::kms::executor::test_support::TestDevice::open_real_drm_or_ignore)
+            .unwrap_or_else(|| {
+                panic!(
+                    "environmental skip: no real DRM primary node (/dev/dri/cardN) available; \
+                     for_tests_with_vk_live_scene needs one for PRIME_FD_TO_HANDLE/ADDFB2/RMFB \
+                     scanout pool allocation"
+                )
+            });
+        let real_device = Rc::new(crate::drm::Device::from_file_for_tests(
+            real_drm.into_file(),
+        ));
+        for kms_device in &mut base.platform.devices {
+            kms_device.device = Rc::clone(&real_device);
+        }
+
         let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
         let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
         for (i, layout) in base.platform.outputs.iter().enumerate() {
@@ -15926,18 +15964,49 @@ fn read_scanout_region(
 /// `#[allow(dead_code)]`: R8 -- this has no production caller yet, only the
 /// `#[cfg(test)]` `c0_2ci_read_source_scratch_regression_vulkan`, so a
 /// plain (non-test) build sees it as unused.
+///
+/// F4-M2: `source_key` is not a parameter. Nothing tied a caller-supplied
+/// key to the buffer actually read, so a caller could correlate the proof
+/// against an unrelated entry. The key is instead derived from the pool
+/// slot the read actually samples: `select_scanout_bo_for_rect` is the
+/// exact selection `read_scanout_region` performs internally, and nothing
+/// mutates the backend's scanout pools between this lookup and that call,
+/// so the two selections agree. A bo that resolves but is not a managed
+/// allocation (`managed_key() == None`) fails closed rather than silently
+/// skipping correlation.
 #[allow(dead_code)]
 pub(crate) fn read_scanout_region_for_managed_source(
     backend: &mut KmsBackend,
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
     service: &mut crate::kms::render::resources::ResourceService,
-    source_key: crate::kms::render::resources::AllocationKey,
     source_obligation: crate::kms::render::resources::ObligationId,
 ) -> (
     io::Result<Vec<u8>>,
     Result<(), crate::kms::render::resources::ResourceError>,
 ) {
+    let managed_source_key = select_scanout_bo_for_rect(backend, rect, selection)
+        .ok()
+        .and_then(|(pool_idx, bo_idx, _)| {
+            backend
+                .platform
+                .scanout_pools
+                .get(pool_idx)
+                .and_then(Option::as_ref)
+                .and_then(|pool| pool.display_pool().bos.get(bo_idx))
+                .and_then(|bo| bo.managed_key())
+        });
+
+    let Some(source_key) = managed_source_key else {
+        return (
+            Err(io::Error::other(
+                "read_scanout_region_for_managed_source: selected scanout bo is not a managed \
+                 allocation",
+            )),
+            Err(crate::kms::render::resources::ResourceError::InvalidProof),
+        );
+    };
+
     let result = read_scanout_region(backend, rect, selection);
     let recorded = crate::kms::render::resources::gpu::record_read_outcome(
         service,
@@ -40141,12 +40210,24 @@ mod tests {
     /// snapshot path above with a managed source and a managed scratch
     /// allocation.
     ///
+    /// F4-M2: source and scratch are real payload types, not `Spy`. The
+    /// source is the live-scene pool's own on-screen scanout bo, converted
+    /// to a managed `ScanoutAllocation` through the real
+    /// `register_managed_scanout_bo` (F-2's conversion) over a real
+    /// `DrmCleanupRegistry` (real device, counting `MockCleanupIo`
+    /// transport -- no real `RMFB`/`GEM_CLOSE` ioctl is issued, but the real
+    /// fb/gem handles are what gets recorded). The scratch is a real
+    /// `StorageAllocation`, adopted via `Storage::into_managed` exactly as
+    /// Composite's own scratch allocation would be.
+    ///
     /// The source-read proof comes from `read_scanout_region_for_managed_source`
     /// correlating the REAL, already-observed outcome of the real
     /// `read_scanout_region` call (real CPU copy off the real composited
     /// scanout) with the source's registered `Read` obligation -- this test
-    /// body never calls `apply_validated_proof` for that proof (F3). The
-    /// scratch allocation's GPU obligation is proven independently, from a
+    /// body never calls `apply_validated_proof` for that proof (F3), and the
+    /// adapter derives the source key itself from the bo it actually reads
+    /// rather than taking it as a parameter this test could point anywhere.
+    /// The scratch allocation's GPU obligation is proven independently, from a
     /// REAL async Vulkan submission's fence (`FencePool::acquire` +
     /// `vk::ops::submit_one_shot_op_async`) polled through the existing,
     /// reviewed-sound `poll_gpu` machinery -- never `test_signal()` on a
@@ -40155,13 +40236,13 @@ mod tests {
     #[ignore = "needs live Vulkan ICD"]
     fn c0_2ci_read_source_scratch_regression_vulkan() {
         use ash::vk;
-        use std::{cell::Cell, sync::Arc};
+        use std::{cell::RefCell, sync::Arc};
         use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
         use yserver_protocol::x11::ResourceId;
 
         use crate::kms::render::resources::{
-            AllocationPayload, CoreRetirementBatch, GpuObligation, ObligationKind, ResourceService,
-            tests::SpyAllocation,
+            CoreRetirementBatch, DrmCleanupRegistry, GpuObligation, ObligationKind,
+            ResourceService, tests::MockCleanupIo,
         };
 
         let mut state = ServerState::new();
@@ -40212,35 +40293,6 @@ mod tests {
             .expect("fill window");
         backend.tick_maybe_composite_for_tests();
 
-        let dev = DrmDeviceKey {
-            major: 226,
-            minor: 0,
-        };
-        let inc = IncarnationId::first();
-        let mut service = ResourceService::new(dev, inc);
-
-        // "Managed source": stands in for the retained root snapshot source
-        // being read -- what the read obligation gates is its lifecycle,
-        // independent of what physically backs it.
-        let source_drops = Rc::new(Cell::new(0));
-        let source_lease = service
-            .adopt(AllocationPayload::Spy(SpyAllocation {
-                drops: Rc::clone(&source_drops),
-            }))
-            .unwrap();
-        let source_key = source_lease.key();
-        let source_read = service.register(source_key, ObligationKind::Read).unwrap();
-
-        // Managed scratch: retained by its own GPU obligation/ticket only.
-        let scratch_drops = Rc::new(Cell::new(0));
-        let scratch_lease = service
-            .adopt(AllocationPayload::Spy(SpyAllocation {
-                drops: Rc::clone(&scratch_drops),
-            }))
-            .unwrap();
-        let scratch_key = scratch_lease.key();
-        let scratch_gpu = service.register(scratch_key, ObligationKind::Gpu).unwrap();
-
         let scan_rect = vk::Rect2D {
             offset: vk::Offset2D { x: 40, y: 40 },
             extent: vk::Extent2D {
@@ -40248,6 +40300,68 @@ mod tests {
                 height: 16,
             },
         };
+
+        // Identify the exact on-screen bo `read_scanout_region` will sample
+        // -- the same selection it performs internally -- so the "managed
+        // source" registered below is that real bo, not a stand-in for it.
+        let (pool_idx, bo_idx, _) = super::select_scanout_bo_for_rect(
+            &backend,
+            scan_rect,
+            super::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("on-screen scanout bo for the composited region");
+
+        let dev = DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let inc = IncarnationId::first();
+        let mut service = ResourceService::new(dev, inc);
+
+        let device_key = backend.platform.outputs[pool_idx].key.device_key;
+        let kms_device_rc = backend
+            .platform
+            .device_for_key(device_key)
+            .expect("live-scene fixture output has a KMS owner")
+            .device
+            .clone();
+        let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
+        let mut registry = DrmCleanupRegistry::new_with_device_and_io(
+            kms_device_rc,
+            device_key,
+            inc,
+            Box::new(MockCleanupIo::new(Rc::clone(&cleanup_calls))),
+        );
+
+        // "Managed source": the real on-screen scanout bo, converted from
+        // legacy to managed ownership (B-13's consuming extraction) rather
+        // than a `Spy` standing in for it.
+        let source_key = backend
+            .platform
+            .register_managed_scanout_bo(&mut service, &mut registry, pool_idx, bo_idx)
+            .expect("register the on-screen scanout bo as a managed source");
+        let source_read = service.register(source_key, ObligationKind::Read).unwrap();
+
+        // Managed scratch: a real `StorageAllocation`, adopted the way
+        // Composite's own scratch allocation would be, retained by its own
+        // GPU obligation/ticket only.
+        let scratch_storage = backend
+            .platform
+            .allocate_drawable_storage(16, 16, 24)
+            .expect("allocate real scratch storage");
+        let scratch_target = PaintTarget::new(
+            crate::kms::render::store::DrawableId::for_tests(0x5c_a7c4),
+            (0, 0),
+            None,
+            24,
+        );
+        let scratch_lease = scratch_storage
+            .into_managed(&mut service, &backend.platform, scratch_target, (0, 0))
+            .map_err(|(e, _)| e)
+            .expect("adopt real scratch storage")
+            .allocation;
+        let scratch_key = scratch_lease.key();
+        let scratch_gpu = service.register(scratch_key, ObligationKind::Gpu).unwrap();
 
         // Real read, real proof: the adapter correlates the real
         // `read_scanout_region`'s actual `Ok`/`Err` with the source's
@@ -40257,7 +40371,6 @@ mod tests {
             scan_rect,
             super::ScanoutReadSelection::OnScreenOnly,
             &mut service,
-            source_key,
             source_read,
         );
         let scanout_bytes = result.expect("scanout readback");
@@ -40283,16 +40396,31 @@ mod tests {
         );
         // Scratch cleanup remains behind its own upload/Composite ticket --
         // untouched by the source read that just completed.
-        assert_eq!(scratch_drops.get(), 0);
+        assert!(service.contains(&scratch_key));
+        assert!(
+            cleanup_calls.borrow().is_empty(),
+            "source read completion is not itself a file-owned discharge"
+        );
 
-        drop(source_lease);
-        service.service_ready();
-        assert_eq!(
-            source_drops.get(),
-            1,
+        // Drop the pool's retain lease on the source -- the source's read
+        // obligation is already discharged and nothing else holds it, so
+        // this is what actually makes it destroyable.
+        backend.platform.scanout_pools[pool_idx]
+            .as_mut()
+            .expect("live-scene output has a scanout pool")
+            .detach_managed_entries();
+        service.service_ready_with_registry(&mut registry);
+        assert!(
+            !service.contains(&source_key),
             "source retention is not extended by scratch use"
         );
-        assert_eq!(scratch_drops.get(), 0);
+        assert_eq!(
+            cleanup_calls.borrow().len(),
+            2,
+            "source destruction must discharge file_owned through the registry \
+             (one RemoveFb, one CloseGem)"
+        );
+        assert!(service.contains(&scratch_key));
 
         // Scratch's own GPU proof: a REAL async submission against a REAL
         // fence, never a fabricated `test_signal()`.
@@ -40317,10 +40445,11 @@ mod tests {
         )
         .expect("submit scratch no-op");
 
-        // Immediately after submission the real fence is not yet observed
-        // signaled -- `queue_submit2` only enqueues the work.
-        assert!(!scratch_ticket.poll_signaled_result(&vk_ctx).unwrap());
-
+        // F4-M1: no assertion about the fence's state immediately after
+        // submission -- a no-op submission can already be signalled by the
+        // time it is polled (R2). The only evidence is the deterministic
+        // sequence below: wait for real retirement, poll the real ticket,
+        // service the entry, and observe it destroyed exactly once.
         let mut batch = CoreRetirementBatch::new(vec![scratch_lease], Vec::new(), true);
         batch.bind_ticket(GpuObligation::new(
             vec![(scratch_key, scratch_gpu)],
@@ -40329,19 +40458,12 @@ mod tests {
         ));
         service.register_batch(batch);
 
-        // Poll while genuinely unsignaled: nothing completed.
-        service.poll_gpu(std::time::Instant::now()).unwrap();
-        assert_eq!(scratch_drops.get(), 0);
-
-        // Wait for the real submission to retire, then observe the genuine
-        // signal through the same ticket and release the scratch's final
-        // logical lease.
         scratch_ticket
             .wait(&vk_ctx)
             .expect("wait for scratch ticket");
         service.poll_gpu(std::time::Instant::now()).unwrap();
         service.service_ready();
-        assert_eq!(scratch_drops.get(), 1);
+        assert!(!service.contains(&scratch_key));
     }
 
     #[test]

@@ -832,14 +832,13 @@ impl ResourceService {
         &self.pending_batches
     }
 
-    /// Test-only (F4): lets a `_vulkan` mechanism test flip a registered
-    /// batch's `test_ticket_status` in place, without needing to fabricate
-    /// a second, independently-signaled real ticket for every step of a
-    /// multi-poll scenario. `GpuObligation.context` still requires a real
-    /// `Arc<VkContext>` to construct at all (M-23) -- this only controls
-    /// what `ticket_status()`'s `#[cfg(test)]` override reports, exactly as
-    /// `CoreRetirementBatch::test_ticket_status` already does before
-    /// registration.
+    /// Test-only (F4): lets a mechanism test flip a registered batch's
+    /// `test_ticket_status` in place, without needing to fabricate a second,
+    /// independently-signaled ticket for every step of a multi-poll
+    /// scenario. `GpuObligation.context` is `Option<Arc<VkContext>>`
+    /// (F4-B1); this only controls what `ticket_status()`'s `#[cfg(test)]`
+    /// override reports, exactly as `CoreRetirementBatch::test_ticket_status`
+    /// already does before registration.
     #[cfg(test)]
     pub(crate) fn pending_batches_mut(&mut self) -> &mut [CoreRetirementBatch] {
         &mut self.pending_batches

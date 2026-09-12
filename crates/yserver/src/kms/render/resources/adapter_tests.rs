@@ -287,20 +287,14 @@ fn c0_2ci_adapter_uncertain_gpu_read_submit_retention() {
 
 // ── 6. VT-away / DPMS-off / idle scene ──────────────────────────────────────
 //
-// M-23: `GpuObligation.context` is `Arc<VkContext>` by value -- there is no
-// `#[cfg(test)]` shim that builds one without a live device, so this test
-// needs `live_platform()` just to construct the obligation at all, even
-// though (like the pre-fix version) it never lets a real ticket reach the
-// device: `test_ticket_status` intercepts `ticket_status()` first.
+// F4-B1: `GpuObligation.context` is `Option<Arc<VkContext>>` and
+// `#[cfg(test)] for_tests_stub` builds one with `context: None` -- legal
+// here because, as before, this test never lets a real ticket reach the
+// device: `test_ticket_status` intercepts `ticket_status()` first. No live
+// device is needed to construct the value any more, so this is deterministic
+// again.
 #[test]
-#[ignore = "needs live Vulkan ICD"]
-fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress_vulkan() {
-    let platform = match live_platform() {
-        Some(p) => p,
-        None => panic!("environmental skip: no live Vulkan ICD available; not claiming pass"),
-    };
-    let vk = platform.vk.clone().expect("live_platform installs vk");
-
+fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress() {
     let (mut dummy_service, dummy_lease, dummy_drops) = spy_service();
     let dummy_key = dummy_lease.key();
     let dummy_gpu = dummy_service
@@ -313,7 +307,10 @@ fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress_vulkan() {
         vec![vk::DescriptorSet::from_raw(0)],
         true,
     );
-    batch.bind_ticket(GpuObligation::new(vec![(dummy_key, dummy_gpu)], ticket, vk));
+    batch.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(dummy_key, dummy_gpu)],
+        ticket,
+    ));
     batch.test_ticket_status = Some(Ok(false));
     dummy_service.register_batch(batch);
 

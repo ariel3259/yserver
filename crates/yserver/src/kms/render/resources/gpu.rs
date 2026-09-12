@@ -16,17 +16,21 @@ use crate::kms::{
 /// A GPU obligation tracking pending execution for allocations covered by a submission fence.
 /// Not Send.
 ///
-/// `context` is `Arc<VkContext>` by value (M-23): a `GpuObligation` exists
-/// only once a real submission has returned a real ticket, and its
-/// completion can only ever be proven against the real device that issued
-/// it. There is no `#[cfg(test)]` shim that constructs one with an absent
-/// context -- unlike `SharedBacking` (F2-m2), nothing here is a payload
-/// destructor that can leave a guard unreachable; every caller, test or
-/// production, must hold a live `Arc<VkContext>` to build one at all.
+/// `context` is `Option<Arc<VkContext>>` (F4-B1, the F5 amendment at
+/// F2-m2): every non-test constructor (`new`) still takes `Arc<VkContext>`
+/// by value and stores `Some` -- a `GpuObligation` built by production or by
+/// a `_vulkan` test exists only once a real submission has returned a real
+/// ticket, and its completion can only ever be proven against the real
+/// device that issued it. The *only* `None` constructor is
+/// `#[cfg(test)] for_tests_stub`, for deterministic tests of the batch
+/// machine's logic (atomicity, quarantine, freeze, serviced-time accounting)
+/// that drive completion through `CoreRetirementBatch::test_ticket_status`
+/// and never reach `poll_signaled_result` at all. A `None` reaching the real
+/// poll path is a bug, not a fallback status -- see `ticket_status` below.
 pub(crate) struct GpuObligation {
     pub(crate) entries: Vec<(AllocationKey, ObligationId)>,
     pub(crate) ticket: FenceTicket,
-    pub(crate) context: Arc<VkContext>,
+    pub(crate) context: Option<Arc<VkContext>>,
 }
 
 impl fmt::Debug for GpuObligation {
@@ -47,7 +51,25 @@ impl GpuObligation {
         Self {
             entries,
             ticket,
-            context,
+            context: Some(context),
+        }
+    }
+
+    /// The only `None`-context constructor (F4-B1). For deterministic tests
+    /// of the batch machine's logic that never let a real ticket reach
+    /// `poll_signaled_result` -- `CoreRetirementBatch::test_ticket_status`
+    /// always intercepts `ticket_status()` first. Not reachable outside
+    /// `#[cfg(test)]`, and not a substitute for a live device in any
+    /// production or `_vulkan` path.
+    #[cfg(test)]
+    pub(crate) fn for_tests_stub(
+        entries: Vec<(AllocationKey, ObligationId)>,
+        ticket: FenceTicket,
+    ) -> Self {
+        Self {
+            entries,
+            ticket,
+            context: None,
         }
     }
 
@@ -59,8 +81,8 @@ impl GpuObligation {
         &self.ticket
     }
 
-    pub(crate) fn context(&self) -> &Arc<VkContext> {
-        &self.context
+    pub(crate) fn context(&self) -> Option<&Arc<VkContext>> {
+        self.context.as_ref()
     }
 }
 
@@ -189,9 +211,18 @@ impl CoreRetirementBatch {
             return Ok(true);
         };
 
-        // F5: no status fallback. `poll_signaled_result` always has a real
-        // `&VkContext` to query -- `GpuObligation.context` is never absent.
-        ob.ticket.poll_signaled_result(&ob.context)
+        // F5/F4-B1: no status fallback. `test_ticket_status` above is the
+        // only legal way to reach this method with `context: None` --
+        // production and every `_vulkan` test bind a real ticket through
+        // `GpuObligation::new`, which always stores `Some`. A `None` here
+        // means a real batch was polled without ever having had a real
+        // submission bind it, which is a bug in the caller, not a status to
+        // report.
+        let context = ob.context.as_ref().expect(
+            "GpuObligation.context is None outside #[cfg(test)] for_tests_stub, which always \
+             intercepts via test_ticket_status before reaching poll_signaled_result",
+        );
+        ob.ticket.poll_signaled_result(context)
     }
 
     pub(crate) fn obligation(&self) -> Option<&GpuObligation> {
