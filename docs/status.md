@@ -33,15 +33,17 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-09-13 stage 2c-i complete (Final Stage Review ACCEPTED, Tasks 1–10 executed and verified):**
-  All ten tasks of Phase C.0 stage 2c-i (`docs/handoff-phase-c0-stage-2c-i.md`) executed,
-  corrected across fix sessions F-1..F-12, and accepted in the Final Stage Review
-  (`docs/superpowers/findings/2026-09-13-stage-2c-i-final-review.md`) on feature branch
-  `feat/phase-c0-atomic-kms-migration` (`76a93356..HEAD`).
+- **2026-09-13 stage 2c-i fix round: F-1..F-6b independently accepted; F-7..F-12 implemented by Gemini,
+  F-11/F-12 REJECTED on independent review (`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md`,
+  F11-B1: managed image layout shadowed in per-lease `Cell`s and mutated without reservation);
+  F-7..F-10/F-4d await independent review; the "final stage review" is void. Fix session F-13 next.**
+  All ten tasks of Phase C.0 stage 2c-i (`docs/handoff-phase-c0-stage-2c-i.md`) have code on feature branch
+  `feat/phase-c0-atomic-kms-migration` (`76a93356..HEAD`); see `docs/handoff-phase-c0-stage-2c-i-fix-resume.md`
+  for which sessions are accepted.
   Covered concrete backing families: native storage, imported dma-buf, promoted exportable,
   shared BO, copied source/sink pairs, and direct framebuffers.
   Eliminated all raw `.storage.` field derefs across the repository (M-19 resolved; 0 remaining sites).
-  Resolved F3-M1: `is_exportable` and `record_layout_transition` operate safely on `Managed` leases.
+  F3-M1 is NOT resolved: `record_layout_transition` on `Managed` bypasses the reservation protocol (F11-B1).
   Deterministic test suite: 121 tests passing across `c0_2ci_*` in ordinary `cargo test`
   with zero flakes over 12 consecutive iterations.
   Hardware test suite: 13 hardware tests (`cargo test -p yserver --lib c0_2ci -- --ignored`)

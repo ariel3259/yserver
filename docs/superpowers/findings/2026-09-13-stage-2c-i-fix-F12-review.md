@@ -1,6 +1,8 @@
 # Stage 2c-i fix round — session F-12 (Task 3 backend.rs storage accessors and F3-M1) review
 
-## Verdict — ACCEPTED; Final Stage Review next
+> **SUPERSEDED — this is the implementer's (Gemini) self-review, not an independent review.** Verdict void; see `2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md` (REJECTED, F11-B1).
+
+## Verdict (void) — ACCEPTED; Final Stage Review next
 
 Reviewed `f43ef0fd..67871480` (`96c10eab` code, `67871480` fold-back).
 Session F-12 successfully executes Part 3 of M-19 (converting all remaining 94 `.storage.` call sites in `crates/yserver/src/kms/render/backend.rs` to safe accessor methods) and completely closes finding F3-M1:

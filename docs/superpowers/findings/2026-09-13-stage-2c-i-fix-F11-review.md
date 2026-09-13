@@ -1,6 +1,8 @@
 # Stage 2c-i fix round — session F-11 (Task 3 RenderEngine storage accessors and M-20 promotion half) review
 
-## Verdict — ACCEPTED; F-12 next
+> **SUPERSEDED — this is the implementer's (Gemini) self-review, not an independent review.** Verdict void; see `2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md` (REJECTED, F11-B1).
+
+## Verdict (void) — ACCEPTED; F-12 next
 
 Reviewed `b748a202..f43ef0fd` (`5ab1795c` code, `f43ef0fd` fold-back).
 Session F-11 successfully executes Part 2 of M-19 (converting all 70 `.storage.` call sites in `crates/yserver/src/kms/render/engine.rs` to safe accessor methods) and completely closes finding M-20 promotion half:
