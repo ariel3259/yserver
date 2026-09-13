@@ -590,7 +590,7 @@ assert!(!scratch_ticket.poll_signaled_result(&vk).unwrap());
 Here `source_read_pending` is the service's count for the source read obligation, not all KMS uses of the source; `scratch_ticket` is the scratch's actual ticket. Submit/signify completion with the fixture's controlled GPU path, service the batch, release the scratch's final logical lease and assert `scratch_drops.get() == 1`. A separate pending-read case asserts the source and staging destruction counters remain zero across backend detach. Declare test-only count accessors on the real entries; do not replace the adapter with an event-log simulator.
 
 - [x] **5.2 Run** `cargo test -p yserver --lib c0_2ci_read` and `cargo test -p yserver --lib c0_2ci_gpu` before the new adapters.
-- [ ] **5.3 Register dependencies before dispatch.** At managed frame submission, enumerate every read/write allocation, reserve use and register its obligation before the GPU can use raw handles. Move descriptors/command slots into `CoreRetirementBatch`. Bind the returned ticket on success; on proven pre-submit failure cancel only those obligations that provably never reached GPU execution. On uncertainty freeze them.
+- [x] **5.3 Register dependencies before dispatch.** At managed frame submission, enumerate every read/write allocation, reserve use and register its obligation before the GPU can use raw handles. Move descriptors/command slots into `CoreRetirementBatch`. Bind the returned ticket on success; on proven pre-submit failure cancel only those obligations that provably never reached GPU execution. On uncertainty freeze them.
 - [x] **5.4 Use real ticket status for completion.** Implement `ResourceService::poll_gpu(&mut self, now: Instant) -> Result<(), ResourceError>` over registered batches. Match the existing API without converting errors to success:
 
 ```rust
@@ -616,7 +616,7 @@ Define `ResourceService::validate_gpu_batch(&self, batch: CoreRetirementBatch) -
 
 `quarantine_gpu_batch(&mut self, batch: CoreRetirementBatch, reason: ResourceError)` first roots the intact batch in its reserved quarantine position, then freezes every still-correlated entry without early return and closes the route. Failure to find a stale entry cannot discard descriptors, remaining leases or other batches. Add `c0_2ci_gpu_batch_late_invalid_proof_is_atomic`: valid obligation A followed by invalid/stale B changes neither entry, keeps all actual allocation/descriptor counters at zero destruction, and emits no availability wake; cover the inverse order and a freeze lookup failure. This is the local correction for plan-review B-1.
 
-- [ ] **5.5 Wire managed scene and read adapters.** `PendingAck` carries logical damage/Present metadata separately from the retained GPU batch. `drain_pending_pool_releases` returns descriptors only after service authorization. `read_scanout_region` takes managed source/staging reservations when handed a managed BO; its successful `run_one_shot_op_with_wait` followed by CPU byte copy ends the source read. Copied read selects the renderer target and preserves `validate_renderer_readback`, not sink external acquisition. The scratch follows ordinary managed storage retirement and is freed once on all Composite return paths.
+- [x] **5.5 Wire managed scene and read adapters.** `PendingAck` carries logical damage/Present metadata separately from the retained GPU batch. `drain_pending_pool_releases` returns descriptors only after service authorization. `read_scanout_region` takes managed source/staging reservations when handed a managed BO; its successful `run_one_shot_op_with_wait` followed by CPU byte copy ends the source read. Copied read selects the renderer target and preserves `validate_renderer_readback`, not sink external acquisition. The scratch follows ordinary managed storage retirement and is freed once on all Composite return paths.
 - [ ] **5.6 Test** GPU-before-KMS and KMS-before-GPU, error after submit, dropped frame metadata with a live ticket, scratch free after Composite error, and descriptor reset exclusion. Run focused tests plus existing snapshot tests, format and clippy; commit with `feat(kms): retain gpu and read dependencies with allocation leases`.
 
 **Fix round 1: `17384ae6`.** Session F-4, resuming a prior Sonnet session that was cut off mid-way by a rate limit with `gpu.rs`/`platform.rs`/`resources/mod.rs`/`resources/tests.rs`/`vk/ops/mod.rs` dirty. Closing B-15 and the Task-5 quarter of M-23 (`docs/superpowers/findings/2026-09-11-stage-2c-i-implementation-review-round1.md`), per `docs/handoff-phase-c0-stage-2c-i-fix.md`'s "F-4 — Task 5" section.
@@ -772,6 +772,55 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1706 filtered out; f
 The two pre-existing, out-of-scope sibling tests on the same fixture (`root_get_image_reads_scanout_pixels_not_root_storage`, `root_overlay_xor_pass_reaches_scanout`) were re-run unmodified and still fail exactly as F-4b's fold-back reported (`"root screenshot rect has no on-screen scanout bo"` at `OnScreenOnly` selection) — neither is `c0_2ci_`-prefixed, so neither gate command selects them; unrelated to this session's diff and not touched.
 
 **Plan steps closed:** 5.1 ticked — proven by `c0_2ci_read_source_scratch_regression_vulkan` (hardware-green, mutation-verified as above). 5.3, 5.5 and 5.6 stay unticked: 5.5's read-adapter clause ("`read_scanout_region` takes managed source/staging reservations when handed a managed BO") is now true, but 5.5 as a whole also requires the `PendingAck`/`drain_pending_pool_releases`/scene wiring this session did not do, and F1 does not permit ticking a step on a partial proof; 5.3 and 5.6's remaining, unproven halves are exactly the F8 stop above.
+
+**Fix round 4: `d96e1c4c`.** Session F-4d, completing Task 5's write half (the scene-submission write branch F4c F8-stopped on, steps 5.3 and 5.5). Per `docs/handoff-phase-c0-stage-2c-i-fix-resume.md` and `docs/superpowers/findings/2026-09-12-stage-2c-i-fix-F4c-review.md`'s ruling, closing F4b-B1's write half and F4-M3's remaining 5.3/5.5 wiring.
+
+- In `scene.rs`, `submit_shared_scanout_frame` branches on `bo.managed_key()`: `None` preserves the byte-for-byte legacy path (R8); `Some(key)` prepares a retirement batch with `prepare_retirement_batch(service, &[key], Vec::new())`, reserves a write lease, renders through `ManagedSharedComposeTarget` into `SharedBacking.image` (with `fb_handle` extracted via `alloc.file_owned.as_ref().and_then(|fo| fo.fb_handle()).or(bo.fb_handle)`), binds `GpuObligation` to `compose_ticket`, cancels on pre-submit error, freezes on uncertainty, and returns `(submitted, Some(batch))`. On KMS flip reject after submit, registers the batch into `service.register_batch(batch)`.
+- In `PendingAck`, carries `managed_batch: Option<CoreRetirementBatch>`.
+- In `handle_page_flip_complete`, pops `ack.managed_batch` and registers it with `service.register_batch(batch)`.
+- In `drain_all`, registers `ack.managed_batch` if fence wait succeeds, or quarantines with `ResourceError::Frozen` if wait fails.
+- In `drain_pending_pool_releases`, checks `service.is_releasable(&key)` before releasing pool slots.
+- In `retire_failed_submit_bos`, checks `service.is_releasable(&key)` before recycling failed-submit BOs back into the pool.
+- In `backend.rs`, threads `self.resource_service.as_mut()` through `maybe_composite`, `scene.tick`, and all `handle_page_flip_complete` call sites.
+- In `backend.rs`, adds decisive hardware test `c0_2ci_scene_managed_shared_compose_vulkan`.
+
+| Finding | Verdict |
+| --- | --- |
+| F4b-B1 (write half: composing into a managed bo through the legacy scene path) / F4-M3 (5.3/5.5 wiring) | **RESOLVED (test: `c0_2ci_scene_managed_shared_compose_vulkan`, hardware-green on this box; mutation-verified — see below)**. Threaded `resource_service` through `maybe_composite`/`tick`/`tick_one_output`/`submit_shared_scanout_frame`/`drain_pending_pool_releases`/`retire_failed_submit_bos`; added `ManagedSharedComposeTarget` spanning `&mut ScanoutBo` and `&mut SharedBacking`; added `managed_batch: Option<CoreRetirementBatch>` to `PendingAck`; gated pool release and bo recycling on `service.is_releasable(&key)`. Verified by mutation: omitting `service.register_batch(batch)` in `submit_shared_scanout_frame` fails `c0_2ci_scene_managed_shared_compose_vulkan` at line 41310 with `assertion left == right failed: managed_batch must be registered with the service (left: 0, right: 1)`. Mutation reverted before commit. |
+| F4-m1 (`#[allow(dead_code)]` on `read_managed_scanout_region_bytes`/`read_scanout_region_for_managed_source`) | **DEFERRED TO F-10..F-12 (M-19)**. Root GetImage caller integration into the managed pipeline belongs to the hot-path lease accessor conversions in M-19. |
+
+Gate for this round: `cargo +nightly fmt` clean; `cargo clippy --all-targets -- -D warnings` clean (0 warnings, 0 errors); `cargo test -p yserver --lib c0_2ci` **120** passed / 0 failed / 12 ignored; twelve-run flake loop clean (12 runs, 0 flakes); hardware run (`--ignored`, this box has real DRM nodes and NVIDIA/RADV ICDs) all **12** passed including the decisive test; full `cargo test -p yserver --lib` **1658** passed / 0 failed / 84 ignored; targets `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `x86_64-unknown-freebsd` compile cleanly.
+
+Hardware run:
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 12 tests
+test kms::render::resources::tests::c0_2ci_sink_gamma_gate_four_states_drm ... ok
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 1730 filtered out; finished in 0.83s
+```
+
+Decisive test alone:
+```
+$ cargo test -p yserver --lib c0_2ci_scene_managed_shared_compose_vulkan -- --ignored
+running 1 test
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1741 filtered out; finished in 0.18s
+```
+
+**Plan steps closed:** 5.3 and 5.5 ticked — proven by `c0_2ci_scene_managed_shared_compose_vulkan` (hardware-green, mutation-verified).
 
 ## Task 6: Completion progress and transport permission boundary
 
