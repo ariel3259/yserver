@@ -924,7 +924,11 @@ impl ResourceService {
         f: impl FnOnce(&ScanoutAllocation) -> T,
     ) -> Result<T, ResourceError> {
         let key = lease.key();
-        let read_lease = self.reserve(key, UseKind::Read)?;
+        let read_lease = if lease.kind == UseKind::Read {
+            None
+        } else {
+            Some(self.reserve(key, UseKind::Read)?)
+        };
         let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
         let payload = entry.payload.borrow();
         let alloc = match payload.as_ref() {
@@ -946,7 +950,11 @@ impl ResourceService {
         f: impl FnOnce(&mut ScanoutAllocation) -> T,
     ) -> Result<T, ResourceError> {
         let key = lease.key();
-        let write_lease = self.reserve(key, UseKind::Write)?;
+        let write_lease = if lease.kind == UseKind::Write {
+            None
+        } else {
+            Some(self.reserve(key, UseKind::Write)?)
+        };
         let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
         let mut payload = entry.payload.borrow_mut();
         let alloc = match payload.as_mut() {

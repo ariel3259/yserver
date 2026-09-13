@@ -79,6 +79,10 @@ impl FileOwnedBacking {
         &self.device
     }
 
+    pub(crate) fn fb_handle(&self) -> Option<framebuffer::Handle> {
+        NonZeroU32::new(self.right.fb()).map(framebuffer::Handle::from)
+    }
+
     pub(crate) fn discharge(
         self,
         registry: &mut DrmCleanupRegistry,

@@ -2462,7 +2462,8 @@ impl KmsBackend {
         // before disabling scanout. Wait for that work, then retire scene and
         // pool state while the old output indices are still authoritative.
         self.platform.wait_idle_bounded();
-        self.scene.drain_all(&mut self.platform);
+        self.scene
+            .drain_all(&mut self.platform, self.resource_service.as_mut());
         if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
             self.kms_outputs_active = false;
             log::error!(
@@ -10051,10 +10052,12 @@ impl KmsBackend {
         self.simulate_page_flip_complete_for_tests()?;
         let mut retired = 0usize;
         for output_idx in 0..self.platform.outputs.len() {
-            if self
-                .scene
-                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
-            {
+            if self.scene.handle_page_flip_complete(
+                output_idx,
+                &mut self.store,
+                &mut self.platform,
+                self.resource_service.as_mut(),
+            ) {
                 retired += 1;
             }
         }
@@ -11088,6 +11091,7 @@ impl KmsBackend {
             &self.windows,
             &mut self.telemetry,
             cow_host_xid,
+            self.resource_service.as_mut(),
         ) {
             Ok(_) => Ok(()),
             Err(e) => Err(io::Error::other(format!(
@@ -11127,7 +11131,8 @@ impl KmsBackend {
         // Phase B.1 Task 21: drain close events emitted by shutdown.
         self.drain_frame_builder_telemetry();
         self.sync_descriptor_pool_telemetry();
-        self.scene.drain_all(&mut self.platform);
+        self.scene
+            .drain_all(&mut self.platform, self.resource_service.as_mut());
 
         // Stage 5 Task 6.1: drain the pending PRESENT batch queue
         // unconditionally. After drain_all every submitted paint
@@ -11953,7 +11958,8 @@ impl KmsBackend {
 
         // The old framebuffer references and events are gone. It is now safe
         // to discard the scene's ack ledger and reset every pool phase.
-        self.scene.drain_all(&mut self.platform);
+        self.scene
+            .drain_all(&mut self.platform, self.resource_service.as_mut());
 
         // 4c. Reset the PLATFORM scanout-BO state too. `drain_all` (4b)
         //     clears the SCENE's pending_acks, but the platform pool still
@@ -16136,6 +16142,33 @@ fn read_scanout_region(
 
     let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
     let needed_bytes = scanout_copy_needed_bytes(local_rect)?;
+    let managed_key = backend
+        .platform
+        .scanout_pools
+        .get(pool_idx)
+        .and_then(Option::as_ref)
+        .and_then(|p| match p {
+            crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+                pool.bos.get(bo_idx).and_then(|bo| bo.managed_key())
+            }
+            crate::kms::vk::scanout::OutputScanout::Copied(_) => None,
+        });
+
+    if let Some(key) = managed_key
+        && let Some(mut service) = backend.resource_service.take()
+    {
+        let res = read_managed_scanout_region_bytes(
+            backend,
+            &mut service,
+            key,
+            pool_idx,
+            rect,
+            local_rect,
+        );
+        backend.resource_service = Some(service);
+        return res;
+    }
+
     let Some(pool) = backend
         .platform
         .scanout_pools
@@ -16211,19 +16244,6 @@ fn read_scanout_region(
 /// renderer-side `CopiedSourceAllocation` instead of `ScanoutAllocation`,
 /// which is out of this session's scope; that case fails closed rather than
 /// silently reading the wrong payload.
-///
-/// `#[allow(dead_code)]`: F4c F8 stop (see `read_scanout_region_for_managed_source`
-/// below) -- F4-m1 asked for this attribute to come off, but it cannot
-/// without the scene-submission write branch this session deferred: with it
-/// removed, `cargo clippy --all-targets -- -D warnings` fails dead-code on
-/// the plain (non-`cfg(test)`) `--lib` build this crate's test binary still
-/// compiles as a dependency, since no non-test caller exists yet (R8: only
-/// a caller in production code makes this a real compile-time root, and
-/// that caller is the write-path wiring, not the read path this session
-/// closes). Verified directly: with the attribute off,
-/// `cargo clippy -p yserver --tests -- -D warnings` fails with exactly this
-/// dead-code error on both this function and `read_scanout_region_for_managed_source`.
-#[allow(dead_code)]
 fn read_managed_scanout_region_bytes(
     backend: &mut KmsBackend,
     service: &mut crate::kms::render::resources::ResourceService,
@@ -17902,6 +17922,7 @@ impl KmsBackend {
                             output_idx,
                             &mut self.store,
                             &mut self.platform,
+                            self.resource_service.as_mut(),
                         );
                     if direct_retired || scene_retired {
                         self.telemetry.record_frame_present();
@@ -18095,6 +18116,7 @@ impl KmsBackend {
                             output_idx,
                             &mut self.store,
                             &mut self.platform,
+                            self.resource_service.as_mut(),
                         );
                     if direct_retired || scene_retired {
                         self.telemetry.record_frame_present();
@@ -18711,6 +18733,7 @@ impl Backend for KmsBackend {
                     output_idx,
                     &mut self.store,
                     &mut self.platform,
+                    self.resource_service.as_mut(),
                 );
             if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
@@ -19065,6 +19088,7 @@ impl Backend for KmsBackend {
                 &self.windows,
                 &mut self.telemetry,
                 cow_host_xid,
+                self.resource_service.as_mut(),
             ) {
                 Ok(composed_outputs) => {
                     if self.scanout_m2.reentry_blocked_until_composed
@@ -27572,7 +27596,8 @@ impl Backend for KmsBackend {
             self.stop_direct_after_scanout_replaced("DPMS off");
             self.scanout_m1.clear("DPMS off");
             log::info!("kms: dpms sleep — scene.drain_all");
-            self.scene.drain_all(&mut self.platform);
+            self.scene
+                .drain_all(&mut self.platform, self.resource_service.as_mut());
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
             if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
                 self.kms_outputs_active = false;
@@ -41163,6 +41188,210 @@ mod tests {
         service.poll_gpu(std::time::Instant::now()).unwrap();
         service.service_ready();
         assert!(!service.contains(&scratch_key));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_managed_shared_compose_vulkan() {
+        use ash::vk;
+        use std::{cell::RefCell, rc::Rc};
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        use crate::{
+            kms::{
+                owner::identity::IncarnationId,
+                render::resources::{DrmCleanupRegistry, ResourceService, tests::MockCleanupIo},
+            },
+            platform::drm::DrmDeviceKey,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
+            Ok(b) => b,
+            Err(e) => {
+                panic!("environmental skip: no live Vulkan ICD available ({e}); not claiming pass")
+            }
+        };
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let (root_w, root_h) = {
+            let root = state.resources.window(ROOT_WINDOW).expect("root window");
+            (root.width, root.height)
+        };
+        let window = ResourceId(0x2005);
+        let window_host = create_live_window(
+            &mut state,
+            &mut backend,
+            window,
+            ROOT_WINDOW,
+            40,
+            40,
+            16,
+            16,
+        );
+
+        let root_color = 0x0022_3344;
+        let window_color = 0x00bb_6600;
+        backend
+            .fill_rectangle(
+                None,
+                backend.core.window_id,
+                root_color,
+                0,
+                0,
+                root_w,
+                root_h,
+            )
+            .expect("fill root");
+        backend
+            .fill_rectangle(None, window_host.as_raw(), window_color, 0, 0, 16, 16)
+            .expect("fill window");
+
+        let pool_idx = 0;
+        let bo_idx = 0;
+        let dev = DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let inc = IncarnationId::first();
+        let mut service = ResourceService::new(dev, inc);
+
+        let device_key = backend.platform.outputs[pool_idx].key.device_key;
+        let kms_device_rc = backend
+            .platform
+            .device_for_key(device_key)
+            .expect("live-scene fixture output has a KMS owner")
+            .device
+            .clone();
+        let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
+        let mut registry = DrmCleanupRegistry::new_with_device_and_io(
+            kms_device_rc,
+            device_key,
+            inc,
+            Box::new(MockCleanupIo::new(Rc::clone(&cleanup_calls))),
+        );
+
+        // Convert the free scanout bo from legacy to managed ownership.
+        let source_key = backend
+            .platform
+            .register_managed_scanout_bo(&mut service, &mut registry, pool_idx, bo_idx)
+            .expect("register free scanout bo as managed");
+
+        // Verify the bo was registered and tagged.
+        assert_eq!(
+            backend.platform.scanout_pools[pool_idx]
+                .as_ref()
+                .unwrap()
+                .display_pool()
+                .bos[bo_idx]
+                .managed_key(),
+            Some(source_key)
+        );
+
+        // Install the service into the backend so SceneCompositor::tick can reach it.
+        backend.resource_service = Some(service);
+
+        backend.tick_maybe_composite_for_tests();
+
+        let mut service = backend
+            .resource_service
+            .take()
+            .expect("resource_service was installed and preserved");
+
+        // Verify the batch was registered in the service with a GPU obligation on source_key.
+        assert_eq!(
+            service.pending_batches().len(),
+            1,
+            "managed_batch must be registered with the service"
+        );
+        let pending_batch = &service.pending_batches()[0];
+        let ob = pending_batch
+            .obligation
+            .as_ref()
+            .expect("batch must carry bound GpuObligation");
+        assert!(
+            ob.entries().iter().any(|&(k, _)| k == source_key),
+            "GpuObligation must cover source_key"
+        );
+        let ticket = ob.ticket().clone();
+
+        // While the GPU obligation is pending, source_key must not be releasable.
+        assert!(
+            !service.is_releasable(&source_key),
+            "source_key must not be releasable while its GPU work is in flight"
+        );
+        assert_eq!(
+            backend.platform.scanout_pools[pool_idx]
+                .as_ref()
+                .unwrap()
+                .display_pool()
+                .bos[bo_idx]
+                .state
+                .phase,
+            crate::kms::vk::scanout::BoPhase::Recording
+        );
+
+        // Wait for the real Vulkan fence to signal.
+        let vk_ctx = backend.platform.vk.clone().expect("live scene installs vk");
+        ticket.wait(&vk_ctx).expect("wait for compose ticket");
+
+        // Poll GPU through ResourceService. This validates and commits the GPU batch,
+        // clearing the GPU obligation and freeing the write lease.
+        service
+            .poll_gpu(std::time::Instant::now())
+            .expect("poll_gpu commits batch");
+        assert!(
+            service.pending_batches().is_empty(),
+            "pending batches must be empty after poll_gpu commits"
+        );
+        assert!(
+            service.is_releasable(&source_key),
+            "source_key must become releasable once GPU obligation is committed"
+        );
+
+        // Re-install service to read back the composited pixels from the managed scanout bo.
+        backend.resource_service = Some(service);
+        let scan_rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 16,
+                height: 16,
+            },
+        };
+        let scanout_bytes = super::read_scanout_region(
+            &mut backend,
+            scan_rect,
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect("readback of composited scanout region from managed payload");
+        assert!(
+            scanout_bytes.iter().any(|&b| b != 0),
+            "managed compose must have written non-zero pixels into SharedBacking.image"
+        );
+
+        // Clean up: detach the managed entries from the pool, dropping the retain lease,
+        // and verify that service_ready_with_registry discharges the allocation.
+        backend.platform.scanout_pools[pool_idx]
+            .as_mut()
+            .expect("scanout pool exists")
+            .detach_managed_entries();
+        let mut service = backend.resource_service.take().unwrap();
+        service.service_ready_with_registry(&mut registry);
+        assert!(
+            !service.contains(&source_key),
+            "source_key must be destroyed after release"
+        );
+        assert_eq!(
+            cleanup_calls.borrow().len(),
+            2,
+            "destruction discharges file_owned (RemoveFb + CloseGem)"
+        );
     }
 
     #[test]
