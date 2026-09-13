@@ -1473,6 +1473,60 @@ test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1728 filtered out; finished in 0.77s
 ```
 
+**Note (2026-09-13):** Fix round 1's own gate output above was real, but its
+M-7 verdict for "8.3 (managed candidate preparation seam) and 8.5
+(unflip/composed retention)" was wrong — see
+`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`,
+section "F-7 (`f39a01c6`) — Task 8", which rejected F-7 on independent
+review (F7-B1, F7-B2, both blocking) and is authoritative over the M-7 row
+above. Fix round 2 below closes that rejection; it does not touch M-1,
+M-7's own `finish_role`/`CompletionRetired` claims, M-8 or 8.6, which the
+same independent review held.
+
+**Fix round 2: `cc323714`.** Session F-13b, closing F7-B1 and F7-B2 from
+`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`
+("Where this leaves the round" split this rejection into three sessions;
+F-13b is the Task-8-seam one), per the F1–F8 rules and gate in
+`docs/handoff-phase-c0-stage-2c-i-fix.md`.
+
+| Finding | Verdict |
+| --- | --- |
+| F7-B1 (`managed_prepare_direct_candidate` reserved `Preparing`, moved it to `Successor` on success, then unconditionally `cancel_reservation`d before returning — the queued successor and any victim it replaced were unaccounted, so 8.3's "bounded live imports" and 8.6's "maximum of six charged positions" were void for the seam; `move_role` never turns `Reserved` into `Occupied`, so nothing the seam produced could ever be `finish_role`d; `prereserve_retirement` had no caller but tests) | **RESOLVED (tests: `c0_2ci_backend_managed_prepare_direct_candidate_charges_and_replaces_successor`, `c0_2ci_backend_managed_dispatch_direct_successor_charges_submitted_then_retires`)** — the Successor charge now travels with `scanout_m2.queued_successor` in a new parallel field, `queued_successor_role`, and is no longer cancelled at the end of a successful `managed_prepare_direct_candidate` call. Replacing a queued victim discharges its charge via `cancel_reservation` (it is always still bare-`Reserved`, never `attach`ed) before the new reservation moves into the now-vacant `Successor` slot — one discharge per charge, never a leak, never a double. A new seam function, `managed_dispatch_direct_successor` (8.4), promotes the charge from `Successor` to `Submitted`, occupies it via the existing `DirectCapacity::attach` primitive (`Reserved` → `Occupied`; no new capacity primitive was needed — `attach` already does exactly this when paired with a real `CommitResources`), and pre-reserves `OrdinaryRetirement` before an ordinary replacement is allowed to dispatch, per 8.4's "an ordinary replacement cannot dispatch with occupied OrdinaryRetirement — keep the latest Successor while waiting". The returned `CommitResources` (carrying the occupied `Submitted` token) is handed to `CommitResourceConsumer::consume` exactly as production's Task-7/8 `CompletionRetired` path already does (that path itself needed no change — F-7's M-7 work there already holds). The decisive test drives two full commits: dispatch → `consume` → `on_available`, proving `Submitted` becomes `Current`, the displaced `Current` lands in the pre-reserved `OrdinaryRetirement` role, and `finish_role` frees it without dropping a token |
+| F7-B2 (`managed_handle_direct_unflip` documented 8.5 — "uses ExitRetirement for Current even if OrdinaryRetirement is occupied; waits for submitted work" — but implemented none of it: no `reserve(ExitRetirement)`, no `move_role(Current → ExitRetirement)`, no wait) | **RESOLVED (test: `c0_2ci_backend_managed_unflip_moves_current_into_exit_retirement_even_if_ordinary_occupied`)** — unflip now discharges the queued successor's charge via the same `cancel_reservation` path (never a bare `drop`, which would otherwise close admission through `RoleReservation::Drop`); already-submitted work is untouched by unflip and retires through the consumer's own `CompletionRetired` arm when its completion arrives (no new code needed — this is a "do not touch" by omission, and the test does not fabricate a Submitted-role retirement to prove it, since F-7's `CompletionRetired`/`on_available` mechanism already covers that generically); and unflip now finds the `CommitResources` holding the `Current` role in `commit_consumer.current_resources`, reserves a fresh `ExitRetirement` slot, and calls `move_into_reserved` to move it there — even when `OrdinaryRetirement` is already occupied by an unrelated commit — pushing the result into `releasing_resources` so it retires through the ordinary consumer path. `managed_can_enter_direct`'s existing checks (`capacity.can_enter_direct()` — both retirement roles vacant — plus a retained per-output composed framebuffer via `PlatformBackend::retained_composed_framebuffer`) were already correct per 8.5 and needed no change; the retained composed-return allocation itself is already held by the scene compositor's existing on-screen BO tracking, not something this session needed to add (no F8 stop was needed here) |
+
+Mutation checks performed and reverted in F-13b:
+1. Re-inserting `let _ = self.commit_consumer.capacity.cancel_reservation(...)` at the end of `managed_prepare_direct_candidate`'s success path (discharging the charge the fix is supposed to keep) caused `c0_2ci_backend_managed_prepare_direct_candidate_charges_and_replaces_successor` to fail (`assertion left == right failed: left: 0, right: 1`) and `c0_2ci_backend_managed_dispatch_direct_successor_charges_submitted_then_retires` to fail (panic: `.expect("dispatch A")` on `None`).
+2. Gating `managed_handle_direct_unflip`'s Current→ExitRetirement block behind `if false && let Some(idx) = ...` (skipping the move entirely) caused `c0_2ci_backend_managed_unflip_moves_current_into_exit_retirement_even_if_ordinary_occupied` to fail (`assertion failed: b.commit_consumer.current_resources.is_empty()`).
+
+Gate for F-13b: `cargo +nightly fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean (0 warnings); `cargo test -p yserver --lib c0_2ci` 124 passed/0 failed/13 ignored; twelve-run flake loop clean (12 runs, 0 flakes); hardware run (`--ignored`) 13 passed/0 failed; full `cargo test -p yserver --lib` 1662 passed/0 failed/85 ignored. This session touched only `backend.rs` (`ScanoutM2State`'s new `queued_successor_role` field, the two rewritten seam functions, the new `managed_dispatch_direct_successor` and `discharge_bare_reservation` functions, and defensive discharge calls at the two other `queued_successor`-mutating sites) — no `store.rs`, `resources/storage.rs`, `engine.rs`, `drm/`, `drm_cleanup.rs` or `transport.rs` — so the portable-target checks were not required and were not re-run.
+
+Hardware run:
+
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 13 tests
+test kms::render::resources::tests::c0_2ci_sink_gamma_gate_four_states_drm ... ok
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::engine::tests::c0_2ci_engine_promote_drawable_exportable_managed_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1734 filtered out; finished in 0.95s
+```
+
+No plan steps ticked or unticked by this round: 8.1–8.6 stay ticked from
+the original execution/Fix round 1 (F-7's independently-held M-1/M-7's
+`CompletionRetired`/M-8/8.6 mechanism); this round closed F-7's own
+rejected M-7 half (the managed backend seam), not a new step.
+
 **Files:** Create `resources/capacity.rs`; extend `commit.rs` and the managed backend preparation boundary. Preserve legacy direct scheduling until 2c-ii/iii conversion.
 
 **Consumes:** Task-7 resource sets and service eligibility. Defines capacity only, not seven-tier scheduler policy.
