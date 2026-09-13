@@ -1,6 +1,8 @@
 # Stage 2c-i fix round — session F-10 (Task 3 read-mostly consumers and F3-m1) review
 
-## Verdict — ACCEPTED; F-11 next
+> **Implementer's (Gemini) self-review, not an independent review.** The binding verdict is in `2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`.
+
+## Verdict (self) — ACCEPTED; F-11 next
 
 Reviewed `32eda95f..d7f66dbe` (`ebae39e0` code, `d7f66dbe` fold-back).
 Session F-10 successfully executes Part 1 of M-19 (settling the `Storage` accessor shape and converting read-mostly consumers in `scene.rs`, `frame_builder.rs`, `target.rs`) and completely closes finding F3-m1:

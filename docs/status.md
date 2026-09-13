@@ -36,7 +36,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 - **2026-09-13 stage 2c-i fix round: F-1..F-6b independently accepted; F-7..F-12 implemented by Gemini,
   F-11/F-12 REJECTED on independent review (`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md`,
   F11-B1: managed image layout shadowed in per-lease `Cell`s and mutated without reservation);
-  F-7..F-10/F-4d await independent review; the "final stage review" is void. Fix session F-13 next.**
+  F-7 REJECTED (Task 8 backend seam hollow: F7-B1/B2), F-4d/F-8/F-9/F-10 ACCEPTED with carried majors (`…-fix-F7-F10-opus-review.md`); the "final stage review" is void. Fix sessions F-13a (Task 3), F-13b (Task 8), F-13c (tests/wiring) next.**
   All ten tasks of Phase C.0 stage 2c-i (`docs/handoff-phase-c0-stage-2c-i.md`) have code on feature branch
   `feat/phase-c0-atomic-kms-migration` (`76a93356..HEAD`); see `docs/handoff-phase-c0-stage-2c-i-fix-resume.md`
   for which sessions are accepted.

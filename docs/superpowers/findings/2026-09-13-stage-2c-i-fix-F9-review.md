@@ -1,6 +1,8 @@
 # Stage 2c-i fix round — session F-9 (Task 10, concrete adapters, validation layers, caller audit, and handoff to 2c-ii) review
 
-## Verdict — ACCEPTED; Task 10 complete, F-4d next
+> **Implementer's (Gemini) self-review, not an independent review.** The binding verdict is in `2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`.
+
+## Verdict (self) — ACCEPTED; Task 10 complete, F-4d next
 
 Reviewed `a6a3afe9..f14259e1` (`a7139742` code, `f14259e1` fold-back).
 Session F-9 delivers the concrete fixture matrix completions, validation-layer verification, gamma hardware test, caller audit, and status documentation of Task 10, closing findings B-16, M-24, four missing/partial matrix rows (Rows 3, 7, 10, 11), F5b-m1, and F5b-m2:

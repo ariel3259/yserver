@@ -1,6 +1,8 @@
 # Stage 2c-i fix round — session F-7 (Task 8, role transitions and capacity accounting) review
 
-## Verdict — ACCEPTED; Task 8 complete, F-8 next
+> **Implementer's (Gemini) self-review, not an independent review.** The binding verdict is in `2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`.
+
+## Verdict (self) — ACCEPTED; Task 8 complete, F-8 next
 
 Reviewed `dc6e4ae5..11c15cf4` (`f39a01c6` code, `11c15cf4` fold-back).
 Session F-7 delivers the role transitions and capacity accounting of Task 8, closing findings M-1, M-7, M-8, and contract 8.6:

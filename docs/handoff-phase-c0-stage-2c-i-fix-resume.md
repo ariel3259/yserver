@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-13,
-after the independent (Opus) review of F-11/F-12: REJECTED, F-13 next; F-7..F-10 and F-4d still need an independent review; the "final stage review" is void.** If you are resuming this work cold — a new
+after the independent (Opus) reviews of F-7..F-12: F-7 and F-11/F-12 REJECTED, F-4d/F-8/F-9/F-10 ACCEPTED with carried majors; F-13a/b/c next; the "final stage review" is void.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -33,7 +33,7 @@ stand so nothing is re-derived.
    `…-09-13-…-F4d-review.md`, `…-09-13-…-F10-review.md`,
    `…-09-13-…-F11-review.md`, `…-09-13-…-F12-review.md` (Gemini self-reviews, void),
    `docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md`
-   (the binding one for F-11/F-12),
+   and `…-fix-F7-F10-opus-review.md` (the binding ones for F-7..F-12),
    `docs/superpowers/findings/2026-09-13-stage-2c-i-final-review.md` (void).
 6. The plan
    `docs/superpowers/plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md`
@@ -51,15 +51,17 @@ stand so nothing is re-derived.
 | F-5b | Task 6, sinks half (B-10 at 7 sinks, 6.5a/6.5b, grant consumed at executor send, real `DirectOwnershipState`) | **ACCEPTED** (gamma `_drm` test → F-9) | `842745a3`/`4eb05029` | F5b-review |
 | F-6a | Task 7, consumer half (B-8, B-9, M-2..M-5, M-15) | **ACCEPTED** | `c35af190`/`e40d0cb9` | F6a-review |
 | F-6b | Task 7, Present half (M-6: 7.5/7.5a, `PresentRelease`, COW test) | **ACCEPTED** | `8b0e00d6`/`a242a9da` | F6b-review |
-| F-7 | Task 8 (role transitions, `on_available`) | Gemini self-accepted — **independent review pending** | `f39a01c6`/`11c15cf4` | F7-review (self) |
-| F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | Gemini self-accepted — **independent review pending** | `ac3c94f7`/`a6a3afe9` | F8-review (self) |
-| F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | Gemini self-accepted — **independent review pending** | `a7139742`/`f14259e1` | F9-review (self) |
-| F-4d | Task 5 write half (scene-submission managed write, 5.3/5.5) | Gemini self-accepted — **independent review pending** | `d96e1c4c`/`20a5461c` | F4d-review (self) |
-| F-10 | Task 3 (M-19 read-mostly consumers: `scene.rs` 17 sites, `frame_builder.rs`, `target.rs` + F3-m1 `Detached`) | Gemini self-accepted — **independent review pending** | `ebae39e0`/`d7f66dbe` | F10-review (self) |
+| F-7 | Task 8 (role transitions, `on_available`) | **REJECTED** (F7-B1 successor charge cancelled, F7-B2 unflip seam hollow) | `f39a01c6`/`11c15cf4` | F7-F10-opus-review |
+| F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | **ACCEPTED** (F8-M1 husk counter unwired, F8-M2 returned descriptors never closed → F-13c) | `ac3c94f7`/`a6a3afe9` | F7-F10-opus-review |
+| F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | **ACCEPTED** (F9-m1 → F-13c) | `a7139742`/`f14259e1` | F7-F10-opus-review |
+| F-4d | Task 5 write half (scene-submission managed write, 5.3/5.5) | **ACCEPTED** (F4d-M1: 5.5 gating and flip-accepted path untested → F-13c) | `d96e1c4c`/`20a5461c` | F7-F10-opus-review |
+| F-10 | Task 3 (M-19 read-mostly consumers: `scene.rs` 17 sites, `frame_builder.rs`, `target.rs` + F3-m1 `Detached`) | **ACCEPTED** | `ebae39e0`/`d7f66dbe` | F7-F10-opus-review |
 | F-11 | Task 3 (`RenderEngine` in `engine.rs`, 70 sites + M-20 promotion half) | **REJECTED** (F11-B1 layout Cell, F11-M1) | `5ab1795c`/`f43ef0fd` | F11-F12-opus-review |
 | F-12 | Task 3 (`KmsBackend` in `backend.rs`, 94 sites + F3-M1) | **REJECTED** (F11-B1 exploited, F12-m1..m3) | `96c10eab`/`67871480` | F11-F12-opus-review |
-| **F-13** | Fix F11-B1 (delete `StorageLease::current_layout` Cell; layout accessors take the service; `record_layout_transition` on Managed via `_managed`; thread service to the engine layout sites), F11-M1, F12-m1..m3 | **next** | — | — |
-| Final | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | **void** (Gemini reviewed its own F-7..F-12); redo after F-13 and the pending independent reviews | — | final-review (void) |
+| **F-13a** | Task 3: F11-B1 (delete `StorageLease::current_layout` Cell; layout accessors take the service; `record_layout_transition` on Managed via `_managed`; thread service to the engine layout sites), F11-M1, F12-m1..m3 | **next** | — | — |
+| F-13b | Task 8 seam: F7-B1 (successor keeps its charge, occupy at dispatch, `prereserve_retirement` from the seam), F7-B2 (unflip reserves/moves `ExitRetirement`, waits) + success-path tests | after F-13a | — | — |
+| F-13c | Tests and wiring: F4d-M1, F8-M1, F8-M2, F8-m1, F9-m1 | after F-13b | — | — |
+| Final | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | **void** (Gemini reviewed its own F-7..F-12); redo after F-13c | — | final-review (void) |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the

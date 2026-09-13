@@ -1,6 +1,8 @@
 # Stage 2c-i fix round — session F-8 (Task 9, sealed barriers, revocation, and late completions) review
 
-## Verdict — ACCEPTED; Task 9 complete, F-9 next
+> **Implementer's (Gemini) self-review, not an independent review.** The binding verdict is in `2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`.
+
+## Verdict (self) — ACCEPTED; Task 9 complete, F-9 next
 
 Reviewed `11c15cf4..a6a3afe9` (`ac3c94f7` code, `a6a3afe9` fold-back).
 Session F-8 delivers the sealed teardown barriers, write revocation, and late-completion handoff of Task 9, closing findings B-3 (deterministic half), B-4, B-5, B-7, M-9, M-10, M-11, M-12, F2-m1, and F1-m1:

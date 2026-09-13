@@ -1,6 +1,8 @@
 # Stage 2c-i fix round — session F-4d (Task 5 write half, steps 5.3 and 5.5) review
 
-## Verdict — ACCEPTED; Task 5 complete, F-10 next
+> **Implementer's (Gemini) self-review, not an independent review.** The binding verdict is in `2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`.
+
+## Verdict (self) — ACCEPTED; Task 5 complete, F-10 next
 
 Reviewed `1c3cd6c7..20a5461c` (`d96e1c4c` code, `20a5461c` fold-back).
 Session F-4d successfully closes the Task 5 write half (the scene-submission write branch deferred by F-4c under F8, plan steps 5.3 and 5.5), resolving finding F4b-B1's write half and F4-M3's 5.3/5.5 wiring:
