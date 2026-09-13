@@ -14,6 +14,9 @@ pub(crate) struct PixelIdentity {
     pub allocation: AllocationKey,
     pub content_offset: (i32, i32),
     pub extent: vk::Extent2D,
+    pub format: vk::Format,
+    pub image_view: vk::ImageView,
+    pub sample_view: vk::ImageView,
 }
 
 #[derive(Debug)]
@@ -182,4 +185,5 @@ impl Drop for StorageAllocation {
 pub(crate) enum StorageBacking {
     Legacy(StorageAllocation),
     Managed(StorageLease),
+    Detached,
 }

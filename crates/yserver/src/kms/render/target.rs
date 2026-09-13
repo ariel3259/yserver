@@ -20,7 +20,7 @@
 //! 1. [`PaintTarget::dst`] / [`PaintTarget::src`] — the client-facing
 //!    route. The handle carries the resolved *content* bounds, and the
 //!    engine clamps and scissors against those bounds everywhere it
-//!    used to use `drawable.storage.extent`. A drawing op added later
+//!    used to use `drawable.storage.extent()`. A drawing op added later
 //!    inherits the clip for free; it cannot forget to consult a field.
 //! 2. [`PaintTarget::server_backing_dst`] /
 //!    [`PaintTarget::server_backing_src`] / [`Dst::server_internal`] /

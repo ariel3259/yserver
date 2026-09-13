@@ -5728,7 +5728,7 @@ fn build_scene_with(
         Option<u64>,
     ) = if let Some(cur) = cursor
         && let Some(drawable) = store.get(cur.id)
-        && drawable.storage.image_view != vk::ImageView::null()
+        && drawable.storage.has_image_view()
     {
         let cw = i32::try_from(cur.extent.width).unwrap_or(i32::MAX);
         let ch = i32::try_from(cur.extent.height).unwrap_or(i32::MAX);
@@ -5769,7 +5769,7 @@ fn build_scene_with(
                 let draw_index = draws.len();
                 let sampled_index = sampled_ids.len();
                 draws.push(CompositeDraw {
-                    image_view: drawable.storage.sample_view,
+                    image_view: drawable.storage.sample_view(),
                     #[allow(clippy::cast_precision_loss)]
                     dst_origin: [dx as f32, dy as f32],
                     #[allow(clippy::cast_precision_loss)]
@@ -5855,12 +5855,12 @@ fn root_node(
     // sampled storage handle reroutes.
     let source_id = store.redirected_target(id).unwrap_or(id);
     let source = store.get(source_id)?;
-    if source.storage.image_view == vk::ImageView::null() {
+    if !source.storage.has_image_view() {
         return None;
     }
     let dx = -layout_x0;
     let dy = -layout_y0;
-    let host = drawable.storage.extent;
+    let host = drawable.storage.extent();
     let full = vk::Rect2D {
         offset: vk::Offset2D { x: dx, y: dy },
         extent: host,
@@ -5877,7 +5877,7 @@ fn root_node(
             )
             .into_iter()
             .collect(),
-            source.storage.extent,
+            source.storage.extent(),
         ),
     };
     Some(RootNode {
@@ -5887,7 +5887,7 @@ fn root_node(
         // format/depth-aware swizzle (depth-24 → α=ONE).
         // See `Storage::sample_view` for why scene draws
         // MUST NOT bind `image_view` directly.
-        view: source.storage.sample_view,
+        view: source.storage.sample_view(),
         place,
         dx,
         dy,
@@ -6696,9 +6696,9 @@ fn decide_node(
         // Only the sampled storage handle reroutes.
         let source_id = layout_source_id.unwrap_or(id);
         let source = store.get(source_id);
-        let source_view_null = source.is_none_or(|s| s.storage.image_view == vk::ImageView::null());
-        let source_view = source.map_or(vk::ImageView::null(), |s| s.storage.sample_view);
-        let source_extent = source.map_or(vk::Extent2D::default(), |s| s.storage.extent);
+        let source_view_null = source.is_none_or(|s| !s.storage.has_image_view());
+        let source_view = source.map_or(vk::ImageView::null(), |s| s.storage.sample_view());
+        let source_extent = source.map_or(vk::Extent2D::default(), |s| s.storage.extent());
 
         // Audit #3 (2026-05-19) — emit-or-skip is governed by
         // "is this window's storage where paint actually lands?"
@@ -6752,8 +6752,8 @@ fn decide_node(
             d_depth: d.depth,
             d_refcount: d.refcount,
             d_part: d.scene_participating,
-            d_extent: d.storage.extent,
-            d_view_null: d.storage.image_view == vk::ImageView::null(),
+            d_extent: d.storage.extent(),
+            d_view_null: !d.storage.has_image_view(),
             source_id,
             source_view_null,
             source_view,
@@ -10632,7 +10632,7 @@ mod tests {
 
         // Confirm W and B have distinct image_views.
         let w_id = store.lookup(0x100).expect("w_id present");
-        let w_view = store.get(w_id).expect("w drawable").storage.image_view;
+        let w_view = store.get(w_id).expect("w drawable").storage.image_view();
         assert_ne!(
             w_view, b_view,
             "fixture sanity: W and B must have distinct sentinel views"
@@ -12050,8 +12050,8 @@ mod tests {
                     d.depth,
                     d.refcount,
                     d.scene_participating,
-                    d.storage.extent,
-                    d.storage.image_view == vk::ImageView::null(),
+                    d.storage.extent(),
+                    !d.storage.has_image_view(),
                 )
             });
             if let Some((d_id, d_kind, d_depth, d_refcount, d_part, d_extent, d_view_null)) =
@@ -12064,7 +12064,7 @@ mod tests {
                 let source_id = store.redirected_target(id).unwrap_or(id);
                 let source_view_null = store
                     .get(source_id)
-                    .is_none_or(|s| s.storage.image_view == vk::ImageView::null());
+                    .is_none_or(|s| !s.storage.has_image_view());
 
                 // Audit #3 (2026-05-19) — emit-or-skip is governed by
                 // "is this window's storage where paint actually lands?"
@@ -12220,7 +12220,7 @@ mod tests {
 
                 if matches!(d_kind, DrawableKind::Window)
                     && let Some(source) = store.get(source_id)
-                    && source.storage.image_view != vk::ImageView::null()
+                    && source.storage.has_image_view()
                     && intersects
                     && paint_target_is_self
                 {
@@ -12251,7 +12251,7 @@ mod tests {
                     // distinction. Pixels outside the bounding region
                     // are intentionally NOT drawn so the layer below
                     // (parent / wallpaper / root) shows through.
-                    let image_view = source.storage.sample_view;
+                    let image_view = source.storage.sample_view();
                     #[allow(clippy::cast_precision_loss)]
                     let win_w_f = win_w as f32;
                     #[allow(clippy::cast_precision_loss)]

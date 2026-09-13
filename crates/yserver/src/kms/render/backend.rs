@@ -45836,6 +45836,9 @@ mod tests {
                 width: 100,
                 height: 100,
             },
+            format: ash::vk::Format::B8G8R8A8_UNORM,
+            image_view: ash::vk::ImageView::null(),
+            sample_view: ash::vk::ImageView::null(),
         };
         let storage_lease = StorageLease {
             allocation: alloc_lease,

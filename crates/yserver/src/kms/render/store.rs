@@ -140,6 +140,9 @@ impl std::ops::Deref for Storage {
                     "StorageAllocation in Managed backing must be accessed via ResourceService::with_storage_read/write"
                 );
             }
+            StorageBacking::Detached => {
+                panic!("StorageAllocation in Detached backing must not be accessed");
+            }
         }
     }
 }
@@ -152,6 +155,9 @@ impl std::ops::DerefMut for Storage {
                 panic!(
                     "StorageAllocation in Managed backing must be accessed via ResourceService::with_storage_read/write"
                 );
+            }
+            StorageBacking::Detached => {
+                panic!("StorageAllocation in Detached backing must not be accessed");
             }
         }
     }
@@ -184,10 +190,14 @@ impl Storage {
         matches!(self.backing, StorageBacking::Managed(_))
     }
 
+    pub(crate) fn is_detached(&self) -> bool {
+        matches!(self.backing, StorageBacking::Detached)
+    }
+
     pub(crate) fn managed_lease(&self) -> Option<&StorageLease> {
         match &self.backing {
             StorageBacking::Managed(lease) => Some(lease),
-            StorageBacking::Legacy(_) => None,
+            StorageBacking::Legacy(_) | StorageBacking::Detached => None,
         }
     }
 
@@ -195,6 +205,7 @@ impl Storage {
         match &self.backing {
             StorageBacking::Legacy(alloc) => alloc.extent,
             StorageBacking::Managed(lease) => lease.pixels.extent,
+            StorageBacking::Detached => vk::Extent2D::default(),
         }
     }
 
@@ -202,14 +213,43 @@ impl Storage {
         match &self.backing {
             StorageBacking::Legacy(alloc) => alloc.depth,
             StorageBacking::Managed(lease) => lease.pixels.target.x11_depth(),
+            StorageBacking::Detached => 0,
         }
     }
 
     pub(crate) fn content_offset(&self) -> (i32, i32) {
         match &self.backing {
-            StorageBacking::Legacy(_) => (0, 0),
+            StorageBacking::Legacy(_) | StorageBacking::Detached => (0, 0),
             StorageBacking::Managed(lease) => lease.pixels.content_offset,
         }
+    }
+
+    pub(crate) fn format(&self) -> vk::Format {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.format,
+            StorageBacking::Managed(lease) => lease.pixels.format,
+            StorageBacking::Detached => vk::Format::UNDEFINED,
+        }
+    }
+
+    pub(crate) fn image_view(&self) -> vk::ImageView {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.image_view,
+            StorageBacking::Managed(lease) => lease.pixels.image_view,
+            StorageBacking::Detached => vk::ImageView::null(),
+        }
+    }
+
+    pub(crate) fn sample_view(&self) -> vk::ImageView {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.sample_view,
+            StorageBacking::Managed(lease) => lease.pixels.sample_view,
+            StorageBacking::Detached => vk::ImageView::null(),
+        }
+    }
+
+    pub(crate) fn has_image_view(&self) -> bool {
+        self.image_view() != vk::ImageView::null()
     }
 
     /// Production constructor — Vk handles owned by `PlatformBackend::
@@ -375,6 +415,7 @@ impl Storage {
                     "Storage::is_exportable called on managed storage; use is_exportable_managed"
                 );
             }
+            StorageBacking::Detached => false,
         }
     }
 
@@ -394,7 +435,7 @@ impl Storage {
             StorageBacking::Managed(lease) => {
                 service.with_storage_read(lease, StorageAllocation::is_exportable)
             }
-            StorageBacking::Legacy(_) => Err(ResourceError::Detached),
+            StorageBacking::Legacy(_) | StorageBacking::Detached => Err(ResourceError::Detached),
         }
     }
 
@@ -434,6 +475,9 @@ impl Storage {
                     alloc.pixmap_pool = platform.pixmap_pool.clone();
                 }
                 let extent = alloc.extent;
+                let format = alloc.format;
+                let image_view = alloc.image_view;
+                let sample_view = alloc.sample_view;
                 match service.adopt(AllocationPayload::Storage(alloc)) {
                     Ok(allocation_lease) => {
                         let key = allocation_lease.key();
@@ -442,6 +486,9 @@ impl Storage {
                             allocation: key,
                             content_offset,
                             extent,
+                            format,
+                            image_view,
+                            sample_view,
                         };
                         Ok(StorageLease {
                             allocation: allocation_lease,
@@ -471,6 +518,12 @@ impl Storage {
                     },
                 )),
             },
+            StorageBacking::Detached => Err((
+                ResourceError::Detached,
+                Storage {
+                    backing: StorageBacking::Detached,
+                },
+            )),
         }
     }
 
@@ -509,6 +562,9 @@ impl Storage {
                     "adopt_exportable called on managed storage without service; use adopt_exportable_managed"
                 );
             }
+            StorageBacking::Detached => {
+                panic!("adopt_exportable called on detached storage");
+            }
         }
     }
 
@@ -537,7 +593,9 @@ impl Storage {
                     service.with_storage_read(lease, |a| a.format)?,
                 )
             }
-            StorageBacking::Legacy(_) => return Err(ResourceError::Detached),
+            StorageBacking::Legacy(_) | StorageBacking::Detached => {
+                return Err(ResourceError::Detached);
+            }
         };
 
         let new_alloc = StorageAllocation {
@@ -570,6 +628,9 @@ impl Storage {
                 allocation: new_alloc_lease.key(),
                 content_offset,
                 extent,
+                format,
+                image_view: new_image_view,
+                sample_view: new_sample_view,
             },
             allocation: new_alloc_lease,
         };
@@ -583,8 +644,7 @@ impl Storage {
     }
 
     /// Idempotent, like the Legacy path: repeat calls are safe (the
-    /// second finds an inert Legacy stub and no-ops through
-    /// `StorageAllocation::destroy`'s own null-guards).
+    /// second finds a Detached backing and no-ops).
     ///
     /// Managed storage's real Vk handles are the `ResourceService`'s to
     /// reclaim once every use/obligation clears
@@ -606,29 +666,11 @@ impl Storage {
                 // (the Managed lease), releasing the Retain use and
                 // marking the entry dirty for the service's own
                 // servicing walk -- now, not later.
-                self.backing = StorageBacking::Legacy(StorageAllocation {
-                    image: vk::Image::null(),
-                    memory: vk::DeviceMemory::null(),
-                    image_view: vk::ImageView::null(),
-                    sample_view: vk::ImageView::null(),
-                    extent: vk::Extent2D {
-                        width: 0,
-                        height: 0,
-                    },
-                    format: vk::Format::UNDEFINED,
-                    depth: 0,
-                    current_layout: vk::ImageLayout::UNDEFINED,
-                    is_test_stub: true,
-                    imported_drawable: None,
-                    imported_dmabuf: None,
-                    promoted_exportable: false,
-                    export_stride: 0,
-                    export_size: 0,
-                    export_modifier: 0,
-                    vk: None,
-                    pixmap_pool: None,
-                });
+                // F3-m1: transitioning to Detached is honest (does not fabricate
+                // a false Legacy stub).
+                self.backing = StorageBacking::Detached;
             }
+            StorageBacking::Detached => {}
         }
     }
 }
@@ -940,6 +982,7 @@ impl Drawable {
                     "Drawable::record_layout_transition called on managed storage; use record_layout_transition_managed"
                 );
             }
+            StorageBacking::Detached => {}
         }
     }
 
@@ -993,6 +1036,22 @@ impl Drawable {
             unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
             alloc.current_layout = target_layout;
         })
+    }
+
+    pub(crate) fn extent(&self) -> vk::Extent2D {
+        self.storage.extent()
+    }
+
+    pub(crate) fn image_view(&self) -> vk::ImageView {
+        self.storage.image_view()
+    }
+
+    pub(crate) fn sample_view(&self) -> vk::ImageView {
+        self.storage.sample_view()
+    }
+
+    pub(crate) fn has_image_view(&self) -> bool {
+        self.storage.has_image_view()
     }
 }
 
@@ -3120,10 +3179,79 @@ mod tests {
              the Storage value later drops",
         );
 
-        // Idempotent: destroying twice (now an inert Legacy stub) must
-        // not panic.
+        // F3-m1: StorageBacking transitions to Detached, not a fabricated Legacy stub.
+        assert!(
+            managed_storage.is_detached(),
+            "destroy() on Managed must transition to Detached (F3-m1)",
+        );
+        assert!(matches!(managed_storage.backing, StorageBacking::Detached));
+
+        // Idempotent: destroying twice (now Detached) must not panic.
         managed_storage.destroy(&platform);
+        assert!(managed_storage.is_detached());
         drop(managed_storage);
+    }
+
+    /// F3-m1: `Storage::destroy` on `Managed` transitions honestly to
+    /// `StorageBacking::Detached` instead of fabricating an inert `Legacy`
+    /// stub. All accessors report safe zero/null/default values.
+    #[test]
+    fn c0_2ci_storage_managed_destroy_transitions_to_detached() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+        let platform = PlatformBackend::for_tests();
+
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let lease = storage
+            .into_managed(&mut service, &platform, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let mut managed_storage = Storage::from_backing(StorageBacking::Managed(lease));
+
+        assert!(managed_storage.is_managed());
+        assert!(!managed_storage.is_detached());
+        assert_eq!(
+            managed_storage.extent(),
+            vk::Extent2D {
+                width: 64,
+                height: 64
+            }
+        );
+        assert_eq!(managed_storage.depth(), 24);
+        assert_eq!(managed_storage.format(), vk::Format::B8G8R8A8_UNORM);
+
+        managed_storage.destroy(&platform);
+
+        // F3-m1 decisive assertion: backing is Detached, not Legacy
+        assert!(
+            managed_storage.is_detached(),
+            "Storage::destroy() must transition Managed to Detached",
+        );
+        assert!(matches!(managed_storage.backing, StorageBacking::Detached));
+        assert!(!managed_storage.is_managed());
+        assert_eq!(managed_storage.extent(), vk::Extent2D::default());
+        assert_eq!(managed_storage.depth(), 0);
+        assert_eq!(managed_storage.content_offset(), (0, 0));
+        assert_eq!(managed_storage.format(), vk::Format::UNDEFINED);
+        assert_eq!(managed_storage.image_view(), vk::ImageView::null());
+        assert_eq!(managed_storage.sample_view(), vk::ImageView::null());
+        assert!(!managed_storage.has_image_view());
+        assert!(!managed_storage.is_exportable());
+
+        // Idempotent: repeat call is safe
+        managed_storage.destroy(&platform);
+        assert!(managed_storage.is_detached());
     }
 
     /// M-20 integration: the same guarantee through the actual
