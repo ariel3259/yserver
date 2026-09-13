@@ -9740,10 +9740,12 @@ impl KmsBackend {
     /// Returns `vk::ImageLayout::UNDEFINED` if `dst_xid` doesn't
     /// resolve in the store (rare; production code always inserts
     /// before any layout transition).
-    pub fn drawable_current_layout_for_tests(&self, dst_xid: u32) -> ash::vk::ImageLayout {
-        self.store
-            .get_by_xid(dst_xid)
-            .map_or(ash::vk::ImageLayout::UNDEFINED, |d| d.current_layout())
+    pub fn drawable_current_layout_for_tests(&mut self, dst_xid: u32) -> ash::vk::ImageLayout {
+        let Some(d) = self.store.get_by_xid(dst_xid) else {
+            return ash::vk::ImageLayout::UNDEFINED;
+        };
+        d.current_layout(self.resource_service.as_mut())
+            .unwrap_or(ash::vk::ImageLayout::UNDEFINED)
     }
 
     /// Phase B.2 Task 11: typed peek of the open frame's recorded
@@ -10686,7 +10688,13 @@ impl KmsBackend {
             crate::kms::render::engine::MaskedCopyMask {
                 image: md.image(),
                 view: md.image_view(), // IDENTITY R8 view
-                old_layout: md.current_layout(),
+                old_layout: md
+                    .current_layout(self.resource_service.as_mut())
+                    .map_err(|e| {
+                        io::Error::other(format!(
+                            "masked_copy_area_for_tests: current_layout: {e:?}"
+                        ))
+                    })?,
                 extent: md.extent(),
                 clip_origin: [clip_origin.0, clip_origin.1],
                 snapshot_id: None, // plain-drawable test path (not a snapshot)
@@ -16329,11 +16337,18 @@ fn read_managed_scanout_region_bytes(
 /// allocation (`managed_key() == None`) fails closed rather than silently
 /// skipping correlation.
 ///
-/// `#[allow(dead_code)]`: F4-m1 asked for this to come off, but it cannot
-/// yet -- see `read_managed_scanout_region_bytes`'s doc comment for the
-/// verified reason (F4c F8 stop: no non-test caller exists until the
-/// scene-submission write branch is wired).
-#[allow(dead_code)]
+/// F12-m2: F4-m1 asked for the `#[allow(dead_code)]` this carried to come
+/// off once F-4d gave `read_managed_scanout_region_bytes` a non-test
+/// caller. F-4d landed the managed scanout WRITE path
+/// (`d96e1c4c`), not a new reader, so this function's only caller
+/// remains `c0_2ci_read_source_scratch_regression_vulkan` below --
+/// `#[cfg(test)]` says that honestly instead of carrying an `allow`
+/// that suppresses the lint on a function real production code still
+/// cannot reach (R8: no production route creates managed storage for
+/// this stage to correlate a scanout read against yet). Give it a
+/// production caller and drop this attribute when the scene-submission
+/// read branch is wired.
+#[cfg(test)]
 pub(crate) fn read_scanout_region_for_managed_source(
     backend: &mut KmsBackend,
     rect: vk::Rect2D,
@@ -45841,7 +45856,6 @@ mod tests {
         let storage_lease = StorageLease {
             allocation: alloc_lease,
             pixels,
-            current_layout: std::cell::Cell::new(ash::vk::ImageLayout::UNDEFINED),
         };
 
         b.store.get_mut(drawable_id).unwrap().storage =

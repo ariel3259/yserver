@@ -261,19 +261,54 @@ impl Storage {
         }
     }
 
-    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
+    /// F11-B1: `current_layout` has exactly one copy --
+    /// `StorageAllocation::current_layout` behind the entry's
+    /// reservation protocol. `Legacy` reads/writes its own field
+    /// directly (byte-for-byte the pre-fix behaviour: never needs a
+    /// service). `Managed` reserves a `Read` use via
+    /// `ResourceService::with_storage_read`, so a live incompatible
+    /// use (e.g. a writer) is `Err(Busy)` instead of racing;
+    /// `service: None` is `Err(InvalidState)` -- never a silent
+    /// fallback value, matching the precedent
+    /// `RenderEngine::promote_drawable_exportable` already set
+    /// (`engine.rs` ~3650). `Detached` is a no-op success, matching
+    /// its other accessors (`extent()`, `format()`, ...).
+    pub(crate) fn current_layout(
+        &self,
+        service: Option<&mut ResourceService>,
+    ) -> Result<vk::ImageLayout, ResourceError> {
         match &self.backing {
-            StorageBacking::Legacy(alloc) => alloc.current_layout,
-            StorageBacking::Managed(lease) => lease.current_layout.get(),
-            StorageBacking::Detached => vk::ImageLayout::UNDEFINED,
+            StorageBacking::Legacy(alloc) => Ok(alloc.current_layout),
+            StorageBacking::Managed(lease) => {
+                let svc = service.ok_or(ResourceError::InvalidState)?;
+                svc.with_storage_read(lease, |alloc| alloc.current_layout)
+            }
+            StorageBacking::Detached => Ok(vk::ImageLayout::UNDEFINED),
         }
     }
 
-    pub(crate) fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+    /// Write counterpart of [`Self::current_layout`] (F11-B1): `Managed`
+    /// reserves a `Write` use via `ResourceService::with_storage_write`
+    /// instead of mutating a lease-local shadow with no reservation at
+    /// all (the pre-fix bug -- a live `Read` reservation did not stop
+    /// this from racing `record_layout_transition_managed`). A refused
+    /// reservation (`Busy`) and a missing service (`InvalidState`) both
+    /// propagate; neither is swallowed into a silent no-op.
+    pub(crate) fn set_current_layout(
+        &mut self,
+        layout: vk::ImageLayout,
+        service: Option<&mut ResourceService>,
+    ) -> Result<(), ResourceError> {
         match &mut self.backing {
-            StorageBacking::Legacy(alloc) => alloc.current_layout = layout,
-            StorageBacking::Managed(lease) => lease.current_layout.set(layout),
-            StorageBacking::Detached => {}
+            StorageBacking::Legacy(alloc) => {
+                alloc.current_layout = layout;
+                Ok(())
+            }
+            StorageBacking::Managed(lease) => {
+                let svc = service.ok_or(ResourceError::InvalidState)?;
+                svc.with_storage_write(lease, |alloc| alloc.current_layout = layout)
+            }
+            StorageBacking::Detached => Ok(()),
         }
     }
 
@@ -496,25 +531,42 @@ impl Storage {
     /// (DRI3-imported, or previously promoted). Used to avoid
     /// re-promoting an already-exportable drawable.
     ///
-    /// Legacy-only: every current caller (engine/backend promotion paths)
-    /// only ever reaches Legacy backing, since managed adoption has no
-    /// production producer yet (R8). Panics on `Managed`, matching
-    /// [`Self::adopt_exportable`]'s existing wrong-arm contract, rather
-    /// than reading `AllocationEntry.payload` directly and bypassing the
-    /// usage-reservation protocol (M-18) -- use
-    /// [`Self::is_exportable_managed`] once a caller actually holds a
-    /// `&mut ResourceService`.
+    /// `Legacy` reads its own field directly, no service needed.
+    /// `Managed` reserves a `Read` use via `with_storage_read` when a
+    /// service is given; a *refused* reservation (`Busy`) is distinct
+    /// from a real "not exportable" answer (F12-m1) -- distinguishing
+    /// them would mean returning `Result`, which every one of this
+    /// method's ~180 call sites across `engine.rs`/`backend.rs` would
+    /// have to unwrap for a case that can't occur yet (no production
+    /// or test caller reaches `Managed` storage through these paths,
+    /// R8), so a refusal is logged (not silently folded into "false"
+    /// the way it was pre-fix) and the bool contract is kept; a
+    /// missing service also logs and answers `false` rather than
+    /// panicking. Use [`Self::is_exportable_managed`] where a caller
+    /// already holds a `&mut ResourceService` and wants the refusal
+    /// itself, not just a log line.
     pub(crate) fn is_exportable(&self, service: Option<&mut ResourceService>) -> bool {
         match &self.backing {
             StorageBacking::Legacy(alloc) => alloc.is_exportable(),
-            StorageBacking::Managed(lease) => {
-                if let Some(svc) = service {
-                    svc.with_storage_read(lease, StorageAllocation::is_exportable)
-                        .unwrap_or(false)
-                } else {
+            StorageBacking::Managed(lease) => match service {
+                Some(svc) => match svc.with_storage_read(lease, StorageAllocation::is_exportable) {
+                    Ok(exportable) => exportable,
+                    Err(e) => {
+                        log::warn!(
+                            "Storage::is_exportable: managed read reservation refused ({e:?}); \
+                             reporting not-exportable rather than retrying"
+                        );
+                        false
+                    }
+                },
+                None => {
+                    log::warn!(
+                        "Storage::is_exportable: managed storage queried with no \
+                         ResourceService; reporting not-exportable"
+                    );
                     false
                 }
-            }
+            },
             StorageBacking::Detached => false,
         }
     }
@@ -579,7 +631,6 @@ impl Storage {
                 let image_view = alloc.image_view;
                 let sample_view = alloc.sample_view;
                 let image = alloc.image;
-                let current_layout = alloc.current_layout;
                 match service.adopt(AllocationPayload::Storage(alloc)) {
                     Ok(allocation_lease) => {
                         let key = allocation_lease.key();
@@ -596,7 +647,6 @@ impl Storage {
                         Ok(StorageLease {
                             allocation: allocation_lease,
                             pixels,
-                            current_layout: std::cell::Cell::new(current_layout),
                         })
                     }
                     Err((err, payload)) => {
@@ -738,7 +788,6 @@ impl Storage {
                 image: new_image,
             },
             allocation: new_alloc_lease,
-            current_layout: std::cell::Cell::new(new_layout),
         };
 
         let _ = std::mem::replace(
@@ -1029,21 +1078,25 @@ pub(crate) struct Drawable {
 impl Drawable {
     /// Record an image-layout transition on `cb` with full
     /// producer/consumer access masks. Updates
-    /// `storage.current_layout` so subsequent ops see the
-    /// correct old-layout in their barrier.
+    /// `StorageAllocation::current_layout` (the ONLY copy of the
+    /// layout, F11-B1) so subsequent ops see the correct old-layout in
+    /// their barrier.
     ///
-    /// **Single source of truth** for what the current layout
-    /// is. Reading or writing `current_layout` outside this
-    /// method is a layered correctness hazard — see Risk 11
-    /// in the Stage 2 plan.
-    ///
-    /// Legacy-only, like [`Storage::is_exportable`]: every current caller
-    /// only ever reaches Legacy backing. Panics on `Managed` rather than
-    /// mutating `AllocationEntry.payload` directly under a Retain lease
-    /// without reserving `Write` first (M-18) — use
-    /// [`Self::record_layout_transition_managed`], which routes the same
-    /// barrier through `ResourceService::with_storage_write` so a
-    /// concurrent incompatible reservation is refused instead of raced.
+    /// **Single source of truth** for what the current layout is.
+    /// `Legacy` mutates its own field directly (byte-for-byte the
+    /// pre-fix behaviour). `Managed` delegates to
+    /// [`Self::record_layout_transition_managed`], which reserves a
+    /// `Write` use via `ResourceService::with_storage_write` before
+    /// touching the payload or recording the barrier — `service: None`
+    /// is `Err(InvalidState)` (the same shape
+    /// `RenderEngine::promote_drawable_exportable` already uses,
+    /// `engine.rs` ~3650), and a live incompatible reservation (e.g. a
+    /// reader) is `Err(Busy)`; neither is a silent local write. Pre-fix
+    /// (F-11/F-12), this arm mutated a `StorageLease`-local
+    /// `Cell<vk::ImageLayout>` unconditionally, with no reservation at
+    /// all, so a live reader did not stop it and the payload / the
+    /// lease's Cell / a twin lease's Cell could each disagree about
+    /// the same image's layout.
     pub(crate) fn record_layout_transition(
         &mut self,
         vk: &crate::kms::vk::device::VkContext,
@@ -1053,14 +1106,28 @@ impl Drawable {
         src_access: vk::AccessFlags2,
         dst_stage: vk::PipelineStageFlags2,
         dst_access: vk::AccessFlags2,
-    ) {
+        service: Option<&mut ResourceService>,
+    ) -> Result<(), ResourceError> {
+        if matches!(self.storage.backing, StorageBacking::Managed(_)) {
+            let svc = service.ok_or(ResourceError::InvalidState)?;
+            return self.record_layout_transition_managed(
+                svc,
+                vk,
+                cb,
+                target_layout,
+                src_stage,
+                src_access,
+                dst_stage,
+                dst_access,
+            );
+        }
         match &mut self.storage.backing {
             StorageBacking::Legacy(alloc) => {
                 if alloc.is_test_stub {
                     // Tests don't issue real Vk; just update the
                     // tracker so logic-side assertions can verify.
                     alloc.current_layout = target_layout;
-                    return;
+                    return Ok(());
                 }
                 let barrier = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(src_stage)
@@ -1082,47 +1149,27 @@ impl Drawable {
                     .image_memory_barriers(std::slice::from_ref(&barrier));
                 unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
                 alloc.current_layout = target_layout;
+                Ok(())
             }
-            StorageBacking::Managed(lease) => {
-                if cb == vk::CommandBuffer::null() || lease.pixels.image == vk::Image::null() {
-                    lease.current_layout.set(target_layout);
-                    return;
-                }
-                let barrier = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(src_stage)
-                    .src_access_mask(src_access)
-                    .dst_stage_mask(dst_stage)
-                    .dst_access_mask(dst_access)
-                    .old_layout(lease.current_layout.get())
-                    .new_layout(target_layout)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(lease.pixels.image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    );
-                let dep = vk::DependencyInfo::default()
-                    .image_memory_barriers(std::slice::from_ref(&barrier));
-                unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
-                lease.current_layout.set(target_layout);
-            }
-            StorageBacking::Detached => {}
+            StorageBacking::Managed(_) => unreachable!("handled above"),
+            StorageBacking::Detached => Ok(()),
         }
     }
 
     /// Managed-storage counterpart of [`Self::record_layout_transition`]
-    /// (M-18). Reserves a `Write` use via
+    /// (M-18, F11-B1). Reserves a `Write` use via
     /// `ResourceService::with_storage_write` before touching
-    /// `current_layout` or recording the barrier, instead of the
-    /// pre-fix code's direct `lease.allocation.entry.payload.borrow_mut()`
-    /// under the storage's own Retain lease — which mutated
-    /// `current_layout` with no reservation at all, so a concurrent
-    /// incompatible use (e.g. a live reader) went undetected. No
-    /// production or test caller reaches managed storage through this
-    /// path yet (R8).
+    /// `current_layout` or recording the barrier, so a concurrent
+    /// incompatible use (e.g. a live reader) is `Err(Busy)` instead of
+    /// going undetected. `current_layout` lives only on the
+    /// `StorageAllocation` payload behind that reservation — there is
+    /// no lease-local shadow left to keep in sync (the pre-fix
+    /// `StorageLease::current_layout: Cell<_>` this replaced could
+    /// silently disagree with the payload and with other leases over
+    /// the same allocation). [`Self::record_layout_transition`]
+    /// delegates to this method on `Managed` whenever it has a
+    /// service; this is also reachable directly wherever a caller
+    /// already holds a `&mut ResourceService`.
     pub(crate) fn record_layout_transition_managed(
         &mut self,
         service: &mut ResourceService,
@@ -1162,9 +1209,7 @@ impl Drawable {
                 vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
             unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
             alloc.current_layout = target_layout;
-        })?;
-        lease.current_layout.set(target_layout);
-        Ok(())
+        })
     }
 
     pub(crate) fn extent(&self) -> vk::Extent2D {
@@ -1199,12 +1244,19 @@ impl Drawable {
         self.storage.format()
     }
 
-    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
-        self.storage.current_layout()
+    pub(crate) fn current_layout(
+        &self,
+        service: Option<&mut ResourceService>,
+    ) -> Result<vk::ImageLayout, ResourceError> {
+        self.storage.current_layout(service)
     }
 
-    pub(crate) fn set_current_layout(&mut self, layout: vk::ImageLayout) {
-        self.storage.set_current_layout(layout);
+    pub(crate) fn set_current_layout(
+        &mut self,
+        layout: vk::ImageLayout,
+        service: Option<&mut ResourceService>,
+    ) -> Result<(), ResourceError> {
+        self.storage.set_current_layout(layout, service)
     }
 
     pub(crate) fn imported_dmabuf(&self) -> Option<&ImportedDmabufMetadata> {
@@ -3227,16 +3279,21 @@ mod tests {
         );
     }
 
-    /// M-18: proves `record_layout_transition_managed` reserves a `Write`
-    /// use before mutating `current_layout`, refusing (and leaving the
-    /// layout untouched) while an incompatible reader is live. Pre-fix,
-    /// the Managed arm mutated `current_layout` through a direct
-    /// `lease.allocation.entry.payload.borrow_mut()` under the storage's
-    /// own Retain lease, with no reservation check at all -- this
-    /// scenario would have silently mutated the layout instead of
-    /// refusing. `is_test_stub` keeps this deterministic (no real
-    /// barrier is recorded), but the type still requires a live
-    /// `VkContext` to construct at all.
+    /// M-18/F11-B1: proves `record_layout_transition_managed` reserves a
+    /// `Write` use before mutating `current_layout`, refusing (and
+    /// leaving the layout untouched) while an incompatible reader is
+    /// live; then proves the SAME is true of the plain
+    /// `Drawable::record_layout_transition` (F11-B1 -- pre-fix, that
+    /// arm mutated a `StorageLease`-local `Cell<vk::ImageLayout>`
+    /// unconditionally, with no reservation at all, so a live reader
+    /// did not stop it); then proves `current_layout` has exactly one
+    /// copy by transitioning through the drawable and observing the
+    /// new layout through an independent `retain_storage` twin lease's
+    /// `with_storage_read` -- pre-fix each lease had its own Cell
+    /// snapshot and the twin would still show the OLD layout.
+    /// `is_test_stub` keeps this deterministic (no real barrier is
+    /// recorded), but the type still requires a live `VkContext` to
+    /// construct at all.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan() {
@@ -3335,8 +3392,14 @@ mod tests {
             "a refused write must not mutate current_layout",
         );
 
-        // F3-M1: Drawable::record_layout_transition must not panic on Managed storage
-        s.get_mut(id).unwrap().record_layout_transition(
+        // F11-B1: with the SAME live reader still held, the PLAIN
+        // `Drawable::record_layout_transition` on Managed storage must
+        // be refused too -- it now delegates to
+        // `record_layout_transition_managed`, which reserves the same
+        // Write use. Pre-fix, this arm mutated a lease-local Cell with
+        // NO reservation at all, so this exact scenario (a live Read
+        // reservation) went through silently.
+        let plain_refusal = s.get_mut(id).unwrap().record_layout_transition(
             &vk,
             vk::CommandBuffer::null(),
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -3344,14 +3407,100 @@ mod tests {
             vk::AccessFlags2::TRANSFER_WRITE,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            Some(&mut service),
         );
-        let StorageBacking::Managed(lease) = &s.get(id).unwrap().storage.backing else {
-            panic!("still managed");
+        assert_eq!(
+            plain_refusal,
+            Err(ResourceError::Busy),
+            "the plain Drawable::record_layout_transition arm must reserve Write via \
+             with_storage_write, not mutate a lease-local Cell unconditionally under a \
+             live reader (F11-B1)",
+        );
+        let layout_still_unchanged = {
+            let StorageBacking::Managed(lease) = &s.get(id).unwrap().storage.backing else {
+                panic!("still managed");
+            };
+            service
+                .with_storage_read(lease, |alloc| alloc.current_layout)
+                .unwrap()
         };
         assert_eq!(
-            lease.current_layout.get(),
+            layout_still_unchanged,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            "a refused plain transition must not mutate the single-sourced payload layout",
+        );
+
+        // F11-B1: with no service at all, the plain arm must propagate
+        // InvalidState -- never fall back to a silent local write.
+        let no_service_result = s.get_mut(id).unwrap().record_layout_transition(
+            &vk,
+            vk::CommandBuffer::null(),
+            vk::ImageLayout::GENERAL,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            None,
+        );
+        assert_eq!(
+            no_service_result,
+            Err(ResourceError::InvalidState),
+            "a Managed transition with no ResourceService must propagate InvalidState, \
+             matching the precedent RenderEngine::promote_drawable_exportable set (F11-B1)",
+        );
+
+        drop(_reader);
+
+        // F11-B1: `current_layout` has exactly one copy. Create an
+        // independent twin lease over the SAME allocation via
+        // `retain_storage` BEFORE the transition, then transition
+        // through the drawable's own lease, then observe the new
+        // layout through the twin's `with_storage_read` -- pre-fix,
+        // each `StorageLease` carried its own `Cell` snapshot and the
+        // twin would still report the OLD layout here.
+        let twin = {
+            let d = s.get(id).unwrap();
+            let lease = d.storage.managed_lease().expect("still managed");
+            service.retain_storage(lease).unwrap()
+        };
+        s.get_mut(id)
+            .unwrap()
+            .record_layout_transition(
+                &vk,
+                vk::CommandBuffer::null(),
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                Some(&mut service),
+            )
+            .expect("no competing reservation now that the reader is gone");
+        let observed_by_twin = service
+            .with_storage_read(&twin, |alloc| alloc.current_layout)
+            .unwrap();
+        assert_eq!(
+            observed_by_twin,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            "Drawable::record_layout_transition updates lease.current_layout without panic",
+            "a retain_storage twin lease over the same allocation must observe the \
+             transition made through the drawable's lease -- single source of truth \
+             (F11-B1)",
+        );
+
+        // Also exercise the accessor-level API `Storage::current_layout`/
+        // `set_current_layout` (F11-B1's other required surface):
+        // Managed + no service is InvalidState, never a silent value.
+        let accessor_no_service = s.get(id).unwrap().storage.current_layout(None);
+        assert_eq!(accessor_no_service, Err(ResourceError::InvalidState));
+        let accessor_with_service = s
+            .get(id)
+            .unwrap()
+            .storage
+            .current_layout(Some(&mut service))
+            .unwrap();
+        assert_eq!(
+            accessor_with_service,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
         );
     }
 
