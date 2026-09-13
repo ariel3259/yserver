@@ -255,6 +255,15 @@ impl TransportGate {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests(device: DrmDeviceKey, incarnation: IncarnationId) -> Self {
+        Self::new_legacy(
+            device,
+            incarnation,
+            Box::new(FakeDirectOwnershipState::new()),
+        )
+    }
+
     pub(crate) fn device(&self) -> DrmDeviceKey {
         self.device
     }
@@ -287,7 +296,7 @@ impl TransportGate {
     /// already quarantined by the same mismatch). The public `close` below
     /// is the graceful path and refuses while grants are outstanding
     /// (M-14).
-    fn force_close(&mut self) {
+    pub(crate) fn force_close(&mut self) {
         self.forced_closed.set(true);
         self.state = TransportState::Closed;
     }

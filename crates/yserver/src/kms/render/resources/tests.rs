@@ -4555,8 +4555,9 @@ fn c0_2ci_handoff_failure_returns_bundle_and_slot_by_value() {
     let io = MockCleanupIo::new(calls);
     let drm = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io));
     let ingress = CompletionIngress::new();
+    let gate = TransportGate::for_tests(device, incarnation);
 
-    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress);
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress, gate);
 
     let mut supervisor = RetainingSupervisor::new();
     let wrong_slot = supervisor.reserve_slot(device, IncarnationId::from_raw(999));
@@ -4611,8 +4612,9 @@ fn c0_2ci_handoff_success_routes_late_events_and_completions() {
     let io = MockCleanupIo::new(calls);
     let drm = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io));
     let ingress = CompletionIngress::new();
+    let gate = TransportGate::for_tests(device, incarnation);
 
-    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress);
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress, gate);
 
     let mut supervisor = RetainingSupervisor::new();
     let slot = supervisor.reserve_slot(device, incarnation);
@@ -4638,7 +4640,7 @@ fn c0_2ci_handoff_success_routes_late_events_and_completions() {
     drop(w);
 
     // Process router service turn
-    supervisor.router.service(Instant::now());
+    supervisor.router.service(Instant::now()).unwrap();
 
     // HardwareComplete was consumed, but GPU is still pending: old allocation not yet destroyed
     assert_eq!(old_drops.get(), 0);
@@ -4653,7 +4655,7 @@ fn c0_2ci_handoff_success_routes_late_events_and_completions() {
     }
 
     // Process service turn again
-    supervisor.router.service(Instant::now());
+    supervisor.router.service(Instant::now()).unwrap();
     {
         let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
         bundle_ref.resources.service_ready();
@@ -4702,7 +4704,18 @@ fn c0_2ci_handoff_unresolved_kms_rejects_teardown_release() {
         major: 226,
         minor: 1,
     };
-    service.record_device_barrier(DeviceBarrier::FileFamilyClosed(second_device));
+    let mut second_drm = DrmCleanupRegistry::new_with_io(
+        second_device,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    second_drm.detach_fake_submitters();
+    second_drm.close_fake_control();
+    second_drm.reap_fake_helper();
+    let second_closed = second_drm
+        .try_mint_file_family_closed(|_, _| Ok(()))
+        .unwrap();
+    service.record_device_barrier(DeviceBarrier::from_file_family_closed(second_closed));
     let proof = supervisor.issue_teardown_release(incarnation, vec![old_key]);
     assert_eq!(
         service.apply_teardown_release(proof).err().unwrap(),
@@ -4741,7 +4754,16 @@ fn c0_2ci_handoff_unresolved_kms_rejects_teardown_release() {
     service_b.freeze(old_key_b).unwrap();
 
     // Family closed barrier for matching device
-    service_b.record_device_barrier(DeviceBarrier::FileFamilyClosed(device));
+    let mut drm_b = DrmCleanupRegistry::new_with_io(
+        device,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    drm_b.detach_fake_submitters();
+    drm_b.close_fake_control();
+    drm_b.reap_fake_helper();
+    let closed_b = drm_b.try_mint_file_family_closed(|_, _| Ok(())).unwrap();
+    service_b.record_device_barrier(DeviceBarrier::from_file_family_closed(closed_b));
     let proof_b = supervisor.issue_teardown_release(incarnation, vec![old_key_b]);
     assert!(service_b.apply_teardown_release(proof_b).is_ok());
 
@@ -4763,8 +4785,9 @@ fn c0_2ci_handoff_unavailable_recipient_and_duplicate_transfer() {
     let io = MockCleanupIo::new(calls);
     let drm = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io));
     let ingress = CompletionIngress::new();
+    let gate = TransportGate::for_tests(device, incarnation);
 
-    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress);
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress, gate);
 
     let mut supervisor = RetainingSupervisor::new();
     let slot = supervisor.reserve_slot(device, incarnation);
@@ -4781,7 +4804,8 @@ fn c0_2ci_handoff_unavailable_recipient_and_duplicate_transfer() {
     let io2 = MockCleanupIo::new(calls2);
     let drm2 = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io2));
     let ingress2 = CompletionIngress::new();
-    let bundle2 = IncarnationBundle::new(owner2, service2, consumer2, drm2, None, ingress2);
+    let gate2 = TransportGate::for_tests(device, incarnation);
+    let bundle2 = IncarnationBundle::new(owner2, service2, consumer2, drm2, None, ingress2, gate2);
     let slot2 = supervisor.reserve_slot(device, incarnation);
 
     let result = supervisor.router.transfer(slot2, bundle2);
@@ -4805,6 +4829,271 @@ fn c0_2ci_handoff_unavailable_recipient_and_duplicate_transfer() {
             .unwrap(),
         ResourceError::Detached
     );
+}
+
+#[test]
+fn c0_2ci_handoff_complete_fd_family_barrier_deterministic() {
+    let (service, _lease, _drops) = spy_service();
+    let device = service.device();
+    let incarnation = service.incarnation();
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(calls.clone());
+    let mut drm = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io));
+
+    // Register a payload alias and a cleanup right
+    let payload_key = AllocationKey {
+        device,
+        incarnation,
+        generation: 101,
+    };
+    drm.register_payload_alias(payload_key);
+    let right = drm.register_right(1001, 2001, GemOwner::Right);
+
+    // Register a pool husk (F2-m1)
+    drm.register_pool_husk();
+
+    // Register a late returned descriptor (M-11)
+    let (r, w) = nix::unistd::pipe().unwrap();
+    drm.register_returned_descriptor(r);
+    drop(w);
+
+    // Initial state: mint fails (submitters not detached)
+    assert!(drm.try_mint_file_family_closed(|_, _| Ok(())).is_err());
+
+    // Close control IPC alone: mint still fails
+    drm.close_fake_control();
+    assert!(drm.try_mint_file_family_closed(|_, _| Ok(())).is_err());
+
+    // Detach submitters: mint still fails (helper not reaped)
+    drm.detach_fake_submitters();
+    assert!(drm.try_mint_file_family_closed(|_, _| Ok(())).is_err());
+
+    // Reap helper: mint still fails because non-payload aliases (pool husk + returned descriptor) remain active
+    drm.reap_fake_helper();
+    assert!(drm.try_mint_file_family_closed(|_, _| Ok(())).is_err());
+
+    // Drain pool husk (unregister pool husk): mint still fails because returned descriptor remains active
+    drm.unregister_pool_husk();
+    assert!(drm.try_mint_file_family_closed(|_, _| Ok(())).is_err());
+
+    // Close returned descriptors: now non-payload aliases are 0
+    drm.close_returned_descriptors();
+
+    // Now try_mint_file_family_closed succeeds, discharging payload aliases in order
+    let discharged = Rc::new(Cell::new(false));
+    let discharged_flag = Rc::clone(&discharged);
+    let mut right_opt = Some(right);
+    let closed = drm
+        .try_mint_file_family_closed(move |drm_reg, key| {
+            assert_eq!(key, payload_key);
+            let r = right_opt.take().expect("right already discharged");
+            drm_reg.consume(r).map_err(|(e, _)| e)?;
+            discharged_flag.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(discharged.get());
+    assert_eq!(
+        *calls.borrow(),
+        vec![CleanupCall::RemoveFb(1001), CleanupCall::CloseGem(2001)]
+    );
+
+    // Sealed DeviceBarrier constructor from FileFamilyClosed
+    let barrier = DeviceBarrier::from_file_family_closed(closed);
+    assert_eq!(barrier.device(), device);
+    assert_eq!(barrier.incarnation(), Some(incarnation));
+
+    // Description is closed; any further ioctl attempt is rejected with PermissionDenied
+    assert!(drm.is_family_closed());
+    let late_right = DrmCleanupRight::new(device, incarnation, 999, 888, GemOwner::Right);
+    let (err, _) = drm.consume(late_right).err().unwrap();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+    // Verify no further ioctls were made to CleanupIo
+    assert_eq!(calls.borrow().len(), 2);
+}
+
+#[test]
+fn c0_2ci_handoff_under_executor_stalled_revokes_grant_and_quarantines() {
+    let (mut service, old_lease, old_drops) = spy_service();
+    let old_key = old_lease.key();
+    let device = service.device();
+    let incarnation = service.incarnation();
+
+    // Setup owner with an active commit
+    let mut owner =
+        DeviceCommitOwner::<CommitResources>::new(incarnation, LifecycleEpochId::first(), 1);
+    let clock_key = crate::kms::owner::clock::ClockKey {
+        hardware_crtc: 1,
+        epoch: crate::kms::owner::identity::ClockEpochId::first(),
+    };
+    owner
+        .install_clock(clock_key, LifecycleEpochId::first(), 1)
+        .unwrap();
+    owner.clock_mut(clock_key).unwrap().install_reference(100);
+    let context = crate::kms::owner::test_fixtures::fast_context_for_crtcs(&[(1, clock_key)]);
+    let desc = crate::kms::owner::test_fixtures::single_active_crtc_with_present(1);
+    let ledger = crate::kms::owner::test_fixtures::commit_ledger();
+    let (commit, _) = owner.begin_with_context(&desc, ledger, context).unwrap();
+    assert!(owner.live_record().is_some());
+
+    let dummy_crtc = CrtcKey::new(
+        device,
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
+    );
+    let member = GroupMember::new(dummy_crtc, 1, 1);
+
+    // Register KMS obligation (correlated to commit/member) and pending Read obligation on old_key
+    let old_kms = service.register_kms(old_key, commit, member).unwrap();
+    let pending_read = service.register(old_key, ObligationKind::Read).unwrap();
+
+    // Setup gate in Owner state with an outstanding grant
+    let mut gate = TransportGate::for_tests(device, incarnation);
+    gate.begin_quiescing().unwrap();
+    let permit = gate
+        .issue_handover_permit(
+            legacy_drained_for_tests(incarnation),
+            &[],
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
+    assert_eq!(gate.state(), TransportState::Owner);
+    let grant = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    assert_eq!(gate.outstanding_owner_writes(), 1);
+
+    // Setup consumer, cleanup registry, and bundle
+    let mut consumer = CommitResourceConsumer::new();
+    let old_res = CommitResources::new(
+        vec![old_lease],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(old_key, old_kms, member)],
+    )
+    .with_commit_id(commit);
+    consumer.current_resources.push(old_res);
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(calls);
+    let drm = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io));
+    let ingress = CompletionIngress::new();
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress, gate);
+
+    let mut supervisor = RetainingSupervisor::new();
+    let slot = supervisor.reserve_slot(device, incarnation);
+
+    // Transfer under ExecutorStalled with grant outstanding:
+    // Revocation precedes close, close succeeds, and live record is Quarantined
+    assert!(supervisor.router.transfer(slot, bundle).is_ok());
+
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
+        // Gate was closed (revocation preceded close, close succeeded)
+        assert_eq!(bundle_ref.gate.state(), TransportState::Closed);
+        assert_eq!(bundle_ref.gate.outstanding_owner_writes(), 0);
+
+        // Owner live record was terminalized to CompletionUnknown and quarantined
+        assert!(matches!(
+            bundle_ref
+                .owner
+                .live_record()
+                .expect("quarantined record")
+                .state(),
+            crate::kms::owner::record::RecordState::Terminal(
+                crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+            )
+        ));
+        assert!(bundle_ref.owner.tombstones().iter().any(|t| {
+            t.commit == commit
+                && matches!(
+                    t.terminal,
+                    crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                )
+        }));
+
+        // Capacity admission was closed
+        assert!(bundle_ref.consumer.capacity.is_admission_closed());
+
+        // F1-m1: Service entries were frozen, but DRM registry was NOT frozen
+        assert!(bundle_ref.resources.is_frozen(&old_key));
+        assert!(!bundle_ref.drm.is_frozen());
+    }
+
+    // Dropping grant does not panic
+    drop(grant);
+
+    // Teardown release is refused because KMS obligation is still Outstanding
+    let proof = supervisor.issue_teardown_release(incarnation, vec![old_key]);
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
+        assert_eq!(
+            bundle_ref
+                .resources
+                .apply_teardown_release(proof)
+                .err()
+                .unwrap(),
+            ResourceError::InvalidProof
+        );
+    }
+    assert_eq!(old_drops.get(), 0);
+
+    // Apply pending read proof
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
+        bundle_ref
+            .resources
+            .apply_validated_proof(old_key, pending_read)
+            .unwrap();
+    }
+
+    // Still refused because KMS obligation is unresolved
+    let proof = supervisor.issue_teardown_release(incarnation, vec![old_key]);
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
+        assert_eq!(
+            bundle_ref
+                .resources
+                .apply_teardown_release(proof)
+                .err()
+                .unwrap(),
+            ResourceError::InvalidProof
+        );
+
+        // Drop old resources: destruction still blocked by outstanding KMS obligation
+        drop(bundle_ref.consumer.take_current());
+        bundle_ref.resources.service_ready();
+    }
+    assert_eq!(old_drops.get(), 0);
+
+    // Satisfy barrier preconditions and record device barrier
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
+        bundle_ref.drm.detach_fake_submitters();
+        bundle_ref.drm.close_fake_control();
+        bundle_ref.drm.reap_fake_helper();
+        let closed = bundle_ref
+            .drm
+            .try_mint_file_family_closed(|_, _| Ok(()))
+            .unwrap();
+        bundle_ref
+            .resources
+            .record_device_barrier(DeviceBarrier::from_file_family_closed(closed));
+    }
+
+    // Now teardown release succeeds
+    let proof = supervisor.issue_teardown_release(incarnation, vec![old_key]);
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
+        assert!(bundle_ref.resources.apply_teardown_release(proof).is_ok());
+
+        bundle_ref.resources.service_ready();
+    }
+    assert_eq!(old_drops.get(), 1);
 }
 
 fn test_crtc_key(major: u32, minor: u32, handle: u32) -> CrtcKey {

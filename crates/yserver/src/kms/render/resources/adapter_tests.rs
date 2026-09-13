@@ -11,7 +11,7 @@ use super::{
     AllocationPayload, CommitResourceConsumer, CommitResources, CompletionIngress,
     CoreRetirementBatch, DeviceBarrier, DirectCapacity, DirectRole, DrmCleanupRegistry,
     DrmDeviceKey, GroupMember, IncarnationBundle, IncarnationId, ObligationKind, ResourceError,
-    ResourceService, RetainingSupervisor, UseKind,
+    ResourceService, RetainingSupervisor, TransportGate, UseKind,
     gpu::GpuObligation,
     storage::StorageBacking,
     tests::{CleanupCall, MockCleanupIo, spy_service},
@@ -482,8 +482,9 @@ fn c0_2ci_adapter_unknown_detach_late_reply_reap() {
     let io = MockCleanupIo::new(calls);
     let drm = DrmCleanupRegistry::new_with_io(dev, inc, Box::new(io));
     let ingress = CompletionIngress::new();
+    let gate = TransportGate::for_tests(dev, inc);
 
-    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress);
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress, gate);
 
     let mut supervisor = RetainingSupervisor::new();
     let slot = supervisor.reserve_slot(dev, inc);
@@ -497,9 +498,17 @@ fn c0_2ci_adapter_unknown_detach_late_reply_reap() {
     // Family closed barrier issued upon complete helper reap
     {
         let bundle_ref = supervisor.router.get_bundle_mut(&inc).unwrap();
+        bundle_ref.drm.close_returned_descriptors();
+        bundle_ref.drm.detach_fake_submitters();
+        bundle_ref.drm.close_fake_control();
+        bundle_ref.drm.reap_fake_helper();
+        let closed = bundle_ref
+            .drm
+            .try_mint_file_family_closed(|_, _| Ok(()))
+            .unwrap();
         bundle_ref
             .resources
-            .record_device_barrier(DeviceBarrier::FileFamilyClosed(dev));
+            .record_device_barrier(DeviceBarrier::from_file_family_closed(closed));
     }
 
     drop(lease);
