@@ -2104,7 +2104,7 @@ impl KmsBackend {
         let lease = self
             .store
             .get(id)
-            .and_then(|d| d.storage.managed_lease())
+            .and_then(|d| d.managed_lease())
             .and_then(|l| {
                 self.resource_service
                     .as_mut()
@@ -3201,7 +3201,7 @@ impl KmsBackend {
         }
 
         let import = self.store.get(source_id).and_then(|drawable| {
-            let metadata = drawable.storage.imported_dmabuf.as_ref()?;
+            let metadata = drawable.imported_dmabuf()?;
             // An unresolved layout must never reach KMS. The client never
             // named it (legacy `PixmapFromBuffer`), so `metadata.modifier`
             // is our linear guess; scanning a tiled buffer out as linear
@@ -3212,11 +3212,7 @@ impl KmsBackend {
                 return None;
             }
             let plane = metadata.planes.first()?;
-            let fd = drawable
-                .storage
-                .imported_drawable
-                .as_ref()?
-                .imported_dma_buf_fd()?;
+            let fd = drawable.imported_drawable()?.imported_dma_buf_fd()?;
             Some((
                 metadata.fourcc,
                 metadata.vk_format,
@@ -3398,10 +3394,8 @@ impl KmsBackend {
                 u32::from(candidate.src_height),
             ),
             |(_, drawable)| {
-                (
-                    drawable.storage.extent.width,
-                    drawable.storage.extent.height,
-                )
+                let extent = drawable.extent();
+                (extent.width, extent.height)
             },
         );
         let depth = source.map_or(0, |(_, drawable)| drawable.depth);
@@ -3409,7 +3403,7 @@ impl KmsBackend {
             .map_or(
                 (false, 0, vk::Format::UNDEFINED, 0, 0, 0, 0),
                 |(_, drawable)| {
-                    drawable.storage.imported_dmabuf.as_ref().map_or(
+                    drawable.imported_dmabuf().map_or(
                         (false, 0, vk::Format::UNDEFINED, 0, 0, 0, 0),
                         |metadata| {
                             let plane = metadata.planes.first();
@@ -3736,7 +3730,7 @@ impl KmsBackend {
     pub fn backing_pixels_for_tests(&mut self, host_xid: u32) -> Option<(u32, u32, Vec<u8>)> {
         let target = self.resolve_paint_target(host_xid)?;
         let id = target.backing_id();
-        let (depth, extent) = self.store.get(id).map(|d| (d.depth, d.storage.extent))?;
+        let (depth, extent) = self.store.get(id).map(|d| (d.depth, d.extent()))?;
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D::default(),
             extent,
@@ -3805,9 +3799,10 @@ impl KmsBackend {
 
     pub fn storage_extent_for_tests(&self, host_xid: u32) -> Option<(u32, u32)> {
         let id = self.store.lookup(host_xid)?;
-        self.store
-            .get(id)
-            .map(|d| (d.storage.extent.width, d.storage.extent.height))
+        self.store.get(id).map(|d| {
+            let e = d.extent();
+            (e.width, e.height)
+        })
     }
 
     /// #133 step 3 (P4) — test accessor: the resolved paint target's
@@ -3960,9 +3955,9 @@ impl KmsBackend {
         // corrected itself after a few redirect cycles. Log the three
         // extents that decide it rather than guess which one is stale.
         if log::log_enabled!(log::Level::Debug) {
-            let b_extent = self.store.get(b_id).map(|d| d.storage.extent);
+            let b_extent = self.store.get(b_id).map(|d| d.extent());
             for d in &plan {
-                let leaf_extent = self.store.get(d.leaf_id).map(|s| s.storage.extent);
+                let leaf_extent = self.store.get(d.leaf_id).map(|s| s.extent());
                 let short = leaf_extent.is_some_and(|e| {
                     let avail_w = e
                         .width
@@ -4007,7 +4002,7 @@ impl KmsBackend {
             if self
                 .store
                 .get(d.leaf_id)
-                .is_none_or(|s| s.storage.image_view == ash::vk::ImageView::null())
+                .is_none_or(|s| !s.has_image_view())
             {
                 continue;
             }
@@ -4155,7 +4150,7 @@ impl KmsBackend {
         let old_layout = self
             .store
             .get(old_id)
-            .map(|d| (d.storage.extent, d.content_offset, d.depth));
+            .map(|d| (d.extent(), d.content_offset, d.depth));
         // #133 step 6 (6.1) — reallocate ONLY if the bordered extent
         // actually changed, exactly as `compReallocPixmap` compares
         // `pix_w != pOld->drawable.width` (`composite/compalloc.c:698`).
@@ -4564,9 +4559,7 @@ impl KmsBackend {
             if dst_target.backing_id() == src {
                 return Ok(());
             }
-            if self.store.get(src).map(|d| d.storage.format)
-                == Some(ash::vk::Format::B8G8R8A8_UNORM)
-            {
+            if self.store.get(src).map(|d| d.format()) == Some(ash::vk::Format::B8G8R8A8_UNORM) {
                 // Higher-stacked sibling windows that share this backing
                 // must not be overwritten by this clear. xfwm4 frames a
                 // top-level with a titlebar window (e.g. 1136x28) and the
@@ -4731,11 +4724,7 @@ impl KmsBackend {
             // takes this early-out rather than painting into content.
             return Ok(());
         }
-        let Some(storage_extent) = self
-            .store
-            .get(target.backing_id())
-            .map(|d| d.storage.extent)
-        else {
+        let Some(storage_extent) = self.store.get(target.backing_id()).map(|d| d.extent()) else {
             return Ok(());
         };
         let (cx, cy) = target.offset();
@@ -4794,7 +4783,7 @@ impl KmsBackend {
         let pixel = self.border_solid_pixel(geom, target.backing_id());
         let format = self.store.get(target.backing_id()).map_or_else(
             || PlatformBackend::format_for_depth(geom.depth),
-            |d| d.storage.format,
+            |d| d.format(),
         );
         let depth = self
             .store
@@ -4978,7 +4967,7 @@ impl KmsBackend {
             // Self-tile would alias src and dst inside render_composite.
             return false;
         }
-        let tile_format = self.store.get(tile_id).map(|d| d.storage.format);
+        let tile_format = self.store.get(tile_id).map(|d| d.format());
         if tile_format != Some(vk::Format::B8G8R8A8_UNORM) {
             log::debug!(
                 "render paint_border_ring_tiled: tile 0x{tile_xid:x} format {tile_format:?} not \
@@ -5521,7 +5510,7 @@ impl KmsBackend {
     fn read_cursor_depth1_pixmap(&mut self, host_xid: u32) -> Option<(Vec<u8>, u16, u16)> {
         let id = self.store.lookup(host_xid)?;
         let drawable = self.store.get(id)?;
-        let extent = drawable.storage.extent;
+        let extent = drawable.extent();
         let w = u16::try_from(extent.width).ok()?;
         let h = u16::try_from(extent.height).ok()?;
         let rect = ash::vk::Rect2D {
@@ -5558,7 +5547,7 @@ impl KmsBackend {
     fn read_cursor_bgra_pixmap(&mut self, host_xid: u32) -> Option<(Vec<u8>, u16, u16)> {
         let id = self.store.lookup(host_xid)?;
         let drawable = self.store.get(id)?;
-        let extent = drawable.storage.extent;
+        let extent = drawable.extent();
         let w = u16::try_from(extent.width).ok()?;
         let h = u16::try_from(extent.height).ok()?;
         let rect = ash::vk::Rect2D {
@@ -5823,7 +5812,7 @@ impl KmsBackend {
         if self
             .store
             .get(pixmap_id)
-            .map(|d| d.storage.image_view == ash::vk::ImageView::null())
+            .map(|d| !d.has_image_view())
             .unwrap_or(true)
         {
             return;
@@ -6120,7 +6109,7 @@ impl KmsBackend {
     pub fn test_storage_views(&self, xid: u32) -> Option<(ash::vk::ImageView, ash::vk::ImageView)> {
         let id = self.store.lookup(xid)?;
         let drawable = self.store.get(id)?;
-        Some((drawable.storage.image_view, drawable.storage.sample_view))
+        Some((drawable.image_view(), drawable.sample_view()))
     }
 
     /// GLX-TFP (Task 1.2) test shim: clone the backend's
@@ -6162,12 +6151,8 @@ impl KmsBackend {
                 .store
                 .get(id)
                 .ok_or_else(|| io::Error::other("promote: drawable vanished"))?;
-            (
-                d.storage.memory,
-                d.storage.export_stride,
-                d.storage.export_size,
-                d.storage.export_modifier,
-            )
+            d.export_metadata(self.resource_service.as_mut())
+                .ok_or_else(|| io::Error::other("promote: drawable not exportable"))?
         };
         // Export the promoted memory directly (the Storage now owns the
         // exportable image's handles; we don't have the ExportableImage
@@ -6823,7 +6808,7 @@ impl KmsBackend {
         let (depth, extent, content_version) = self
             .store
             .get(src.id())
-            .map(|d| (d.depth, d.storage.extent, d.content_version))
+            .map(|d| (d.depth, d.extent(), d.content_version))
             .ok_or("source drawable is not in the store")?;
         let rect = uniform_pixel_glyph_source(src, repeat, extent, mask_fmt)
             .ok_or("not a one-pixel sampled domain under a plane-covering repeat (tier 1 only)")?;
@@ -6885,7 +6870,7 @@ impl KmsBackend {
         clip: super::target::ContentClipAccum,
         id: DrawableId,
     ) -> Option<ash::vk::Rect2D> {
-        let extent = self.store.get(id).map(|d| d.storage.extent)?;
+        let extent = self.store.get(id).map(|d| d.extent())?;
         clip.finish(extent)
     }
 
@@ -7405,7 +7390,7 @@ impl KmsBackend {
         let root_id = self.store.lookup(root_xid)?;
         let (extent, depth) = {
             let d = self.store.get(root_id)?;
-            (d.storage.extent, d.depth)
+            (d.extent(), d.depth)
         };
         if extent.width == 0 || extent.height == 0 {
             return None;
@@ -7713,7 +7698,7 @@ impl KmsBackend {
         let parent_extent = self
             .store
             .get(parent_target.backing_id())
-            .map(|d| d.storage.extent)
+            .map(|d| d.extent())
             .unwrap_or_default();
         if parent_extent.width == 0 || parent_extent.height == 0 {
             log::debug!(
@@ -7859,7 +7844,7 @@ impl KmsBackend {
             if self
                 .store
                 .get(d.leaf_id)
-                .is_none_or(|s| s.storage.image_view == ash::vk::ImageView::null())
+                .is_none_or(|s| !s.has_image_view())
             {
                 continue;
             }
@@ -7925,7 +7910,7 @@ impl KmsBackend {
         let b_extent = self
             .store
             .get(b_id)
-            .map_or(ash::vk::Extent2D::default(), |d| d.storage.extent);
+            .map_or(ash::vk::Extent2D::default(), |d| d.extent());
         if b_extent.width == 0 || b_extent.height == 0 {
             return out;
         }
@@ -7984,8 +7969,8 @@ impl KmsBackend {
             // clamp is against the storage minus the ring and the
             // source origin is `(bw, bw)`. Identity at `bw == 0`.
             let bw = u32::from(geom.border_width);
-            let content_cap_w = d.storage.extent.width.saturating_sub(bw.saturating_mul(2));
-            let content_cap_h = d.storage.extent.height.saturating_sub(bw.saturating_mul(2));
+            let content_cap_w = d.extent().width.saturating_sub(bw.saturating_mul(2));
+            let content_cap_h = d.extent().height.saturating_sub(bw.saturating_mul(2));
             let w = u32::from(geom.width).min(content_cap_w);
             let h = u32::from(geom.height).min(content_cap_h);
             self.push_inferior_rects(xid, leaf_id, off_x, off_y, w, h, out);
@@ -9338,7 +9323,7 @@ impl KmsBackend {
         if self
             .store
             .get(id)
-            .map(|d| d.storage.is_exportable())
+            .map(|d| d.is_exportable(self.resource_service.as_mut()))
             .unwrap_or(false)
         {
             return true;
@@ -9362,7 +9347,7 @@ impl KmsBackend {
             Ok(()) => self
                 .store
                 .get(id)
-                .map(|d| d.storage.is_exportable())
+                .map(|d| d.is_exportable(self.resource_service.as_mut()))
                 .unwrap_or(false),
             Err(e) => {
                 log::warn!("GLX BindTexImageEXT promote 0x{host_xid:x} failed: {e:?}");
@@ -9758,9 +9743,7 @@ impl KmsBackend {
     pub fn drawable_current_layout_for_tests(&self, dst_xid: u32) -> ash::vk::ImageLayout {
         self.store
             .get_by_xid(dst_xid)
-            .map_or(ash::vk::ImageLayout::UNDEFINED, |d| {
-                d.storage.current_layout
-            })
+            .map_or(ash::vk::ImageLayout::UNDEFINED, |d| d.current_layout())
     }
 
     /// Phase B.2 Task 11: typed peek of the open frame's recorded
@@ -10701,10 +10684,10 @@ impl KmsBackend {
                 ))
             })?;
             crate::kms::render::engine::MaskedCopyMask {
-                image: md.storage.image,
-                view: md.storage.image_view, // IDENTITY R8 view
-                old_layout: md.storage.current_layout,
-                extent: md.storage.extent,
+                image: md.image(),
+                view: md.image_view(), // IDENTITY R8 view
+                old_layout: md.current_layout(),
+                extent: md.extent(),
                 clip_origin: [clip_origin.0, clip_origin.1],
                 snapshot_id: None, // plain-drawable test path (not a snapshot)
             }
@@ -13200,7 +13183,7 @@ impl KmsBackend {
         let id = self.store.lookup(host_pixmap_xid)?;
         let (width, height, depth, content_version) = {
             let d = self.store.get(id)?;
-            let extent = d.storage.extent;
+            let extent = d.extent();
             (
                 u16::try_from(extent.width).ok()?,
                 u16::try_from(extent.height).ok()?,
@@ -13231,7 +13214,7 @@ impl KmsBackend {
         let id = self.store.lookup(host_pixmap_xid)?;
         let (depth, extent) = {
             let d = self.store.get(id)?;
-            (d.depth, d.storage.extent)
+            (d.depth, d.extent())
         };
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D { x: 0, y: 0 },
@@ -13385,7 +13368,7 @@ impl KmsBackend {
             return;
         };
         let Some((w, h, live_version)) = self.store.get(did).and_then(|d| {
-            let e = d.storage.extent;
+            let e = d.extent();
             (e.width != 0 && e.height != 0).then_some((e.width, e.height, d.content_version))
         }) else {
             return;
@@ -13443,7 +13426,8 @@ impl KmsBackend {
     fn drawable_dims(&self, host_xid: u32) -> Option<(u32, u32)> {
         let id = self.store.lookup(host_xid)?;
         let d = self.store.get(id)?;
-        Some((d.storage.extent.width, d.storage.extent.height))
+        let e = d.extent();
+        Some((e.width, e.height))
     }
 
     /// Lower a list of solid-colour rectangles to the appropriate
@@ -13728,14 +13712,14 @@ impl KmsBackend {
                 height: g.height,
             }
         } else {
-            let ext =
-                self.store
-                    .get(dst_id)
-                    .map(|d| d.storage.extent)
-                    .unwrap_or(ash::vk::Extent2D {
-                        width: 0,
-                        height: 0,
-                    });
+            let ext = self
+                .store
+                .get(dst_id)
+                .map(|d| d.extent())
+                .unwrap_or(ash::vk::Extent2D {
+                    width: 0,
+                    height: 0,
+                });
             Rectangle16 {
                 x: 0,
                 y: 0,
@@ -14098,7 +14082,7 @@ impl KmsBackend {
         let Some((_storage_depth, format, extent)) = self
             .store
             .get(id)
-            .map(|d| (d.depth, d.storage.format, d.storage.extent))
+            .map(|d| (d.depth, d.format(), d.extent()))
         else {
             return;
         };
@@ -14359,10 +14343,10 @@ impl KmsBackend {
         let src_id = src_handle.id();
         let dst_id = dst_handle.id();
         self.telemetry.record_copy_area_cpu_run();
-        let Some(src_extent) = self.store.get(src_id).map(|d| d.storage.extent) else {
+        let Some(src_extent) = self.store.get(src_id).map(|d| d.extent()) else {
             return;
         };
-        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
+        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.extent()) else {
             return;
         };
         // #133 step 3 (P4): clamp against each handle's content BOUNDS
@@ -14489,7 +14473,7 @@ impl KmsBackend {
     ) {
         let dst_id = dst_handle.id();
         let width = data_width;
-        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
+        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.extent()) else {
             return;
         };
         // #133 step 3 (P4): the clamp floor/ceiling is the handle's
@@ -14670,7 +14654,7 @@ impl KmsBackend {
             return;
         }
         let id = target.backing_id();
-        let Some((depth, extent)) = self.store.get(id).map(|d| (d.depth, d.storage.extent)) else {
+        let Some((depth, extent)) = self.store.get(id).map(|d| (d.depth, d.extent())) else {
             return;
         };
         // #133 step 3 (P4): the readback and write-back below span the
@@ -14894,7 +14878,7 @@ impl KmsBackend {
             // Self-tile would alias src + dst inside render_composite.
             return false;
         }
-        let tile_format = self.store.get(tile_id).map(|d| d.storage.format);
+        let tile_format = self.store.get(tile_id).map(|d| d.format());
         if tile_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
             log::debug!(
                 "render try_tiled_fill: tile 0x{tile_xid:x} format {tile_format:?} not BGRA8"
@@ -15360,7 +15344,7 @@ impl KmsBackend {
         let format = self
             .store
             .get(target.backing_id())
-            .map(|d| d.storage.format)
+            .map(|d| d.format())
             .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
         let color = decode_x11_pixel_for_storage(background, depth, format);
         let rect = ash::vk::Rect2D {
@@ -16577,8 +16561,8 @@ fn do_dump_drawables(backend: &mut KmsBackend) -> io::Result<()> {
                 label: format!("root-0x{:x}", backend.core.window_id),
                 id: root_id,
                 depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
+                width: d.extent().width,
+                height: d.extent().height,
             });
         }
         if let Some(cow_id) = backend.cow_id
@@ -16591,8 +16575,8 @@ fn do_dump_drawables(backend: &mut KmsBackend) -> io::Result<()> {
                 ),
                 id: cow_id,
                 depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
+                width: d.extent().width,
+                height: d.extent().height,
             });
         }
         // Sorted iteration so re-running the dump gives the same
@@ -16615,8 +16599,8 @@ fn do_dump_drawables(backend: &mut KmsBackend) -> io::Result<()> {
                 label: format!("backing-W0x{w_xid:x}-B0x{b_xid:x}"),
                 id: b_id,
                 depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
+                width: d.extent().width,
+                height: d.extent().height,
             });
         }
         let mut windows: Vec<(u32, WindowGeometry)> = backend
@@ -16667,15 +16651,15 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 let Some(d) = backend.store.get(leaf_id) else {
                     continue;
                 };
-                if d.storage.extent.width == 0 || d.storage.extent.height == 0 {
+                if d.extent().width == 0 || d.extent().height == 0 {
                     continue;
                 }
                 targets.push(DumpTarget {
                     label: format!("win-0x{w_xid:x}"),
                     id: leaf_id,
                     depth: d.depth,
-                    width: d.storage.extent.width,
-                    height: d.storage.extent.height,
+                    width: d.extent().width,
+                    height: d.extent().height,
                 });
             }
         }
@@ -16697,15 +16681,15 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 let Some(d) = backend.store.get(id) else {
                     continue;
                 };
-                if d.storage.extent.width == 0 || d.storage.extent.height == 0 {
+                if d.extent().width == 0 || d.extent().height == 0 {
                     continue;
                 }
                 targets.push(DumpTarget {
                     label: format!("xid-0x{xid:x}"),
                     id,
                     depth: d.depth,
-                    width: d.storage.extent.width,
-                    height: d.storage.extent.height,
+                    width: d.extent().width,
+                    height: d.extent().height,
                 });
             }
         }
@@ -16735,8 +16719,8 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 label: format!("present-src-{idx}-0x{src_xid:x}-to-0x{dst_xid:x}"),
                 id: src_id,
                 depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
+                width: d.extent().width,
+                height: d.extent().height,
             });
         }
     }
@@ -17244,7 +17228,7 @@ fn picture_source_domain_clip(
     // Only when the domain actually restricts the sampled storage.
     // A `bw == 0` window's content IS its storage, so this returns
     // `None` and the clip list stays byte-identical there.
-    let storage = store.get(sd.id())?.storage.extent;
+    let storage = store.get(sd.id())?.extent();
     if sd.offset() == (0, 0) && domain.width >= storage.width && domain.height >= storage.height {
         return None;
     }
@@ -18256,7 +18240,7 @@ impl KmsBackend {
             .store
             .get(source_id)
             .and_then(|drawable| {
-                let metadata = drawable.storage.imported_dmabuf.as_ref()?;
+                let metadata = drawable.imported_dmabuf()?;
                 Some(metadata.implicit_layout)
             })
             .unwrap_or(false);
@@ -19412,7 +19396,7 @@ impl Backend for KmsBackend {
         if let Some(fd) = self
             .store
             .get(src_id)
-            .and_then(|d| d.storage.imported_drawable.as_ref())
+            .and_then(|d| d.imported_drawable())
             .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
         {
             match export_dmabuf_read_access_sync_file(fd) {
@@ -19820,7 +19804,7 @@ impl Backend for KmsBackend {
         let lease = self
             .store
             .get(id)
-            .and_then(|d| d.storage.managed_lease())
+            .and_then(|d| d.managed_lease())
             .and_then(|l| {
                 self.resource_service
                     .as_mut()
@@ -21822,8 +21806,8 @@ impl Backend for KmsBackend {
             return false;
         };
         drawable.depth == depth
-            && drawable.storage.extent.width >= u32::from(width)
-            && drawable.storage.extent.height >= u32::from(height)
+            && drawable.extent().width >= u32::from(width)
+            && drawable.extent().height >= u32::from(height)
     }
 
     fn update_redirected_backing_geometry(
@@ -22635,7 +22619,7 @@ impl Backend for KmsBackend {
             let format = self
                 .store
                 .get(target.backing_id())
-                .map(|d| d.storage.format)
+                .map(|d| d.format())
                 .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
@@ -22694,7 +22678,7 @@ impl Backend for KmsBackend {
             self.scene.wake_for_damage();
             return Ok(());
         }
-        let src_format = self.store.get(src).map(|d| d.storage.format);
+        let src_format = self.store.get(src).map(|d| d.format());
         if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
             // Tile path requires BGRA8 src (matches `try_tiled_fill`
             // gate). Other formats fall through with no paint —
@@ -23477,7 +23461,7 @@ impl Backend for KmsBackend {
         // anyway, so the "full extent" overhead matches the call
         // pattern.
         let src_extent = match self.store.get(src_id) {
-            Some(d) => d.storage.extent,
+            Some(d) => d.extent(),
             None => return Ok(()),
         };
         let src_w = src_extent.width;
@@ -23869,7 +23853,7 @@ impl Backend for KmsBackend {
         // redirect routing landed on. The extent must come from the
         // storage (that is what is being read); the depth must not.
         let storage_extent = match self.store.get(target.backing_id()) {
-            Some(d) => d.storage.extent,
+            Some(d) => d.extent(),
             None => return Ok(None),
         };
         let depth = target.x11_depth();
@@ -24013,7 +23997,7 @@ impl Backend for KmsBackend {
             return Ok(None);
         };
         let (depth, extent, content_version) = match self.store.get(target.backing_id()) {
-            Some(d) => (d.depth, d.storage.extent, d.content_version),
+            Some(d) => (d.depth, d.extent(), d.content_version),
             None => return Ok(None),
         };
         if depth != 1 {
@@ -26359,7 +26343,7 @@ impl Backend for KmsBackend {
         if !self
             .store
             .get(id)
-            .map(|d| d.storage.is_exportable())
+            .map(|d| d.is_exportable(self.resource_service.as_mut()))
             .unwrap_or(false)
         {
             // promote_drawable_exportable needs &mut self.engine/platform/store,
@@ -26395,8 +26379,8 @@ impl Backend for KmsBackend {
             .unwrap_or_else(|| {
                 (
                     drawable.depth,
-                    u16::try_from(drawable.storage.extent.width).unwrap_or(u16::MAX),
-                    u16::try_from(drawable.storage.extent.height).unwrap_or(u16::MAX),
+                    u16::try_from(drawable.extent().width).unwrap_or(u16::MAX),
+                    u16::try_from(drawable.extent().height).unwrap_or(u16::MAX),
                 )
             });
         let bpp: u8 = match depth {
@@ -26408,22 +26392,23 @@ impl Backend for KmsBackend {
         // Export: imported images go through the DrawableImage path; promoted /
         // server-owned images use export_promoted on the storage's raw memory
         // handle + stride/size carried from allocation-time layout query.
-        let export = if let Some(imported) = drawable.storage.imported_drawable.as_ref() {
+        let export = if let Some(imported) = drawable.imported_drawable() {
             crate::kms::vk::dri3::export_dmabuf(vk, imported)
                 .map_err(|e| io::Error::other(format!("DRI3 export_dmabuf: {e:?}")))?
         } else {
+            let (memory, export_stride, export_size, export_modifier) = drawable
+                .export_metadata(self.resource_service.as_mut())
+                .ok_or_else(|| io::Error::other("promoted storage missing export metadata"))?;
             debug_assert!(
-                drawable.storage.export_stride != 0 && drawable.storage.export_size != 0,
-                "promoted storage missing export metadata (stride={} size={})",
-                drawable.storage.export_stride,
-                drawable.storage.export_size,
+                export_stride != 0 && export_size != 0,
+                "promoted storage missing export metadata (stride={export_stride} size={export_size})",
             );
             crate::kms::vk::dri3::export_promoted(
                 vk,
-                drawable.storage.memory,
-                drawable.storage.export_stride,
-                drawable.storage.export_size,
-                drawable.storage.export_modifier,
+                memory,
+                export_stride,
+                export_size,
+                export_modifier,
             )
             .map_err(|e| io::Error::other(format!("DRI3 export_promoted: {e:?}")))?
         };
@@ -38659,7 +38644,7 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
         let leaf_before = b.store.lookup(0x100).expect("leaf before");
-        let extent_before = b.store.get(leaf_before).unwrap().storage.extent;
+        let extent_before = b.store.get(leaf_before).unwrap().extent();
         let backing_id = seed_backing_drawable(&mut b, 0x900);
         b.store.set_redirected_target(leaf_before, Some(backing_id));
         b.configure_subwindow(
@@ -38678,7 +38663,7 @@ mod tests {
         .expect("configure_subwindow");
 
         let leaf_after = b.store.lookup(0x100).expect("leaf after");
-        let extent_after = b.store.get(leaf_after).unwrap().storage.extent;
+        let extent_after = b.store.get(leaf_after).unwrap().extent();
         assert_eq!(
             leaf_after, leaf_before,
             "redirected resize must not churn the hidden leaf DrawableId",
@@ -38724,7 +38709,7 @@ mod tests {
         .expect("configure_subwindow");
 
         let leaf_during_redirect = b.store.lookup(0x100).expect("leaf during redirect");
-        let extent_during_redirect = b.store.get(leaf_during_redirect).unwrap().storage.extent;
+        let extent_during_redirect = b.store.get(leaf_during_redirect).unwrap().extent();
         assert_eq!(extent_during_redirect.width, 100);
         assert_eq!(extent_during_redirect.height, 100);
 
@@ -38732,7 +38717,7 @@ mod tests {
             .expect("release_redirected_backing");
 
         let leaf_after = b.store.lookup(0x100).expect("leaf after unredirect");
-        let extent_after = b.store.get(leaf_after).unwrap().storage.extent;
+        let extent_after = b.store.get(leaf_after).unwrap().extent();
         assert_eq!(extent_after.width, 180);
         assert_eq!(extent_after.height, 140);
     }
@@ -38946,8 +38931,8 @@ mod tests {
             matches!(cow.kind, super::super::store::DrawableKind::Window),
             "COW must be DrawableKind::Window",
         );
-        assert_eq!(cow.storage.extent.width, u32::from(b.platform.fb_w));
-        assert_eq!(cow.storage.extent.height, u32::from(b.platform.fb_h));
+        assert_eq!(cow.extent().width, u32::from(b.platform.fb_w));
+        assert_eq!(cow.extent().height, u32::from(b.platform.fb_h));
     }
 
     #[test]
@@ -42515,7 +42500,7 @@ mod tests {
             .store
             .lookup(root_xid)
             .expect("root must be live before resize");
-        let extent_before = b.store.get(id_before).unwrap().storage.extent;
+        let extent_before = b.store.get(id_before).unwrap().extent();
         assert_eq!(extent_before.width, u32::from(initial_w));
         assert_eq!(extent_before.height, u32::from(initial_h));
 
@@ -42539,7 +42524,7 @@ mod tests {
             .store
             .lookup(root_xid)
             .expect("root must still be live after resize");
-        let extent_after = b.store.get(id_after).unwrap().storage.extent;
+        let extent_after = b.store.get(id_after).unwrap().extent();
         assert_eq!(
             extent_after.width,
             u32::from(new_w),

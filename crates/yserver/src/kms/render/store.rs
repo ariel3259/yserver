@@ -277,6 +277,78 @@ impl Storage {
         }
     }
 
+    pub(crate) fn imported_dmabuf(&self) -> Option<&ImportedDmabufMetadata> {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.imported_dmabuf.as_ref(),
+            StorageBacking::Managed(_) | StorageBacking::Detached => None,
+        }
+    }
+
+    pub(crate) fn imported_drawable(&self) -> Option<&crate::kms::vk::target::DrawableImage> {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.imported_drawable.as_ref(),
+            StorageBacking::Managed(_) | StorageBacking::Detached => None,
+        }
+    }
+
+    pub(crate) fn export_metadata(
+        &self,
+        service: Option<&mut ResourceService>,
+    ) -> Option<(vk::DeviceMemory, u32, u64, u64)> {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => Some((
+                alloc.memory,
+                alloc.export_stride,
+                alloc.export_size,
+                alloc.export_modifier,
+            )),
+            StorageBacking::Managed(lease) => {
+                if let Some(svc) = service {
+                    svc.with_storage_read(lease, |alloc| {
+                        (
+                            alloc.memory,
+                            alloc.export_stride,
+                            alloc.export_size,
+                            alloc.export_modifier,
+                        )
+                    })
+                    .ok()
+                } else {
+                    None
+                }
+            }
+            StorageBacking::Detached => None,
+        }
+    }
+
+    pub(crate) fn memory(&self) -> vk::DeviceMemory {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.memory,
+            StorageBacking::Managed(_) | StorageBacking::Detached => vk::DeviceMemory::null(),
+        }
+    }
+
+    pub(crate) fn export_stride(&self) -> u32 {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.export_stride,
+            StorageBacking::Managed(_) | StorageBacking::Detached => 0,
+        }
+    }
+
+    pub(crate) fn export_size(&self) -> u64 {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.export_size,
+            StorageBacking::Managed(_) | StorageBacking::Detached => 0,
+        }
+    }
+
+    pub(crate) fn export_modifier(&self) -> u64 {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.export_modifier,
+            StorageBacking::Managed(_) | StorageBacking::Detached => 0,
+        }
+    }
+
     /// Production constructor — Vk handles owned by `PlatformBackend::
     /// allocate_drawable_storage`. Initial layout is `UNDEFINED`;
     /// transitions tracked thereafter via
@@ -432,13 +504,16 @@ impl Storage {
     /// usage-reservation protocol (M-18) -- use
     /// [`Self::is_exportable_managed`] once a caller actually holds a
     /// `&mut ResourceService`.
-    pub(crate) fn is_exportable(&self) -> bool {
+    pub(crate) fn is_exportable(&self, service: Option<&mut ResourceService>) -> bool {
         match &self.backing {
             StorageBacking::Legacy(alloc) => alloc.is_exportable(),
-            StorageBacking::Managed(_) => {
-                panic!(
-                    "Storage::is_exportable called on managed storage; use is_exportable_managed"
-                );
+            StorageBacking::Managed(lease) => {
+                if let Some(svc) = service {
+                    svc.with_storage_read(lease, StorageAllocation::is_exportable)
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
             }
             StorageBacking::Detached => false,
         }
@@ -1008,10 +1083,31 @@ impl Drawable {
                 unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
                 alloc.current_layout = target_layout;
             }
-            StorageBacking::Managed(_) => {
-                panic!(
-                    "Drawable::record_layout_transition called on managed storage; use record_layout_transition_managed"
-                );
+            StorageBacking::Managed(lease) => {
+                if cb == vk::CommandBuffer::null() || lease.pixels.image == vk::Image::null() {
+                    lease.current_layout.set(target_layout);
+                    return;
+                }
+                let barrier = vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(src_stage)
+                    .src_access_mask(src_access)
+                    .dst_stage_mask(dst_stage)
+                    .dst_access_mask(dst_access)
+                    .old_layout(lease.current_layout.get())
+                    .new_layout(target_layout)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(lease.pixels.image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    );
+                let dep = vk::DependencyInfo::default()
+                    .image_memory_barriers(std::slice::from_ref(&barrier));
+                unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
+                lease.current_layout.set(target_layout);
             }
             StorageBacking::Detached => {}
         }
@@ -1075,6 +1171,14 @@ impl Drawable {
         self.storage.extent()
     }
 
+    pub(crate) fn depth(&self) -> u8 {
+        self.storage.depth()
+    }
+
+    pub(crate) fn content_offset(&self) -> (i32, i32) {
+        self.storage.content_offset()
+    }
+
     pub(crate) fn image_view(&self) -> vk::ImageView {
         self.storage.image_view()
     }
@@ -1101,6 +1205,53 @@ impl Drawable {
 
     pub(crate) fn set_current_layout(&mut self, layout: vk::ImageLayout) {
         self.storage.set_current_layout(layout);
+    }
+
+    pub(crate) fn imported_dmabuf(&self) -> Option<&ImportedDmabufMetadata> {
+        self.storage.imported_dmabuf()
+    }
+
+    pub(crate) fn imported_drawable(&self) -> Option<&crate::kms::vk::target::DrawableImage> {
+        self.storage.imported_drawable()
+    }
+
+    pub(crate) fn export_metadata(
+        &self,
+        service: Option<&mut ResourceService>,
+    ) -> Option<(vk::DeviceMemory, u32, u64, u64)> {
+        self.storage.export_metadata(service)
+    }
+
+    pub(crate) fn memory(&self) -> vk::DeviceMemory {
+        self.storage.memory()
+    }
+
+    pub(crate) fn is_exportable(&self, service: Option<&mut ResourceService>) -> bool {
+        self.storage.is_exportable(service)
+    }
+
+    pub(crate) fn managed_lease(&self) -> Option<&StorageLease> {
+        self.storage.managed_lease()
+    }
+
+    pub(crate) fn is_managed(&self) -> bool {
+        self.storage.is_managed()
+    }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        self.storage.is_detached()
+    }
+
+    pub(crate) fn export_stride(&self) -> u32 {
+        self.storage.export_stride()
+    }
+
+    pub(crate) fn export_size(&self) -> u64 {
+        self.storage.export_size()
+    }
+
+    pub(crate) fn export_modifier(&self) -> u64 {
+        self.storage.export_modifier()
     }
 }
 
@@ -2883,7 +3034,7 @@ mod tests {
         if let StorageBacking::Legacy(ref mut alloc) = promoted.backing {
             alloc.promoted_exportable = true;
         }
-        assert!(promoted.is_exportable());
+        assert!(promoted.is_exportable(None));
         // destroy must not crash and must not pool-return
         promoted.destroy(&platform);
     }
@@ -3060,6 +3211,9 @@ mod tests {
             Ok(true),
             "read reservation succeeds and observes the real payload flag",
         );
+        // F3-M1: Storage::is_exportable must not panic on Managed storage
+        assert!(managed.is_exportable(Some(&mut service)));
+        assert!(!managed.is_exportable(None));
 
         // A live writer makes a Read reservation incompatible
         // (`EntryAvailability::is_compatible`); the pre-fix direct
@@ -3180,6 +3334,25 @@ mod tests {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             "a refused write must not mutate current_layout",
         );
+
+        // F3-M1: Drawable::record_layout_transition must not panic on Managed storage
+        s.get_mut(id).unwrap().record_layout_transition(
+            &vk,
+            vk::CommandBuffer::null(),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        );
+        let StorageBacking::Managed(lease) = &s.get(id).unwrap().storage.backing else {
+            panic!("still managed");
+        };
+        assert_eq!(
+            lease.current_layout.get(),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            "Drawable::record_layout_transition updates lease.current_layout without panic",
+        );
     }
 
     /// M-20: `Storage::destroy`'s Managed arm must detach the Retain use
@@ -3296,7 +3469,7 @@ mod tests {
         assert_eq!(managed_storage.image_view(), vk::ImageView::null());
         assert_eq!(managed_storage.sample_view(), vk::ImageView::null());
         assert!(!managed_storage.has_image_view());
-        assert!(!managed_storage.is_exportable());
+        assert!(!managed_storage.is_exportable(None));
 
         // Idempotent: repeat call is safe
         managed_storage.destroy(&platform);
