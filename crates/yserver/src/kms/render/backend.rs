@@ -17695,7 +17695,7 @@ impl KmsBackend {
         resampled
     }
 
-    fn apply_gamma_to_live_output(&self, output_key: &OutputKey) -> io::Result<()> {
+    pub(crate) fn apply_gamma_to_live_output(&self, output_key: &OutputKey) -> io::Result<()> {
         use ::drm::control::Device as ControlDevice;
 
         let Some((device_key, crtc, gamma_size)) = self.live_crtc_and_gamma_size(output_key)?
@@ -17721,7 +17721,6 @@ impl KmsBackend {
         device
             .device
             .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
-            .map_err(|e| io::Error::other(format!("set_gamma for {output_key:?} failed: {e}")))
     }
 
     fn reapply_gamma_for_output(&self, output_key: &OutputKey) {

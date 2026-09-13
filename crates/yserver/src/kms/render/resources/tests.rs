@@ -1294,7 +1294,7 @@ fn c0_2ci_scanout_partial_grouped_replacement_leaves_shared_source_retained() {
 /// per the plan's 9.5 fixture note: `Device::for_tests()` is a Unix socket
 /// and cannot back a `GbmDevice`. `None` when no real DRM hardware is
 /// present.
-fn open_test_render_node() -> Option<crate::drm::Device> {
+pub(crate) fn open_test_render_node() -> Option<crate::drm::Device> {
     let card = crate::kms::executor::test_support::TestDevice::open_real_drm_or_ignore()?;
     let render = crate::kms::render_node::open_for_card(&card).ok()?;
     crate::drm::Device::open_render_node(render.path().to_str()?).ok()
@@ -2824,7 +2824,10 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
 /// way to `Owner` (Legacy -> Quiescing -> handover -> publish), for tests
 /// that need to mint a real `OwnerWriteGrant` matching a specific device/
 /// incarnation identity.
-fn owner_gate_for_tests(device: DrmDeviceKey, incarnation: IncarnationId) -> TransportGate {
+pub(crate) fn owner_gate_for_tests(
+    device: DrmDeviceKey,
+    incarnation: IncarnationId,
+) -> TransportGate {
     let mut gate = TransportGate::new_legacy(
         device,
         incarnation,
@@ -2985,6 +2988,106 @@ fn c0_2ci_sink_output_disable_gate_four_states() {
     assert_sink_gated_four_states(WriterClass::Modeset, |permitted| {
         crate::drm::modeset::disable_output(&device, output, permitted)
     });
+}
+
+/// F5b-m1 (gamma four-way test): drives `apply_gamma_to_live_output` under
+/// `WriterClass::Gamma` through four gate states (Legacy, Quiescing, Owner, Closed)
+/// on a real primary DRM node opened without master.
+///
+/// In Legacy: `apply_gamma_to_live_output` reaches the kernel `set_gamma` ioctl,
+/// which fails with an OS error (`err.raw_os_error().is_some() == true`) because
+/// the fixture holds no DRM master.
+///
+/// In Quiescing, Owner, and Closed: the transport gate blocks the call before
+/// the ioctl, returning `crate::drm::transport_gate_refusal("gamma")` whose
+/// `raw_os_error()` is `None`.
+#[test]
+#[ignore = "requires a real DRM primary node; run explicitly"]
+fn c0_2ci_sink_gamma_gate_four_states_drm() {
+    use std::os::fd::AsRawFd;
+
+    let test_device = crate::kms::executor::test_support::TestDevice::open_real_drm_or_ignore()
+        .unwrap_or_else(|| {
+            panic!("environmental skip: no real DRM primary node (/dev/dri/cardN) available for gamma test")
+        });
+    let file = test_device.into_file();
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(file.as_raw_fd(), &mut stat) };
+    assert!(rc >= 0, "fstat on real drm primary node failed");
+    #[allow(clippy::cast_possible_truncation)]
+    let device_key = crate::platform::drm::DrmDeviceKey {
+        major: libc::major(stat.st_rdev) as u32,
+        minor: libc::minor(stat.st_rdev) as u32,
+    };
+    let device = Rc::new(crate::drm::Device::from_file_for_tests(file));
+    use ::drm::control::Device as ControlDevice;
+    let res = device
+        .resource_handles()
+        .expect("drm resource handles on real primary node");
+    let crtc = *res
+        .crtcs()
+        .first()
+        .expect("real drm device has at least one crtc");
+
+    let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
+    backend.platform.devices = vec![crate::kms::render::platform::KmsDevice {
+        key: device_key,
+        device: Rc::clone(&device),
+        cursor: crate::kms::render::platform::KmsCursorState::new(),
+        executor: None,
+        owner: None,
+    }];
+    let output_key = crate::kms::backend::OutputKey::new(device_key, "gamma_test_output");
+    let mut output = backend.platform.outputs.remove(0);
+    output.key = output_key.clone();
+    output.output.crtc = crtc;
+    backend.platform.outputs.push(output);
+
+    for state in [
+        TransportState::Legacy,
+        TransportState::Quiescing,
+        TransportState::Owner,
+        TransportState::Closed,
+    ] {
+        let mut gate = TransportGate::new_legacy(
+            device_key,
+            IncarnationId::first(),
+            Box::new(FakeDirectOwnershipState::new()),
+        );
+        if state != TransportState::Legacy {
+            gate.begin_quiescing().unwrap();
+            if state == TransportState::Owner {
+                let permit = gate
+                    .issue_handover_permit(
+                        legacy_drained_for_tests(IncarnationId::first()),
+                        &[],
+                        &WriterCoverageProof::new_for_tests(),
+                        RecipientReservation::new_for_tests(),
+                    )
+                    .unwrap();
+                gate.publish_owner(permit).unwrap();
+            } else if state == TransportState::Closed {
+                gate.close().unwrap();
+            }
+        }
+        backend.platform.transport_gates.insert(device_key, gate);
+
+        let res = backend.apply_gamma_to_live_output(&output_key);
+        let err = res.expect_err("apply_gamma_to_live_output without master must fail");
+        let reached_ioctl = err.raw_os_error().is_some();
+        assert_eq!(
+            reached_ioctl,
+            state == TransportState::Legacy,
+            "state={state:?} reached_ioctl={reached_ioctl} err={err}",
+        );
+        if state != TransportState::Legacy {
+            assert!(
+                err.to_string()
+                    .contains("transport gate: legacy gamma write refused"),
+                "state={state:?} err={err}",
+            );
+        }
+    }
 }
 
 /// B-10/R11 (helper mutation): unlike the five DRM sinks above, this sink

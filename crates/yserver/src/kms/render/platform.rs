@@ -2123,7 +2123,7 @@ impl RollbackScanoutOutput for ActiveOutput {
 fn rollback_initial_scanout_with<O, F>(devices: &[KmsDevice], outputs: &mut [O], disable: &mut F)
 where
     O: RollbackScanoutOutput,
-    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+    F: FnMut(&KmsDevice, &crate::platform::drm::Output) -> io::Result<()>,
 {
     for layout in outputs.iter_mut().rev() {
         let device_key = layout.output_key().device_key;
@@ -2138,7 +2138,7 @@ where
             layout.disarm_swapchain();
             continue;
         };
-        if let Err(err) = disable(&device.device, layout.drm_output()) {
+        if let Err(err) = disable(device, layout.drm_output()) {
             log::warn!(
                 "initial scanout rollback: failed to disable {} on {}: {err}; \
                  leaving its buffers for DRM-fd close",
@@ -2157,7 +2157,7 @@ where
 struct InitialScanoutRollbackGuard<'a, O, F>
 where
     O: RollbackScanoutOutput,
-    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+    F: FnMut(&KmsDevice, &crate::platform::drm::Output) -> io::Result<()>,
 {
     devices: &'a [KmsDevice],
     outputs: &'a mut [O],
@@ -2168,7 +2168,7 @@ where
 impl<'a, O, F> InitialScanoutRollbackGuard<'a, O, F>
 where
     O: RollbackScanoutOutput,
-    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+    F: FnMut(&KmsDevice, &crate::platform::drm::Output) -> io::Result<()>,
 {
     fn new_with(devices: &'a [KmsDevice], outputs: &'a mut [O], disable: F) -> Self {
         Self {
@@ -2199,7 +2199,7 @@ where
 impl<O, F> Drop for InitialScanoutRollbackGuard<'_, O, F>
 where
     O: RollbackScanoutOutput,
-    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+    F: FnMut(&KmsDevice, &crate::platform::drm::Output) -> io::Result<()>,
 {
     fn drop(&mut self) {
         if self.armed {
@@ -2547,11 +2547,15 @@ impl Drop for PlatformBackend {
         if !self.initial_scanout_rollback_armed {
             return;
         }
-        // B-10/R11: `true` -- a `PlatformBackend` being unwound mid-
-        // construction (the only time this `Drop` rolls back) never
-        // installed a transport gate (R8).
+        // F5b-m2: pass `self.allows_legacy(&device.key, WriterClass::Modeset)`
+        // rather than literal `true`.
+        let transport_gates = &self.transport_gates;
         rollback_initial_scanout_with(&self.devices, &mut self.outputs, &mut |device, output| {
-            drm::modeset::disable_output(device, output, true)
+            let allow_legacy = transport_gates
+                .get(&device.key)
+                .map(|g| g.allows_legacy(crate::kms::render::resources::WriterClass::Modeset))
+                .unwrap_or(true);
+            drm::modeset::disable_output(&device.device, output, allow_legacy)
         });
         self.initial_scanout_rollback_armed = false;
     }
@@ -2649,7 +2653,7 @@ impl PlatformBackend {
         // `PlatformBackend` (and any transport gate) exists (R8).
         let mut initial_scanout_rollback =
             InitialScanoutRollbackGuard::new_with(&devices, &mut layouts, |device, output| {
-                drm::modeset::disable_output(device, output, true)
+                drm::modeset::disable_output(&device.device, output, true)
             });
 
         let requested_render_node = render_node.as_ref().map(|node| node.key());

@@ -1297,12 +1297,53 @@ unsafe extern "system" fn vk_debug_callback(
             .unwrap_or("<non-utf8 message>")
     };
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        #[cfg(test)]
+        {
+            VALIDATION_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            THREAD_VALIDATION_ERROR_COUNT.with(|c| c.set(c.get() + 1));
+        }
         log::error!("vk: {msg}");
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+        #[cfg(test)]
+        {
+            VALIDATION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            THREAD_VALIDATION_WARNING_COUNT.with(|c| c.set(c.get() + 1));
+        }
         log::warn!("vk: {msg}");
     }
     // INFO/VERBOSE intentionally suppressed — too noisy.
     vk::FALSE
+}
+
+#[cfg(test)]
+static VALIDATION_ERROR_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static VALIDATION_WARNING_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_VALIDATION_ERROR_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static THREAD_VALIDATION_WARNING_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn validation_error_count() -> usize {
+    THREAD_VALIDATION_ERROR_COUNT.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn validation_warning_count() -> usize {
+    THREAD_VALIDATION_WARNING_COUNT.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_counts() {
+    VALIDATION_ERROR_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    VALIDATION_WARNING_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    THREAD_VALIDATION_ERROR_COUNT.with(|c| c.set(0));
+    THREAD_VALIDATION_WARNING_COUNT.with(|c| c.set(0));
 }
 
 #[cfg(test)]

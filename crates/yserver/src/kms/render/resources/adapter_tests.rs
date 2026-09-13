@@ -8,16 +8,19 @@ use std::{
 use ash::vk::{self, Handle};
 
 use super::{
-    AllocationPayload, CommitResourceConsumer, CommitResources, CompletionIngress,
-    CoreRetirementBatch, DeviceBarrier, DirectCapacity, DirectRole, DrmCleanupRegistry,
-    DrmDeviceKey, GroupMember, IncarnationBundle, IncarnationId, ObligationKind, ResourceError,
-    ResourceService, RetainingSupervisor, TransportGate, UseKind,
+    AllocationPayload, CommitResourceConsumer, CommitResources, CompletionDisposition,
+    CompletionIngress, CopiedSourceAllocation, CoreRetirementBatch, DeviceBarrier, DirectCapacity,
+    DirectRole, DrmCleanupRegistry, DrmDeviceKey, FileOwnedBacking, GemOwner, GroupMember,
+    IncarnationBundle, IncarnationId, ObligationKind, PresentDisposition, PresentKey,
+    ResourceError, ResourceService, RetainingSupervisor, ScanoutAllocation, SharedBacking, UseKind,
+    WriterClass,
     gpu::GpuObligation,
     storage::StorageBacking,
-    tests::{CleanupCall, MockCleanupIo, spy_service},
+    tests::{CleanupCall, MockCleanupIo, open_test_render_node, owner_gate_for_tests, spy_service},
 };
 use crate::kms::{
     owner::{
+        clock::ClockSample,
         device::{DeviceCommitOwner, OwnerEvent},
         identity::CommitId,
         lifecycle::LifecycleEpochId,
@@ -193,42 +196,104 @@ fn c0_2ci_adapter_old_layout_during_relayout_promotion() {
 // ── 3. Shared BO and copied source/sink pair ────────────────────────────────
 #[test]
 fn c0_2ci_adapter_shared_bo_and_copied_source_sink_order() {
-    let (mut service, shared_lease, shared_drops) = spy_service();
-    let shared_key = shared_lease.key();
+    let dev = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let inc = IncarnationId::first();
+    let mut renderer_service = ResourceService::new(dev, inc);
+    let mut display_service = ResourceService::new(dev, inc);
 
-    let (mut sink_service, sink_lease, sink_drops) = spy_service();
-    let sink_key = sink_lease.key();
-
-    // Register KMS obligation on sink, GPU obligation on shared source
-    let sink_kms = sink_service
-        .register(sink_key, ObligationKind::KmsRelease)
+    let renderer_alloc = CopiedSourceAllocation::mock(
+        ash::vk::Semaphore::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        crate::kms::vk::scanout::CopiedSourceOwnership::ForeignAwaitingSink,
+    );
+    let renderer_lease = renderer_service
+        .adopt(AllocationPayload::CopiedSource(renderer_alloc))
         .unwrap();
-    let shared_gpu = service.register(shared_key, ObligationKind::Gpu).unwrap();
+    let renderer_key = renderer_lease.key();
 
-    // Drops leases
-    drop(shared_lease);
-    drop(sink_lease);
-
-    // Neither is freed yet
-    service.service_ready();
-    sink_service.service_ready();
-    assert_eq!(shared_drops.get(), 0);
-    assert_eq!(sink_drops.get(), 0);
-
-    // Completing KMS on sink does NOT free shared source
-    sink_service
-        .apply_validated_proof(sink_key, sink_kms)
+    let display_alloc = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let display_lease = display_service
+        .adopt(AllocationPayload::Scanout(display_alloc))
         .unwrap();
-    sink_service.service_ready();
-    assert_eq!(sink_drops.get(), 1);
-    assert_eq!(shared_drops.get(), 0);
+    let display_key = display_lease.key();
 
-    // Completing GPU on shared source frees it
-    service
-        .apply_validated_proof(shared_key, shared_gpu)
+    // Register KMS obligation on display sink, GPU on both, FOREIGN return on renderer source
+    let kms_disp = display_service
+        .register(display_key, ObligationKind::KmsRelease)
         .unwrap();
-    service.service_ready();
-    assert_eq!(shared_drops.get(), 1);
+    let gpu_disp = display_service
+        .register(display_key, ObligationKind::Gpu)
+        .unwrap();
+    let foreign_rend = renderer_service
+        .register(renderer_key, ObligationKind::ForeignReturn)
+        .unwrap();
+    let gpu_rend = renderer_service
+        .register(renderer_key, ObligationKind::Gpu)
+        .unwrap();
+
+    // Drop leases: both allocations stay pinned by their outstanding obligations
+    drop(display_lease);
+    drop(renderer_lease);
+    display_service.service_ready();
+    renderer_service.service_ready();
+    assert!(display_service.contains(&display_key));
+    assert!(renderer_service.contains(&renderer_key));
+
+    // KMS release on sink must NOT allow premature reuse of renderer or display
+    display_service
+        .apply_validated_proof(display_key, kms_disp)
+        .unwrap();
+    display_service.service_ready();
+    assert!(display_service.contains(&display_key));
+    assert!(renderer_service.contains(&renderer_key));
+    assert!(matches!(
+        renderer_service.reserve(renderer_key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+
+    // Complete display GPU work: frees display sink allocation
+    display_service
+        .apply_validated_proof(display_key, gpu_disp)
+        .unwrap();
+    display_service.service_ready();
+    assert!(!display_service.contains(&display_key));
+
+    // Renderer source is STILL pinned by GPU and ForeignReturn dependencies
+    assert!(renderer_service.contains(&renderer_key));
+    assert!(matches!(
+        renderer_service.reserve(renderer_key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+
+    // Complete renderer GPU work: still pinned by ForeignReturn
+    renderer_service
+        .apply_validated_proof(renderer_key, gpu_rend)
+        .unwrap();
+    renderer_service.service_ready();
+    assert!(renderer_service.contains(&renderer_key));
+    assert!(matches!(
+        renderer_service.reserve(renderer_key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+
+    // Discharge FOREIGN return dependency: renderer source is now freed and eligible for reuse
+    renderer_service
+        .apply_validated_proof(renderer_key, foreign_rend)
+        .unwrap();
+    renderer_service.service_ready();
+    assert!(!renderer_service.contains(&renderer_key));
 }
 
 // ── 4. Root snapshot then scratch Composite ─────────────────────────────────
@@ -338,40 +403,126 @@ fn c0_2ci_adapter_vt_away_dpms_off_idle_service_progress() {
 // ── 7. Grouped A/B frame, reversed output evidence ──────────────────────────
 #[test]
 fn c0_2ci_adapter_grouped_frame_reversed_evidence() {
-    let (mut service, old_a, drops_a) = spy_service();
-    let (mut service_b, old_b, drops_b) = spy_service();
-    let key_a = old_a.key();
-    let key_b = old_b.key();
+    let dev = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let inc = IncarnationId::first();
+    let mut service = ResourceService::new(dev, inc);
 
-    let dev = service.device();
+    let shared_alloc = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let shared_lease = service
+        .adopt(AllocationPayload::Scanout(shared_alloc))
+        .unwrap();
+    let shared_key = shared_lease.key();
+
     let crtc_a = crtc_key(dev.major, dev.minor, 1);
     let crtc_b = crtc_key(dev.major, dev.minor, 2);
     let member_a = GroupMember::new(crtc_a, 1, 1);
     let member_b = GroupMember::new(crtc_b, 1, 1);
     let commit = CommitId::for_tests(701);
 
-    let ob_a = service.register_kms(key_a, commit, member_a).unwrap();
-    let ob_b = service_b.register_kms(key_b, commit, member_b).unwrap();
+    let ob_a = service.register_kms(shared_key, commit, member_a).unwrap();
+    let ob_b = service.register_kms(shared_key, commit, member_b).unwrap();
 
-    drop(old_a);
-    drop(old_b);
+    let mut consumer = CommitResourceConsumer::new();
+    let present_key = PresentKey::new(dev, inc, commit, 1);
+    // Reference CRTC is CRTC 2 (crtc_b)
+    consumer.record_present_disposition_with_reference(
+        present_key,
+        PresentDisposition::pending(),
+        2,
+    );
 
-    // Reversed output evidence: CRTC B arrives before reference CRTC A
-    service_b
-        .record_kms_discharged(key_b, ob_b, commit, member_b)
+    let mut res = CommitResources::new(
+        vec![shared_lease],
+        None,
+        None,
+        None,
+        vec![member_a, member_b],
+        vec![(shared_key, ob_a, member_a), (shared_key, ob_b, member_b)],
+    );
+    res.commit_id = Some(commit);
+    consumer.releasing_resources.push(res);
+
+    // Reversed evidence: non-reference CRTC B hardware-completes first
+    consumer.commit_members.insert(commit, vec![member_b]);
+    consumer
+        .consume(OwnerEvent::HardwareComplete { commit }, &mut service)
         .unwrap();
-    service_b.apply_validated_proof(key_b, ob_b).unwrap();
-    service_b.service_ready();
-    assert_eq!(drops_b.get(), 1);
-    assert_eq!(drops_a.get(), 0);
-
-    // CRTC A arrives later
-    service
-        .record_kms_discharged(key_a, ob_a, commit, member_a)
-        .unwrap();
-    service.apply_validated_proof(key_a, ob_a).unwrap();
+    consumer.on_available(&[shared_key], &mut service).unwrap();
     service.service_ready();
-    assert_eq!(drops_a.get(), 1);
+
+    // Shared source MUST be retained because CRTC A replacement has not yet completed
+    assert!(
+        service.contains(&shared_key),
+        "shared source must survive while member_a replacement is incomplete"
+    );
+
+    // Presentation event arrives with clock samples for both CRTC 1 and CRTC 2
+    let mut samples = std::collections::BTreeMap::new();
+    samples.insert(
+        1,
+        ClockSample {
+            msc: 100,
+            ust: 1000,
+        },
+    );
+    samples.insert(
+        2,
+        ClockSample {
+            msc: 200,
+            ust: 2000,
+        },
+    );
+    consumer
+        .consume(OwnerEvent::Presented { commit, samples }, &mut service)
+        .unwrap();
+
+    // Verify reference CRTC (CRTC 2) supplied the presentation sample
+    let disp = consumer
+        .present_dispositions
+        .get(&present_key)
+        .expect("present disposition");
+    assert_eq!(disp.completion, CompletionDisposition::Emitted);
+    assert_eq!(
+        disp.sample,
+        Some(ClockSample {
+            msc: 200,
+            ust: 2000,
+        })
+    );
+
+    // Shared source still retained
+    consumer.on_available(&[shared_key], &mut service).unwrap();
+    service.service_ready();
+    assert!(
+        service.contains(&shared_key),
+        "shared source still retained before member_a completion"
+    );
+
+    // CRTC A (reference CRTC) hardware-completes later
+    consumer.commit_members.insert(commit, vec![member_a]);
+    consumer
+        .consume(OwnerEvent::HardwareComplete { commit }, &mut service)
+        .unwrap();
+    consumer.on_available(&[shared_key], &mut service).unwrap();
+    service.service_ready();
+
+    // All replacements finished: shared source is freed
+    assert!(
+        !service.contains(&shared_key),
+        "shared source freed once all CRTC replacements finish"
+    );
 }
 
 // ── 8. Rejection, accepted Skip and supersession ────────────────────────────
@@ -450,73 +601,203 @@ fn c0_2ci_adapter_preparing_failure_and_burst_capacity() {
     drop(new_prep);
 }
 
-// ── 10. Unflip with ordinary retirement occupied ────────────────────
+// ── 10. Unflip with ordinary retirement occupied ────────────────────────────
 #[test]
 fn c0_2ci_adapter_unflip_ordinary_retirement_occupied() {
-    let mut capacity = DirectCapacity::new();
-    let mut current = capacity.reserve(DirectRole::Current).unwrap();
-    let ordinary = capacity.reserve(DirectRole::OrdinaryRetirement).unwrap();
-    let exit_res = capacity.reserve(DirectRole::ExitRetirement).unwrap();
+    let dev = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let inc = IncarnationId::first();
+    let mut service = ResourceService::new(dev, inc);
+    let mut consumer = CommitResourceConsumer::new();
 
-    // OrdinaryRetirement is occupied; unflip uses pre-reserved ExitRetirement
-    let result = capacity.move_into_reserved(&mut current, exit_res);
-    assert!(result.is_ok());
-    assert_eq!(current.role, DirectRole::ExitRetirement);
+    // Allocation A: currently occupying OrdinaryRetirement (previous frame)
+    let alloc_a = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let lease_a = service.adopt(AllocationPayload::Scanout(alloc_a)).unwrap();
+    let key_a = lease_a.key();
+    let gpu_a = service.register(key_a, ObligationKind::Gpu).unwrap();
+    let ord_slot = consumer
+        .capacity
+        .reserve(DirectRole::OrdinaryRetirement)
+        .unwrap();
+    let res_a = CommitResources::new(vec![lease_a], None, None, None, vec![], vec![]);
+    let res_a = consumer.capacity.attach(ord_slot, res_a).unwrap();
+    consumer.releasing_resources.push(res_a);
 
-    // Clean up
-    let _ = capacity.finish_role(current);
-    let _ = capacity.cancel_reservation(ordinary);
+    // Allocation B: currently in Current role (direct scanout frame to be unflipped)
+    let alloc_b = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let lease_b = service.adopt(AllocationPayload::Scanout(alloc_b)).unwrap();
+    let key_b = lease_b.key();
+    let gpu_b = service.register(key_b, ObligationKind::Gpu).unwrap();
+    let curr_slot = consumer.capacity.reserve(DirectRole::Current).unwrap();
+    let res_b = CommitResources::new(vec![lease_b], None, None, None, vec![], vec![]);
+    let res_b = consumer.capacity.attach(curr_slot, res_b).unwrap();
+    consumer.current_resources.push(res_b);
+
+    // Allocation C: composed return resource pre-allocated in service (no extra allocation at unflip time)
+    let alloc_c = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let lease_c = service.adopt(AllocationPayload::Scanout(alloc_c)).unwrap();
+    let key_c = lease_c.key();
+
+    // Verify OrdinaryRetirement is occupied by Frame A
+    assert!(!consumer.capacity.is_vacant(DirectRole::OrdinaryRetirement));
+
+    // Unflip occurs: move Current (Frame B) into ExitRetirement via pre-reserved exit slot
+    let exit_slot = consumer
+        .capacity
+        .reserve(DirectRole::ExitRetirement)
+        .unwrap();
+    let mut b_res = consumer.take_current().into_iter().next().unwrap();
+    consumer
+        .capacity
+        .move_into_reserved(b_res.direct_role.as_mut().unwrap(), exit_slot)
+        .unwrap();
+    assert_eq!(
+        b_res.direct_role.as_ref().unwrap().role(),
+        DirectRole::ExitRetirement
+    );
+    consumer.releasing_resources.push(b_res);
+
+    // Both retirement roles are now occupied
+    assert!(!consumer.capacity.is_vacant(DirectRole::OrdinaryRetirement));
+    assert!(!consumer.capacity.is_vacant(DirectRole::ExitRetirement));
+    assert!(!consumer.capacity.can_enter_direct());
+
+    // Composed return resource C is acquired for composed scanout without extra allocation
+    let composed_write = service.reserve(key_c, UseKind::Write).unwrap();
+    assert_eq!(composed_write.key(), key_c);
+
+    // Fulfill GPU obligations for A and B
+    service.apply_validated_proof(key_a, gpu_a).unwrap();
+    service.apply_validated_proof(key_b, gpu_b).unwrap();
+
+    consumer
+        .on_available(&[key_a, key_b], &mut service)
+        .unwrap();
+    service.service_ready();
+
+    // A and B freed; retirement roles are vacant; direct re-entry is permitted again
+    assert!(!service.contains(&key_a));
+    assert!(!service.contains(&key_b));
+    assert!(consumer.capacity.is_vacant(DirectRole::OrdinaryRetirement));
+    assert!(consumer.capacity.is_vacant(DirectRole::ExitRetirement));
+    assert!(consumer.capacity.can_enter_direct());
+
+    // Composed return resource remains valid in service
+    drop(composed_write);
+    drop(lease_c);
+    service.service_ready();
+    assert!(!service.contains(&key_c));
 }
 
 // ── 11. Unknown -> detach -> late reply -> helper reap ──────────────────────
 #[test]
 fn c0_2ci_adapter_unknown_detach_late_reply_reap() {
-    let (service, lease, drops) = spy_service();
+    let dev = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let inc = IncarnationId::first();
+    let mut service = ResourceService::new(dev, inc);
+
+    let storage = Storage::for_tests_null(
+        vk::Extent2D {
+            width: 64,
+            height: 64,
+        },
+        vk::Format::B8G8R8A8_UNORM,
+    );
+    let StorageBacking::Legacy(alloc) = storage.backing else {
+        panic!("expected legacy storage");
+    };
+    let lease = service.adopt(AllocationPayload::Storage(alloc)).unwrap();
     let _key = lease.key();
-    let dev = service.device();
-    let inc = service.incarnation();
 
     let owner = DeviceCommitOwner::<CommitResources>::new(inc, LifecycleEpochId::first(), 1);
-    let consumer = CommitResourceConsumer::new();
+    let commit_res = CommitResources::new(vec![lease], None, None, None, vec![], vec![]);
+
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.current_resources.push(commit_res);
     let calls = Rc::new(RefCell::new(Vec::new()));
     let io = MockCleanupIo::new(calls);
     let drm = DrmCleanupRegistry::new_with_io(dev, inc, Box::new(io));
     let ingress = CompletionIngress::new();
-    let gate = TransportGate::for_tests(dev, inc);
+    let mut gate = owner_gate_for_tests(dev, inc);
+    let grant = gate.authorize_owner_write(WriterClass::Modeset).unwrap();
 
     let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress, gate);
 
     let mut supervisor = RetainingSupervisor::new();
     let slot = supervisor.reserve_slot(dev, inc);
+    // Handoff revokes owner writes and transfers bundle
     assert!(supervisor.router.transfer(slot, bundle).is_ok());
+    drop(grant);
 
     // Deliver late descriptor
     let (r, w) = nix::unistd::pipe().unwrap();
     supervisor.router.deliver_descriptor(inc, r).unwrap();
     drop(w);
 
-    // Family closed barrier issued upon complete helper reap
+    // Attempting to mint barrier while descriptor is open fails
     {
         let bundle_ref = supervisor.router.get_bundle_mut(&inc).unwrap();
-        bundle_ref.drm.close_returned_descriptors();
         bundle_ref.drm.detach_fake_submitters();
         bundle_ref.drm.close_fake_control();
         bundle_ref.drm.reap_fake_helper();
+        assert_eq!(
+            bundle_ref
+                .drm
+                .try_mint_file_family_closed(|_, _| Ok(()))
+                .err()
+                .unwrap()
+                .to_string(),
+            "non-payload aliases still active"
+        );
+    }
+
+    // Close returned descriptors and complete reap: barrier minting succeeds
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&inc).unwrap();
+        bundle_ref.drm.close_returned_descriptors();
         let closed = bundle_ref
             .drm
             .try_mint_file_family_closed(|_, _| Ok(()))
             .unwrap();
-        bundle_ref
-            .resources
-            .record_device_barrier(DeviceBarrier::from_file_family_closed(closed));
-    }
-
-    drop(lease);
-    {
-        let bundle_ref = supervisor.router.get_bundle_mut(&inc).unwrap();
+        let barrier = DeviceBarrier::from_file_family_closed(closed);
+        bundle_ref.resources.record_device_barrier(barrier);
         bundle_ref.resources.service_ready();
     }
-    assert_eq!(drops.get(), 1);
+
+    // Recipient router services late evidence without panics
+    assert!(supervisor.router.service(Instant::now()).is_ok());
 }
 
 // ── 12. Duplicate/stale evidence and aliasing ───────────────────────────────
@@ -545,8 +826,11 @@ fn c0_2ci_adapter_duplicate_stale_evidence_aliasing() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn c0_2ci_live_lifetime_adapters_vulkan() {
+    // Reset validation layer error/warning counters before smoke test
+    crate::kms::vk::device::reset_validation_counts();
+
     // R12: Environmental skip must be reported honestly, never fake a pass.
-    let platform = match live_platform() {
+    let mut platform = match live_platform() {
         Some(p) => p,
         None => {
             panic!("environmental skip: no live Vulkan ICD available; not claiming pass");
@@ -559,28 +843,55 @@ fn c0_2ci_live_lifetime_adapters_vulkan() {
     };
     let inc = IncarnationId::first();
     let mut service = ResourceService::new(dev, inc);
+    let mut store = crate::kms::render::store::DrawableStore::new();
+    let mut invalidations = 0;
 
-    // 1. Allocate native storage via real PlatformBackend + Vulkan
+    // 1. Native storage: allocate, adopt into managed lease, free drawable in store, observe cleanup
     let storage = platform
         .allocate_drawable_storage(64, 64, 32)
         .expect("allocate_drawable_storage");
-
-    let StorageBacking::Legacy(storage_alloc) = storage.backing else {
-        panic!("expected legacy storage allocation");
-    };
-
-    let lease = service
-        .adopt(AllocationPayload::Storage(storage_alloc))
-        .expect("adopt storage");
-    let key = lease.key();
-
-    // Retain managed lease, register GPU obligation
+    let lease = storage
+        .into_managed(
+            &mut service,
+            &platform,
+            crate::kms::render::target::PaintTarget::new(
+                crate::kms::render::store::DrawableId::for_tests(0x2001),
+                (0, 0),
+                None,
+                32,
+            ),
+            (0, 0),
+        )
+        .map_err(|(e, _)| e)
+        .expect("into_managed");
+    let key = lease.allocation.key();
     let gpu_ob = service
         .register(key, ObligationKind::Gpu)
         .expect("register gpu");
+    let managed_storage = Storage::from_backing(StorageBacking::Managed(lease));
+    let xid = 0x2001;
+    let id = store
+        .allocate(
+            xid,
+            crate::kms::render::store::DrawableKind::Pixmap,
+            32,
+            false,
+            managed_storage,
+        )
+        .expect("allocate drawable");
 
-    // Drop lease while GPU work is pending
-    drop(lease);
+    // Free drawable in store via decref: triggers cache invalidation callback
+    let dec = store.decref(&mut platform, id, |_inv_id| {
+        invalidations += 1;
+    });
+    assert_eq!(dec, crate::kms::render::store::RetireDecision::Destroyed);
+    assert_eq!(
+        invalidations, 1,
+        "decref must trigger invalidation callback once"
+    );
+    assert!(store.lookup(xid).is_none());
+
+    // Storage is destroyed by decref, but GPU obligation retains allocation in ResourceService
     service.service_ready();
     assert!(
         service.contains(&key),
@@ -595,6 +906,344 @@ fn c0_2ci_live_lifetime_adapters_vulkan() {
     assert!(
         !service.contains(&key),
         "allocation freed once GPU completes"
+    );
+
+    // 2. Repeat for promoted backing
+    let storage2 = platform
+        .allocate_drawable_storage(64, 64, 32)
+        .expect("allocate storage2");
+    let lease2 = storage2
+        .into_managed(
+            &mut service,
+            &platform,
+            crate::kms::render::target::PaintTarget::new(
+                crate::kms::render::store::DrawableId::for_tests(0x2002),
+                (0, 0),
+                None,
+                32,
+            ),
+            (0, 0),
+        )
+        .map_err(|(e, _)| e)
+        .expect("into_managed");
+    let managed_storage2 = Storage::from_backing(StorageBacking::Managed(lease2));
+    let xid2 = 0x2002;
+    let id2 = store
+        .allocate(
+            xid2,
+            crate::kms::render::store::DrawableKind::Pixmap,
+            32,
+            false,
+            managed_storage2,
+        )
+        .expect("allocate managed drawable");
+
+    let vk_ctx = platform.vk.clone().unwrap();
+    let (exp_img, exp_mem, exp_view, exp_sample) = {
+        use ash::vk;
+        let img_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .extent(vk::Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED);
+        let img = unsafe {
+            vk_ctx
+                .device
+                .create_image(&img_info, None)
+                .expect("create image")
+        };
+        let mem_req = unsafe { vk_ctx.device.get_image_memory_requirements(img) };
+        let mem_props = unsafe {
+            vk_ctx
+                .instance
+                .get_physical_device_memory_properties(vk_ctx.physical_device)
+        };
+        let type_idx = (0..mem_props.memory_type_count as usize)
+            .find(|&i| (mem_req.memory_type_bits & (1 << i)) != 0)
+            .expect("valid memory type");
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_req.size)
+            .memory_type_index(type_idx as u32);
+        let mem = unsafe {
+            vk_ctx
+                .device
+                .allocate_memory(&alloc_info, None)
+                .expect("alloc memory")
+        };
+        unsafe { vk_ctx.device.bind_image_memory(img, mem, 0).expect("bind") };
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(img)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let v1 = unsafe {
+            vk_ctx
+                .device
+                .create_image_view(&view_info, None)
+                .expect("view")
+        };
+        let v2 = unsafe {
+            vk_ctx
+                .device
+                .create_image_view(&view_info, None)
+                .expect("view2")
+        };
+        (img, mem, v1, v2)
+    };
+
+    let old_lease = store
+        .get_mut(id2)
+        .unwrap()
+        .storage
+        .adopt_exportable_managed(
+            &mut service,
+            exp_img,
+            exp_mem,
+            exp_sample,
+            exp_view,
+            ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            256,
+            16384,
+            0,
+            Some(Arc::clone(&vk_ctx)),
+        )
+        .expect("adopt_exportable_managed");
+    let old_key = old_lease.allocation.key();
+    let new_key = store
+        .get(id2)
+        .unwrap()
+        .storage
+        .managed_lease()
+        .unwrap()
+        .allocation
+        .key();
+    assert_ne!(old_key, new_key);
+
+    let old_gpu = service.register(old_key, ObligationKind::Gpu).unwrap();
+    let new_gpu = service.register(new_key, ObligationKind::Gpu).unwrap();
+
+    drop(old_lease);
+    let dec2 = store.decref(&mut platform, id2, |_| {
+        invalidations += 1;
+    });
+    assert_eq!(dec2, crate::kms::render::store::RetireDecision::Destroyed);
+    assert_eq!(invalidations, 2);
+
+    service.service_ready();
+    assert!(service.contains(&old_key));
+    assert!(service.contains(&new_key));
+
+    service.apply_validated_proof(old_key, old_gpu).unwrap();
+    service.service_ready();
+    assert!(!service.contains(&old_key));
+    assert!(service.contains(&new_key));
+
+    service.apply_validated_proof(new_key, new_gpu).unwrap();
+    service.service_ready();
+    assert!(!service.contains(&new_key));
+
+    // 3. Repeat for snapshot scratch
+    let scratch_storage = platform
+        .allocate_drawable_storage(64, 64, 32)
+        .expect("allocate scratch");
+    let StorageBacking::Legacy(scratch_alloc) = scratch_storage.backing else {
+        panic!("expected legacy storage");
+    };
+    let scratch_lease = service
+        .adopt(AllocationPayload::Storage(scratch_alloc))
+        .expect("adopt scratch");
+    let scratch_key = scratch_lease.key();
+    let scratch_read = service.reserve(scratch_key, UseKind::Read).unwrap();
+    let scratch_gpu = service.register(scratch_key, ObligationKind::Gpu).unwrap();
+
+    // Source read ends at CPU copy
+    drop(scratch_read);
+    drop(scratch_lease);
+    service.service_ready();
+    assert!(
+        service.contains(&scratch_key),
+        "scratch retained through GPU use"
+    );
+
+    // Scratch GPU use finishes and frees once
+    service
+        .apply_validated_proof(scratch_key, scratch_gpu)
+        .unwrap();
+    service.service_ready();
+    assert!(!service.contains(&scratch_key), "scratch freed");
+
+    // 4. If render node is available, include gbm_bo in the _vulkan case
+    if let Some(drm_dev) = open_test_render_node() {
+        let drm_dev = Rc::new(drm_dev);
+        let gbm_dev = gbm::Device::new(Rc::clone(&drm_dev)).expect("gbm device");
+        let gbm_bo = gbm_dev
+            .create_buffer_object::<()>(
+                64,
+                64,
+                gbm::Format::Xrgb8888,
+                gbm::BufferObjectFlags::RENDERING | gbm::BufferObjectFlags::SCANOUT,
+            )
+            .expect("gbm bo");
+
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let io = MockCleanupIo::new(Rc::clone(&calls));
+        let mut registry =
+            DrmCleanupRegistry::new_with_device_and_io(Rc::clone(&drm_dev), dev, inc, Box::new(io));
+        registry.detach_fake_submitters();
+        registry.reap_fake_helper();
+        registry.close_fake_control();
+
+        let right = registry.register_right(2001, 2002, GemOwner::Gbm);
+        let fo = FileOwnedBacking::new(right, Some(gbm_bo), Rc::clone(&drm_dev))
+            .expect("file owned backing");
+
+        // Allocate real Vulkan image for SharedBacking
+        let shared_img = {
+            use ash::vk;
+            let img_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: 64,
+                    height: 64,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED);
+            unsafe {
+                vk_ctx
+                    .device
+                    .create_image(&img_info, None)
+                    .expect("create image")
+            }
+        };
+        let shared_mem_req = unsafe { vk_ctx.device.get_image_memory_requirements(shared_img) };
+        let mem_props = unsafe {
+            vk_ctx
+                .instance
+                .get_physical_device_memory_properties(vk_ctx.physical_device)
+        };
+        let type_idx = (0..mem_props.memory_type_count as usize)
+            .find(|&i| (shared_mem_req.memory_type_bits & (1 << i)) != 0)
+            .expect("valid memory type");
+        let alloc_info = ash::vk::MemoryAllocateInfo::default()
+            .allocation_size(shared_mem_req.size)
+            .memory_type_index(type_idx as u32);
+        let shared_mem = unsafe {
+            vk_ctx
+                .device
+                .allocate_memory(&alloc_info, None)
+                .expect("alloc memory")
+        };
+        unsafe {
+            vk_ctx
+                .device
+                .bind_image_memory(shared_img, shared_mem, 0)
+                .expect("bind")
+        };
+        let view_info = ash::vk::ImageViewCreateInfo::default()
+            .image(shared_img)
+            .view_type(ash::vk::ImageViewType::TYPE_2D)
+            .format(ash::vk::Format::B8G8R8A8_UNORM)
+            .subresource_range(ash::vk::ImageSubresourceRange {
+                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let shared_view = unsafe {
+            vk_ctx
+                .device
+                .create_image_view(&view_info, None)
+                .expect("view")
+        };
+
+        let shared = SharedBacking::new(
+            shared_img,
+            shared_mem,
+            shared_view,
+            crate::kms::vk::scanout::TransferResources::empty(),
+            Arc::clone(&vk_ctx),
+            None,
+        );
+        let scanout_alloc = ScanoutAllocation::new(Some(fo), shared);
+        let scanout_lease = service
+            .adopt_with_registry(AllocationPayload::Scanout(scanout_alloc), &mut registry)
+            .expect("adopt scanout with gbm_bo");
+        let scanout_key = scanout_lease.key();
+        let scanout_gpu = service.register(scanout_key, ObligationKind::Gpu).unwrap();
+
+        drop(scanout_lease);
+        drop(gbm_dev);
+        drop(drm_dev);
+        service.service_ready();
+        assert!(service.contains(&scanout_key));
+
+        // Discharge file-owned half through registry (step 2): drops gbm_bo
+        let proof = registry
+            .try_mint_file_family_closed(|reg, discharge_key| {
+                assert_eq!(discharge_key, scanout_key);
+                let entry = service.entries.get(&discharge_key).expect("entry present");
+                let mut payload = entry.payload.borrow_mut();
+                match payload.as_mut() {
+                    Some(AllocationPayload::Scanout(alloc)) => alloc.discharge_file_owned(reg),
+                    _ => Ok(()),
+                }
+            })
+            .expect("mint file family closed");
+
+        // Table order: GEM closer is gbm_bo drop, registry sees 0 CloseGem calls
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .filter(|c| matches!(c, CleanupCall::CloseGem(_)))
+                .count(),
+            0,
+            "gbm_bo must be the sole GEM closer; registry sees zero CloseGem calls"
+        );
+
+        service.record_device_barrier(DeviceBarrier::from_file_family_closed(proof));
+        service.service_ready();
+        // Still alive because GPU obligation remains
+        assert!(service.contains(&scanout_key));
+
+        // Discharge shared GPU obligation to observe VkImage cleanup (step 3+)
+        service
+            .apply_validated_proof(scanout_key, scanout_gpu)
+            .unwrap();
+        service.service_ready();
+        assert!(!service.contains(&scanout_key));
+    }
+
+    // 5. Assert zero validation layer messages
+    assert_eq!(
+        crate::kms::vk::device::validation_error_count(),
+        0,
+        "must have zero Vulkan validation layer errors"
+    );
+    assert_eq!(
+        crate::kms::vk::device::validation_warning_count(),
+        0,
+        "must have zero Vulkan validation layer warnings"
     );
 }
 
