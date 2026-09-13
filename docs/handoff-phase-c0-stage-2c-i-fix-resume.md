@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-13,
-after F-4d (F-10 next).** If you are resuming this work cold — a new
+after F-10 (F-11 next).** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -30,7 +30,7 @@ stand so nothing is re-derived.
    `…-F4b-review.md`, `…-F4c-review.md`, `…-F5a-review.md`,
    `…-F5b-review.md`, `…-F6a-review.md`, `…-F6b-review.md`,
    `…-F7-review.md`, `…-F8-review.md`, `…-09-13-…-F9-review.md`,
-   `…-09-13-…-F4d-review.md`.
+   `…-09-13-…-F4d-review.md`, `…-09-13-…-F10-review.md`.
 6. The plan
    `docs/superpowers/plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md`
    — per-task `Status:` blocks carry every fix-round verdict table.
@@ -50,7 +50,9 @@ stand so nothing is re-derived.
 | F-7 | Task 8 (role transitions, `on_available`) | **ACCEPTED** | `f39a01c6`/`11c15cf4` | F7-review |
 | F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | **ACCEPTED** | `ac3c94f7`/`a6a3afe9` | F8-review |
 | F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | **ACCEPTED** | `a7139742`/`f14259e1` | F9-review |
-| F-10..F-12 | M-19 (180 `Storage` Deref accessor sites → lease accessors; 3 sessions: read-mostly consumers → `engine.rs` → `backend.rs`) + M-20 promotion half + F3-M1/F3-m1 | next | — | ruled in F3-review |
+| **F-10** | Task 3 (M-19 read-mostly consumers: `scene.rs` 17 sites, `frame_builder.rs`, `target.rs` + F3-m1 `Detached`) | **ACCEPTED** | `ebae39e0`/`d7f66dbe` | F10-review |
+| F-11 | Task 3 (`RenderEngine` in `engine.rs`, 70 sites + M-20 promotion half) | next | — | ruled in F3-review |
+| F-12 | Task 3 (`KmsBackend` in `backend.rs`, 94 sites + F3-M1) | after F-11 | — | ruled in F3-review |
 | Final | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | after F-12 | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
