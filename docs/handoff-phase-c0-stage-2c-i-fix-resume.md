@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-13,
-after F-9 (F-4d next).** If you are resuming this work cold — a new
+after F-4d (F-10 next).** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -29,7 +29,8 @@ stand so nothing is re-derived.
    `…-09-12-…-F2-review.md`, `…-F3-review.md`, `…-F4-review.md`,
    `…-F4b-review.md`, `…-F4c-review.md`, `…-F5a-review.md`,
    `…-F5b-review.md`, `…-F6a-review.md`, `…-F6b-review.md`,
-   `…-F7-review.md`, `…-F8-review.md`, `…-09-13-…-F9-review.md`.
+   `…-F7-review.md`, `…-F8-review.md`, `…-09-13-…-F9-review.md`,
+   `…-09-13-…-F4d-review.md`.
 6. The plan
    `docs/superpowers/plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md`
    — per-task `Status:` blocks carry every fix-round verdict table.
@@ -41,7 +42,7 @@ stand so nothing is re-derived.
 | F-1, F-1b | Task 2 (barrier, registry) | **ACCEPTED** | `95f9dba6`/`53f7ca23`, `13c75265`/`282ed2dc` | F1-review |
 | F-2, F-2b | Task 4 (scanout payloads, pool) | **ACCEPTED** | `fea5c043`/`08cb7b91`, `05555b03`/`98328b85` | F2-review |
 | F-3, F-3b | Task 3 (storage) | **ACCEPTED** (M-19 deferred) | `12c5926c`/`3677e4b6`, `36ab74a7`/`5c10f7ee` | F3-review |
-| F-4, F-4b, F-4c | Task 5 (GPU/read adapters) | **ACCEPTED** (write half → F-4d) | `17384ae6`, `f475b04c`, `4e870930` (+fold-backs) | F4/F4b/F4c-review |
+| F-4, F-4b, F-4c, **F-4d** | Task 5 (GPU/read/write adapters) | **ACCEPTED** | `17384ae6`, `f475b04c`, `4e870930`, `d96e1c4c`/`20a5461c` | F4/F4b/F4c/F4d-review |
 | F-5a | Task 6, resources half (per-batch deadline, gate sealing, B-6) | **ACCEPTED** (M-13 real impl → F-5b) | `5f025fed`/`265b228e` | F5a-review |
 | F-5b | Task 6, sinks half (B-10 at 7 sinks, 6.5a/6.5b, grant consumed at executor send, real `DirectOwnershipState`) | **ACCEPTED** (gamma `_drm` test → F-9) | `842745a3`/`4eb05029` | F5b-review |
 | F-6a | Task 7, consumer half (B-8, B-9, M-2..M-5, M-15) | **ACCEPTED** | `c35af190`/`e40d0cb9` | F6a-review |
@@ -49,8 +50,7 @@ stand so nothing is re-derived.
 | F-7 | Task 8 (role transitions, `on_available`) | **ACCEPTED** | `f39a01c6`/`11c15cf4` | F7-review |
 | F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | **ACCEPTED** | `ac3c94f7`/`a6a3afe9` | F8-review |
 | F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | **ACCEPTED** | `a7139742`/`f14259e1` | F9-review |
-| **F-4d** | Task 5 write half (5.3/5.5: managed branch in `scene.rs` `submit_shared_scanout_frame`, `PendingAck` batch, `drain_pending_pool_releases`) | pending | — | ruled in F4c-review |
-| F-10..F-12 | M-19 (180 `Storage` Deref accessor sites → lease accessors; 3 sessions: read-mostly consumers → `engine.rs` → `backend.rs`) + M-20 promotion half + F3-M1/F3-m1 | after F-4d | — | ruled in F3-review |
+| F-10..F-12 | M-19 (180 `Storage` Deref accessor sites → lease accessors; 3 sessions: read-mostly consumers → `engine.rs` → `backend.rs`) + M-20 promotion half + F3-M1/F3-m1 | next | — | ruled in F3-review |
 | Final | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | after F-12 | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
