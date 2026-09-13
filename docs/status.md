@@ -33,19 +33,24 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-09-13 stage 2c-i fix round complete (Tasks 1–10 executed and verified):**
-  All ten tasks of Phase C.0 stage 2c-i (`docs/handoff-phase-c0-stage-2c-i.md`) executed
-  and verified on feature branch `feat/phase-c0-atomic-kms-migration` through fix rounds F-1..F-9.
+- **2026-09-13 stage 2c-i complete (Final Stage Review ACCEPTED, Tasks 1–10 executed and verified):**
+  All ten tasks of Phase C.0 stage 2c-i (`docs/handoff-phase-c0-stage-2c-i.md`) executed,
+  corrected across fix sessions F-1..F-12, and accepted in the Final Stage Review
+  (`docs/superpowers/findings/2026-09-13-stage-2c-i-final-review.md`) on feature branch
+  `feat/phase-c0-atomic-kms-migration` (`76a93356..HEAD`).
   Covered concrete backing families: native storage, imported dma-buf, promoted exportable,
   shared BO, copied source/sink pairs, and direct framebuffers.
-  Deterministic test suite: 120 tests passing across `c0_2ci_*` in ordinary `cargo test`
+  Eliminated all raw `.storage.` field derefs across the repository (M-19 resolved; 0 remaining sites).
+  Resolved F3-M1: `is_exportable` and `record_layout_transition` operate safely on `Managed` leases.
+  Deterministic test suite: 121 tests passing across `c0_2ci_*` in ordinary `cargo test`
   with zero flakes over 12 consecutive iterations.
-  Hardware test suite: 11 hardware tests (`cargo test -p yserver --lib c0_2ci -- --ignored`)
+  Hardware test suite: 13 hardware tests (`cargo test -p yserver --lib c0_2ci -- --ignored`)
   passing on real DRM nodes (including `c0_2ci_sink_gamma_gate_four_states_drm` and
   `c0_2ci_fd_family_barrier_real_gbm_payload_drm`) and real hardware Vulkan with
   `VK_LAYER_KHRONOS_validation` active (including `c0_2ci_live_lifetime_adapters_vulkan` and
   `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`) verifying zero validation errors
   and zero validation warnings. Fictitious lavapipe claims have been removed; tests exercise real hardware devices.
+  Full test suite: 1659 tests passing in `cargo test -p yserver --lib` (0 failures).
   Cross-compilation portability checks verified clean for `x86_64-unknown-linux-gnu`,
   `x86_64-unknown-linux-musl`, and `x86_64-unknown-freebsd`.
   Operational readiness remains closed and production paths remain strictly Legacy (R8).
