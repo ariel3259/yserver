@@ -33,24 +33,37 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-09-11 stage 2c-i executed and verified (Tasks 1–10 complete):**
+- **2026-09-13 stage 2c-i fix round complete (Tasks 1–10 executed and verified):**
   All ten tasks of Phase C.0 stage 2c-i (`docs/handoff-phase-c0-stage-2c-i.md`) executed
-  and verified on feature branch `feat/phase-c0-atomic-kms-migration`.
+  and verified on feature branch `feat/phase-c0-atomic-kms-migration` through fix rounds F-1..F-9.
   Covered concrete backing families: native storage, imported dma-buf, promoted exportable,
   shared BO, copied source/sink pairs, and direct framebuffers.
-  Deterministic test suite: 78 tests passing across `c0_2ci_*` in ordinary `cargo test`
+  Deterministic test suite: 120 tests passing across `c0_2ci_*` in ordinary `cargo test`
   with zero flakes over 12 consecutive iterations.
-  Live Vulkan smoke test (`c0_2ci_live_lifetime_adapters_vulkan`) verified under
-  software Vulkan (`lavapipe` with `YSERVER_ALLOW_SOFTWARE_VULKAN=1`), proving real
-  Vulkan allocation, managed retention, and verified view/image destruction.
+  Hardware test suite: 11 hardware tests (`cargo test -p yserver --lib c0_2ci -- --ignored`)
+  passing on real DRM nodes (including `c0_2ci_sink_gamma_gate_four_states_drm` and
+  `c0_2ci_fd_family_barrier_real_gbm_payload_drm`) and real hardware Vulkan with
+  `VK_LAYER_KHRONOS_validation` active (including `c0_2ci_live_lifetime_adapters_vulkan` and
+  `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`) verifying zero validation errors
+  and zero validation warnings. Fictitious lavapipe claims have been removed; tests exercise real hardware devices.
   Cross-compilation portability checks verified clean for `x86_64-unknown-linux-gnu`,
   `x86_64-unknown-linux-musl`, and `x86_64-unknown-freebsd`.
   Operational readiness remains closed and production paths remain strictly Legacy (R8).
-  API handoff to 2c-ii established: physical-role reservation (`DirectCapacity`),
-  generation-bound lease acquisition (`ResourceService::reserve`), service readiness/wake
-  subscription (`WaiterRegistry`), and typed outcome consumption (`CommitResourceConsumer`).
-  Stage 2c-iii retains producer conversion/damage integration; stage 3 retains live
-  teardown supervisor; stages 3/4 supply remaining owner-mediated writers.
+  Readiness boundary established for Stage 2c-ii:
+  - What 2c-ii can rely on:
+    - Physical-role reservation (`DirectCapacity`: A/B direct, composed scanout, cursor, unflip, victim lifetime release)
+    - Generation-bound lease acquisition (`ResourceService::reserve`, lease retain counts, cache invalidation tracking)
+    - Split `file_owned` and `shared` backings with single-owner GEM close semantics
+    - Reference CRTC clock selection for multi-CRTC grouped frames
+    - Transport gate enforcement (`TransportGate::allows_legacy`, `WriterClass` checks, write revocation before close)
+    - Typed resource outcome consumption (`CommitResourceConsumer::consume`, atomic validation, obligation discharge)
+    - Service readiness and wake subscription (`WaiterRegistry`, pinned wakes)
+    - Incident-bound teardown barriers (`FileFamilyClosed` requiring reap, control IPC close, and alias discharge)
+  - What 2c-ii cannot rely on:
+    - Production Owner activation (operational readiness remains closed; non-legacy writes are strictly refused in production paths; production paths remain strictly Legacy under R8)
+    - Automated teardown supervisor (retaining supervisor is currently a test-only fixture; stage 3 supplies the production teardown supervisor)
+    - Producer conversion and incremental damage integration (retained for stage 2c-iii)
+    - Remaining owner-mediated writers / helper mutation execution (stages 3/4 supply production helper mutation paths)
 
 - **2026-09-10 stage 2c-i handed to the implementing model:**
   [`docs/handoff-phase-c0-stage-2c-i.md`](handoff-phase-c0-stage-2c-i.md) hands
