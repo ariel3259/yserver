@@ -370,6 +370,44 @@ test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 1698 filtered out; f
 
 No steps ticked or unticked by this round; F3-B1 was procedural only.
 
+**Fix round 3: `ebae39e0`.** Session F-10, executing Part 1 of M-19 (read-mostly consumers: `scene.rs`, `frame_builder.rs`, `target.rs`) and closing F3-m1 (`docs/superpowers/findings/2026-09-12-stage-2c-i-fix-F3-review.md`).
+
+- Introduced `StorageBacking::Detached` to represent destroyed managed drawables honestly without fabricating an inert `Legacy` stub (closing F3-m1). On `Storage::destroy(&platform)`, if backing is `Managed`, the `StorageLease` is immediately dropped (releasing its Retain reservation in `ResourceService`) and transitions to `StorageBacking::Detached`.
+- Added accessors on `Storage`: `extent()`, `depth()`, `content_offset()`, `format()`, `image_view()`, `sample_view()`, `has_image_view()`, `is_detached()`. Added corresponding forwarding accessors on `Drawable` (`extent()`, `image_view()`, `sample_view()`, `has_image_view()`).
+- Extended `PixelIdentity` on `StorageLease` to carry `format: vk::Format`, `image_view: vk::ImageView`, and `sample_view: vk::ImageView`, enabling `StorageLease` and `Storage` to service image view and format queries in constant time without accessing raw borrows or panicking across `Deref`.
+- Converted all 17 `.storage.` field deref sites in `crates/yserver/src/kms/render/scene.rs` to safe method calls (`.storage.extent()`, `.storage.sample_view()`, `.storage.image_view()`, `.storage.has_image_view()`).
+- Inspected `frame_builder.rs` (line 1619) and `target.rs` (line 23): both contained doc-comment references only and zero executable code call sites. Updated doc comments to reflect method calls.
+- Verified recount of remaining unmigrated `.storage.` sites: exactly 164 sites (`engine.rs` 70, `backend.rs` 94 [86 production + 8 test]).
+
+| Finding | Verdict |
+| --- | --- |
+| F3-m1 (`Storage::destroy` on `Managed` overwrites the backing with a fabricated `Legacy` stub) | **RESOLVED (test: `c0_2ci_storage_managed_destroy_transitions_to_detached`, `c0_2ci_storage_managed_destroy_detaches_before_drop`)** — added `StorageBacking::Detached` variant. Destroying managed storage immediately drops the lease and transitions to `Detached`. Added `Storage::is_detached(&self) -> bool`. Mutation check: reverting `destroy` on `Managed` to fabricate a `Legacy` stub fails both tests with `panicked at ... destroy() on Managed must transition to Detached (F3-m1)`. Reverted mutation before commit. |
+| M-19 (read-mostly consumers: settle accessor shape; convert `target.rs`, `frame_builder.rs`, `scene.rs`) | **RESOLVED for read-mostly consumers (Part 1 of 3)**. Established safe accessor shape on `Storage`/`Drawable` and extended `PixelIdentity` with format/views. Converted all 17 sites in `scene.rs`. Verified 0 code sites in `target.rs` and `frame_builder.rs`. Recount stands at 164 remaining sites (`engine.rs` 70, `backend.rs` 94). Step 3.3 remains UNTICKED until F-12 completes. |
+
+Gate for this round: `cargo +nightly fmt` clean; `cargo clippy --all-targets -- -D warnings` clean (0 warnings, 0 errors); `cargo test -p yserver --lib c0_2ci` **121** passed / 0 failed / 12 ignored; twelve-run flake loop clean (12 runs, 0 flakes); hardware run (`--ignored`, this box has real DRM nodes and NVIDIA/RADV ICDs) all **12** passed; full `cargo test -p yserver --lib` **1659** passed / 0 failed / 84 ignored; targets `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `x86_64-unknown-freebsd` compile cleanly.
+
+Hardware run:
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 12 tests
+test kms::render::resources::tests::c0_2ci_sink_gamma_gate_four_states_drm ... ok
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 1731 filtered out; finished in 0.83s
+```
+
+No steps ticked by this round: step 3.3 remains unticked until F-12 completes all remaining `Storage` accessor conversions.
+
 ## Task 4: Shared/copied scanout backing and pool reuse
 
 **Files:** Create `resources/scanout.rs`; modify `kms/vk/scanout.rs`, `kms/render/platform.rs` and the resource payload enum.
