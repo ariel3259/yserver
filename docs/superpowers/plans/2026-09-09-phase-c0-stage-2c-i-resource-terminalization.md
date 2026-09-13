@@ -287,7 +287,7 @@ pub(crate) struct StorageLease {
 
 - [x] **3.1 Add a real-storage retirement test.** In the existing store test module, extend `decref_then_realloc_then_retire_keeps_new_xid_mapping` to retain a managed allocation from the old drawable before reallocation. Keep its original offset/depth in `PixelIdentity`. Assert old destruction is delayed, new lookup still selects the new ID, and old cleanup does not reset the new drawable's content/damage state. Use existing null-storage tests for logical ordering and a live Vulkan version in Task 10 for actual image/view lifetime.
 - [x] **3.2 Run** `cargo test -p yserver --lib c0_2ci_storage` before adding the adapter.
-- [ ] **3.3 Extract physical fields into `StorageAllocation`.** Move image/memory/views, format/depth/extent/current Vulkan layout, imported owner/metadata and promoted-export metadata listed in the inventory. Keep drawable identity, scene damage, dormancy and current selection in `DrawableStore`. Provide `Storage::into_managed(self, service: &mut ResourceService, target: PaintTarget, content_offset: (i32, i32)) -> Result<StorageLease, (ResourceError, Storage)>` at the owning boundary; on failure reconstruct the original storage and return it. A live logical drawable retains its own allocation lease when its backing is managed; do not consume the drawable's only reference to create an intent. Introduce `StorageBacking { Legacy(StorageAllocation), Managed(StorageLease) }` beneath the store's logical facade, updating its field accessors and all affected engine consumers in this task. The payload contains `StorageAllocation`, never that facade, so there is no recursive ownership. Adoption captures extent from the allocation and target/offset from the resolved drawable, then assigns the new allocation key. `ResourceService::retain_storage(&mut self, source: &StorageLease) -> Result<StorageLease, ResourceError>` creates another Retain use with the same captured identity; no implicit `Clone` issues a new usage.
+- [x] **3.3 Extract physical fields into `StorageAllocation`.** Move image/memory/views, format/depth/extent/current Vulkan layout, imported owner/metadata and promoted-export metadata listed in the inventory. Keep drawable identity, scene damage, dormancy and current selection in `DrawableStore`. Provide `Storage::into_managed(self, service: &mut ResourceService, target: PaintTarget, content_offset: (i32, i32)) -> Result<StorageLease, (ResourceError, Storage)>` at the owning boundary; on failure reconstruct the original storage and return it. A live logical drawable retains its own allocation lease when its backing is managed; do not consume the drawable's only reference to create an intent. Introduce `StorageBacking { Legacy(StorageAllocation), Managed(StorageLease) }` beneath the store's logical facade, updating its field accessors and all affected engine consumers in this task. The payload contains `StorageAllocation`, never that facade, so there is no recursive ownership. Adoption captures extent from the allocation and target/offset from the resolved drawable, then assigns the new allocation key. `ResourceService::retain_storage(&mut self, source: &StorageLease) -> Result<StorageLease, ResourceError>` creates another Retain use with the same captured identity; no implicit `Clone` issues a new usage.
 
 For managed storage, `destroy_now`, `poll_pending_retire` and `shutdown_destroy_all` detach logical references and submit invalidation/cleanup work. The service retains actual image owners and their contexts. Invalidation must occur before image cleanup; its job retains the necessary cache entries, not a closure capturing `&mut KmsBackend`. Imported image aliases remain single-owned; sample view is destroyed before dropping the imported owner. Preserve the legacy storage constructor and cleanup route until a producer adopts managed storage explicitly.
 
@@ -301,7 +301,7 @@ assert_eq!(pixels.allocation, lease.allocation.key());
 
 Use this assertion in the depth-24 target/depth-32 backing regression. For border relayout, first attempt exclusive layout/write reservation. If busy, take the existing separately allocated copy path within pool limits; if no capacity, defer layout publication and request the existing scene retry. Never change `content_offset` before moving pixels, and never bump a generation to justify overwriting held storage.
 
-- [ ] **3.5 Convert promotion retirement.** `adopt_exportable` publishes a new allocation generation. Old `RetiredImage` becomes a retained payload guarded by every old usage plus the existing render ticket. `retire_image_after` and `destroy_retired_image` feed the service for managed payloads. Returning ordinary storage to `PixmapPool` is authorized only after all uses/tickets; promoted/imported storage remains pool-ineligible. Pool checkout establishes a new generation.
+- [x] **3.5 Convert promotion retirement.** `adopt_exportable` publishes a new allocation generation. Old `RetiredImage` becomes a retained payload guarded by every old usage plus the existing render ticket. `retire_image_after` and `destroy_retired_image` feed the service for managed payloads. Returning ordinary storage to `PixmapPool` is authorized only after all uses/tickets; promoted/imported storage remains pool-ineligible. Pool checkout establishes a new generation.
 - [x] **3.5a Preserve upstream DRI3 buffer identity.** Extend the retained imported owner with the original `ImageBacking::Imported::dma_buf_fd`, `DrawableImage::drm_modifier`, `import_plane0`, `import_size`, and `ImportedDmabufMetadata::implicit_layout`. Preserve `Dri3ImportModifier::Implicit` versus `Explicit(m)` through import; do not reinterpret the server's guessed Vulkan view as a verified client layout. Imported re-export duplicates the original client FD with its original stride/offset and stated legacy size; do not replace this with `vkGetMemoryFdKHR` or `lseek`. Implicit export reports `DRM_FORMAT_MOD_INVALID`; explicit export retains its supplied modifier. Copying or moving a lease cannot relabel the metadata. Retain the window modifier list's `drmFormatModifierPlaneCount == 1` constraint; multi-plane import is still out of scope.
 - [x] **3.5b Add DRI3 lease regressions.** Extend upstream's imported-buffer metadata/export test across managed adoption, logical FreePixmap and deferred retirement; use a distinguishable client size so a Vulkan-derived substitute fails. Assert no client FD offset change, explicit/implicit modifier preservation and once-only FD ownership. No-ICD or export-not-supported conditions are reported as such; do not hide arbitrary fixture failure as a successful test.
 
@@ -446,6 +446,44 @@ test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1731 filtered out; 
 ```
 
 No steps ticked by this round: step 3.3 remains unticked until F-12 completes all remaining `Storage` accessor conversions.
+
+**Fix round 5: `96c10eab`.** Session F-12, executing Part 3 of M-19 (`KmsBackend` in `backend.rs`, 94 call sites) and F3-M1 (`is_exportable` and `record_layout_transition` on `Managed` storage).
+
+- Converted all remaining 94 raw `.storage.` field deref sites in `crates/yserver/src/kms/render/backend.rs` to safe method calls (`.extent()`, `.format()`, `.image()`, `.image_view()`, `.current_layout()`, `.set_current_layout()`, `.imported_drawable()`, `.export_metadata()`) and lease-aware accesses on `Drawable`.
+- Closed F3-M1: updated `Storage::is_exportable(&self, service: Option<&mut ResourceService>) -> bool` and `Drawable::is_exportable` to read managed leases safely via `svc.with_storage_read(lease, StorageAllocation::is_exportable)` without panicking when called on `StorageBacking::Managed`.
+- Closed F3-M1: updated `Drawable::record_layout_transition` to handle `StorageBacking::Managed(lease)` safely, recording the image barrier (when `cb` and `image` are non-null) and setting `lease.current_layout` without panicking.
+- Tested: verified `is_exportable` and `record_layout_transition` under live Vulkan and null fixtures, with adversarial mutation checks proving both mechanisms are decisive.
+- Recount of remaining unmigrated `.storage.` call sites across codebase: exactly **0** sites remaining.
+
+| Finding | Verdict |
+| --- | --- |
+| M-19 (`KmsBackend` call sites in `backend.rs`, Part 3 of 3) | **RESOLVED**. All 94 call sites converted. Total unmigrated `.storage.` sites across codebase is now 0. Step 3.3 is ticked. |
+| F3-M1 (`is_exportable` and `record_layout_transition` handle `Managed` safely) | **RESOLVED (test: `c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan`, `c0_2ci_storage_is_exportable_managed_reserves_read_and_refuses_when_written`)** — safe read reservation on `is_exportable` without panicking; barrier recording and layout update on `record_layout_transition` without panicking. Both mutation-verified. |
+
+Gate for this round: `cargo +nightly fmt` clean; `cargo clippy --all-targets -- -D warnings` clean (0 warnings, 0 errors); `cargo test -p yserver --lib c0_2ci` **121** passed / 0 failed / 13 ignored; twelve-run flake loop clean (12 runs, 0 flakes); hardware run (`--ignored`, this box has real DRM nodes and NVIDIA/RADV ICDs) all **13** passed; full `cargo test -p yserver --lib` **1659** passed / 0 failed / 85 ignored; targets `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `x86_64-unknown-freebsd` compile cleanly.
+
+Hardware run:
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 13 tests
+test kms::render::resources::tests::c0_2ci_sink_gamma_gate_four_states_drm ... ok
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::engine::tests::c0_2ci_engine_promote_drawable_exportable_managed_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1731 filtered out; finished in 0.94s
+```
+
+Step 3.3 and Step 3.5 are both ticked by this round. Task 3 is fully closed.
 
 ## Task 4: Shared/copied scanout backing and pool reuse
 
