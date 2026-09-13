@@ -49,6 +49,7 @@ use super::{
     glyph_pixels::{GlyphPixels, GlyphSourceFormat},
     platform::{FenceTicket, PlatformBackend, PresentCompletionSignal},
     present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait},
+    resources::{ResourceError, ResourceService, StorageBacking, StorageLease},
     store::{DrawableId, DrawableStore, RetiredImage},
     target::{Dst, Src},
 };
@@ -63,6 +64,12 @@ use crate::kms::{
         text_pipeline::TextPipeline,
     },
 };
+
+#[derive(Debug)]
+pub(crate) enum RetiredPromotionPayload {
+    Legacy(RetiredImage),
+    Managed(StorageLease),
+}
 
 // ────────────────────────────────────────────────────────────────
 // Errors
@@ -82,6 +89,8 @@ pub(crate) enum RenderError {
     UnsupportedDepth(u8),
     #[error("source byte slice too short for {expected} bytes")]
     TruncatedSource { expected: usize },
+    #[error("resource error: {0:?}")]
+    Resource(#[from] ResourceError),
 }
 
 impl From<vk::Result> for RenderError {
@@ -1071,7 +1080,7 @@ pub(crate) enum SwizzleClass {
 /// Cached `vk::ImageView` for a `(DrawableId, SamplerConfig,
 /// SwizzleClass)` triple. The engine destroys these on Drawable
 /// retire (signalled by `DrawableStore::poll_pending_retire`).
-/// The underlying `Drawable.storage.image` lifetime gates view
+/// The underlying `Drawable.storage.image()` lifetime gates view
 /// validity.
 #[allow(
     dead_code,
@@ -1277,7 +1286,7 @@ struct RenderEngineInner {
     /// `retire_image_after`). Kept separate from `submitted` because
     /// the retire isn't gated on one of *our* CBs — it rides whatever
     /// ticket last touched the drawable.
-    retired_promoted_images: Vec<(RetiredImage, Option<FenceTicket>)>,
+    retired_promoted_images: Vec<(RetiredPromotionPayload, Option<FenceTicket>)>,
     /// Task 11: GC-owned pinned clip-mask snapshots, keyed by opaque
     /// [`SnapshotId`]. Created at clip-mask install (Task 14), populated by
     /// `refresh_clip_snapshot` (Task 13), sampled by `masked_copy_area`.
@@ -1562,7 +1571,7 @@ impl RenderEngineInner {
     ) -> vk::ImageLayout {
         let storage_fallback = store
             .get(id)
-            .map(|d| d.storage.current_layout)
+            .map(|d| d.storage.current_layout())
             .unwrap_or(vk::ImageLayout::UNDEFINED);
         if let Some(open) = self.frame_builder.open.as_ref() {
             open.layouts
@@ -1906,7 +1915,14 @@ impl RenderEngine {
             inner.retired_promoted_images.retain(|(retired, guard)| {
                 let signaled = guard.as_ref().is_none_or(|t| t.poll_signaled(&vk));
                 if signaled {
-                    Self::destroy_retired_image(&vk, retired);
+                    match retired {
+                        RetiredPromotionPayload::Legacy(legacy) => {
+                            Self::destroy_retired_image(&vk, legacy);
+                        }
+                        RetiredPromotionPayload::Managed(_) => {
+                            // StorageLease will be dropped when the tuple is removed by retain.
+                        }
+                    }
                 }
                 !signaled
             });
@@ -1945,22 +1961,37 @@ impl RenderEngine {
         }
     }
 
-    /// Push old promotion-displaced handles onto the deferred-destroy
-    /// list. If `guard` is `None` or already signaled, the handles are
-    /// destroyed immediately; otherwise they're parked until
+    /// Push old promotion-displaced payload onto the deferred-destroy
+    /// list. If `guard` is `None` or already signaled, the payload is
+    /// released immediately; otherwise it is parked until
     /// [`Self::poll_retired`] observes the fence signal.
-    fn retire_image_after(&mut self, retired: RetiredImage, guard: Option<FenceTicket>) {
+    fn retire_promotion_after(
+        &mut self,
+        retired: RetiredPromotionPayload,
+        guard: Option<FenceTicket>,
+    ) {
         let Some(inner) = self.inner.as_mut() else {
-            // No Vk inner: nothing to destroy against. (The handles are
-            // necessarily null in the stub case.)
+            // No Vk inner: nothing to destroy against.
             return;
         };
         let ready = guard.as_ref().is_none_or(|t| t.poll_signaled(&inner.vk));
         if ready {
-            Self::destroy_retired_image(&inner.vk, &retired);
+            match retired {
+                RetiredPromotionPayload::Legacy(legacy) => {
+                    Self::destroy_retired_image(&inner.vk, &legacy);
+                }
+                RetiredPromotionPayload::Managed(lease) => {
+                    drop(lease);
+                }
+            }
         } else {
             inner.retired_promoted_images.push((retired, guard));
         }
+    }
+
+    #[allow(dead_code)]
+    fn retire_image_after(&mut self, retired: RetiredImage, guard: Option<FenceTicket>) {
+        self.retire_promotion_after(RetiredPromotionPayload::Legacy(retired), guard);
     }
 
     /// Create a new pinned R8 snapshot image (TRANSFER_DST | SAMPLED), UNDEFINED
@@ -2224,7 +2255,14 @@ impl RenderEngine {
             if let Some(t) = guard.as_ref() {
                 let _ = t.wait(&vk);
             }
-            Self::destroy_retired_image(&vk, &retired);
+            match retired {
+                RetiredPromotionPayload::Legacy(legacy) => {
+                    Self::destroy_retired_image(&vk, &legacy);
+                }
+                RetiredPromotionPayload::Managed(lease) => {
+                    drop(lease);
+                }
+            }
         }
         // Task 11 (codex round-5 finding 8): release any clip snapshots parked
         // in `retired_snapshots`; covering only `poll_retired` leaks the last
@@ -3600,6 +3638,7 @@ impl RenderEngine {
         &mut self,
         platform: &mut PlatformBackend,
         store: &mut DrawableStore,
+        mut service: Option<&mut ResourceService>,
         id: DrawableId,
     ) -> Result<(), RenderError> {
         if self.inner.is_none() {
@@ -3608,7 +3647,17 @@ impl RenderEngine {
         // Idempotency check first — avoid the flush cost if already done.
         {
             let d = store.get(id).ok_or(RenderError::UnknownDrawable(id))?;
-            if d.storage.is_exportable() {
+            let is_exp = match d.storage.backing() {
+                StorageBacking::Legacy(alloc) => alloc.is_exportable(),
+                StorageBacking::Managed(_) => {
+                    let svc = service
+                        .as_deref_mut()
+                        .ok_or(RenderError::Resource(ResourceError::InvalidState))?;
+                    d.storage.is_exportable_managed(svc)?
+                }
+                StorageBacking::Detached => false,
+            };
+            if is_exp {
                 return Ok(());
             }
         }
@@ -3636,8 +3685,13 @@ impl RenderEngine {
         // transition the frame close recorded).
         let (extent, format, depth, old_layout, old_image) = {
             let d = store.get(id).ok_or(RenderError::UnknownDrawable(id))?;
-            let s = &d.storage;
-            (s.extent, s.format, s.depth, s.current_layout, s.image)
+            (
+                d.storage.extent(),
+                d.storage.format(),
+                d.storage.depth(),
+                d.storage.current_layout(),
+                d.storage.image(),
+            )
         };
 
         let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
@@ -3670,16 +3724,40 @@ impl RenderEngine {
         let retired = {
             let d = store.get_mut(id).ok_or(RenderError::UnknownDrawable(id))?;
             let (exp_image, exp_memory, exp_stride, exp_size, exp_modifier) = exp.into_raw_parts();
-            d.storage.adopt_exportable(
-                exp_image,
-                exp_memory,
-                sample_view,
-                image_view,
-                new_layout,
-                exp_stride,
-                exp_size,
-                exp_modifier,
-            )
+            match d.storage.backing() {
+                StorageBacking::Legacy(_) => {
+                    let legacy = d.storage.adopt_exportable(
+                        exp_image,
+                        exp_memory,
+                        sample_view,
+                        image_view,
+                        new_layout,
+                        exp_stride,
+                        exp_size,
+                        exp_modifier,
+                    );
+                    RetiredPromotionPayload::Legacy(legacy)
+                }
+                StorageBacking::Managed(_) => {
+                    let svc = service.ok_or(RenderError::Resource(ResourceError::InvalidState))?;
+                    let old_lease = d.storage.adopt_exportable_managed(
+                        svc,
+                        exp_image,
+                        exp_memory,
+                        sample_view,
+                        image_view,
+                        new_layout,
+                        exp_stride,
+                        exp_size,
+                        exp_modifier,
+                        Some(Arc::clone(&vk)),
+                    )?;
+                    RetiredPromotionPayload::Managed(old_lease)
+                }
+                StorageBacking::Detached => {
+                    return Err(RenderError::Resource(ResourceError::Detached));
+                }
+            }
         };
 
         // (f) invalidate the view cache for this DrawableId.
@@ -3688,7 +3766,7 @@ impl RenderEngine {
         // (g) retire old handles once the old image's last render fence
         //     signals (clone the ticket; None → retire eagerly).
         let guard = store.get(id).and_then(|d| d.last_render_ticket.clone());
-        self.retire_image_after(retired, guard);
+        self.retire_promotion_after(retired, guard);
         Ok(())
     }
 
@@ -3863,9 +3941,9 @@ impl RenderEngine {
         let Some(drawable) = store.get(target) else {
             return Err(RenderError::UnknownDrawable(target));
         };
-        let extent = drawable.storage.extent;
-        let image_view = drawable.storage.image_view;
-        let format = drawable.storage.format;
+        let extent = drawable.storage.extent();
+        let image_view = drawable.storage.image_view();
+        let format = drawable.storage.format();
         let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
@@ -4026,7 +4104,7 @@ impl RenderEngine {
             let d = store
                 .get(target)
                 .ok_or(RenderError::UnknownDrawable(target))?;
-            d.storage.format
+            d.storage.format()
         };
         self.ensure_logic_fill_cache(platform, format)?;
 
@@ -4036,9 +4114,9 @@ impl RenderEngine {
         let Some(drawable) = store.get(target) else {
             return Err(RenderError::UnknownDrawable(target));
         };
-        let extent = drawable.storage.extent;
+        let extent = drawable.storage.extent();
         let depth = drawable.depth;
-        let image_view = drawable.storage.image_view;
+        let image_view = drawable.storage.image_view();
         let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
@@ -4178,11 +4256,11 @@ impl RenderEngine {
         };
         let (src_image, src_extent, src_format) = {
             let d = store.get(src).ok_or(RenderError::UnknownDrawable(src))?;
-            (d.storage.image, d.storage.extent, d.storage.format)
+            (d.storage.image(), d.storage.extent(), d.storage.format())
         };
         let (dst_image, dst_extent, dst_format) = {
             let d = store.get(dst).ok_or(RenderError::UnknownDrawable(dst))?;
-            (d.storage.image, d.storage.extent, d.storage.format)
+            (d.storage.image(), d.storage.extent(), d.storage.format())
         };
         if src_format != dst_format {
             return Err(RenderError::UnsupportedDepth(0));
@@ -4373,19 +4451,19 @@ impl RenderEngine {
         let (src_image, src_view, src_extent, src_format) = {
             let d = store.get(src).ok_or(RenderError::UnknownDrawable(src))?;
             (
-                d.storage.image,
-                d.storage.image_view,
-                d.storage.extent,
-                d.storage.format,
+                d.storage.image(),
+                d.storage.image_view(),
+                d.storage.extent(),
+                d.storage.format(),
             )
         };
         let (dst_image, dst_view, dst_extent, dst_format) = {
             let d = store.get(dst).ok_or(RenderError::UnknownDrawable(dst))?;
             (
-                d.storage.image,
-                d.storage.image_view,
-                d.storage.extent,
-                d.storage.format,
+                d.storage.image(),
+                d.storage.image_view(),
+                d.storage.extent(),
+                d.storage.format(),
             )
         };
 
@@ -4621,7 +4699,7 @@ impl RenderEngine {
             let d = store
                 .get(live_mask_id)
                 .ok_or(RenderError::UnknownDrawable(live_mask_id))?;
-            d.storage.image
+            d.storage.image()
         };
         let copy_extent = inner.clip_snapshots.get(&id).expect("snapshot").extent;
         let snap_image = inner.clip_snapshots.get(&id).expect("snapshot").image;
@@ -4912,10 +4990,10 @@ impl RenderEngine {
                 .get(dst_id)
                 .ok_or(RenderError::UnknownDrawable(dst_id))?;
             (
-                d.storage.image,
-                d.storage.image_view,
-                d.storage.extent,
-                d.storage.format,
+                d.storage.image(),
+                d.storage.image_view(),
+                d.storage.extent(),
+                d.storage.format(),
                 d.depth,
             )
         };
@@ -5065,7 +5143,7 @@ impl RenderEngine {
                     extent: dst_extent,
                     image: dst_image,
                     image_view: dst_view,
-                    current_layout: d.storage.current_layout,
+                    current_layout: d.storage.current_layout(),
                 }
             };
             crate::kms::vk::ops::render::record_render_composite_open(
@@ -5081,7 +5159,8 @@ impl RenderEngine {
             // see COLOR_ATTACHMENT_OPTIMAL between open and close.
             {
                 let d = store.get_mut(dst_id).expect("checked");
-                d.storage.current_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                d.storage
+                    .set_current_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
             }
             // First-append draws (binds this call's descriptor set).
             crate::kms::vk::ops::render::record_render_composite_draws(
@@ -5245,7 +5324,11 @@ impl RenderEngine {
             let d = store
                 .get(batch.key.dst)
                 .ok_or(RenderError::UnknownDrawable(batch.key.dst))?;
-            (d.storage.image, d.storage.image_view, d.storage.extent)
+            (
+                d.storage.image(),
+                d.storage.image_view(),
+                d.storage.extent(),
+            )
         };
 
         // Close the render pass + transition dst back to
@@ -5263,7 +5346,7 @@ impl RenderEngine {
         );
         {
             let d = store.get_mut(batch.key.dst).expect("checked");
-            d.storage.current_layout = adapter.current_layout;
+            d.storage.set_current_layout(adapter.current_layout);
         }
 
         // End + submit (append to group).
@@ -5373,7 +5456,7 @@ impl RenderEngine {
             24 | 32 => 4,
             _ => return Err(RenderError::UnsupportedDepth(src_depth)),
         };
-        let dst_format = drawable.storage.format;
+        let dst_format = drawable.storage.format();
         // The store allocates storage by depth; format mismatch
         // here means the caller targeted a depth-mismatched
         // drawable. Treat as unsupported.
@@ -5386,8 +5469,8 @@ impl RenderEngine {
             return Err(RenderError::UnsupportedDepth(src_depth));
         }
 
-        let dst_extent = drawable.storage.extent;
-        let dst_image = drawable.storage.image;
+        let dst_extent = drawable.storage.extent();
+        let dst_image = drawable.storage.image();
         let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
@@ -5565,7 +5648,7 @@ impl RenderEngine {
             24 | 32 => 4,
             _ => return Err(RenderError::UnsupportedDepth(out_depth)),
         };
-        let extent = drawable.storage.extent;
+        let extent = drawable.storage.extent();
         // Clamp the read rect to the SOURCE HANDLE's bounds (#133 step 3
         // (P4)): GetImage on a bordered window must not return ring
         // pixels as window content.
@@ -5622,7 +5705,7 @@ impl RenderEngine {
         unsafe {
             device.cmd_copy_image_to_buffer(
                 cb,
-                drawable.storage.image,
+                drawable.storage.image(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 staging.buffer,
                 &region,
@@ -5829,7 +5912,7 @@ impl RenderEngine {
             let d = store
                 .get(target)
                 .ok_or(RenderError::UnknownDrawable(target))?;
-            (d.storage.extent, d.storage.format)
+            (d.storage.extent(), d.storage.format())
         };
         if target_format != vk::Format::B8G8R8A8_UNORM {
             log::warn!(
@@ -6335,7 +6418,7 @@ impl RenderEngine {
             let d = store
                 .get(dst_id)
                 .ok_or(RenderError::UnknownDrawable(dst_id))?;
-            (d.storage.extent, d.storage.format, d.storage.depth)
+            (d.storage.extent(), d.storage.format(), d.storage.depth())
         };
         // BGRA8 window/pixmap mirrors, or a depth-8 R8 a8 mask
         // pixmap — the cairo/Pango component-alpha text
@@ -7377,10 +7460,10 @@ impl RenderEngine {
                 .get(dst_id)
                 .ok_or(RenderError::UnknownDrawable(dst_id))?;
             (
-                d.storage.image,
-                d.storage.image_view,
-                d.storage.extent,
-                d.storage.format,
+                d.storage.image(),
+                d.storage.image_view(),
+                d.storage.extent(),
+                d.storage.format(),
                 d.depth,
             )
         };
@@ -7910,7 +7993,7 @@ impl RenderEngine {
         //      accessor. Pitfall 5 — for the 2nd op-in-frame, the
         //      overlay reflects op 1's post-op layout
         //      (SHADER_READ_ONLY_OPTIMAL); reading
-        //      `store.get(dst_id).storage.current_layout` directly
+        //      `store.get(dst_id).storage.current_layout()` directly
         //      would return the STALE pre-frame value because
         //      storage is intentionally not mutated during recording.
         let inner = self.inner.as_ref().expect("inner");
@@ -8158,10 +8241,10 @@ impl RenderEngine {
                 .get(dst_id)
                 .ok_or(RenderError::UnknownDrawable(dst_id))?;
             (
-                d.storage.image,
-                d.storage.image_view,
-                d.storage.extent,
-                d.storage.format,
+                d.storage.image(),
+                d.storage.image_view(),
+                d.storage.extent(),
+                d.storage.format(),
                 d.depth,
             )
         };
@@ -8968,9 +9051,9 @@ fn build_render_composite_attrs(
 fn drawable_for_render_view(store: &DrawableStore, id: DrawableId) -> Option<DrawableViewInfo> {
     let d = store.get(id)?;
     Some(DrawableViewInfo {
-        image: d.storage.image,
-        extent: d.storage.extent,
-        format: d.storage.format,
+        image: d.storage.image(),
+        extent: d.storage.extent(),
+        format: d.storage.format(),
         depth: d.depth,
     })
 }
@@ -9480,9 +9563,9 @@ fn emit_recorded_op_into_cb(
                 .get_mut(cg.dst_id)
                 .ok_or(RenderError::UnknownDrawable(cg.dst_id))?;
             let mut adapter = StorageTextTarget {
-                extent: drawable.storage.extent,
-                image: drawable.storage.image,
-                image_view: drawable.storage.image_view,
+                extent: drawable.storage.extent(),
+                image: drawable.storage.image(),
+                image_view: drawable.storage.image_view(),
                 current_layout: cg.dst_old_layout,
             };
             // Per-(op, dst_format, dst_has_alpha) pipeline — the
@@ -9493,7 +9576,7 @@ fn emit_recorded_op_into_cb(
                 .text_pipelines
                 .get(&(
                     cg.op,
-                    drawable.storage.format,
+                    drawable.storage.format(),
                     cg.dst_has_alpha,
                     cg.component_alpha,
                 ))
@@ -9511,7 +9594,7 @@ fn emit_recorded_op_into_cb(
                 &cg.clip_scissors,
             )?;
             // Pipeline borrow ends here; mutate storage now.
-            drawable.storage.current_layout = adapter.current_layout;
+            drawable.storage.set_current_layout(adapter.current_layout);
             Ok(())
         }
         Op::LayoutTransition(lt) => {
@@ -10837,7 +10920,7 @@ fn emit_session_open_and_draws(
             // the recorded `rc.dst_image` the standalone path uses.
             let dst_image = store
                 .get(rc.dst_id)
-                .map_or(rc.dst_image, |d| d.storage.image);
+                .map_or(rc.dst_image, |d| d.storage.image());
             open_dst_color_pass(
                 vk,
                 cb,
@@ -10936,11 +11019,11 @@ fn emit_recorded_image_text_into_cb(
     // `dst_old_layout` (Pitfall 5 — the drawable's live
     // `current_layout` is stale during deferred emit; the overlay
     // has already been committed by push_op_and_set_layouts).
-    let drawable_extent = drawable.storage.extent;
+    let drawable_extent = drawable.storage.extent();
     let mut adapter = StorageTextTarget {
         extent: drawable_extent,
-        image: drawable.storage.image,
-        image_view: drawable.storage.image_view,
+        image: drawable.storage.image(),
+        image_view: drawable.storage.image_view(),
         current_layout: it.dst_old_layout,
     };
     // Core ImageText is always Over+BGRA8 — the legacy singleton
@@ -10987,7 +11070,7 @@ fn emit_recorded_image_text_into_cb(
     }
     // Propagate the adapter's tracked layout back into the drawable's
     // storage — record_text_run transitions to SHADER_READ_ONLY_OPTIMAL.
-    drawable.storage.current_layout = adapter.current_layout;
+    drawable.storage.set_current_layout(adapter.current_layout);
     Ok(())
 }
 
@@ -11557,7 +11640,7 @@ fn commit_close_success(
     // route their layout updates exclusively through the overlay.
     for (id, entry) in layouts.drawables {
         if let Some(d) = store.get_mut(id) {
-            d.storage.current_layout = entry.current_in_frame_layout;
+            d.storage.set_current_layout(entry.current_in_frame_layout);
         }
     }
     if let Some(atlas) = inner.glyph_atlas.as_mut() {
@@ -11585,7 +11668,7 @@ fn rollback_pre_submit(
 ) {
     for (id, entry) in open_frame.layouts.drawables.drain() {
         if let Some(d) = store.get_mut(id) {
-            d.storage.current_layout = entry.pre_frame_layout;
+            d.storage.set_current_layout(entry.pre_frame_layout);
         }
     }
     for (id, prior) in open_frame.touched.snapshots.drain() {
@@ -15439,7 +15522,7 @@ mod tests {
             )
             .expect("store.allocate");
         assert_eq!(
-            store.get(mask).unwrap().storage.format,
+            store.get(mask).unwrap().storage.format(),
             vk::Format::R8_UNORM,
             "depth-8 pixmap must be R8 storage",
         );
@@ -16936,7 +17019,7 @@ mod tests {
         }
         // Storage unchanged during recording.
         assert_eq!(
-            store.get(id).expect("drawable").storage.current_layout,
+            store.get(id).expect("drawable").storage.current_layout(),
             vk::ImageLayout::UNDEFINED,
             "storage NOT mutated during recording (B.2 invariant)",
         );
@@ -16993,7 +17076,7 @@ mod tests {
             .expect("create");
         // Storage starts UNDEFINED.
         assert_eq!(
-            store.get(id).expect("drawable").storage.current_layout,
+            store.get(id).expect("drawable").storage.current_layout(),
             vk::ImageLayout::UNDEFINED,
         );
 
@@ -17015,7 +17098,7 @@ mod tests {
         }
         // While the frame is open, storage MUST NOT have moved.
         assert_eq!(
-            store.get(id).expect("drawable").storage.current_layout,
+            store.get(id).expect("drawable").storage.current_layout(),
             vk::ImageLayout::UNDEFINED,
             "storage unchanged during recording (B.2 invariant)",
         );
@@ -17028,7 +17111,7 @@ mod tests {
 
         // Storage MUST have caught up to the overlay's in-frame value.
         assert_eq!(
-            store.get(id).expect("drawable").storage.current_layout,
+            store.get(id).expect("drawable").storage.current_layout(),
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             "commit_close_success wrote overlay → storage \
              (USER-codex U-R6.F1 LOAD-BEARING invariant)",
@@ -17653,10 +17736,10 @@ mod tests {
                 .expect("pipeline built by the warm-up");
             let drawable = store.get_mut(target).expect("target");
             let mut adapter = StorageTextTarget {
-                extent: drawable.storage.extent,
-                image: drawable.storage.image,
-                image_view: drawable.storage.image_view,
-                current_layout: drawable.storage.current_layout,
+                extent: drawable.storage.extent(),
+                image: drawable.storage.image(),
+                image_view: drawable.storage.image_view(),
+                current_layout: drawable.storage.current_layout(),
             };
             crate::kms::vk::ops::run_one_shot_op(&vk_ctx, pool, |vk, cb| {
                 crate::kms::vk::ops::text::record_text_run_scissored(
@@ -17674,7 +17757,7 @@ mod tests {
                 )
             })
             .expect("one-shot text run");
-            drawable.storage.current_layout = adapter.current_layout;
+            drawable.storage.set_current_layout(adapter.current_layout);
         }
 
         let out = engine
@@ -18316,6 +18399,96 @@ mod tests {
                 32,
             )
             .expect("get_image closes the two-run frame");
+        engine.drain_all(&mut platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_engine_promote_drawable_exportable_managed_vulkan() {
+        let mut platform = match live_platform() {
+            Some(p) => p,
+            None => panic!("environmental skip: no live Vulkan ICD; not claiming pass"),
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        let id =
+            create_pixmap(&mut store, &mut platform, 0x100, 32, 32, 32).expect("create_pixmap");
+
+        // Convert storage to managed
+        let target = crate::kms::render::target::PaintTarget::new(id, (0, 0), None, 32);
+        let old_storage = std::mem::replace(
+            &mut store.get_mut(id).unwrap().storage,
+            crate::kms::render::store::Storage::from_backing(StorageBacking::Detached),
+        );
+        let lease = old_storage
+            .into_managed(&mut service, &platform, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let old_key = lease.allocation.key();
+        store.get_mut(id).unwrap().storage =
+            crate::kms::render::store::Storage::from_backing(StorageBacking::Managed(lease));
+
+        // Attach an unsignaled fence ticket as the last render ticket
+        let ticket = platform
+            .acquire_fence_ticket()
+            .expect("acquire_fence_ticket");
+        store.get_mut(id).unwrap().last_render_ticket = Some(ticket.clone());
+
+        // Old key is currently retained by the managed storage lease
+        assert!(
+            service
+                .reserve(old_key, super::super::resources::UseKind::Read)
+                .is_ok(),
+            "old allocation must be active and retainable"
+        );
+
+        // Promote the managed drawable to exportable
+        engine
+            .promote_drawable_exportable(&mut platform, &mut store, Some(&mut service), id)
+            .expect("promote_drawable_exportable");
+
+        // New storage is exportable managed
+        let (new_key, is_exportable) = {
+            let d = store.get(id).unwrap();
+            let lease_key = d.storage.managed_lease().unwrap().allocation.key();
+            let is_exp = d.storage.is_exportable_managed(&mut service).unwrap();
+            (lease_key, is_exp)
+        };
+        assert!(is_exportable, "promoted storage must be exportable managed");
+        assert_ne!(new_key, old_key, "promotion must produce a new allocation");
+
+        // Old lease must be parked in retired_promoted_images guarded by the ticket
+        assert_eq!(
+            engine.inner.as_ref().unwrap().retired_promoted_images.len(),
+            1,
+            "retired managed lease must be parked in retired_promoted_images"
+        );
+
+        // Before ticket signals, polling retired leaves the old lease parked
+        engine.poll_retired(&platform);
+        assert_eq!(
+            engine.inner.as_ref().unwrap().retired_promoted_images.len(),
+            1,
+            "unsignaled fence ticket keeps old lease parked"
+        );
+
+        // Signal ticket: now poll_retired drains the retired image and drops the old lease
+        ticket.test_signal();
+        engine.poll_retired(&platform);
+        assert_eq!(
+            engine.inner.as_ref().unwrap().retired_promoted_images.len(),
+            0,
+            "signaled ticket causes poll_retired to drop the parked lease"
+        );
+
         engine.drain_all(&mut platform);
     }
 }

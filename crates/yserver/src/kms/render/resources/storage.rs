@@ -17,12 +17,14 @@ pub(crate) struct PixelIdentity {
     pub format: vk::Format,
     pub image_view: vk::ImageView,
     pub sample_view: vk::ImageView,
+    pub image: vk::Image,
 }
 
 #[derive(Debug)]
 pub(crate) struct StorageLease {
     pub allocation: AllocationLease,
     pub pixels: PixelIdentity,
+    pub current_layout: std::cell::Cell<vk::ImageLayout>,
 }
 
 #[derive(Debug)]

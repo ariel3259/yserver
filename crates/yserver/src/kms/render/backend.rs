@@ -6145,7 +6145,12 @@ impl KmsBackend {
             .lookup(xid)
             .ok_or_else(|| io::Error::other(format!("promote: unknown xid {xid:#x}")))?;
         self.engine
-            .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+            .promote_drawable_exportable(
+                &mut self.platform,
+                &mut self.store,
+                self.resource_service.as_mut(),
+                id,
+            )
             .map_err(|e| io::Error::other(format!("promote_drawable_exportable: {e:?}")))?;
         let vk = self
             .platform
@@ -9348,10 +9353,12 @@ impl KmsBackend {
         // flush inside engine.promote_drawable_exportable. Counted for the
         // gkrellm submit-storm attribution (project_client_scheduling_fairness).
         self.telemetry.record_promote_exportable_run();
-        match self
-            .engine
-            .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
-        {
+        match self.engine.promote_drawable_exportable(
+            &mut self.platform,
+            &mut self.store,
+            self.resource_service.as_mut(),
+            id,
+        ) {
             Ok(()) => self
                 .store
                 .get(id)
@@ -26361,7 +26368,12 @@ impl Backend for KmsBackend {
                 return Err(io::Error::other("DRI3 export: Vulkan unavailable"));
             }
             self.engine
-                .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+                .promote_drawable_exportable(
+                    &mut self.platform,
+                    &mut self.store,
+                    self.resource_service.as_mut(),
+                    id,
+                )
                 .map_err(|e| io::Error::other(format!("DRI3 export promote: {e:?}")))?;
         }
 
@@ -45839,10 +45851,12 @@ mod tests {
             format: ash::vk::Format::B8G8R8A8_UNORM,
             image_view: ash::vk::ImageView::null(),
             sample_view: ash::vk::ImageView::null(),
+            image: ash::vk::Image::null(),
         };
         let storage_lease = StorageLease {
             allocation: alloc_lease,
             pixels,
+            current_layout: std::cell::Cell::new(ash::vk::ImageLayout::UNDEFINED),
         };
 
         b.store.get_mut(drawable_id).unwrap().storage =

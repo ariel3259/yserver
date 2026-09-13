@@ -857,6 +857,7 @@ impl ResourceService {
         Ok(StorageLease {
             allocation: new_alloc_lease,
             pixels: source.pixels.clone(),
+            current_layout: std::cell::Cell::new(source.current_layout.get()),
         })
     }
 
@@ -869,6 +870,7 @@ impl ResourceService {
         Ok(StorageLease {
             allocation: new_alloc_lease,
             pixels: source.pixels.clone(),
+            current_layout: std::cell::Cell::new(source.current_layout.get()),
         })
     }
 

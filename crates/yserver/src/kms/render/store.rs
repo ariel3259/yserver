@@ -166,6 +166,7 @@ impl std::ops::DerefMut for Storage {
 /// Old Vk handles displaced by promotion ([`Storage::adopt_exportable`]).
 /// Destroyed by the engine only once the fence guarding the old image's
 /// last render has signaled.
+#[derive(Debug)]
 pub(crate) struct RetiredImage {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
@@ -250,6 +251,30 @@ impl Storage {
 
     pub(crate) fn has_image_view(&self) -> bool {
         self.image_view() != vk::ImageView::null()
+    }
+
+    pub(crate) fn image(&self) -> vk::Image {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.image,
+            StorageBacking::Managed(lease) => lease.pixels.image,
+            StorageBacking::Detached => vk::Image::null(),
+        }
+    }
+
+    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.current_layout,
+            StorageBacking::Managed(lease) => lease.current_layout.get(),
+            StorageBacking::Detached => vk::ImageLayout::UNDEFINED,
+        }
+    }
+
+    pub(crate) fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        match &mut self.backing {
+            StorageBacking::Legacy(alloc) => alloc.current_layout = layout,
+            StorageBacking::Managed(lease) => lease.current_layout.set(layout),
+            StorageBacking::Detached => {}
+        }
     }
 
     /// Production constructor — Vk handles owned by `PlatformBackend::
@@ -478,6 +503,8 @@ impl Storage {
                 let format = alloc.format;
                 let image_view = alloc.image_view;
                 let sample_view = alloc.sample_view;
+                let image = alloc.image;
+                let current_layout = alloc.current_layout;
                 match service.adopt(AllocationPayload::Storage(alloc)) {
                     Ok(allocation_lease) => {
                         let key = allocation_lease.key();
@@ -489,10 +516,12 @@ impl Storage {
                             format,
                             image_view,
                             sample_view,
+                            image,
                         };
                         Ok(StorageLease {
                             allocation: allocation_lease,
                             pixels,
+                            current_layout: std::cell::Cell::new(current_layout),
                         })
                     }
                     Err((err, payload)) => {
@@ -631,8 +660,10 @@ impl Storage {
                 format,
                 image_view: new_image_view,
                 sample_view: new_sample_view,
+                image: new_image,
             },
             allocation: new_alloc_lease,
+            current_layout: std::cell::Cell::new(new_layout),
         };
 
         let _ = std::mem::replace(
@@ -1035,7 +1066,9 @@ impl Drawable {
                 vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
             unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
             alloc.current_layout = target_layout;
-        })
+        })?;
+        lease.current_layout.set(target_layout);
+        Ok(())
     }
 
     pub(crate) fn extent(&self) -> vk::Extent2D {
@@ -1052,6 +1085,22 @@ impl Drawable {
 
     pub(crate) fn has_image_view(&self) -> bool {
         self.storage.has_image_view()
+    }
+
+    pub(crate) fn image(&self) -> vk::Image {
+        self.storage.image()
+    }
+
+    pub(crate) fn format(&self) -> vk::Format {
+        self.storage.format()
+    }
+
+    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
+        self.storage.current_layout()
+    }
+
+    pub(crate) fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        self.storage.set_current_layout(layout);
     }
 }
 
