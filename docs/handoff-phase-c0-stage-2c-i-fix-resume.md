@@ -1,7 +1,7 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
-**Kept current after every accepted session. Last update: 2026-09-12,
-after F-8 (F-9 next).** If you are resuming this work cold — a new
+**Kept current after every accepted session. Last update: 2026-09-13,
+after F-9 (F-4d next).** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -29,7 +29,7 @@ stand so nothing is re-derived.
    `…-09-12-…-F2-review.md`, `…-F3-review.md`, `…-F4-review.md`,
    `…-F4b-review.md`, `…-F4c-review.md`, `…-F5a-review.md`,
    `…-F5b-review.md`, `…-F6a-review.md`, `…-F6b-review.md`,
-   `…-F7-review.md`, `…-F8-review.md`.
+   `…-F7-review.md`, `…-F8-review.md`, `…-09-13-…-F9-review.md`.
 6. The plan
    `docs/superpowers/plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md`
    — per-task `Status:` blocks carry every fix-round verdict table.
@@ -48,8 +48,8 @@ stand so nothing is re-derived.
 | F-6b | Task 7, Present half (M-6: 7.5/7.5a, `PresentRelease`, COW test) | **ACCEPTED** | `8b0e00d6`/`a242a9da` | F6b-review |
 | F-7 | Task 8 (role transitions, `on_available`) | **ACCEPTED** | `f39a01c6`/`11c15cf4` | F7-review |
 | F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | **ACCEPTED** | `ac3c94f7`/`a6a3afe9` | F8-review |
-| **F-9** | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | pending | — | — |
-| F-4d | Task 5 write half (5.3/5.5: managed branch in `scene.rs` `submit_shared_scanout_frame`, `PendingAck` batch, `drain_pending_pool_releases`) | after F-9 | — | ruled in F4c-review |
+| F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | **ACCEPTED** | `a7139742`/`f14259e1` | F9-review |
+| **F-4d** | Task 5 write half (5.3/5.5: managed branch in `scene.rs` `submit_shared_scanout_frame`, `PendingAck` batch, `drain_pending_pool_releases`) | pending | — | ruled in F4c-review |
 | F-10..F-12 | M-19 (180 `Storage` Deref accessor sites → lease accessors; 3 sessions: read-mostly consumers → `engine.rs` → `backend.rs`) + M-20 promotion half + F3-M1/F3-m1 | after F-4d | — | ruled in F3-review |
 | Final | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | after F-12 | — | — |
 
