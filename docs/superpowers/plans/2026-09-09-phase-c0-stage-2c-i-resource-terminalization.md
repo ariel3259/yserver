@@ -485,6 +485,114 @@ test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1731 filtered out; 
 
 Step 3.3 and Step 3.5 are both ticked by this round. Task 3 is fully closed.
 
+**Note (2026-09-13):** the "fully closed" line above and Fix round 5's
+own review (`18b86e14`) were the Gemini implementer's self-review, not
+an independent pass — see
+`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md`,
+which rejected F-11/F-12 on independent review (F11-B1 blocking,
+F11-M1 major, F12-m1/m2/m3 minor) and is authoritative over both.
+Fix round 6 below closes that rejection.
+
+**Fix round 6: `4eb5a96b`.** Session F-13a, closing F11-B1, F11-M1,
+F12-m1, F12-m2, F12-m3 from
+`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md`,
+per that finding's "What F-13 must do" list.
+
+| Finding | Verdict |
+| --- | --- |
+| F11-B1 (managed storage layout lived in three places — a `StorageLease`-local `Cell<vk::ImageLayout>` shadow, the payload's `StorageAllocation::current_layout`, and whatever any twin lease's own Cell said; the plain `Storage::current_layout()`/`set_current_layout()` and `Drawable::record_layout_transition`'s `Managed` arm mutated the Cell with no reservation at all, so a live `Read` reservation did not stop it) | **RESOLVED (test: `c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan`, rewritten)** — deleted `StorageLease::current_layout`; `StorageAllocation::current_layout` (behind the entry's reservation protocol) is the only copy. `Storage::current_layout()`/`set_current_layout()` now take `Option<&mut ResourceService>` and return `Result<_, ResourceError>`: `Legacy` is byte-for-byte unchanged, `Managed` dispatches through `with_storage_read`/`with_storage_write`, and `Managed` with no service is `Err(InvalidState)` (the `promote_drawable_exportable` precedent) rather than a silent value. `Drawable::record_layout_transition` on `Managed` now delegates to `record_layout_transition_managed` (`Err(Busy)` under a live incompatible reservation, `Err(InvalidState)` with no service) instead of writing the Cell unconditionally. The rewritten test proves: (1) under the live `_reader`, the plain arm is refused (`Err(Busy)`) and the payload's `current_layout` (read via `with_storage_read`) is unchanged; (2) with no service at all, `Err(InvalidState)`; (3) after the reader drops, a transition made through the drawable's own lease is observed by an independent `retain_storage` twin lease's `with_storage_read` — single source of truth, no per-lease Cell left to disagree. Mutation check: reverting the `Managed` arm of `Drawable::record_layout_transition` to `return Ok(())` without calling `record_layout_transition_managed` (i.e. a silent local "success" that bypasses the reservation) fails the test with `assertion left == right failed ... left: Ok(()) right: Err(Busy)`. Reverted before commit |
+| F11-M1 (`c0_2ci_engine_promote_drawable_exportable_managed_vulkan` asserted only `retired_promoted_images.len()`, which a lease-leaking mutation of `poll_retired` could still satisfy) | **RESOLVED (test: `c0_2ci_engine_promote_drawable_exportable_managed_vulkan`, extended)** — added: while parked (unsignaled ticket), `service.reserve(old_key, UseKind::Read)` succeeds and is dropped immediately (proves the parked allocation is still genuinely live/retained); after the signaled `poll_retired`, `service.service_ready()` contains `old_key` and a further `service.reserve(old_key, UseKind::Read)` is `Err` (proves the release is real, not just the queue entry disappearing). Mutation check: replacing `poll_retired`'s managed-arm `retain` with a `partition` that removes the signaled tuple and `std::mem::forget`s its `StorageLease` (leaking the `Retain` reservation while still shrinking the queue to 0, so the pre-fix `len()`-only assertion would still pass) fails the new assertion with `assertion failed: service.reserve(old_key, ...).is_err()`. Reverted before commit |
+| F12-m1 (`Storage::is_exportable(Some(svc))` mapped a refused read (`Busy`) to `false` via `unwrap_or(false)`, indistinguishable from a real "not exportable" answer) | **RESOLVED** — kept the bool-returning signature (this accessor has ~180 call sites across `engine.rs`/`backend.rs`, none of which can reach `Managed` storage yet per R8, so a `Result` conversion would be pure unwrap-boilerplate for a case that can't occur); a refused reservation and a missing service now both `log::warn!` before answering `false`, instead of silently folding into it. A caller that needs the refusal itself (not just a log line) already has `is_exportable_managed`, which returns `Result` |
+| F12-m2 (the residual `#[allow(dead_code)]` on `read_scanout_region_for_managed_source` was F-4d's to resolve, not "intentionally retained") | **RESOLVED** — confirmed the function's only caller is `c0_2ci_read_source_scratch_regression_vulkan` (a `#[test]` fn); F-4d (`d96e1c4c`) landed the managed scanout WRITE path, not a new reader, so no non-test caller exists. Replaced `#[allow(dead_code)]` with `#[cfg(test)]` rather than carrying an `allow` for a function production code cannot reach; `read_managed_scanout_region_bytes` (which already lost its `allow` in F-4d) was left untouched per the finding's note |
+| F12-m3 (stale doc comments on `Drawable::record_layout_transition`/`record_layout_transition_managed` still described the pre-fix "Legacy-only, panics on Managed" / "no caller reaches this yet" shape) | **RESOLVED** — both doc comments rewritten to describe the fixed single-source-of-truth shape: `record_layout_transition` documents its `Managed`→delegate-with-`InvalidState`-fallback behaviour; `record_layout_transition_managed` documents reserving `Write` and that `current_layout` has no lease-local shadow left to keep in sync |
+
+**Service threading (F11-B1's "thread it to the engine sites" requirement).**
+Found every direct `current_layout()`/`set_current_layout()` call site with
+`grep -n "current_layout()\|set_current_layout(" engine.rs backend.rs`
+(excluding the `ComposeTarget`/`TextRunTarget`-style adapter impls
+`StorageCompositeTarget`/`StorageTextTarget`/`GlyphAtlas`/`MaskScratch`,
+which are distinct types with their own plain fields, not `Storage`) and
+threaded `Option<&mut ResourceService>` through each:
+
+- `RenderEngineInner::current_layout_for_drawable` (engine.rs) gained the
+  parameter and now returns `Result<vk::ImageLayout, ResourceError>`;
+  all ~24 call sites across the paint-op recording path (`fill_rect_batch`,
+  `logic_fill`, `copy_area`, `masked_copy_area`, `refresh_clip_snapshot`,
+  `put_image`, `image_text`, `composite_glyphs_via_frame_builder`,
+  `render_composite_via_frame_builder`, `render_traps_or_tris`, and their
+  test call sites) pass `None` and propagate via `?` (production/test code)
+  or `.unwrap()` (test-only assertions).
+- `promote_drawable_exportable`'s own metadata-read block passes its
+  existing `service.as_deref_mut()` — this one already had a real service
+  in scope from its own signature (unchanged from F-11).
+- `try_append_render_batch`, `flush_render_batch`,
+  `emit_recorded_op_into_cb`, `emit_recorded_image_text_into_cb` pass
+  `None` and propagate via `?` (all four already return
+  `Result<_, RenderError>`-compatible types).
+- `commit_close_success`/`rollback_pre_submit` (previously `()`-returning)
+  now return `Result<(), RenderError>`, passing `None`. Their 6 call sites
+  are all inside `close_open_frame`'s error-unwind arms except one
+  (the success path, which uses `?`); the 5 unwind-path calls use
+  `if let Err(re) = rollback_pre_submit(...) { log::error!(...) }` rather
+  than `?`, so a rollback failure is logged (never swallowed) without
+  replacing the ORIGINAL triggering error the unwind is handling — R8
+  means this can't actually happen today (no Managed drawable reaches the
+  frame-builder recording path), but overwriting a real error with a
+  rollback error would be the wrong failure mode if it ever did.
+- `backend.rs`'s two direct call sites (`drawable_current_layout_for_tests`,
+  `masked_copy_area_for_tests`) pass `self.resource_service.as_mut()` (a
+  real service, since `KmsBackend` already carries one) rather than `None`.
+
+Every one of these sites is reachable only through the general paint-op /
+frame-builder recording path, which R8 established has no production or
+test producer of `Managed` storage yet; passing `None` there is
+"production passes None" exactly as the dispatch specified, not a
+narrowing of scope. No site silently defaults on `Managed` — every one
+would now surface `Err(InvalidState)` loudly (via `?`/`.unwrap()`/logged
+`Err`) instead of writing a lease-local Cell, which is the actual defect
+this fix round closes.
+
+Gate for this round: `cargo +nightly fmt --check` clean; `cargo clippy
+--all-targets -- -D warnings` clean (0 warnings, 0 errors); `cargo test -p
+yserver --lib c0_2ci` **121** passed / 0 failed / 13 ignored; twelve-run
+flake loop clean (12 runs, 0 flakes); hardware run (`--ignored`, this box
+has a real DRM node and NVIDIA/RADV Vulkan ICDs with validation layers)
+all **13** passed; full `cargo test -p yserver --lib` **1659** passed / 0
+failed / 85 ignored (matches the Fix round 5 baseline exactly). `grep -nE
+"\.storage\.[a-z_]+\b[^(]" crates/yserver/src/kms/render/*.rs` returns only
+`store.rs`'s own `.storage.backing` matches (the type's own definition,
+same as every prior round) — M-19's zero-external-raw-deref invariant
+holds. This session touched only `backend.rs`, `engine.rs`,
+`resources/{mod,storage}.rs` and `store.rs` — no `drm/`, `drm_cleanup.rs`
+or `transport.rs` — so the portable-target checks were not required and
+were not re-run.
+
+Hardware run:
+
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored --nocapture
+running 13 tests
+test kms::render::resources::tests::c0_2ci_sink_gamma_gate_four_states_drm ... ok
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::engine::tests::c0_2ci_engine_promote_drawable_exportable_managed_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1731 filtered out; finished in 0.94s
+```
+
+No plan steps ticked or unticked by this round — 3.3/3.4/3.5 stay ticked
+from Fix rounds 1/3/4/5; this round closed an independent-review
+rejection of Fix rounds 4/5's mechanism, not a new step.
+
 ## Task 4: Shared/copied scanout backing and pool reuse
 
 **Files:** Create `resources/scanout.rs`; modify `kms/vk/scanout.rs`, `kms/render/platform.rs` and the resource payload enum.
