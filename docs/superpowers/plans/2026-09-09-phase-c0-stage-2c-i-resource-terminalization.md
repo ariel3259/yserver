@@ -408,6 +408,45 @@ test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 1731 filtered out; 
 
 No steps ticked by this round: step 3.3 remains unticked until F-12 completes all remaining `Storage` accessor conversions.
 
+**Fix round 4: `5ab1795c`.** Session F-11, executing Part 2 of M-19 (`RenderEngine` in `engine.rs`, 70 call sites) and M-20 promotion half (`retire_promotion_after`, `destroy_retired_image`, `poll_retired`, `drain_all` for managed payloads in `promote_drawable_exportable`).
+
+- Converted all 70 raw `.storage.` field deref sites in `crates/yserver/src/kms/render/engine.rs` to safe method calls (`.image()`, `.image_view()`, `.extent()`, `.format()`, `.current_layout()`, `.set_current_layout()`).
+- Defined `RetiredPromotionPayload` enum (`Legacy(RetiredImage)`, `Managed(StorageLease)`); updated `retired_promoted_images` queue to store `(RetiredPromotionPayload, Option<FenceTicket>)`.
+- Implemented safe deferred retirement for managed leases in `retire_promotion_after`, `poll_retired`, and `drain_all`. When the guarding fence signals or during engine drain, managed `StorageLease`s are cleanly dropped, releasing their `Retain` reservation in `ResourceService` without handle leaks.
+- Updated `promote_drawable_exportable` signature and implementation to take `Option<&mut ResourceService>`, support managed drawables via `Storage::adopt_exportable_managed`, and retire the old storage lease as `RetiredPromotionPayload::Managed`.
+- Added unit test `c0_2ci_engine_promote_drawable_exportable_managed_vulkan` verifying deferred retirement of managed storage leases under fence tickets; verified via adversarial mutation check.
+- Recount of remaining unmigrated `.storage.` call sites across codebase: exactly 94 sites (all in `crates/yserver/src/kms/render/backend.rs`, assigned to F-12).
+
+| Finding | Verdict |
+| --- | --- |
+| M-19 (`RenderEngine` call sites in `engine.rs`) | **RESOLVED for `engine.rs` (Part 2 of 3)**. Converted all 70 sites in `engine.rs`. Exactly 94 sites remain across the codebase, all in `backend.rs` (assigned to F-12). Step 3.3 remains UNTICKED until F-12 completes. |
+| M-20 (promotion half: retire/destroy managed payloads) | **RESOLVED (test: `c0_2ci_engine_promote_drawable_exportable_managed_vulkan`)** — wired `RetiredPromotionPayload::Managed(StorageLease)` into `retire_promotion_after`, `poll_retired`, and `drain_all`. Mutation check: mutating `poll_retired` to retain instead of drop signaled entries failed `c0_2ci_engine_promote_drawable_exportable_managed_vulkan` with `assertion left == right failed: signaled ticket causes poll_retired to drop the parked lease; left: 1, right: 0`. Reverted mutation before commit. |
+
+Gate for this round: `cargo +nightly fmt` clean; `cargo clippy --all-targets -- -D warnings` clean (0 warnings, 0 errors); `cargo test -p yserver --lib c0_2ci` **121** passed / 0 failed / 13 ignored; twelve-run flake loop clean (12 runs, 0 flakes); hardware run (`--ignored`, this box has real DRM nodes and NVIDIA/RADV ICDs) all **13** passed; full `cargo test -p yserver --lib` **1659** passed / 0 failed / 85 ignored; targets `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `x86_64-unknown-freebsd` compile cleanly.
+
+Hardware run:
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 13 tests
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::resources::tests::c0_2ci_sink_gamma_gate_four_states_drm ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::engine::tests::c0_2ci_engine_promote_drawable_exportable_managed_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1731 filtered out; finished in 0.89s
+```
+
+No steps ticked by this round: step 3.3 remains unticked until F-12 completes all remaining `Storage` accessor conversions.
+
 ## Task 4: Shared/copied scanout backing and pool reuse
 
 **Files:** Create `resources/scanout.rs`; modify `kms/vk/scanout.rs`, `kms/render/platform.rs` and the resource payload enum.
