@@ -1,10 +1,11 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-14,
-after the independent (Opus) review of F-13c: ACCEPTED. Every fix session
-F-1..F-13c is now closed — the whole findings backlog is empty. The only
-work left in the round is the **final stage review**, which must be redone
-from scratch (Gemini's is void) and split by scope.** If you are resuming this work cold — a new
+after the final stage review, run by Opus in three scopes. Scopes 1 and 3
+HOLD; scope 2 found two majors and one minor. Twenty-one mutations across
+the stage, eighteen caught. The stage is NOT accepted: one tests-only fix
+session (**F-14**) closes S2-M1, S2-M2 and S2-m1, then its review, then
+`docs/status.md`, then 2c-ii's spec.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -45,6 +46,10 @@ not the calendar: split work small enough to finish inside one window.
    and `…-fix-F7-F10-opus-review.md` (the binding ones for F-7..F-12),
    `…-fix-F13a-review.md`, `…-fix-F13b-review.md`,
    `docs/superpowers/findings/2026-09-14-stage-2c-i-fix-F13c-review.md`,
+   and the final stage review, three documents:
+   `…-2026-09-14-stage-2c-i-final-review-scope1.md` (Tasks 1–4, HOLDS),
+   `…-scope2.md` (Tasks 5–7, **the open findings live here**),
+   `…-scope3.md` (Tasks 8–10, HOLDS, plus the stage-wide verdict table),
    `docs/superpowers/findings/2026-09-13-stage-2c-i-final-review.md` (void).
 6. The plan
    `docs/superpowers/plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md`
@@ -72,7 +77,10 @@ not the calendar: split work small enough to finish inside one window.
 | F-13a | Task 3: F11-B1 (delete `StorageLease::current_layout` Cell; layout accessors take the service; `record_layout_transition` on Managed via `_managed`; thread service to the engine layout sites), F11-M1, F12-m1..m3 | **ACCEPTED** (F13a-m1 → F-13c) | `4eb5a96b`/`75edc865` | F13a-review |
 | F-13b | Task 8 seam: F7-B1 (successor keeps its charge, occupy at dispatch, `prereserve_retirement` from the seam), F7-B2 (unflip reserves/moves `ExitRetirement`, waits) + success-path tests | **ACCEPTED** (F13b-D1 deferred to 2c-iii: dispatched `CommitResources` carries no leases) | `cc323714`/`5fa653d7` | F13b-review |
 | F-13c | Tests and wiring: F4d-M1, F8-M1, F8-M2, F8-m1, F9-m1, F13a-m1 | **ACCEPTED** (F13c-m1, F13c-m2 → 2c-ii) | `c0918b22`/`526b0085` | F13c-review |
-| **Final** | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | **next** — redone from scratch, **one session per scope** (Gemini's is void) | — | final-review (void) |
+| Final review, scope 1 | Tasks 1–4 | **HOLDS** (7 mutations, all caught) | `25d1f1b7` | final-review-scope1 |
+| Final review, scope 2 | Tasks 5–7 | **NOT CLEAN** — S2-M1, S2-M2 (major), S2-m1 (minor) | `d1e8397a` | final-review-scope2 |
+| Final review, scope 3 | Tasks 8–10 | **HOLDS** (7 mutations + 2 static audits, all caught) | this commit | final-review-scope3 |
+| **F-14** | Tests only: S2-M1 (R6 retained-member clause), S2-M2 (R9 serviced-time pause), S2-m1 (cancel vs discharge + stale disposition) | **next** | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the
@@ -118,6 +126,12 @@ not accepted until that passes. Then the next session is dispatched.
   scene test that cannot exist here, and got a silent substitution instead
   of a report). Rule F8 extends to shapes: an unreachable suggestion **must
   be reported**; the silent substitution is the defect, not the deviation.
+- **Findings from the final stage review are stated as invariants**
+  (scope 2, 2026-09-14): S2-M1 and S2-M2 name the invariant and the exact
+  mutation that must fail a named test; they deliberately do **not** say
+  where the test goes or what shape it takes. That is the first application
+  of the ruling above — do not "helpfully" turn them back into edits when
+  dispatching F-14.
 - **Carried out of the round into 2c-ii's spec** (not fix-session work):
   **F13b-D1** (dispatched `CommitResources` carries no present-pin leases),
   **F13c-m1** (`detach_managed_entries(None)` lets the production route skip
