@@ -1,17 +1,26 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
-**Kept current after every accepted session. Last update: 2026-09-13,
-after the independent (Opus) reviews of F-7..F-12: F-7 and F-11/F-12 REJECTED, F-4d/F-8/F-9/F-10 ACCEPTED with carried majors; F-13a and F-13b ACCEPTED; F-13c running; the "final stage review" is void.** If you are resuming this work cold — a new
+**Kept current after every accepted session. Last update: 2026-09-14,
+after the independent (Opus) review of F-13c: ACCEPTED. Every fix session
+F-1..F-13c is now closed — the whole findings backlog is empty. The only
+work left in the round is the **final stage review**, which must be redone
+from scratch (Gemini's is void) and split by scope.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
 
 ## Why this file exists
 
-The user's Claude subscription ends **2026-09-28**. Sonnet's 5-hour
-session limit has cut long sessions mid-way twice. Every session must
-leave the branch coherent, and this file must say exactly where things
-stand so nothing is re-derived.
+Sessions get cut. The 5-hour window cut F-4, F-4c and F-5b; the account's
+**weekly** cap cut F-13c. Every session must therefore leave the branch
+coherent, and this file must say exactly where things stand so nothing is
+re-derived.
+
+**There is no calendar deadline any more.** The 2026-09-28 date this file
+used to open with belonged to the old, cancelled subscription, abandoned
+on 2026-09-12 when it hit its weekly cap; the work moved to the user's
+personal Pro account on 2026-09-14. Session *size* is the thing to manage,
+not the calendar: split work small enough to finish inside one window.
 
 ## The documents, in reading order for a cold start
 
@@ -35,6 +44,7 @@ stand so nothing is re-derived.
    `docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md`
    and `…-fix-F7-F10-opus-review.md` (the binding ones for F-7..F-12),
    `…-fix-F13a-review.md`, `…-fix-F13b-review.md`,
+   `docs/superpowers/findings/2026-09-14-stage-2c-i-fix-F13c-review.md`,
    `docs/superpowers/findings/2026-09-13-stage-2c-i-final-review.md` (void).
 6. The plan
    `docs/superpowers/plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md`
@@ -61,8 +71,8 @@ stand so nothing is re-derived.
 | F-12 | Task 3 (`KmsBackend` in `backend.rs`, 94 sites + F3-M1) | **REJECTED** (F11-B1 exploited, F12-m1..m3) | `96c10eab`/`67871480` | F11-F12-opus-review |
 | F-13a | Task 3: F11-B1 (delete `StorageLease::current_layout` Cell; layout accessors take the service; `record_layout_transition` on Managed via `_managed`; thread service to the engine layout sites), F11-M1, F12-m1..m3 | **ACCEPTED** (F13a-m1 → F-13c) | `4eb5a96b`/`75edc865` | F13a-review |
 | F-13b | Task 8 seam: F7-B1 (successor keeps its charge, occupy at dispatch, `prereserve_retirement` from the seam), F7-B2 (unflip reserves/moves `ExitRetirement`, waits) + success-path tests | **ACCEPTED** (F13b-D1 deferred to 2c-iii: dispatched `CommitResources` carries no leases) | `cc323714`/`5fa653d7` | F13b-review |
-| **F-13c** | Tests and wiring: F4d-M1, F8-M1, F8-M2, F8-m1, F9-m1, F13a-m1 | **next** | — | — |
-| Final | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | **void** (Gemini reviewed its own F-7..F-12); redo after F-13c | — | final-review (void) |
+| F-13c | Tests and wiring: F4d-M1, F8-M1, F8-M2, F8-m1, F9-m1, F13a-m1 | **ACCEPTED** (F13c-m1, F13c-m2 → 2c-ii) | `c0918b22`/`526b0085` | F13c-review |
+| **Final** | Stage review: one adversarial pass over `76a93356..HEAD` against the 2c-i design spec and the rulings, same shape as the round-1 implementation review (three scopes, mutation checks); then `docs/status.md`, then 2c-ii's spec | **next** — redone from scratch, **one session per scope** (Gemini's is void) | — | final-review (void) |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the
@@ -99,6 +109,21 @@ not accepted until that passes. Then the next session is dispatched.
 - **F13b-D1 deferred to 2c-iii** (F13b-review): the managed direct seam's
   dispatched `CommitResources` carries no present-pin leases by value;
   that is the activation half R8 excludes. 2c-iii's spec must pick it up.
+- **Findings state invariants, not edits** (F13c-review, 2026-09-14): a
+  finding says *what must hold* and *which mutation must break which named
+  test*. It does not enumerate call sites (F8-M1's two named sites became
+  the implementer's scope boundary, leaving the `Copied` `sources` loop and
+  the `None` arm outside the work) and does not prescribe a test shape the
+  reviewer has not verified is reachable (F4d-M1 prescribed a deterministic
+  scene test that cannot exist here, and got a silent substitution instead
+  of a report). Rule F8 extends to shapes: an unreachable suggestion **must
+  be reported**; the silent substitution is the defect, not the deviation.
+- **Carried out of the round into 2c-ii's spec** (not fix-session work):
+  **F13b-D1** (dispatched `CommitResources` carries no present-pin leases),
+  **F13c-m1** (`detach_managed_entries(None)` lets the production route skip
+  husk accounting silently — inert only while R8 holds; when the managed
+  route goes production-active the fd-family barrier can never mint again),
+  **F13c-m2** (`unregister_pool_husk`'s `saturating_sub` hides underflow).
 - Hardware tests: `_vulkan`/`_drm` suffix, `#[ignore = "..."]`, and a
   missing device is `panic!`, never `return` (R12 — F-3 got this wrong
   and redid it).
