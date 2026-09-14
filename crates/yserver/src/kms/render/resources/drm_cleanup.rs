@@ -244,6 +244,15 @@ impl DrmCleanupRegistry {
         self.family_closed
     }
 
+    /// F8-M2: lets a router's own teardown step decide when it is safe to
+    /// close returned descriptors (`HandoffRouter::service`) -- once the
+    /// helper is reaped, no more late replies can arrive on this incident,
+    /// so whatever the router has accumulated so far may be closed without
+    /// racing a future `deliver_descriptor`.
+    pub(crate) fn helper_reaped(&self) -> bool {
+        self.family_inventory.helper_reaped
+    }
+
     pub(crate) fn register_right(
         &mut self,
         fb: u32,

@@ -4953,9 +4953,6 @@ fn c0_2ci_handoff_complete_fd_family_barrier_deterministic() {
     drm.register_payload_alias(payload_key);
     let right = drm.register_right(1001, 2001, GemOwner::Right);
 
-    // Register a pool husk (F2-m1)
-    drm.register_pool_husk();
-
     // Register a late returned descriptor (M-11)
     let (r, w) = nix::unistd::pipe().unwrap();
     drm.register_returned_descriptor(r);
@@ -4972,22 +4969,66 @@ fn c0_2ci_handoff_complete_fd_family_barrier_deterministic() {
     drm.detach_fake_submitters();
     assert!(drm.try_mint_file_family_closed(|_, _| Ok(())).is_err());
 
-    // Reap helper: mint still fails because non-payload aliases (pool husk + returned descriptor) remain active
+    // Reap helper: mint still fails because the returned descriptor's
+    // non-payload alias remains active. F8-M1: the pool-husk half of this
+    // stacking (a real `ScanoutBo`'s `Rc<drm::Device>` clone, registered
+    // and unregistered through `PlatformBackend::register_managed_scanout_bo`
+    // / `OutputScanout::detach_managed_entries`) is exercised end-to-end,
+    // through the real call sites rather than a hand-bumped counter, by
+    // `resources::adapter_tests::
+    // c0_2ci_scanout_managed_pool_husk_blocks_family_barrier_until_detached_vulkan`.
     drm.reap_fake_helper();
     assert!(drm.try_mint_file_family_closed(|_, _| Ok(())).is_err());
 
-    // Drain pool husk (unregister pool husk): mint still fails because returned descriptor remains active
-    drm.unregister_pool_husk();
-    assert!(drm.try_mint_file_family_closed(|_, _| Ok(())).is_err());
+    // F8-M2: closing returned descriptors is no longer a hand call this test
+    // makes directly -- it goes through `HandoffRouter::service`'s own
+    // teardown step, the real (only) caller of `close_returned_descriptors`,
+    // once the helper is reaped. Route `drm` through a router the same way
+    // production would.
+    let owner =
+        DeviceCommitOwner::<CommitResources>::new(incarnation, LifecycleEpochId::first(), 1);
+    let consumer = CommitResourceConsumer::new();
+    let ingress = CompletionIngress::new();
+    let gate = TransportGate::for_tests(device, incarnation);
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress, gate);
+    let mut supervisor = RetainingSupervisor::new();
+    let slot = supervisor.reserve_slot(device, incarnation);
+    supervisor
+        .router
+        .transfer(slot, bundle)
+        .map_err(|(err, _, _)| err)
+        .expect("transfer");
 
-    // Close returned descriptors: now non-payload aliases are 0
-    drm.close_returned_descriptors();
+    // Before the router services this recipient, the descriptor is still
+    // open and the barrier still refuses to mint.
+    {
+        let bundle = supervisor
+            .router
+            .get_bundle_mut(&incarnation)
+            .expect("bundle present");
+        assert!(
+            bundle
+                .drm
+                .try_mint_file_family_closed(|_, _| Ok(()))
+                .is_err()
+        );
+    }
+
+    supervisor
+        .router
+        .service(std::time::Instant::now())
+        .expect("router service closes returned descriptors");
 
     // Now try_mint_file_family_closed succeeds, discharging payload aliases in order
     let discharged = Rc::new(Cell::new(false));
     let discharged_flag = Rc::clone(&discharged);
     let mut right_opt = Some(right);
-    let closed = drm
+    let bundle = supervisor
+        .router
+        .get_bundle_mut(&incarnation)
+        .expect("bundle present");
+    let closed = bundle
+        .drm
         .try_mint_file_family_closed(move |drm_reg, key| {
             assert_eq!(key, payload_key);
             let r = right_opt.take().expect("right already discharged");
@@ -4995,7 +5036,7 @@ fn c0_2ci_handoff_complete_fd_family_barrier_deterministic() {
             discharged_flag.set(true);
             Ok(())
         })
-        .unwrap();
+        .expect("F8-M2: once the router has closed returned descriptors, the barrier must mint");
 
     assert!(discharged.get());
     assert_eq!(
@@ -5009,9 +5050,13 @@ fn c0_2ci_handoff_complete_fd_family_barrier_deterministic() {
     assert_eq!(barrier.incarnation(), Some(incarnation));
 
     // Description is closed; any further ioctl attempt is rejected with PermissionDenied
-    assert!(drm.is_family_closed());
+    let bundle = supervisor
+        .router
+        .get_bundle_mut(&incarnation)
+        .expect("bundle present");
+    assert!(bundle.drm.is_family_closed());
     let late_right = DrmCleanupRight::new(device, incarnation, 999, 888, GemOwner::Right);
-    let (err, _) = drm.consume(late_right).err().unwrap();
+    let (err, _) = bundle.drm.consume(late_right).err().unwrap();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 
     // Verify no further ioctls were made to CleanupIo
@@ -5100,7 +5145,11 @@ fn c0_2ci_handoff_under_executor_stalled_revokes_grant_and_quarantines() {
         assert_eq!(bundle_ref.gate.state(), TransportState::Closed);
         assert_eq!(bundle_ref.gate.outstanding_owner_writes(), 0);
 
-        // Owner live record was terminalized to CompletionUnknown and quarantined
+        // Owner live record was terminalized to CompletionUnknown and quarantined.
+        // F8-m1: the cause is specifically `GrantRevokedInFlight`, not
+        // `ContradictoryEvidence` -- this record's shape was never in
+        // question, its write authority was revoked mid-flight by the
+        // handoff.
         assert!(matches!(
             bundle_ref
                 .owner
@@ -5108,14 +5157,18 @@ fn c0_2ci_handoff_under_executor_stalled_revokes_grant_and_quarantines() {
                 .expect("quarantined record")
                 .state(),
             crate::kms::owner::record::RecordState::Terminal(
-                crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                crate::kms::owner::record::TerminalState::CompletionUnknown(
+                    crate::kms::owner::record::UnknownCause::GrantRevokedInFlight
+                )
             )
         ));
         assert!(bundle_ref.owner.tombstones().iter().any(|t| {
             t.commit == commit
                 && matches!(
                     t.terminal,
-                    crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                    crate::kms::owner::record::TerminalState::CompletionUnknown(
+                        crate::kms::owner::record::UnknownCause::GrantRevokedInFlight
+                    )
                 )
         }));
 

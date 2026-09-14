@@ -5878,6 +5878,13 @@ impl PlatformBackend {
             .get_mut(bo_idx)
             .ok_or(ResourceError::InvalidState)?
             .set_managed(display_lease);
+        // F8-M1: the display husk keeps its own `Rc<drm::Device>` clone
+        // (`take_physical_backing` above only moved the file-owned handles
+        // and shared Vulkan backing out, not `self.drm`); count that alias
+        // now that the conversion has committed, so the fd-family barrier's
+        // inventory sees it. `detach_managed_entries` is the real
+        // unregister site (F2-m1).
+        registry.register_pool_husk();
         if let Some(renderer_lease) = renderer_lease {
             scanout
                 .copied_mut()
@@ -6307,7 +6314,11 @@ impl PlatformBackend {
             .get_mut(output_idx)
             .and_then(Option::as_mut)
             .map_or(Ok(()), |pool| {
-                pool.detach_managed_entries();
+                // Production route: no `DrmCleanupRegistry` reaches
+                // `PlatformBackend` (R8 -- nothing built by this stage is
+                // production-active), and no production bo is ever managed,
+                // so this is a no-op today.
+                pool.detach_managed_entries(None);
                 pool.drain_all_pending(&vk)
             });
         if result.is_err() {

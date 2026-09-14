@@ -3449,6 +3449,35 @@ mod tests {
              matching the precedent RenderEngine::promote_drawable_exportable set (F11-B1)",
         );
 
+        // F13a-m1: `Storage::set_current_layout`'s Managed arm must reserve
+        // Write via `with_storage_write` too, not silently succeed (or
+        // silently no-op) under the same live reader. Mutation: replacing
+        // the Managed arm's body with a bare `Ok(())` makes this fail.
+        let set_current_layout_refusal = s
+            .get_mut(id)
+            .unwrap()
+            .storage
+            .set_current_layout(vk::ImageLayout::GENERAL, Some(&mut service));
+        assert_eq!(
+            set_current_layout_refusal,
+            Err(ResourceError::Busy),
+            "Storage::set_current_layout must reserve Write via with_storage_write, not \
+             mutate the payload unconditionally under a live reader (F13a-m1)",
+        );
+        let layout_after_set_current_layout_refusal = {
+            let StorageBacking::Managed(lease) = &s.get(id).unwrap().storage.backing else {
+                panic!("still managed");
+            };
+            service
+                .with_storage_read(lease, |alloc| alloc.current_layout)
+                .unwrap()
+        };
+        assert_eq!(
+            layout_after_set_current_layout_refusal,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            "a refused set_current_layout must not mutate the payload (F13a-m1)",
+        );
+
         drop(_reader);
 
         // F11-B1: `current_layout` has exactly one copy. Create an
@@ -3501,6 +3530,34 @@ mod tests {
         assert_eq!(
             accessor_with_service,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+
+        // F13a-m1: a `set_current_layout` made through the drawable is also
+        // observed by an independent `retain_storage` twin -- single
+        // source of truth applies to the accessor-level write too, not
+        // just `record_layout_transition_managed`. Mutation to paste:
+        // replace `set_current_layout`'s Managed arm with a bare `Ok(())`
+        // (no `with_storage_write` call) -- `observed_by_twin2` then still
+        // reads `COLOR_ATTACHMENT_OPTIMAL` instead of `GENERAL` and this
+        // assertion fails (134/134 pass without this test, per F13a-m1).
+        let twin2 = {
+            let d = s.get(id).unwrap();
+            let lease = d.storage.managed_lease().expect("still managed");
+            service.retain_storage(lease).unwrap()
+        };
+        s.get_mut(id)
+            .unwrap()
+            .storage
+            .set_current_layout(vk::ImageLayout::GENERAL, Some(&mut service))
+            .expect("no competing reservation");
+        let observed_by_twin2 = service
+            .with_storage_read(&twin2, |alloc| alloc.current_layout)
+            .unwrap();
+        assert_eq!(
+            observed_by_twin2,
+            vk::ImageLayout::GENERAL,
+            "a retain_storage twin lease must observe a set_current_layout made through \
+             the drawable (F13a-m1)",
         );
     }
 

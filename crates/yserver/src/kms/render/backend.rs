@@ -41339,7 +41339,7 @@ mod tests {
         backend.platform.scanout_pools[pool_idx]
             .as_mut()
             .expect("live-scene output has a scanout pool")
-            .detach_managed_entries();
+            .detach_managed_entries(Some(&mut registry));
         service.service_ready_with_registry(&mut registry);
         assert!(
             !service.contains(&source_key),
@@ -41584,10 +41584,12 @@ mod tests {
 
         // Clean up: detach the managed entries from the pool, dropping the retain lease,
         // and verify that service_ready_with_registry discharges the allocation.
+        // F8-M1: also unregisters the husk `register_managed_scanout_bo` registered
+        // above through the real site, not a hand-bumped counter.
         backend.platform.scanout_pools[pool_idx]
             .as_mut()
             .expect("scanout pool exists")
-            .detach_managed_entries();
+            .detach_managed_entries(Some(&mut registry));
         let mut service = backend.resource_service.take().unwrap();
         service.service_ready_with_registry(&mut registry);
         assert!(

@@ -783,14 +783,22 @@ fn c0_2ci_adapter_unknown_detach_late_reply_reap() {
         );
     }
 
-    // Close returned descriptors and complete reap: barrier minting succeeds
+    // Close returned descriptors and complete reap: barrier minting succeeds.
+    // F8-M2: closing goes through the router's own teardown step
+    // (`HandoffRouter::service`, real now that helper_reaped() is true
+    // above), not a hand call to `close_returned_descriptors`.
+    supervisor
+        .router
+        .service(Instant::now())
+        .expect("router service closes returned descriptors");
     {
         let bundle_ref = supervisor.router.get_bundle_mut(&inc).unwrap();
-        bundle_ref.drm.close_returned_descriptors();
         let closed = bundle_ref
             .drm
             .try_mint_file_family_closed(|_, _| Ok(()))
-            .unwrap();
+            .expect(
+                "F8-M2: once the router has closed returned descriptors, the barrier must mint",
+            );
         let barrier = DeviceBarrier::from_file_family_closed(closed);
         bundle_ref.resources.record_device_barrier(barrier);
         bundle_ref.resources.service_ready();
@@ -1234,7 +1242,19 @@ fn c0_2ci_live_lifetime_adapters_vulkan() {
         assert!(!service.contains(&scanout_key));
     }
 
-    // 5. Assert zero validation layer messages
+    // 5. Assert zero validation layer messages -- but first (F9-m1) prove the
+    // layer was actually active on this box. Without this, a box with no
+    // `VK_LAYER_KHRONOS_validation` installed passes the zero-messages
+    // asserts vacuously: nothing was ever watching. R12: report the gap
+    // honestly rather than claim a pass that proves nothing.
+    let vk = platform.vk.clone().expect("live_platform installs vk");
+    if !vk.validation_layer_active() || vk.debug_messenger.is_none() {
+        panic!(
+            "environmental skip: VK_LAYER_KHRONOS_validation is not active on this box \
+             (install the `vulkan-validation-layers` package, or set YSERVER_VK_VALIDATION \
+             in a release build); zero-message assertions below would prove nothing"
+        );
+    }
     assert_eq!(
         crate::kms::vk::device::validation_error_count(),
         0,
@@ -1354,10 +1374,12 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
 
     // Topology reuse: detach clears the real `managed_key` this test
     // registered, not just an already-empty pool's (nonexistent) entries.
+    // F8-M1: also unregisters the husk `register_managed_scanout_bo`
+    // registered above.
     platform.scanout_pools[0]
         .as_mut()
         .unwrap()
-        .detach_managed_entries();
+        .detach_managed_entries(Some(&mut registry));
     match platform.scanout_pools[0].as_ref().unwrap() {
         OutputScanout::Shared(p) => assert_eq!(p.bos[0].managed_key(), None),
         OutputScanout::Copied(_) => panic!("expected Shared pool"),
@@ -1431,5 +1453,102 @@ fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
         calls.borrow().len(),
         calls_before,
         "an exhausted registration attempt must issue no ioctl"
+    );
+}
+
+// ── F8-M1: the pool-husk alias counter must be driven by the real sites ───
+//
+// `DrmCleanupRegistry::register_pool_husk`/`unregister_pool_husk` used to be
+// called only by a test hand-bumping the counter -- nothing that actually
+// created or destroyed the husk's `Rc<drm::Device>` clone (left behind by
+// `ScanoutBo::take_physical_backing`, F2-m1) touched them. This drives the
+// counter through the real sites (`register_managed_scanout_bo` registers,
+// `detach_managed_entries` unregisters) and proves the fd-family barrier
+// actually observes it.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_scanout_managed_pool_husk_blocks_family_barrier_until_detached_vulkan() {
+    use crate::kms::vk::scanout::{OutputScanout, ScanoutBo, ScanoutBoPool};
+
+    let mut platform = match live_platform() {
+        Some(p) => p,
+        None => panic!("environmental skip: no live Vulkan ICD available; not claiming pass"),
+    };
+    let vk = platform.vk.clone().expect("live_platform installs vk");
+
+    let dev = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let inc = IncarnationId::first();
+    let mut service = ResourceService::new(dev, inc);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut registry =
+        DrmCleanupRegistry::new_with_io(dev, inc, Box::new(MockCleanupIo::new(Rc::clone(&calls))));
+
+    let bo_drm = Rc::new(crate::drm::Device::for_tests().expect("test drm device"));
+    let mut bo = ScanoutBo::for_tests(bo_drm, vk);
+    bo.fb_handle = Some(::drm::control::framebuffer::Handle::from(
+        std::num::NonZeroU32::new(9501).unwrap(),
+    ));
+    bo.gem_handle = Some(::drm::buffer::Handle::from(
+        std::num::NonZeroU32::new(9502).unwrap(),
+    ));
+
+    let mut pool = ScanoutBoPool::for_tests();
+    pool.route = crate::kms::scanout_route::ScanoutRoute::new(
+        crate::kms::scanout_route::RenderDeviceId::UnverifiedFallback,
+        DrmDeviceKey { major: 0, minor: 0 },
+        crate::kms::scanout_route::RenderKmsRelationship::Unknown,
+    );
+    pool.bos.push(bo);
+    platform.scanout_pools[0] = Some(OutputScanout::Shared(pool));
+    platform.bo_generations[0] = vec![Default::default()];
+
+    // Real register site: converting the bo to managed registers the husk.
+    let display_key = platform
+        .register_managed_scanout_bo(&mut service, &mut registry, 0, 0)
+        .expect("register managed scanout bo");
+
+    // Every other fd-family precondition is satisfied; only the husk
+    // registered above stands between the barrier and minting.
+    registry.detach_fake_submitters();
+    registry.close_fake_control();
+    registry.reap_fake_helper();
+
+    let err = registry
+        .try_mint_file_family_closed(|_, _| Ok(()))
+        .expect_err(
+            "F8-M1: the real husk alias registered by register_managed_scanout_bo \
+             must still block the barrier",
+        );
+    assert!(
+        err.to_string().contains("non-payload aliases"),
+        "unexpected refusal reason: {err}"
+    );
+
+    // Real unregister site: dropping the managed lease through
+    // `detach_managed_entries` must unregister the husk it registered.
+    platform.scanout_pools[0]
+        .as_mut()
+        .unwrap()
+        .detach_managed_entries(Some(&mut registry));
+
+    let closed = registry
+        .try_mint_file_family_closed(|reg, discharge_key| {
+            assert_eq!(discharge_key, display_key);
+            let entry = service.entries.get(&discharge_key).expect("entry present");
+            let mut payload = entry.payload.borrow_mut();
+            match payload.as_mut() {
+                Some(AllocationPayload::Scanout(alloc)) => alloc.discharge_file_owned(reg),
+                _ => Ok(()),
+            }
+        })
+        .expect("F8-M1: once the husk is unregistered, the barrier must mint");
+
+    assert_eq!(closed.device_key, dev);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(9501), CleanupCall::CloseGem(9502)]
     );
 }

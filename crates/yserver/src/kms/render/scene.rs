@@ -8623,6 +8623,334 @@ mod tests {
         assert_eq!(failed[0].pool_slot, 5);
     }
 
+    // F4d-M1 (fix session F-13c): the four `is_releasable` gates F-4d added
+    // (`drain_pending_pool_releases`, `retire_failed_submit_bos`,
+    // `handle_page_flip_complete`'s pool-slot retirement arm and
+    // `drain_all`'s `DeferredSceneRelease::PoolSlot` release) had no test
+    // that would fail if all four were disabled -- the only decisive test
+    // (`c0_2ci_scene_managed_shared_compose_vulkan`) only ever reaches the
+    // flip-reject exit on this fixture (no DRM master). These tests drive
+    // each gate directly against a real `ResourceService`/`AllocationKey`
+    // (no `ResourceService` mock, per F3) with a registered `Gpu` obligation
+    // standing in for "not yet releasable," and `service.cancel` standing in
+    // for the obligation being discharged.
+
+    /// Builds a `PlatformBackend` with a live `VkContext` (no real DRM
+    /// device or ICD-backed allocation) plus one managed scanout bo at
+    /// `(output_idx=0, bo_idx=0)`, mirroring
+    /// `resources::adapter_tests::live_platform` +
+    /// `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`'s
+    /// fixture. Returns `None` when no Vulkan ICD is available (the caller
+    /// reports an environmental skip -- R12).
+    fn managed_pool_release_fixture() -> Option<(
+        PlatformBackend,
+        ResourceService,
+        crate::kms::render::resources::DrmCleanupRegistry,
+        AllocationKey,
+    )> {
+        use std::{cell::RefCell, rc::Rc};
+
+        use crate::kms::vk::scanout::ScanoutBoPool;
+
+        let mut platform = PlatformBackend::for_tests();
+        let vk = crate::kms::vk::device::VkContext::new().ok()?;
+        let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).ok()?;
+        let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
+        platform.vk = Some(Arc::clone(&vk));
+        platform.ops_command_pool = Some(ops_pool);
+        platform.fence_pool = Some(fence_pool);
+
+        let dev = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let inc = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(dev, inc);
+        let mut registry = crate::kms::render::resources::DrmCleanupRegistry::new_with_io(
+            dev,
+            inc,
+            Box::new(crate::kms::render::resources::tests::MockCleanupIo::new(
+                Rc::new(RefCell::new(Vec::new())),
+            )),
+        );
+
+        let bo_drm = Rc::new(crate::drm::Device::for_tests().expect("test drm device"));
+        let mut bo = ScanoutBo::for_tests(bo_drm, Arc::clone(&vk));
+        bo.fb_handle = Some(::drm::control::framebuffer::Handle::from(
+            std::num::NonZeroU32::new(9301).unwrap(),
+        ));
+        bo.gem_handle = Some(::drm::buffer::Handle::from(
+            std::num::NonZeroU32::new(9302).unwrap(),
+        ));
+
+        let mut pool = ScanoutBoPool::for_tests();
+        // Match `PlatformBackend::for_tests()`'s own output route, exactly
+        // as `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`
+        // does, so `debug_assert_scanout_pool_route` holds.
+        pool.route = crate::kms::scanout_route::ScanoutRoute::new(
+            crate::kms::scanout_route::RenderDeviceId::UnverifiedFallback,
+            crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 },
+            crate::kms::scanout_route::RenderKmsRelationship::Unknown,
+        );
+        pool.bos.push(bo);
+        platform.scanout_pools[0] = Some(OutputScanout::Shared(pool));
+        platform.bo_generations[0] = vec![Default::default()];
+
+        let key = platform
+            .register_managed_scanout_bo(&mut service, &mut registry, 0, 0)
+            .expect("register managed scanout bo");
+
+        Some((platform, service, registry, key))
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_drain_pending_pool_releases_gates_on_service_vulkan() {
+        use crate::kms::render::resources::ObligationKind;
+
+        let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
+        else {
+            panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
+        };
+        let vk = platform.vk.clone().expect("fixture installs vk");
+
+        let obligation = service
+            .register(key, ObligationKind::Gpu)
+            .expect("register gpu obligation");
+        assert!(!service.is_releasable(&key));
+
+        let mut scene = SceneCompositor::new(&platform).expect("build scene compositor");
+        let slot = {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            let slot = state.pool_ring.acquire().expect("acquire pool slot");
+            state
+                .pending_pool_releases
+                .push_back((slot, FenceTicket::for_tests_stub(), Some(key)));
+            slot
+        };
+
+        {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            drain_pending_pool_releases(state, &vk, &mut platform, Some(&service));
+            assert_eq!(
+                state.pending_pool_releases.len(),
+                1,
+                "F4d-M1: a not-releasable managed pool slot must stay queued"
+            );
+            assert_eq!(state.pending_pool_releases[0].0, slot);
+        }
+
+        service
+            .cancel(key, obligation)
+            .expect("discharge the gpu obligation");
+        assert!(service.is_releasable(&key));
+
+        let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+        drain_pending_pool_releases(state, &vk, &mut platform, Some(&service));
+        assert!(
+            state.pending_pool_releases.is_empty(),
+            "once releasable, the deferred pool slot must drain"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_retire_failed_submit_bos_gates_on_service_vulkan() {
+        use crate::kms::render::resources::ObligationKind;
+
+        let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
+        else {
+            panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
+        };
+        let vk = platform.vk.clone().expect("fixture installs vk");
+
+        let obligation = service
+            .register(key, ObligationKind::Gpu)
+            .expect("register gpu obligation");
+        assert!(!service.is_releasable(&key));
+
+        let mut scene = SceneCompositor::new(&platform).expect("build scene compositor");
+        let slot = {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            let slot = state.pool_ring.acquire().expect("acquire pool slot");
+            state.failed_submit_bos.push_back(FailedSubmitBo {
+                bo_idx: 0,
+                pool_slot: slot,
+                ticket: FenceTicket::for_tests_stub(),
+            });
+            slot
+        };
+
+        {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            retire_failed_submit_bos(state, 0, &mut platform, &vk, Some(&service));
+            assert_eq!(
+                state.failed_submit_bos.len(),
+                1,
+                "F4d-M1: a not-releasable failed-submit bo must stay queued"
+            );
+            assert_eq!(state.failed_submit_bos[0].pool_slot, slot);
+        }
+
+        service
+            .cancel(key, obligation)
+            .expect("discharge the gpu obligation");
+        assert!(service.is_releasable(&key));
+
+        let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+        retire_failed_submit_bos(state, 0, &mut platform, &vk, Some(&service));
+        assert!(
+            state.failed_submit_bos.is_empty(),
+            "once releasable, the failed-submit bo must recycle"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_drain_all_gates_pool_slot_release_on_service_vulkan() {
+        use crate::kms::render::resources::ObligationKind;
+
+        let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
+        else {
+            panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
+        };
+
+        let obligation = service
+            .register(key, ObligationKind::Gpu)
+            .expect("register gpu obligation");
+        assert!(!service.is_releasable(&key));
+
+        let mut scene = SceneCompositor::new(&platform).expect("build scene compositor");
+        {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            let slot = state.pool_ring.acquire().expect("acquire pool slot");
+            state
+                .pending_pool_releases
+                .push_back((slot, FenceTicket::for_tests_stub(), Some(key)));
+        }
+
+        scene.drain_all(&mut platform, Some(&mut service));
+        assert_eq!(
+            scene.inner.as_ref().unwrap().outputs[0]
+                .pending_pool_releases
+                .len(),
+            1,
+            "F4d-M1: drain_all must not release a not-releasable managed pool slot"
+        );
+
+        service
+            .cancel(key, obligation)
+            .expect("discharge the gpu obligation");
+        assert!(service.is_releasable(&key));
+
+        scene.drain_all(&mut platform, Some(&mut service));
+        assert!(
+            scene.inner.as_ref().unwrap().outputs[0]
+                .pending_pool_releases
+                .is_empty(),
+            "once releasable, drain_all must release the deferred pool slot"
+        );
+    }
+
+    /// F4d-M1's second required test: a `PendingAck` carrying a
+    /// `managed_batch` driven through `handle_page_flip_complete` must
+    /// register that batch with the service (the call the F-4d fold-back
+    /// cites at `scene.rs:2165`), and the pool-slot retirement arm at the
+    /// same call must defer release while the batch's key is not yet
+    /// releasable -- gate (c) of the same finding.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_handle_page_flip_complete_registers_managed_batch_vulkan() {
+        use crate::kms::render::resources::{GpuObligation, ObligationKind};
+
+        let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
+        else {
+            panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
+        };
+        let vk = platform.vk.clone().expect("fixture installs vk");
+
+        // Hold the source key's obligation live so the pool-slot arm below
+        // must defer rather than release immediately (gate (c)).
+        let obligation = service
+            .register(key, ObligationKind::Gpu)
+            .expect("register gpu obligation");
+        assert!(!service.is_releasable(&key));
+
+        // Mark the managed bo as the kernel's one Pending buffer, exactly
+        // what a real submitted flip leaves behind, so
+        // `on_page_flip_complete` (pure bookkeeping, no ioctl) retires it.
+        match platform.scanout_pools[0].as_mut().unwrap() {
+            OutputScanout::Shared(pool) => pool.bos[0].state.phase = BoPhase::Pending,
+            OutputScanout::Copied(_) => panic!("expected Shared pool"),
+        }
+
+        let mut batch = CoreRetirementBatch::new(Vec::new(), Vec::new(), true);
+        batch.bind_ticket(GpuObligation::for_tests_stub(
+            vec![(key, obligation)],
+            FenceTicket::for_tests_stub(),
+        ));
+
+        let mut scene = SceneCompositor::new(&platform).expect("build scene compositor");
+        let slot = {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            let slot = state.pool_ring.acquire().expect("acquire pool slot");
+            state.pool_slots.push_back(slot);
+            state.pending_acks.push_back(PendingAck {
+                bo_idx: 0,
+                generation: 1,
+                stage: InFlightStage::KmsFlipPending,
+                drawable_snapshots: Vec::new(),
+                ticket: Some(FenceTicket::for_tests_stub()),
+                submitted_output_damage: RegionSet::new(),
+                submitted_participants: Vec::new(),
+                submitted_scene_structure_damage: RegionSet::new(),
+                submitted_failed_repaint: RegionSet::new(),
+                cursor_transition: None,
+                cursor_prev_pos_after_retire: None,
+                cursor_mode_after_retire: OutputCursorMode::Hidden,
+                last_present_cursor_rect_after_retire: None,
+                last_present_cursor_version_after_retire: None,
+                managed_batch: Some(batch),
+            });
+            slot
+        };
+
+        let mut store = DrawableStore::new();
+        let retired =
+            scene.handle_page_flip_complete(0, &mut store, &mut platform, Some(&mut service));
+        assert!(retired, "flip-complete must retire the staged ack");
+
+        assert_eq!(
+            service.pending_batches().len(),
+            1,
+            "F4d-M1: managed_batch must be registered with the service at flip completion"
+        );
+
+        {
+            let state = &scene.inner.as_ref().unwrap().outputs[0];
+            assert!(
+                state.pool_slots.is_empty(),
+                "the ack's pool slot must have been popped"
+            );
+            assert_eq!(
+                state.pending_pool_releases.len(),
+                1,
+                "F4d-M1: the pool-slot retirement arm must defer release while the \
+                 managed key is not yet releasable"
+            );
+            assert_eq!(state.pending_pool_releases[0].0, slot);
+        }
+
+        // Discharge the obligation and prove the deferred slot actually
+        // drains through the ordinary drain path.
+        service
+            .cancel(key, obligation)
+            .expect("discharge the gpu obligation");
+        let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+        drain_pending_pool_releases(state, &vk, &mut platform, Some(&service));
+        assert!(state.pending_pool_releases.is_empty());
+    }
+
     // Stage 5 Phase G — strategy decision unit tests. Verify the
     // pure `derive_cursor_transition` matrix without needing
     // build_scene or a live Vk fixture.

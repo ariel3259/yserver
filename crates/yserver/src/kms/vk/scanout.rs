@@ -764,21 +764,61 @@ impl OutputScanout {
         }
     }
 
-    pub(crate) fn detach_managed_entries(&mut self) {
+    /// F8-M1: `registry` accounts for the husk's `Rc<drm::Device>` clone
+    /// left behind by `take_physical_backing` (F2-m1) -- every `ScanoutBo`
+    /// whose managed lease this call actually drops (`take_managed()`
+    /// returned `Some`) had that clone registered once at conversion time
+    /// (`PlatformBackend::register_managed_scanout_bo`), and this is the
+    /// real, non-test site that unregisters it: `take_managed()` alone
+    /// releases the pool's retain reservation and makes the entry
+    /// destroyable, but the husk's own `self.drm` field is untouched by it
+    /// and outlives the managed key -- the fd-family barrier's inventory
+    /// must stop counting it here or it can never mint (R5). `None` is the
+    /// production shape (`reset_scanout_bos_for_suspend` calls this with no
+    /// registry in scope, and no production bo is ever managed to begin
+    /// with -- R8), and a no-op there is correct.
+    pub(crate) fn detach_managed_entries(
+        &mut self,
+        mut registry: Option<&mut crate::kms::render::resources::DrmCleanupRegistry>,
+    ) {
         // F2-B1: drop the lease, not just clear a key -- this is the actual
         // release of the managed reservation, which is what makes the
         // entry destroyable on the next service tick.
         match self {
             Self::Shared(pool) => {
                 for bo in &mut pool.bos {
-                    bo.take_managed();
+                    if bo.take_managed().is_some()
+                        && let Some(registry) = registry.as_deref_mut()
+                    {
+                        registry.unregister_pool_husk();
+                    }
                 }
             }
             Self::Copied(pool) => {
                 for bo in &mut pool.destinations.bos {
-                    bo.take_managed();
+                    if bo.take_managed().is_some()
+                        && let Some(registry) = registry.as_deref_mut()
+                    {
+                        registry.unregister_pool_husk();
+                    }
                 }
                 for src in &mut pool.sources {
+                    // F8-M1 (resolved open question): no `unregister_pool_husk()`
+                    // here, and correctly so. A husk alias is `self.drm`
+                    // (`Rc<drm::Device>`) left behind by `take_physical_backing`
+                    // on a *display* bo (`ScanoutBoBacking::drm`, scanout.rs
+                    // ~3224) -- `register_managed_scanout_bo` counts exactly
+                    // one such alias, for the display half, when it commits.
+                    // `CopiedRenderSource` (this loop) has no `drm` field at
+                    // all: its own `take_physical_backing` produces a
+                    // `CopiedRenderSourceBacking` whose doc comment says so
+                    // explicitly ("no file-owned half here: the copied
+                    // source is purely renderer/Vulkan state, never a DRM
+                    // framebuffer/GEM owner") and whose fields are all
+                    // `Arc<VkContext>`/Vulkan handles, never an `Rc<drm::Device>`.
+                    // So no husk was ever registered for a source bo, and
+                    // there is nothing to unregister when its managed lease
+                    // is dropped here.
                     src.take_managed();
                 }
             }

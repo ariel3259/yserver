@@ -245,6 +245,17 @@ impl HandoffRouter {
             bundle
                 .consumer
                 .on_available(&available, &mut bundle.resources)?;
+            // F8-M2: the router's own teardown step. `deliver_descriptor`
+            // registers a late returned descriptor under the incident
+            // (M-11); nothing else ever closed it, so a recipient that
+            // received one could never mint the fd-family barrier. Once the
+            // ingress just drained above carries no more events and the
+            // helper is reaped, no further late reply can arrive on this
+            // incident, so whatever has accumulated so far is safe to
+            // close. Idempotent when nothing is pending.
+            if bundle.drm.helper_reaped() {
+                bundle.drm.close_returned_descriptors();
+            }
         }
         Ok(())
     }

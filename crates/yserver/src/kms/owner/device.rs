@@ -1471,7 +1471,12 @@ impl<R> DeviceCommitOwner<R> {
             .filter(|r| !matches!(r.state(), RecordState::Terminal(_)))
         {
             let commit = record.commit_id();
-            let terminal = TerminalState::CompletionUnknown(UnknownCause::ContradictoryEvidence);
+            // F8-m1: a grant revoked mid-flight (incarnation handoff) is not
+            // "an outcome whose shape contradicts the request class" --
+            // nothing about this record's shape is in question, its write
+            // authority was pulled out from under it before it could
+            // complete or fail on its own.
+            let terminal = TerminalState::CompletionUnknown(UnknownCause::GrantRevokedInFlight);
             record.terminalize(terminal);
             let tombstone = record.tombstone().expect("terminal");
             self.push_tombstone(tombstone);
