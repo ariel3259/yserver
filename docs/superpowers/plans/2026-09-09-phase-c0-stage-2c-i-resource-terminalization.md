@@ -1115,6 +1115,51 @@ All four mechanisms restored before commit; all four tests green again
 **Plan steps closed:** none newly ticked — 5.3/5.5 stay ticked from Fix
 round 4; this round closed a test-coverage gap in an already-ticked step.
 
+**Fix round 6 (F-15): `b611c115`.** Session F-15, tests-only, closing
+F14-M2 from
+`docs/superpowers/findings/2026-09-14-stage-2c-i-fix-F14-review.md`'s
+second mutation battery on scope 2, per
+`docs/handoff-phase-c0-stage-2c-i-fix-resume.md`'s ruling that these
+findings are stated as invariants, not edits. F14-M1 and the remaining
+two sites of F14-m1 (Task 7's scope) are closed in this same commit —
+see Task 7's own fold-back entry below. No production code changed; the
+frozen-entry refusal in `validate_gpu_batch` was already correct.
+
+| Finding | Verdict |
+| --- | --- |
+| F14-M2 (`validate_gpu_batch`'s frozen-entry refusal, mod.rs:1076-1078 — the write-obligation loop's `if avail.frozen { return Err((ResourceError::Frozen, batch)); }` — is proven by nothing: the existing tests show quarantining a batch freezes its own entries, and that a failed ticket quarantines its own batch, but nothing shows a frozen entry refusing a *different*, subsequently-registered, independently-valid batch) | **RESOLVED (test: `c0_2ci_gpu_frozen_entry_refuses_subsequent_valid_batch`, new, `tests.rs:2056`)** — registers two `Gpu` obligations on one entry, quarantines the entry via a first batch whose ticket genuinely errors (the already-covered direction, asserted first for contrast), then submits a *second*, independent batch carrying the second obligation with a genuinely valid ticket status. Asserts `poll_gpu` still refuses (`Err(Frozen)`) rather than committing, that the second obligation is still pending (not discharged), and that both batches ended up quarantined (2, not 1) |
+
+Mutation check performed and reverted, at its exact `file:line`:
+
+```
+$ # F14-M2: frozen check deleted from validate_gpu_batch's write-obligation
+$ # loop, mod.rs:1076-1078 (the entry's `if avail.frozen { return Err(...) }`)
+$ cargo test -p yserver --lib c0_2ci_gpu_frozen_entry_refuses_subsequent_valid_batch
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:2095:5:
+assertion `left == right` failed: a frozen entry must refuse a subsequent batch, not let it discharge (R6/quarantine)
+  left: Ok(())
+ right: Err(Frozen)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1758 filtered out
+```
+
+Restored before commit; `git diff --stat` after restoring showed only
+`resources/tests.rs` changed from the pre-session tree.
+
+**Plan steps closed:** none newly ticked — same reasoning as Fix round 5:
+a test-coverage gap in an already-ticked step, not a new mechanism.
+
+Gate for this round: shared with Task 7's Fix round 4 below (one
+session, one commit closed all three findings across both tasks) —
+`cargo +nightly fmt` clean; `cargo clippy --all-targets -- -D warnings`
+clean; `cargo test -p yserver --lib c0_2ci` **131** passed / 0 failed /
+18 ignored on a clean run and on twelve consecutive runs (zero flakes);
+`cargo test -p yserver --lib c0_2ci -- --ignored` **18** passed / 0
+failed (this box's real DRM node + NVIDIA/RADV ICDs); full `cargo test
+-p yserver --lib` **1669** passed / 0 failed / 90 ignored (no R2 flake
+this run). Portable-target checks were not run: this session touches
+only `resources/tests.rs`, none of `drm/`, `drm_cleanup.rs` or
+`transport.rs`.
+
 ## Task 6: Completion progress and transport permission boundary
 
 **Status: EXECUTED at `72a91c27`.** **Review round 1 (2026-09-11): REJECTED** — see the findings and `docs/handoff-phase-c0-stage-2c-i-fix.md`; unchecked steps below are not done or not proven.
@@ -1552,6 +1597,84 @@ node + NVIDIA/RADV ICDs, transcript in Task 6's entry above); full
 R2 flake this run). Portable-target checks were not run: this session
 touches only `resources/{commit,handoff,mod,tests}.rs`, none of `drm/`,
 `drm_cleanup.rs` or `transport.rs`.
+
+**Fix round 4 (F-15): `b611c115`.** Session F-15, tests-only, closing
+F14-M1 and the two remaining sites of F14-m1 from
+`docs/superpowers/findings/2026-09-14-stage-2c-i-fix-F14-review.md`'s
+second mutation battery on scope 2, per
+`docs/handoff-phase-c0-stage-2c-i-fix-resume.md`'s ruling that these
+findings are stated as invariants, not edits. F14-M2 (Task 5's scope) is
+closed in this same commit — see Task 5's own fold-back entry above. No
+production code changed for any of the three findings this round; all
+three mechanisms were already correct.
+
+| Finding | Verdict |
+| --- | --- |
+| F14-M1 (`is_resource_releasable`'s `kms_obligations` emptiness clause, commit.rs:501-503, is proven by nothing: the coarser N8 mutation (whole gate to `true`) already fails three tests, but those come from the per-key `service.is_releasable` allocation clauses just below it — in the production registration path every `kms_obligations` key is also one of `res.allocations`' keys, so the two clauses are normally coupled through the same `pending_obligations` map and the allocation clause alone masks a deletion of the finer one) | **RESOLVED (test: `c0_2ci_commit_kms_obligations_block_release_gate`, new, `tests.rs:6164`)** — constructs a `CommitResources` with a `kms_obligations` entry but *no* allocations/source/fallback at all, so nothing else in the function has anything to check and the rest of `is_resource_releasable` defaults to `true`; only the kms_obligations clause can gate it. `is_resource_releasable` is private to `commit.rs`, so the test drives it through its only accessible caller, `CommitResourceConsumer::on_available`, via `consumer.releasing_resources`. Confirms the resource stays retained (not released) while the obligation is outstanding, then confirms it does release once discharged (`apply_validated_proof`) and drained — the sanity half, proving the test isn't just permanently stuck |
+| F14-m1, `ResourcesStillCurrent` site (commit.rs:308) — the existing test `c0_2ci_commit_resources_still_current_cancels_not_discharges` used `assert_ne!(kms_disposition, Some(Discharged))`, which cannot distinguish cancel from discharge: `apply_validated_proof` also removes the `kms_dispositions` entry outright, so after the mutation `kms_disposition` returns `None`, and `None != Some(Discharged)` still holds — the old assertion survives the mutation it was meant to catch | **RESOLVED (test strengthened, `tests.rs:3775`)** — `assert_ne!` replaced with `assert_eq!(.., Some(KmsDisposition::Cancelled))`, the same decisive form F-14 used for `cancel_pre_ipc_commit`. `None != Some(Cancelled)`, so the mutation now fails this assertion directly (see the mutation-check transcript below) |
+| F14-m1, `ResourcesReleased` site (commit.rs:325) — no test exercised the cancel/discharge distinction on this path at all; the existing `ResourcesReleased`-consuming test (`c0_2ci_commit_topology_replacement_reused_numeric_crtc`'s companion capacity-admission test) only checks capacity/GPU-completion bookkeeping, never `kms_disposition` | **RESOLVED (test: `c0_2ci_commit_resources_released_cancels_not_discharges`, new, `tests.rs:3851`)** — same shape as the strengthened `ResourcesStillCurrent` test above, driving `consume` directly with `OwnerEvent::ResourcesReleased` and asserting `kms_disposition() == Some(Cancelled)` |
+
+Mutation checks performed and reverted, each applied at its exact
+`file:line` with `sed -i '<line>s/.../.../'` (not a first-match
+string-replace — the F-14 review's own rule, after its S2-m1 mutation hit
+the wrong one of `commit.rs`'s four identical `service.cancel(key,
+obligation_id);` lines by textual match), confirmed to compile and
+produce the `test result:` line below, then reverted and confirmed green
+again before the next:
+
+```
+$ # F14-M1: kms_obligations clause deleted at commit.rs:501-503
+$ cargo test -p yserver --lib c0_2ci_commit_kms_obligations_block_release_gate
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:6195:5:
+assertion `left == right` failed: a CommitResources with an outstanding KmsRelease obligation must not be released (R6)
+  left: 0
+ right: 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1758 filtered out
+
+$ # F14-m1, ResourcesStillCurrent: commit.rs:308 cancel -> apply_validated_proof
+$ cargo test -p yserver --lib c0_2ci_commit_resources_still_current_cancels_not_discharges
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:3829:5:
+assertion `left == right` failed: a rejected commit's ResourcesStillCurrent path must cancel, not discharge (R6)
+  left: None
+ right: Some(Cancelled)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1758 filtered out
+
+$ # F14-m1, ResourcesReleased: commit.rs:325 cancel -> apply_validated_proof
+$ cargo test -p yserver --lib c0_2ci_commit_resources_released_cancels_not_discharges
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:3891:5:
+assertion `left == right` failed: a rejected commit's ResourcesReleased path must cancel, not discharge (R6)
+  left: None
+ right: Some(Cancelled)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1758 filtered out
+
+$ # Re-confirmation, cancel_pre_ipc_commit: commit.rs:643 cancel -> apply_validated_proof
+$ # (the third of the three F14-m1 paths, already covered by F-14; re-run at
+$ # its exact line to confirm it still holds alongside the two new sites)
+$ cargo test -p yserver --lib c0_2ci_commit_cancel_pre_ipc_marks_cancelled_and_cleans_stale_disposition
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:6102:5:
+assertion `left == right` failed: a cancelled registration must be observably distinct from a discharged one
+  left: None
+ right: Some(Cancelled)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1758 filtered out
+```
+
+All mutations restored before commit; `git diff --stat` after restoring
+showed only `resources/tests.rs` changed from the pre-session tree.
+
+**Plan steps closed:** none newly ticked — 7.4/7.6 stay ticked from Fix
+round 1 (F-6a); this round closed test-coverage gaps in already-ticked
+steps, same as Fix round 3.
+
+Gate for this round: shared with Task 5's Fix round 6 above (one session,
+one commit closed all three findings across both tasks) — `cargo
++nightly fmt` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test -p yserver --lib c0_2ci` **131** passed / 0 failed / 18
+ignored on a clean run and on twelve consecutive runs (zero flakes);
+`cargo test -p yserver --lib c0_2ci -- --ignored` **18** passed / 0
+failed (this box's real DRM node + NVIDIA/RADV ICDs); full `cargo test -p
+yserver --lib` **1669** passed / 0 failed / 90 ignored (no R2 flake this
+run). Portable-target checks were not run: this session touches only
+`resources/tests.rs`, none of `drm/`, `drm_cleanup.rs` or `transport.rs`.
 
 **Files:** Create `resources/commit.rs`, `resources/present.rs`; modify backend/platform owner-event types, `present_completion.rs` and owner tests without adding backend dependencies to `kms/owner`.
 
