@@ -2363,6 +2363,137 @@ fn c0_2ci_serviced_deadline_not_expired_on_first_poll_after_prior_service() {
     assert_eq!(drops.get(), 0);
 }
 
+/// F-14/S2-M2 (mutation N7): `set_seat_active` must credit the *active*
+/// interval that elapsed since the last sample **before** it pauses --
+/// otherwise that real serviced time is silently dropped instead of counted
+/// (R9: the deadline counts serviced time; it must not simply forget time
+/// that genuinely was serviced). This isolates that specific bookkeeping
+/// from `service_completions`'s own advance (S2-M2's other mutation, N7b,
+/// covered separately below) by priming `last_serviced` with one active
+/// poll, then letting a known *active* interval elapse with no intervening
+/// `service_completions` call before pausing -- the pause transition itself
+/// is the only code that can ever see and credit that interval.
+///
+/// Mutation check: deleting the `if let Some(last) = self.last_serviced {
+/// ... serviced_elapsed = serviced_elapsed.saturating_add(delta); }` flush
+/// inside `set_seat_active`'s pause branch (with or without also deleting
+/// the following `self.last_serviced = None`) makes this fail: the 25ms of
+/// active time before the pause is never credited, so cumulative serviced
+/// time only reaches 6ms by the last poll below instead of 31ms, and the
+/// batch never expires.
+#[test]
+fn c0_2ci_serviced_time_credits_active_interval_before_pause() {
+    let (mut service, held, _drops) = spy_service();
+    let base = Instant::now();
+
+    service.max_serviced_duration = std::time::Duration::from_millis(30);
+    unsignaled_batch(&mut service, held);
+
+    // Prime `last_serviced` at t=0ms (serviced_elapsed stays 0; nothing to
+    // diff against yet).
+    let _ = service.service_completions(base);
+    assert_eq!(service.pending_batches().len(), 1);
+
+    // 25ms of ACTIVE time elapses with no intervening `service_completions`
+    // call -- only the pause transition below ever observes it.
+    let pause_at = base + std::time::Duration::from_millis(25);
+    service.set_seat_active(false, pause_at);
+
+    // Resume after a long WALL-CLOCK gap while inactive; none of that gap
+    // may count (that is S2-M2's other half, proven separately below).
+    let resume_at = pause_at + std::time::Duration::from_millis(9_974);
+    service.set_seat_active(true, resume_at);
+
+    // +4ms of active time: correct cumulative serviced time is
+    // 25 (pre-pause, credited at the pause transition) + 4 = 29ms < 30ms.
+    let r1 = service.service_completions(resume_at + std::time::Duration::from_millis(4));
+    assert!(r1.is_ok());
+    assert_eq!(
+        service.pending_batches().len(),
+        1,
+        "29ms serviced must not yet reach the 30ms deadline"
+    );
+    assert_eq!(service.quarantined_batches().len(), 0);
+
+    // +2ms more: cumulative serviced time reaches 31ms >= 30ms deadline.
+    // Under the mutation, cumulative serviced time is only 4ms + 2ms = 6ms
+    // here (the 25ms pre-pause interval was never credited), so the batch
+    // would still be pending and this assertion would fail.
+    let r2 = service.service_completions(resume_at + std::time::Duration::from_millis(6));
+    assert_eq!(r2, Err(ResourceError::Frozen));
+    assert_eq!(service.pending_batches().len(), 0);
+    assert_eq!(service.quarantined_batches().len(), 1);
+}
+
+/// F-14/S2-M2 (mutation N7b): `service_completions` must never advance
+/// `serviced_elapsed` by wall-clock time while the seat is inactive -- R9's
+/// clause verbatim. The existing `c0_2ci_serviced_time_pauses_during_seat_
+/// inactive_and_expires` test pauses immediately at registration, before
+/// `last_serviced` is ever primed, so removing the `if self.seat_active`
+/// gate in `service_completions` has nothing to diff against on the first
+/// post-pause poll and the mutation survives undetected. This test primes
+/// `last_serviced` with an active poll *before* pausing (with zero elapsed
+/// active time, isolating this from S2-M2's other mutation above), then
+/// polls **twice** while still inactive: under the mutation the first
+/// inactive poll has no prior `last_serviced` to diff against but still SETS
+/// one (the whole gated block, including the `last_serviced = Some(now)`
+/// assignment, becomes unconditional), giving the second inactive poll a
+/// real interval to wrongly burn.
+///
+/// Mutation check: removing the `if self.seat_active { ... }` gate around
+/// `service_completions`'s serviced-time advance makes the second assertion
+/// below fail -- the batch is already quarantined after 10_050ms of wall
+/// time has elapsed with the seat inactive throughout, in place of the 30ms
+/// serviced-time deadline.
+#[test]
+fn c0_2ci_serviced_time_ignores_wall_clock_while_seat_inactive() {
+    let (mut service, held, _drops) = spy_service();
+    let base = Instant::now();
+
+    service.max_serviced_duration = std::time::Duration::from_millis(30);
+    unsignaled_batch(&mut service, held);
+
+    // Prime `last_serviced` at t=0ms with zero active time before pausing.
+    let _ = service.service_completions(base);
+    service.set_seat_active(false, base);
+
+    // First poll while inactive, 10_000ms of wall time later: must not
+    // advance serviced time at all (no prior `last_serviced` to diff
+    // against under correct code either way).
+    let poll1 = base + std::time::Duration::from_millis(10_000);
+    let r1 = service.service_completions(poll1);
+    assert!(r1.is_ok());
+    assert_eq!(service.pending_batches().len(), 1);
+    assert_eq!(service.quarantined_batches().len(), 0);
+
+    // Second poll while STILL inactive, 50ms after the first: under correct
+    // code this still advances nothing (the seat never became active), but
+    // under the mutation the first poll above left a live `last_serviced`
+    // behind, so this poll would wrongly burn ~50ms of wall time -- more
+    // than the 30ms deadline.
+    let poll2 = poll1 + std::time::Duration::from_millis(50);
+    let r2 = service.service_completions(poll2);
+    assert!(
+        r2.is_ok(),
+        "wall time burned while the seat is inactive must never expire a batch (R9)"
+    );
+    assert_eq!(
+        service.pending_batches().len(),
+        1,
+        "batch must still be pending: no serviced time has genuinely elapsed"
+    );
+    assert_eq!(service.quarantined_batches().len(), 0);
+
+    // Resume and confirm the deadline still fires from genuinely serviced
+    // time, proving this is a real, working deadline and not one disabled
+    // by the fix.
+    service.set_seat_active(true, poll2);
+    let r3 = service.service_completions(poll2 + std::time::Duration::from_millis(31));
+    assert_eq!(r3, Err(ResourceError::Frozen));
+    assert_eq!(service.pending_batches().len(), 0);
+    assert_eq!(service.quarantined_batches().len(), 1);
+}
+
 #[test]
 fn c0_2ci_completion_waiter_registration_and_recheck() {
     let mut registry = WaiterRegistry::new();
@@ -5657,6 +5788,196 @@ fn c0_2ci_commit_register_dependencies_and_pre_ipc_cancellation() {
     service.service_ready();
     assert_eq!(drops_old.get(), 1);
     assert_eq!(drops_new.get(), 1);
+}
+
+/// F-14/S2-M1: R6's retained-member clause, proven against the real
+/// `register_commit_dependencies` (not hand-built, unlike
+/// `c0_2ci_commit_grouped_skip_and_duplicate_protection`, whose retained
+/// allocation is not part of the commit's membership in any role and whose
+/// obligation vector is constructed by hand -- its assertion holds no
+/// matter what the registration logic does).
+///
+/// Grouped commit spanning two CRTCs: member1 is DISPLACED (`old_a` ->
+/// `new_a`, a different allocation), member2 is RETAINED (`old_b`/`new_b`
+/// name the SAME allocation, resubmitted unchanged as part of the same
+/// atomic group -- two independent leases on one entry, since
+/// `AllocationLease` is non-Clone).
+#[test]
+fn c0_2ci_commit_register_dependencies_retained_member_registers_no_kms_obligation() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old_a, drops_old_a) = spy_service();
+    let old_a_key = old_a.key();
+
+    let drops_new_a = Rc::new(Cell::new(0));
+    let new_a = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_new_a),
+        }))
+        .unwrap();
+
+    let drops_b = Rc::new(Cell::new(0));
+    let old_b = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_b),
+        }))
+        .unwrap();
+    let b_key = old_b.key();
+    let new_b = service.reserve(b_key, UseKind::Retain).unwrap();
+
+    let dev = service.device();
+    let crtc1 = test_crtc_key(dev.major, dev.minor, 1);
+    let crtc2 = test_crtc_key(dev.major, dev.minor, 2);
+    let member1 = GroupMember::new(crtc1, 1, 1);
+    let member2 = GroupMember::new(crtc2, 1, 1);
+
+    let commit = CommitId::for_tests(712);
+
+    let old_res_1 = CommitResources::new(vec![old_a], None, None, None, vec![member1], vec![]);
+    let old_res_2 = CommitResources::new(vec![old_b], None, None, None, vec![member2], vec![]);
+    let new_res_1 = CommitResources::new(vec![new_a], None, None, None, vec![member1], vec![]);
+    let new_res_2 = CommitResources::new(vec![new_b], None, None, None, vec![member2], vec![]);
+
+    let submitted = register_commit_dependencies(
+        commit,
+        vec![old_res_1, old_res_2],
+        vec![new_res_1, new_res_2],
+        &mut service,
+    )
+    .expect("register_commit_dependencies");
+
+    // The displaced pair (old_a, member1) registered a KMS obligation.
+    assert!(
+        service.has_pending_obligations(&old_a_key),
+        "a displaced pair must register a KMS release obligation"
+    );
+
+    // R6/S2-M1: the retained pair (old_b/new_b, member2) registers nothing.
+    //
+    // Mutation check: deleting the `if !retained_in_new { ... }` guard in
+    // `register_commit_dependencies` (so the retained pair registers
+    // unconditionally, like the displaced one) makes this assertion fail --
+    // `old_b`/`b_key` would also carry a pending KMS obligation here.
+    //
+    // This is checked immediately after registration, before any completion
+    // event runs, because a full happy-path completion cannot distinguish
+    // the two: a grouped commit's own `HardwareComplete` discharges every
+    // member of the group in one event (the atomic commit proves them all
+    // at once), so an erroneous obligation on a genuinely retained member
+    // self-cancels in that same event -- which is precisely why the mutation
+    // leaves the pre-existing 142-test suite green (S2-M1) and why the
+    // check belongs here, at the point where the retention decision is
+    // actually made, not after a round trip through completion. Under
+    // partial group completion this is the mechanism of the real leak the
+    // finding describes: a retained allocation gated on an obligation for a
+    // member whose completion the retained member's own membership does not
+    // actually correlate to would never discharge.
+    assert!(
+        !service.has_pending_obligations(&b_key),
+        "a retained pair must register no KMS release obligation (R6)"
+    );
+
+    // Clean up: cancel the pre-IPC commit so the registered obligation and
+    // all four leases (two of them aliasing the retained entry) release
+    // cleanly.
+    let (old_returned, new_returned) = cancel_pre_ipc_commit(submitted, &mut service);
+    drop(old_returned);
+    drop(new_returned);
+    service.service_ready();
+    assert_eq!(drops_old_a.get(), 1);
+    assert_eq!(drops_new_a.get(), 1);
+    assert_eq!(
+        drops_b.get(),
+        1,
+        "both leases on the retained entry must release exactly once"
+    );
+}
+
+/// F-14/S2-m1: cancellation must be observably different from discharge in
+/// the ledger, and must not leave a stale `kms_dispositions` entry behind.
+///
+/// This drives `cancel_pre_ipc_commit` directly (rather than through
+/// `register_commit_dependencies`, S2-M1's test above) so the obligation ID
+/// is known and `kms_disposition` can be inspected after cancellation --
+/// the existing `c0_2ci_commit_register_dependencies_and_pre_ipc_
+/// cancellation` test only ever checked `has_pending_obligations`, which
+/// `cancel` and `apply_validated_proof` satisfy identically, so it could not
+/// have caught this.
+#[test]
+fn c0_2ci_commit_cancel_pre_ipc_marks_cancelled_and_cleans_stale_disposition() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old_alloc, drops_old) = spy_service();
+    let old_key = old_alloc.key();
+
+    let dev = service.device();
+    let crtc = test_crtc_key(dev.major, dev.minor, 1);
+    let member = GroupMember::new(crtc, 1, 1);
+    let commit = CommitId::for_tests(713);
+
+    let old_kms = service.register_kms(old_key, commit, member).unwrap();
+
+    let old_res = CommitResources::new(
+        vec![old_alloc],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(old_key, old_kms, member)],
+    );
+    let new_res = CommitResources::new(vec![], None, None, None, vec![member], vec![]);
+    let submitted = crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]);
+
+    // The displacement never happened: pre-IPC cancellation.
+    let (old_returned, new_returned) = cancel_pre_ipc_commit(submitted, &mut service);
+
+    assert!(!service.has_pending_obligations(&old_key));
+
+    // R6/S2-m1: cancelled, not discharged -- and that is observable.
+    //
+    // Mutation check: swapping `service.cancel(key, obligation_id)` for
+    // `service.apply_validated_proof(key, obligation_id)` inside
+    // `cancel_pre_ipc_commit` makes this fail -- `apply_validated_proof`
+    // removes the `kms_dispositions` entry outright, so `kms_disposition`
+    // would return `None` here instead of `Some(Cancelled)`. `cancel` and
+    // `apply_validated_proof` remove the obligation from
+    // `pending_obligations` identically, which is why
+    // `has_pending_obligations` above (and the pre-existing pre-IPC test)
+    // cannot tell them apart; `kms_disposition` is the decisive check.
+    assert_eq!(
+        service.kms_disposition(old_key, old_kms),
+        Some(KmsDisposition::Cancelled),
+        "a cancelled registration must be observably distinct from a discharged one"
+    );
+
+    // Stale-disposition half: a cancelled registration must not be
+    // mistaken for a still-live one later. Clear the dirty mark cancel
+    // itself raised, then run a device barrier and confirm it does not
+    // re-dirty the entry or flip the disposition -- `record_device_barrier`
+    // only ever touches an `Outstanding` disposition, so a `Cancelled` one
+    // (rather than the pre-fix `Outstanding` left behind by `cancel`) is
+    // never spuriously superseded for a commit that never happened.
+    let _ = service.service_ready();
+    let barrier = DeviceBarrier::from_device_loss(
+        dev,
+        crate::kms::render::resources::handoff::DeviceLossProof::for_tests(),
+    );
+    service.record_device_barrier(barrier);
+    assert_eq!(
+        service.kms_disposition(old_key, old_kms),
+        Some(KmsDisposition::Cancelled),
+        "record_device_barrier must never flip a Cancelled disposition to Superseded"
+    );
+    let redirtied = service.service_ready();
+    assert!(
+        !redirtied.contains(&old_key),
+        "a cancelled registration's stale disposition must not cause a spurious dirty mark"
+    );
+
+    drop(old_returned);
+    drop(new_returned);
+    service.service_ready();
+    assert_eq!(drops_old.get(), 1);
 }
 
 #[test]

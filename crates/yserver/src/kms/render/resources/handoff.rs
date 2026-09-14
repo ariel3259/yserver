@@ -75,6 +75,18 @@ pub(crate) enum KmsDisposition {
     Outstanding,
     Discharged,
     Superseded(DeviceBarrier),
+    /// F-14/S2-m1: a rejected/pre-IPC-cancelled commit's registration was
+    /// cancelled, not discharged -- the displacement never happened, so no
+    /// completion proof was ever correlated to it (R6). Distinct from
+    /// `Discharged` (a real `HardwareComplete` proof was applied) so a test
+    /// can observe the difference through `ResourceService::cancel`
+    /// (`cancel_pre_ipc_commit`, `ResourcesStillCurrent`, `ResourcesReleased`)
+    /// versus `apply_validated_proof` (`discharge_commit_kms_obligations`).
+    /// Also closes the stale-disposition bug: `record_device_barrier` only
+    /// ever flips an `Outstanding` entry, so a `Cancelled` one is never
+    /// mistaken for a still-live obligation and never causes a spurious
+    /// `Superseded` flip or dirty mark for a commit that never happened.
+    Cancelled,
 }
 
 #[derive(Debug, Default)]

@@ -552,6 +552,17 @@ impl ResourceService {
         if avail.pending_obligations.remove(&obligation).is_none() {
             return Err(ResourceError::InvalidProof);
         }
+        // F-14/S2-m1: mark a cancelled KMS registration `Cancelled` rather
+        // than leaving it `Outstanding` (stale) or removing it outright
+        // (which would make `cancel` indistinguishable from
+        // `apply_validated_proof`, below). `record_device_barrier` only
+        // ever flips an `Outstanding` disposition, so this also stops the
+        // stale-entry bug: a cancelled registration can no longer be
+        // mistaken for a live one and flipped to `Superseded` (with a
+        // spurious dirty mark) for a commit that never happened.
+        if let Some((_, _, disp)) = avail.kms_dispositions.get_mut(&obligation) {
+            *disp = KmsDisposition::Cancelled;
+        }
         drop(avail);
         self.dirty_entries.borrow_mut().insert(key);
         Ok(())
