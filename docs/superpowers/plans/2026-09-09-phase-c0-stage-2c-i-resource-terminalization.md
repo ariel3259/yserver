@@ -593,6 +593,30 @@ No plan steps ticked or unticked by this round — 3.3/3.4/3.5 stay ticked
 from Fix rounds 1/3/4/5; this round closed an independent-review
 rejection of Fix rounds 4/5's mechanism, not a new step.
 
+**Fix round 7: `c0918b22`.** Session F-13c, closing F13a-m1 from
+`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F13a-review.md`'s
+residuals section.
+
+| Finding | Verdict |
+| --- | --- |
+| F13a-m1 (the F11-B1 rewrite of `Storage::set_current_layout`/`record_layout_transition_managed` had no test proving the *accessor-level* write reservation — only `record_layout_transition_managed` was exercised under a live reader) | **RESOLVED (test: `c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan`, extended)** — added two assertions to the existing test: (1) under the live `_reader` already in scope, `Storage::set_current_layout(GENERAL, Some(&mut service))` returns `Err(ResourceError::Busy)` and a `with_storage_read` right after confirms the payload's `current_layout` is unchanged (`TRANSFER_DST_OPTIMAL`); (2) after the reader drops, an independent `retain_storage` twin lease observes a `set_current_layout` made through the drawable's own lease (`GENERAL`) via its own `with_storage_read` — single source of truth applies to the accessor-level write, not just the layout-transition helper. Mutation check (performed in this session, reverted before commit): replacing `Storage::set_current_layout`'s `Managed` arm with a bare `Ok(())` (no `with_storage_write` call) fails the first new assertion — `assertion left == right failed ... left: Ok(()) right: Err(Busy)` — at `store.rs:3461` |
+
+Gate for this round (F-13c; shared with Tasks 5, 9, 10 below since one
+session closed all four tasks' residuals in one commit): `cargo +nightly
+fmt` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test
+-p yserver --lib c0_2ci` **124** passed / 0 failed / 18 ignored; twelve-run
+flake loop clean (12 runs, 0 flakes); hardware run (`--ignored`) all **18**
+passed; full `cargo test -p yserver --lib` **1662** passed / 0 failed / 90
+ignored; `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
+`x86_64-unknown-freebsd` all `cargo check` clean (this session touches
+`drm_cleanup.rs` and `vk/scanout.rs`). See Task 9's fold-back entry for
+the full hardware-run transcript (all four tasks' new tests are in the
+same run).
+
+No plan steps ticked or unticked by this round — 3.3/3.4/3.5 stay ticked
+from prior rounds; this round only strengthened an existing test's
+assertions.
+
 ## Task 4: Shared/copied scanout backing and pool reuse
 
 **Files:** Create `resources/scanout.rs`; modify `kms/vk/scanout.rs`, `kms/render/platform.rs` and the resource payload enum.
@@ -1044,6 +1068,52 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1741 filtered out; f
 ```
 
 **Plan steps closed:** 5.3 and 5.5 ticked — proven by `c0_2ci_scene_managed_shared_compose_vulkan` (hardware-green, mutation-verified).
+
+**Fix round 5: `c0918b22`.** Session F-13c, closing F4d-M1 from
+`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`.
+
+| Finding | Verdict |
+| --- | --- |
+| F4d-M1 (plan step 5.5 was ticked with no test that would fail if any of the four `is_releasable` gates F-4d added were disabled — the only decisive test, `c0_2ci_scene_managed_shared_compose_vulkan`, only ever reaches the flip-reject exit on this fixture, so neither pool-recycle gating nor the flip-accepted `PendingAck` → `handle_page_flip_complete` path ever ran) | **RESOLVED (tests: `c0_2ci_scene_drain_pending_pool_releases_gates_on_service_vulkan`, `c0_2ci_scene_retire_failed_submit_bos_gates_on_service_vulkan`, `c0_2ci_scene_drain_all_gates_pool_slot_release_on_service_vulkan`, `c0_2ci_scene_handle_page_flip_complete_registers_managed_batch_vulkan`)** — four new tests, each driving one of the four gates directly against a real `ResourceService`/`AllocationKey` (no `ResourceService` mock, per F3) through a new `managed_pool_release_fixture()` helper (a `PlatformBackend` with a live `VkContext` and one managed scanout bo at `(0,0)`, mirroring the existing `live_platform()`/`c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan` fixture shape). Each test registers a `Gpu` obligation on the key (not-releasable), drives the gate, asserts the entry stays queued, then `service.cancel`s the obligation (releasable) and asserts the gate now drains/registers. Mutation check (performed in this session, one at a time, reverted before commit): disabling each of the four `is_releasable` checks in turn (`drain_pending_pool_releases` at `scene.rs:2911`, `retire_failed_submit_bos` at `scene.rs:2852`, `drain_all`'s `DeferredSceneRelease::PoolSlot` arm at `scene.rs:1873`, and the `service.register_batch(batch)` call at `scene.rs:2165` inside `handle_page_flip_complete`) fails its corresponding new test — see the gate transcript below for the exact failure text of each |
+
+**Open question resolved (coordinator-flagged): why `_vulkan` `#[ignore]`d tests instead of a deterministic scene-level test on the existing `drain_deferred_scene_resources`/`PendingAck` harness, as F4d-M1 originally asked for.** A real `VkContext` is genuinely required, not merely convenient: `SceneCompositor::new` (`scene.rs:1267`) unconditionally calls `platform.vk().ok_or(SceneError::NoVk)?` and then builds real Vulkan objects — `CompositorPipeline::new`, `LogicFillPipelineCache::new`, and, per output, `Self::build_output_state` → `CompositePoolRing::new`, whose body issues `unsafe { vk.device.create_descriptor_pool(...) }` against a live `ash::Device` (`composite_pool_ring.rs:80`). There is no stub/mock constructor for `SceneCompositor`, `OutputSceneState` or `CompositePoolRing` anywhere in the codebase (`grep -n "fn for_tests" scene.rs` finds none on `SceneCompositor`) — every existing scene-level test that needs one is already `_vulkan`. Building a `OutputSceneState` by hand without going through `SceneCompositor::new` still needs a `CompositePoolRing`, so it does not avoid the live-device requirement either. Since `drain_pending_pool_releases`/`retire_failed_submit_bos`/`drain_all`/`handle_page_flip_complete` all take `&mut OutputSceneState` (or reach it through `&mut SceneCompositor`), a deterministic (non-Vulkan) version of these four tests is not reachable in this codebase today without adding new mock infrastructure for `SceneCompositor` itself — out of proportion to this finding, and arguably against F3's spirit even though F3's literal text names only `ResourceService`. The `_vulkan` `#[ignore]`d shape is the correct one; this session did not attempt to build a scene-level mock.
+
+Gate transcript (mutation checks, this round only):
+```
+$ # drain_pending_pool_releases gate disabled
+$ cargo test -p yserver --lib c0_2ci_scene_drain_pending_pool_releases_gates_on_service_vulkan -- --ignored
+thread '...' panicked at crates/yserver/src/kms/render/scene.rs:8736:13:
+assertion `left == right` failed: F4d-M1: a not-releasable managed pool slot must stay queued
+  left: 0
+ right: 1
+
+$ # retire_failed_submit_bos gate disabled
+$ cargo test -p yserver --lib c0_2ci_scene_retire_failed_submit_bos_gates_on_service_vulkan -- --ignored
+thread '...' panicked at crates/yserver/src/kms/render/scene.rs:8788:13:
+assertion `left == right` failed: F4d-M1: a not-releasable failed-submit bo must stay queued
+  left: 0
+ right: 1
+
+$ # drain_all's PoolSlot gate disabled
+$ cargo test -p yserver --lib c0_2ci_scene_drain_all_gates_pool_slot_release_on_service_vulkan -- --ignored
+thread '...' panicked at crates/yserver/src/kms/render/scene.rs:8834:9:
+assertion `left == right` failed: F4d-M1: drain_all must not release a not-releasable managed pool slot
+  left: 0
+ right: 1
+
+$ # handle_page_flip_complete's service.register_batch call disabled
+$ cargo test -p yserver --lib c0_2ci_scene_handle_page_flip_complete_registers_managed_batch_vulkan -- --ignored
+thread '...' panicked at crates/yserver/src/kms/render/scene.rs:8924:9:
+assertion `left == right` failed: F4d-M1: managed_batch must be registered with the service at flip completion
+  left: 0
+ right: 1
+```
+All four mechanisms restored before commit; all four tests green again
+(see Task 9's fold-back entry for the full hardware-run transcript,
+`--ignored` 18/18).
+
+**Plan steps closed:** none newly ticked — 5.3/5.5 stay ticked from Fix
+round 4; this round closed a test-coverage gap in an already-ticked step.
 
 ## Task 6: Completion progress and transport permission boundary
 
@@ -1636,6 +1706,52 @@ test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1730 filtered out; finished in 0.79s
 ```
 
+**Fix round 2: `c0918b22`.** Session F-13c, closing F8-M1, F8-M2 and F8-m1
+from
+`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`.
+
+| Finding | Verdict |
+| --- | --- |
+| F8-M1 (the pool-husk alias counter was a hand-bumped `#[cfg(test)]`-only counter — `register_pool_husk`/`unregister_pool_husk` were called only by `tests.rs`'s own test bodies, not by `register_managed_scanout_bo` or `detach_managed_entries`, so in any real sequence the fd-family barrier's inventory never followed the husk) | **RESOLVED (test: `c0_2ci_scanout_managed_pool_husk_blocks_family_barrier_until_detached_vulkan`, new)** — wired the counter at the real sites: `PlatformBackend::register_managed_scanout_bo` (`platform.rs:5887`) calls `registry.register_pool_husk()` right after committing the display half's managed lease; `OutputScanout::detach_managed_entries` (`scanout.rs`) now takes `Option<&mut DrmCleanupRegistry>` and calls `registry.unregister_pool_husk()` for every display-pool `ScanoutBo` whose `take_managed()` actually returned `Some` (`None` in production, since `reset_scanout_bos_for_suspend` has no registry in scope and no production bo is ever managed — R8). The new test drives both real sites end-to-end: registers a managed bo through `register_managed_scanout_bo`, asserts the barrier still refuses to mint with every other precondition satisfied, then detaches through `detach_managed_entries` and asserts the barrier now mints. Mutation check (performed in this session, reverted before commit): commenting out the `registry.register_pool_husk()` call at the register site makes the barrier mint prematurely (`FileFamilyClosed { ... }` returned where an `Err` was expected); separately, commenting out the `registry.unregister_pool_husk()` call at the unregister site (`scanout.rs:793`) leaves the barrier permanently refusing to mint after detach (`"non-payload aliases still active"`) — both mutations were run and reverted independently |
+| Open question (coordinator-flagged): does the `Copied` pool's `sources` loop leak a husk by calling bare `src.take_managed()` with no `unregister_pool_husk()`? | **Resolved: no leak — a source bo's husk is never registered in the first place, so there is nothing to unregister.** Inspected `CopiedRenderSource`/`CopiedRenderSourceBacking` (`kms/vk/scanout.rs`): neither type has an `Rc<drm::Device>`/`drm` field at all — `CopiedRenderSourceBacking`'s own doc comment says so explicitly ("Unlike `ScanoutBoBacking` there is no file-owned half here: the copied source is purely renderer/Vulkan state, never a DRM framebuffer/GEM owner"), and its fields are all `Option<DrawableImage>`/`ExportableImage`/`Arc<VkContext>`/Vulkan handles. `register_managed_scanout_bo` registers exactly one husk per conversion, for the *display* half's `ScanoutBoBacking::drm` clone (`platform.rs:5887`, right after `scanout.display_pool_mut().bos...set_managed(display_lease)`) — there is no second `register_pool_husk()` call for the renderer/copied-source half. So a source bo's managed lease was never counted as a husk, and the `pool.sources` loop's bare `src.take_managed()` (`scanout.rs`, `Copied` arm) is correct as written. A comment was added at that call site recording this reasoning so a future reader does not have to re-derive it |
+| F8-M2 (`deliver_descriptor` registers a late returned descriptor under the incident, correctly, but nothing ever closed it outside test code — `close_returned_descriptors` had only `tests.rs`/`adapter_tests.rs` callers, so a real `HandoffRouter` recipient that received a late descriptor could never mint the barrier without a test-only hand call) | **RESOLVED (tests: `c0_2ci_handoff_complete_fd_family_barrier_deterministic` and `c0_2ci_adapter_unknown_detach_late_reply_reap`, both reworked)** — added `DrmCleanupRegistry::helper_reaped()` (a plain accessor onto the existing `family_inventory.helper_reaped` field) and made `HandoffRouter::service` (`handoff.rs`) call `bundle.drm.close_returned_descriptors()` once `bundle.drm.helper_reaped()` is true, on every service tick (idempotent when nothing is pending — `close_returned_descriptors` clears an already-empty `Vec` and saturating-subtracts 0). Both existing tests were reworked to route their `DrmCleanupRegistry` through a real `HandoffRouter`/`IncarnationBundle`/`RetainingSupervisor` (`c0_2ci_handoff_complete_fd_family_barrier_deterministic` previously called `drm.close_returned_descriptors()` directly on a bare registry with no router in scope at all — it now builds a full bundle, transfers it into the router, and asserts the barrier still refuses to mint *before* `router.service(now)` runs and mints only after) rather than a hand call. Mutation check (performed in this session, reverted before commit): gating the `close_returned_descriptors()` call behind `if false && ...` in `HandoffRouter::service` fails both tests with `"F8-M2: once the router has closed returned descriptors, the barrier must mint: ... non-payload aliases still active"` |
+| F8-m1 (`quarantine_live` terminalized a grant revoked mid-flight with `UnknownCause::ContradictoryEvidence`, which describes "an outcome whose shape contradicts the request class" — not what a mid-flight revocation is) | **RESOLVED (test: `c0_2ci_handoff_under_executor_stalled_revokes_grant_and_quarantines`, extended)** — added `UnknownCause::GrantRevokedInFlight` (`owner/record.rs`) and used it at `owner/device.rs:1479` (`DeviceCommitOwner::quarantine_live`), with a doc comment on both the variant and the call site explaining why neither `ContradictoryEvidence` nor any existing `UnknownReason`/`HostCall` variant fits (those are about a host-call's own verification failing; this is about write authority being pulled out from under a commit that was never given the chance to complete or fail on its own). The existing test's two `matches!` assertions were tightened from `TerminalState::CompletionUnknown(_)` to `TerminalState::CompletionUnknown(UnknownCause::GrantRevokedInFlight)`. Mutation check (performed in this session, reverted before commit): reverting `quarantine_live`'s terminal cause back to `ContradictoryEvidence` fails the test at `tests.rs:5153` with `assertion failed: matches!(... UnknownCause::GrantRevokedInFlight ...)` |
+
+Gate for this round (F-13c; one session closed Tasks 3, 5, 9 and 10's
+residuals together): `cargo +nightly fmt` clean; `cargo clippy
+--all-targets -- -D warnings` clean; `cargo test -p yserver --lib c0_2ci`
+**124** passed / 0 failed / 18 ignored on a clean run and twelve
+consecutive runs (zero flakes); full `cargo test -p yserver --lib`
+**1662** passed / 0 failed / 90 ignored; `cargo check -p yserver --target
+x86_64-unknown-linux-gnu`, `--target x86_64-unknown-linux-musl`, and
+`--target x86_64-unknown-freebsd` all clean (this session touches
+`drm_cleanup.rs` and `kms/vk/scanout.rs`).
+
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 18 tests
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::resources::tests::c0_2ci_sink_gamma_gate_four_states_drm ... ok
+test kms::render::scene::tests::c0_2ci_scene_handle_page_flip_complete_registers_managed_batch_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::scene::tests::c0_2ci_scene_retire_failed_submit_bos_gates_on_service_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::scene::tests::c0_2ci_scene_drain_pending_pool_releases_gates_on_service_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::engine::tests::c0_2ci_engine_promote_drawable_exportable_managed_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_pool_husk_blocks_family_barrier_until_detached_vulkan ... ok
+test kms::render::scene::tests::c0_2ci_scene_drain_all_gates_pool_slot_release_on_service_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1734 filtered out; finished in 0.09s
+```
+
 **Files:** Create `resources/handoff.rs`; modify platform/backend detach seams and test support. The stage-3 recovery process itself is not implemented here.
 
 **Consumes:** All prior tasks, original `DeviceCommitOwner<CommitResources>` and `KmsIoExecutor` values, registry cleanup rights and existing completion registrations.
@@ -1756,6 +1872,19 @@ test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan .
 
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1730 filtered out; finished in 0.75s
 ```
+
+**Fix round 2: `c0918b22`.** Session F-13c, closing F9-m1 from
+`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F7-F10-opus-review.md`.
+
+| Finding | Verdict |
+| --- | --- |
+| F9-m1 (`c0_2ci_live_lifetime_adapters_vulkan` asserted zero validation-layer messages but never asserted the layer was actually active — `debug_messenger.is_some()` alone does not prove it, since the `VK_EXT_debug_utils` messenger is created unconditionally regardless of any layer; on a box with no `VK_LAYER_KHRONOS_validation` installed the test would pass vacuously) | **RESOLVED (test: `c0_2ci_live_lifetime_adapters_vulkan`, extended)** — added `VkContext::validation_layer_active` (`kms/vk/device.rs`, `#[cfg(test)]`), a new field set at construction to `validation_requested && validation_layer_present(...)` (the same expression the constructor already computed and named `validation_available`, now also stored on the context instead of only feeding the `layer_ptrs` decision). The test now panics with an explicit `"environmental skip: ..."` message (R12) before its zero-message assertions if `!vk.validation_layer_active() || vk.debug_messenger.is_none()`, rather than silently asserting zero messages nobody was watching for. Mutation check (performed in this session, reverted before commit): forcing `validation_layer_active: false` at the field's construction site makes the test fail with the new environmental-skip panic text instead of a vacuous pass — proving the guard actually gates the assertions below it rather than being dead code |
+
+Gate for this round: see Task 9's fold-back entry above (`c0918b22`, one
+session closed Tasks 3, 5, 9 and 10's residuals together) — `c0_2ci`
+124/0/18, `--ignored` 18/18 (includes this finding's test), full `--lib`
+1662/0/90, fmt/clippy clean, 12-run flake loop clean, all three portable
+targets clean.
 
 **Files:** Create `resources/adapter_tests.rs`; update affected tests and `docs/status.md`. Keep deterministic tests in ordinary `cargo test`; actual Vulkan/DRM cases use the repository's hardware annotations and must report environmental skips honestly.
 
