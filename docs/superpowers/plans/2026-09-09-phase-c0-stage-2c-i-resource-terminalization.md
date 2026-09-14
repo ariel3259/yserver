@@ -1266,6 +1266,88 @@ test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1711 filtered out; finished in 0.75s
 ```
 
+**Fix round 3 (F-14): `e69d32c9`.** Session F-14, tests-only, closing S2-M2
+from the final stage review's scope 2
+(`docs/superpowers/findings/2026-09-14-stage-2c-i-final-review-scope2.md`),
+per `docs/handoff-phase-c0-stage-2c-i-fix-resume.md`'s "Cold-start recipe"
+and its binding ruling that S2-M1/S2-M2 are stated as invariants, not
+edits: the mechanisms in `set_seat_active`/`service_completions` were
+already correct by inspection; the finding is that nothing proved it. No
+production code changed for this finding.
+
+| Finding | Verdict |
+| --- | --- |
+| S2-M2 (R9's serviced-time deadline counts serviced time and pauses while the seat is inactive — unproven in either direction: dropping the pre-pause flush in `set_seat_active`, and removing the `seat_active` gate in `service_completions`, both left the pre-existing 142-test `c0_2ci` suite green) | **RESOLVED (tests: `c0_2ci_serviced_time_credits_active_interval_before_pause`, `c0_2ci_serviced_time_ignores_wall_clock_while_seat_inactive`)** — the existing `c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires` test pauses immediately at registration, before `last_serviced` is ever primed by an active poll, so neither mutation has anything to act on there. Both new tests prime `last_serviced` with one active `service_completions` call before pausing, then isolate one mutation's contribution from the other's (zero pre-pause active time for the wall-clock test; a large post-resume wall gap for the pre-pause-credit test) so each fails only its own named mutation, not both at once. See the code commit's mutation-check transcript below for the exact failure text of each |
+
+Mutation checks performed and reverted (transcript from this session's
+build, each mutation applied, confirmed to compile and produce the
+`test result:` line below, then reverted and confirmed green again before
+the next):
+
+```
+$ # N7: set_seat_active's pause-flush bookkeeping deleted
+$ cargo test -p yserver --lib c0_2ci_serviced_time_credits_active_interval_before_pause
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:2423:5:
+assertion `left == right` failed
+  left: Ok([])
+ right: Err(Frozen)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1755 filtered out
+
+$ # N7b: service_completions's seat_active gate removed
+$ cargo test -p yserver --lib c0_2ci_serviced_time_ignores_wall_clock_while_seat_inactive
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:2476:5:
+wall time burned while the seat is inactive must never expire a batch (R9)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1755 filtered out
+```
+
+Each mutation was also confirmed not to trip the *other* new test (N7
+survives `c0_2ci_serviced_time_ignores_wall_clock_while_seat_inactive`
+and vice versa), confirming the two tests isolate the two mutations
+rather than incidentally both catching either one.
+
+**Plan steps closed:** none newly ticked — 6.3 stays ticked from Fix
+round 1 (F-5a); this round closed a test-coverage gap in an
+already-ticked step, per the finding's own framing (invariant proven,
+not a new mechanism).
+
+Gate for this round (F-14; shared with Task 7 below since one session
+closed both tasks' scope-2 findings in one commit): `cargo +nightly fmt`
+clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test -p
+yserver --lib c0_2ci` **128** passed / 0 failed / 18 ignored on a clean
+run and on twelve consecutive runs (zero flakes); `cargo test -p yserver
+--lib c0_2ci -- --ignored` **18** passed / 0 failed (this box's real DRM
+node + NVIDIA/RADV ICDs); full `cargo test -p yserver --lib` **1666**
+passed / 0 failed / 90 ignored (no R2 flake this run). Portable-target
+checks (`x86_64-unknown-linux-musl`, `x86_64-unknown-freebsd`) were not
+run: this session touches only `resources/{commit,handoff,mod,tests}.rs`,
+none of `drm/`, `drm_cleanup.rs` or `transport.rs`, per the resume doc's
+own scoping rule for when that check is required.
+
+```
+$ cargo test -p yserver --lib c0_2ci -- --ignored
+running 18 tests
+test kms::render::resources::tests::c0_2ci_fd_family_barrier_real_gbm_payload_drm ... ok
+test kms::render::resources::tests::c0_2ci_sink_gamma_gate_four_states_drm ... ok
+test kms::render::resources::tests::c0_2ci_gpu_dropped_frame_metadata_with_live_ticket_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_live_lifetime_adapters_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_dri3_lease_regressions_vulkan ... ok
+test kms::render::scene::tests::c0_2ci_scene_drain_pending_pool_releases_gates_on_service_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_into_managed_pins_real_context_for_cleanup_vulkan ... ok
+test kms::render::scene::tests::c0_2ci_scene_drain_all_gates_pool_slot_release_on_service_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan ... ok
+test kms::render::scene::tests::c0_2ci_scene_retire_failed_submit_bos_gates_on_service_vulkan ... ok
+test kms::render::resources::adapter_tests::c0_2ci_scanout_managed_pool_husk_blocks_family_barrier_until_detached_vulkan ... ok
+test kms::render::engine::tests::c0_2ci_engine_promote_drawable_exportable_managed_vulkan ... ok
+test kms::render::resources::tests::c0_2ci_descriptor_reset_exclusion_until_gpu_signaled_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_record_layout_transition_managed_reserves_write_vulkan ... ok
+test kms::render::scene::tests::c0_2ci_scene_handle_page_flip_complete_registers_managed_batch_vulkan ... ok
+test kms::render::store::tests::c0_2ci_storage_no_premature_pool_return_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_scene_managed_shared_compose_vulkan ... ok
+test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1738 filtered out; finished in 0.09s
+```
+
 **Files:** Create `resources/completion.rs` and `resources/transport.rs`; modify `backend.rs` and `platform.rs`. Extend `crates/yserver-core/src/core_loop/run.rs` tests only if needed to observe the existing completion callback.
 
 **Consumes:** Service pending tickets; current `before_block`, `on_owner_completion_ready`, `next_wakeup`, `owner_completion_deadline`, `service_owner_completions`, scanout completion registrations and executor-control processing.
@@ -1421,6 +1503,55 @@ test kms::render::backend::tests::c0_2ci_read_source_scratch_regression_vulkan .
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1719 filtered out; finished in 0.75s
 ```
 
+**Fix round 3 (F-14): `e69d32c9`.** Session F-14, tests-only except for
+S2-m1's one expected production line, closing S2-M1 and S2-m1 from the
+final stage review's scope 2
+(`docs/superpowers/findings/2026-09-14-stage-2c-i-final-review-scope2.md`),
+per `docs/handoff-phase-c0-stage-2c-i-fix-resume.md`'s binding ruling that
+these findings are stated as invariants, not edits.
+
+| Finding | Verdict |
+| --- | --- |
+| S2-M1 (R6's retained-member clause — a member retained across a grouped commit registers no `KmsRelease` obligation — was proven by nothing: the only test claiming it, `c0_2ci_commit_grouped_skip_and_duplicate_protection`, never calls `register_commit_dependencies`, hand-builds its obligation vector instead, and its retained allocation is not part of the commit's membership in any role, so its assertion holds regardless of the registration logic. Deleting the retention check left the pre-existing 142-test suite green) | **RESOLVED (test: `c0_2ci_commit_register_dependencies_retained_member_registers_no_kms_obligation`, new)** — drives the real `register_commit_dependencies` with a mixed grouped commit: one displaced pair (`old_a` → `new_a`, member1) and one genuinely retained pair (`old_b`/`new_b` name the same `AllocationKey` via two independent leases on one entry, member2, resubmitted unchanged). Asserts, immediately after registration and before any completion event runs, that the displaced pair registered an obligation and the retained pair did not. This is checked pre-completion deliberately: a grouped commit's own `HardwareComplete` discharges every member of the group in one event (the atomic commit proves them all at once), so an obligation erroneously registered on a retained member self-cancels in that same event and a post-completion check cannot distinguish correct from buggy registration — which is exactly why the mutation left the suite green and why the decisive check has to run at the point the retention decision is actually made |
+| S2-m1 (a rejected/pre-IPC-cancelled commit's KMS registrations must be *cancelled*, not discharged, and that difference must be observable — but `cancel` and `apply_validated_proof` differed by exactly one line, so no ledger state distinguished them, and `cancel` left a stale `Outstanding` `kms_dispositions` entry that `record_device_barrier` kept flipping to `Superseded` with a spurious dirty mark for a commit that never happened) | **RESOLVED (production: `KmsDisposition::Cancelled` (`handoff.rs`), set by `ResourceService::cancel` when a cancelled obligation carries a KMS disposition (`mod.rs`); test: `c0_2ci_commit_cancel_pre_ipc_marks_cancelled_and_cleans_stale_disposition`, new)** — this is the one finding where a small production change was expected (per the finding's own text). Two designs were considered: (1) make `cancel` also remove the `kms_dispositions` entry, mirroring `apply_validated_proof`'s existing removal line exactly; (2) give cancellation its own terminal disposition value. (1) was rejected: it makes `cancel` and `apply_validated_proof` byte-for-byte identical in their effect on the ledger (same `pending_obligations` removal, same `kms_dispositions` removal), which would make the S2-m1 mutation (swap `cancel` for `apply_validated_proof` in `cancel_pre_ipc_commit`) permanently undetectable by any test — directly contradicting the finding's own requirement that this mutation must fail a named test. (2), the `Cancelled` variant, is what was built: `kms_disposition()` returns `Some(Cancelled)` after cancellation versus `None` (removed) after a real discharge — decisively distinct — and, because `record_device_barrier` only ever touches an `Outstanding` entry, a `Cancelled` one is never mistaken for a live obligation and never flipped to `Superseded` with a spurious dirty mark, closing the stale-disposition half of the finding without deleting the record of what happened. The new test drives `cancel_pre_ipc_commit` directly (not through `register_commit_dependencies`, since the existing pre-IPC test only ever asserted `has_pending_obligations`, which `cancel` and `apply_validated_proof` satisfy identically and so could never have caught this), asserts `kms_disposition() == Some(Cancelled)`, then runs a real `DeviceBarrier::from_device_loss` and confirms the disposition is unchanged and the entry is not re-marked dirty |
+
+Mutation checks performed and reverted (each mutation applied to a
+scratch copy of the source, confirmed to compile and produce the
+`test result:` line below, then the file was restored byte-for-byte from
+the pre-mutation copy — confirmed with `diff`):
+
+```
+$ # S2-M1 (N4): retention check deleted from register_commit_dependencies
+$ cargo test -p yserver --lib c0_2ci_commit_register_dependencies_retained_member_registers_no_kms_obligation
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:5875:5:
+a retained pair must register no KMS release obligation (R6)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1755 filtered out
+
+$ # S2-m1 (N6): cancel_pre_ipc_commit swapped to apply_validated_proof
+$ cargo test -p yserver --lib c0_2ci_commit_cancel_pre_ipc_marks_cancelled_and_cleans_stale_disposition
+thread '...' panicked at crates/yserver/src/kms/render/resources/tests.rs:5947:5:
+assertion `left == right` failed: a cancelled registration must be observably distinct from a discharged one
+  left: None
+ right: Some(Cancelled)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1755 filtered out
+```
+
+**Plan steps closed:** none newly ticked — 7.4/7.6 stay ticked from Fix
+round 1 (F-6a); this round closed a test-coverage gap in already-ticked
+steps and made one production line (`cancel`'s disposition bookkeeping)
+match what 7.4's disposition table always said cancellation was.
+
+Gate for this round: shared with Task 6's Fix round 3 above (one session,
+one commit closed both tasks' scope-2 findings) — `cargo +nightly fmt`
+clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test -p
+yserver --lib c0_2ci` **128** passed / 0 failed / 18 ignored on a clean
+run and on twelve consecutive runs (zero flakes); `cargo test -p yserver
+--lib c0_2ci -- --ignored` **18** passed / 0 failed (this box's real DRM
+node + NVIDIA/RADV ICDs, transcript in Task 6's entry above); full
+`cargo test -p yserver --lib` **1666** passed / 0 failed / 90 ignored (no
+R2 flake this run). Portable-target checks were not run: this session
+touches only `resources/{commit,handoff,mod,tests}.rs`, none of `drm/`,
+`drm_cleanup.rs` or `transport.rs`.
 
 **Files:** Create `resources/commit.rs`, `resources/present.rs`; modify backend/platform owner-event types, `present_completion.rs` and owner tests without adding backend dependencies to `kms/owner`.
 
