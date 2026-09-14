@@ -1,13 +1,13 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-14,
-after F-14's review and a **second** mutation battery on scope 2. F-14 is
-ACCEPTED (its three findings close, re-verified by the reviewer's own
-mutations), but scope 2 is **still not clean**: the second battery found
-two more majors and one minor. Scopes 1 and 3 hold. The stage is NOT
-accepted. **The user decided (2026-09-14): close the three findings in one
-more session (F-15) and accept the stage; the systematic clause-by-clause
-pass over Tasks 5–7 becomes the first task of 2c-ii's spec.** If you are resuming this work cold — a new
+after F-15's review. **STAGE 2c-i IS ACCEPTED.** Every fix session
+F-1..F-15 is accepted, the final stage review is complete in three scopes,
+and `docs/status.md` carries the acceptance entry. Twenty-six mutations
+across the review: nineteen caught on first contact, seven exposed gaps,
+all seven now closed. **This file's job is done** — the remaining work
+lives in 2c-ii's spec, which opens with the systematic per-guard-clause
+pass over Tasks 5–7 and carries F13b-D1, F13c-m1 and F13c-m2.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -83,8 +83,9 @@ not the calendar: split work small enough to finish inside one window.
 | Final review, scope 2 | Tasks 5–7 | **NOT CLEAN** — S2-M1, S2-M2 (major), S2-m1 (minor) | `d1e8397a` | final-review-scope2 |
 | Final review, scope 3 | Tasks 8–10 | **HOLDS** (7 mutations + 2 static audits, all caught) | this commit | final-review-scope3 |
 | F-14 | Tests only: S2-M1 (R6 retained-member clause), S2-M2 (R9 serviced-time pause), S2-m1 (cancel vs discharge + stale disposition) | **ACCEPTED** (F14-M1, F14-M2, F14-m1 opened by the second battery) | `e69d32c9`/`919952f2` | F14-review |
-| **F-15** | Tests only: F14-M1 (R6's release gate ignores outstanding `kms_obligations`), F14-M2 (`validate_gpu_batch`'s frozen-entry refusal), F14-m1 (cancel-vs-discharge on all three cancelling paths, not one) | **next** | — | — |
-| Accept | After F-15's review: `docs/status.md`, then 2c-ii's spec | pending F-15 | — | — |
+| F-15 | Tests only: F14-M1, F14-M2, F14-m1 | **ACCEPTED** (F14-M1 downgraded to an observation on review — see below) | `b611c115`/`df599934` | F15-review |
+| **Stage** | Final acceptance + `docs/status.md` | **ACCEPTED 2026-09-14** | this commit | F15-review |
+| Next | 2c-ii's spec: systematic per-guard-clause pass over Tasks 5–7 first, then F13b-D1, F13c-m1, F13c-m2 | — | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the
@@ -130,6 +131,17 @@ not accepted until that passes. Then the next session is dispatched.
   scene test that cannot exist here, and got a silent substitution instead
   of a report). Rule F8 extends to shapes: an unreachable suggestion **must
   be reported**; the silent substitution is the defect, not the deviation.
+- **F14-M1 was overstated, and the correction is on the record**
+  (F15-review, 2026-09-14): I claimed deleting the `kms_obligations` clause
+  from the release gate would allow releasing a buffer that may still be
+  scanning out. It would not — `register_commit_dependencies` only ever
+  draws obligations from the same `res`'s own `allocations`, and
+  `allocations` is never drained after construction, so the allocation
+  loop's `is_releasable` already refuses while the obligation is pending.
+  The clause is defensive redundancy; the test F-15 wrote proves the guard,
+  not a reachable hazard, and is worth keeping for that. The lesson: check
+  whether a guard is reachable *before* assigning a severity, not after the
+  fix lands.
 - **Mutate by location, not by first textual match** (F14-review,
   2026-09-14): the reviewer's own S2-m1 mutation reported a false survival
   because the mutated string occurred four times in `commit.rs` and the

@@ -33,6 +33,38 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-14 Phase C.0 stage 2c-i ACCEPTED.** Every fix session F-1..F-15 is accepted and the
+  final stage review is complete (`docs/superpowers/findings/2026-09-14-stage-2c-i-final-review-scope1.md`,
+  `…-scope2.md`, `…-scope3.md`, plus `…-fix-F14-review.md` and `…-fix-F15-review.md`).
+  The review ran adversarially in three scopes with **twenty-six mutation checks**: nineteen were
+  caught on first contact, seven exposed coverage gaps, and all seven are now closed by sessions
+  F-14 and F-15. Scopes 1 (Tasks 1-4) and 3 (Tasks 8-10) hold with no findings.
+  Round 1's verdict is answered on its own terms: it held that the R5 fd-family chain was inverted
+  and that the three tests the handoff calls decisive (2.5, 4.6, 9.5) proved nothing. Restoring that
+  inversion today fails eight tests, all three of them included.
+  Rulings verified by mutation or static audit: R3 (one closer per kernel object — `GemOwner::Gbm`
+  never closes the GEM handle), R4, R5, R6, R7, R8 (production constructor sets
+  `resource_service: None`; the Task 8 seam's only callers are inside `#[cfg(test)]`), R9
+  (`apply_validated_proof` private to the module, two evidence-correlating producers,
+  `FileFamilyClosed` sealed and constructed at one site), R10 (no `Send`/`Sync`, no threads under
+  `resources/`), R11 (one mutation of `allows_legacy` fails eight distinct real sinks), R12 (every
+  `c0_2ci` hardware test reports an environmental skip with `panic!`, none with a bare `return`).
+  Deterministic test suite: **131** `c0_2ci_*` tests passing in ordinary `cargo test`, zero flakes
+  over 12 consecutive iterations. Hardware suite: **18** passing on real DRM nodes and real hardware
+  Vulkan with `VK_LAYER_KHRONOS_validation` active (now asserted active, not assumed — a box without
+  the layer reports an environmental skip instead of passing vacuously). Full suite: **1669** passing,
+  0 failures. Operational readiness remains closed; production paths remain strictly Legacy (R8).
+  **Carried into 2c-ii's spec, deliberately.** Mutation sampling of Tasks 5-7 did not converge: two
+  batteries, 17 mutations, 7 survivors, against 0 survivors in 14 mutations across Tasks 1-4 and
+  8-10. The seven found are closed; there is no basis for claiming none remain. 2c-ii's spec
+  therefore **opens with a systematic per-guard-clause pass** over `commit.rs`, `gpu.rs` and
+  `transport.rs` — enumerate every guard clause, one decisive test each, clause-deletion as the
+  acceptance criterion. It also carries F13b-D1 (dispatched `CommitResources` carries no present-pin
+  leases by value), F13c-m1 (`detach_managed_entries(None)` lets the production route skip husk
+  accounting — inert only while R8 holds) and F13c-m2 (`unregister_pool_husk`'s `saturating_sub`
+  hides underflow). This entry is an acceptance with a recorded trade, not a clean bill of health
+  for the Tasks 5-7 surface.
+
 - **2026-09-13 stage 2c-i fix round: F-1..F-6b independently accepted; F-7..F-12 implemented by Gemini,
   F-11/F-12 REJECTED on independent review (`docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md`,
   F11-B1: managed image layout shadowed in per-lease `Cell`s and mutated without reservation);
