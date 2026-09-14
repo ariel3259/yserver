@@ -5,10 +5,9 @@ after F-14's review and a **second** mutation battery on scope 2. F-14 is
 ACCEPTED (its three findings close, re-verified by the reviewer's own
 mutations), but scope 2 is **still not clean**: the second battery found
 two more majors and one minor. Scopes 1 and 3 hold. The stage is NOT
-accepted, and the open question is no longer "which tests are missing" but
-**whether to keep sampling this surface or do a systematic clause-by-clause
-pass** — see the recommendation in the F-14 review. That call is the
-user's.** If you are resuming this work cold — a new
+accepted. **The user decided (2026-09-14): close the three findings in one
+more session (F-15) and accept the stage; the systematic clause-by-clause
+pass over Tasks 5–7 becomes the first task of 2c-ii's spec.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -84,7 +83,8 @@ not the calendar: split work small enough to finish inside one window.
 | Final review, scope 2 | Tasks 5–7 | **NOT CLEAN** — S2-M1, S2-M2 (major), S2-m1 (minor) | `d1e8397a` | final-review-scope2 |
 | Final review, scope 3 | Tasks 8–10 | **HOLDS** (7 mutations + 2 static audits, all caught) | this commit | final-review-scope3 |
 | F-14 | Tests only: S2-M1 (R6 retained-member clause), S2-M2 (R9 serviced-time pause), S2-m1 (cancel vs discharge + stale disposition) | **ACCEPTED** (F14-M1, F14-M2, F14-m1 opened by the second battery) | `e69d32c9`/`919952f2` | F14-review |
-| **F-15?** | Open: F14-M1 (R6's release gate ignores outstanding `kms_obligations` — unproven), F14-M2 (`validate_gpu_batch`'s frozen-entry refusal — unproven), F14-m1 (cancel-vs-discharge proven on 1 of 3 paths). **Shape undecided** — see the F-14 review's recommendation: sampling Tasks 5–7 is not converging (2 batteries, 17 mutations, 7 survivors), so this may want to be a systematic per-guard-clause pass rather than another three-finding session | **next, pending the user's call** | — | — |
+| **F-15** | Tests only: F14-M1 (R6's release gate ignores outstanding `kms_obligations`), F14-M2 (`validate_gpu_batch`'s frozen-entry refusal), F14-m1 (cancel-vs-discharge on all three cancelling paths, not one) | **next** | — | — |
+| Accept | After F-15's review: `docs/status.md`, then 2c-ii's spec | pending F-15 | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the
@@ -146,6 +146,17 @@ not accepted until that passes. Then the next session is dispatched.
   where the test goes or what shape it takes. That is the first application
   of the ruling above — do not "helpfully" turn them back into edits when
   dispatching F-14.
+- **Scope 2 is accepted knowingly under-tested** (user's call, 2026-09-14):
+  sampling Tasks 5–7 with mutations did not converge — two batteries, 17
+  mutations, 7 survivors, against 0 survivors in 14 mutations across Tasks
+  1–4 and 8–10. Rather than keep sampling, F-15 closes the three known
+  findings and the stage is accepted. **2c-ii's spec opens with a
+  systematic per-guard-clause pass over `commit.rs` (consumer and
+  registration paths), `gpu.rs` (the batch state machine) and
+  `transport.rs`: enumerate every guard clause, require a decisive test per
+  clause, and use clause-deletion as each one's acceptance criterion.**
+  This is a deliberate, recorded trade — not a clean bill of health for
+  that surface.
 - **Carried out of the round into 2c-ii's spec** (not fix-session work):
   **F13b-D1** (dispatched `CommitResources` carries no present-pin leases),
   **F13c-m1** (`detach_managed_entries(None)` lets the production route skip
