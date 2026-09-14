@@ -32,7 +32,10 @@ pub(crate) use availability::{
 #[allow(unused_imports)]
 pub(crate) use capacity::{DirectCapacity, DirectRole, RoleReservation, RoleState};
 #[allow(unused_imports)]
-pub use commit::{CommitResourceConsumer, CommitResources, GroupMember, PresentRelease};
+pub(crate) use commit::{
+    CommitResourceConsumer, CommitResources, GroupMember, PresentRelease, cancel_pre_ipc_commit,
+    register_commit_dependencies,
+};
 #[allow(unused_imports)]
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
 #[allow(unused_imports)]
@@ -71,7 +74,7 @@ pub(crate) use transport::FakeDirectOwnershipState;
 #[allow(unused_imports)]
 pub(crate) use transport::{
     DirectOwnershipState, HandoverPermit, OwnerWriteGrant, RecipientReservation, TransportGate,
-    TransportState, WriterClass, WriterCoverageProof,
+    TransportGateHandle, TransportState, WriterClass, WriterCoverageProof,
 };
 
 #[allow(dead_code, clippy::large_enum_variant)]
@@ -532,6 +535,10 @@ impl ResourceService {
         Ok(())
     }
 
+    pub(crate) fn is_frozen(&self, key: &AllocationKey) -> bool {
+        self.entries.get(key).map(|e| e.frozen()).unwrap_or(false)
+    }
+
     pub(crate) fn cancel(
         &mut self,
         key: AllocationKey,
@@ -545,8 +552,35 @@ impl ResourceService {
         if avail.pending_obligations.remove(&obligation).is_none() {
             return Err(ResourceError::InvalidProof);
         }
+        // F-14/S2-m1: mark a cancelled KMS registration `Cancelled` rather
+        // than leaving it `Outstanding` (stale) or removing it outright
+        // (which would make `cancel` indistinguishable from
+        // `apply_validated_proof`, below). `record_device_barrier` only
+        // ever flips an `Outstanding` disposition, so this also stops the
+        // stale-entry bug: a cancelled registration can no longer be
+        // mistaken for a live one and flipped to `Superseded` (with a
+        // spurious dirty mark) for a commit that never happened.
+        if let Some((_, _, disp)) = avail.kms_dispositions.get_mut(&obligation) {
+            *disp = KmsDisposition::Cancelled;
+        }
         drop(avail);
         self.dirty_entries.borrow_mut().insert(key);
+        Ok(())
+    }
+
+    pub(in crate::kms::render::resources) fn validate_proof_target(
+        &self,
+        key: AllocationKey,
+        obligation: ObligationId,
+    ) -> Result<(), ResourceError> {
+        if key.device != self.device || key.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let avail = entry.availability.borrow();
+        if !avail.pending_obligations.contains_key(&obligation) {
+            return Err(ResourceError::InvalidProof);
+        }
         Ok(())
     }
 
@@ -597,6 +631,20 @@ impl ResourceService {
             .kms_dispositions
             .insert(id, (member, commit, KmsDisposition::Outstanding));
         Ok(id)
+    }
+
+    pub(crate) fn kms_disposition(
+        &self,
+        key: AllocationKey,
+        obligation: ObligationId,
+    ) -> Option<handoff::KmsDisposition> {
+        let entry = self.entries.get(&key)?;
+        entry
+            .availability
+            .borrow()
+            .kms_dispositions
+            .get(&obligation)
+            .map(|(_, _, disp)| *disp)
     }
 
     pub(crate) fn record_kms_discharged(
@@ -823,6 +871,18 @@ impl ResourceService {
         })
     }
 
+    pub(crate) fn share_storage_read(
+        &mut self,
+        source: &StorageLease,
+    ) -> Result<StorageLease, ResourceError> {
+        let key = source.allocation.key();
+        let new_alloc_lease = self.reserve(key, UseKind::Read)?;
+        Ok(StorageLease {
+            allocation: new_alloc_lease,
+            pixels: source.pixels.clone(),
+        })
+    }
+
     pub(crate) fn with_storage_read<T>(
         &mut self,
         lease: &StorageLease,
@@ -875,7 +935,11 @@ impl ResourceService {
         f: impl FnOnce(&ScanoutAllocation) -> T,
     ) -> Result<T, ResourceError> {
         let key = lease.key();
-        let read_lease = self.reserve(key, UseKind::Read)?;
+        let read_lease = if lease.kind == UseKind::Read {
+            None
+        } else {
+            Some(self.reserve(key, UseKind::Read)?)
+        };
         let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
         let payload = entry.payload.borrow();
         let alloc = match payload.as_ref() {
@@ -897,7 +961,11 @@ impl ResourceService {
         f: impl FnOnce(&mut ScanoutAllocation) -> T,
     ) -> Result<T, ResourceError> {
         let key = lease.key();
-        let write_lease = self.reserve(key, UseKind::Write)?;
+        let write_lease = if lease.kind == UseKind::Write {
+            None
+        } else {
+            Some(self.reserve(key, UseKind::Write)?)
+        };
         let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
         let mut payload = entry.payload.borrow_mut();
         let alloc = match payload.as_mut() {

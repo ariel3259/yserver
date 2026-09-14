@@ -9,7 +9,7 @@ use crate::{
         },
         render::resources::{
             AllocationKey, CommitResourceConsumer, CommitResources, RecipientReservation,
-            ResourceError, ResourceService,
+            ResourceError, ResourceService, TransportGate,
             drm_cleanup::{DrmCleanupRegistry, FileFamilyClosed},
         },
     },
@@ -18,19 +18,55 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeviceBarrier {
-    FileFamilyClosed(DrmDeviceKey),
-    DeviceLost(DrmDeviceKey),
+    FileFamilyClosed {
+        device: DrmDeviceKey,
+        incarnation: IncarnationId,
+        _private: (),
+    },
+    DeviceLost {
+        device: DrmDeviceKey,
+        _private: (),
+    },
 }
 
 impl DeviceBarrier {
-    pub(crate) fn from_file_family_closed(closed: &FileFamilyClosed) -> Self {
-        Self::FileFamilyClosed(closed.device_key)
+    pub(crate) fn from_file_family_closed(closed: FileFamilyClosed) -> Self {
+        Self::FileFamilyClosed {
+            device: closed.device_key,
+            incarnation: closed.incarnation,
+            _private: (),
+        }
+    }
+
+    pub(crate) fn from_device_loss(device: DrmDeviceKey, _proof: DeviceLossProof) -> Self {
+        Self::DeviceLost {
+            device,
+            _private: (),
+        }
     }
 
     pub(crate) fn device(&self) -> DrmDeviceKey {
         match self {
-            Self::FileFamilyClosed(d) | Self::DeviceLost(d) => *d,
+            Self::FileFamilyClosed { device, .. } | Self::DeviceLost { device, .. } => *device,
         }
+    }
+
+    pub(crate) fn incarnation(&self) -> Option<IncarnationId> {
+        match self {
+            Self::FileFamilyClosed { incarnation, .. } => Some(*incarnation),
+            Self::DeviceLost { .. } => None,
+        }
+    }
+}
+
+pub(crate) struct DeviceLossProof {
+    _private: (),
+}
+
+impl DeviceLossProof {
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self { _private: () }
     }
 }
 
@@ -39,6 +75,18 @@ pub(crate) enum KmsDisposition {
     Outstanding,
     Discharged,
     Superseded(DeviceBarrier),
+    /// F-14/S2-m1: a rejected/pre-IPC-cancelled commit's registration was
+    /// cancelled, not discharged -- the displacement never happened, so no
+    /// completion proof was ever correlated to it (R6). Distinct from
+    /// `Discharged` (a real `HardwareComplete` proof was applied) so a test
+    /// can observe the difference through `ResourceService::cancel`
+    /// (`cancel_pre_ipc_commit`, `ResourcesStillCurrent`, `ResourcesReleased`)
+    /// versus `apply_validated_proof` (`discharge_commit_kms_obligations`).
+    /// Also closes the stale-disposition bug: `record_device_barrier` only
+    /// ever flips an `Outstanding` entry, so a `Cancelled` one is never
+    /// mistaken for a still-live obligation and never causes a spurious
+    /// `Superseded` flip or dirty mark for a commit that never happened.
+    Cancelled,
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +144,7 @@ pub(crate) struct IncarnationBundle {
     pub(crate) drm: DrmCleanupRegistry,
     pub(crate) executor: Option<crate::kms::executor::KmsIoExecutor>,
     pub(crate) ingress: CompletionIngress,
+    pub(crate) gate: TransportGate,
 }
 
 impl IncarnationBundle {
@@ -106,6 +155,7 @@ impl IncarnationBundle {
         drm: DrmCleanupRegistry,
         executor: Option<crate::kms::executor::KmsIoExecutor>,
         ingress: CompletionIngress,
+        gate: TransportGate,
     ) -> Self {
         Self {
             owner,
@@ -114,6 +164,7 @@ impl IncarnationBundle {
             drm,
             executor,
             ingress,
+            gate,
         }
     }
 }
@@ -125,6 +176,7 @@ pub(crate) struct TeardownRelease {
 }
 
 impl TeardownRelease {
+    #[cfg(test)]
     pub(crate) fn mint_for_supervisor(
         incarnation: IncarnationId,
         entries: Vec<AllocationKey>,
@@ -155,34 +207,69 @@ impl HandoffRouter {
     pub(crate) fn transfer(
         &mut self,
         slot: RecipientSlot,
-        bundle: IncarnationBundle,
+        mut bundle: IncarnationBundle,
     ) -> Result<(), (ResourceError, RecipientSlot, IncarnationBundle)> {
         if slot.device != bundle.resources.device()
             || slot.incarnation != bundle.owner.incarnation()
+            || bundle.gate.device() != slot.device
+            || bundle.gate.incarnation() != slot.incarnation
         {
+            bundle.gate.force_close();
             return Err((ResourceError::WrongIncarnation, slot, bundle));
         }
         if self.recipients.contains_key(&slot.incarnation) {
+            bundle.gate.force_close();
             return Err((ResourceError::Busy, slot, bundle));
         }
+
+        // B-7: Revocation precedes close
+        let revoked = bundle.gate.revoke_owner_writes();
+        if let Err(err) = bundle.gate.close() {
+            bundle.gate.force_close();
+            return Err((err, slot, bundle));
+        }
+
+        // Treat every revoked grant as possibly dispatched: its owner record is Quarantined (round-4 M-2)
+        if revoked > 0 {
+            let events = bundle.owner.quarantine_live();
+            for ev in events {
+                if let Err(err) = bundle.consumer.consume(ev, &mut bundle.resources) {
+                    bundle.gate.force_close();
+                    return Err((err, slot, bundle));
+                }
+            }
+            bundle.consumer.capacity.close_admission();
+        }
+
         let incarnation = slot.incarnation;
         let _ = slot; // consumes reservation made before activation
         self.recipients.insert(incarnation, bundle);
         Ok(())
     }
 
-    pub(crate) fn service(&mut self, now: Instant) {
+    pub(crate) fn service(&mut self, now: Instant) -> Result<(), ResourceError> {
         for bundle in self.recipients.values_mut() {
             let events = std::mem::take(&mut bundle.ingress.pending_events);
             for ev in events {
-                let _ = bundle.consumer.consume(ev, &mut bundle.resources);
+                bundle.consumer.consume(ev, &mut bundle.resources)?;
             }
-            if let Ok(available) = bundle.resources.service_completions(now) {
-                let _ = bundle
-                    .consumer
-                    .on_available(&available, &mut bundle.resources);
+            let available = bundle.resources.service_completions(now)?;
+            bundle
+                .consumer
+                .on_available(&available, &mut bundle.resources)?;
+            // F8-M2: the router's own teardown step. `deliver_descriptor`
+            // registers a late returned descriptor under the incident
+            // (M-11); nothing else ever closed it, so a recipient that
+            // received one could never mint the fd-family barrier. Once the
+            // ingress just drained above carries no more events and the
+            // helper is reaped, no further late reply can arrive on this
+            // incident, so whatever has accumulated so far is safe to
+            // close. Idempotent when nothing is pending.
+            if bundle.drm.helper_reaped() {
+                bundle.drm.close_returned_descriptors();
             }
         }
+        Ok(())
     }
 
     pub(crate) fn deliver_event(
@@ -207,7 +294,7 @@ impl HandoffRouter {
             .recipients
             .get_mut(&incarnation)
             .ok_or(ResourceError::Detached)?;
-        bundle.ingress.push_descriptor(fd);
+        bundle.drm.register_returned_descriptor(fd);
         Ok(())
     }
 

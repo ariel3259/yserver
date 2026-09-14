@@ -154,6 +154,7 @@ pub(crate) struct DrmCleanupRegistry {
     /// rather than waiting for it to drop on its own (R5).
     payload_alias_keys: BTreeSet<AllocationKey>,
     family_inventory: FamilyInventory,
+    returned_descriptors: Vec<std::os::fd::OwnedFd>,
 }
 
 impl std::fmt::Debug for DrmCleanupRegistry {
@@ -186,6 +187,7 @@ impl DrmCleanupRegistry {
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
             family_inventory: FamilyInventory::default(),
+            returned_descriptors: Vec::new(),
         }
     }
 
@@ -203,6 +205,7 @@ impl DrmCleanupRegistry {
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
             family_inventory: FamilyInventory::default(),
+            returned_descriptors: Vec::new(),
         }
     }
 
@@ -221,6 +224,7 @@ impl DrmCleanupRegistry {
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
             family_inventory: FamilyInventory::default(),
+            returned_descriptors: Vec::new(),
         }
     }
 
@@ -238,6 +242,15 @@ impl DrmCleanupRegistry {
 
     pub(crate) fn is_family_closed(&self) -> bool {
         self.family_closed
+    }
+
+    /// F8-M2: lets a router's own teardown step decide when it is safe to
+    /// close returned descriptors (`HandoffRouter::service`) -- once the
+    /// helper is reaped, no more late replies can arrive on this incident,
+    /// so whatever the router has accumulated so far may be closed without
+    /// racing a future `deliver_descriptor`.
+    pub(crate) fn helper_reaped(&self) -> bool {
+        self.family_inventory.helper_reaped
     }
 
     pub(crate) fn register_right(
@@ -342,6 +355,29 @@ impl DrmCleanupRegistry {
 
     #[cfg(test)]
     pub(crate) fn remove_fake_alias(&mut self) {
+        self.family_inventory.non_payload_aliases =
+            self.family_inventory.non_payload_aliases.saturating_sub(1);
+    }
+
+    pub(crate) fn register_returned_descriptor(&mut self, fd: std::os::fd::OwnedFd) {
+        self.family_inventory.non_payload_aliases += 1;
+        self.returned_descriptors.push(fd);
+    }
+
+    pub(crate) fn close_returned_descriptors(&mut self) {
+        let count = self.returned_descriptors.len();
+        self.returned_descriptors.clear();
+        self.family_inventory.non_payload_aliases = self
+            .family_inventory
+            .non_payload_aliases
+            .saturating_sub(count);
+    }
+
+    pub(crate) fn register_pool_husk(&mut self) {
+        self.family_inventory.non_payload_aliases += 1;
+    }
+
+    pub(crate) fn unregister_pool_husk(&mut self) {
         self.family_inventory.non_payload_aliases =
             self.family_inventory.non_payload_aliases.saturating_sub(1);
     }

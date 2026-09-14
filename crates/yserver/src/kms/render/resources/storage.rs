@@ -14,8 +14,24 @@ pub(crate) struct PixelIdentity {
     pub allocation: AllocationKey,
     pub content_offset: (i32, i32),
     pub extent: vk::Extent2D,
+    pub format: vk::Format,
+    pub image_view: vk::ImageView,
+    pub sample_view: vk::ImageView,
+    pub image: vk::Image,
 }
 
+/// F11-B1: `current_layout` lives ONLY on the `StorageAllocation`
+/// payload behind `allocation`'s reservation -- there is no
+/// lease-local copy. A lease-local `Cell<vk::ImageLayout>` (F-11)
+/// let every `retain_storage`/`share_storage_read` copy snapshot the
+/// layout independently and let the plain `Storage::current_layout`/
+/// `set_current_layout` accessors mutate it with no reservation at
+/// all, so a live `Read` reservation didn't stop the plain arm from
+/// racing `record_layout_transition_managed`'s `with_storage_write`
+/// path, and the entry payload, the drawable's lease and a twin lease
+/// could disagree about one image's layout. Read/write it via
+/// `ResourceService::with_storage_read`/`with_storage_write` (see
+/// `Storage::current_layout`/`set_current_layout` in `store.rs`).
 #[derive(Debug)]
 pub(crate) struct StorageLease {
     pub allocation: AllocationLease,
@@ -182,4 +198,5 @@ impl Drop for StorageAllocation {
 pub(crate) enum StorageBacking {
     Legacy(StorageAllocation),
     Managed(StorageLease),
+    Detached,
 }

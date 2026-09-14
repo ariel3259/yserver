@@ -41,6 +41,7 @@ pub(crate) struct RoleReservation {
 }
 
 impl RoleReservation {
+    #[cfg(test)]
     pub(crate) fn new_for_test(role: DirectRole, serial: u64, closed: Rc<Cell<bool>>) -> Self {
         Self {
             role,
@@ -191,9 +192,7 @@ impl DirectCapacity {
         mut slot: RoleReservation,
     ) -> Result<(), (ResourceError, RoleReservation)> {
         let idx = slot.role.index();
-        if self.roles[idx] == RoleState::Occupied(slot.serial)
-            || self.roles[idx] == RoleState::Reserved(slot.serial)
-        {
+        if self.roles[idx] == RoleState::Occupied(slot.serial) {
             self.roles[idx] = RoleState::Vacant;
             slot.discharged = true;
             Ok(())

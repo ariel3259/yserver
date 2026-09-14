@@ -75,6 +75,7 @@ use yserver_protocol::x11::xfixes;
 use super::{
     platform::{FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
     region::Region,
+    resources::{AllocationKey, CoreRetirementBatch, ResourceError, ResourceService},
     scanout_damage::ScanoutDamage,
     scene_diff::{
         ParticipantId, PresenceSignature, ScenePresence, SceneRole, presence_from_place,
@@ -213,6 +214,7 @@ struct PendingAck {
     /// the submitted frame. `None` when the cursor is hidden on
     /// this output.
     last_present_cursor_version_after_retire: Option<u64>,
+    managed_batch: Option<CoreRetirementBatch>,
 }
 
 /// Stage 5 Phase C — pure result of the cursor-plane strategy
@@ -351,12 +353,12 @@ struct FailedSubmitBo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeferredSceneRelease {
-    PoolSlot(usize),
+    PoolSlot(usize, Option<AllocationKey>),
     FailedSubmit { bo_idx: usize, pool_slot: usize },
 }
 
 fn drain_deferred_scene_resources<W, R>(
-    pending_pool_releases: &mut VecDeque<(usize, FenceTicket)>,
+    pending_pool_releases: &mut VecDeque<(usize, FenceTicket, Option<AllocationKey>)>,
     failed_submit_bos: &mut VecDeque<FailedSubmitBo>,
     mut wait: W,
     mut release: R,
@@ -365,11 +367,11 @@ fn drain_deferred_scene_resources<W, R>(
     R: FnMut(DeferredSceneRelease) -> bool,
 {
     let mut retained_pool_releases = VecDeque::with_capacity(pending_pool_releases.len());
-    while let Some((slot, ticket)) = pending_pool_releases.pop_front() {
-        if wait(&ticket) && release(DeferredSceneRelease::PoolSlot(slot)) {
+    while let Some((slot, ticket, managed_key)) = pending_pool_releases.pop_front() {
+        if wait(&ticket) && release(DeferredSceneRelease::PoolSlot(slot, managed_key)) {
             continue;
         }
-        retained_pool_releases.push_back((slot, ticket));
+        retained_pool_releases.push_back((slot, ticket, managed_key));
     }
     *pending_pool_releases = retained_pool_releases;
 
@@ -465,7 +467,7 @@ struct OutputSceneState {
     /// release to this queue and drain it on the next opportunity
     /// (next tick / pageflip-complete) once `ticket.poll_signaled`
     /// returns true. Mirrors `failed_submit_bos` / `retire_failed_submit_bos`.
-    pending_pool_releases: VecDeque<(usize, FenceTicket)>,
+    pending_pool_releases: VecDeque<(usize, FenceTicket, Option<AllocationKey>)>,
     /// GPU-submitted frames whose atomic commit was rejected.
     /// Keep both BO and descriptor-pool slot alive until the
     /// compose fence signals, then recycle them locally because
@@ -1778,7 +1780,11 @@ impl SceneCompositor {
     /// — `device_wait_idle` is the safe fallback the platform
     /// uses anyway. Releases descriptor-pool slots so the
     /// pool-ring's Drop doesn't fire while slots are still in use.
-    pub(crate) fn drain_all(&mut self, platform: &mut PlatformBackend) {
+    pub(crate) fn drain_all(
+        &mut self,
+        platform: &mut PlatformBackend,
+        mut resource_service: Option<&mut ResourceService>,
+    ) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -1799,7 +1805,7 @@ impl SceneCompositor {
             // descriptorPool-00313 satisfied during teardown too.
             let mut retained_acks = VecDeque::with_capacity(o.pending_acks.len());
             let mut retained_slots = VecDeque::with_capacity(o.pool_slots.len());
-            while let Some(ack) = o.pending_acks.pop_front() {
+            while let Some(mut ack) = o.pending_acks.pop_front() {
                 let slot = o.pool_slots.pop_front();
                 let wait_ok = ack
                     .ticket
@@ -1819,7 +1825,17 @@ impl SceneCompositor {
                     if let Some(slot) = slot {
                         o.pool_ring.release(slot);
                     }
+                    if let Some(batch) = ack.managed_batch.take()
+                        && let Some(service) = resource_service.as_deref_mut()
+                    {
+                        service.register_batch(batch);
+                    }
                 } else {
+                    if let Some(batch) = ack.managed_batch.take()
+                        && let Some(service) = resource_service.as_deref_mut()
+                    {
+                        service.quarantine_gpu_batch(batch, ResourceError::Frozen);
+                    }
                     retained_acks.push_back(ack);
                     if let Some(slot) = slot {
                         retained_slots.push_back(slot);
@@ -1855,11 +1871,29 @@ impl SceneCompositor {
                     }
                 },
                 |release| match release {
-                    DeferredSceneRelease::PoolSlot(slot) => {
+                    DeferredSceneRelease::PoolSlot(slot, key) => {
+                        if let Some(k) = key
+                            && let Some(service) = resource_service.as_deref()
+                            && !service.is_releasable(&k)
+                        {
+                            return false;
+                        }
                         pool_ring.release(slot);
                         true
                     }
                     DeferredSceneRelease::FailedSubmit { bo_idx, pool_slot } => {
+                        let managed_key = platform
+                            .scanout_pools
+                            .get(output_idx)
+                            .and_then(Option::as_ref)
+                            .and_then(|p| p.display_pool().bos.get(bo_idx))
+                            .and_then(|bo| bo.managed_key());
+                        if let Some(key) = managed_key
+                            && let Some(service) = resource_service.as_deref()
+                            && !service.is_releasable(&key)
+                        {
+                            return false;
+                        }
                         match platform.recycle_failed_submit_bo(output_idx, bo_idx) {
                             Ok(()) => {
                                 pool_ring.release(pool_slot);
@@ -1914,6 +1948,7 @@ impl SceneCompositor {
         windows: &super::backend::WindowsMap,
         telemetry: &mut Telemetry,
         cow_host_xid: Option<u32>,
+        mut resource_service: Option<&mut ResourceService>,
     ) -> Result<Vec<usize>, SceneError> {
         // Destructure so `inner` (mutable) and `root_overlay` (shared)
         // are borrowed as disjoint fields: `tick_one_output` needs
@@ -2007,6 +2042,7 @@ impl SceneCompositor {
                 &mut had_pieces,
                 structure_dirty,
                 pending_presentation,
+                resource_service.as_deref_mut(),
             ) {
                 Ok(outcome) => {
                     if outcome == TickOutcome::Composed {
@@ -2088,6 +2124,7 @@ impl SceneCompositor {
         output_idx: usize,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
+        mut resource_service: Option<&mut ResourceService>,
     ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
@@ -2125,6 +2162,11 @@ impl SceneCompositor {
             return false;
         }
         if let Some(ack) = state.pending_acks.pop_front() {
+            if let Some(batch) = ack.managed_batch
+                && let Some(service) = resource_service.as_deref_mut()
+            {
+                service.register_batch(batch);
+            }
             // Ack each per-drawable damage snapshot. Snapshots
             // from paint that landed after the tick's peek
             // survive (per I5 epoch semantics).
@@ -2176,22 +2218,48 @@ impl SceneCompositor {
             // otherwise defer to `pending_pool_releases` for the
             // drain pass to handle on a later tick.
             if let Some(slot) = state.pool_slots.pop_front() {
+                let managed_key = platform
+                    .scanout_pools
+                    .get(output_idx)
+                    .and_then(Option::as_ref)
+                    .and_then(|p| p.display_pool().bos.get(ack.bo_idx))
+                    .and_then(|bo| bo.managed_key());
                 match &ack.ticket {
                     None => state.pool_ring.release(slot),
-                    Some(t) => match t.poll_signaled_result(&inner.vk) {
-                        Ok(true) => state.pool_ring.release(slot),
-                        Ok(false) => {
-                            state.pending_pool_releases.push_back((slot, t.clone()));
+                    Some(t) => {
+                        let releasable = match (managed_key, resource_service.as_deref()) {
+                            (Some(key), Some(service)) => service.is_releasable(&key),
+                            _ => true,
+                        };
+                        if releasable {
+                            match t.poll_signaled_result(&inner.vk) {
+                                Ok(true) => state.pool_ring.release(slot),
+                                Ok(false) => {
+                                    state.pending_pool_releases.push_back((
+                                        slot,
+                                        t.clone(),
+                                        managed_key,
+                                    ));
+                                }
+                                Err(error) => {
+                                    log::error!(
+                                        "render scene: compose fence status failed at pageflip \
+                                         retirement: {error:?}"
+                                    );
+                                    platform.renderer_failed = true;
+                                    state.pending_pool_releases.push_back((
+                                        slot,
+                                        t.clone(),
+                                        managed_key,
+                                    ));
+                                }
+                            }
+                        } else {
+                            state
+                                .pending_pool_releases
+                                .push_back((slot, t.clone(), managed_key));
                         }
-                        Err(error) => {
-                            log::error!(
-                                "render scene: compose fence status failed at pageflip \
-                                 retirement: {error:?}"
-                            );
-                            platform.renderer_failed = true;
-                            state.pending_pool_releases.push_back((slot, t.clone()));
-                        }
-                    },
+                    }
                 }
             }
             // Commit the BO's new last_present_generation in the
@@ -2769,29 +2837,45 @@ fn retire_failed_submit_bos(
     output_idx: usize,
     platform: &mut PlatformBackend,
     vk: &crate::kms::vk::device::VkContext,
+    resource_service: Option<&ResourceService>,
 ) {
     let mut remaining = VecDeque::with_capacity(state.failed_submit_bos.len());
     while let Some(failed) = state.failed_submit_bos.pop_front() {
         match failed.ticket.poll_signaled_result(vk) {
-            Ok(true) => match platform.recycle_failed_submit_bo(output_idx, failed.bo_idx) {
-                Ok(()) => {
-                    state.pool_ring.release(failed.pool_slot);
-                    log::debug!(
-                        "render scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
-                        failed.bo_idx,
-                        failed.pool_slot,
-                    );
-                }
-                Err(error) => {
-                    log::error!(
-                        "render scene: failed-submit recovery failed for output {output_idx} \
-                         bo {}: {error}",
-                        failed.bo_idx,
-                    );
-                    platform.renderer_failed = true;
+            Ok(true) => {
+                let managed_key = platform
+                    .scanout_pools
+                    .get(output_idx)
+                    .and_then(Option::as_ref)
+                    .and_then(|p| p.display_pool().bos.get(failed.bo_idx))
+                    .and_then(|bo| bo.managed_key());
+                if let Some(key) = managed_key
+                    && let Some(service) = resource_service
+                    && !service.is_releasable(&key)
+                {
                     remaining.push_back(failed);
+                    continue;
                 }
-            },
+                match platform.recycle_failed_submit_bo(output_idx, failed.bo_idx) {
+                    Ok(()) => {
+                        state.pool_ring.release(failed.pool_slot);
+                        log::debug!(
+                            "render scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
+                            failed.bo_idx,
+                            failed.pool_slot,
+                        );
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "render scene: failed-submit recovery failed for output {output_idx} \
+                             bo {}: {error}",
+                            failed.bo_idx,
+                        );
+                        platform.renderer_failed = true;
+                        remaining.push_back(failed);
+                    }
+                }
+            }
             Ok(false) => remaining.push_back(failed),
             Err(error) => {
                 log::error!(
@@ -2817,19 +2901,27 @@ fn drain_pending_pool_releases(
     state: &mut OutputSceneState,
     vk: &crate::kms::vk::device::VkContext,
     platform: &mut PlatformBackend,
+    resource_service: Option<&ResourceService>,
 ) {
     if state.pending_pool_releases.is_empty() {
         return;
     }
     let mut remaining = VecDeque::with_capacity(state.pending_pool_releases.len());
-    while let Some((slot, ticket)) = state.pending_pool_releases.pop_front() {
+    while let Some((slot, ticket, managed_key)) = state.pending_pool_releases.pop_front() {
+        if let Some(key) = managed_key
+            && let Some(service) = resource_service
+            && !service.is_releasable(&key)
+        {
+            remaining.push_back((slot, ticket, managed_key));
+            continue;
+        }
         match ticket.poll_signaled_result(vk) {
             Ok(true) => state.pool_ring.release(slot),
-            Ok(false) => remaining.push_back((slot, ticket)),
+            Ok(false) => remaining.push_back((slot, ticket, managed_key)),
             Err(error) => {
                 log::error!("render scene: deferred pool fence status failed: {error:?}");
                 platform.renderer_failed = true;
-                remaining.push_back((slot, ticket));
+                remaining.push_back((slot, ticket, managed_key));
             }
         }
     }
@@ -3973,6 +4065,7 @@ fn tick_one_output(
     // `walk_needed`.
     structure_dirty: bool,
     pending_presentation: bool,
+    resource_service: Option<&mut ResourceService>,
 ) -> Result<TickOutcome, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -3995,14 +4088,20 @@ fn tick_one_output(
     {
         let vk = Arc::clone(&inner.vk);
         let s = inner.outputs.get_mut(output_idx).expect("range");
-        retire_failed_submit_bos(s, output_idx, platform, vk.as_ref());
+        retire_failed_submit_bos(
+            s,
+            output_idx,
+            platform,
+            vk.as_ref(),
+            resource_service.as_deref(),
+        );
         // B.2-context fix (vkdebug VUID-vkResetDescriptorPool-00313):
         // drain any deferred descriptor-pool slot releases whose
         // compose fence has now signaled. Deferred entries are
         // queued at `handle_page_flip_complete` when the GPU hadn't
         // yet finished the compose CB at KMS pageflip time;
         // releasing the slot then would have tripped the VUID.
-        drain_pending_pool_releases(s, vk.as_ref(), platform);
+        drain_pending_pool_releases(s, vk.as_ref(), platform, resource_service.as_deref());
         if !s.pending_acks.is_empty() {
             record_tick_skip(s, output_idx, TickSkipReason::PendingAcks, 0);
             return Ok(TickOutcome::Skipped(TickSkipReason::PendingAcks));
@@ -4606,9 +4705,10 @@ fn tick_one_output(
     // Full and re-clears every frame, so only the shared path reports it.
     let mut compose_complete = true;
     let record_start = std::time::Instant::now();
-    let (render_result, previous_gpu_ns, copied_prepare_failed) = match pool {
+    let (render_result, previous_gpu_ns, copied_prepare_failed, managed_batch) = match pool {
         OutputScanout::Shared(pool) => {
             let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            let mut managed_batch = None;
             let result = submit_shared_scanout_frame(
                 &inner.vk,
                 &drm_device,
@@ -4619,18 +4719,20 @@ fn tick_one_output(
                 render_scene,
                 repaint,
                 &plan.scissors,
-                compose_ticket.fence(),
+                &compose_ticket,
                 &mut gpu_submitted,
                 &overlay_ops,
                 xor_pipeline,
                 xor_layout,
                 legacy_write_permitted,
+                resource_service,
             )
-            .map(|submitted| {
+            .map(|(submitted, batch)| {
                 compose_complete = compose_submit_was_complete(submitted, render_scene.draws.len());
+                managed_batch = batch;
                 None
             });
-            (result, bo.last_gpu_render_ns.take(), false)
+            (result, bo.last_gpu_render_ns.take(), false, managed_batch)
         }
         OutputScanout::Copied(pool) => {
             let source = pool.sources.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
@@ -4664,6 +4766,7 @@ fn tick_one_output(
                     .map_err(CopiedRenderSubmitError::into_present),
                 source.last_gpu_render_ns.take(),
                 copied_prepare_failed,
+                None,
             )
         }
     };
@@ -4715,6 +4818,7 @@ fn tick_one_output(
                 cursor_mode_after_retire,
                 last_present_cursor_rect_after_retire: built.new_cursor_rect,
                 last_present_cursor_version_after_retire: built.cursor_record_version,
+                managed_batch,
             });
             state.current_generation = frame_gen;
             // Step 3 — stage the frame that just succeeded. Deliberately here
@@ -5624,7 +5728,7 @@ fn build_scene_with(
         Option<u64>,
     ) = if let Some(cur) = cursor
         && let Some(drawable) = store.get(cur.id)
-        && drawable.storage.image_view != vk::ImageView::null()
+        && drawable.storage.has_image_view()
     {
         let cw = i32::try_from(cur.extent.width).unwrap_or(i32::MAX);
         let ch = i32::try_from(cur.extent.height).unwrap_or(i32::MAX);
@@ -5665,7 +5769,7 @@ fn build_scene_with(
                 let draw_index = draws.len();
                 let sampled_index = sampled_ids.len();
                 draws.push(CompositeDraw {
-                    image_view: drawable.storage.sample_view,
+                    image_view: drawable.storage.sample_view(),
                     #[allow(clippy::cast_precision_loss)]
                     dst_origin: [dx as f32, dy as f32],
                     #[allow(clippy::cast_precision_loss)]
@@ -5751,12 +5855,12 @@ fn root_node(
     // sampled storage handle reroutes.
     let source_id = store.redirected_target(id).unwrap_or(id);
     let source = store.get(source_id)?;
-    if source.storage.image_view == vk::ImageView::null() {
+    if !source.storage.has_image_view() {
         return None;
     }
     let dx = -layout_x0;
     let dy = -layout_y0;
-    let host = drawable.storage.extent;
+    let host = drawable.storage.extent();
     let full = vk::Rect2D {
         offset: vk::Offset2D { x: dx, y: dy },
         extent: host,
@@ -5773,7 +5877,7 @@ fn root_node(
             )
             .into_iter()
             .collect(),
-            source.storage.extent,
+            source.storage.extent(),
         ),
     };
     Some(RootNode {
@@ -5783,7 +5887,7 @@ fn root_node(
         // format/depth-aware swizzle (depth-24 → α=ONE).
         // See `Storage::sample_view` for why scene draws
         // MUST NOT bind `image_view` directly.
-        view: source.storage.sample_view,
+        view: source.storage.sample_view(),
         place,
         dx,
         dy,
@@ -6592,9 +6696,9 @@ fn decide_node(
         // Only the sampled storage handle reroutes.
         let source_id = layout_source_id.unwrap_or(id);
         let source = store.get(source_id);
-        let source_view_null = source.is_none_or(|s| s.storage.image_view == vk::ImageView::null());
-        let source_view = source.map_or(vk::ImageView::null(), |s| s.storage.sample_view);
-        let source_extent = source.map_or(vk::Extent2D::default(), |s| s.storage.extent);
+        let source_view_null = source.is_none_or(|s| !s.storage.has_image_view());
+        let source_view = source.map_or(vk::ImageView::null(), |s| s.storage.sample_view());
+        let source_extent = source.map_or(vk::Extent2D::default(), |s| s.storage.extent());
 
         // Audit #3 (2026-05-19) — emit-or-skip is governed by
         // "is this window's storage where paint actually lands?"
@@ -6648,8 +6752,8 @@ fn decide_node(
             d_depth: d.depth,
             d_refcount: d.refcount,
             d_part: d.scene_participating,
-            d_extent: d.storage.extent,
-            d_view_null: d.storage.image_view == vk::ImageView::null(),
+            d_extent: d.storage.extent(),
+            d_view_null: !d.storage.has_image_view(),
             source_id,
             source_view_null,
             source_view,
@@ -7527,6 +7631,79 @@ impl ComposeRenderTarget for ScanoutBo {
     }
 }
 
+struct ManagedSharedComposeTarget<'a> {
+    bo: &'a mut ScanoutBo,
+    shared: &'a mut crate::kms::render::resources::scanout::SharedBacking,
+}
+
+impl<'a> ComposeRenderTarget for ManagedSharedComposeTarget<'a> {
+    fn image(&self) -> vk::Image {
+        self.shared.image
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.shared.view
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.shared.transfer.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        self.bo.vk_semaphore
+    }
+
+    fn width(&self) -> u32 {
+        self.bo.width
+    }
+
+    fn height(&self) -> u32 {
+        self.bo.height
+    }
+
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        self.shared.transfer.timestamp_pool
+    }
+
+    fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
+        self.bo.last_gpu_render_ns = value;
+    }
+
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
+        Ok(PostComposePreparation::Shared)
+    }
+
+    fn record_post_compose(
+        &self,
+        vk: &crate::kms::vk::device::VkContext,
+        command_buffer: vk::CommandBuffer,
+        preparation: PostComposePreparation,
+    ) {
+        debug_assert!(matches!(preparation, PostComposePreparation::Shared));
+        let to_scanout = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::empty())
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(self.shared.image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            )];
+        crate::vk_count!(cmd_pipeline_barrier2);
+        unsafe {
+            vk.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_scanout),
+            );
+        }
+    }
+}
+
 impl ComposeRenderTarget for CopiedRenderSource {
     fn image(&self) -> vk::Image {
         self.image()
@@ -7660,7 +7837,7 @@ impl ComposeRenderTarget for DamageAuditTarget {
 /// Render directly into the KMS framebuffer and immediately queue its flip.
 #[allow(clippy::too_many_arguments)]
 fn submit_shared_scanout_frame(
-    vk: &crate::kms::vk::device::VkContext,
+    vk: &Arc<crate::kms::vk::device::VkContext>,
     drm: &crate::drm::Device,
     output: &crate::platform::drm::Output,
     bo: &mut ScanoutBo,
@@ -7669,39 +7846,163 @@ fn submit_shared_scanout_frame(
     scene: &CompositeScene,
     repaint: Repaint,
     scissors: &[vk::Rect2D],
-    signal_fence: vk::Fence,
+    compose_ticket: &FenceTicket,
     gpu_submitted: &mut bool,
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
     legacy_write_permitted: bool,
-) -> Result<ComposeSubmit, PresentError> {
+    resource_service: Option<&mut ResourceService>,
+) -> Result<(ComposeSubmit, Option<CoreRetirementBatch>), PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
-    if bo.state.phase != BoPhase::Free {
+    let Some(key) = bo.managed_key() else {
+        if bo.state.phase != BoPhase::Free {
+            return Err(PresentError::WrongPhase(bo.state.phase));
+        }
+        let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
+        bo.state.transition_to_recording();
+        let submitted = record_and_submit_render(
+            vk,
+            bo,
+            pipeline,
+            descriptor_pool,
+            scene,
+            repaint,
+            scissors,
+            compose_ticket.fence(),
+            gpu_submitted,
+            overlay_ops,
+            xor_pipeline,
+            xor_layout,
+        )?;
+
+        let fd = bo
+            .export_signaled_fd()
+            .map_err(PresentError::Vk)?
+            .map_or(-1, IntoRawFd::into_raw_fd);
+        bo.state.transition_to_submitted(fd);
+
+        let mut out_fence: i32 = -1;
+        return match crate::drm::page_flip::submit_flip_with_fences(
+            drm,
+            output,
+            fb_handle,
+            fd,
+            &mut out_fence,
+            legacy_write_permitted,
+        ) {
+            Ok(()) => {
+                if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
+                    // SAFETY: `reclaimed` was inserted by
+                    // `transition_to_submitted` above.
+                    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
+                }
+                Ok((submitted, None))
+            }
+            Err(error) => {
+                if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
+                    // SAFETY: same fd we just inserted.
+                    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
+                }
+                if out_fence >= 0 {
+                    // Defensive: OUT_FENCE_PTR should only be written on success.
+                    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
+                }
+                Err(PresentError::Io(error))
+            }
+        };
+    };
+
+    let service = resource_service.ok_or_else(|| {
+        PresentError::Io(std::io::Error::other(
+            "managed scanout bo without resource service",
+        ))
+    })?;
+
+    if bo.state.phase != BoPhase::Recording && bo.state.phase != BoPhase::Free {
         return Err(PresentError::WrongPhase(bo.state.phase));
     }
-    let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
-    bo.state.transition_to_recording();
-    let submitted = record_and_submit_render(
-        vk,
-        bo,
-        pipeline,
-        descriptor_pool,
-        scene,
-        repaint,
-        scissors,
-        signal_fence,
-        gpu_submitted,
-        overlay_ops,
-        xor_pipeline,
-        xor_layout,
-    )?;
+    if bo.state.phase == BoPhase::Free {
+        bo.state.transition_to_recording();
+    }
 
-    let fd = bo
-        .export_signaled_fd()
-        .map_err(PresentError::Vk)?
-        .map_or(-1, IntoRawFd::into_raw_fd);
+    let (mut batch, entries) =
+        crate::kms::render::resources::gpu::prepare_retirement_batch(service, &[key], Vec::new())
+            .map_err(|e| {
+            PresentError::Io(std::io::Error::other(format!(
+                "prepare_retirement_batch: {e:?}"
+            )))
+        })?;
+
+    let write_lease = &batch.leases()[0];
+    let render_res = service.with_scanout_write(write_lease, |alloc| {
+        let fb = alloc
+            .file_owned
+            .as_ref()
+            .and_then(|fo| fo.fb_handle())
+            .or(bo.fb_handle)
+            .ok_or(PresentError::NoFb)?;
+        let mut target = ManagedSharedComposeTarget {
+            bo,
+            shared: &mut alloc.shared,
+        };
+        let sub = record_and_submit_render(
+            vk,
+            &mut target,
+            pipeline,
+            descriptor_pool,
+            scene,
+            repaint,
+            scissors,
+            compose_ticket.fence(),
+            gpu_submitted,
+            overlay_ops,
+            xor_pipeline,
+            xor_layout,
+        )?;
+        Ok((sub, fb))
+    });
+
+    let (submitted, fb_handle) = match render_res {
+        Ok(Ok((sub, fb))) => (sub, fb),
+        Ok(Err(render_err)) => {
+            if *gpu_submitted {
+                let _ =
+                    crate::kms::render::resources::gpu::freeze_uncertain_batch(service, &entries);
+            } else {
+                let _ =
+                    crate::kms::render::resources::gpu::cancel_pre_submit_batch(service, &entries);
+            }
+            return Err(render_err);
+        }
+        Err(res_err) => {
+            if *gpu_submitted {
+                let _ =
+                    crate::kms::render::resources::gpu::freeze_uncertain_batch(service, &entries);
+            } else {
+                let _ =
+                    crate::kms::render::resources::gpu::cancel_pre_submit_batch(service, &entries);
+            }
+            return Err(PresentError::Io(std::io::Error::other(format!(
+                "with_scanout_write: {res_err:?}"
+            ))));
+        }
+    };
+
+    batch.bind_ticket(crate::kms::render::resources::GpuObligation::new(
+        entries,
+        compose_ticket.clone(),
+        Arc::clone(vk),
+    ));
+
+    let fd = match bo.export_signaled_fd() {
+        Ok(opt_fd) => opt_fd.map_or(-1, IntoRawFd::into_raw_fd),
+        Err(e) => {
+            service.register_batch(batch);
+            return Err(PresentError::Vk(e));
+        }
+    };
     bo.state.transition_to_submitted(fd);
 
     let mut out_fence: i32 = -1;
@@ -7719,7 +8020,7 @@ fn submit_shared_scanout_frame(
                 // `transition_to_submitted` above.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
             }
-            Ok(submitted)
+            Ok((submitted, Some(batch)))
         }
         Err(error) => {
             if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
@@ -7730,6 +8031,7 @@ fn submit_shared_scanout_frame(
                 // Defensive: OUT_FENCE_PTR should only be written on success.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
             }
+            service.register_batch(batch);
             Err(PresentError::Io(error))
         }
     }
@@ -8251,6 +8553,7 @@ mod tests {
         let mut pending = VecDeque::from([(
             3,
             crate::kms::render::platform::FenceTicket::for_tests_stub(),
+            None,
         )]);
         let mut failed = VecDeque::from([FailedSubmitBo {
             bo_idx: 7,
@@ -8279,7 +8582,7 @@ mod tests {
         assert_eq!(
             released,
             vec![
-                DeferredSceneRelease::PoolSlot(3),
+                DeferredSceneRelease::PoolSlot(3, None),
                 DeferredSceneRelease::FailedSubmit {
                     bo_idx: 7,
                     pool_slot: 5,
@@ -8293,6 +8596,7 @@ mod tests {
         let mut pending = VecDeque::from([(
             3,
             crate::kms::render::platform::FenceTicket::for_tests_stub(),
+            None,
         )]);
         let mut failed = VecDeque::from([FailedSubmitBo {
             bo_idx: 7,
@@ -8317,6 +8621,334 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].bo_idx, 7);
         assert_eq!(failed[0].pool_slot, 5);
+    }
+
+    // F4d-M1 (fix session F-13c): the four `is_releasable` gates F-4d added
+    // (`drain_pending_pool_releases`, `retire_failed_submit_bos`,
+    // `handle_page_flip_complete`'s pool-slot retirement arm and
+    // `drain_all`'s `DeferredSceneRelease::PoolSlot` release) had no test
+    // that would fail if all four were disabled -- the only decisive test
+    // (`c0_2ci_scene_managed_shared_compose_vulkan`) only ever reaches the
+    // flip-reject exit on this fixture (no DRM master). These tests drive
+    // each gate directly against a real `ResourceService`/`AllocationKey`
+    // (no `ResourceService` mock, per F3) with a registered `Gpu` obligation
+    // standing in for "not yet releasable," and `service.cancel` standing in
+    // for the obligation being discharged.
+
+    /// Builds a `PlatformBackend` with a live `VkContext` (no real DRM
+    /// device or ICD-backed allocation) plus one managed scanout bo at
+    /// `(output_idx=0, bo_idx=0)`, mirroring
+    /// `resources::adapter_tests::live_platform` +
+    /// `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`'s
+    /// fixture. Returns `None` when no Vulkan ICD is available (the caller
+    /// reports an environmental skip -- R12).
+    fn managed_pool_release_fixture() -> Option<(
+        PlatformBackend,
+        ResourceService,
+        crate::kms::render::resources::DrmCleanupRegistry,
+        AllocationKey,
+    )> {
+        use std::{cell::RefCell, rc::Rc};
+
+        use crate::kms::vk::scanout::ScanoutBoPool;
+
+        let mut platform = PlatformBackend::for_tests();
+        let vk = crate::kms::vk::device::VkContext::new().ok()?;
+        let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).ok()?;
+        let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
+        platform.vk = Some(Arc::clone(&vk));
+        platform.ops_command_pool = Some(ops_pool);
+        platform.fence_pool = Some(fence_pool);
+
+        let dev = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let inc = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(dev, inc);
+        let mut registry = crate::kms::render::resources::DrmCleanupRegistry::new_with_io(
+            dev,
+            inc,
+            Box::new(crate::kms::render::resources::tests::MockCleanupIo::new(
+                Rc::new(RefCell::new(Vec::new())),
+            )),
+        );
+
+        let bo_drm = Rc::new(crate::drm::Device::for_tests().expect("test drm device"));
+        let mut bo = ScanoutBo::for_tests(bo_drm, Arc::clone(&vk));
+        bo.fb_handle = Some(::drm::control::framebuffer::Handle::from(
+            std::num::NonZeroU32::new(9301).unwrap(),
+        ));
+        bo.gem_handle = Some(::drm::buffer::Handle::from(
+            std::num::NonZeroU32::new(9302).unwrap(),
+        ));
+
+        let mut pool = ScanoutBoPool::for_tests();
+        // Match `PlatformBackend::for_tests()`'s own output route, exactly
+        // as `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`
+        // does, so `debug_assert_scanout_pool_route` holds.
+        pool.route = crate::kms::scanout_route::ScanoutRoute::new(
+            crate::kms::scanout_route::RenderDeviceId::UnverifiedFallback,
+            crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 },
+            crate::kms::scanout_route::RenderKmsRelationship::Unknown,
+        );
+        pool.bos.push(bo);
+        platform.scanout_pools[0] = Some(OutputScanout::Shared(pool));
+        platform.bo_generations[0] = vec![Default::default()];
+
+        let key = platform
+            .register_managed_scanout_bo(&mut service, &mut registry, 0, 0)
+            .expect("register managed scanout bo");
+
+        Some((platform, service, registry, key))
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_drain_pending_pool_releases_gates_on_service_vulkan() {
+        use crate::kms::render::resources::ObligationKind;
+
+        let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
+        else {
+            panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
+        };
+        let vk = platform.vk.clone().expect("fixture installs vk");
+
+        let obligation = service
+            .register(key, ObligationKind::Gpu)
+            .expect("register gpu obligation");
+        assert!(!service.is_releasable(&key));
+
+        let mut scene = SceneCompositor::new(&platform).expect("build scene compositor");
+        let slot = {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            let slot = state.pool_ring.acquire().expect("acquire pool slot");
+            state
+                .pending_pool_releases
+                .push_back((slot, FenceTicket::for_tests_stub(), Some(key)));
+            slot
+        };
+
+        {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            drain_pending_pool_releases(state, &vk, &mut platform, Some(&service));
+            assert_eq!(
+                state.pending_pool_releases.len(),
+                1,
+                "F4d-M1: a not-releasable managed pool slot must stay queued"
+            );
+            assert_eq!(state.pending_pool_releases[0].0, slot);
+        }
+
+        service
+            .cancel(key, obligation)
+            .expect("discharge the gpu obligation");
+        assert!(service.is_releasable(&key));
+
+        let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+        drain_pending_pool_releases(state, &vk, &mut platform, Some(&service));
+        assert!(
+            state.pending_pool_releases.is_empty(),
+            "once releasable, the deferred pool slot must drain"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_retire_failed_submit_bos_gates_on_service_vulkan() {
+        use crate::kms::render::resources::ObligationKind;
+
+        let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
+        else {
+            panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
+        };
+        let vk = platform.vk.clone().expect("fixture installs vk");
+
+        let obligation = service
+            .register(key, ObligationKind::Gpu)
+            .expect("register gpu obligation");
+        assert!(!service.is_releasable(&key));
+
+        let mut scene = SceneCompositor::new(&platform).expect("build scene compositor");
+        let slot = {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            let slot = state.pool_ring.acquire().expect("acquire pool slot");
+            state.failed_submit_bos.push_back(FailedSubmitBo {
+                bo_idx: 0,
+                pool_slot: slot,
+                ticket: FenceTicket::for_tests_stub(),
+            });
+            slot
+        };
+
+        {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            retire_failed_submit_bos(state, 0, &mut platform, &vk, Some(&service));
+            assert_eq!(
+                state.failed_submit_bos.len(),
+                1,
+                "F4d-M1: a not-releasable failed-submit bo must stay queued"
+            );
+            assert_eq!(state.failed_submit_bos[0].pool_slot, slot);
+        }
+
+        service
+            .cancel(key, obligation)
+            .expect("discharge the gpu obligation");
+        assert!(service.is_releasable(&key));
+
+        let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+        retire_failed_submit_bos(state, 0, &mut platform, &vk, Some(&service));
+        assert!(
+            state.failed_submit_bos.is_empty(),
+            "once releasable, the failed-submit bo must recycle"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_drain_all_gates_pool_slot_release_on_service_vulkan() {
+        use crate::kms::render::resources::ObligationKind;
+
+        let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
+        else {
+            panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
+        };
+
+        let obligation = service
+            .register(key, ObligationKind::Gpu)
+            .expect("register gpu obligation");
+        assert!(!service.is_releasable(&key));
+
+        let mut scene = SceneCompositor::new(&platform).expect("build scene compositor");
+        {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            let slot = state.pool_ring.acquire().expect("acquire pool slot");
+            state
+                .pending_pool_releases
+                .push_back((slot, FenceTicket::for_tests_stub(), Some(key)));
+        }
+
+        scene.drain_all(&mut platform, Some(&mut service));
+        assert_eq!(
+            scene.inner.as_ref().unwrap().outputs[0]
+                .pending_pool_releases
+                .len(),
+            1,
+            "F4d-M1: drain_all must not release a not-releasable managed pool slot"
+        );
+
+        service
+            .cancel(key, obligation)
+            .expect("discharge the gpu obligation");
+        assert!(service.is_releasable(&key));
+
+        scene.drain_all(&mut platform, Some(&mut service));
+        assert!(
+            scene.inner.as_ref().unwrap().outputs[0]
+                .pending_pool_releases
+                .is_empty(),
+            "once releasable, drain_all must release the deferred pool slot"
+        );
+    }
+
+    /// F4d-M1's second required test: a `PendingAck` carrying a
+    /// `managed_batch` driven through `handle_page_flip_complete` must
+    /// register that batch with the service (the call the F-4d fold-back
+    /// cites at `scene.rs:2165`), and the pool-slot retirement arm at the
+    /// same call must defer release while the batch's key is not yet
+    /// releasable -- gate (c) of the same finding.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_handle_page_flip_complete_registers_managed_batch_vulkan() {
+        use crate::kms::render::resources::{GpuObligation, ObligationKind};
+
+        let Some((mut platform, mut service, _registry, key)) = managed_pool_release_fixture()
+        else {
+            panic!("environmental skip: no live Vulkan ICD available; not claiming pass")
+        };
+        let vk = platform.vk.clone().expect("fixture installs vk");
+
+        // Hold the source key's obligation live so the pool-slot arm below
+        // must defer rather than release immediately (gate (c)).
+        let obligation = service
+            .register(key, ObligationKind::Gpu)
+            .expect("register gpu obligation");
+        assert!(!service.is_releasable(&key));
+
+        // Mark the managed bo as the kernel's one Pending buffer, exactly
+        // what a real submitted flip leaves behind, so
+        // `on_page_flip_complete` (pure bookkeeping, no ioctl) retires it.
+        match platform.scanout_pools[0].as_mut().unwrap() {
+            OutputScanout::Shared(pool) => pool.bos[0].state.phase = BoPhase::Pending,
+            OutputScanout::Copied(_) => panic!("expected Shared pool"),
+        }
+
+        let mut batch = CoreRetirementBatch::new(Vec::new(), Vec::new(), true);
+        batch.bind_ticket(GpuObligation::for_tests_stub(
+            vec![(key, obligation)],
+            FenceTicket::for_tests_stub(),
+        ));
+
+        let mut scene = SceneCompositor::new(&platform).expect("build scene compositor");
+        let slot = {
+            let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+            let slot = state.pool_ring.acquire().expect("acquire pool slot");
+            state.pool_slots.push_back(slot);
+            state.pending_acks.push_back(PendingAck {
+                bo_idx: 0,
+                generation: 1,
+                stage: InFlightStage::KmsFlipPending,
+                drawable_snapshots: Vec::new(),
+                ticket: Some(FenceTicket::for_tests_stub()),
+                submitted_output_damage: RegionSet::new(),
+                submitted_participants: Vec::new(),
+                submitted_scene_structure_damage: RegionSet::new(),
+                submitted_failed_repaint: RegionSet::new(),
+                cursor_transition: None,
+                cursor_prev_pos_after_retire: None,
+                cursor_mode_after_retire: OutputCursorMode::Hidden,
+                last_present_cursor_rect_after_retire: None,
+                last_present_cursor_version_after_retire: None,
+                managed_batch: Some(batch),
+            });
+            slot
+        };
+
+        let mut store = DrawableStore::new();
+        let retired =
+            scene.handle_page_flip_complete(0, &mut store, &mut platform, Some(&mut service));
+        assert!(retired, "flip-complete must retire the staged ack");
+
+        assert_eq!(
+            service.pending_batches().len(),
+            1,
+            "F4d-M1: managed_batch must be registered with the service at flip completion"
+        );
+
+        {
+            let state = &scene.inner.as_ref().unwrap().outputs[0];
+            assert!(
+                state.pool_slots.is_empty(),
+                "the ack's pool slot must have been popped"
+            );
+            assert_eq!(
+                state.pending_pool_releases.len(),
+                1,
+                "F4d-M1: the pool-slot retirement arm must defer release while the \
+                 managed key is not yet releasable"
+            );
+            assert_eq!(state.pending_pool_releases[0].0, slot);
+        }
+
+        // Discharge the obligation and prove the deferred slot actually
+        // drains through the ordinary drain path.
+        service
+            .cancel(key, obligation)
+            .expect("discharge the gpu obligation");
+        let state = &mut scene.inner.as_mut().unwrap().outputs[0];
+        drain_pending_pool_releases(state, &vk, &mut platform, Some(&service));
+        assert!(state.pending_pool_releases.is_empty());
     }
 
     // Stage 5 Phase G — strategy decision unit tests. Verify the
@@ -9200,6 +9832,7 @@ mod tests {
                 &mut platform,
                 &windows,
                 &mut telemetry,
+                None,
                 None,
             )
             .expect_err("stub must reject tick");
@@ -10327,7 +10960,7 @@ mod tests {
 
         // Confirm W and B have distinct image_views.
         let w_id = store.lookup(0x100).expect("w_id present");
-        let w_view = store.get(w_id).expect("w drawable").storage.image_view;
+        let w_view = store.get(w_id).expect("w drawable").storage.image_view();
         assert_ne!(
             w_view, b_view,
             "fixture sanity: W and B must have distinct sentinel views"
@@ -11745,8 +12378,8 @@ mod tests {
                     d.depth,
                     d.refcount,
                     d.scene_participating,
-                    d.storage.extent,
-                    d.storage.image_view == vk::ImageView::null(),
+                    d.storage.extent(),
+                    !d.storage.has_image_view(),
                 )
             });
             if let Some((d_id, d_kind, d_depth, d_refcount, d_part, d_extent, d_view_null)) =
@@ -11759,7 +12392,7 @@ mod tests {
                 let source_id = store.redirected_target(id).unwrap_or(id);
                 let source_view_null = store
                     .get(source_id)
-                    .is_none_or(|s| s.storage.image_view == vk::ImageView::null());
+                    .is_none_or(|s| !s.storage.has_image_view());
 
                 // Audit #3 (2026-05-19) — emit-or-skip is governed by
                 // "is this window's storage where paint actually lands?"
@@ -11915,7 +12548,7 @@ mod tests {
 
                 if matches!(d_kind, DrawableKind::Window)
                     && let Some(source) = store.get(source_id)
-                    && source.storage.image_view != vk::ImageView::null()
+                    && source.storage.has_image_view()
                     && intersects
                     && paint_target_is_self
                 {
@@ -11946,7 +12579,7 @@ mod tests {
                     // distinction. Pixels outside the bounding region
                     // are intentionally NOT drawn so the layer below
                     // (parent / wallpaper / root) shows through.
-                    let image_view = source.storage.sample_view;
+                    let image_view = source.storage.sample_view();
                     #[allow(clippy::cast_precision_loss)]
                     let win_w_f = win_w as f32;
                     #[allow(clippy::cast_precision_loss)]

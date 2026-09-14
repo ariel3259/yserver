@@ -1616,7 +1616,7 @@ impl FrameLayoutTable {
     /// Query the effective layout for `id` from the perspective of
     /// the next in-frame op that will touch it. Falls back to
     /// `storage_fallback` (the caller passes
-    /// `drawable.storage.current_layout` if the drawable isn't in
+    /// `drawable.storage.current_layout()` if the drawable isn't in
     /// the overlay yet).
     #[allow(
         dead_code,

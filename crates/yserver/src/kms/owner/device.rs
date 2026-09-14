@@ -1459,6 +1459,33 @@ impl<R> DeviceCommitOwner<R> {
         Ok(events)
     }
 
+    /// Quarantine a live record under stalled executor / handoff (round-4 M-2).
+    ///
+    /// Revoked or uncertain dispatches must not be cancelled; they are terminalized
+    /// as `CompletionUnknown` and emit `OwnerEvent::Quarantined`.
+    pub fn quarantine_live(&mut self) -> Vec<OwnerEvent<R>> {
+        let mut events = Vec::new();
+        if let Some(record) = self
+            .live
+            .as_mut()
+            .filter(|r| !matches!(r.state(), RecordState::Terminal(_)))
+        {
+            let commit = record.commit_id();
+            // F8-m1: a grant revoked mid-flight (incarnation handoff) is not
+            // "an outcome whose shape contradicts the request class" --
+            // nothing about this record's shape is in question, its write
+            // authority was pulled out from under it before it could
+            // complete or fail on its own.
+            let terminal = TerminalState::CompletionUnknown(UnknownCause::GrantRevokedInFlight);
+            record.terminalize(terminal);
+            let tombstone = record.tombstone().expect("terminal");
+            self.push_tombstone(tombstone);
+            events.push(OwnerEvent::Terminal { commit, terminal });
+            events.push(OwnerEvent::Quarantined { commit });
+        }
+        events
+    }
+
     /// Send the request `begin` built.
     ///
     /// A refusal from `send` before it installs `InFlight` — `Reaped`,

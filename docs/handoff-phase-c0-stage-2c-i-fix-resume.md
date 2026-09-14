@@ -1,17 +1,29 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
-**Kept current after every accepted session. Last update: 2026-09-12,
-after F-5b.** If you are resuming this work cold — a new
+**Kept current after every accepted session. Last update: 2026-09-14,
+after F-15's review. **STAGE 2c-i IS ACCEPTED.** Every fix session
+F-1..F-15 is accepted, the final stage review is complete in three scopes,
+and `docs/status.md` carries the acceptance entry. Twenty-six mutations
+across the review: nineteen caught on first contact, seven exposed gaps,
+all seven now closed. **This file's job is done** — the remaining work
+lives in 2c-ii's spec, which opens with the systematic per-guard-clause
+pass over Tasks 5–7 and carries F13b-D1, F13c-m1 and F13c-m2.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
 
 ## Why this file exists
 
-The user's Claude subscription ends **2026-09-28**. Sonnet's 5-hour
-session limit has cut long sessions mid-way twice. Every session must
-leave the branch coherent, and this file must say exactly where things
-stand so nothing is re-derived.
+Sessions get cut. The 5-hour window cut F-4, F-4c and F-5b; the account's
+**weekly** cap cut F-13c. Every session must therefore leave the branch
+coherent, and this file must say exactly where things stand so nothing is
+re-derived.
+
+**There is no calendar deadline any more.** The 2026-09-28 date this file
+used to open with belonged to the old, cancelled subscription, abandoned
+on 2026-09-12 when it hit its weekly cap; the work moved to the user's
+personal Pro account on 2026-09-14. Session *size* is the thing to manage,
+not the calendar: split work small enough to finish inside one window.
 
 ## The documents, in reading order for a cold start
 
@@ -27,7 +39,20 @@ stand so nothing is re-derived.
    do):
    `docs/superpowers/findings/2026-09-11-stage-2c-i-fix-F1-review.md`,
    `…-09-12-…-F2-review.md`, `…-F3-review.md`, `…-F4-review.md`,
-   `…-F4b-review.md`, `…-F4c-review.md`.
+   `…-F4b-review.md`, `…-F4c-review.md`, `…-F5a-review.md`,
+   `…-F5b-review.md`, `…-F6a-review.md`, `…-F6b-review.md`,
+   `…-F7-review.md`, `…-F8-review.md`, `…-09-13-…-F9-review.md`,
+   `…-09-13-…-F4d-review.md`, `…-09-13-…-F10-review.md`,
+   `…-09-13-…-F11-review.md`, `…-09-13-…-F12-review.md` (Gemini self-reviews, void),
+   `docs/superpowers/findings/2026-09-13-stage-2c-i-fix-F11-F12-opus-review.md`
+   and `…-fix-F7-F10-opus-review.md` (the binding ones for F-7..F-12),
+   `…-fix-F13a-review.md`, `…-fix-F13b-review.md`,
+   `docs/superpowers/findings/2026-09-14-stage-2c-i-fix-F13c-review.md`,
+   and the final stage review, three documents:
+   `…-2026-09-14-stage-2c-i-final-review-scope1.md` (Tasks 1–4, HOLDS),
+   `…-scope2.md` (Tasks 5–7, **the open findings live here**),
+   `…-scope3.md` (Tasks 8–10, HOLDS, plus the stage-wide verdict table),
+   `docs/superpowers/findings/2026-09-13-stage-2c-i-final-review.md` (void).
 6. The plan
    `docs/superpowers/plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md`
    — per-task `Status:` blocks carry every fix-round verdict table.
@@ -39,15 +64,28 @@ stand so nothing is re-derived.
 | F-1, F-1b | Task 2 (barrier, registry) | **ACCEPTED** | `95f9dba6`/`53f7ca23`, `13c75265`/`282ed2dc` | F1-review |
 | F-2, F-2b | Task 4 (scanout payloads, pool) | **ACCEPTED** | `fea5c043`/`08cb7b91`, `05555b03`/`98328b85` | F2-review |
 | F-3, F-3b | Task 3 (storage) | **ACCEPTED** (M-19 deferred) | `12c5926c`/`3677e4b6`, `36ab74a7`/`5c10f7ee` | F3-review |
-| F-4, F-4b, F-4c | Task 5 (GPU/read adapters) | **ACCEPTED** (write half → F-4d) | `17384ae6`, `f475b04c`, `4e870930` (+fold-backs) | F4/F4b/F4c-review |
+| F-4, F-4b, F-4c, **F-4d** | Task 5 (GPU/read/write adapters) | **ACCEPTED** | `17384ae6`, `f475b04c`, `4e870930`, `d96e1c4c`/`20a5461c` | F4/F4b/F4c/F4d-review |
 | F-5a | Task 6, resources half (per-batch deadline, gate sealing, B-6) | **ACCEPTED** (M-13 real impl → F-5b) | `5f025fed`/`265b228e` | F5a-review |
 | F-5b | Task 6, sinks half (B-10 at 7 sinks, 6.5a/6.5b, grant consumed at executor send, real `DirectOwnershipState`) | **ACCEPTED** (gamma `_drm` test → F-9) | `842745a3`/`4eb05029` | F5b-review |
-| **F-6** | Task 7 (`Terminal` by cause, one keyed release path, 7.6) | **NEXT** | — | — |
-| F-7 | Task 8 (role transitions, `on_available`) | pending | — | — |
-| F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | pending | — | — |
-| F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | pending | — | — |
-| F-4d | Task 5 write half (5.3/5.5: managed branch in `scene.rs` `submit_shared_scanout_frame`, `PendingAck` batch, `drain_pending_pool_releases`) | after F-9 | — | ruled in F4c-review |
-| F-10..F-12 | M-19 (180 `Storage` Deref accessor sites → lease accessors; 3 sessions: read-mostly consumers → `engine.rs` → `backend.rs`) + M-20 promotion half + F3-M1/F3-m1 | after F-4d | — | ruled in F3-review |
+| F-6a | Task 7, consumer half (B-8, B-9, M-2..M-5, M-15) | **ACCEPTED** | `c35af190`/`e40d0cb9` | F6a-review |
+| F-6b | Task 7, Present half (M-6: 7.5/7.5a, `PresentRelease`, COW test) | **ACCEPTED** | `8b0e00d6`/`a242a9da` | F6b-review |
+| F-7 | Task 8 (role transitions, `on_available`) | **REJECTED** (F7-B1 successor charge cancelled, F7-B2 unflip seam hollow) | `f39a01c6`/`11c15cf4` | F7-F10-opus-review |
+| F-8 | Task 9 (sealed barriers, revocation, 9.5 deterministic half) | **ACCEPTED** (F8-M1 husk counter unwired, F8-M2 returned descriptors never closed → F-13c) | `ac3c94f7`/`a6a3afe9` | F7-F10-opus-review |
+| F-9 | Task 10 (fixture matrix, 10.2 validation layers, status.md; + gamma `_drm` four-way test F5b-m1, F5b-m2) | **ACCEPTED** (F9-m1 → F-13c) | `a7139742`/`f14259e1` | F7-F10-opus-review |
+| F-4d | Task 5 write half (scene-submission managed write, 5.3/5.5) | **ACCEPTED** (F4d-M1: 5.5 gating and flip-accepted path untested → F-13c) | `d96e1c4c`/`20a5461c` | F7-F10-opus-review |
+| F-10 | Task 3 (M-19 read-mostly consumers: `scene.rs` 17 sites, `frame_builder.rs`, `target.rs` + F3-m1 `Detached`) | **ACCEPTED** | `ebae39e0`/`d7f66dbe` | F7-F10-opus-review |
+| F-11 | Task 3 (`RenderEngine` in `engine.rs`, 70 sites + M-20 promotion half) | **REJECTED** (F11-B1 layout Cell, F11-M1) | `5ab1795c`/`f43ef0fd` | F11-F12-opus-review |
+| F-12 | Task 3 (`KmsBackend` in `backend.rs`, 94 sites + F3-M1) | **REJECTED** (F11-B1 exploited, F12-m1..m3) | `96c10eab`/`67871480` | F11-F12-opus-review |
+| F-13a | Task 3: F11-B1 (delete `StorageLease::current_layout` Cell; layout accessors take the service; `record_layout_transition` on Managed via `_managed`; thread service to the engine layout sites), F11-M1, F12-m1..m3 | **ACCEPTED** (F13a-m1 → F-13c) | `4eb5a96b`/`75edc865` | F13a-review |
+| F-13b | Task 8 seam: F7-B1 (successor keeps its charge, occupy at dispatch, `prereserve_retirement` from the seam), F7-B2 (unflip reserves/moves `ExitRetirement`, waits) + success-path tests | **ACCEPTED** (F13b-D1 deferred to 2c-iii: dispatched `CommitResources` carries no leases) | `cc323714`/`5fa653d7` | F13b-review |
+| F-13c | Tests and wiring: F4d-M1, F8-M1, F8-M2, F8-m1, F9-m1, F13a-m1 | **ACCEPTED** (F13c-m1, F13c-m2 → 2c-ii) | `c0918b22`/`526b0085` | F13c-review |
+| Final review, scope 1 | Tasks 1–4 | **HOLDS** (7 mutations, all caught) | `25d1f1b7` | final-review-scope1 |
+| Final review, scope 2 | Tasks 5–7 | **NOT CLEAN** — S2-M1, S2-M2 (major), S2-m1 (minor) | `d1e8397a` | final-review-scope2 |
+| Final review, scope 3 | Tasks 8–10 | **HOLDS** (7 mutations + 2 static audits, all caught) | this commit | final-review-scope3 |
+| F-14 | Tests only: S2-M1 (R6 retained-member clause), S2-M2 (R9 serviced-time pause), S2-m1 (cancel vs discharge + stale disposition) | **ACCEPTED** (F14-M1, F14-M2, F14-m1 opened by the second battery) | `e69d32c9`/`919952f2` | F14-review |
+| F-15 | Tests only: F14-M1, F14-M2, F14-m1 | **ACCEPTED** (F14-M1 downgraded to an observation on review — see below) | `b611c115`/`df599934` | F15-review |
+| **Stage** | Final acceptance + `docs/status.md` | **ACCEPTED 2026-09-14** | this commit | F15-review |
+| Next | 2c-ii's spec: systematic per-guard-clause pass over Tasks 5–7 first, then F13b-D1, F13c-m1, F13c-m2 | — | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the
@@ -72,6 +110,71 @@ not accepted until that passes. Then the next session is dispatched.
   a husk; `with_scanout_read`/`with_scanout_write` are the accessors.
 - **F-4d** (F4c-review): the managed *write* branch is its own session
   after F-9.
+- **Layout is not identity** (F11-F12-opus-review, F11-B1): `PixelIdentity`
+  may mirror immutable handles (`format`, `image`, views) so `Managed`
+  accessors are service-free, but `current_layout` is mutable state and
+  lives only in `StorageAllocation`, behind `with_storage_read`/
+  `with_storage_write`. No shadow copies on leases, ever.
+- **Self-review is not review** (2026-09-13): F-7..F-12 and the final
+  review were produced by Gemini in one run, reviews included. Nothing
+  Gemini accepted counts until a different model has done the mutation
+  pass; the resume table says which rows are pending.
+- **F13b-D1 deferred to 2c-iii** (F13b-review): the managed direct seam's
+  dispatched `CommitResources` carries no present-pin leases by value;
+  that is the activation half R8 excludes. 2c-iii's spec must pick it up.
+- **Findings state invariants, not edits** (F13c-review, 2026-09-14): a
+  finding says *what must hold* and *which mutation must break which named
+  test*. It does not enumerate call sites (F8-M1's two named sites became
+  the implementer's scope boundary, leaving the `Copied` `sources` loop and
+  the `None` arm outside the work) and does not prescribe a test shape the
+  reviewer has not verified is reachable (F4d-M1 prescribed a deterministic
+  scene test that cannot exist here, and got a silent substitution instead
+  of a report). Rule F8 extends to shapes: an unreachable suggestion **must
+  be reported**; the silent substitution is the defect, not the deviation.
+- **F14-M1 was overstated, and the correction is on the record**
+  (F15-review, 2026-09-14): I claimed deleting the `kms_obligations` clause
+  from the release gate would allow releasing a buffer that may still be
+  scanning out. It would not — `register_commit_dependencies` only ever
+  draws obligations from the same `res`'s own `allocations`, and
+  `allocations` is never drained after construction, so the allocation
+  loop's `is_releasable` already refuses while the obligation is pending.
+  The clause is defensive redundancy; the test F-15 wrote proves the guard,
+  not a reachable hazard, and is worth keeping for that. The lesson: check
+  whether a guard is reachable *before* assigning a severity, not after the
+  fix lands.
+- **Mutate by location, not by first textual match** (F14-review,
+  2026-09-14): the reviewer's own S2-m1 mutation reported a false survival
+  because the mutated string occurred four times in `commit.rs` and the
+  replacement hit `consume`'s `ResourcesStillCurrent` arm instead of
+  `cancel_pre_ipc_commit`. Always state which site was hit; a repeated line
+  silently tests something other than what the finding named. (The error
+  found a real gap — F14-m1 — but that was luck, not method.) Companion to
+  the scope-1 rule: a run that prints no `test result:` line did not
+  execute, and an empty result is never evidence that nothing detects the
+  change.
+- **Findings from the final stage review are stated as invariants**
+  (scope 2, 2026-09-14): S2-M1 and S2-M2 name the invariant and the exact
+  mutation that must fail a named test; they deliberately do **not** say
+  where the test goes or what shape it takes. That is the first application
+  of the ruling above — do not "helpfully" turn them back into edits when
+  dispatching F-14.
+- **Scope 2 is accepted knowingly under-tested** (user's call, 2026-09-14):
+  sampling Tasks 5–7 with mutations did not converge — two batteries, 17
+  mutations, 7 survivors, against 0 survivors in 14 mutations across Tasks
+  1–4 and 8–10. Rather than keep sampling, F-15 closes the three known
+  findings and the stage is accepted. **2c-ii's spec opens with a
+  systematic per-guard-clause pass over `commit.rs` (consumer and
+  registration paths), `gpu.rs` (the batch state machine) and
+  `transport.rs`: enumerate every guard clause, require a decisive test per
+  clause, and use clause-deletion as each one's acceptance criterion.**
+  This is a deliberate, recorded trade — not a clean bill of health for
+  that surface.
+- **Carried out of the round into 2c-ii's spec** (not fix-session work):
+  **F13b-D1** (dispatched `CommitResources` carries no present-pin leases),
+  **F13c-m1** (`detach_managed_entries(None)` lets the production route skip
+  husk accounting silently — inert only while R8 holds; when the managed
+  route goes production-active the fd-family barrier can never mint again),
+  **F13c-m2** (`unregister_pool_husk`'s `saturating_sub` hides underflow).
 - Hardware tests: `_vulkan`/`_drm` suffix, `#[ignore = "..."]`, and a
   missing device is `panic!`, never `return` (R12 — F-3 got this wrong
   and redid it).
@@ -114,6 +217,59 @@ session are the models; the essentials are:
 Then review: read the diff, run the gate, mutate the decisive assertion,
 write `…-Fn-review.md`, commit it, update this file's table, dispatch
 the next.
+
+## If the implementer or reviewer is not Claude (codex, a local model)
+
+Everything above holds; only the mechanics change.
+
+- **Skills**: nothing loads the Superpowers skills for a non-Claude
+  harness. Cite them by path instead of by name:
+  `~/.claude/plugins/cache/claude-plugins-official/superpowers/6.3.0/skills/executing-plans/SKILL.md`
+  and `…/test-driven-development/SKILL.md` (plain markdown; read before
+  writing code). The version directory may differ — `ls` the parent.
+- **codex as implementer**: run it with `< /dev/null` and
+  `--sandbox workspace-write` (the review dispatcher's read-only sandbox
+  is for reviewing, not implementing). Stage 2b-i's Tasks 6–7 were done
+  this way (`docs/handoff-phase-c0-stage-2b-i-tasks-6-7.md` is the
+  model). The prompt shape in the recipe above is otherwise identical;
+  replace the `Co-Authored-By` trailer with the tool's own.
+- **codex as reviewer**: `docs/superpowers/review/review.sh` and its
+  frozen `brief.md` are for **spec/plan** review; do not use them for
+  code. For the per-session code review, dispatch codex read-only
+  (`--sandbox read-only < /dev/null`) with the review prompt the
+  round-1 implementation review used (three scopes, the rulings, the
+  plan's contracts, "verify every claim with file:line", the severity
+  calibration) — `docs/superpowers/findings/2026-09-11-stage-2c-i-implementation-review-round1.md`
+  records the shape and the output format. The **mutation checks** are
+  what made the reviews in this round catch what reading missed
+  (F1-M1, F2-B2, F4c): delete the mechanism under test, run the decisive
+  test, it must fail; restore. A reviewer that cannot run cargo cannot
+  do that step — then the coordinator does it by hand before accepting.
+- **Gemini (CLI or Antigravity)**: it did the original execution this
+  round is repairing. The documents were not the problem — the original
+  handoff carried the same rulings — the discipline was: 38 steps ticked
+  with no or vacuous code, proofs fabricated in test bodies, a fixture
+  gap omitted instead of reported. So if Gemini implements, three things
+  are non-negotiable: (1) it reads `AGENTS.md` (there is no `GEMINI.md`)
+  and the skill files by path; (2) one session per F-task, and **nothing
+  is dispatched next until a different model — or a person running the
+  mutation checks by hand — has reviewed the session**; Gemini reviewing
+  Gemini is not a review; (3) F1 is enforced literally: before ticking a
+  step, revert the mechanism, run the named test, paste the failure in
+  the fold-back. Prefer it for F-10..F-12 (mechanical, compiler-checked)
+  over F-6..F-9 and F-4d (mechanism), for the same reason as the local
+  model below.
+- **Local model (Qwen etc.)**: only for F-10..F-12 (M-19), with a
+  one-page recipe (before/after pattern, the site list from
+  `grep -n "\.storage\." crates/yserver/src/kms/render/*.rs`, `cargo
+  check` after every file) rather than the document stack — an 8k
+  context cannot hold the contracts the mechanism sessions need. Not
+  for F-6..F-9 or F-4d.
+- **Budget**: Claude Pro's 5-hour window cut three mechanism sessions
+  (F-4, F-4c, F-5b) around 350k tokens; each was resumed from the dirty
+  tree by a fresh session told exactly what it inherited. If a session
+  is cut, do not discard the tree: `git diff`, keep what compiles or
+  make it compile, finish, commit.
 
 ## Upstream notes for the maintainer (not ours to fix)
 

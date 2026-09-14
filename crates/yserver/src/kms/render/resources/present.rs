@@ -41,6 +41,7 @@ pub enum ReleaseDisposition {
 pub struct PresentDisposition {
     pub(crate) completion: CompletionDisposition,
     pub(crate) release: ReleaseDisposition,
+    pub(crate) sample: Option<crate::kms::owner::clock::ClockSample>,
 }
 
 impl PresentDisposition {
@@ -48,13 +49,20 @@ impl PresentDisposition {
         Self {
             completion,
             release,
+            sample: None,
         }
+    }
+
+    pub(crate) fn with_sample(mut self, sample: crate::kms::owner::clock::ClockSample) -> Self {
+        self.sample = Some(sample);
+        self
     }
 
     pub(crate) fn pending() -> Self {
         Self {
             completion: CompletionDisposition::Pending,
             release: ReleaseDisposition::Retained,
+            sample: None,
         }
     }
 
@@ -62,6 +70,7 @@ impl PresentDisposition {
         Self {
             completion: CompletionDisposition::Emitted,
             release: ReleaseDisposition::Retained,
+            sample: None,
         }
     }
 
@@ -69,6 +78,7 @@ impl PresentDisposition {
         Self {
             completion: CompletionDisposition::Emitted,
             release: ReleaseDisposition::Released,
+            sample: None,
         }
     }
 
@@ -76,6 +86,7 @@ impl PresentDisposition {
         Self {
             completion: CompletionDisposition::Suppressed,
             release: ReleaseDisposition::Retained,
+            sample: None,
         }
     }
 }

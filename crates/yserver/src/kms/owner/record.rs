@@ -71,6 +71,16 @@ pub enum UnknownCause {
     ContradictoryEvidence,
     /// A completion or hardware mechanism failure.
     Mechanism(MechanismFailure),
+    /// F8-m1: the owner's write authority was revoked while this commit was
+    /// still outstanding (e.g. an incarnation handoff transferring the
+    /// device mid-flight, `HandoffRouter::transfer`'s `revoke_owner_writes`
+    /// then `quarantine_live`). Not `ContradictoryEvidence` -- the outcome's
+    /// shape is not in question, and no `UnknownReason` fits either: those
+    /// are all about a host-call's own verification failing (watchdog,
+    /// helper exit, IPC, malformed reply), not about the grant being pulled
+    /// out from under a commit that was never given a chance to complete or
+    /// fail.
+    GrantRevokedInFlight,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

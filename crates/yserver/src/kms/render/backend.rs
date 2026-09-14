@@ -479,8 +479,11 @@ impl ScanoutM1ProbeEntry {
     }
 }
 
+const MAX_M1_PROBE_CACHE_ENTRIES: usize = 32;
+
 struct ScanoutM1ProbeCache {
     topology_signature: u64,
+    order: std::collections::VecDeque<DrawableId>,
     entries: HashMap<DrawableId, ScanoutM1ProbeEntry>,
 }
 
@@ -488,8 +491,23 @@ impl ScanoutM1ProbeCache {
     fn new() -> Self {
         Self {
             topology_signature: 0,
+            order: std::collections::VecDeque::new(),
             entries: HashMap::new(),
         }
+    }
+
+    fn insert(&mut self, id: DrawableId, entry: ScanoutM1ProbeEntry) {
+        if !self.entries.contains_key(&id) {
+            while self.entries.len() >= MAX_M1_PROBE_CACHE_ENTRIES {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            self.order.push_back(id);
+        }
+        self.entries.insert(id, entry);
     }
 
     fn remove(&mut self, id: DrawableId) {
@@ -503,6 +521,7 @@ impl ScanoutM1ProbeCache {
                 self.entries.len()
             );
             self.entries.clear();
+            self.order.clear();
         }
     }
 }
@@ -561,6 +580,17 @@ struct ScanoutM2State {
     /// hardware transaction. Newer successors replace this slot (latest
     /// wins); there is never more than one not-yet-submitted direct frame.
     queued_successor: Option<DirectPresentFrame>,
+    /// F7-B1: the `DirectRole::Successor` capacity charge for
+    /// `queued_successor`, kept in lockstep with it. It travels as a bare
+    /// `RoleReservation` (never `attach`ed into a `CommitResources`, so it
+    /// is always `Reserved`, never `Occupied`) until the managed dispatch
+    /// seam promotes it. Every site that mutates `queued_successor` must
+    /// mutate this field in the same step: dropping a charged
+    /// `RoleReservation` without an explicit `cancel_reservation`/
+    /// `finish_role` closes admission via its own `Drop` impl (capacity.rs),
+    /// so a bare `.take()`/`.replace()` on `queued_successor` alone would
+    /// either leak a charge or spuriously close admission.
+    queued_successor_role: Option<crate::kms::render::resources::RoleReservation>,
     current: Option<DirectPresentFrame>,
     completed: Vec<yserver_core::backend::CompletedPresentEvent>,
     /// Coalesced successors cannot overtake the in-flight predecessor's
@@ -598,6 +628,7 @@ impl ScanoutM2State {
             ownership: ScanoutM2OwnershipHandle::default(),
             pending: None,
             queued_successor: None,
+            queued_successor_role: None,
             current: None,
             completed: Vec::new(),
             deferred_successor_skips: Vec::new(),
@@ -1135,6 +1166,46 @@ fn reconcile_connector_probe(
     delta
 }
 
+/// One pinned Present source entry (Task 7.5).
+///
+/// For managed pins the table entry owns `StorageLease` and an
+/// invalidation-aware logical decref obligation. `release_present_source`
+/// removes that entry once and lets the service run the appropriate cleanup.
+#[derive(Debug)]
+pub(crate) struct PresentPinEntry {
+    pub(crate) id: crate::kms::render::store::DrawableId,
+    pub(crate) lease: Option<crate::kms::render::resources::StorageLease>,
+}
+
+impl PresentPinEntry {
+    pub(crate) fn new(
+        id: crate::kms::render::store::DrawableId,
+        lease: Option<crate::kms::render::resources::StorageLease>,
+    ) -> Self {
+        Self { id, lease }
+    }
+}
+
+impl PartialEq for PresentPinEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for PresentPinEntry {}
+
+impl PartialEq<crate::kms::render::store::DrawableId> for PresentPinEntry {
+    fn eq(&self, other: &crate::kms::render::store::DrawableId) -> bool {
+        self.id == *other
+    }
+}
+
+impl PartialEq<PresentPinEntry> for crate::kms::render::store::DrawableId {
+    fn eq(&self, other: &PresentPinEntry) -> bool {
+        *self == other.id
+    }
+}
+
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
@@ -1202,7 +1273,7 @@ pub struct KmsBackend {
     /// Final COW release accepted while direct scanout still owns a frame.
     /// The protocol resource is logically gone, but the backend identity and
     /// storage stay alive until the composed replacement retires.
-    pub(crate) deferred_cow_release: bool,
+    deferred_cow_release: bool,
 
     /// M0 direct-scanout telemetry. Purely observational: it never owns a
     /// drawable pin, submits DRM work, or affects Present capabilities.
@@ -1411,12 +1482,10 @@ pub struct KmsBackend {
         HashMap<u64, crate::kms::render::present_source_wait::PendingPresentSourceWait>,
     pub(crate) next_present_source_wait_id: u64,
 
-    /// `pin_present_source` tokens: the xid is resolved to a `DrawableId`
-    /// ONCE at pin time and held here, incref'd, so a later `FreePixmap` /
-    /// xid reuse on `store.by_xid` cannot re-point an already-pinned
-    /// present source out from under a parked entry. Released by
-    /// `release_present_source`.
-    pub(crate) present_source_pins: HashMap<u64, crate::kms::render::store::DrawableId>,
+    /// `pin_present_source` tokens: for managed pins the entry owns
+    /// `StorageLease` and an invalidation-aware logical decref obligation.
+    /// Released by `release_present_source`.
+    pub(crate) present_source_pins: HashMap<u64, PresentPinEntry>,
     pub(crate) next_present_source_pin_id: u64,
 
     /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
@@ -2044,10 +2113,78 @@ impl KmsBackend {
 
     fn pin_direct_source(&mut self, id: DrawableId) -> u64 {
         self.store.incref(id);
+        let lease = self
+            .store
+            .get(id)
+            .and_then(|d| d.managed_lease())
+            .and_then(|l| {
+                self.resource_service
+                    .as_mut()
+                    .and_then(|s| s.share_storage_read(l).ok())
+            });
         let pin_id = self.next_present_source_pin_id;
         self.next_present_source_pin_id = self.next_present_source_pin_id.wrapping_add(1).max(1);
-        self.present_source_pins.insert(pin_id, id);
+        self.present_source_pins
+            .insert(pin_id, PresentPinEntry::new(id, lease));
         pin_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn present_source_pin_id(&self, pin_id: u64) -> Option<DrawableId> {
+        self.present_source_pins.get(&pin_id).map(|e| e.id)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn present_source_pin_lease(
+        &self,
+        pin_id: u64,
+    ) -> Option<&crate::kms::render::resources::StorageLease> {
+        self.present_source_pins
+            .get(&pin_id)
+            .and_then(|e| e.lease.as_ref())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn make_present_release(
+        &mut self,
+        event: yserver_core::backend::CompletedPresentEvent,
+    ) -> crate::kms::render::resources::PresentRelease {
+        let wake = self.retained_present_wakes.remove(&event.present_id);
+        crate::kms::render::resources::PresentRelease::new(event, wake)
+    }
+
+    pub(crate) fn dispatch_pinned_wake(
+        &mut self,
+        pin: crate::kms::render::present_completion::PinnedWake,
+    ) {
+        use crate::kms::render::present_completion::PinnedWake;
+        match pin {
+            PinnedWake::Pixmap(h) => {
+                if let Err(e) = self.dri3_trigger_fence_via_handle(&h) {
+                    log::warn!("dispatch_pinned_wake: dri3_trigger_fence_via_handle failed: {e}");
+                }
+            }
+            PinnedWake::PixmapSynced { handle, value } => {
+                if let Err(e) = self.dri3_signal_syncobj_via_handle(&handle, value) {
+                    log::warn!("dispatch_pinned_wake: dri3_signal_syncobj_via_handle failed: {e}");
+                }
+            }
+            PinnedWake::PixmapSyncedFencePublished {
+                handle: _handle,
+                value: _value,
+            } => {}
+            PinnedWake::None => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn signal_present_release(
+        &mut self,
+        release: crate::kms::render::resources::PresentRelease,
+    ) {
+        if let Some(pin) = release.wake {
+            self.dispatch_pinned_wake(pin);
+        }
     }
 
     fn retain_direct_present_wake(&mut self, event: &yserver_core::backend::CompletedPresentEvent) {
@@ -2114,6 +2251,11 @@ impl KmsBackend {
         let Some(mut successor) = self.scanout_m2.queued_successor.take() else {
             return;
         };
+        // F7-B1: this production path has no managed caller (R8), so
+        // `queued_successor_role` is always `None` here in practice; still
+        // discharge it if present rather than silently losing the charge or
+        // leaving a stale token for a later managed call to misread.
+        let successor_role = self.scanout_m2.queued_successor_role.take();
         match self.submit_direct_frame(&mut successor) {
             Ok(()) => {
                 log::info!(
@@ -2122,6 +2264,9 @@ impl KmsBackend {
                     successor.candidate.present_id,
                     self.platform.outputs.len()
                 );
+                if let Some(role) = successor_role {
+                    self.discharge_bare_reservation(role);
+                }
                 self.scanout_m2.pending = Some(successor);
                 self.scanout_m2.hold_direct = true;
                 self.scanout_m2.sync_ownership();
@@ -2130,6 +2275,9 @@ impl KmsBackend {
                 log::warn!(
                     "scanout_m2: queued direct successor submit failed after predecessor retirement: {error}"
                 );
+                if let Some(role) = successor_role {
+                    self.discharge_bare_reservation(role);
+                }
                 self.defer_direct_successor_skip(successor);
                 self.scanout_m2
                     .completed
@@ -2186,6 +2334,9 @@ impl KmsBackend {
             <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
         }
         if let Some(queued) = self.scanout_m2.queued_successor.take() {
+            if let Some(role) = self.scanout_m2.queued_successor_role.take() {
+                self.discharge_bare_reservation(role);
+            }
             self.defer_direct_successor_skip(queued);
         }
         self.scanout_m2
@@ -2337,7 +2488,8 @@ impl KmsBackend {
         // before disabling scanout. Wait for that work, then retire scene and
         // pool state while the old output indices are still authoritative.
         self.platform.wait_idle_bounded();
-        self.scene.drain_all(&mut self.platform);
+        self.scene
+            .drain_all(&mut self.platform, self.resource_service.as_mut());
         if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
             self.kms_outputs_active = false;
             log::error!(
@@ -3069,14 +3221,13 @@ impl KmsBackend {
                 output_geometry,
             );
             self.scanout_m1
-                .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         }
 
         let import = self.store.get(source_id).and_then(|drawable| {
-            let metadata = drawable.storage.imported_dmabuf.as_ref()?;
+            let metadata = drawable.imported_dmabuf()?;
             // An unresolved layout must never reach KMS. The client never
             // named it (legacy `PixmapFromBuffer`), so `metadata.modifier`
             // is our linear guess; scanning a tiled buffer out as linear
@@ -3087,11 +3238,7 @@ impl KmsBackend {
                 return None;
             }
             let plane = metadata.planes.first()?;
-            let fd = drawable
-                .storage
-                .imported_drawable
-                .as_ref()?
-                .imported_dma_buf_fd()?;
+            let fd = drawable.imported_drawable()?.imported_dma_buf_fd()?;
             Some((
                 metadata.fourcc,
                 metadata.vk_format,
@@ -3147,7 +3294,6 @@ impl KmsBackend {
                 height,
             );
             self.scanout_m1
-                .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
@@ -3160,7 +3306,6 @@ impl KmsBackend {
                     source_id.as_u64()
                 );
                 self.scanout_m1
-                    .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
                 self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
                 return;
@@ -3180,7 +3325,6 @@ impl KmsBackend {
             .collect();
         let Some(primary) = self.platform.primary_device() else {
             self.scanout_m1
-                .entries
                 .insert(source_id, ScanoutM1ProbeEntry::rejected());
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
@@ -3209,7 +3353,6 @@ impl KmsBackend {
                     output_geometry,
                 );
                 self.scanout_m1
-                    .entries
                     .insert(source_id, ScanoutM1ProbeEntry::accepted(framebuffer));
                 self.scanout_m0.m1_probe_pass = self.scanout_m0.m1_probe_pass.saturating_add(1);
             }
@@ -3220,7 +3363,6 @@ impl KmsBackend {
                     candidate.src_host_xid,
                 );
                 self.scanout_m1
-                    .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
                 self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             }
@@ -3231,7 +3373,6 @@ impl KmsBackend {
                     candidate.src_host_xid,
                 );
                 self.scanout_m1
-                    .entries
                     .insert(source_id, ScanoutM1ProbeEntry::rejected());
                 self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
             }
@@ -3279,10 +3420,8 @@ impl KmsBackend {
                 u32::from(candidate.src_height),
             ),
             |(_, drawable)| {
-                (
-                    drawable.storage.extent.width,
-                    drawable.storage.extent.height,
-                )
+                let extent = drawable.extent();
+                (extent.width, extent.height)
             },
         );
         let depth = source.map_or(0, |(_, drawable)| drawable.depth);
@@ -3290,7 +3429,7 @@ impl KmsBackend {
             .map_or(
                 (false, 0, vk::Format::UNDEFINED, 0, 0, 0, 0),
                 |(_, drawable)| {
-                    drawable.storage.imported_dmabuf.as_ref().map_or(
+                    drawable.imported_dmabuf().map_or(
                         (false, 0, vk::Format::UNDEFINED, 0, 0, 0, 0),
                         |metadata| {
                             let plane = metadata.planes.first();
@@ -3617,7 +3756,7 @@ impl KmsBackend {
     pub fn backing_pixels_for_tests(&mut self, host_xid: u32) -> Option<(u32, u32, Vec<u8>)> {
         let target = self.resolve_paint_target(host_xid)?;
         let id = target.backing_id();
-        let (depth, extent) = self.store.get(id).map(|d| (d.depth, d.storage.extent))?;
+        let (depth, extent) = self.store.get(id).map(|d| (d.depth, d.extent()))?;
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D::default(),
             extent,
@@ -3686,9 +3825,10 @@ impl KmsBackend {
 
     pub fn storage_extent_for_tests(&self, host_xid: u32) -> Option<(u32, u32)> {
         let id = self.store.lookup(host_xid)?;
-        self.store
-            .get(id)
-            .map(|d| (d.storage.extent.width, d.storage.extent.height))
+        self.store.get(id).map(|d| {
+            let e = d.extent();
+            (e.width, e.height)
+        })
     }
 
     /// #133 step 3 (P4) — test accessor: the resolved paint target's
@@ -3841,9 +3981,9 @@ impl KmsBackend {
         // corrected itself after a few redirect cycles. Log the three
         // extents that decide it rather than guess which one is stale.
         if log::log_enabled!(log::Level::Debug) {
-            let b_extent = self.store.get(b_id).map(|d| d.storage.extent);
+            let b_extent = self.store.get(b_id).map(|d| d.extent());
             for d in &plan {
-                let leaf_extent = self.store.get(d.leaf_id).map(|s| s.storage.extent);
+                let leaf_extent = self.store.get(d.leaf_id).map(|s| s.extent());
                 let short = leaf_extent.is_some_and(|e| {
                     let avail_w = e
                         .width
@@ -3888,7 +4028,7 @@ impl KmsBackend {
             if self
                 .store
                 .get(d.leaf_id)
-                .is_none_or(|s| s.storage.image_view == ash::vk::ImageView::null())
+                .is_none_or(|s| !s.has_image_view())
             {
                 continue;
             }
@@ -4036,7 +4176,7 @@ impl KmsBackend {
         let old_layout = self
             .store
             .get(old_id)
-            .map(|d| (d.storage.extent, d.content_offset, d.depth));
+            .map(|d| (d.extent(), d.content_offset, d.depth));
         // #133 step 6 (6.1) — reallocate ONLY if the bordered extent
         // actually changed, exactly as `compReallocPixmap` compares
         // `pix_w != pOld->drawable.width` (`composite/compalloc.c:698`).
@@ -4445,9 +4585,7 @@ impl KmsBackend {
             if dst_target.backing_id() == src {
                 return Ok(());
             }
-            if self.store.get(src).map(|d| d.storage.format)
-                == Some(ash::vk::Format::B8G8R8A8_UNORM)
-            {
+            if self.store.get(src).map(|d| d.format()) == Some(ash::vk::Format::B8G8R8A8_UNORM) {
                 // Higher-stacked sibling windows that share this backing
                 // must not be overwritten by this clear. xfwm4 frames a
                 // top-level with a titlebar window (e.g. 1136x28) and the
@@ -4612,11 +4750,7 @@ impl KmsBackend {
             // takes this early-out rather than painting into content.
             return Ok(());
         }
-        let Some(storage_extent) = self
-            .store
-            .get(target.backing_id())
-            .map(|d| d.storage.extent)
-        else {
+        let Some(storage_extent) = self.store.get(target.backing_id()).map(|d| d.extent()) else {
             return Ok(());
         };
         let (cx, cy) = target.offset();
@@ -4675,7 +4809,7 @@ impl KmsBackend {
         let pixel = self.border_solid_pixel(geom, target.backing_id());
         let format = self.store.get(target.backing_id()).map_or_else(
             || PlatformBackend::format_for_depth(geom.depth),
-            |d| d.storage.format,
+            |d| d.format(),
         );
         let depth = self
             .store
@@ -4859,7 +4993,7 @@ impl KmsBackend {
             // Self-tile would alias src and dst inside render_composite.
             return false;
         }
-        let tile_format = self.store.get(tile_id).map(|d| d.storage.format);
+        let tile_format = self.store.get(tile_id).map(|d| d.format());
         if tile_format != Some(vk::Format::B8G8R8A8_UNORM) {
             log::debug!(
                 "render paint_border_ring_tiled: tile 0x{tile_xid:x} format {tile_format:?} not \
@@ -5402,7 +5536,7 @@ impl KmsBackend {
     fn read_cursor_depth1_pixmap(&mut self, host_xid: u32) -> Option<(Vec<u8>, u16, u16)> {
         let id = self.store.lookup(host_xid)?;
         let drawable = self.store.get(id)?;
-        let extent = drawable.storage.extent;
+        let extent = drawable.extent();
         let w = u16::try_from(extent.width).ok()?;
         let h = u16::try_from(extent.height).ok()?;
         let rect = ash::vk::Rect2D {
@@ -5439,7 +5573,7 @@ impl KmsBackend {
     fn read_cursor_bgra_pixmap(&mut self, host_xid: u32) -> Option<(Vec<u8>, u16, u16)> {
         let id = self.store.lookup(host_xid)?;
         let drawable = self.store.get(id)?;
-        let extent = drawable.storage.extent;
+        let extent = drawable.extent();
         let w = u16::try_from(extent.width).ok()?;
         let h = u16::try_from(extent.height).ok()?;
         let rect = ash::vk::Rect2D {
@@ -5704,7 +5838,7 @@ impl KmsBackend {
         if self
             .store
             .get(pixmap_id)
-            .map(|d| d.storage.image_view == ash::vk::ImageView::null())
+            .map(|d| !d.has_image_view())
             .unwrap_or(true)
         {
             return;
@@ -6001,7 +6135,7 @@ impl KmsBackend {
     pub fn test_storage_views(&self, xid: u32) -> Option<(ash::vk::ImageView, ash::vk::ImageView)> {
         let id = self.store.lookup(xid)?;
         let drawable = self.store.get(id)?;
-        Some((drawable.storage.image_view, drawable.storage.sample_view))
+        Some((drawable.image_view(), drawable.sample_view()))
     }
 
     /// GLX-TFP (Task 1.2) test shim: clone the backend's
@@ -6026,7 +6160,12 @@ impl KmsBackend {
             .lookup(xid)
             .ok_or_else(|| io::Error::other(format!("promote: unknown xid {xid:#x}")))?;
         self.engine
-            .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+            .promote_drawable_exportable(
+                &mut self.platform,
+                &mut self.store,
+                self.resource_service.as_mut(),
+                id,
+            )
             .map_err(|e| io::Error::other(format!("promote_drawable_exportable: {e:?}")))?;
         let vk = self
             .platform
@@ -6038,12 +6177,8 @@ impl KmsBackend {
                 .store
                 .get(id)
                 .ok_or_else(|| io::Error::other("promote: drawable vanished"))?;
-            (
-                d.storage.memory,
-                d.storage.export_stride,
-                d.storage.export_size,
-                d.storage.export_modifier,
-            )
+            d.export_metadata(self.resource_service.as_mut())
+                .ok_or_else(|| io::Error::other("promote: drawable not exportable"))?
         };
         // Export the promoted memory directly (the Storage now owns the
         // exportable image's handles; we don't have the ExportableImage
@@ -6699,7 +6834,7 @@ impl KmsBackend {
         let (depth, extent, content_version) = self
             .store
             .get(src.id())
-            .map(|d| (d.depth, d.storage.extent, d.content_version))
+            .map(|d| (d.depth, d.extent(), d.content_version))
             .ok_or("source drawable is not in the store")?;
         let rect = uniform_pixel_glyph_source(src, repeat, extent, mask_fmt)
             .ok_or("not a one-pixel sampled domain under a plane-covering repeat (tier 1 only)")?;
@@ -6761,7 +6896,7 @@ impl KmsBackend {
         clip: super::target::ContentClipAccum,
         id: DrawableId,
     ) -> Option<ash::vk::Rect2D> {
-        let extent = self.store.get(id).map(|d| d.storage.extent)?;
+        let extent = self.store.get(id).map(|d| d.extent())?;
         clip.finish(extent)
     }
 
@@ -7281,7 +7416,7 @@ impl KmsBackend {
         let root_id = self.store.lookup(root_xid)?;
         let (extent, depth) = {
             let d = self.store.get(root_id)?;
-            (d.storage.extent, d.depth)
+            (d.extent(), d.depth)
         };
         if extent.width == 0 || extent.height == 0 {
             return None;
@@ -7589,7 +7724,7 @@ impl KmsBackend {
         let parent_extent = self
             .store
             .get(parent_target.backing_id())
-            .map(|d| d.storage.extent)
+            .map(|d| d.extent())
             .unwrap_or_default();
         if parent_extent.width == 0 || parent_extent.height == 0 {
             log::debug!(
@@ -7735,7 +7870,7 @@ impl KmsBackend {
             if self
                 .store
                 .get(d.leaf_id)
-                .is_none_or(|s| s.storage.image_view == ash::vk::ImageView::null())
+                .is_none_or(|s| !s.has_image_view())
             {
                 continue;
             }
@@ -7801,7 +7936,7 @@ impl KmsBackend {
         let b_extent = self
             .store
             .get(b_id)
-            .map_or(ash::vk::Extent2D::default(), |d| d.storage.extent);
+            .map_or(ash::vk::Extent2D::default(), |d| d.extent());
         if b_extent.width == 0 || b_extent.height == 0 {
             return out;
         }
@@ -7860,8 +7995,8 @@ impl KmsBackend {
             // clamp is against the storage minus the ring and the
             // source origin is `(bw, bw)`. Identity at `bw == 0`.
             let bw = u32::from(geom.border_width);
-            let content_cap_w = d.storage.extent.width.saturating_sub(bw.saturating_mul(2));
-            let content_cap_h = d.storage.extent.height.saturating_sub(bw.saturating_mul(2));
+            let content_cap_w = d.extent().width.saturating_sub(bw.saturating_mul(2));
+            let content_cap_h = d.extent().height.saturating_sub(bw.saturating_mul(2));
             let w = u32::from(geom.width).min(content_cap_w);
             let h = u32::from(geom.height).min(content_cap_h);
             self.push_inferior_rects(xid, leaf_id, off_x, off_y, w, h, out);
@@ -9214,7 +9349,7 @@ impl KmsBackend {
         if self
             .store
             .get(id)
-            .map(|d| d.storage.is_exportable())
+            .map(|d| d.is_exportable(self.resource_service.as_mut()))
             .unwrap_or(false)
         {
             return true;
@@ -9229,14 +9364,16 @@ impl KmsBackend {
         // flush inside engine.promote_drawable_exportable. Counted for the
         // gkrellm submit-storm attribution (project_client_scheduling_fairness).
         self.telemetry.record_promote_exportable_run();
-        match self
-            .engine
-            .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
-        {
+        match self.engine.promote_drawable_exportable(
+            &mut self.platform,
+            &mut self.store,
+            self.resource_service.as_mut(),
+            id,
+        ) {
             Ok(()) => self
                 .store
                 .get(id)
-                .map(|d| d.storage.is_exportable())
+                .map(|d| d.is_exportable(self.resource_service.as_mut()))
                 .unwrap_or(false),
             Err(e) => {
                 log::warn!("GLX BindTexImageEXT promote 0x{host_xid:x} failed: {e:?}");
@@ -9629,12 +9766,12 @@ impl KmsBackend {
     /// Returns `vk::ImageLayout::UNDEFINED` if `dst_xid` doesn't
     /// resolve in the store (rare; production code always inserts
     /// before any layout transition).
-    pub fn drawable_current_layout_for_tests(&self, dst_xid: u32) -> ash::vk::ImageLayout {
-        self.store
-            .get_by_xid(dst_xid)
-            .map_or(ash::vk::ImageLayout::UNDEFINED, |d| {
-                d.storage.current_layout
-            })
+    pub fn drawable_current_layout_for_tests(&mut self, dst_xid: u32) -> ash::vk::ImageLayout {
+        let Some(d) = self.store.get_by_xid(dst_xid) else {
+            return ash::vk::ImageLayout::UNDEFINED;
+        };
+        d.current_layout(self.resource_service.as_mut())
+            .unwrap_or(ash::vk::ImageLayout::UNDEFINED)
     }
 
     /// Phase B.2 Task 11: typed peek of the open frame's recorded
@@ -9933,10 +10070,12 @@ impl KmsBackend {
         self.simulate_page_flip_complete_for_tests()?;
         let mut retired = 0usize;
         for output_idx in 0..self.platform.outputs.len() {
-            if self
-                .scene
-                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
-            {
+            if self.scene.handle_page_flip_complete(
+                output_idx,
+                &mut self.store,
+                &mut self.platform,
+                self.resource_service.as_mut(),
+            ) {
                 retired += 1;
             }
         }
@@ -10573,10 +10712,16 @@ impl KmsBackend {
                 ))
             })?;
             crate::kms::render::engine::MaskedCopyMask {
-                image: md.storage.image,
-                view: md.storage.image_view, // IDENTITY R8 view
-                old_layout: md.storage.current_layout,
-                extent: md.storage.extent,
+                image: md.image(),
+                view: md.image_view(), // IDENTITY R8 view
+                old_layout: md
+                    .current_layout(self.resource_service.as_mut())
+                    .map_err(|e| {
+                        io::Error::other(format!(
+                            "masked_copy_area_for_tests: current_layout: {e:?}"
+                        ))
+                    })?,
+                extent: md.extent(),
                 clip_origin: [clip_origin.0, clip_origin.1],
                 snapshot_id: None, // plain-drawable test path (not a snapshot)
             }
@@ -10970,6 +11115,7 @@ impl KmsBackend {
             &self.windows,
             &mut self.telemetry,
             cow_host_xid,
+            self.resource_service.as_mut(),
         ) {
             Ok(_) => Ok(()),
             Err(e) => Err(io::Error::other(format!(
@@ -11009,7 +11155,8 @@ impl KmsBackend {
         // Phase B.1 Task 21: drain close events emitted by shutdown.
         self.drain_frame_builder_telemetry();
         self.sync_descriptor_pool_telemetry();
-        self.scene.drain_all(&mut self.platform);
+        self.scene
+            .drain_all(&mut self.platform, self.resource_service.as_mut());
 
         // Stage 5 Task 6.1: drain the pending PRESENT batch queue
         // unconditionally. After drain_all every submitted paint
@@ -11835,7 +11982,8 @@ impl KmsBackend {
 
         // The old framebuffer references and events are gone. It is now safe
         // to discard the scene's ack ledger and reset every pool phase.
-        self.scene.drain_all(&mut self.platform);
+        self.scene
+            .drain_all(&mut self.platform, self.resource_service.as_mut());
 
         // 4c. Reset the PLATFORM scanout-BO state too. `drain_all` (4b)
         //     clears the SCENE's pending_acks, but the platform pool still
@@ -13069,7 +13217,7 @@ impl KmsBackend {
         let id = self.store.lookup(host_pixmap_xid)?;
         let (width, height, depth, content_version) = {
             let d = self.store.get(id)?;
-            let extent = d.storage.extent;
+            let extent = d.extent();
             (
                 u16::try_from(extent.width).ok()?,
                 u16::try_from(extent.height).ok()?,
@@ -13100,7 +13248,7 @@ impl KmsBackend {
         let id = self.store.lookup(host_pixmap_xid)?;
         let (depth, extent) = {
             let d = self.store.get(id)?;
-            (d.depth, d.storage.extent)
+            (d.depth, d.extent())
         };
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D { x: 0, y: 0 },
@@ -13254,7 +13402,7 @@ impl KmsBackend {
             return;
         };
         let Some((w, h, live_version)) = self.store.get(did).and_then(|d| {
-            let e = d.storage.extent;
+            let e = d.extent();
             (e.width != 0 && e.height != 0).then_some((e.width, e.height, d.content_version))
         }) else {
             return;
@@ -13312,7 +13460,8 @@ impl KmsBackend {
     fn drawable_dims(&self, host_xid: u32) -> Option<(u32, u32)> {
         let id = self.store.lookup(host_xid)?;
         let d = self.store.get(id)?;
-        Some((d.storage.extent.width, d.storage.extent.height))
+        let e = d.extent();
+        Some((e.width, e.height))
     }
 
     /// Lower a list of solid-colour rectangles to the appropriate
@@ -13597,14 +13746,14 @@ impl KmsBackend {
                 height: g.height,
             }
         } else {
-            let ext =
-                self.store
-                    .get(dst_id)
-                    .map(|d| d.storage.extent)
-                    .unwrap_or(ash::vk::Extent2D {
-                        width: 0,
-                        height: 0,
-                    });
+            let ext = self
+                .store
+                .get(dst_id)
+                .map(|d| d.extent())
+                .unwrap_or(ash::vk::Extent2D {
+                    width: 0,
+                    height: 0,
+                });
             Rectangle16 {
                 x: 0,
                 y: 0,
@@ -13967,7 +14116,7 @@ impl KmsBackend {
         let Some((_storage_depth, format, extent)) = self
             .store
             .get(id)
-            .map(|d| (d.depth, d.storage.format, d.storage.extent))
+            .map(|d| (d.depth, d.format(), d.extent()))
         else {
             return;
         };
@@ -14228,10 +14377,10 @@ impl KmsBackend {
         let src_id = src_handle.id();
         let dst_id = dst_handle.id();
         self.telemetry.record_copy_area_cpu_run();
-        let Some(src_extent) = self.store.get(src_id).map(|d| d.storage.extent) else {
+        let Some(src_extent) = self.store.get(src_id).map(|d| d.extent()) else {
             return;
         };
-        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
+        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.extent()) else {
             return;
         };
         // #133 step 3 (P4): clamp against each handle's content BOUNDS
@@ -14358,7 +14507,7 @@ impl KmsBackend {
     ) {
         let dst_id = dst_handle.id();
         let width = data_width;
-        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
+        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.extent()) else {
             return;
         };
         // #133 step 3 (P4): the clamp floor/ceiling is the handle's
@@ -14539,7 +14688,7 @@ impl KmsBackend {
             return;
         }
         let id = target.backing_id();
-        let Some((depth, extent)) = self.store.get(id).map(|d| (d.depth, d.storage.extent)) else {
+        let Some((depth, extent)) = self.store.get(id).map(|d| (d.depth, d.extent())) else {
             return;
         };
         // #133 step 3 (P4): the readback and write-back below span the
@@ -14763,7 +14912,7 @@ impl KmsBackend {
             // Self-tile would alias src + dst inside render_composite.
             return false;
         }
-        let tile_format = self.store.get(tile_id).map(|d| d.storage.format);
+        let tile_format = self.store.get(tile_id).map(|d| d.format());
         if tile_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
             log::debug!(
                 "render try_tiled_fill: tile 0x{tile_xid:x} format {tile_format:?} not BGRA8"
@@ -15229,7 +15378,7 @@ impl KmsBackend {
         let format = self
             .store
             .get(target.backing_id())
-            .map(|d| d.storage.format)
+            .map(|d| d.format())
             .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
         let color = decode_x11_pixel_for_storage(background, depth, format);
         let rect = ash::vk::Rect2D {
@@ -16018,6 +16167,33 @@ fn read_scanout_region(
 
     let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
     let needed_bytes = scanout_copy_needed_bytes(local_rect)?;
+    let managed_key = backend
+        .platform
+        .scanout_pools
+        .get(pool_idx)
+        .and_then(Option::as_ref)
+        .and_then(|p| match p {
+            crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+                pool.bos.get(bo_idx).and_then(|bo| bo.managed_key())
+            }
+            crate::kms::vk::scanout::OutputScanout::Copied(_) => None,
+        });
+
+    if let Some(key) = managed_key
+        && let Some(mut service) = backend.resource_service.take()
+    {
+        let res = read_managed_scanout_region_bytes(
+            backend,
+            &mut service,
+            key,
+            pool_idx,
+            rect,
+            local_rect,
+        );
+        backend.resource_service = Some(service);
+        return res;
+    }
+
     let Some(pool) = backend
         .platform
         .scanout_pools
@@ -16093,19 +16269,6 @@ fn read_scanout_region(
 /// renderer-side `CopiedSourceAllocation` instead of `ScanoutAllocation`,
 /// which is out of this session's scope; that case fails closed rather than
 /// silently reading the wrong payload.
-///
-/// `#[allow(dead_code)]`: F4c F8 stop (see `read_scanout_region_for_managed_source`
-/// below) -- F4-m1 asked for this attribute to come off, but it cannot
-/// without the scene-submission write branch this session deferred: with it
-/// removed, `cargo clippy --all-targets -- -D warnings` fails dead-code on
-/// the plain (non-`cfg(test)`) `--lib` build this crate's test binary still
-/// compiles as a dependency, since no non-test caller exists yet (R8: only
-/// a caller in production code makes this a real compile-time root, and
-/// that caller is the write-path wiring, not the read path this session
-/// closes). Verified directly: with the attribute off,
-/// `cargo clippy -p yserver --tests -- -D warnings` fails with exactly this
-/// dead-code error on both this function and `read_scanout_region_for_managed_source`.
-#[allow(dead_code)]
 fn read_managed_scanout_region_bytes(
     backend: &mut KmsBackend,
     service: &mut crate::kms::render::resources::ResourceService,
@@ -16200,11 +16363,18 @@ fn read_managed_scanout_region_bytes(
 /// allocation (`managed_key() == None`) fails closed rather than silently
 /// skipping correlation.
 ///
-/// `#[allow(dead_code)]`: F4-m1 asked for this to come off, but it cannot
-/// yet -- see `read_managed_scanout_region_bytes`'s doc comment for the
-/// verified reason (F4c F8 stop: no non-test caller exists until the
-/// scene-submission write branch is wired).
-#[allow(dead_code)]
+/// F12-m2: F4-m1 asked for the `#[allow(dead_code)]` this carried to come
+/// off once F-4d gave `read_managed_scanout_region_bytes` a non-test
+/// caller. F-4d landed the managed scanout WRITE path
+/// (`d96e1c4c`), not a new reader, so this function's only caller
+/// remains `c0_2ci_read_source_scratch_regression_vulkan` below --
+/// `#[cfg(test)]` says that honestly instead of carrying an `allow`
+/// that suppresses the lint on a function real production code still
+/// cannot reach (R8: no production route creates managed storage for
+/// this stage to correlate a scanout read against yet). Give it a
+/// production caller and drop this attribute when the scene-submission
+/// read branch is wired.
+#[cfg(test)]
 pub(crate) fn read_scanout_region_for_managed_source(
     backend: &mut KmsBackend,
     rect: vk::Rect2D,
@@ -16432,8 +16602,8 @@ fn do_dump_drawables(backend: &mut KmsBackend) -> io::Result<()> {
                 label: format!("root-0x{:x}", backend.core.window_id),
                 id: root_id,
                 depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
+                width: d.extent().width,
+                height: d.extent().height,
             });
         }
         if let Some(cow_id) = backend.cow_id
@@ -16446,8 +16616,8 @@ fn do_dump_drawables(backend: &mut KmsBackend) -> io::Result<()> {
                 ),
                 id: cow_id,
                 depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
+                width: d.extent().width,
+                height: d.extent().height,
             });
         }
         // Sorted iteration so re-running the dump gives the same
@@ -16470,8 +16640,8 @@ fn do_dump_drawables(backend: &mut KmsBackend) -> io::Result<()> {
                 label: format!("backing-W0x{w_xid:x}-B0x{b_xid:x}"),
                 id: b_id,
                 depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
+                width: d.extent().width,
+                height: d.extent().height,
             });
         }
         let mut windows: Vec<(u32, WindowGeometry)> = backend
@@ -16522,15 +16692,15 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 let Some(d) = backend.store.get(leaf_id) else {
                     continue;
                 };
-                if d.storage.extent.width == 0 || d.storage.extent.height == 0 {
+                if d.extent().width == 0 || d.extent().height == 0 {
                     continue;
                 }
                 targets.push(DumpTarget {
                     label: format!("win-0x{w_xid:x}"),
                     id: leaf_id,
                     depth: d.depth,
-                    width: d.storage.extent.width,
-                    height: d.storage.extent.height,
+                    width: d.extent().width,
+                    height: d.extent().height,
                 });
             }
         }
@@ -16552,15 +16722,15 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 let Some(d) = backend.store.get(id) else {
                     continue;
                 };
-                if d.storage.extent.width == 0 || d.storage.extent.height == 0 {
+                if d.extent().width == 0 || d.extent().height == 0 {
                     continue;
                 }
                 targets.push(DumpTarget {
                     label: format!("xid-0x{xid:x}"),
                     id,
                     depth: d.depth,
-                    width: d.storage.extent.width,
-                    height: d.storage.extent.height,
+                    width: d.extent().width,
+                    height: d.extent().height,
                 });
             }
         }
@@ -16590,8 +16760,8 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 label: format!("present-src-{idx}-0x{src_xid:x}-to-0x{dst_xid:x}"),
                 id: src_id,
                 depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
+                width: d.extent().width,
+                height: d.extent().height,
             });
         }
     }
@@ -17099,7 +17269,7 @@ fn picture_source_domain_clip(
     // Only when the domain actually restricts the sampled storage.
     // A `bw == 0` window's content IS its storage, so this returns
     // `None` and the clip list stays byte-identical there.
-    let storage = store.get(sd.id())?.storage.extent;
+    let storage = store.get(sd.id())?.extent();
     if sd.offset() == (0, 0) && domain.width >= storage.width && domain.height >= storage.height {
         return None;
     }
@@ -17577,7 +17747,7 @@ impl KmsBackend {
         resampled
     }
 
-    fn apply_gamma_to_live_output(&self, output_key: &OutputKey) -> io::Result<()> {
+    pub(crate) fn apply_gamma_to_live_output(&self, output_key: &OutputKey) -> io::Result<()> {
         use ::drm::control::Device as ControlDevice;
 
         let Some((device_key, crtc, gamma_size)) = self.live_crtc_and_gamma_size(output_key)?
@@ -17603,7 +17773,6 @@ impl KmsBackend {
         device
             .device
             .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
-            .map_err(|e| io::Error::other(format!("set_gamma for {output_key:?} failed: {e}")))
     }
 
     fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
@@ -17785,6 +17954,7 @@ impl KmsBackend {
                             output_idx,
                             &mut self.store,
                             &mut self.platform,
+                            self.resource_service.as_mut(),
                         );
                     if direct_retired || scene_retired {
                         self.telemetry.record_frame_present();
@@ -17978,6 +18148,7 @@ impl KmsBackend {
                             output_idx,
                             &mut self.store,
                             &mut self.platform,
+                            self.resource_service.as_mut(),
                         );
                     if direct_retired || scene_retired {
                         self.telemetry.record_frame_present();
@@ -18086,6 +18257,333 @@ impl KmsBackend {
                 }
             }
         }
+    }
+
+    /// Discharge a `RoleReservation` that is still `Reserved` (never
+    /// `attach`ed into a `CommitResources`, so never `Occupied`): a
+    /// `queued_successor_role` token replaced/cancelled before dispatch
+    /// (8.3, 8.5) or a `move_into_reserved` destination that was never
+    /// adopted. Used for proven pre-import cancellation, unflip's
+    /// cancellation of unsent direct work, and the (practically
+    /// unreachable) `move_into_reserved` failure path. Never a bare `drop`:
+    /// `RoleReservation::Drop` treats an undischarged token as a lost charge
+    /// and closes admission.
+    fn discharge_bare_reservation(&mut self, role: crate::kms::render::resources::RoleReservation) {
+        if let Err((_err, mut leaked)) = self.commit_consumer.capacity.cancel_reservation(role) {
+            // Not `Reserved` under this serial -- should not happen for a
+            // bare queued token, but `cancel_reservation` already closed
+            // admission on the mismatch. Mark discharged so `Drop` does not
+            // attempt to close it a second time.
+            leaked.discharged = true;
+        }
+    }
+
+    /// Managed direct candidate preparation seam (8.3).
+    ///
+    /// 1. Rejects `implicit_layout` before any direct import/validation, preserving
+    ///    upstream's `m1_gate_reject_import` behavior (guessed LINEAR is never scanout qualification).
+    /// 2. Takes a `DirectRole::Preparing` reservation from `self.commit_consumer.capacity`.
+    /// 3. Pins source and fallback target; tests FB in probe cache.
+    /// 4. On proven failure, cleans up candidate and cancels the Preparing reservation, retaining the existing successor.
+    /// 5. On successful validation, transitions/replaces Successor, idles/releases victim,
+    ///    and retains ordered Skip metadata. F7-B1: the Successor charge now
+    ///    travels with `queued_successor` in `scanout_m2.queued_successor_role`
+    ///    and is **not** cancelled at the end of a successful call -- it is
+    ///    discharged only when the frame is later replaced (cancel, still
+    ///    `Reserved`), dispatched (`managed_dispatch_direct_successor`) or
+    ///    the seam unflips (`managed_handle_direct_unflip`).
+    /// 6. If cleanup is uncertain, charges the role and closes admission.
+    #[allow(dead_code)]
+    pub(crate) fn managed_prepare_direct_candidate(
+        &mut self,
+        source_id: DrawableId,
+        candidate: PresentScanoutCandidate,
+        event: yserver_core::backend::CompletedPresentEvent,
+    ) -> Result<bool, crate::kms::render::resources::ResourceError> {
+        // 1. Rejects implicit_layout before any direct import/validation (8.3)
+        let is_implicit = self
+            .store
+            .get(source_id)
+            .and_then(|drawable| {
+                let metadata = drawable.imported_dmabuf()?;
+                Some(metadata.implicit_layout)
+            })
+            .unwrap_or(false);
+
+        if is_implicit {
+            self.scanout_m0.m1_gate_reject_import =
+                self.scanout_m0.m1_gate_reject_import.saturating_add(1);
+            return Ok(false);
+        }
+
+        // 2. Reserve Preparing role before retaining / importing (8.3)
+        let prep_slot = self
+            .commit_consumer
+            .capacity
+            .reserve(crate::kms::render::resources::DirectRole::Preparing)?;
+
+        // 3. Resolve paint target and CRTC domain
+        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
+        let Some(fallback_target) = paint_target else {
+            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            self.request_direct_unflip("managed_prepare_paint_target_missing");
+            return Ok(false);
+        };
+
+        let (completion_output_idx, _) = match self.present_crtc_output(candidate.crtc_id) {
+            Some(pair) => pair,
+            None => {
+                let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                return Ok(false);
+            }
+        };
+
+        // Pin source and fallback target
+        let source_pin = self.pin_direct_source(source_id);
+        let fallback_target_pin = self.pin_direct_source(fallback_target.backing_id());
+
+        // 4. Test/import FB from probe cache
+        let fb_ready = self
+            .scanout_m1
+            .entries
+            .get(&source_id)
+            .and_then(ScanoutM1ProbeEntry::framebuffer)
+            .is_some();
+
+        if !fb_ready {
+            // Proven failure: clean up candidate and cancel role, retaining existing successor
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            self.request_direct_unflip("managed_prepare_framebuffer_missing");
+            return Ok(false);
+        }
+
+        // 5. Successful validation: `Successor` is a single physical slot,
+        // so an atomic replace must free it before the new reservation can
+        // move in. Discharge the victim's charge first -- it is still
+        // bare-`Reserved` (queued but never dispatched/attached), so
+        // `cancel_reservation` is the correct, single discharge -- then move
+        // the new candidate's own charge from `Preparing` into the now
+        // vacant `Successor`. The new charge (`prep_slot`) survives this
+        // call (F7-B1): it moves into `queued_successor_role` below, never
+        // cancelled here.
+        let victim_role = self.scanout_m2.queued_successor_role.take();
+        if let Some(victim_role) = victim_role {
+            self.discharge_bare_reservation(victim_role);
+        }
+
+        let mut prep_slot = prep_slot;
+        if let Err(err) = self.commit_consumer.capacity.move_role(
+            &mut prep_slot,
+            crate::kms::render::resources::DirectRole::Successor,
+        ) {
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            return Err(err);
+        }
+
+        let frame = DirectPresentFrame {
+            source_pin,
+            fallback_target_pin,
+            source_id,
+            candidate,
+            fallback_target,
+            event,
+            completion_output_idx,
+            completion_clock: None,
+            awaiting_outputs: HashSet::new(),
+        };
+
+        // Idle/release the victim frame and retain its ordered Skip
+        // metadata; its charge was already discharged above.
+        if let Some(victim) = self.scanout_m2.queued_successor.replace(frame) {
+            self.defer_direct_successor_skip(victim);
+        }
+        self.scanout_m2.queued_successor_role = Some(prep_slot);
+        self.scanout_m2.hold_direct = true;
+        self.scanout_m2.sync_ownership();
+
+        Ok(true)
+    }
+
+    /// Managed direct successor dispatch seam (8.4).
+    ///
+    /// Promotes the queued successor's `Successor` charge to `Submitted`,
+    /// occupies it via `DirectCapacity::attach` and, when it displaces an
+    /// existing `Current`, pre-reserves the `OrdinaryRetirement` role before
+    /// dispatch is allowed to proceed: "an ordinary replacement cannot
+    /// dispatch with occupied OrdinaryRetirement -- keep the latest
+    /// Successor while waiting and register a service wake." Returns the
+    /// `CommitResources` now carrying the occupied `Submitted` token so the
+    /// caller can hand it to `CommitResourceConsumer::consume` (a
+    /// `CompletionRetired` outcome) exactly as production's Task-7 path
+    /// would; `Ok(None)` means "nothing to dispatch" or "waiting on
+    /// retirement" (checked via `capacity.occupied()`/the caller's own
+    /// state, not this seam's return alone -- see the decisive tests). No
+    /// production caller (R8): exercised directly by tests to prove the
+    /// managed seam performs 8.4, not just 8.3's charge.
+    #[allow(dead_code)]
+    pub(crate) fn managed_dispatch_direct_successor(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> Result<
+        Option<crate::kms::render::resources::CommitResources>,
+        crate::kms::render::resources::ResourceError,
+    > {
+        if self.scanout_m2.queued_successor_role.is_none() {
+            return Ok(None);
+        }
+        let displacing = !self.commit_consumer.current_resources.is_empty();
+        if displacing
+            && !self
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::OrdinaryRetirement)
+        {
+            // 8.4: keep the latest Successor queued and register a service
+            // wake rather than dispatching over an occupied retirement slot.
+            self.commit_consumer.direct_admission_scheduled = true;
+            return Ok(None);
+        }
+
+        let mut slot = self
+            .scanout_m2
+            .queued_successor_role
+            .take()
+            .expect("checked Some above");
+        if let Err(err) = self.commit_consumer.capacity.move_role(
+            &mut slot,
+            crate::kms::render::resources::DirectRole::Submitted,
+        ) {
+            self.scanout_m2.queued_successor_role = Some(slot);
+            return Err(err);
+        }
+
+        let pending = crate::kms::render::resources::CommitResources::new(
+            Vec::new(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_commit_id(commit);
+        let attached = match self.commit_consumer.capacity.attach(slot, pending) {
+            Ok(res) => res,
+            Err((err, slot, _res)) => {
+                self.scanout_m2.queued_successor_role = Some(slot);
+                return Err(err);
+            }
+        };
+
+        if displacing {
+            let retire_slot = self
+                .commit_consumer
+                .capacity
+                .reserve(crate::kms::render::resources::DirectRole::OrdinaryRetirement)?;
+            self.commit_consumer
+                .prereserve_retirement(commit, retire_slot);
+        }
+
+        Ok(Some(attached))
+    }
+
+    /// Managed direct unflip / exit-resource accounting seam (8.5).
+    ///
+    /// 1. Unflip cancels unsent direct work (queued successor) -- its
+    ///    Successor charge is discharged (still bare-`Reserved`), never
+    ///    bare-dropped (F7-B2).
+    /// 2. Already-submitted work is not freed here: the `Submitted` role
+    ///    (if any) retires through `CommitResourceConsumer::consume` when
+    ///    its `CompletionRetired` outcome arrives, exactly as production's
+    ///    Task-7/8 path does.
+    /// 3. Moves `Current` into a freshly reserved `ExitRetirement` even if
+    ///    `OrdinaryRetirement` is occupied (8.5's two independent
+    ///    retirement roles).
+    /// 4. Materializes shadow and resolves dependencies before using
+    ///    composed return resources.
+    /// 5. Enforces that direct re-entry requires both retirement roles
+    ///    vacant (`managed_can_enter_direct`) and a retained per-output
+    ///    composed return allocation (`PlatformBackend::retained_composed_framebuffer`,
+    ///    already held by the scene compositor's on-screen BO tracking --
+    ///    `managed_can_enter_direct` already checks it per output).
+    #[allow(dead_code)]
+    pub(crate) fn managed_handle_direct_unflip(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<bool, crate::kms::render::resources::ResourceError> {
+        self.request_direct_unflip(reason);
+
+        // 1. Cancel unsent direct work: discharge the queued successor's
+        // charge before dropping the frame.
+        if let Some(queued) = self.scanout_m2.queued_successor.take() {
+            if let Some(role) = self.scanout_m2.queued_successor_role.take() {
+                self.discharge_bare_reservation(role);
+            }
+            self.defer_direct_successor_skip(queued);
+        }
+
+        // 3. Move Current into ExitRetirement even if OrdinaryRetirement is
+        // occupied (8.5). At most one `CommitResources` in
+        // `current_resources` carries the `Current` role at a time.
+        if let Some(idx) = self
+            .commit_consumer
+            .current_resources
+            .iter()
+            .position(|res| {
+                res.direct_role.as_ref().is_some_and(|role| {
+                    role.role() == crate::kms::render::resources::DirectRole::Current
+                })
+            })
+        {
+            let exit_slot = self
+                .commit_consumer
+                .capacity
+                .reserve(crate::kms::render::resources::DirectRole::ExitRetirement)?;
+            let mut res = self.commit_consumer.current_resources.remove(idx);
+            if let Err((err, leaked)) = self.commit_consumer.capacity.move_into_reserved(
+                res.direct_role.as_mut().expect("checked Some above"),
+                exit_slot,
+            ) {
+                // `res`'s own occupied role is untouched on this error path
+                // (validated before mutation); `leaked` is the never-adopted
+                // ExitRetirement reservation -- discharge it explicitly
+                // rather than losing track of that capacity slot.
+                self.discharge_bare_reservation(leaked);
+                self.commit_consumer.current_resources.insert(idx, res);
+                return Err(err);
+            }
+            self.commit_consumer.releasing_resources.push(res);
+        }
+
+        // 4. Materialize shadow for unflip.
+        let _ = self.materialize_direct_shadow_for_unflip();
+
+        // 5. Re-entry requires both retirement roles vacant.
+        let can_reenter = self.managed_can_enter_direct();
+        self.scanout_m2.reentry_blocked_until_composed = !can_reenter;
+
+        Ok(can_reenter)
+    }
+
+    /// Check whether direct entry is permitted under managed capacity rules (8.5).
+    #[allow(dead_code)]
+    pub(crate) fn managed_can_enter_direct(&self) -> bool {
+        if !self.commit_consumer.capacity.can_enter_direct() {
+            return false;
+        }
+        for output_idx in 0..self.platform.outputs.len() {
+            if self
+                .platform
+                .retained_composed_framebuffer(output_idx)
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -18436,6 +18934,7 @@ impl Backend for KmsBackend {
                     output_idx,
                     &mut self.store,
                     &mut self.platform,
+                    self.resource_service.as_mut(),
                 );
             if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
@@ -18790,6 +19289,7 @@ impl Backend for KmsBackend {
                 &self.windows,
                 &mut self.telemetry,
                 cow_host_xid,
+                self.resource_service.as_mut(),
             ) {
                 Ok(composed_outputs) => {
                     if self.scanout_m2.reentry_blocked_until_composed
@@ -19106,7 +19606,7 @@ impl Backend for KmsBackend {
         if let Some(fd) = self
             .store
             .get(src_id)
-            .and_then(|d| d.storage.imported_drawable.as_ref())
+            .and_then(|d| d.imported_drawable())
             .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
         {
             match export_dmabuf_read_access_sync_file(fd) {
@@ -19511,17 +20011,28 @@ impl Backend for KmsBackend {
     fn pin_present_source(&mut self, host_xid: u32) -> Option<u64> {
         let id = self.store.lookup(host_xid)?;
         self.store.incref(id);
+        let lease = self
+            .store
+            .get(id)
+            .and_then(|d| d.managed_lease())
+            .and_then(|l| {
+                self.resource_service
+                    .as_mut()
+                    .and_then(|s| s.share_storage_read(l).ok())
+            });
         let pin_id = self.next_present_source_pin_id;
         self.next_present_source_pin_id = self.next_present_source_pin_id.wrapping_add(1).max(1);
-        self.present_source_pins.insert(pin_id, id);
+        self.present_source_pins
+            .insert(pin_id, PresentPinEntry::new(id, lease));
         Some(pin_id)
     }
 
     fn release_present_source(&mut self, pin_id: u64) {
-        let Some(id) = self.present_source_pins.remove(&pin_id) else {
+        let Some(entry) = self.present_source_pins.remove(&pin_id) else {
             return;
         };
-        self.store_decref_with_invalidate(id);
+        drop(entry.lease);
+        self.store_decref_with_invalidate(entry.id);
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
@@ -21505,8 +22016,8 @@ impl Backend for KmsBackend {
             return false;
         };
         drawable.depth == depth
-            && drawable.storage.extent.width >= u32::from(width)
-            && drawable.storage.extent.height >= u32::from(height)
+            && drawable.extent().width >= u32::from(width)
+            && drawable.extent().height >= u32::from(height)
     }
 
     fn update_redirected_backing_geometry(
@@ -22318,7 +22829,7 @@ impl Backend for KmsBackend {
             let format = self
                 .store
                 .get(target.backing_id())
-                .map(|d| d.storage.format)
+                .map(|d| d.format())
                 .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
@@ -22377,7 +22888,7 @@ impl Backend for KmsBackend {
             self.scene.wake_for_damage();
             return Ok(());
         }
-        let src_format = self.store.get(src).map(|d| d.storage.format);
+        let src_format = self.store.get(src).map(|d| d.format());
         if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
             // Tile path requires BGRA8 src (matches `try_tiled_fill`
             // gate). Other formats fall through with no paint —
@@ -23160,7 +23671,7 @@ impl Backend for KmsBackend {
         // anyway, so the "full extent" overhead matches the call
         // pattern.
         let src_extent = match self.store.get(src_id) {
-            Some(d) => d.storage.extent,
+            Some(d) => d.extent(),
             None => return Ok(()),
         };
         let src_w = src_extent.width;
@@ -23552,7 +24063,7 @@ impl Backend for KmsBackend {
         // redirect routing landed on. The extent must come from the
         // storage (that is what is being read); the depth must not.
         let storage_extent = match self.store.get(target.backing_id()) {
-            Some(d) => d.storage.extent,
+            Some(d) => d.extent(),
             None => return Ok(None),
         };
         let depth = target.x11_depth();
@@ -23696,7 +24207,7 @@ impl Backend for KmsBackend {
             return Ok(None);
         };
         let (depth, extent, content_version) = match self.store.get(target.backing_id()) {
-            Some(d) => (d.depth, d.storage.extent, d.content_version),
+            Some(d) => (d.depth, d.extent(), d.content_version),
             None => return Ok(None),
         };
         if depth != 1 {
@@ -26042,7 +26553,7 @@ impl Backend for KmsBackend {
         if !self
             .store
             .get(id)
-            .map(|d| d.storage.is_exportable())
+            .map(|d| d.is_exportable(self.resource_service.as_mut()))
             .unwrap_or(false)
         {
             // promote_drawable_exportable needs &mut self.engine/platform/store,
@@ -26051,7 +26562,12 @@ impl Backend for KmsBackend {
                 return Err(io::Error::other("DRI3 export: Vulkan unavailable"));
             }
             self.engine
-                .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+                .promote_drawable_exportable(
+                    &mut self.platform,
+                    &mut self.store,
+                    self.resource_service.as_mut(),
+                    id,
+                )
                 .map_err(|e| io::Error::other(format!("DRI3 export promote: {e:?}")))?;
         }
 
@@ -26073,8 +26589,8 @@ impl Backend for KmsBackend {
             .unwrap_or_else(|| {
                 (
                     drawable.depth,
-                    u16::try_from(drawable.storage.extent.width).unwrap_or(u16::MAX),
-                    u16::try_from(drawable.storage.extent.height).unwrap_or(u16::MAX),
+                    u16::try_from(drawable.extent().width).unwrap_or(u16::MAX),
+                    u16::try_from(drawable.extent().height).unwrap_or(u16::MAX),
                 )
             });
         let bpp: u8 = match depth {
@@ -26086,22 +26602,23 @@ impl Backend for KmsBackend {
         // Export: imported images go through the DrawableImage path; promoted /
         // server-owned images use export_promoted on the storage's raw memory
         // handle + stride/size carried from allocation-time layout query.
-        let export = if let Some(imported) = drawable.storage.imported_drawable.as_ref() {
+        let export = if let Some(imported) = drawable.imported_drawable() {
             crate::kms::vk::dri3::export_dmabuf(vk, imported)
                 .map_err(|e| io::Error::other(format!("DRI3 export_dmabuf: {e:?}")))?
         } else {
+            let (memory, export_stride, export_size, export_modifier) = drawable
+                .export_metadata(self.resource_service.as_mut())
+                .ok_or_else(|| io::Error::other("promoted storage missing export metadata"))?;
             debug_assert!(
-                drawable.storage.export_stride != 0 && drawable.storage.export_size != 0,
-                "promoted storage missing export metadata (stride={} size={})",
-                drawable.storage.export_stride,
-                drawable.storage.export_size,
+                export_stride != 0 && export_size != 0,
+                "promoted storage missing export metadata (stride={export_stride} size={export_size})",
             );
             crate::kms::vk::dri3::export_promoted(
                 vk,
-                drawable.storage.memory,
-                drawable.storage.export_stride,
-                drawable.storage.export_size,
-                drawable.storage.export_modifier,
+                memory,
+                export_stride,
+                export_size,
+                export_modifier,
             )
             .map_err(|e| io::Error::other(format!("DRI3 export_promoted: {e:?}")))?
         };
@@ -26471,29 +26988,8 @@ impl Backend for KmsBackend {
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {
-        use crate::kms::render::present_completion::PinnedWake;
-        let Some(pin) = self.retained_present_wakes.remove(&present_id) else {
-            return;
-        };
-        match pin {
-            PinnedWake::Pixmap(h) => {
-                if let Err(e) = self.dri3_trigger_fence_via_handle(&h) {
-                    log::warn!("signal_present_wake: dri3_trigger_fence_via_handle failed: {e}");
-                }
-            }
-            PinnedWake::PixmapSynced { handle, value } => {
-                if let Err(e) = self.dri3_signal_syncobj_via_handle(&handle, value) {
-                    log::warn!("signal_present_wake: dri3_signal_syncobj_via_handle failed: {e}");
-                }
-            }
-            // The release point already carries the GPU completion fence.
-            // Consuming the pin here drops its retained handle without
-            // advancing the timeline from the host.
-            PinnedWake::PixmapSyncedFencePublished {
-                handle: _handle,
-                value: _value,
-            } => {}
-            PinnedWake::None => {}
+        if let Some(pin) = self.retained_present_wakes.remove(&present_id) {
+            self.dispatch_pinned_wake(pin);
         }
     }
 
@@ -27307,7 +27803,8 @@ impl Backend for KmsBackend {
             self.stop_direct_after_scanout_replaced("DPMS off");
             self.scanout_m1.clear("DPMS off");
             log::info!("kms: dpms sleep — scene.drain_all");
-            self.scene.drain_all(&mut self.platform);
+            self.scene
+                .drain_all(&mut self.platform, self.resource_service.as_mut());
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
             if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
                 self.kms_outputs_active = false;
@@ -38357,7 +38854,7 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
         let leaf_before = b.store.lookup(0x100).expect("leaf before");
-        let extent_before = b.store.get(leaf_before).unwrap().storage.extent;
+        let extent_before = b.store.get(leaf_before).unwrap().extent();
         let backing_id = seed_backing_drawable(&mut b, 0x900);
         b.store.set_redirected_target(leaf_before, Some(backing_id));
         b.configure_subwindow(
@@ -38376,7 +38873,7 @@ mod tests {
         .expect("configure_subwindow");
 
         let leaf_after = b.store.lookup(0x100).expect("leaf after");
-        let extent_after = b.store.get(leaf_after).unwrap().storage.extent;
+        let extent_after = b.store.get(leaf_after).unwrap().extent();
         assert_eq!(
             leaf_after, leaf_before,
             "redirected resize must not churn the hidden leaf DrawableId",
@@ -38422,7 +38919,7 @@ mod tests {
         .expect("configure_subwindow");
 
         let leaf_during_redirect = b.store.lookup(0x100).expect("leaf during redirect");
-        let extent_during_redirect = b.store.get(leaf_during_redirect).unwrap().storage.extent;
+        let extent_during_redirect = b.store.get(leaf_during_redirect).unwrap().extent();
         assert_eq!(extent_during_redirect.width, 100);
         assert_eq!(extent_during_redirect.height, 100);
 
@@ -38430,7 +38927,7 @@ mod tests {
             .expect("release_redirected_backing");
 
         let leaf_after = b.store.lookup(0x100).expect("leaf after unredirect");
-        let extent_after = b.store.get(leaf_after).unwrap().storage.extent;
+        let extent_after = b.store.get(leaf_after).unwrap().extent();
         assert_eq!(extent_after.width, 180);
         assert_eq!(extent_after.height, 140);
     }
@@ -38644,8 +39141,8 @@ mod tests {
             matches!(cow.kind, super::super::store::DrawableKind::Window),
             "COW must be DrawableKind::Window",
         );
-        assert_eq!(cow.storage.extent.width, u32::from(b.platform.fb_w));
-        assert_eq!(cow.storage.extent.height, u32::from(b.platform.fb_h));
+        assert_eq!(cow.extent().width, u32::from(b.platform.fb_w));
+        assert_eq!(cow.extent().height, u32::from(b.platform.fb_h));
     }
 
     #[test]
@@ -40842,7 +41339,7 @@ mod tests {
         backend.platform.scanout_pools[pool_idx]
             .as_mut()
             .expect("live-scene output has a scanout pool")
-            .detach_managed_entries();
+            .detach_managed_entries(Some(&mut registry));
         service.service_ready_with_registry(&mut registry);
         assert!(
             !service.contains(&source_key),
@@ -40898,6 +41395,212 @@ mod tests {
         service.poll_gpu(std::time::Instant::now()).unwrap();
         service.service_ready();
         assert!(!service.contains(&scratch_key));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2ci_scene_managed_shared_compose_vulkan() {
+        use ash::vk;
+        use std::{cell::RefCell, rc::Rc};
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        use crate::{
+            kms::{
+                owner::identity::IncarnationId,
+                render::resources::{DrmCleanupRegistry, ResourceService, tests::MockCleanupIo},
+            },
+            platform::drm::DrmDeviceKey,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
+            Ok(b) => b,
+            Err(e) => {
+                panic!("environmental skip: no live Vulkan ICD available ({e}); not claiming pass")
+            }
+        };
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let (root_w, root_h) = {
+            let root = state.resources.window(ROOT_WINDOW).expect("root window");
+            (root.width, root.height)
+        };
+        let window = ResourceId(0x2005);
+        let window_host = create_live_window(
+            &mut state,
+            &mut backend,
+            window,
+            ROOT_WINDOW,
+            40,
+            40,
+            16,
+            16,
+        );
+
+        let root_color = 0x0022_3344;
+        let window_color = 0x00bb_6600;
+        backend
+            .fill_rectangle(
+                None,
+                backend.core.window_id,
+                root_color,
+                0,
+                0,
+                root_w,
+                root_h,
+            )
+            .expect("fill root");
+        backend
+            .fill_rectangle(None, window_host.as_raw(), window_color, 0, 0, 16, 16)
+            .expect("fill window");
+
+        let pool_idx = 0;
+        let bo_idx = 0;
+        let dev = DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let inc = IncarnationId::first();
+        let mut service = ResourceService::new(dev, inc);
+
+        let device_key = backend.platform.outputs[pool_idx].key.device_key;
+        let kms_device_rc = backend
+            .platform
+            .device_for_key(device_key)
+            .expect("live-scene fixture output has a KMS owner")
+            .device
+            .clone();
+        let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
+        let mut registry = DrmCleanupRegistry::new_with_device_and_io(
+            kms_device_rc,
+            device_key,
+            inc,
+            Box::new(MockCleanupIo::new(Rc::clone(&cleanup_calls))),
+        );
+
+        // Convert the free scanout bo from legacy to managed ownership.
+        let source_key = backend
+            .platform
+            .register_managed_scanout_bo(&mut service, &mut registry, pool_idx, bo_idx)
+            .expect("register free scanout bo as managed");
+
+        // Verify the bo was registered and tagged.
+        assert_eq!(
+            backend.platform.scanout_pools[pool_idx]
+                .as_ref()
+                .unwrap()
+                .display_pool()
+                .bos[bo_idx]
+                .managed_key(),
+            Some(source_key)
+        );
+
+        // Install the service into the backend so SceneCompositor::tick can reach it.
+        backend.resource_service = Some(service);
+
+        backend.tick_maybe_composite_for_tests();
+
+        let mut service = backend
+            .resource_service
+            .take()
+            .expect("resource_service was installed and preserved");
+
+        // Verify the batch was registered in the service with a GPU obligation on source_key.
+        assert_eq!(
+            service.pending_batches().len(),
+            1,
+            "managed_batch must be registered with the service"
+        );
+        let pending_batch = &service.pending_batches()[0];
+        let ob = pending_batch
+            .obligation
+            .as_ref()
+            .expect("batch must carry bound GpuObligation");
+        assert!(
+            ob.entries().iter().any(|&(k, _)| k == source_key),
+            "GpuObligation must cover source_key"
+        );
+        let ticket = ob.ticket().clone();
+
+        // While the GPU obligation is pending, source_key must not be releasable.
+        assert!(
+            !service.is_releasable(&source_key),
+            "source_key must not be releasable while its GPU work is in flight"
+        );
+        assert_eq!(
+            backend.platform.scanout_pools[pool_idx]
+                .as_ref()
+                .unwrap()
+                .display_pool()
+                .bos[bo_idx]
+                .state
+                .phase,
+            crate::kms::vk::scanout::BoPhase::Recording
+        );
+
+        // Wait for the real Vulkan fence to signal.
+        let vk_ctx = backend.platform.vk.clone().expect("live scene installs vk");
+        ticket.wait(&vk_ctx).expect("wait for compose ticket");
+
+        // Poll GPU through ResourceService. This validates and commits the GPU batch,
+        // clearing the GPU obligation and freeing the write lease.
+        service
+            .poll_gpu(std::time::Instant::now())
+            .expect("poll_gpu commits batch");
+        assert!(
+            service.pending_batches().is_empty(),
+            "pending batches must be empty after poll_gpu commits"
+        );
+        assert!(
+            service.is_releasable(&source_key),
+            "source_key must become releasable once GPU obligation is committed"
+        );
+
+        // Re-install service to read back the composited pixels from the managed scanout bo.
+        backend.resource_service = Some(service);
+        let scan_rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 16,
+                height: 16,
+            },
+        };
+        let scanout_bytes = super::read_scanout_region(
+            &mut backend,
+            scan_rect,
+            super::ScanoutReadSelection::PermissiveDump,
+        )
+        .expect("readback of composited scanout region from managed payload");
+        assert!(
+            scanout_bytes.iter().any(|&b| b != 0),
+            "managed compose must have written non-zero pixels into SharedBacking.image"
+        );
+
+        // Clean up: detach the managed entries from the pool, dropping the retain lease,
+        // and verify that service_ready_with_registry discharges the allocation.
+        // F8-M1: also unregisters the husk `register_managed_scanout_bo` registered
+        // above through the real site, not a hand-bumped counter.
+        backend.platform.scanout_pools[pool_idx]
+            .as_mut()
+            .expect("scanout pool exists")
+            .detach_managed_entries(Some(&mut registry));
+        let mut service = backend.resource_service.take().unwrap();
+        service.service_ready_with_registry(&mut registry);
+        assert!(
+            !service.contains(&source_key),
+            "source_key must be destroyed after release"
+        );
+        assert_eq!(
+            cleanup_calls.borrow().len(),
+            2,
+            "destruction discharges file_owned (RemoveFb + CloseGem)"
+        );
     }
 
     #[test]
@@ -42009,7 +42712,7 @@ mod tests {
             .store
             .lookup(root_xid)
             .expect("root must be live before resize");
-        let extent_before = b.store.get(id_before).unwrap().storage.extent;
+        let extent_before = b.store.get(id_before).unwrap().extent();
         assert_eq!(extent_before.width, u32::from(initial_w));
         assert_eq!(extent_before.height, u32::from(initial_h));
 
@@ -42033,7 +42736,7 @@ mod tests {
             .store
             .lookup(root_xid)
             .expect("root must still be live after resize");
-        let extent_after = b.store.get(id_after).unwrap().storage.extent;
+        let extent_after = b.store.get(id_after).unwrap().extent();
         assert_eq!(
             extent_after.width,
             u32::from(new_w),
@@ -43702,8 +44405,8 @@ mod tests {
         assert!(b.store.get(unrelated_id).is_none());
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43725,8 +44428,8 @@ mod tests {
         assert!(b.scanout_m2.current.is_none());
         assert!(b.scanout_m2.completed.is_empty());
         assert!(b.scanout_m2.idled.is_empty());
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
         assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
         assert!(
             b.store.get(target_id).is_none(),
@@ -43756,8 +44459,8 @@ mod tests {
         assert!(!b.scanout_m2.hold_direct);
         assert!(b.scanout_m2.current.is_some());
         assert!(b.scanout_m2.idled.is_empty());
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
         assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
         assert!(b.store.get(target_id).is_none());
         assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
@@ -43799,8 +44502,8 @@ mod tests {
         assert!(b.scanout_m2.current.is_some());
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
         assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
 
         b.stop_direct_after_scanout_replaced("final COW release test replacement");
@@ -43838,10 +44541,10 @@ mod tests {
         assert!(b.scanout_m2.current.is_some());
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
         assert_eq!(
-            b.present_source_pins.get(&fallback_pin),
-            Some(&redirected_fallback)
+            b.present_source_pin_id(fallback_pin),
+            Some(redirected_fallback)
         );
     }
 
@@ -43882,8 +44585,8 @@ mod tests {
         assert!(!b.windows[&target_xid].mapped);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43904,8 +44607,8 @@ mod tests {
         assert!(!b.windows[&unrelated_xid].mapped);
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43928,8 +44631,8 @@ mod tests {
         assert!(b.windows[&target_xid].mapped);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43954,8 +44657,8 @@ mod tests {
         assert!(b.windows[&unrelated_xid].mapped);
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -43988,8 +44691,8 @@ mod tests {
         assert_eq!(b.windows[&target_xid].x, 12);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -44024,8 +44727,8 @@ mod tests {
         assert_eq!(b.windows[&unrelated_xid].x, 12);
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
     }
 
     #[test]
@@ -44048,8 +44751,8 @@ mod tests {
         assert_ne!(new_cow_id, old_cow_id);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
-        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&old_cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(old_cow_id));
         assert_eq!(
             b.store.get(old_cow_id).map(|d| d.refcount),
             Some(1),
@@ -44096,10 +44799,10 @@ mod tests {
         assert!(b.store.get(old_cow_id).is_some());
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
-        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
         assert_eq!(
-            b.present_source_pins.get(&fallback_pin),
-            Some(&redirected_fallback)
+            b.present_source_pin_id(fallback_pin),
+            Some(redirected_fallback)
         );
     }
 
@@ -45304,5 +46007,756 @@ mod tests {
             2,
             "a single-read implementation would report 1"
         );
+    }
+
+    #[test]
+    fn c0_2ci_present_split_source_fallback_pin_ownership_and_release() {
+        use crate::kms::{
+            owner::identity::IncarnationId,
+            render::resources::{
+                AllocationPayload, ResourceService,
+                storage::{PixelIdentity, StorageBacking, StorageLease},
+                tests::SpyAllocation,
+            },
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        let mut b = super::KmsBackend::for_tests();
+        let inc_id = IncarnationId::from_raw(1);
+        let device_key = b.platform.primary_device().unwrap().key;
+        let mut service = ResourceService::new(device_key, inc_id);
+
+        let target_xid = 0x6a00;
+        let drawable_id = seed_window(&mut b, target_xid, None, 0, 0);
+
+        let drops = Rc::new(Cell::new(0));
+        let alloc_lease = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        let alloc_key = alloc_lease.key();
+
+        let pixels = PixelIdentity {
+            target: PaintTarget::new(drawable_id, (0, 0), None, 24),
+            allocation: alloc_key,
+            content_offset: (0, 0),
+            extent: ash::vk::Extent2D {
+                width: 100,
+                height: 100,
+            },
+            format: ash::vk::Format::B8G8R8A8_UNORM,
+            image_view: ash::vk::ImageView::null(),
+            sample_view: ash::vk::ImageView::null(),
+            image: ash::vk::Image::null(),
+        };
+        let storage_lease = StorageLease {
+            allocation: alloc_lease,
+            pixels,
+        };
+
+        b.store.get_mut(drawable_id).unwrap().storage =
+            Storage::from_backing(StorageBacking::Managed(storage_lease));
+        b.resource_service = Some(service);
+
+        let initial_refcount = b.store.get(drawable_id).unwrap().refcount;
+
+        // 1. pin_present_source creates a PresentPinEntry with StorageLease
+        let pin = b
+            .pin_present_source(target_xid)
+            .expect("pin present source");
+        assert_eq!(b.present_source_pin_id(pin), Some(drawable_id));
+        assert!(b.present_source_pin_lease(pin).is_some());
+        assert_eq!(
+            b.store.get(drawable_id).unwrap().refcount,
+            initial_refcount + 1
+        );
+
+        // 2. release_present_source removes entry once and cleans up
+        b.release_present_source(pin);
+        assert!(!b.present_source_pins.contains_key(&pin));
+        assert_eq!(b.present_source_pin_id(pin), None);
+        assert!(b.present_source_pin_lease(pin).is_none());
+        assert_eq!(b.store.get(drawable_id).unwrap().refcount, initial_refcount);
+
+        // 3. Second release_present_source is a no-op (removes once)
+        b.release_present_source(pin);
+        assert_eq!(b.store.get(drawable_id).unwrap().refcount, initial_refcount);
+    }
+
+    #[test]
+    fn c0_2ci_present_retained_wakes_move_into_present_release_and_signal() {
+        use crate::kms::render::present_completion::PinnedWake;
+        use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+
+        let mut b = super::KmsBackend::for_tests();
+
+        let present_id = 991;
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: 1,
+            host_xid: 0x200,
+            dst_host_xid: 0x300,
+            options: 0,
+            present_id,
+            window_generation: 0,
+            crtc_id: 1,
+            crtc_epoch: 1,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: 0,
+            emit_idle: true,
+        };
+
+        // Retain a wake
+        b.retained_present_wakes
+            .insert(present_id, PinnedWake::None);
+        assert!(b.retained_present_wakes.contains_key(&present_id));
+
+        // make_present_release moves the actual pinned wake into PresentRelease without XID lookup
+        let release = b.make_present_release(event);
+        assert_eq!(release.event.present_id, present_id);
+        assert!(release.wake.is_some());
+        assert!(!b.retained_present_wakes.contains_key(&present_id));
+
+        // signal_present_release consumes and signals the wake
+        b.signal_present_release(release);
+    }
+
+    #[test]
+    fn c0_2ci_cow_deferred_release_and_reclaim_with_physical_contracts() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x6b00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+
+        // 1. 0 -> 1 claim edge allocates COW
+        assert!(b.cow_id.is_none());
+        assert!(b.get_overlay_window(None).expect("materialize COW"));
+        let cow_id = b.cow_id.expect("COW id");
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
+
+        // 2. Direct frame installed
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+        b.scanout_m2.unflip_shadow_ready = true;
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+
+        // 3. 1 -> 0 edge with direct active defers release
+        let deferred = b.release_overlay_window(None).expect("release overlay");
+        assert!(deferred);
+        assert!(b.deferred_cow_release);
+        // Deferred release drops no lease and decrefs no storage
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+        assert_eq!(b.present_source_pin_id(cow_pin), Some(cow_id));
+        assert_eq!(b.present_source_pin_id(source_pin), Some(source_id));
+
+        // 4. 0 -> 1 edge while deferred_cow_release holds (re-claim)
+        let reclaimed = b.get_overlay_window(None).expect("re-claim COW");
+        assert!(reclaimed);
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+
+        // 5. Unflip replacement stop path after re-claim: flag is cleared, so it frees nothing!
+        b.stop_direct_after_scanout_replaced("replacement after re-claim");
+        assert_eq!(b.cow_id, Some(cow_id));
+        // Direct fallback pin was released, but protocol COW survives with refcount 1
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
+
+        // 6. No-re-claim ordering: 1 -> 0 release without active direct scanout decrefs to 0
+        assert!(
+            b.release_overlay_window(None)
+                .expect("final release without direct")
+        );
+        assert!(b.cow_id.is_none());
+        assert!(b.store.get(cow_id).is_none());
+
+        // 7. Fresh 0 -> 1 allocation after completed release gets fresh identity
+        assert!(b.get_overlay_window(None).expect("fresh COW allocation"));
+        let fresh_cow_id = b.cow_id.expect("fresh cow id");
+        assert_ne!(fresh_cow_id, cow_id);
+
+        // Stale stop-path / unflip evidence for the old identity does not retire the new identity
+        b.stop_direct_after_scanout_replaced("stale stop path for old unflip");
+        assert_eq!(b.cow_id, Some(fresh_cow_id));
+        assert!(b.store.get(fresh_cow_id).is_some());
+
+        // 8. Failure route: materialization failure keeps COW and pins
+        let fail_target_xid = 0x6b40;
+        let _ = seed_window(&mut b, fail_target_xid, None, 0, 0);
+        let redirected_fallback = seed_window(&mut b, 0x6b10, None, 0, 0);
+        let (_, _, _, fail_fallback_pin) = install_direct_frame_for_target_test(
+            &mut b,
+            fail_target_xid,
+            redirected_fallback,
+            true,
+        );
+        b.scanout_m2.unflip_shadow_ready = false;
+        let err = b
+            .release_overlay_window(None)
+            .expect_err("unflip shadow not ready");
+        assert!(err.to_string().contains("NoVk"), "{err}");
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(fresh_cow_id));
+        assert_eq!(
+            b.present_source_pin_id(fail_fallback_pin),
+            Some(redirected_fallback)
+        );
+    }
+
+    #[test]
+    fn c0_2ci_backend_scanout_m1_probe_cache_strictly_bounded() {
+        use crate::kms::render::store::DrawableId;
+
+        let mut cache = super::ScanoutM1ProbeCache::new();
+        assert_eq!(cache.entries.len(), 0);
+
+        // Insert 40 entries, exceeding MAX_M1_PROBE_CACHE_ENTRIES = 32
+        for i in 1..=40 {
+            let id = DrawableId::for_tests(i);
+            cache.insert(id, super::ScanoutM1ProbeEntry::rejected());
+            assert!(cache.entries.len() <= 32);
+        }
+
+        assert_eq!(cache.entries.len(), 32);
+        // The earliest entries must have been evicted to bound memory usage
+        assert!(!cache.entries.contains_key(&DrawableId::for_tests(1)));
+        assert!(cache.entries.contains_key(&DrawableId::for_tests(40)));
+    }
+
+    #[test]
+    fn c0_2ci_backend_managed_prepare_direct_candidate_implicit_layout_rejection() {
+        use ash::vk;
+        use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
+
+        use crate::kms::render::store::{DrawableKind, ImportedDmabufMetadata};
+
+        let mut b = super::KmsBackend::for_tests();
+        let xid: u32 = 0x5432;
+        let mut storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+
+        // Mark dmabuf with implicit_layout = true
+        storage.imported_dmabuf = Some(ImportedDmabufMetadata {
+            fourcc: 0x3432_5258,
+            vk_format: vk::Format::B8G8R8A8_UNORM,
+            modifier: 0,
+            planes: Vec::new(),
+            implicit_layout: true,
+            width: 64,
+            height: 64,
+            depth: 24,
+            bpp: 32,
+        });
+
+        let did = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate");
+
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 1,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            src_pixmap_xid: xid,
+            dst_window_xid: 0,
+            src_host_xid: xid,
+            paint_dst_host_xid: 0,
+            completion_dst_host_xid: 0,
+            src_width: 64,
+            src_height: 64,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: 1,
+            host_xid: xid,
+            dst_host_xid: 0,
+            options: 0,
+            present_id: 1,
+            window_generation: 1,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: 0,
+            emit_idle: false,
+        };
+
+        let initial_rejects = b.scanout_m0.m1_gate_reject_import;
+        let result = b
+            .managed_prepare_direct_candidate(did, candidate, event)
+            .unwrap();
+        // Must reject implicit layout before any import or reservation (8.3)
+        assert!(!result);
+        assert_eq!(b.scanout_m0.m1_gate_reject_import, initial_rejects + 1);
+        // Capacity remained completely uncharged
+        assert_eq!(b.commit_consumer.capacity.occupied(), 0);
+    }
+
+    /// Build a `managed_prepare_direct_candidate` input that reaches the
+    /// success path: a non-implicit-layout source pixmap with a
+    /// probe-cache-accepted (fake, deterministic) framebuffer, a plain
+    /// pixmap fallback/paint target, and a bound RandR CRTC.
+    fn managed_prepare_ready_candidate(
+        b: &mut super::KmsBackend,
+        source_xid: u32,
+        fallback_xid: u32,
+        crtc_id: u32,
+        present_id: u32,
+    ) -> (
+        crate::kms::render::store::DrawableId,
+        yserver_core::backend::PresentScanoutCandidate,
+        yserver_core::backend::CompletedPresentEvent,
+    ) {
+        use ash::vk;
+        use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
+
+        use crate::kms::render::store::{DrawableKind, ImportedDmabufMetadata};
+
+        let mut source_storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        source_storage.imported_dmabuf = Some(ImportedDmabufMetadata {
+            fourcc: 0x3432_5258,
+            vk_format: vk::Format::B8G8R8A8_UNORM,
+            modifier: 0,
+            planes: Vec::new(),
+            implicit_layout: false,
+            width: 64,
+            height: 64,
+            depth: 24,
+            bpp: 32,
+        });
+        let source_id = b
+            .store
+            .allocate(source_xid, DrawableKind::Pixmap, 24, false, source_storage)
+            .expect("allocate source pixmap");
+
+        let fallback_storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        b.store
+            .allocate(
+                fallback_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                fallback_storage,
+            )
+            .expect("allocate fallback pixmap");
+
+        bind_test_randr_crtc(b, 0, crtc_id);
+
+        // Deterministic, hardware-free "accepted" probe framebuffer: a fake
+        // DRM device (`Device::for_tests()`, unable to issue real ioctls --
+        // its `Drop` cleanup logs a warning and does not panic) with
+        // made-up handles. Only `ScanoutM1ProbeEntry::framebuffer().is_some()`
+        // is observed by the seam under test.
+        let fb_handle =
+            ::drm::control::from_u32::<::drm::control::framebuffer::Handle>(100 + present_id)
+                .expect("fake fb handle");
+        let gem_handle = ::drm::control::from_u32::<::drm::buffer::Handle>(200 + present_id)
+            .expect("fake gem handle");
+        let device = Rc::new(crate::drm::Device::for_tests().expect("fake drm device"));
+        let fb = crate::drm::modeset::DirectScanoutProbeFramebuffer {
+            inner: crate::drm::modeset::ProbeFbOwnership::Legacy {
+                device,
+                fb: fb_handle,
+                gem: gem_handle,
+            },
+        };
+        b.scanout_m1
+            .entries
+            .insert(source_id, super::ScanoutM1ProbeEntry::accepted(fb));
+
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: u64::from(present_id),
+            crtc_id,
+            crtc_epoch: 0,
+            src_pixmap_xid: source_xid,
+            dst_window_xid: 0,
+            src_host_xid: source_xid,
+            paint_dst_host_xid: fallback_xid,
+            completion_dst_host_xid: 0,
+            src_width: 64,
+            src_height: 64,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: present_id,
+            host_xid: source_xid,
+            dst_host_xid: 0,
+            options: 0,
+            present_id: u64::from(present_id),
+            window_generation: 1,
+            crtc_id,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: 0,
+            emit_idle: false,
+        };
+
+        (source_id, candidate, event)
+    }
+
+    #[test]
+    fn c0_2ci_backend_managed_prepare_direct_candidate_charges_and_replaces_successor() {
+        use crate::kms::render::resources::DirectRole;
+
+        let mut b = super::KmsBackend::for_tests();
+
+        // First candidate: charges the Successor role and survives past the
+        // call (F7-B1 -- this is the mutation that regresses if
+        // `cancel_reservation(prep_slot)` is restored at the end of the
+        // success path).
+        let (_id_a, candidate_a, event_a) =
+            managed_prepare_ready_candidate(&mut b, 0x7001, 0x7002, 10, 1);
+        assert!(
+            b.managed_prepare_direct_candidate(_id_a, candidate_a, event_a)
+                .unwrap()
+        );
+        assert_eq!(b.commit_consumer.capacity.occupied(), 1);
+        let serial_a = b
+            .scanout_m2
+            .queued_successor_role
+            .as_ref()
+            .expect("charged after success")
+            .serial();
+        assert_eq!(
+            b.scanout_m2.queued_successor_role.as_ref().unwrap().role(),
+            DirectRole::Successor
+        );
+
+        // Second, successful candidate replaces the victim: exactly one
+        // discharge per charge -- occupied() does not grow, and the serial
+        // changes (a new reservation, not the old one kept alive).
+        let (_id_b, candidate_b, event_b) =
+            managed_prepare_ready_candidate(&mut b, 0x7003, 0x7004, 10, 2);
+        assert!(
+            b.managed_prepare_direct_candidate(_id_b, candidate_b, event_b)
+                .unwrap()
+        );
+        assert_eq!(b.commit_consumer.capacity.occupied(), 1);
+        let serial_b = b
+            .scanout_m2
+            .queued_successor_role
+            .as_ref()
+            .expect("still charged after replacement")
+            .serial();
+        assert_ne!(serial_a, serial_b);
+
+        // A failed prepare (implicit layout) leaves the existing successor
+        // and its charge intact.
+        let mut storage = Storage::for_tests_null(
+            ash::vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            ash::vk::Format::B8G8R8A8_UNORM,
+        );
+        storage.imported_dmabuf = Some(crate::kms::render::store::ImportedDmabufMetadata {
+            fourcc: 0x3432_5258,
+            vk_format: ash::vk::Format::B8G8R8A8_UNORM,
+            modifier: 0,
+            planes: Vec::new(),
+            implicit_layout: true,
+            width: 64,
+            height: 64,
+            depth: 24,
+            bpp: 32,
+        });
+        let bad_id = b
+            .store
+            .allocate(
+                0x7005,
+                crate::kms::render::store::DrawableKind::Pixmap,
+                24,
+                false,
+                storage,
+            )
+            .expect("allocate rejected candidate");
+        let (_, mut candidate_c, event_c) =
+            managed_prepare_ready_candidate(&mut b, 0x7006, 0x7007, 10, 3);
+        candidate_c.src_pixmap_xid = 0x7005;
+        candidate_c.src_host_xid = 0x7005;
+        assert!(
+            !b.managed_prepare_direct_candidate(bad_id, candidate_c, event_c)
+                .unwrap()
+        );
+        assert_eq!(b.commit_consumer.capacity.occupied(), 1);
+        assert_eq!(
+            b.scanout_m2
+                .queued_successor_role
+                .as_ref()
+                .expect("failed prepare must not discharge the existing successor")
+                .serial(),
+            serial_b
+        );
+    }
+
+    #[test]
+    fn c0_2ci_backend_managed_dispatch_direct_successor_charges_submitted_then_retires() {
+        use crate::kms::{
+            owner::identity::{CommitId, IncarnationId},
+            render::resources::{DirectRole, ResourceService},
+        };
+
+        let mut b = super::KmsBackend::for_tests();
+        let device_key = b.platform.primary_device().unwrap().key;
+        let mut service = ResourceService::new(device_key, IncarnationId::from_raw(1));
+
+        // ── Frame A: first dispatch, nothing to displace ──
+        let (id_a, candidate_a, event_a) =
+            managed_prepare_ready_candidate(&mut b, 0x7101, 0x7102, 20, 1);
+        assert!(
+            b.managed_prepare_direct_candidate(id_a, candidate_a, event_a)
+                .unwrap()
+        );
+
+        let commit_a = CommitId::for_tests(9001);
+        let res_a = b
+            .managed_dispatch_direct_successor(commit_a)
+            .unwrap()
+            .expect("dispatch A");
+        assert_eq!(
+            res_a.direct_role.as_ref().unwrap().role(),
+            DirectRole::Submitted
+        );
+        // Occupied Submitted only -- no retirement pre-reserved (nothing to displace).
+        assert_eq!(b.commit_consumer.capacity.occupied(), 1);
+        assert!(b.scanout_m2.queued_successor_role.is_none());
+
+        b.commit_consumer
+            .consume(
+                crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                    commit: commit_a,
+                    resources: crate::kms::owner::ledger::Submitted::new(vec![], vec![res_a])
+                        .accepted(),
+                },
+                &mut service,
+            )
+            .unwrap();
+        assert_eq!(
+            b.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .unwrap()
+                .role(),
+            DirectRole::Current
+        );
+        assert_eq!(b.commit_consumer.capacity.occupied(), 1);
+
+        // ── Frame B: displaces A, retirement pre-reserved before dispatch ──
+        let (id_b, candidate_b, event_b) =
+            managed_prepare_ready_candidate(&mut b, 0x7103, 0x7104, 20, 2);
+        assert!(
+            b.managed_prepare_direct_candidate(id_b, candidate_b, event_b)
+                .unwrap()
+        );
+        assert_eq!(b.commit_consumer.capacity.occupied(), 2); // Current(A) + Successor(B)
+
+        let commit_b = CommitId::for_tests(9002);
+        let res_b = b
+            .managed_dispatch_direct_successor(commit_b)
+            .unwrap()
+            .expect("dispatch B");
+        assert_eq!(
+            res_b.direct_role.as_ref().unwrap().role(),
+            DirectRole::Submitted
+        );
+        // Current(A) + Submitted(B) + pre-reserved OrdinaryRetirement.
+        assert_eq!(b.commit_consumer.capacity.occupied(), 3);
+
+        let old = b.commit_consumer.take_current();
+        b.commit_consumer
+            .consume(
+                crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                    commit: commit_b,
+                    resources: crate::kms::owner::ledger::Submitted::new(old, vec![res_b])
+                        .accepted(),
+                },
+                &mut service,
+            )
+            .unwrap();
+        // A moved into the pre-reserved OrdinaryRetirement role; B is Current.
+        assert_eq!(
+            b.commit_consumer.releasing_resources[0]
+                .direct_role
+                .as_ref()
+                .unwrap()
+                .role(),
+            DirectRole::OrdinaryRetirement
+        );
+        assert_eq!(
+            b.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .unwrap()
+                .role(),
+            DirectRole::Current
+        );
+        assert_eq!(b.commit_consumer.capacity.occupied(), 2);
+
+        // A has no allocations/kms_obligations, so it is immediately
+        // releasable: `on_available` must `finish_role` it -- returning the
+        // blocked OrdinaryRetirement role to Vacant -- without dropping a
+        // token to free its charge (8.6).
+        b.commit_consumer.on_available(&[], &mut service).unwrap();
+        assert!(b.commit_consumer.releasing_resources.is_empty());
+        assert_eq!(b.commit_consumer.capacity.occupied(), 1);
+        assert!(
+            b.commit_consumer
+                .capacity
+                .is_vacant(DirectRole::OrdinaryRetirement)
+        );
+    }
+
+    #[test]
+    fn c0_2ci_backend_managed_unflip_and_reentry_contracts() {
+        let mut b = super::KmsBackend::for_tests();
+        b.scanout_m2.test_force_active = true;
+
+        // With no active retirement roles, re-entry requires composed fb for outputs
+        // In the test harness with no composed fb ready:
+        assert!(!b.managed_can_enter_direct());
+
+        // Call managed_handle_direct_unflip
+        let result = b.managed_handle_direct_unflip("test_unflip").unwrap();
+        assert_eq!(result, b.managed_can_enter_direct());
+        assert!(b.scanout_m2.unflip_requested);
+        assert_eq!(b.scanout_m2.unflip_reason, Some("test_unflip"));
+    }
+
+    #[test]
+    fn c0_2ci_backend_managed_unflip_moves_current_into_exit_retirement_even_if_ordinary_occupied()
+    {
+        use crate::kms::render::resources::{CommitResources, DirectRole};
+
+        let mut b = super::KmsBackend::for_tests();
+
+        // OrdinaryRetirement is already occupied by an unrelated, still
+        // in-flight retirement (F7-B2: unflip must not need it vacant).
+        let ordinary_slot = b
+            .commit_consumer
+            .capacity
+            .reserve(DirectRole::OrdinaryRetirement)
+            .unwrap();
+        let ordinary_res =
+            CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new());
+        let ordinary_res = b
+            .commit_consumer
+            .capacity
+            .attach(ordinary_slot, ordinary_res)
+            .unwrap();
+        b.commit_consumer.releasing_resources.push(ordinary_res);
+
+        // Current is occupied by the backend's own in-flight direct frame.
+        let current_slot = b
+            .commit_consumer
+            .capacity
+            .reserve(DirectRole::Current)
+            .unwrap();
+        let current_res =
+            CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new());
+        let current_res = b
+            .commit_consumer
+            .capacity
+            .attach(current_slot, current_res)
+            .unwrap();
+        b.commit_consumer.current_resources.push(current_res);
+
+        // A queued successor with its own charge -- unflip's "cancels
+        // unsent direct work" must discharge it, never bare-drop it.
+        let (id, candidate, event) = managed_prepare_ready_candidate(&mut b, 0x7201, 0x7202, 30, 1);
+        assert!(
+            b.managed_prepare_direct_candidate(id, candidate, event)
+                .unwrap()
+        );
+        // OrdinaryRetirement + Current + Successor.
+        assert_eq!(b.commit_consumer.capacity.occupied(), 3);
+
+        let can_reenter = b
+            .managed_handle_direct_unflip("test_ordinary_occupied")
+            .unwrap();
+        // This fixture never retains a composed framebuffer per output, so
+        // re-entry is refused regardless of role state (unchanged contract).
+        assert!(!can_reenter);
+        assert_eq!(can_reenter, b.managed_can_enter_direct());
+
+        // The queued successor's charge was discharged, not bare-dropped
+        // (a bare drop would have closed admission instead).
+        assert!(b.scanout_m2.queued_successor.is_none());
+        assert!(b.scanout_m2.queued_successor_role.is_none());
+        assert!(!b.commit_consumer.capacity.is_admission_closed());
+
+        // Current moved into a freshly reserved ExitRetirement even though
+        // OrdinaryRetirement stayed occupied the whole time (8.5).
+        assert!(b.commit_consumer.current_resources.is_empty());
+        assert_eq!(b.commit_consumer.releasing_resources.len(), 2);
+        assert!(
+            b.commit_consumer.releasing_resources.iter().any(|res| res
+                .direct_role
+                .as_ref()
+                .unwrap()
+                .role()
+                == DirectRole::ExitRetirement)
+        );
+        assert!(
+            b.commit_consumer.releasing_resources.iter().any(|res| res
+                .direct_role
+                .as_ref()
+                .unwrap()
+                .role()
+                == DirectRole::OrdinaryRetirement)
+        );
+        assert_eq!(b.commit_consumer.capacity.occupied(), 2);
+
+        // Re-entry is refused at the capacity level while both retirement
+        // roles are occupied; discharging both (without dropping a token)
+        // frees the capacity table completely and permits re-entry.
+        assert!(!b.commit_consumer.capacity.can_enter_direct());
+        for mut res in b.commit_consumer.releasing_resources.drain(..) {
+            let slot = res.direct_role.take().unwrap();
+            b.commit_consumer.capacity.finish_role(slot).unwrap();
+        }
+        assert!(b.commit_consumer.capacity.can_enter_direct());
+        assert_eq!(b.commit_consumer.capacity.occupied(), 0);
     }
 }

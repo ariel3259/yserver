@@ -48,6 +48,14 @@ pub(crate) enum ResourceError {
     InvalidState,
 }
 
+impl std::fmt::Display for ResourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for ResourceError {}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct EntryAvailability {

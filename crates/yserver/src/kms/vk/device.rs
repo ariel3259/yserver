@@ -203,6 +203,13 @@ pub struct VkContext {
     /// Maximum descriptor range, in bytes, for one storage buffer.
     max_storage_buffer_range: u64,
     pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+    /// F9-m1: whether `VK_LAYER_KHRONOS_validation` was actually enabled on
+    /// this instance (`validation_requested && validation_layer_present`).
+    /// `debug_messenger` alone does not prove this: the `VK_EXT_debug_utils`
+    /// messenger is created unconditionally, independent of any layer, so a
+    /// test asserting zero validation messages while the layer is silently
+    /// absent (no `vulkan-validation-layers` package) passes vacuously.
+    validation_layer_active: bool,
     /// Cached `VkPhysicalDeviceDriverProperties::driverID` for the
     /// picked device. Kept as a diagnostic for log lines / future
     /// driver-specific quirks; the scanout path itself no longer
@@ -597,6 +604,7 @@ impl VkContext {
             graphics_queue_supports_compute,
             max_storage_buffer_range,
             debug_messenger,
+            validation_layer_active: validation_available,
             driver_id,
             device_type,
             timestamp_period,
@@ -619,6 +627,17 @@ impl VkContext {
     #[must_use]
     pub fn is_software_rasterizer(&self) -> bool {
         self.device_type == vk::PhysicalDeviceType::CPU
+    }
+
+    /// F9-m1: whether `VK_LAYER_KHRONOS_validation` was actually enabled on
+    /// this instance. `#[cfg(test)]` because production has no use for
+    /// asking -- it is a test-only guard against a validation-message
+    /// assertion passing vacuously on a box with no validation layer
+    /// installed (`debug_messenger.is_some()` alone does not prove the
+    /// layer is active; the debug-utils messenger is unconditional).
+    #[cfg(test)]
+    pub(crate) fn validation_layer_active(&self) -> bool {
+        self.validation_layer_active
     }
 
     /// Mark a disposable context as fence-proven quiescent.
@@ -1297,12 +1316,53 @@ unsafe extern "system" fn vk_debug_callback(
             .unwrap_or("<non-utf8 message>")
     };
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        #[cfg(test)]
+        {
+            VALIDATION_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            THREAD_VALIDATION_ERROR_COUNT.with(|c| c.set(c.get() + 1));
+        }
         log::error!("vk: {msg}");
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+        #[cfg(test)]
+        {
+            VALIDATION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            THREAD_VALIDATION_WARNING_COUNT.with(|c| c.set(c.get() + 1));
+        }
         log::warn!("vk: {msg}");
     }
     // INFO/VERBOSE intentionally suppressed — too noisy.
     vk::FALSE
+}
+
+#[cfg(test)]
+static VALIDATION_ERROR_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static VALIDATION_WARNING_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_VALIDATION_ERROR_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static THREAD_VALIDATION_WARNING_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn validation_error_count() -> usize {
+    THREAD_VALIDATION_ERROR_COUNT.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn validation_warning_count() -> usize {
+    THREAD_VALIDATION_WARNING_COUNT.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_counts() {
+    VALIDATION_ERROR_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    VALIDATION_WARNING_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    THREAD_VALIDATION_ERROR_COUNT.with(|c| c.set(0));
+    THREAD_VALIDATION_WARNING_COUNT.with(|c| c.set(0));
 }
 
 #[cfg(test)]
