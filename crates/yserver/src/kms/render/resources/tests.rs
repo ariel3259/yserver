@@ -2036,6 +2036,87 @@ fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket() {
     assert_eq!(service.pending_batches().len(), 0);
 }
 
+/// F-15/F14-M2: the quarantine boundary in GPU batch validation -- a batch
+/// whose entry's availability is `frozen` is refused, not committed.
+/// Freezing is how quarantine is expressed and quarantine is not a state
+/// this stage can undo.
+///
+/// What is already covered elsewhere and this test deliberately does not
+/// re-prove: that quarantining a batch freezes its entries
+/// (`c0_2ci_gpu_ticket_error_quarantines_batch` and others above), and that
+/// a failed ticket quarantines its own batch (same tests: the batch whose
+/// own ticket errors is quarantined and `poll_gpu` reports `Frozen` for
+/// it). The untested direction is the other one: that being frozen
+/// actually stops a *subsequent*, independently-valid batch from
+/// discharging obligations on that entry -- i.e. `validate_gpu_batch`'s
+/// `if avail.frozen { return Err((ResourceError::Frozen, batch)); }` guard
+/// (mod.rs:1076-1078, the write-obligation loop) refuses rather than
+/// commits.
+#[test]
+fn c0_2ci_gpu_frozen_entry_refuses_subsequent_valid_batch() {
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let gpu1 = service.register(key, ObligationKind::Gpu).unwrap();
+    let gpu2 = service.register(key, ObligationKind::Gpu).unwrap();
+
+    // First batch: ticket genuinely errors, quarantining its batch and
+    // freezing the entry (the already-covered direction).
+    let mut batch1 =
+        CoreRetirementBatch::new(vec![held], vec![vk::DescriptorSet::from_raw(0)], true);
+    batch1.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key, gpu1)],
+        crate::kms::render::platform::FenceTicket::for_tests_stub(),
+    ));
+    batch1.test_ticket_status = Some(Err(ash::vk::Result::ERROR_DEVICE_LOST));
+
+    service.register_batch(batch1);
+    assert_eq!(service.poll_gpu(Instant::now()), Err(ResourceError::Frozen));
+    assert!(service.entries.get(&key).unwrap().frozen());
+    assert_eq!(service.quarantined_batches().len(), 1);
+
+    // Second, independent batch references gpu2 -- registered before the
+    // freeze (registration itself refuses on an already-frozen entry, so
+    // this obligation had to be minted first), still pending, and its own
+    // ticket genuinely signals valid. The entry it targets is frozen by
+    // the *first* batch's quarantine, not this one's.
+    let mut batch2 = CoreRetirementBatch::new(Vec::new(), Vec::new(), true);
+    batch2.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key, gpu2)],
+        crate::kms::render::platform::FenceTicket::for_tests_stub(),
+    ));
+    batch2.test_ticket_status = Some(Ok(true));
+
+    service.register_batch(batch2);
+
+    // Mutation check: removing the frozen-entry refusal in
+    // `validate_gpu_batch` (mod.rs:1076-1078) makes this `Ok(())` instead
+    // -- batch2 would be committed via `commit_gpu_batch`, discharging
+    // gpu2's pending obligation on a frozen (quarantined) entry.
+    assert_eq!(
+        service.poll_gpu(Instant::now()),
+        Err(ResourceError::Frozen),
+        "a frozen entry must refuse a subsequent batch, not let it discharge (R6/quarantine)"
+    );
+
+    // Refused, not committed: gpu2 is still pending and batch2 was
+    // quarantined alongside batch1, never reaching `commit_gpu_batch`.
+    assert!(
+        service
+            .entries
+            .get(&key)
+            .unwrap()
+            .availability
+            .borrow()
+            .pending_obligations
+            .contains_key(&gpu2),
+        "a refused batch must not discharge the obligation it carried"
+    );
+    assert_eq!(service.quarantined_batches().len(), 2);
+
+    service.service_ready();
+    assert_eq!(drops.get(), 0);
+}
+
 // F4-B1: real-fence variant. The deterministic test above proves the state
 // machine (retained while unsignaled, released once signaled) via
 // `test_ticket_status`; this proves the actual `ticket_status()` ->
@@ -3734,13 +3815,87 @@ fn c0_2ci_commit_resources_still_current_cancels_not_discharges() {
     // The consumer restored old_res into current_resources.
     assert_eq!(consumer.current_resources.len(), 1);
     assert_eq!(drops_old.get(), 0);
-    assert_ne!(
+
+    // F-15/F14-m1: `assert_ne!(.., Some(Discharged))` (the previous form of
+    // this check) cannot distinguish cancel from discharge -- swapping
+    // `service.cancel(key, obligation_id)` for
+    // `service.apply_validated_proof(key, obligation_id)` at commit.rs:308
+    // (the `ResourcesStillCurrent` arm) makes `apply_validated_proof` also
+    // remove the `kms_dispositions` entry outright, so `kms_disposition`
+    // returns `None` instead of `Some(Discharged)` -- still `!= Some(Discharged)`,
+    // so the old assertion survives the mutation. `Some(Cancelled)` is the
+    // decisive check: it fails under that same mutation because `None !=
+    // Some(Cancelled)`.
+    assert_eq!(
         service.kms_disposition(old_key, old_kms),
-        Some(crate::kms::render::resources::handoff::KmsDisposition::Discharged)
+        Some(KmsDisposition::Cancelled),
+        "a rejected commit's ResourcesStillCurrent path must cancel, not discharge (R6)"
     );
 
     // Dropping current_resources drops old lease; since obligation was cancelled, it frees immediately.
     consumer.current_resources.clear();
+    service.service_ready();
+    assert_eq!(drops_old.get(), 1);
+}
+
+/// F-15/F14-m1: R6's "a rejected commit cancels, it does not discharge" on
+/// the third and last of the three paths that cancel KMS registrations --
+/// `cancel_pre_ipc_commit`
+/// (`c0_2ci_commit_cancel_pre_ipc_marks_cancelled_and_cleans_stale_disposition`)
+/// and `ResourcesStillCurrent` (the test above) are the other two. Before
+/// this test, swapping `service.cancel(key, obligation_id)` for
+/// `service.apply_validated_proof(key, obligation_id)` at commit.rs:325
+/// (the `ResourcesReleased` arm of `CommitResourceConsumer::consume`) left
+/// the suite green.
+#[test]
+fn c0_2ci_commit_resources_released_cancels_not_discharges() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old, drops_old) = spy_service();
+    let old_key = old.key();
+
+    let dev = service.device();
+    let crtc1 = test_crtc_key(dev.major, dev.minor, 12);
+    let member1 = GroupMember::new(crtc1, 1, 1);
+    let commit_id = CommitId::for_tests(715);
+    let old_kms = service.register_kms(old_key, commit_id, member1).unwrap();
+
+    let mut consumer = CommitResourceConsumer::new();
+
+    let old_res = CommitResources::new(
+        vec![old],
+        None,
+        None,
+        None,
+        vec![member1],
+        vec![(old_key, old_kms, member1)],
+    );
+
+    // Rejection before dispatch even took: `ResourcesReleased`.
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::ResourcesReleased {
+                commit: commit_id,
+                resources: vec![old_res],
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    assert_eq!(consumer.rejected_resources.len(), 1);
+    assert_eq!(drops_old.get(), 0);
+
+    // Decisive check, same reasoning as the `ResourcesStillCurrent` test
+    // above: `Some(Cancelled)` distinguishes cancel from discharge where
+    // `has_pending_obligations`/`!= Some(Discharged)` cannot.
+    assert_eq!(
+        service.kms_disposition(old_key, old_kms),
+        Some(KmsDisposition::Cancelled),
+        "a rejected commit's ResourcesReleased path must cancel, not discharge (R6)"
+    );
+
+    // Dropping rejected_resources drops the lease; cancelled, so it frees immediately.
+    consumer.rejected_resources.clear();
     service.service_ready();
     assert_eq!(drops_old.get(), 1);
 }
@@ -5978,6 +6133,82 @@ fn c0_2ci_commit_cancel_pre_ipc_marks_cancelled_and_cleans_stale_disposition() {
     drop(new_returned);
     service.service_ready();
     assert_eq!(drops_old.get(), 1);
+}
+
+/// F-15/F14-M1: R6's central release-gate clause -- a `CommitResources`
+/// carrying outstanding `KmsRelease` obligations is not releasable, i.e. a
+/// displaced buffer is not idle until its release obligation is
+/// discharged. This targets `is_resource_releasable`'s
+/// `if !res.kms_obligations.is_empty() { return false; }` clause
+/// (commit.rs:502-504) in isolation from the function's per-key
+/// `service.is_releasable(&alloc.key())` clauses just below it.
+///
+/// A prior, coarser mutation (replacing the whole gate body with `true`)
+/// already fails three tests -- those come from the allocation-key
+/// clauses, because in the production registration path
+/// (`register_commit_dependencies`) every `kms_obligations` key is also
+/// one of `res.allocations`' keys, so `service.is_releasable` on that same
+/// key is independently false for as long as the KMS obligation is
+/// pending: the two clauses are normally coupled through the same
+/// `pending_obligations` map and the allocation-key clause alone would
+/// mask a deletion of the kms_obligations clause.
+///
+/// To isolate the clause this `CommitResources` carries a kms_obligations
+/// entry but no allocations/source/fallback at all, so the rest of
+/// `is_resource_releasable` has nothing to check and defaults to `true` --
+/// only the kms_obligations clause can make this test's resource stay
+/// gated. `is_resource_releasable` is private to `commit.rs`, so it is
+/// exercised through its only accessible caller, `on_available`, via
+/// `consumer.releasing_resources`.
+#[test]
+fn c0_2ci_commit_kms_obligations_block_release_gate() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, alloc_held, drops) = spy_service();
+    let key = alloc_held.key();
+
+    let dev = service.device();
+    let crtc = test_crtc_key(dev.major, dev.minor, 13);
+    let member = GroupMember::new(crtc, 1, 1);
+    let commit = CommitId::for_tests(716);
+
+    let kms_ob = service.register_kms(key, commit, member).unwrap();
+
+    let mut consumer = CommitResourceConsumer::new();
+    let res = CommitResources::new(
+        vec![],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(key, kms_ob, member)],
+    );
+    consumer.releasing_resources.push(res);
+
+    consumer.on_available(&[], &mut service).unwrap();
+
+    // Mutation check: deleting the kms_obligations emptiness clause at
+    // commit.rs:502-504 makes this fail -- with no allocations, source or
+    // fallback on `res`, `is_resource_releasable` would fall through to
+    // `true` and this resource would be freed here instead of staying
+    // gated on its outstanding KmsRelease obligation.
+    assert_eq!(
+        consumer.releasing_resources.len(),
+        1,
+        "a CommitResources with an outstanding KmsRelease obligation must not be released (R6)"
+    );
+
+    // Sanity: once the obligation is actually discharged (and drained, as
+    // `discharge_commit_kms_obligations` would do), the same resource does
+    // release.
+    service.apply_validated_proof(key, kms_ob).unwrap();
+    consumer.releasing_resources[0].kms_obligations.clear();
+    consumer.on_available(&[], &mut service).unwrap();
+    assert_eq!(consumer.releasing_resources.len(), 0);
+
+    drop(alloc_held);
+    service.service_ready();
+    assert_eq!(drops.get(), 1);
 }
 
 #[test]
