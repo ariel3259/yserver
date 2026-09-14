@@ -1,11 +1,14 @@
 # Resume point — Phase C.0 stage 2c-i fix round
 
 **Kept current after every accepted session. Last update: 2026-09-14,
-after the final stage review, run by Opus in three scopes. Scopes 1 and 3
-HOLD; scope 2 found two majors and one minor. Twenty-one mutations across
-the stage, eighteen caught. The stage is NOT accepted: one tests-only fix
-session (**F-14**) closes S2-M1, S2-M2 and S2-m1, then its review, then
-`docs/status.md`, then 2c-ii's spec.** If you are resuming this work cold — a new
+after F-14's review and a **second** mutation battery on scope 2. F-14 is
+ACCEPTED (its three findings close, re-verified by the reviewer's own
+mutations), but scope 2 is **still not clean**: the second battery found
+two more majors and one minor. Scopes 1 and 3 hold. The stage is NOT
+accepted, and the open question is no longer "which tests are missing" but
+**whether to keep sampling this surface or do a systematic clause-by-clause
+pass** — see the recommendation in the F-14 review. That call is the
+user's.** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -80,7 +83,8 @@ not the calendar: split work small enough to finish inside one window.
 | Final review, scope 1 | Tasks 1–4 | **HOLDS** (7 mutations, all caught) | `25d1f1b7` | final-review-scope1 |
 | Final review, scope 2 | Tasks 5–7 | **NOT CLEAN** — S2-M1, S2-M2 (major), S2-m1 (minor) | `d1e8397a` | final-review-scope2 |
 | Final review, scope 3 | Tasks 8–10 | **HOLDS** (7 mutations + 2 static audits, all caught) | this commit | final-review-scope3 |
-| **F-14** | Tests only: S2-M1 (R6 retained-member clause), S2-M2 (R9 serviced-time pause), S2-m1 (cancel vs discharge + stale disposition) | **next** | — | — |
+| F-14 | Tests only: S2-M1 (R6 retained-member clause), S2-M2 (R9 serviced-time pause), S2-m1 (cancel vs discharge + stale disposition) | **ACCEPTED** (F14-M1, F14-M2, F14-m1 opened by the second battery) | `e69d32c9`/`919952f2` | F14-review |
+| **F-15?** | Open: F14-M1 (R6's release gate ignores outstanding `kms_obligations` — unproven), F14-M2 (`validate_gpu_batch`'s frozen-entry refusal — unproven), F14-m1 (cancel-vs-discharge proven on 1 of 3 paths). **Shape undecided** — see the F-14 review's recommendation: sampling Tasks 5–7 is not converging (2 batteries, 17 mutations, 7 survivors), so this may want to be a systematic per-guard-clause pass rather than another three-finding session | **next, pending the user's call** | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the
@@ -126,6 +130,16 @@ not accepted until that passes. Then the next session is dispatched.
   scene test that cannot exist here, and got a silent substitution instead
   of a report). Rule F8 extends to shapes: an unreachable suggestion **must
   be reported**; the silent substitution is the defect, not the deviation.
+- **Mutate by location, not by first textual match** (F14-review,
+  2026-09-14): the reviewer's own S2-m1 mutation reported a false survival
+  because the mutated string occurred four times in `commit.rs` and the
+  replacement hit `consume`'s `ResourcesStillCurrent` arm instead of
+  `cancel_pre_ipc_commit`. Always state which site was hit; a repeated line
+  silently tests something other than what the finding named. (The error
+  found a real gap — F14-m1 — but that was luck, not method.) Companion to
+  the scope-1 rule: a run that prints no `test result:` line did not
+  execute, and an empty result is never evidence that nothing detects the
+  change.
 - **Findings from the final stage review are stated as invariants**
   (scope 2, 2026-09-14): S2-M1 and S2-M2 name the invariant and the exact
   mutation that must fail a named test; they deliberately do **not** say
