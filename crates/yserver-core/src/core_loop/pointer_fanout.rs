@@ -3353,7 +3353,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0,
@@ -3368,6 +3368,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         b

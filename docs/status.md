@@ -1092,6 +1092,23 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
     `m1_gate_reject_import`, so it is visible in telemetry.
 
   Multi-plane `PixmapFromBuffers` also remains unimplemented.
+- **2026-09-10 the reset boundary inherits the overlay release (#121 step 4):**
+  the claim-ownership fix landed on master as `2248b352`, so
+  `reset_generation` no longer carries the "NOT handled here" note and adds no
+  COW-specific cleanup: `force_destroy_all_clients` routes every client
+  through `process_disconnect`, which releases its claims. Note the rebase put
+  master's call inside `process_disconnect_reporting`, the shared body, not the
+  `process_disconnect` wrapper — reset calls the reporting variant, so had it
+  landed in the wrapper the forced teardown would have silently skipped it.
+  What the boundary *does* add is a **refusal**: between the forced teardown
+  and the state swap it returns `None`, and the caller shuts down the way
+  `-terminate` does, if `cow_teardown_failed` holds or a claim somehow remains.
+  Both halves are tested because a failed teardown releases the claim anyway,
+  so a claim-only check would see nothing; and the placement is asserted, not
+  trusted, because the flag lives in `ServerState` and a check after the swap
+  would read a fresh state with it clear — destroying the evidence and then
+  proceeding on the strength of its absence. Verified by disabling the guard
+  and watching the refusal test fail on that assertion.
 
 - **2026-09-10 composite overlay claim ownership validated on hardware:**
   awesome + picom on silence, **A/B against master on the same hardware**:
@@ -1123,7 +1140,176 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   allocated storage that nothing initialises — and the cheap fix is the same
   shape: force a full repaint at the materialise edge. Worth confirming
   against Xorg, where killing and restarting a compositor recovers promptly.
+- **2026-09-10 XDMCP validated on hardware, cross-machine (#121 stage 4):**
+  eiger (aarch64) as the display, silence (x86_64) running LightDM's XDMCP
+  daemon and the session. Query → Willing → Request → Accept → Manage, a MATE
+  session, logout, reset, re-query, an XFCE session, logout — the full loop
+  twice in one run, with a **fresh 16-byte session cookie installed per
+  generation**, and every client that established did so over TCP with fd
+  passing off. This is the first exercise of `FamilyInternet` cookie
+  selection: loopback cannot reach it, because xtrans rewrites `127.0.0.1` to
+  FamilyLocal before the lookup. Both hardware checks the reset work still
+  owed are covered by the same run.
 
+  **The log is a CLOBBERED file, and no per-client count may be taken from
+  it.** An earlier revision of this note claimed "59 clients established in
+  the second generation"; that number is withdrawn. The run predates
+  `b634bb56`, so the recipe still wrote a fixed `yserver-hw-xdmcp.log` with
+  `>`: two runs opened the same path with independent write offsets and the
+  later one's bytes landed inside the earlier one's file. The evidence, in
+  case a future log looks like this: timestamps run backwards at one point
+  (09:04:03 → 08:54:24), there is only one startup banner for two runs, and a
+  block of `KeepAlive`/`Alive` targets `127.0.0.1:177` in a run configured for
+  `192.168.1.40:177` — which `XdmcpService` cannot emit, because `manager` is
+  resolved once at construction and never reassigned, and `restart()` only
+  feeds `Start`. Client ids being monotonic in file order is **not** evidence
+  of a single writer here: two id sequences interleave by offset, not by value.
+
+  What does survive attribution is the part that matters: a single process
+  logged `Generation(1)` and then `Generation(2)`, which no second process
+  could produce, and both boundaries ran the full
+  Query → Willing → Request → Accept → Manage to `192.168.1.40` on display 2
+  with a fresh cookie. Counts need a re-run under the timestamped recipe.
+  *Six clients refused* at the logout boundary for presenting no authorization
+  at all — after the new cookie was installed, so not the fail-closed window;
+  old-session components reconnecting during teardown. Nothing was lost.
+  *Open, not reproduced:* applying a display-scaling change in MATE killed
+  caja and the panel. Not the outbound cap (zero cap disconnects in the log
+  covering the other runs) and not auth rejection; the run that showed it was
+  overwritten before it could be read, which is why both hardware recipes now
+  write timestamped logs.
+  *Also seen:* resizing wezterm exposes the lightdm greeter's background
+  through the uninitialised strip — the known resize bug, but showing
+  recycled content rather than black, which makes it stale content disclosure
+  between clients rather than a cosmetic fault.
+
+- **2026-09-09 TCP transport and server reset (#121 stages 1 and 3, branch
+  `feat/121-server-reset`):** groundwork for XDMCP on HPC login nodes.
+  *Transport* — a `Transport`/`Listener` enum replaces the concrete
+  `UnixStream` at the six production seams, and `-listen tcp` binds
+  `0.0.0.0:6000+N`, off by default per Xorg's `defaultNoListenList`.
+  Authorization was **fail-open** before this (`check` returned `Allow` with no
+  `-auth`, and `local_open` started true) which was harmless while every
+  connection was AF_UNIX; it is now transport-aware and fail-closed, and
+  `-listen tcp` is a startup error when auth cannot satisfy a TCP client. Two
+  per-client capability flags, deliberately distinct: `fd_passing` gates
+  `SCM_RIGHTS`, `is_local` gates extension policy. Extensions stay advertised
+  and are refused at dispatch exactly as Xorg does — DRI3 `BadMatch`
+  (`dri3_request.c:662`), MIT-SHM `BadRequest` except `QueryVersion`
+  (`shm.c:1346`), vidmode's mutating half only
+  (`VidModeErrorBase + ClientNotLocal`); Present is **not** gated, having no
+  `client->local` anywhere in Xorg. Verified against a real remote client
+  (`bee:2`), not just loopback — loopback proves nothing about
+  FamilyInternet selection, because xtrans rewrites `127.0.0.1` to FamilyLocal
+  before the cookie lookup.
+  *Reset* — a generation quarantine, not a `ServerState` swap: setup threads,
+  reader threads, queued messages, the parked-CRTC maps, both deferred-request
+  queues and the telemetry rows all live outside `ServerState` and are cleared
+  or generation-tagged. The tag is bound to the **producer**, not read at send
+  time: `CoreSender::bind` is called at accept, the setup thread forwards that
+  binding to its reader thread through `ClientSetupComplete`, and both keep
+  stamping the accepting generation however long after the boundary they wake.
+  The first implementation read the shared counter inside `CoreSender::send`,
+  which had the opposite effect — a producer of the destroyed session that woke
+  after the bump stamped its message with the *new* generation and the
+  dispatcher accepted it, so an old client's `ClientSetupComplete` could still
+  be inserted into the fresh session. Shutting the setup sockets down at the
+  boundary narrows that window but cannot close it: a producer may already hold
+  a fully decoded message. Process-lifetime producers (libinput, signalfd,
+  backend completions) keep the unbound `CoreSender`; their messages dispatch
+  whatever their tag. Only `start_instant` survives a generation literally
+  (timestamps must not go backwards); topology and devices are re-seeded from
+  the backend and from a new process-lifetime `InputInventory`, which exists
+  because `probe_input_devices` is a no-op in Direct mode and libinput's
+  `DeviceAdded` burst is one-shot at process start. Forced teardown ignores
+  close-down mode and releases backend-side objects, with a whole-session
+  re-sweep because the orphan gate is per-*reference*: a GC tile named by
+  another client is deferred and never reported again once that client also
+  dies. Trigger is armed, never inferred — set only after registration *and*
+  reader spawn succeed, mirroring `ClientStateRunning`
+  (`dix/dispatch.c:3762`), so a port scan, a bad cookie or a failed setup arms
+  nothing. Default `-noreset`, opposite to Xorg, because a stray reset in a
+  desktop session is indistinguishable from a crash.
+  *First hardware run (bee, 2026-09-09):* the server survived **four** real
+  resets, kept its outputs, and shut down cleanly on SIGTERM — no errors, only
+  the pre-existing Vulkan validation-layer and dma-buf warnings from startup.
+  **Input worked in the second session**, which is the load-bearing result:
+  Direct mode's `probe_input_devices` is a no-op and libinput's `DeviceAdded`
+  burst is one-shot at process start, so XI state can only come from the
+  `InputInventory`, and by session 2 it had been rebuilt three times. Note a
+  re-seed does not re-emit `DeviceAdded`, so the absence of further
+  `xi-device: added` lines in the log is expected and proves nothing either
+  way — only a client receiving events does.
+  The run also surfaced a semantic sharp edge, now in the man page: under
+  `-reset` **any** one-shot client that is the last one resets the session, so
+  running `xprop` against an idle `-reset` server destroys it. That invalidated
+  the first version of the `yserver-reset-hw` probe, whose own `xprop -set`
+  reset away the property it had just written — it could only ever report
+  "not found". Fixed by holding session 1's xterm open across the stamp.
+  *Still unverified on hardware:* the root-property leak check (the probe was
+  vacuous on the first run), and whether the boundary clears the screen
+  without blinking or changing mode.
+  *Not done:* stage 2 (`xhost`) is specified and deferred. The
+  composite-overlay claim prerequisite is **done** — it became a per-client
+  resource on master (`2248b352`), so the boundary inherits the release
+  through `force_destroy_all_clients` and adds no COW-specific code, only a
+  refusal to install a generation while `cow_teardown_failed` holds. Stage 4 (XDMCP)
+  is under way on `feat/121-xdmcp`: steps 1 and 2 of
+  [the plan](superpowers/plans/2026-09-09-xdmcp-plan.md) are in —
+  `yserver-protocol`'s `xdmcp::codec` (the thirteen display-side messages over
+  the `ARRAY8`/`ARRAY16`/`ARRAY32`/`ARRAYofARRAY8` primitives, with the
+  declared-length arithmetic every `xdmcp.c` receiver checks by hand) and
+  `xdmcp::state` (the `(state, event) -> (state, actions)` transition
+  function). Both are pure and unwired. Step 3 added `launch::XdmcpOptions`
+  (`-query`/`-broadcast`/`-indirect`/`-port`/`-from`/`-class`/`-displayID`/
+  `-once`, ordered and last-wins; `-cookie` rejected), still only a
+  configuration source. Step 4 is the auth integration, and the one place in
+  this stage where a mistake is cross-user access rather than a hang:
+  `AuthState` now holds one **session credential** beside the file cookies —
+  the cookie an `Accept` carries — installed by
+  `install_session_cookie(generation, name, data)` and dropped by
+  `clear_session_cookie()`. `check` takes the *calling setup thread's own*
+  `BoundSender` generation, so a reset invalidates the previous session's
+  cookie by **mismatch**, with no clear call at the boundary to miss or race;
+  the explicit clear covers the case the binding cannot, an offer abandoned
+  inside one generation (`Refuse` → `StartConnection`, same generation). In
+  XDMCP mode TCP setup accepts that credential *only* — file cookies no longer
+  authorize a TCP client, Unix is untouched — an XDMCP option satisfies the
+  stage-1 `-listen tcp` startup check in place of `-auth`, and TCP fails
+  closed until the first `Accept`. An empty or non-MIT credential is never
+  installed (`ct_eq(&[], &[])` is true, so an empty one would match any client
+  presenting an empty cookie). Steps 5 and 6 wire it up. An XDMCP option now
+  implies `-reset` and `-once` implies `-terminate` (overriding an explicit
+  flag, with a warning: under XDMCP the protocol decides what happens at
+  session end), and `core_loop::xdmcp::XdmcpService` puts one **UDP socket in
+  the core poll set** (`XDMCP_TOKEN`) with its retransmission deadline joining
+  the loop's existing per-iteration poll-timeout computation — **no new
+  thread**, because the machine has to see the generation boundary directly.
+  Backoff is `XDM_MIN_RTX << timeOutRtx` capped at `XDM_MAX_RTX` (2 s → 32 s),
+  giving up at `XDM_RTX_LIMIT` 7 (`XDM_KA_RTX_LIMIT` 4 awaiting `Alive`), all
+  from `X11/Xdmcp.h`. The class default (`MIT-unspecified`) is applied where
+  the packet is built, not in the parser; the generation for
+  `install_session_cookie` is read *as the `Accept` is processed*; the machine
+  emits the session-client lifecycle, so a `Refuse` racing an authenticated
+  setup leaves the loser disconnected rather than running on a cleared cookie
+  — and that loser arms nothing, because arming the reset trigger belongs to
+  the caller, *after* XDMCP admission: an orphan that armed would have its own
+  disconnect drain the session and, under XDMCP's implied `-reset`, cross a
+  generation boundary in the middle of the negotiation's own `Request` retry;
+  and the re-query hook runs **after** the new generation is installed. Two
+  deliberate hardening divergences from `os/xdmcp.c`, both decided 2026-09-10:
+  **(A)** `Unwilling` acts only in `CollectQuery` and only from the configured
+  manager — Xorg's `case UNWILLING:` (`xdmcp.c:741`) is unguarded, so one
+  datagram kills a running desktop — and never aborts a broadcast/indirect
+  collection; **(B)** only a packet *accepted for the current state* resets
+  the retry budget, where Xorg clears `timeOutRtx` at `xdmcp.c:729` before the
+  header is even parsed, which made `XDM_RTX_LIMIT` unreachable against a peer
+  answering rubbish and `-once` unable to terminate. Both have fake-manager
+  tests over loopback UDP, alongside the happy path (Query → Willing → Request
+  → Accept → Manage → session → session end → reset → re-query), a silent
+  manager backing off to the limit, and `-once` on both exits. *Not done:*
+  steps 7 (docs/man page) and 8 (hardware against LightDM). Nothing changes
+  for a server without an XDMCP option: no socket, no timer, no policy change.
 - **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
   Present's pinned redirected paint target need not be the Composite Overlay
   Window itself. Lazy fallback now copies into that exact pinned paint target

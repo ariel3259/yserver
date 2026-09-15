@@ -2,14 +2,11 @@
 //!
 //! See `docs/superpowers/plans/2026-05-06-single-threaded-core.md` Phase B.
 
-use std::{
-    os::{fd::OwnedFd, unix::net::UnixStream},
-    time::Instant,
-};
+use std::{os::fd::OwnedFd, time::Instant};
 
 use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
-use crate::host_x11::HostKeyEvent;
+use crate::{core_loop::generation::Generation, host_x11::HostKeyEvent, transport::Transport};
 
 /// Snapshot of a libinput device's identity and touchpad configuration at
 /// device-add time.  Plain data — no libinput handles, safe to send across
@@ -137,10 +134,22 @@ pub enum Message {
     /// spawn (D4).
     ClientSetupComplete {
         id: ClientId,
-        stream: UnixStream,
+        /// The generation the setup thread was bound to at accept.
+        /// Carried explicitly so the reader thread spawned for this
+        /// client inherits the *connection's* generation rather than
+        /// re-reading the counter. Necessarily equal to this message's
+        /// own channel tag — a completion whose tag did not match the
+        /// running generation is discarded before it is ever read — but
+        /// the counter is not a safe substitute: the point of the
+        /// quarantine is that a producer's generation is fixed where the
+        /// producer is created.
+        generation: Generation,
+        stream: Transport,
         resource_id_base: u32,
         resource_id_mask: u32,
         byte_order: ClientByteOrder,
+        is_local: bool,
+        fd_passing: bool,
     },
     /// One framed X11 request from a client reader thread.
     Request {
@@ -171,6 +180,23 @@ pub enum Message {
     CrtcConfigReady,
     /// signalfd readable.
     Shutdown,
+    /// SIGHUP under a policy other than `-noreset` → cross the
+    /// generation boundary instead of shutting down (the server-reset
+    /// design's "Flags and signals": *`SIGHUP` — force a reset
+    /// regardless*).
+    ///
+    /// The policy gate lives at the *sender*: under `-noreset` the
+    /// signal thread keeps sending `Shutdown`, so a default server's
+    /// SIGHUP behaviour is byte-identical to today and this variant is
+    /// never produced. Xorg resets unconditionally
+    /// (`AutoResetServer`, `os/utils.c:407`); we deliberately do not,
+    /// because adopting that would make SIGHUP destroy a default
+    /// server's session where today it stops it cleanly.
+    ///
+    /// Process-lifetime, not session-scoped: an operator's request must
+    /// never be discarded because it happened to be tagged with the
+    /// generation that a reset just retired.
+    ResetRequested,
     /// SIGUSR1 → release the VT on direct-mode backends. Ignored when the
     /// backend has not armed VT switching: there is no switch to service,
     /// and this is *not* a diagnostic-dump path (see `DumpScanout`).

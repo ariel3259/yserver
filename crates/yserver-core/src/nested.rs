@@ -14,9 +14,7 @@ use std::{
 use log::{error, info};
 use yserver_protocol::x11::{ResourceId, shape as x11shape, xfixes as x11xfixes};
 
-use crate::{
-    backend::WindowHandle, host_x11::HostX11Backend, resources::ROOT_WINDOW, server::ServerState,
-};
+use crate::{host_x11::HostX11Backend, server::ServerState};
 
 // Extension error-code bases. INVARIANT: each extension's reserved range
 // `[first_error, first_error + error_count)` must NOT overlap any other
@@ -379,58 +377,21 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     // before clients connect.
     let _ = crate::backend::Backend::ping(&mut backend, None);
 
-    let host_window_id = backend.window_id();
-
-    // Build the synthetic ynest output explicitly. The exact integer
-    // IDs (output=1, crtc=2, mode=3) and `ynest-0` name are
-    // load-bearing for existing xts wire-byte fixtures.
-    let synthetic = crate::randr::RandrOutput {
-        name: "ynest-0".to_string(),
-        output_id: 1,
-        crtc_id: 2,
-        mode_id: 3,
-        connected: true,
-        x: 0,
-        y: 0,
-        width,
-        height,
-        vrefresh: 60,
-        timing: None,
-        // Nested backend has no EDID; `RandrState::output_info` falls
-        // back to 96-DPI synthesis from pixel dims.
-        mm_width: 0,
-        mm_height: 0,
-        mode_ids: vec![3],
-        num_preferred: 1,
-    };
-    // The backend capabilities snapshot (DPMS support, GLX
-    // texture-from-pixmap support, GLX vendor names) is taken once,
-    // through `from_backend`, and shared by both entry points — this
-    // one and `yserver::run`'s KMS path.
-    let capabilities = crate::server::BackendCapabilities::from_backend(&backend);
-    let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic], capabilities);
+    // The topology snapshot (screen extent, the synthetic `ynest-0`
+    // output and its mode table, providers) plus the capabilities
+    // snapshot (DPMS support, GLX texture-from-pixmap support, GLX
+    // vendor names) are taken once, through `BackendTopology::
+    // from_backend`, and shared by every entry point: this one,
+    // `yserver::run`'s KMS path, and the server-reset generation
+    // boundary.
+    let topology = crate::backend::BackendTopology::from_backend(&mut backend);
+    let mut state = topology.into_server_state();
     // Route root-window drawing/clearing to the host container window
     // so clients that paint the root (e.g. fvwm3 setting its desktop
-    // bg pixmap) produce visible output in the nested viewport.
-    if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
-        root.host_xid = WindowHandle::from_raw(host_window_id);
-    }
-
-    // Push host visual / colormap xids into the resource table so that
+    // bg pixmap) produce visible output in the nested viewport, and
+    // push host visual / colormap xids into the resource table so that
     // CreateWindow forwarding can translate our visual ids to host ones.
-    state
-        .resources
-        .set_visual_host_xid(crate::resources::ROOT_VISUAL, backend.root_visual_xid());
-    if let Some(host_colormap) = backend.argb_colormap_xid() {
-        state
-            .resources
-            .set_colormap_host_xid(crate::resources::ARGB_COLORMAP, host_colormap);
-    }
-    if let Some(host_argb_visual) = backend.argb_visual_xid() {
-        state
-            .resources
-            .set_visual_host_xid(crate::resources::ARGB_VISUAL, host_argb_visual);
-    }
+    crate::backend::install_backend_root_bindings(&mut state, &backend);
 
     let (poll, sender, rx) = crate::core_loop::sender::channel()?;
     let allocator = crate::core_loop::poll_tokens::ClientIdAllocator::new();
@@ -440,9 +401,18 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         sender,
         &mut state,
         &mut backend,
-        Some(listener),
+        vec![crate::transport::Listener::Unix(listener)],
         &allocator,
         crate::core_loop::auth::AuthState::new(None),
+        // The nested harness parses no X-server argv of its own, so it
+        // takes the default policy: never reset. `ynest` is a dev
+        // harness whose clients come and go constantly
+        // (`project_discontinue_ynest`), and a reset on the last one
+        // leaving would look exactly like a crash.
+        crate::core_loop::ResetPolicy::NoReset,
+        // Likewise no XDMCP: the nested harness is not a display manager's
+        // display.
+        None,
     )
 }
 
@@ -1474,7 +1444,7 @@ mod tests {
             state.clients.insert(
                 1,
                 ClientState {
-                    writer: Arc::new(Mutex::new(writer_local)),
+                    writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0010_0000,
@@ -1489,6 +1459,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             (state, reader_remote)

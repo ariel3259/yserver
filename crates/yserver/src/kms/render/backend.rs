@@ -393,8 +393,21 @@ struct ScanoutM0Shape {
     plane_offset: u64,
     plane_pitch: u32,
     offsets: (i16, i16),
-    valid_region: u32,
-    update_region: u32,
+    /// Whether the Present carried a valid / update region, NOT which one.
+    ///
+    /// Issue #146: these were the region XIDs. A compositor creates a fresh
+    /// update region every frame (`update=0x4144dd` → `0x4144eb` →
+    /// `0x4144f9` in the reporter's log), so putting the XID in the dedup key
+    /// made the key change on every Present by construction — and
+    /// `scanout_m0 shape`, which is supposed to log only when the shape
+    /// CHANGES, logged once per composited frame instead.
+    ///
+    /// Only the zero-ness is ever consumed: `regions_ok` tests
+    /// `valid_region_xid == 0 && update_region_xid == 0 && update_is_full`.
+    /// The identities are printed in the log line straight from the
+    /// candidate, so nothing is lost by keeping them out of the key.
+    valid_region_present: bool,
+    update_region_present: bool,
     update_is_full: bool,
 }
 
@@ -516,7 +529,7 @@ impl ScanoutM1ProbeCache {
 
     fn clear(&mut self, reason: &'static str) {
         if !self.entries.is_empty() {
-            log::info!(
+            log::debug!(
                 "scanout_m1: dropping {} cached probe framebuffer(s): {reason}",
                 self.entries.len()
             );
@@ -2258,7 +2271,7 @@ impl KmsBackend {
         let successor_role = self.scanout_m2.queued_successor_role.take();
         match self.submit_direct_frame(&mut successor) {
             Ok(()) => {
-                log::info!(
+                log::debug!(
                     "scanout_m2: submitted queued direct successor source_id={} present_id={} outputs={}",
                     successor.source_id.as_u64(),
                     successor.candidate.present_id,
@@ -2358,7 +2371,7 @@ impl KmsBackend {
         self.scanout_m2.degraded_composed_unflip = false;
         self.scanout_m2.sync_ownership();
         self.finish_deferred_cow_release();
-        log::info!("scanout_m2: stopped after scanout replacement: {reason}");
+        log::debug!("scanout_m2: stopped after scanout replacement: {reason}");
     }
 
     /// Restore the current composed scanout after a topology operation had to
@@ -2614,7 +2627,7 @@ impl KmsBackend {
             )
             .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
         self.scanout_m2.unflip_shadow_ready = true;
-        log::info!(
+        log::debug!(
             "scanout_m2: lazily materialized direct source_id={} into fallback_target={} for unflip",
             source_id.as_u64(),
             target.backing_id().as_u64()
@@ -2676,7 +2689,7 @@ impl KmsBackend {
                 frame.candidate.paint_dst_host_xid,
             )
         };
-        log::info!(
+        log::debug!(
             "scanout_m2: submitted atomic composed unflip outputs={} reason={} last_reason={} pending={:?} current={:?}",
             planes.len(),
             self.scanout_m2.unflip_reason.unwrap_or("unknown"),
@@ -2709,7 +2722,7 @@ impl KmsBackend {
                 self.scene.invalidate_all_scanout_damage();
                 self.scene.mark_scene_structure_dirty();
                 self.scanout_m2.degraded_composed_unflip = false;
-                log::info!("scanout_m2: composed unflip retired on all outputs");
+                log::debug!("scanout_m2: composed unflip retired on all outputs");
             }
             if degraded {
                 // The planes were replaced by the scene's own per-output
@@ -2756,7 +2769,7 @@ impl KmsBackend {
                 self.release_direct_frame(previous);
             }
             self.scanout_m2.sync_ownership();
-            log::info!(
+            log::debug!(
                 "scanout_m2: direct frame retired on all outputs source_id={}",
                 self.scanout_m2
                     .current
@@ -3214,7 +3227,7 @@ impl KmsBackend {
             })
             .collect();
         if !scanout_m1_outputs_cover_root(root, &output_geometry) {
-            log::info!(
+            log::debug!(
                 "scanout_m1: source_id={} skipped: active outputs do not exactly tile root {:?}: {:?}",
                 source_id.as_u64(),
                 root,
@@ -3285,7 +3298,7 @@ impl KmsBackend {
                     && !layout.output.scanout_modifiers.contains(&modifier)
             })
         {
-            log::info!(
+            log::debug!(
                 "scanout_m1: source_id={} skipped: incompatible metadata fourcc={fourcc:#010x} \
                  vk_format={vk_format:?} modifier={modifier:#x} planes={plane_count} \
                  size={}x{} depth={depth} bpp={bpp} pitch={pitch}",
@@ -3342,7 +3355,7 @@ impl KmsBackend {
         );
         match result {
             Ok(crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer)) => {
-                log::info!(
+                log::debug!(
                     "scanout_m1: TEST_ONLY passed source_id={} drawable_host={:#x} \
                      root={}x{} modifier={modifier:#x} pitch={pitch} outputs={:?}; \
                      live scanout unchanged",
@@ -3357,7 +3370,7 @@ impl KmsBackend {
                 self.scanout_m0.m1_probe_pass = self.scanout_m0.m1_probe_pass.saturating_add(1);
             }
             Ok(crate::drm::modeset::DirectScanoutTestResult::Rejected(error)) => {
-                log::info!(
+                log::debug!(
                     "scanout_m1: TEST_ONLY rejected source_id={} drawable_host={:#x}: {error}",
                     source_id.as_u64(),
                     candidate.src_host_xid,
@@ -3492,8 +3505,8 @@ impl KmsBackend {
             plane_offset,
             plane_pitch,
             offsets: (candidate.x_off, candidate.y_off),
-            valid_region: candidate.valid_region_xid,
-            update_region: candidate.update_region_xid,
+            valid_region_present: candidate.valid_region_xid != 0,
+            update_region_present: candidate.update_region_xid != 0,
             update_is_full: candidate.update_is_full,
         };
         let authoritative = !matches!(target, ScanoutM0Target::Other);
@@ -3594,7 +3607,7 @@ impl KmsBackend {
                     recent.pop_front();
                 }
                 recent.push_back(source_id);
-                log::info!(
+                log::debug!(
                     "scanout_m0 new_buffer dst_host={:#x} source_id={} rotation_depth={}",
                     candidate.paint_dst_host_xid,
                     source_id.as_u64(),
@@ -3621,7 +3634,7 @@ impl KmsBackend {
             } else {
                 String::new()
             };
-            log::info!(
+            log::debug!(
                 "scanout_m0 shape client={} present={} src_client={:#x} src_host={:#x} \
                  dst_client={:#x} dst_host={:#x} completion_host={:#x} source_id={:?} \
                  target={target:?} coverage={coverage:?} rect={rect:?} root={root_extent:?} \
@@ -3660,7 +3673,7 @@ impl KmsBackend {
                 .insert(candidate.paint_dst_host_xid, shape);
         }
         if diag.interval_start.elapsed() >= std::time::Duration::from_secs(1) {
-            log::info!(
+            log::debug!(
                 "scanout_m0_summary presents={} authoritative={} root={} output={} \
                  distinct_sources={} reject_server_owned={} reject_target={} \
                  reject_geometry={} reject_offsets={} reject_regions={} \
@@ -18606,6 +18619,23 @@ impl Backend for KmsBackend {
         Some(ARGB_COLORMAP.0)
     }
 
+    fn fb_dimensions(&self) -> (u16, u16) {
+        KmsBackend::fb_dimensions(self)
+    }
+
+    fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (
+        Vec<yserver_core::randr::RandrOutput>,
+        Vec<yserver_core::randr::RandrMode>,
+    ) {
+        KmsBackend::randr_outputs_and_modes(self)
+    }
+
+    fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
+        KmsBackend::randr_providers(self)
+    }
+
     fn render_opcode(&self) -> Option<u8> {
         Some(133)
     }
@@ -19296,7 +19326,7 @@ impl Backend for KmsBackend {
                         && composed_outputs.len() == self.platform.outputs.len()
                     {
                         self.scanout_m2.reentry_blocked_until_composed = false;
-                        log::info!(
+                        log::debug!(
                             "scanout_m2: composed fallback submitted; re-entry barrier cleared"
                         );
                     }
@@ -19395,7 +19425,7 @@ impl Backend for KmsBackend {
         {
             self.scanout_m2.unflip_fallback_source = None;
             self.scanout_m2.unflip_shadow_ready = true;
-            log::info!(
+            log::debug!(
                 "scanout_m2: normal Present Copy prepared composed fallback source=0x{src_pixmap_xid:x}"
             );
         }
@@ -19571,7 +19601,7 @@ impl Backend for KmsBackend {
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
         self.scanout_m2.sync_ownership();
-        log::info!(
+        log::debug!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),
             present_id,
@@ -31010,7 +31040,7 @@ mod tests {
         state.clients.insert(
             7,
             ClientState {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(9)),
                 resource_id_base: 0,
@@ -31025,6 +31055,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: yserver_core::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.randr_select_masks.insert(
@@ -41988,7 +42020,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0,
@@ -42003,6 +42035,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
     }
@@ -46758,5 +46792,98 @@ mod tests {
         }
         assert!(b.commit_consumer.capacity.can_enter_direct());
         assert_eq!(b.commit_consumer.capacity.occupied(), 0);
+    }
+    /// Issue #146 — the dedup key must not move when only the region XIDs do.
+    ///
+    /// `scanout_m0 shape` logs when the shape CHANGES, and the key used to
+    /// carry the Present valid/update region XIDs. A compositor creates a
+    /// fresh update region every frame (`0x4144dd` → `0x4144eb` → `0x4144f9`
+    /// across three consecutive Presents in the #146 report), so the key
+    /// changed on every Present by construction and the guard suppressed
+    /// nothing — one ~700-byte line per composited frame.
+    ///
+    /// The sibling test above cannot catch this: it sends
+    /// `update_region_xid: 0` on both Presents, so the key is identical
+    /// either way and it passes before and after the fix.
+    ///
+    /// Both directions are asserted. Identity must NOT move the key, or the
+    /// flood returns; presence must STILL move it, or the fix has simply
+    /// thrown the information away.
+    #[test]
+    fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use ash::vk;
+        use yserver_core::backend::PresentScanoutCandidate;
+
+        let mut b = super::KmsBackend::for_tests();
+        seed_window(&mut b, 0xD57, None, 0, 0);
+        b.store
+            .allocate(
+                0x5AC,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("source");
+        let base = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 1,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            src_pixmap_xid: 0x100,
+            dst_window_xid: 0x200,
+            src_host_xid: 0x5AC,
+            paint_dst_host_xid: 0xD57,
+            completion_dst_host_xid: 0xD57,
+            src_width: 100,
+            src_height: 100,
+            x_off: 0,
+            y_off: 0,
+            // A real compositor's regions: present, and a different XID every
+            // frame. These are the exact values from the #146 report.
+            valid_region_xid: 0,
+            update_region_xid: 0x0041_44dd,
+            update_is_full: false,
+            explicit_sync: false,
+            options: 0,
+        };
+
+        b.observe_scanout_m0(base);
+        let after_first = b.scanout_m0.last_shape_by_dst[&0xD57].clone();
+
+        for (present_id, update) in [(2u64, 0x0041_44ebu32), (3, 0x0041_44f9)] {
+            b.observe_scanout_m0(PresentScanoutCandidate {
+                present_id,
+                update_region_xid: update,
+                ..base
+            });
+            assert_eq!(
+                b.scanout_m0.last_shape_by_dst[&0xD57], after_first,
+                "a fresh update-region XID must not count as a shape change \
+                 (present {present_id}, update {update:#x}) — that is the \
+                 per-frame log flood in #146",
+            );
+        }
+
+        // ...but losing the region entirely IS a real change, so the key has
+        // to notice. Otherwise the fix would just have dropped the signal.
+        b.observe_scanout_m0(PresentScanoutCandidate {
+            present_id: 4,
+            update_region_xid: 0,
+            update_is_full: true,
+            ..base
+        });
+        assert_ne!(
+            b.scanout_m0.last_shape_by_dst[&0xD57], after_first,
+            "a Present that carries no update region at all is a different \
+             shape and must still be logged",
+        );
     }
 }

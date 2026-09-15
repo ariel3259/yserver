@@ -10,10 +10,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
-    os::{
-        fd::{AsRawFd, OwnedFd, RawFd},
-        unix::net::{UnixListener, UnixStream},
-    },
+    os::fd::{AsRawFd, OwnedFd, RawFd},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,22 +21,27 @@ use mio::{Events, Interest, Poll, unix::SourceFd};
 use super::{
     auth::AuthState,
     client_io::{self, WriteOutcome},
+    generation,
+    input_inventory::InputInventory,
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
-        ClientIdAllocator, LISTENER_TOKEN, NOTIFY_TOKEN, backend_token, client_token,
-        token_to_backend_index, token_to_client,
+        ClientIdAllocator, NOTIFY_TOKEN, backend_token, client_token, listener_token,
+        token_to_backend_index, token_to_client, token_to_listener_index,
     },
     process_request::{
         PendingCrtcConfig, RequestOutcome, complete_crtc_config,
         fire_present_configure_notify_for_window, process_request,
     },
+    reset::{GenerationLocals, ResetAction, ResetPolicy, ResetTrigger, reset_generation},
     sender::{CoreReceiver, CoreSender},
     setup_thread::{self, SetupRegistry},
+    xdmcp::{XDMCP_TOKEN, XdmcpOutcome, XdmcpService},
 };
 use crate::{
     backend::{Backend, BackendFdKind, CrtcConfigToken, HostSocketStatus},
     host_x11::HostEvent,
     server::{KeyRepeatState, ServerState},
+    transport::{Listener, Transport},
 };
 
 /// Diagnostic: per-second loop telemetry emit interval. Toggle via
@@ -77,7 +79,7 @@ struct ClientLoopTelemetry {
 }
 
 #[derive(Debug, Default)]
-struct LoopTelemetry {
+pub(crate) struct LoopTelemetry {
     enabled: bool,
     last_emit: Option<Instant>,
     iter_count: u64,
@@ -431,6 +433,25 @@ impl LoopTelemetry {
             stats.deferred_current != 0
         });
     }
+
+    /// Drop every per-client row and zero the deferred-depth gauges.
+    ///
+    /// Called only from the server-reset boundary, and only because the
+    /// window rollover above prunes a client row when its
+    /// `deferred_current` reaches zero — which happens through
+    /// `record_deferred_pop`, i.e. only when a request is actually
+    /// dispatched. A reset DISCARDS the queues instead, so without this
+    /// the gauge would stay permanently non-zero, the dead client's row
+    /// would never be pruned, and — since client ids are reused across
+    /// generations — the next generation's client 7 would inherit the
+    /// previous one's numbers. Diagnostics only; nothing on the
+    /// protocol path reads these.
+    #[allow(dead_code)] // called by `reset::reset_generation`; armed in step 5
+    pub(crate) fn forget_clients(&mut self) {
+        self.clients.clear();
+        self.deferred_current = 0;
+        self.max_deferred_depth = 0;
+    }
 }
 
 /// Core-loop work cap. Each main-loop iteration processes at
@@ -512,7 +533,7 @@ fn budget_exhausted(remaining: usize, elapsed: Duration) -> bool {
 }
 
 /// One pending X protocol request accepted by a reader but not yet dispatched.
-struct DeferredRequest {
+pub(crate) struct DeferredRequest {
     id: yserver_protocol::x11::ClientId,
     sequence: yserver_protocol::x11::SequenceNumber,
     accepted_at: Option<Instant>,
@@ -534,7 +555,7 @@ struct ParkedCrtcConfig {
 /// Backend waits indexed both by opaque token (completion) and by client
 /// (strict same-client FIFO blocking/cancellation).
 #[derive(Default)]
-struct PendingBackendRequests {
+pub(crate) struct PendingBackendRequests {
     crtc_by_token: HashMap<CrtcConfigToken, ParkedCrtcConfig>,
     crtc_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
 }
@@ -573,7 +594,37 @@ impl PendingBackendRequests {
         Some(token)
     }
 
-    fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
+    /// Park a CRTC configuration with only the fields a lifetime test
+    /// needs. The protocol continuation is inert filler: nothing here
+    /// completes the request, it only has to be cancellable.
+    #[cfg(test)]
+    pub(crate) fn park_crtc_for_test(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+        token: CrtcConfigToken,
+    ) -> Result<(), &'static str> {
+        self.park_crtc(ParkedCrtcConfig {
+            client_id: client,
+            sequence: yserver_protocol::x11::SequenceNumber(1),
+            continuation: PendingCrtcConfig {
+                token,
+                completion: crate::core_loop::process_request::CrtcConfigCompletion {
+                    output_id: 1,
+                    set_time: 0,
+                    output_bbox_before: None,
+                    byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                },
+            },
+            request_wire_bytes: 0,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.crtc_by_token.is_empty() && self.crtc_by_client.is_empty()
+    }
+
+    pub(crate) fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
         self.crtc_by_client.clear();
         self.crtc_by_token.drain().map(|(token, _)| token).collect()
     }
@@ -585,7 +636,7 @@ impl PendingBackendRequests {
 /// continuously busy client gets at most one request before every other ready
 /// client gets a turn. Cross-client request order has no protocol meaning.
 #[derive(Default)]
-struct FairRequestQueue {
+pub(crate) struct FairRequestQueue {
     by_client: HashMap<yserver_protocol::x11::ClientId, VecDeque<DeferredRequest>>,
     ready: VecDeque<yserver_protocol::x11::ClientId>,
     len: usize,
@@ -593,11 +644,22 @@ struct FairRequestQueue {
 
 impl FairRequestQueue {
     #[cfg(test)]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    fn push_back(&mut self, req: DeferredRequest) {
+    /// Drop every queued request. Used only by the server-reset
+    /// generation boundary: the clients that issued them are gone, and
+    /// a request is meaningless in a generation whose resource ids mean
+    /// something else.
+    #[allow(dead_code)] // called by `reset::reset_generation`; armed in step 5
+    pub(crate) fn clear(&mut self) {
+        self.by_client.clear();
+        self.ready.clear();
+        self.len = 0;
+    }
+
+    pub(crate) fn push_back(&mut self, req: DeferredRequest) {
         let client = req.id;
         let queue = self.by_client.entry(client).or_default();
         if queue.is_empty() {
@@ -681,13 +743,32 @@ impl FairRequestQueue {
     }
 }
 
+/// A minimal `DeferredRequest` for tests outside this module. The
+/// opcode is arbitrary: the reset boundary discards these without ever
+/// decoding one.
+#[cfg(test)]
+pub(crate) fn deferred_request_for_test(id: u32) -> DeferredRequest {
+    DeferredRequest {
+        id: yserver_protocol::x11::ClientId(id),
+        sequence: yserver_protocol::x11::SequenceNumber(1),
+        accepted_at: None,
+        header: yserver_protocol::x11::RequestHeader {
+            opcode: 127,
+            data: 0,
+            length_units: 1,
+        },
+        body: Vec::new(),
+        attached_fd: None,
+    }
+}
+
 fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
     state.server_grab_owner.is_some_and(|owner| owner != req.id)
 }
 
 /// Restore parked server-grab requests to the fair queue without changing
 /// their per-client arrival order.
-fn release_server_grab_waiters(
+pub(crate) fn release_server_grab_waiters(
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     telemetry: &mut LoopTelemetry,
@@ -735,19 +816,30 @@ fn grant_request_credit(
     }
 }
 
+/// Complete one client's disconnect and tell the reset trigger about
+/// it.
+///
+/// Every path in this file that removes a client from `state.clients`
+/// funnels through here — a request handler asking for a disconnect, a
+/// failed `park_crtc`, an asynchronous CRTC completion, a failed
+/// `ClientSetupComplete`, the reader thread's `ClientDisconnected`, a
+/// failed outbound drain and the writable-interest reconcile — which is
+/// what lets the trigger be an *event* rather than a state check.
 fn disconnect_with_pending_cleanup(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
     client: yserver_protocol::x11::ClientId,
 ) {
     if let Some(token) = pending.take_client_crtc(client) {
         backend.cancel_crtc_config(token);
     }
     crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
+    reset_trigger.note_client_departed(state.clients.len());
 }
 
-fn cancel_all_pending_backend_requests(
+pub(crate) fn cancel_all_pending_backend_requests(
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
 ) {
@@ -761,6 +853,7 @@ fn process_one_request(
     backend: &mut dyn Backend,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
     requests_this_iter: &mut u32,
     request_budget: &mut usize,
     req: DeferredRequest,
@@ -778,6 +871,7 @@ fn process_one_request(
     } else {
         None
     };
+    let clients_before = state.clients.len();
     let outcome = process_request_inline(
         state,
         backend,
@@ -787,6 +881,21 @@ fn process_one_request(
         &req.body,
         req.attached_fd,
     );
+    // The one client removal that does NOT come back as
+    // `RequestOutcome::Disconnect`: `KillClient` naming a resource owned
+    // by a *different* client calls `process_disconnect` inline
+    // (`process_request.rs`, "Force-disconnect the other client"). That
+    // is still a departure and the trigger has to hear about it. Gated
+    // on the count actually dropping, so this stays an event — a
+    // request that removes nobody reports nothing.
+    //
+    // Today it can never be the departure that drains the session (the
+    // killer is still connected, so the set is non-empty), but nothing
+    // in the handler guarantees that, and an unreported departure is a
+    // trigger that silently never fires again.
+    if state.clients.len() < clients_before {
+        reset_trigger.note_client_departed(state.clients.len());
+    }
     if let Some(start) = req_start {
         telemetry.record_request(
             req_client,
@@ -801,7 +910,7 @@ fn process_one_request(
     match outcome {
         RequestOutcome::Handled => grant_request_credit(state, req_client, req_wire_bytes),
         RequestOutcome::Disconnect(disc_id) => {
-            disconnect_with_pending_cleanup(state, backend, pending, disc_id);
+            disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, disc_id);
         }
         RequestOutcome::PendingCrtcConfig(continuation) => {
             let token = continuation.token;
@@ -825,7 +934,7 @@ fn process_one_request(
                 // An ordering/token contract violation cannot be replied to
                 // safely without overtaking an earlier request from this
                 // client. Disconnect it and cancel any older parked work.
-                disconnect_with_pending_cleanup(state, backend, pending, req_client);
+                disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, req_client);
             }
         }
     }
@@ -836,6 +945,7 @@ fn drain_pending_requests(
     backend: &mut dyn Backend,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     requests_this_iter: &mut u32,
@@ -856,6 +966,7 @@ fn drain_pending_requests(
             backend,
             telemetry,
             pending,
+            reset_trigger,
             requests_this_iter,
             request_budget,
             req,
@@ -941,10 +1052,11 @@ fn process_request_inline(
 /// Resume every asynchronous CRTC request whose backend result is ready.
 /// `finish_crtc_config` is called only while the originating client is still
 /// waiting, so a late worker completion can never install a cancelled mode.
-fn drain_ready_crtc_configs(
+pub(crate) fn drain_ready_crtc_configs(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
 ) {
     for token in backend.drain_ready_crtc_configs() {
         let Some(parked) = pending.take_crtc(token) else {
@@ -984,7 +1096,7 @@ fn drain_ready_crtc_configs(
         backend.mark_dirty();
         match outcome {
             RequestOutcome::Disconnect(client) => {
-                disconnect_with_pending_cleanup(state, backend, pending, client);
+                disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, client);
             }
             RequestOutcome::Handled => {
                 grant_request_credit(state, parked.client_id, parked.request_wire_bytes)
@@ -1021,20 +1133,47 @@ pub fn run_core(
     sender: CoreSender,
     state: &mut ServerState,
     backend: &mut dyn Backend,
-    listener: Option<UnixListener>,
+    listeners: impl IntoIterator<Item = Listener>,
     client_id_allocator: &ClientIdAllocator,
     auth: Arc<AuthState>,
+    reset_policy: ResetPolicy,
+    xdmcp: Option<XdmcpService>,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
-    let listener = if let Some(listener) = listener {
-        listener.set_nonblocking(true)?;
-        let raw = listener.as_raw_fd();
-        poll.registry()
-            .register(&mut SourceFd(&raw), LISTENER_TOKEN, Interest::READABLE)?;
-        Some(listener)
-    } else {
-        None
-    };
+    // The generation counter is shared with every `CoreSender`; the
+    // receiver is the loop's sole handle to it, and the reset boundary
+    // is the only thing that bumps it.
+    let generations = rx.generation_counter();
+    // The armed trigger (server-reset design, "The trigger must be
+    // armed, not inferred"). False until a client becomes established,
+    // and false again immediately after every reset.
+    let mut reset_trigger = ResetTrigger::new(reset_policy);
+    let listeners: Vec<_> = listeners
+        .into_iter()
+        .enumerate()
+        .map(|(index, listener)| {
+            listener.set_nonblocking(true)?;
+            let raw = listener.as_raw_fd();
+            let token = listener_token(index)
+                .ok_or_else(|| io::Error::other("too many client listeners"))?;
+            poll.registry()
+                .register(&mut SourceFd(&raw), token, Interest::READABLE)?;
+            Ok(listener)
+        })
+        .collect::<io::Result<_>>()?;
+    let mut listener_readiness = ListenerReadiness::new(listeners.len());
+
+    // XDMCP: one UDP socket in this same poll set, and the first query.
+    // `None` unless argv named `-query`/`-broadcast`/`-indirect`, in which
+    // case nothing below this point does anything at all (invariant 4).
+    let mut xdmcp = xdmcp;
+    if let Some(service) = xdmcp.as_mut() {
+        service.register(poll.registry())?;
+        // `XdmcpInit` (`xdmcp.c:600`): the query goes out before the first
+        // poll, so a manager on the same host can answer within the first
+        // iteration.
+        service.start(&auth, rx.current_generation());
+    }
 
     // E3: register backend-owned fds with the core poller. KMS returns
     // `Drm` only after `take_input_ctx`; the libinput context, when
@@ -1097,6 +1236,10 @@ pub fn run_core(
     let mut deferred_requests = FairRequestQueue::default();
     let mut server_grab_waiters: VecDeque<DeferredRequest> = VecDeque::new();
     let mut pending_backend_requests = PendingBackendRequests::default();
+    // Process-lifetime, not per-generation — see `input_inventory`'s
+    // module docs. Populated below on every `HostInput` device event;
+    // nothing consumes it yet (step 1 of the server-reset plan).
+    let mut input_inventory = InputInventory::new();
     loop {
         // The grab can be dropped by paths that have no release check of
         // their own — notably the two disconnect sites outside the message
@@ -1123,7 +1266,9 @@ pub fn run_core(
         // Compute poll timeout. If there are runnable deferred requests, do
         // not block: drain them immediately. Otherwise, blocking could wait for
         // a fresh fd event, leaving the backlog stranded.
-        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests) {
+        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests)
+            || listener_readiness.has_pending()
+        {
             Some(Duration::ZERO)
         } else {
             // Wake for the earliest deadline owned by either core
@@ -1137,6 +1282,11 @@ pub fn run_core(
             let ss_idle_deadline = state.screensaver_idle_deadline();
             let ss_cycle_deadline = state.screensaver_cycle_deadline();
             let idletime_alarm_deadline = state.idletime_alarm_deadline();
+            // The XDMCP retransmission/dormancy deadline joins the existing
+            // computation rather than bringing a thread of its own — the
+            // state machine belongs on this loop, where it can see the
+            // generation boundary directly.
+            let xdmcp_deadline = xdmcp.as_ref().and_then(XdmcpService::next_deadline);
             repeat_deadline
                 .into_iter()
                 .chain(backend_deadline)
@@ -1144,6 +1294,7 @@ pub fn run_core(
                 .chain(ss_idle_deadline)
                 .chain(ss_cycle_deadline)
                 .chain(idletime_alarm_deadline)
+                .chain(xdmcp_deadline)
                 .min()
                 .map(|deadline| {
                     deadline
@@ -1188,6 +1339,7 @@ pub fn run_core(
             backend,
             &mut telemetry,
             &mut pending_backend_requests,
+            &mut reset_trigger,
             &mut deferred_requests,
             &mut server_grab_waiters,
             &mut requests_this_iter,
@@ -1195,6 +1347,19 @@ pub fn run_core(
             drain_start,
         );
         for ev in events.iter() {
+            if let Some(index) = token_to_listener_index(ev.token()) {
+                listener_readiness.mark_ready(index);
+                continue;
+            }
+            if ev.token() == XDMCP_TOKEN {
+                // `XdmcpSocketNotify` (`xdmcp.c:655`). Whatever the machine
+                // decides is latched on the service and acted on at the
+                // tail of this iteration, where the reset boundary lives.
+                if let Some(service) = xdmcp.as_mut() {
+                    service.handle_readable(&auth, rx.current_generation());
+                }
+                continue;
+            }
             if let Some(index) = token_to_backend_index(ev.token()) {
                 let Some(source) = backend_poll_sources.get(index).copied() else {
                     warn!(
@@ -1261,21 +1426,22 @@ pub fn run_core(
                 continue;
             }
             match ev.token() {
-                LISTENER_TOKEN => {
-                    if let Some(listener) = listener.as_ref() {
-                        accept_pending(
-                            listener,
-                            client_id_allocator,
-                            &sender,
-                            &setup_registry,
-                            &auth,
-                        );
-                    }
-                }
                 NOTIFY_TOKEN => {
                     let mut channel_requests = 0_usize;
                     let mut channel_requests_by_client = HashMap::new();
-                    for msg in rx.try_recv_all() {
+                    for (msg_generation, msg) in rx.try_recv_all_tagged() {
+                        // Discard stale session-scoped traffic at the top
+                        // of dispatch (server-reset plan step 2). Inert
+                        // today: the generation never advances yet, so
+                        // `msg_generation` always equals the current one
+                        // and every message dispatches exactly as before.
+                        if !generation::should_dispatch(
+                            rx.current_generation(),
+                            msg_generation,
+                            &msg,
+                        ) {
+                            continue;
+                        }
                         match msg {
                             Message::Shutdown => {
                                 setup_thread::shutdown_all(&setup_registry);
@@ -1284,6 +1450,16 @@ pub fn run_core(
                                     &mut pending_backend_requests,
                                 );
                                 return Ok(());
+                            }
+                            Message::ResetRequested => {
+                                // SIGHUP under `-reset` / `-terminate`.
+                                // Latched, not executed here: the
+                                // boundary needs the loop-local
+                                // collections that this dispatch arm
+                                // has borrowed, and it runs at the tail
+                                // of this same iteration.
+                                log::info!("reset: SIGHUP requested a server reset");
+                                reset_trigger.note_reset_requested();
                             }
                             Message::Request {
                                 id,
@@ -1322,10 +1498,13 @@ pub fn run_core(
                             }
                             Message::ClientSetupComplete {
                                 id,
+                                generation,
                                 stream,
                                 resource_id_base,
                                 resource_id_mask,
                                 byte_order,
+                                is_local,
+                                fd_passing,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
                                     poll.registry(),
@@ -1333,18 +1512,60 @@ pub fn run_core(
                                     &setup_registry,
                                     state,
                                     id,
+                                    generation,
                                     stream,
                                     resource_id_base,
                                     resource_id_mask,
                                     byte_order,
+                                    is_local,
+                                    fd_passing,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
                                     disconnect_with_pending_cleanup(
                                         state,
                                         backend,
                                         &mut pending_backend_requests,
+                                        &mut reset_trigger,
                                         id,
                                     );
+                                } else if let Some(service) = xdmcp.as_mut() {
+                                    // `XdmcpOpenDisplay` (`xdmcp.c:632`),
+                                    // called from `ClientAuthorized`
+                                    // (`os/connection.c:581`) for every
+                                    // client that completes an authorized
+                                    // setup. Immediately after
+                                    // establishment, not deferred to the
+                                    // tail: this is the ordering that
+                                    // decides a `Refuse` racing an
+                                    // in-flight setup, and the service
+                                    // reports a client the race left with
+                                    // no session to belong to.
+                                    if service.note_client_established(
+                                        id,
+                                        is_local,
+                                        &auth,
+                                        rx.current_generation(),
+                                    ) {
+                                        // Orphaned by a lost `Refuse`
+                                        // race. Drop it WITHOUT having
+                                        // armed the reset trigger: an
+                                        // orphan never counted as an
+                                        // established client, so its
+                                        // departure must not drain an
+                                        // armed set and start a
+                                        // generation mid-retry.
+                                        disconnect_with_pending_cleanup(
+                                            state,
+                                            backend,
+                                            &mut pending_backend_requests,
+                                            &mut reset_trigger,
+                                            id,
+                                        );
+                                    } else {
+                                        reset_trigger.note_client_established();
+                                    }
+                                } else {
+                                    reset_trigger.note_client_established();
                                 }
                             }
                             Message::ClientDisconnected { id, reason: _ } => {
@@ -1352,12 +1573,29 @@ pub fn run_core(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
+                                    &mut reset_trigger,
                                     id,
                                 );
                             }
                             Message::HostInput(ev) => {
                                 if telemetry.enabled {
                                     telemetry.record_host_input(Instant::now());
+                                }
+                                // Process-lifetime bookkeeping: maintain
+                                // `InputInventory` regardless of
+                                // generation (it always dispatches, see
+                                // above) so a device add/remove is never
+                                // missed, even mid-reset once resets
+                                // exist. Nothing consumes the inventory
+                                // yet — purely additive.
+                                match &ev {
+                                    HostInputEvent::DeviceAdded(info) => {
+                                        input_inventory.add(info.clone());
+                                    }
+                                    HostInputEvent::DeviceRemoved { device_node } => {
+                                        input_inventory.remove(device_node);
+                                    }
+                                    _ => {}
                                 }
                                 handle_host_input(state, backend, ev);
                                 backend.mark_dirty();
@@ -1367,6 +1605,7 @@ pub fn run_core(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
+                                    &mut reset_trigger,
                                 );
                             }
                             Message::VtRelease => {
@@ -1406,6 +1645,7 @@ pub fn run_core(
                         backend,
                         &mut telemetry,
                         &mut pending_backend_requests,
+                        &mut reset_trigger,
                         &mut deferred_requests,
                         &mut server_grab_waiters,
                         &mut requests_this_iter,
@@ -1443,6 +1683,7 @@ pub fn run_core(
                                 state,
                                 backend,
                                 &mut pending_backend_requests,
+                                &mut reset_trigger,
                                 client_id,
                             );
                         }
@@ -1450,6 +1691,13 @@ pub fn run_core(
                 }
             }
         }
+        listener_readiness.accept_ready(
+            &listeners,
+            client_id_allocator,
+            &sender,
+            &setup_registry,
+            &auth,
+        );
         // F2: drain any host-X11 events the backend decoded during
         // this iteration. Fanout runs at the outermost stack frame
         // — no `wait_for_reply` is on the stack here — so handlers
@@ -1519,7 +1767,13 @@ pub fn run_core(
         // disconnect that ran during this iteration doesn't break
         // the next one.
         for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
-            disconnect_with_pending_cleanup(state, backend, &mut pending_backend_requests, disc_id);
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                &mut pending_backend_requests,
+                &mut reset_trigger,
+                disc_id,
+            );
         }
 
         run_iteration_tail(state, backend);
@@ -1531,6 +1785,101 @@ pub fn run_core(
             let wall = now.saturating_duration_since(start);
             telemetry.record_iteration(requests_this_iter, wall);
             telemetry.maybe_emit(now);
+        }
+
+        // The generation boundary. Reached only from an action the
+        // trigger LATCHED earlier in this iteration — a departure that
+        // drained an armed generation, or a SIGHUP — never from a state
+        // check here: an idle client set is indistinguishable from a
+        // drained one, and a `-reset` server that inspected
+        // `state.clients` would reset itself repeatedly at startup.
+        //
+        // The boundary runs at the tail rather than at the disconnect
+        // site because it needs the loop-local collections
+        // (`GenerationLocals`) that the dispatch arms have borrowed.
+        // Deferring it inside one iteration is also what makes the
+        // cancellation in `note_client_established` meaningful: a
+        // client that completes setup after the drain, in this same
+        // batch, un-drains the session before the boundary is reached.
+        // XDMCP, once per iteration and immediately before the boundary:
+        // fire a due timer, notice the session client leaving, and act on
+        // whatever the machine decided.
+        if let Some(service) = xdmcp.as_mut() {
+            service.service_timer(Instant::now(), &auth, rx.current_generation());
+            // `XdmcpCloseDisplay` (`xdmcp.c:642`). Ids are allocated
+            // monotonically and only `disconnect_with_pending_cleanup`
+            // removes an entry, so a recorded session client that is no
+            // longer in `state.clients` HAS departed — this is the
+            // departure, not a guess about one.
+            if let Some(client) = service.live_session_client()
+                && !state.clients.contains_key(&client.0)
+            {
+                service.note_session_client_disconnected(client, &auth, rx.current_generation());
+            }
+            match service.take_outcome() {
+                None => {}
+                Some(XdmcpOutcome::Terminate) => {
+                    log::info!("xdmcp: terminating the server");
+                    setup_thread::shutdown_all(&setup_registry);
+                    cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+                    return Ok(());
+                }
+                Some(XdmcpOutcome::Reset) => {
+                    // Forced, like SIGHUP: a client connecting between the
+                    // session ending and the boundary must not veto the
+                    // renewal the protocol already committed to.
+                    reset_trigger.note_reset_requested();
+                }
+            }
+        }
+
+        match reset_trigger.take_pending() {
+            None => {}
+            Some(ResetAction::Terminate) => {
+                log::info!("reset: -terminate — last client left, shutting down");
+                setup_thread::shutdown_all(&setup_registry);
+                cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+                return Ok(());
+            }
+            Some(ResetAction::Reset) => {
+                let outcome = reset_generation(
+                    state,
+                    backend,
+                    poll.registry(),
+                    &generations,
+                    &setup_registry,
+                    &input_inventory,
+                    GenerationLocals {
+                        deferred_requests: &mut deferred_requests,
+                        server_grab_waiters: &mut server_grab_waiters,
+                        pending_backend_requests: &mut pending_backend_requests,
+                        telemetry: &mut telemetry,
+                    },
+                );
+                // The boundary refused: the old session's composite overlay
+                // could not be released, so there is no safe generation to
+                // continue into. `reset_generation` has already logged why.
+                // Shut down the same way `-terminate` does — under XDMCP the
+                // display manager re-queries and gets a clean process.
+                let Some(generation) = outcome else {
+                    setup_thread::shutdown_all(&setup_registry);
+                    cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+                    return Ok(());
+                };
+                // Disarm for the generation just installed. Without
+                // this the empty client set the reset leaves behind
+                // would be re-latched by the next departure-shaped
+                // event and reset a second time.
+                reset_trigger.begin_generation();
+                log::info!("reset: new generation installed ({generation:?})");
+                // `XdmcpReset` (`xdmcp.c:618`), AFTER the new generation is
+                // installed — the cookie the re-query is about to earn
+                // belongs to this generation, and binding it to the old one
+                // would refuse the very session it is fetching.
+                if let Some(service) = xdmcp.as_mut() {
+                    service.restart(&auth, generation);
+                }
+            }
         }
     }
 }
@@ -2907,10 +3256,13 @@ fn handle_client_setup_complete(
     setup_registry: &SetupRegistry,
     state: &mut ServerState,
     id: yserver_protocol::x11::ClientId,
-    stream: UnixStream,
+    generation: crate::core_loop::Generation,
+    stream: Transport,
     resource_id_base: u32,
     resource_id_mask: u32,
     byte_order: yserver_protocol::x11::ClientByteOrder,
+    is_local: bool,
+    fd_passing: bool,
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
     let writer = stream.try_clone()?;
@@ -2937,9 +3289,10 @@ fn handle_client_setup_complete(
             watching_writable: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: Some(reader_control_tx),
+            is_local,
+            fd_passing,
         },
     );
-
     setup_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2957,58 +3310,411 @@ fn handle_client_setup_complete(
     )?;
 
     const BIG_REQUESTS_MAJOR_OPCODE: u8 = 135;
+    // Read the transport off the stream before it is moved into the
+    // reader. It has to be the transport, not `is_local`: locality is a
+    // property of the ADDRESS, so a loopback TCP client is local and
+    // would otherwise be reported as "unix" on the same line that says
+    // fd passing is off — misleading exactly where same-host XDMCP is
+    // being debugged. The branch already had to learn this distinction
+    // once, for authorization.
+    let transport_label = match &stream {
+        Transport::Unix(_) => "unix",
+        Transport::Tcp(_) => "TCP",
+    };
+    // The reader inherits the setup thread's binding rather than
+    // re-reading the counter, so the connection keeps ONE generation
+    // from accept to disconnect.
     crate::core_loop::client_reader::spawn(
         id,
         stream,
         byte_order,
         BIG_REQUESTS_MAJOR_OPCODE,
         reader_control_rx,
-        sender.clone_handle(),
+        sender.bind_to(generation),
     )?;
 
+    // At INFO deliberately: this is the only place a log says which
+    // transport a client arrived on. In an XDMCP deployment that is the
+    // first question worth asking, because it decides whether DRI3 and
+    // MIT-SHM were available to that client at all — and it should not
+    // require raising the log level of a whole session to find out.
+    log::info!(
+        "client {} established over {} (fd passing {})",
+        id.0,
+        transport_label,
+        if fd_passing { "on" } else { "off" },
+    );
+
+    // Reaching here is what "ESTABLISHED" means: the poller registration
+    // and the reader spawn have both succeeded, so the client can
+    // actually participate in the loop. The reset trigger is NOT armed
+    // here — see the note at the end of this function — but this is the
+    // point the caller's arming decision is about.
+    //
+    // Xorg's equivalent is `client->clientState = ClientStateRunning`
+    // (`dix/dispatch.c:3762`), set only after the setup reply is written
+    // and establishment has fully succeeded; `CloseDownClient`
+    // (`:3537`) then triggers the last-client reset only for a client
+    // that reached Running. A client of ours whose `register` or
+    // `spawn` fails cannot participate in the core loop at all — it
+    // produces no request and no reader thread — so it is not the
+    // analogue of Running. Arming at the insert instead would let the
+    // caller's own error path — which disconnects a failed setup — fire a
+    // reset for a client that never ran.
+    //
+    // Everything that ends before this line must arm nothing: a port
+    // scan on the TCP listener, a handshake that drops half-way, a
+    // connection refused for a bad cookie, and a failed registration or
+    // reader spawn.
+    //
+    // Arming itself is the CALLER's, deliberately. Under XDMCP a setup
+    // can complete and then immediately lose a `Refuse` race, and the
+    // service disconnects it as orphaned. Arming here would let that
+    // drop drain an armed client set and schedule a generation — a
+    // spurious reset in the middle of the negotiation's own retry. Only
+    // a RETAINED client may arm, so the decision has to sit after
+    // XDMCP admission.
     Ok(())
 }
 
-/// Drain pending accepts on the listener. For each, allocate a fresh
-/// `ClientId` and spawn a setup thread that does the X11 handshake.
+/// Is `peer` one of this machine's own addresses?
+///
+/// Xorg's `xtransLocalClient` (`os/access.c`) treats an AF_UNIX peer as
+/// local, and otherwise compares the peer against `selfhosts` — the
+/// addresses `DefineSelf` collected from the interfaces. So a TCP
+/// connection from the machine's own address is a LOCAL client there, and
+/// keeps the locality-gated extensions.
+///
+/// Queried per accept rather than snapshotted at startup: accepts are
+/// rare, `getifaddrs` is cheap, and a cached set goes stale across a
+/// hotplug or a DHCP renewal. Xorg snapshots and then patches with
+/// `AugmentSelf`; asking each time is simpler and cannot drift.
+///
+/// Not implemented: Xorg additionally treats a client whose command name
+/// is `ssh` as non-local, to catch a forwarded connection. That is a
+/// heuristic on `/proc`, and `ssh -X` reaches us over a UNIX socket
+/// anyway.
+fn address_is_ours(peer: std::net::IpAddr) -> bool {
+    if peer.is_loopback() {
+        return true;
+    }
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `ifap` with an owned list on success; we
+    // walk it without retaining anything and free it before returning.
+    if unsafe { libc::getifaddrs(&raw mut ifap) } != 0 {
+        return false;
+    }
+    let mut found = false;
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list `getifaddrs` just built, and
+        // `ifa_addr` is either null or a valid `sockaddr` for its family.
+        let addr = unsafe { (*cur).ifa_addr };
+        if !addr.is_null() && unsafe { (*addr).sa_family } == libc::AF_INET as libc::sa_family_t {
+            let sin = addr.cast::<libc::sockaddr_in>();
+            // SAFETY: family said AF_INET, so the node is a sockaddr_in.
+            let raw = unsafe { (*sin).sin_addr.s_addr };
+            if std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(raw))) == peer {
+                found = true;
+                break;
+            }
+        }
+        // SAFETY: as above; `ifa_next` is null at the end of the list.
+        cur = unsafe { (*cur).ifa_next };
+    }
+    // SAFETY: `ifap` is exactly what `getifaddrs` returned and is freed once.
+    unsafe { libc::freeifaddrs(ifap) };
+    found
+}
+
+/// Accept at most this many connections per listener and core iteration.
+const ACCEPT_BUDGET: usize = 16;
+
+/// Preserve readiness across budget-limited accepts, and rotate the first
+/// listener served each iteration independently of the poller's event order.
+struct ListenerReadiness {
+    ready: Vec<bool>,
+    next: usize,
+}
+
+impl ListenerReadiness {
+    fn new(count: usize) -> Self {
+        Self {
+            ready: vec![false; count],
+            next: 0,
+        }
+    }
+
+    fn mark_ready(&mut self, index: usize) {
+        if let Some(ready) = self.ready.get_mut(index) {
+            *ready = true;
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.ready.iter().any(|ready| *ready)
+    }
+
+    fn accept_ready(
+        &mut self,
+        listeners: &[Listener],
+        allocator: &ClientIdAllocator,
+        sender: &CoreSender,
+        registry: &SetupRegistry,
+        auth: &Arc<AuthState>,
+    ) {
+        let mut first = None;
+        for offset in 0..listeners.len() {
+            let index = (self.next + offset) % listeners.len();
+            if self.ready[index] {
+                first.get_or_insert(index);
+                self.ready[index] =
+                    accept_pending(&listeners[index], allocator, sender, registry, auth);
+            }
+        }
+        if let Some(first) = first {
+            self.next = (first + 1) % listeners.len();
+        }
+    }
+}
+
+/// Accept one bounded batch, returning whether readiness must be retained.
+/// mio is edge-triggered: after hitting the budget, keep polling this listener
+/// without blocking until an accept reaches WouldBlock.
 fn accept_pending(
-    listener: &UnixListener,
+    listener: &Listener,
     client_id_allocator: &ClientIdAllocator,
     sender: &CoreSender,
     registry: &SetupRegistry,
     auth: &Arc<AuthState>,
-) {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
+) -> bool {
+    for _ in 0..ACCEPT_BUDGET {
+        let accepted = match listener {
+            Listener::Unix(listener) => listener
+                .accept()
+                .map(|(stream, _)| (Transport::Unix(stream), true, true)),
+            Listener::Tcp(listener) => listener.accept().map(|(stream, peer)| {
+                // `is_local` is an ADDRESS property, `fd_passing` is a
+                // TRANSPORT one, and this is the site that must not
+                // conflate them. `SCM_RIGHTS` is impossible over TCP
+                // whoever the peer is, so fd passing is always off here.
+                // Locality is not: Xorg's `xtransLocalClient`
+                // (`os/access.c`) answers TRUE for a TCP peer whose
+                // address is one of the server's own, which is why a
+                // same-machine client keeps MIT-SHM — its `Attach` passes
+                // a SysV shmid, an integer on the wire, so shared memory
+                // works fine without a descriptor.
+                (Transport::Tcp(stream), address_is_ours(peer.ip()), false)
+            }),
+        };
+        match accepted {
+            Ok((stream, is_local, fd_passing)) => {
                 let id = client_id_allocator.allocate();
+                // Bind the connection's producer HERE, at accept: this
+                // is the moment that decides which session the client
+                // belongs to. Everything it later sends — its setup
+                // thread's messages, and its reader thread's, which
+                // inherit this binding — is tagged with the generation
+                // running now, so a reset retires all of it even if the
+                // thread only wakes up on the far side of the boundary.
                 if let Err(err) = setup_thread::spawn(
                     id,
                     stream,
-                    sender.clone_handle(),
+                    sender.bind(),
                     registry.clone(),
                     auth.clone(),
+                    is_local,
+                    fd_passing,
                 ) {
                     error!("setup thread spawn failed for client {}: {err}", id.0);
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return false,
+            // These do not mean the accept queue is empty. Count failed
+            // syscalls toward the budget too, so even repeated errors yield.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                ) => {}
             Err(err) => {
                 warn!("accept failed: {err}");
-                break;
+                return false;
             }
         }
     }
+    true
 }
 
 // Silence unused-import lints when the listener path is only exercised
 // indirectly. Concrete uses below.
 #[allow(dead_code)]
-fn _hint(_: UnixStream) {}
+fn _hint(_: Transport) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn listener_accept_budget_leaves_flood_backlog_for_next_turn() {
+        let path =
+            std::env::temp_dir().join(format!("yserver-accept-budget-{}", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let peers: Vec<_> = (0..33)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        std::fs::remove_file(path).unwrap();
+        let listener = Listener::Unix(listener);
+        let alloc = ClientIdAllocator::new();
+        let (_poll, sender, _rx) = channel().unwrap();
+        let registry = setup_thread::make_registry();
+
+        accept_pending(&listener, &alloc, &sender, &registry, &AuthState::new(None));
+        let accepted = alloc.peek().0 - 1;
+        setup_thread::shutdown_all(&registry);
+        drop(peers);
+        assert_eq!(
+            accepted, 16,
+            "one listener must yield after its accept budget"
+        );
+    }
+
+    #[test]
+    fn ready_listeners_round_robin_under_accept_flood() {
+        for tcp_count in [1, 33] {
+            let path = std::env::temp_dir().join(format!(
+                "yserver-accept-fair-{}-{tcp_count}",
+                std::process::id()
+            ));
+            let unix = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let unix_peers: Vec<_> = (0..33)
+                .map(|_| UnixStream::connect(&path).unwrap())
+                .collect();
+            let tcp_peers: Vec<_> = (0..tcp_count)
+                .map(|_| std::net::TcpStream::connect(tcp.local_addr().unwrap()).unwrap())
+                .collect();
+            std::fs::remove_file(path).unwrap();
+            let listeners = [Listener::Unix(unix), Listener::Tcp(tcp)];
+            for listener in &listeners {
+                listener.set_nonblocking(true).unwrap();
+            }
+            let alloc = ClientIdAllocator::new();
+            let (_poll, sender, _rx) = channel().unwrap();
+            let registry = setup_thread::make_registry();
+            let mut readiness = ListenerReadiness::new(2);
+            readiness.mark_ready(0);
+            readiness.mark_ready(1);
+            readiness.accept_ready(
+                &listeners,
+                &alloc,
+                &sender,
+                &registry,
+                &AuthState::new(None),
+            );
+            {
+                let clients = registry.lock().unwrap();
+                assert!(matches!(
+                    clients[&yserver_protocol::x11::ClientId(1)],
+                    Transport::Unix(_)
+                ));
+                assert!(
+                    matches!(
+                        clients[&yserver_protocol::x11::ClientId(17)],
+                        Transport::Tcp(_)
+                    ),
+                    "TCP must be accepted within one Unix accept budget, even during a flood"
+                );
+                assert_eq!(clients.len(), if tcp_count == 1 { 17 } else { 32 });
+            }
+            // No fresh readiness marks. Queued accepts must persist, and the
+            // second round must start at TCP rather than repeat Unix-first.
+            readiness.accept_ready(
+                &listeners,
+                &alloc,
+                &sender,
+                &registry,
+                &AuthState::new(None),
+            );
+            if tcp_count == 33 {
+                let clients = registry.lock().unwrap();
+                assert!(matches!(
+                    clients[&yserver_protocol::x11::ClientId(33)],
+                    Transport::Tcp(_)
+                ));
+                assert!(matches!(
+                    clients[&yserver_protocol::x11::ClientId(49)],
+                    Transport::Unix(_)
+                ));
+            }
+            readiness.accept_ready(
+                &listeners,
+                &alloc,
+                &sender,
+                &registry,
+                &AuthState::new(None),
+            );
+            assert!(
+                !readiness.has_pending(),
+                "WouldBlock clears retained readiness"
+            );
+            assert_eq!(alloc.peek().0 - 1, 33 + tcp_count);
+            setup_thread::shutdown_all(&registry);
+            drop((unix_peers, tcp_peers));
+        }
+    }
+
+    #[test]
+    fn listener_backlog_completes_without_a_fresh_readiness_edge() {
+        use std::io::{Read, Write};
+        let path = std::env::temp_dir().join(format!("yserver-accept-edge-{}", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Queue more than two accept budgets before the listener is registered:
+        // there is one readiness edge, with no later connection to wake it.
+        let mut peers: Vec<_> = (0..33)
+            .map(|_| {
+                let mut peer = UnixStream::connect(&path).unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                    .unwrap();
+                peer
+            })
+            .collect();
+        std::fs::remove_file(path).unwrap();
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                [Listener::Unix(listener)],
+                &ClientIdAllocator::new(),
+                AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
+            )
+        });
+        let result: io::Result<()> = (|| {
+            for peer in &mut peers {
+                let mut header = [0; 8];
+                peer.read_exact(&mut header)?;
+                assert_eq!(header[0], 1);
+                let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
+                peer.read_exact(&mut vec![0; len])?;
+            }
+            Ok(())
+        })();
+        sender.send(Message::Shutdown).unwrap();
+        handle.join().unwrap().unwrap();
+        result.expect("all queued connections must finish setup without another accept edge");
+    }
 
     #[test]
     fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {
@@ -3034,7 +3740,7 @@ mod tests {
         state.clients.insert(
             7,
             ClientState {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(9)),
                 resource_id_base: 0,
@@ -3049,6 +3755,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.randr_select_masks.insert(
@@ -3330,7 +4038,7 @@ mod tests {
         state.clients.insert(
             client_id.0,
             ClientState {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0,
@@ -3345,6 +4053,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: Some(control_tx),
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -3368,7 +4078,12 @@ mod tests {
         backend.ready_crtc_configs.push(token);
         backend.crtc_config_results.insert(token, Ok(false));
 
-        drain_ready_crtc_configs(&mut state, &mut backend, &mut pending);
+        drain_ready_crtc_configs(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
 
         let mut reply = [0_u8; 32];
         peer.read_exact(&mut reply).unwrap();
@@ -3395,7 +4110,13 @@ mod tests {
                 request_wire_bytes: 28,
             })
             .unwrap();
-        disconnect_with_pending_cleanup(&mut state, &mut backend, &mut pending, client_id);
+        disconnect_with_pending_cleanup(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+            client_id,
+        );
         assert_eq!(backend.cancelled_crtc_configs, [cancel_token]);
         assert!(!state.clients.contains_key(&client_id.0));
     }
@@ -3461,7 +4182,7 @@ mod tests {
         // We just need a real fd registered with the poller.
         let (mut peer, writer) = UnixStream::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
-        let writer_arc = Arc::new(Mutex::new(writer));
+        let writer_arc = Arc::new(Mutex::new(crate::transport::Transport::Unix(writer)));
         let raw = writer_arc.lock().unwrap().as_raw_fd();
         let token = client_token(Cid(7));
         poll.registry()
@@ -3487,6 +4208,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -3618,6 +4341,8 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
             );
             (result, backend)
         });
@@ -3645,6 +4370,424 @@ mod tests {
             dispatched_fds.iter().all(|fd| *fd == drm_fd_b),
             "idle DRM fd {drm_fd_a} was dispatched: {dispatched_fds:?}",
         );
+    }
+
+    /// A fake XDMCP manager on loopback, for the two loop-level tests
+    /// below. The service-level behaviour is covered in `core_loop::xdmcp`;
+    /// what these prove is the *plumbing* — the UDP socket really is in
+    /// this poll set, its readiness really is dispatched, and the reset
+    /// hook really runs after the new generation is installed.
+    struct XdmcpManagerFixture {
+        socket: std::net::UdpSocket,
+    }
+
+    impl XdmcpManagerFixture {
+        fn new() -> Self {
+            let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            Self { socket }
+        }
+
+        fn service(&self, once: bool) -> XdmcpService {
+            use crate::core_loop::xdmcp::{XdmcpMode, XdmcpSetup};
+            XdmcpService::bind(&XdmcpSetup {
+                mode: XdmcpMode::Query("127.0.0.1".into()),
+                port: self.socket.local_addr().unwrap().port(),
+                from: Some("127.0.0.1".into()),
+                class: None,
+                display_id: None,
+                once,
+                display_number: 7,
+            })
+            .unwrap()
+        }
+
+        fn expect(
+            &self,
+            what: &str,
+        ) -> (yserver_protocol::xdmcp::XdmcpMessage, std::net::SocketAddr) {
+            let mut buf = [0_u8; 8192];
+            let (len, from) = self
+                .socket
+                .recv_from(&mut buf)
+                .unwrap_or_else(|e| panic!("no {what} from the display: {e}"));
+            (
+                yserver_protocol::xdmcp::decode_message(&buf[..len]).unwrap(),
+                from,
+            )
+        }
+
+        fn send(&self, to: std::net::SocketAddr, message: &yserver_protocol::xdmcp::XdmcpMessage) {
+            let packet = yserver_protocol::xdmcp::encode_message(message).unwrap();
+            self.socket.send_to(&packet, to).unwrap();
+        }
+    }
+
+    /// The socket is registered with the core poller, its readiness is
+    /// dispatched, and a reset re-queries — from the loop, not from a
+    /// hand-driven service.
+    #[test]
+    fn the_xdmcp_socket_is_polled_and_a_reset_re_queries() {
+        use crate::backend::recording::RecordingBackend;
+        use yserver_protocol::xdmcp::XdmcpMessage;
+
+        let manager = XdmcpManagerFixture::new();
+        let service = manager.service(false);
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new_with_xdmcp(None, true),
+                ResetPolicy::Reset,
+                Some(service),
+            )
+        });
+
+        let (query, display) = manager.expect("the startup Query");
+        assert!(matches!(query, XdmcpMessage::Query { .. }), "{query:?}");
+
+        manager.send(
+            display,
+            &XdmcpMessage::Willing {
+                authentication_name: Vec::new(),
+                hostname: b"fake-dm".to_vec(),
+                status: b"willing".to_vec(),
+            },
+        );
+        let (request, _) = manager.expect("a Request");
+        assert!(
+            matches!(request, XdmcpMessage::Request { .. }),
+            "the loop did not dispatch the socket's readiness: {request:?}"
+        );
+
+        // A forced reset (the SIGHUP path) crosses the boundary; the XDMCP
+        // hook then re-queries on the NEW generation.
+        sender.send(Message::ResetRequested).unwrap();
+        let (requery, _) = manager.expect("a re-query after the reset");
+        assert!(matches!(requery, XdmcpMessage::Query { .. }), "{requery:?}");
+
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
+    }
+
+    /// A `Terminate` from the machine ends the loop cleanly — the other
+    /// half of the outcome wiring. `Failed` gets there in three packets
+    /// instead of the 126 seconds a retransmission timeout would take.
+    #[test]
+    fn an_xdmcp_terminate_ends_the_core_loop() {
+        use crate::backend::recording::RecordingBackend;
+        use yserver_protocol::xdmcp::{MIT_MAGIC_COOKIE_1, XdmcpMessage};
+
+        let manager = XdmcpManagerFixture::new();
+        let service = manager.service(false);
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new_with_xdmcp(None, true),
+                ResetPolicy::Reset,
+                Some(service),
+            )
+        });
+
+        let (_, display) = manager.expect("the startup Query");
+        manager.send(
+            display,
+            &XdmcpMessage::Willing {
+                authentication_name: Vec::new(),
+                hostname: b"fake-dm".to_vec(),
+                status: b"willing".to_vec(),
+            },
+        );
+        let _ = manager.expect("a Request");
+        manager.send(
+            display,
+            &XdmcpMessage::Accept {
+                session_id: 0x1234,
+                authentication_name: Vec::new(),
+                authentication_data: Vec::new(),
+                authorization_name: MIT_MAGIC_COOKIE_1.to_vec(),
+                authorization_data: b"cookie".to_vec(),
+            },
+        );
+        let _ = manager.expect("a Manage");
+        manager.send(
+            display,
+            &XdmcpMessage::Failed {
+                session_id: 0x1234,
+                status: b"no session for you".to_vec(),
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_finished(),
+            "a fatal XDMCP packet did not stop the loop"
+        );
+        handle.join().unwrap().unwrap();
+        drop(sender);
+    }
+    /// A setup that lost the `Refuse` race is dropped as orphaned — and
+    /// that drop must not start a generation.
+    ///
+    /// `AuthState` is atomic per call, but a setup thread that already
+    /// passed `check` is past that point: a `Refuse` can clear the
+    /// session cookie while the thread is one instruction from sending
+    /// its `ClientSetupComplete`. `XdmcpService::note_client_established`
+    /// reports that loser and the loop disconnects it. Under XDMCP the
+    /// policy is an implied `-reset`, so if the completion had armed the
+    /// reset trigger, the orphan's *own* disconnect would drain an armed
+    /// client set and cross the generation boundary — tearing down the
+    /// negotiation that is at that very moment retrying its `Request`.
+    ///
+    /// Arming therefore belongs to the caller, after XDMCP admission has
+    /// decided. What this pins is that decision order: the orphan goes
+    /// away, the generation does not move, and the manager's outstanding
+    /// offer is undisturbed. The injected message stands in for the
+    /// racing setup thread exactly as it reaches the loop — a **remote**
+    /// client, because the orphan rule deliberately spares local ones
+    /// (Xorg's `XdmcpOpenDisplay` ignores a unix client, which the XDMCP
+    /// cookie never authorized).
+    /// `is_local` is an ADDRESS property. A TCP peer on this machine is a
+    /// local client — Xorg's `xtransLocalClient` says so — and therefore
+    /// keeps MIT-SHM, whose legacy `Attach` passes a SysV shmid rather
+    /// than a descriptor and so works fine without fd passing.
+    ///
+    /// Deriving it from the transport instead, as this did until
+    /// 2026-09-10, refused shared memory to a same-machine XDMCP session
+    /// (`DISPLAY=127.0.0.1:1`) and pushed every image over the wire.
+    #[test]
+    fn a_tcp_peer_on_this_machine_is_a_local_client() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        assert!(
+            address_is_ours(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "127.0.0.1 is ours"
+        );
+        assert!(
+            address_is_ours(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+            "the whole loopback range is ours, not just 127.0.0.1"
+        );
+        // TEST-NET-3 (RFC 5737): reserved for documentation, so it cannot
+        // be a real interface address on the machine running this test.
+        assert!(
+            !address_is_ours(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+            "a documentation-range address is not ours"
+        );
+    }
+
+    #[test]
+    fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
+        use crate::backend::recording::RecordingBackend;
+        use std::io::Read;
+        use yserver_protocol::{
+            x11::ClientByteOrder,
+            xdmcp::{MIT_MAGIC_COOKIE_1, XdmcpMessage, decode_message},
+        };
+
+        /// How long the "no reset happened" assertions watch for. The
+        /// XDMCP retransmit floor is `XDM_MIN_RTX` = 2 s, so nothing the
+        /// healthy machine does can land inside this window; a reset's
+        /// re-query would land immediately.
+        const QUIET: Duration = Duration::from_millis(400);
+        const SESSION: u32 = 0x1234;
+
+        let manager = XdmcpManagerFixture::new();
+        let service = manager.service(false);
+        let (poll, sender, rx) = channel().unwrap();
+        // The generation is read from the counter, not inferred from
+        // timing: the boundary bumps it and nothing else in the loop
+        // does.
+        let generations = rx.generation_counter();
+        let sender_for_core = sender.clone_handle();
+        let client_ids = std::sync::Arc::new(ClientIdAllocator::new());
+        let client_ids_for_core = client_ids.clone();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &client_ids_for_core,
+                AuthState::new_with_xdmcp(None, true),
+                ResetPolicy::Reset,
+                Some(service),
+            )
+        });
+
+        let start_generation = generations.current();
+
+        // Query -> Willing -> Request -> Accept installs the session
+        // cookie, and the machine answers with Manage.
+        let (query, display) = manager.expect("the startup Query");
+        assert!(matches!(query, XdmcpMessage::Query { .. }), "{query:?}");
+        manager.send(
+            display,
+            &XdmcpMessage::Willing {
+                authentication_name: Vec::new(),
+                hostname: b"fake-dm".to_vec(),
+                status: b"willing".to_vec(),
+            },
+        );
+        let (request, _) = manager.expect("a Request");
+        assert!(
+            matches!(request, XdmcpMessage::Request { .. }),
+            "{request:?}"
+        );
+        manager.send(
+            display,
+            &XdmcpMessage::Accept {
+                session_id: SESSION,
+                authentication_name: Vec::new(),
+                authentication_data: Vec::new(),
+                authorization_name: MIT_MAGIC_COOKIE_1.to_vec(),
+                authorization_data: b"cookie".to_vec(),
+            },
+        );
+        let (manage, _) = manager.expect("a Manage");
+        assert!(matches!(manage, XdmcpMessage::Manage { .. }), "{manage:?}");
+
+        // The Refuse clears the cookie and sends the machine back round
+        // to Request. Reading that retry is the synchronisation point:
+        // it cannot be on the wire until the Refuse has been fully
+        // applied, so the injection below is unambiguously *after* the
+        // clear. No generation change — the offer is being retried, not
+        // abandoned.
+        manager.send(
+            display,
+            &XdmcpMessage::Refuse {
+                session_id: SESSION,
+            },
+        );
+        let (retry, _) = manager.expect("the Request retry after the Refuse");
+        assert!(
+            matches!(retry, XdmcpMessage::Request { .. }),
+            "a Refuse must resend the Request, got {retry:?}"
+        );
+        assert_eq!(
+            generations.current(),
+            start_generation,
+            "a Refuse retries the offer; it does not cross a boundary"
+        );
+
+        // The racing setup thread's completion, arriving now.
+        let orphan = client_ids.allocate();
+        let (core_side, mut peer) = UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let stale = sender.bind();
+        stale
+            .send(Message::ClientSetupComplete {
+                id: orphan,
+                generation: stale.generation(),
+                stream: Transport::Unix(core_side),
+                resource_id_base: 0x0020_0000,
+                resource_id_mask: 0x000F_FFFF,
+                byte_order: ClientByteOrder::LittleEndian,
+                // Remote: only a TCP client can have been authorized by
+                // the session credential the Refuse just revoked.
+                is_local: false,
+                fd_passing: false,
+            })
+            .expect("send the racing completion");
+
+        // 1. The orphan is dropped. `process_disconnect` shuts the
+        //    socket down on both sides, so this is EOF, not a timeout.
+        let mut sink = [0_u8; 1];
+        match peer.read(&mut sink) {
+            Ok(0) => {}
+            other => panic!("a client with no session must be disconnected; read {other:?}"),
+        }
+
+        // Watch the manager socket for a while before judging anything.
+        // The boundary is crossed at the *end* of the iteration the
+        // disconnect ran in, so EOF above races the bump by microseconds
+        // — this window is what makes the two assertions below decisive
+        // rather than a coin flip. Collect only; asserting inside the
+        // loop would let the re-query fire first and hide which of the
+        // two actually broke.
+        manager
+            .socket
+            .set_read_timeout(Some(QUIET))
+            .expect("quiet-window timeout");
+        let mut buf = [0_u8; 8192];
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + QUIET;
+        while Instant::now() < deadline {
+            let len = match manager.socket.recv_from(&mut buf) {
+                Ok((len, _)) => len,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(err) => panic!("unexpected error reading the manager socket: {err}"),
+            };
+            seen.push(decode_message(&buf[..len]).expect("decode"));
+        }
+
+        // 2. The regression itself.
+        assert_eq!(
+            generations.current(),
+            start_generation,
+            "an orphaned client never became established; its disconnect must not \
+             drain an armed session and start a new generation"
+        );
+
+        // 3. And the negotiation carried on untouched: the retry read
+        //    above is the manager's Request, and no Query followed it —
+        //    a Query is what a reset's re-query looks like.
+        assert!(
+            !seen
+                .iter()
+                .any(|message| matches!(message, XdmcpMessage::Query { .. })),
+            "the display re-queried mid-negotiation: {seen:?}"
+        );
+
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
     }
 
     #[test]
@@ -3679,6 +4822,8 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
             );
             (result, backend)
         });
@@ -3736,6 +4881,8 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
             );
             (result, backend)
         });
@@ -3797,6 +4944,8 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
             );
             (result, backend)
         });
@@ -3840,6 +4989,8 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
             )
         });
 
@@ -3923,6 +5074,8 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
             )
         });
 
@@ -3996,6 +5149,8 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
             )
         });
 
@@ -4264,6 +5419,8 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
             )
         });
         sender.send(Message::Shutdown).unwrap();
@@ -5030,5 +6187,695 @@ mod tests {
             .expect("compose attempted");
         assert!(flush < compose);
         assert!(!state.damage_notify_flush_pending);
+    }
+}
+
+/// The armed reset trigger, driven through a live `run_core` rather than
+/// against `ResetTrigger` directly (that state machine is unit-tested in
+/// `core_loop::reset`). What these pin is the *wiring*: which loop events
+/// arm it, which fire it, and what the boundary does afterwards.
+///
+/// A reset is observed through the generation counter — the boundary
+/// bumps it, and nothing else in the loop does — read from the clone the
+/// test keeps before handing `CoreReceiver` to the loop.
+#[cfg(test)]
+mod server_reset {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::{UnixListener, UnixStream},
+        path::PathBuf,
+        sync::atomic::{AtomicU32, Ordering},
+        thread::JoinHandle,
+        time::{Duration, Instant},
+    };
+
+    use super::{Listener, ResetPolicy, ServerState, run_core};
+    use crate::{
+        backend::recording::RecordingBackend,
+        core_loop::{
+            Generation, GenerationCounter, Message,
+            auth::AuthState,
+            poll_tokens::ClientIdAllocator,
+            sender::{CoreSender, channel},
+        },
+        transport::Transport,
+    };
+    use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+
+    /// Generous: these wait on real threads (setup, reader, core) under a
+    /// loaded test binary, and every use is a wait-for-success.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    /// How long a "must NOT happen" assertion watches for. The positive
+    /// cases below complete in single-digit milliseconds.
+    const QUIET: Duration = Duration::from_millis(400);
+
+    /// The value a `GenerationCounter` holds after `n` resets.
+    fn generation_after(n: u64) -> Generation {
+        let counter = GenerationCounter::new();
+        for _ in 0..n {
+            counter.bump();
+        }
+        counter.current()
+    }
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < TIMEOUT {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// A `run_core` running on its own thread over a private unix socket.
+    struct Server {
+        path: PathBuf,
+        sender: CoreSender,
+        generations: GenerationCounter,
+        /// The loop's own id allocator, shared so a test can learn the
+        /// `ClientId` the next connection will be given. Monotonic, so a
+        /// peek before `establish()` names that client exactly.
+        client_ids: std::sync::Arc<ClientIdAllocator>,
+        handle: Option<JoinHandle<std::io::Result<()>>>,
+    }
+
+    impl Server {
+        fn start(policy: ResetPolicy, auth: std::sync::Arc<AuthState>) -> Self {
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "yserver-reset-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind");
+            let (poll, sender, rx) = channel().expect("channel");
+            let generations = rx.generation_counter();
+            let sender_for_core = sender.clone_handle();
+            let client_ids = std::sync::Arc::new(ClientIdAllocator::new());
+            let client_ids_for_core = client_ids.clone();
+            let handle = std::thread::spawn(move || {
+                let mut state = ServerState::new();
+                let mut backend = RecordingBackend::new();
+                run_core(
+                    poll,
+                    rx,
+                    sender_for_core,
+                    &mut state,
+                    &mut backend,
+                    [Listener::Unix(listener)],
+                    &client_ids_for_core,
+                    auth,
+                    policy,
+                    None,
+                )
+            });
+            Self {
+                path,
+                sender,
+                generations,
+                client_ids,
+                handle: Some(handle),
+            }
+        }
+
+        /// The id the next accepted connection will get.
+        fn next_client_id(&self) -> ClientId {
+            self.client_ids.peek()
+        }
+
+        fn with_policy(policy: ResetPolicy) -> Self {
+            Self::start(policy, AuthState::new(None))
+        }
+
+        fn generation(&self) -> Generation {
+            self.generations.current()
+        }
+
+        fn connect(&self) -> UnixStream {
+            let peer = UnixStream::connect(&self.path).expect("connect");
+            peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
+            peer
+        }
+
+        /// Connect and take the connection all the way to *established*:
+        /// setup handshake, then a `GetInputFocus` round-trip. The reply
+        /// is what proves the core reached `handle_client_setup_complete`
+        /// — the setup reply alone is written by the setup thread and
+        /// says nothing about `state.clients`.
+        fn establish(&self) -> UnixStream {
+            let mut peer = self.connect();
+            peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .expect("setup request");
+            let mut header = [0_u8; 8];
+            peer.read_exact(&mut header).expect("setup reply header");
+            assert_eq!(header[0], 1, "setup must succeed");
+            let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
+            peer.read_exact(&mut vec![0; len])
+                .expect("setup reply body");
+            round_trip(&mut peer);
+            peer
+        }
+
+        fn shutdown(mut self) -> std::io::Result<()> {
+            let _ = self.sender.send(Message::Shutdown);
+            let result = self.handle.take().expect("handle").join().expect("join");
+            let _ = std::fs::remove_file(&self.path);
+            result
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = self.sender.send(Message::Shutdown);
+                let _ = handle.join();
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// `GetInputFocus` — the classic X11 round-trip probe. Always replies,
+    /// changes nothing.
+    fn round_trip(peer: &mut UnixStream) {
+        peer.write_all(&[43, 0, 1, 0]).expect("GetInputFocus");
+        let mut reply = [0_u8; 32];
+        peer.read_exact(&mut reply).expect("GetInputFocus reply");
+        assert_eq!(reply[0], 1, "reply, not an error");
+    }
+
+    /// `SetCloseDownMode(RetainPermanent)` — opcode 112, mode in the data
+    /// byte. Followed by a round-trip so the request is known to have been
+    /// processed before the caller drops the socket.
+    fn set_retain_permanent(peer: &mut UnixStream) {
+        peer.write_all(&[112, 1, 1, 0]).expect("SetCloseDownMode");
+        round_trip(peer);
+    }
+
+    // -- the trigger table: last client leaves x each policy ----------
+
+    #[test]
+    fn the_last_client_leaving_resets_under_reset() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let peer = server.establish();
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn the_last_client_leaving_does_nothing_under_noreset() {
+        let server = Server::with_policy(ResetPolicy::NoReset);
+        let peer = server.establish();
+        drop(peer);
+        std::thread::sleep(QUIET);
+        // Non-vacuous: the server is still serving, so the loop did run
+        // through the disconnect — it simply did not reset.
+        let survivor = server.establish();
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "-noreset must never cross the boundary"
+        );
+        drop(survivor);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn the_last_client_leaving_terminates_under_terminate() {
+        let mut server = Server::with_policy(ResetPolicy::Terminate);
+        let peer = server.establish();
+        drop(peer);
+        let handle = server.handle.take().expect("handle");
+        wait_until("run_core to return", || handle.is_finished());
+        handle
+            .join()
+            .expect("join")
+            .expect("-terminate must shut down cleanly, not error");
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "-terminate exits instead of resetting"
+        );
+    }
+
+    #[test]
+    fn a_retain_permanent_client_does_not_inhibit_the_reset() {
+        // `process_disconnect` keeps a retained client's resources as a
+        // zombie but removes it from `state.clients` regardless, so the
+        // session still counts as drained. Xorg's `really_close_down`
+        // gate does the opposite; the forced teardown at the boundary is
+        // what makes ours safe.
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let mut peer = server.establish();
+        set_retain_permanent(&mut peer);
+        drop(peer);
+        wait_until("a retained client's departure to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn a_client_that_leaves_while_another_stays_does_not_reset() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let first = server.establish();
+        let mut second = server.establish();
+        drop(first);
+        std::thread::sleep(QUIET);
+        round_trip(&mut second);
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "the session is not drained while a client remains"
+        );
+        drop(second);
+        wait_until("the second departure to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    // -- SIGHUP, per policy -------------------------------------------
+
+    #[test]
+    fn sighup_resets_a_running_session_under_reset() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let _peer = server.establish();
+        server
+            .sender
+            .send(Message::ResetRequested)
+            .expect("send SIGHUP request");
+        wait_until("SIGHUP to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn sighup_resets_rather_than_terminating_under_terminate() {
+        let server = Server::with_policy(ResetPolicy::Terminate);
+        let _peer = server.establish();
+        server
+            .sender
+            .send(Message::ResetRequested)
+            .expect("send SIGHUP request");
+        wait_until("SIGHUP to reset", || {
+            server.generation() == generation_after(1)
+        });
+        assert!(
+            !server.handle.as_ref().expect("handle").is_finished(),
+            "SIGHUP raises DE_RESET, not DE_TERMINATE"
+        );
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn sighup_does_not_reset_under_noreset() {
+        // Under the default policy the signal thread never produces this
+        // message (it keeps sending `Shutdown`); the loop refuses it
+        // anyway, so `-noreset` behaviour cannot drift.
+        let server = Server::with_policy(ResetPolicy::NoReset);
+        let mut peer = server.establish();
+        server
+            .sender
+            .send(Message::ResetRequested)
+            .expect("send SIGHUP request");
+        std::thread::sleep(QUIET);
+        round_trip(&mut peer);
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    // -- the arming cases a happy-path suite misses --------------------
+
+    #[test]
+    fn an_idle_reset_server_never_resets() {
+        // No client has ever connected, so the client set is empty from
+        // the first iteration. A state check would reset here, over and
+        // over.
+        let server = Server::with_policy(ResetPolicy::Reset);
+        std::thread::sleep(QUIET);
+        assert_eq!(server.generation(), generation_after(0));
+        // Still serving: the idle loop was running, not wedged.
+        let peer = server.establish();
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn a_connection_dropped_before_setup_completes_arms_nothing() {
+        // Accepted, a setup thread spawned, then gone before any
+        // `ClientSetupComplete`. Nothing was ever established, so
+        // nothing may fire.
+        let server = Server::with_policy(ResetPolicy::Reset);
+        for _ in 0..5 {
+            let peer = server.connect();
+            drop(peer);
+        }
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "accept is not arming"
+        );
+        let peer = server.establish();
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn a_client_refused_for_a_bad_cookie_arms_nothing() {
+        // The case a stranger can reach: stage 1's TCP listener binds
+        // 0.0.0.0, so a wrong cookie must not be able to erase a
+        // session. Refused inside the setup thread — the core never
+        // hears about it.
+        let cookie = [0x5A_u8; 16];
+        let auth_path = write_xauth(&cookie);
+        let server = Server::start(ResetPolicy::Reset, AuthState::new(Some(auth_path.clone())));
+
+        let mut peer = server.connect();
+        write_setup_with_cookie(&mut peer, &[0x22_u8; 16]);
+        let mut header = [0_u8; 8];
+        peer.read_exact(&mut header).expect("setup reply header");
+        assert_eq!(header[0], 0, "a bad cookie must be refused");
+        drop(peer);
+
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "a refused connection is not arming"
+        );
+
+        // And the good cookie still works, so the refusal was the
+        // server's decision, not a broken fixture.
+        let mut good = server.connect();
+        write_setup_with_cookie(&mut good, &cookie);
+        good.read_exact(&mut header).expect("setup reply header");
+        assert_eq!(header[0], 1, "the matching cookie must be accepted");
+        let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
+        good.read_exact(&mut vec![0; len])
+            .expect("setup reply body");
+        round_trip(&mut good);
+        assert_eq!(server.generation(), generation_after(0));
+
+        drop(good);
+        wait_until("the authorized client's departure to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+        let _ = std::fs::remove_file(&auth_path);
+    }
+
+    #[test]
+    fn a_reset_disarms_the_new_generation() {
+        // The boundary leaves an empty client set behind, and the dead
+        // generation's reader thread posts its `ClientDisconnected`
+        // afterwards. Neither may produce a second reset.
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the first reset", || {
+            server.generation() == generation_after(1)
+        });
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(1),
+            "exactly one reset; the fresh generation starts disarmed"
+        );
+        // The new generation serves, and arms again on its own client.
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the second generation to reset in turn", || {
+            server.generation() == generation_after(2)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    // -- the generation quarantine: producers bound at creation time ---
+
+    /// Watch a socket for `QUIET` and report whether the server wrote
+    /// **no bytes** to it. Restores the long timeout, so the caller can
+    /// keep using the socket afterwards.
+    ///
+    /// "The far end went away without writing" counts as quiet, and has
+    /// three shapes here: a timeout (nobody holds the other half open),
+    /// `Ok(0)`, and — when the other half is dropped while bytes we sent
+    /// are still unread in its queue, which is exactly what discarding a
+    /// message carrying a `Transport` does — `ECONNRESET`. What must not
+    /// happen is bytes arriving; a caller that also cares whether the
+    /// peer is still *alive* follows this with a `round_trip`.
+    fn stays_quiet(peer: &mut UnixStream) -> bool {
+        peer.set_read_timeout(Some(QUIET)).expect("read timeout");
+        let mut byte = [0_u8; 1];
+        let quiet = match peer.read(&mut byte) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(err) => matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+        };
+        peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
+        quiet
+    }
+
+    /// The hole the quarantine exists to close: a producer belonging to
+    /// the destroyed session must not be able to hand the new one a
+    /// client.
+    ///
+    /// `reset_generation` shuts the setup sockets down, which narrows the
+    /// window but does not close it — a setup thread can already hold a
+    /// fully decoded `ClientSetupComplete` and be one instruction away
+    /// from sending it. The producer here stands in for that thread: it
+    /// takes its handle while generation 0 runs, exactly where
+    /// `accept_pending` hands one to `setup_thread::spawn`, and sends
+    /// after the boundary. Tagging at *send* time would stamp it with the
+    /// new generation and let it through.
+    #[test]
+    fn an_old_setup_completion_cannot_create_a_client_in_the_new_generation() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        // The id the pre-reset client holds — what a real old setup
+        // thread's completion would carry.
+        let doomed = server.next_client_id();
+        let stale = server.sender.bind();
+        let peer = server.establish();
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+
+        let (core_side, mut phantom) = UnixStream::pair().expect("socketpair");
+        stale
+            .send(Message::ClientSetupComplete {
+                id: doomed,
+                generation: stale.generation(),
+                stream: Transport::Unix(core_side),
+                resource_id_base: 0x0020_0000,
+                resource_id_mask: 0x000F_FFFF,
+                byte_order: ClientByteOrder::LittleEndian,
+                is_local: true,
+                fd_passing: true,
+            })
+            .expect("send the stale completion");
+
+        // Accepted, this would insert a `ClientState` and spawn a reader,
+        // and the request below would come back answered.
+        phantom.write_all(&[43, 0, 1, 0]).expect("GetInputFocus");
+        assert!(
+            stays_quiet(&mut phantom),
+            "a client authorized in the destroyed session must not be served by the new one"
+        );
+        // Nor may it arm the fresh generation: an accepted completion
+        // calls `note_client_established`, and the phantom's own
+        // departure would then reset a session it was never part of.
+        drop(phantom);
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(1),
+            "the phantom must not arm — and then drain — the new generation"
+        );
+        server.shutdown().expect("clean shutdown");
+    }
+
+    /// The reader-thread half: a `Request` produced by a retired reader
+    /// must not execute against the new session.
+    ///
+    /// It names a client of the *new* session deliberately. The loop
+    /// already drops a request whose client is unknown
+    /// (`process_request_inline`'s post-disconnect guard), so an old id
+    /// would pass whether or not the generation filter works, and the
+    /// test would prove nothing. The reply landing on a live client's
+    /// socket is the sharpest observable there is.
+    #[test]
+    fn an_old_generation_request_is_not_executed_in_the_new_session() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let stale = server.sender.bind();
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+
+        let live_id = server.next_client_id();
+        let mut live = server.establish();
+
+        stale
+            .send(Message::Request {
+                id: live_id,
+                sequence: SequenceNumber(0x4242),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 43, // GetInputFocus — always replies
+                    data: 0,
+                    length_units: 1,
+                },
+                body: Vec::new(),
+                attached_fd: None,
+            })
+            .expect("send the stale request");
+
+        assert!(
+            stays_quiet(&mut live),
+            "a request tagged by a retired producer must not be executed"
+        );
+        // Quiet because the request was discarded, not because the
+        // client is broken.
+        round_trip(&mut live);
+        assert_eq!(server.generation(), generation_after(1));
+        drop(live);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    /// The other message a retired reader can still emit. Accepted, it
+    /// runs `disconnect_with_pending_cleanup` against the new session —
+    /// which under `-reset` drains it and resets a generation that was
+    /// serving a live client.
+    #[test]
+    fn an_old_generation_disconnect_cannot_tear_down_a_new_session_client() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let stale = server.sender.bind();
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+
+        let live_id = server.next_client_id();
+        let mut live = server.establish();
+
+        stale
+            .send(Message::ClientDisconnected {
+                id: live_id,
+                reason: std::io::Error::other("retired reader"),
+            })
+            .expect("send the stale disconnect");
+
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(1),
+            "a retired producer must not be able to drain the new session"
+        );
+        round_trip(&mut live);
+
+        // The real departure still works, so the filter did not wedge
+        // the trigger.
+        drop(live);
+        wait_until("the live client's own departure to reset", || {
+            server.generation() == generation_after(2)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    /// The other half of binding at accept: a connection accepted *after*
+    /// the boundary gets a producer bound to the new generation, so
+    /// nothing it sends is stale. Both its setup thread and its reader
+    /// thread have to pass the filter for `establish` (which ends in a
+    /// `GetInputFocus` round-trip) to return at all.
+    #[test]
+    fn a_connection_accepted_after_a_reset_is_served_normally() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+
+        let mut fresh = server.establish();
+        for _ in 0..3 {
+            round_trip(&mut fresh);
+        }
+        assert_eq!(server.generation(), generation_after(1));
+        drop(fresh);
+        wait_until("the second generation to reset in turn", || {
+            server.generation() == generation_after(2)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    // -- fixtures for the auth case ------------------------------------
+
+    const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
+
+    fn write_xauth(cookie: &[u8]) -> PathBuf {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&256_u16.to_be_bytes()); // FamilyLocal
+        for field in [
+            b"host".as_slice(),
+            b"0",
+            MIT_MAGIC_COOKIE.as_bytes(),
+            cookie,
+        ] {
+            bytes.extend_from_slice(
+                &u16::try_from(field.len())
+                    .expect("field fits")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(field);
+        }
+        let path = std::env::temp_dir().join(format!("yserver-reset-auth-{}", std::process::id()));
+        std::fs::write(&path, bytes).expect("write xauthority");
+        path
+    }
+
+    fn write_setup_with_cookie(peer: &mut UnixStream, cookie: &[u8]) {
+        let name = MIT_MAGIC_COOKIE.as_bytes();
+        let mut buf = Vec::new();
+        buf.push(b'l');
+        buf.push(0);
+        buf.extend_from_slice(&11_u16.to_le_bytes());
+        buf.extend_from_slice(&0_u16.to_le_bytes());
+        buf.extend_from_slice(&u16::try_from(name.len()).expect("name fits").to_le_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(cookie.len())
+                .expect("cookie fits")
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(name);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(cookie);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        peer.write_all(&buf).expect("setup request with cookie");
     }
 }

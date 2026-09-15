@@ -160,6 +160,9 @@ pub fn process_request(
             .last_sequence
             .store(sequence.0, std::sync::atomic::Ordering::Relaxed);
     }
+    if let Some(outcome) = reject_non_local_extension_request(state, client_id, sequence, header) {
+        return outcome;
+    }
     if !x11::request_lengths::validate_core_request_length(header.opcode, header.length_units) {
         return emit_x11_error(
             state,
@@ -479,6 +482,149 @@ pub fn process_request(
                 opcode,
             )
         }
+    }
+}
+
+/// Apply Xorg's per-client locality policy before an extension handler sees a
+/// request.  Extensions remain advertised; remote clients receive the same
+/// dispatch errors that they do from Xorg.
+fn reject_non_local_extension_request(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+) -> Option<io::Result<RequestOutcome>> {
+    let (is_local, fd_passing) = state
+        .clients
+        .get(&client_id.0)
+        .map_or((true, true), |client| (client.is_local, client.fd_passing));
+
+    // DRI3 needs a DESCRIPTOR, not merely a local peer — every one of its
+    // requests either sends or receives one. So it is gated on
+    // `fd_passing`, which is false for any TCP peer however local.
+    //
+    // This is finer-grained than Xorg, deliberately. There a loopback TCP
+    // client is `client->local` (`xtransLocalClient`, os/access.c), so
+    // DRI3 dispatch is allowed and the request fails later, at the
+    // descriptor it cannot carry. Same refusal, worse diagnosis: the
+    // client sees the extension work and then break. Refusing at the gate
+    // reports `BadMatch` where the client already handles it.
+    if header.opcode == 147 && !fd_passing {
+        return Some(emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_MATCH,
+            0,
+            u16::from(header.data),
+            147,
+        ));
+    }
+
+    // MIT-SHM's two descriptor-bearing minors need the same treatment, and
+    // for the same reason: `is_local` is an ADDRESS property, so a loopback
+    // TCP peer is local and reaches them, then fails at the descriptor the
+    // transport cannot carry. `Attach` is deliberately NOT here — it passes
+    // a SysV shmid, not a descriptor, and stays available to a local TCP
+    // client (see `tcp_tests.rs`). Neither is `QueryVersion`.
+    //
+    // The codes are Xorg's, per minor rather than uniform: `ProcShmAttachFd`
+    // reaches `ReadFdFromClient` and returns `BadMatch` when it fails
+    // (`Xext/shm.c:1163`), while `ProcShmCreateSegment` returns `BadAlloc`
+    // when `WriteFdToClient` does (`Xext/shm.c:1323`). A client that handles
+    // Xorg's answer handles ours.
+    if header.opcode == 130 && !fd_passing {
+        use yserver_protocol::x11::mit_shm;
+        let code = match header.data {
+            mit_shm::ATTACH_FD => Some(x11::error::BAD_MATCH),
+            mit_shm::CREATE_SEGMENT => Some(x11::error::BAD_ALLOC),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return Some(emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                0,
+                u16::from(header.data),
+                130,
+            ));
+        }
+    }
+
+    if is_local {
+        return None;
+    }
+
+    match header.opcode {
+        // dri3/dri3_request.c rejects every DRI3 request from a non-local
+        // client, before inspecting its minor opcode or body.
+        147 => Some(emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_MATCH,
+            0,
+            u16::from(header.data),
+            147,
+        )),
+        // Xext/shm.c keeps QueryVersion available to remote clients but
+        // rejects the descriptor- and shared-memory-bearing requests.
+        130 if header.data != yserver_protocol::x11::mit_shm::QUERY_VERSION => {
+            Some(emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(header.data),
+                130,
+            ))
+        }
+        // Xext/vidmode.c lets its read-only requests through for remote
+        // clients, but reports ClientNotLocal for known mutating minors and
+        // BadRequest for unknown minors.
+        153 => {
+            use crate::nested::{XF86VIDMODE_FIRST_ERROR, XF86VIDMODE_MAJOR_OPCODE};
+            use yserver_protocol::x11::xf86vidmode as x11vm;
+
+            let code = match header.data {
+                x11vm::QUERY_VERSION
+                | x11vm::GET_MODE_LINE
+                | x11vm::GET_MONITOR
+                | x11vm::GET_ALL_MODE_LINES
+                | x11vm::VALIDATE_MODE_LINE
+                | x11vm::GET_VIEW_PORT
+                | x11vm::GET_DOT_CLOCKS
+                | x11vm::SET_CLIENT_VERSION
+                | x11vm::GET_GAMMA
+                | x11vm::GET_GAMMA_RAMP
+                | x11vm::GET_GAMMA_RAMP_SIZE
+                | x11vm::GET_PERMISSIONS => return None,
+                x11vm::MOD_MODE_LINE
+                | x11vm::SWITCH_MODE
+                | x11vm::LOCK_MODE_SWITCH
+                | x11vm::ADD_MODE_LINE
+                | x11vm::DELETE_MODE_LINE
+                | x11vm::SWITCH_TO_MODE
+                | x11vm::SET_VIEW_PORT
+                | x11vm::SET_GAMMA
+                | x11vm::SET_GAMMA_RAMP => XF86VIDMODE_FIRST_ERROR + x11vm::CLIENT_NOT_LOCAL,
+                _ => x11::error::BAD_REQUEST,
+            };
+            Some(emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                0,
+                u16::from(header.data),
+                XF86VIDMODE_MAJOR_OPCODE,
+            ))
+        }
+        // Present intentionally has no locality gate in Xorg.
+        _ => None,
     }
 }
 
@@ -7247,6 +7393,12 @@ fn send_reply_with_fd(
     bytes: &[u8],
     fd: std::os::fd::RawFd,
 ) -> io::Result<()> {
+    if !client.fd_passing {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file descriptor passing is unavailable on this transport",
+        ));
+    }
     // Drain whatever's pending so the SCM_RIGHTS frame lands in order.
     while !client.outbound.is_empty() {
         match client_io::drain_outbound(client)? {
@@ -7266,7 +7418,13 @@ fn send_reply_with_fd(
     let mut w = writer_arc
         .lock()
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "client writer mutex poisoned"))?;
-    crate::unix_fd::send_with_fd(&mut w, bytes, fd)
+    let crate::transport::Transport::Unix(stream) = &mut *w else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file descriptor passing is unavailable on this transport",
+        ));
+    };
+    crate::unix_fd::send_with_fd(stream, bytes, fd)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7948,7 +8106,32 @@ fn handle_mit_shm_create_segment(
         None => Ok(()),
     };
     unsafe { libc::close(fd_for_client) };
-    send_res?;
+    if send_res.is_err() {
+        // Xorg's `ProcShmCreateSegment` (`Xext/shm.c:1323`):
+        //
+        //     if (WriteFdToClient(client, fd, TRUE) < 0) {
+        //         FreeResource(stuff->shmseg, X11_RESTYPE_NONE);
+        //         close(fd);
+        //         return BadAlloc;
+        //     }
+        //
+        // Both halves matter. Propagating the I/O error instead left the
+        // segment in `mit_shm_segments` with no client able to reach it,
+        // and sent no protocol reply at all — the client saw a request that
+        // neither succeeded nor failed. The dispatch gate above should mean
+        // this is now unreachable for the transport reason; it stays
+        // because a short write is not the only way to get here.
+        state.mit_shm_segments.remove(&req.shmseg);
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ALLOC,
+            req.shmseg,
+            u16::from(shm::CREATE_SEGMENT),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
     Ok(RequestOutcome::Handled)
 }
 
@@ -13322,6 +13505,9 @@ fn handle_x_resource_request(
     #[cfg(target_os = "linux")]
     fn client_peer_pid(client: &crate::server::ClientState) -> Option<u32> {
         use std::os::fd::AsRawFd;
+        if !client.is_local {
+            return None;
+        }
         let guard = client
             .writer
             .lock()
@@ -13729,6 +13915,10 @@ fn handle_xf86vidmode_request(
         .clients
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |client| client.byte_order);
+    let is_local = state
+        .clients
+        .get(&client_id.0)
+        .is_none_or(|client| client.is_local);
     let version_2 = state
         .vidmode_client_versions
         .get(&client_id)
@@ -13935,7 +14125,9 @@ fn handle_xf86vidmode_request(
                 );
             }
             let reply = match header.data {
-                x11vm::GET_PERMISSIONS => x11vm::encode_get_permissions_reply(byte_order, sequence),
+                x11vm::GET_PERMISSIONS => {
+                    x11vm::encode_get_permissions_reply(byte_order, sequence, is_local)
+                }
                 x11vm::GET_VIEW_PORT => {
                     x11vm::encode_get_view_port_reply(byte_order, sequence, 0, 0)
                 }
@@ -30831,7 +31023,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 // Permissive resource-id range so tests driving
@@ -30853,9 +31045,197 @@ mod tests {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         b
+    }
+
+    #[test]
+    fn remote_clients_are_rejected_before_dri3_and_mit_shm_handlers() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).expect("test client").is_local = false;
+        let mut backend = RecordingBackend::new();
+
+        for (sequence, minor) in (0u8..=11).enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let sequence = sequence as u16 + 1;
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 147,
+                    data: minor,
+                    length_units: 1,
+                },
+                &[],
+                None,
+            )
+            .expect("dispatch");
+            let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+            assert_eq!(reply.len(), 32);
+            assert_eq!(reply[0], 0);
+            assert_eq!(reply[1], x11::error::BAD_MATCH);
+            assert_eq!(
+                u16::from_le_bytes(reply[8..10].try_into().unwrap()),
+                u16::from(minor)
+            );
+            assert_eq!(reply[10], 147);
+        }
+
+        for (sequence, minor) in (1u8..=7).enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let sequence = sequence as u16 + 20;
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 130,
+                    data: minor,
+                    length_units: 1,
+                },
+                &[],
+                None,
+            )
+            .expect("dispatch");
+            let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+            assert_eq!(reply.len(), 32);
+            assert_eq!(reply[0], 0);
+            assert_eq!(reply[1], x11::error::BAD_REQUEST);
+            assert_eq!(
+                u16::from_le_bytes(reply[8..10].try_into().unwrap()),
+                u16::from(minor)
+            );
+            assert_eq!(reply[10], 130);
+        }
+    }
+
+    #[test]
+    fn remote_mit_shm_query_version_remains_reachable() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).expect("test client").is_local = false;
+        let mut backend = RecordingBackend::new();
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 130,
+                data: 0,
+                length_units: 1,
+            },
+            &[],
+            None,
+        )
+        .expect("ShmQueryVersion dispatch");
+        let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(reply[0], 1, "ShmQueryVersion must not be locality-gated");
+    }
+
+    #[test]
+    fn local_clients_reach_dri3_and_mit_shm_handlers() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = syncobj_cap_backend();
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: yserver_protocol::x11::dri3::QUERY_VERSION,
+                length_units: 3,
+            },
+            &[1, 0, 0, 0, 4, 0, 0, 0],
+            None,
+        )
+        .expect("DRI3::QueryVersion dispatch");
+        let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(reply[0], 1, "local DRI3 request reaches its handler");
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 130,
+                data: yserver_protocol::x11::mit_shm::ATTACH,
+                length_units: 1,
+            },
+            &[],
+            None,
+        )
+        .expect("MIT-SHM Attach dispatch");
+        let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(reply[0], 0, "malformed local request reaches the handler");
+        assert_eq!(reply[1], x11::error::BAD_LENGTH);
+    }
+
+    #[test]
+    fn remote_client_can_query_present() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).expect("test client").is_local = false;
+        let mut backend = RecordingBackend::new();
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::QUERY_VERSION,
+                length_units: 1,
+            },
+            &[],
+            None,
+        )
+        .expect("Present::QueryVersion dispatch");
+        let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(reply[0], 1, "Present must not be locality-gated");
+    }
+
+    #[test]
+    fn locality_gated_extensions_remain_advertised() {
+        let mut backend = syncobj_cap_backend();
+        let names = advertised_extension_names(&mut backend);
+
+        for name in ["MIT-SHM", "DRI3", "XFree86-VidModeExtension"] {
+            assert!(
+                extension_query_reply(name, &mut backend).is_some(),
+                "{name} must be advertised before its per-client locality gate"
+            );
+            assert!(
+                names.contains(&name),
+                "{name} must remain in ListExtensions"
+            );
+        }
+    }
+
+    #[test]
+    fn fd_reply_refuses_a_client_without_fd_passing() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let client = state.clients.get_mut(&1).expect("test client");
+        client.fd_passing = false;
+        let file = std::fs::File::open("/dev/null").expect("open null device");
+
+        let error = send_reply_with_fd(client, &[1; 32], std::os::fd::AsRawFd::as_raw_fd(&file))
+            .expect_err("non-FD-capable clients must reject descriptor replies");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
     fn set_test_pointer_grab(
@@ -35011,6 +35391,40 @@ mod tests {
             u32::from_le_bytes(error[4..8].try_into().unwrap()),
             0x00f0_0000
         );
+    }
+
+    #[test]
+    fn x_resource_query_client_ids_omits_pid_for_nonlocal_client() {
+        use yserver_protocol::x11::x_resource as x11xres;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).unwrap().is_local = false;
+        let mut backend = RecordingBackend::new();
+        let mut body = 1u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&x11xres::LOCAL_CLIENT_PID_MASK.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 149,
+                data: x11xres::QUERY_CLIENT_IDS,
+                length_units: 4,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        let reply = read_all_available(&mut peer);
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            0,
+            "nonlocal clients have no LocalClientPID even if the underlying socket supports credentials"
+        );
+        assert_eq!(reply.len(), 32);
     }
 
     #[test]
@@ -41823,6 +42237,7 @@ mod tests {
     fn xf86vidmode_rejects_writes_with_client_not_local() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).expect("test client").is_local = false;
 
         for (seq, minor) in [2u8, 3, 5, 7, 8, 10, 12, 15, 18].into_iter().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
@@ -41846,11 +42261,37 @@ mod tests {
     }
 
     #[test]
+    fn xf86vidmode_permissions_follow_client_locality() {
+        use yserver_protocol::x11::xf86vidmode as x11vm;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let local = dispatch_vidmode(&mut state, &mut peer, 1, x11vm::GET_PERMISSIONS, &[0; 4]);
+        assert_eq!(local[0], 1);
+        assert_eq!(
+            u32::from_le_bytes(local[8..12].try_into().unwrap()),
+            x11vm::PERMISSION_READ | 2,
+            "local clients receive XF86VM_WRITE_PERMISSION"
+        );
+
+        state.clients.get_mut(&1).expect("test client").is_local = false;
+        let remote = dispatch_vidmode(&mut state, &mut peer, 2, x11vm::GET_PERMISSIONS, &[0; 4]);
+        assert_eq!(remote[0], 1);
+        assert_eq!(
+            u32::from_le_bytes(remote[8..12].try_into().unwrap()),
+            x11vm::PERMISSION_READ,
+            "remote clients remain read-only"
+        );
+    }
+
+    #[test]
     fn xf86vidmode_rejects_malformed_bodies_with_bad_length() {
         use yserver_protocol::x11::xf86vidmode as x11vm;
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).expect("test client").is_local = false;
 
         // QueryVersion takes no body at all.
         let reply = dispatch_vidmode(&mut state, &mut peer, 1, x11vm::QUERY_VERSION, &[0; 4]);
@@ -41909,7 +42350,7 @@ mod tests {
     }
 
     #[test]
-    fn xf86vidmode_read_only_gamma_matches_selected_randr_crtc() {
+    fn xf86vidmode_gamma_matches_selected_randr_crtc() {
         use yserver_protocol::x11::xf86vidmode as x11vm;
 
         let mut state = ServerState::new();
@@ -41944,8 +42385,8 @@ mod tests {
         assert_eq!(perms[0], 1, "reply, not an error");
         assert_eq!(
             u32::from_le_bytes(perms[8..12].try_into().unwrap()),
-            x11vm::PERMISSION_READ,
-            "READ only — granting WRITE would advertise mode setting we do not implement"
+            x11vm::PERMISSION_READ | x11vm::PERMISSION_WRITE,
+            "local clients receive Xorg's WRITE permission"
         );
 
         let size = dispatch_vidmode_with_backend(

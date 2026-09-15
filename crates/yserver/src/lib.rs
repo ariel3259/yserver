@@ -21,30 +21,14 @@ use nix::sys::signal::{SigmaskHow, sigprocmask};
 use nix::sys::signalfd::SignalFd;
 
 use yserver_core::{
-    backend::Backend,
-    core_loop::{self, Message, poll_tokens::ClientIdAllocator},
-    resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
-    server::ServerState,
+    // Moved into core (`backend::install_backend_root_bindings`) so the
+    // server-reset generation boundary can re-run the identical binding
+    // step against a freshly constructed `ServerState`. Imported under
+    // its own name here so this crate's call sites and test read as
+    // before.
+    backend::{Backend, BackendTopology, install_backend_root_bindings},
+    core_loop::{self, Message, ResetPolicy, poll_tokens::ClientIdAllocator},
 };
-
-fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend) {
-    if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
-        root.host_xid = yserver_core::backend::WindowHandle::from_raw(backend.window_id());
-    }
-    state
-        .resources
-        .set_visual_host_xid(ROOT_VISUAL, backend.root_visual_xid());
-    if let Some(host_colormap) = backend.argb_colormap_xid() {
-        state
-            .resources
-            .set_colormap_host_xid(ARGB_COLORMAP, host_colormap);
-    }
-    if let Some(host_argb_visual) = backend.argb_visual_xid() {
-        state
-            .resources
-            .set_visual_host_xid(ARGB_VISUAL, host_argb_visual);
-    }
-}
 
 /// Refuse to start when libinput's initial seat enumeration opened zero
 /// **usable** (keyboard- or pointer-capable) input devices. A display server
@@ -93,6 +77,110 @@ fn input_startup_action(has_input_ctx: bool) -> InputStartup {
     }
 }
 
+/// Build the process-lifetime authorization state from argv.
+///
+/// XDMCP is an approved *dynamic* authorization source: with `-query` and
+/// friends the session cookie arrives in an `Accept` rather than from
+/// `-auth`, which is what lets `-listen tcp` come up without an auth file —
+/// and what makes the file cookies stop authorizing TCP clients. See
+/// `core_loop::auth::AuthState::new_with_xdmcp`.
+fn build_auth_state(opts: &launch::LaunchOptions) -> std::sync::Arc<core_loop::auth::AuthState> {
+    core_loop::auth::AuthState::new_with_xdmcp(opts.auth_file.clone(), opts.xdmcp.is_some())
+}
+
+/// Validate TCP prerequisites before opening hardware or sockets, using the
+/// same authorization state that will serve every accepted connection.
+fn validate_tcp_startup(
+    opts: &launch::LaunchOptions,
+    auth: &core_loop::auth::AuthState,
+) -> io::Result<()> {
+    if !opts.tcp_listen {
+        // XDMCP without a TCP listener starts happily and can never finish:
+        // the manager completes Query/Willing/Request/Accept/Manage over
+        // UDP and then starts a session whose clients have no X server to
+        // connect to, because the only socket we bound is the unix one it
+        // cannot reach. Every documented invocation pairs them
+        // (`docs/setup.md`, and the stage-4 plan's deliverable is
+        // `yserver :N -query <host> -listen tcp`); this makes the pairing a
+        // startup error instead of a silent dead end.
+        if opts.xdmcp.is_some() {
+            return Err(io::Error::other(
+                "XDMCP requires -listen tcp: the manager's session has no way to                  reach this display without it",
+            ));
+        }
+        return Ok(());
+    }
+    auth.require_tcp_auth_at_startup()
+        .map_err(io::Error::other)?;
+    if let launch::Resolution::Explicit { display, .. } = launch::resolve(opts) {
+        let _ = launch::tcp_port(display).map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// Build the XDMCP service from argv, or `None` when no XDMCP option was
+/// given — in which case no UDP socket is opened and nothing about the
+/// server changes (design invariant 4).
+///
+/// Binding here, at the point the display number is finally known, is also
+/// where the display-class default lands: `-class` is left unset by the
+/// parser precisely because a default is only meaningful where the packet
+/// is built (`xdmcp.c:65`, `defaultDisplayClass`).
+fn build_xdmcp_service(
+    opts: &launch::LaunchOptions,
+    display: u16,
+) -> io::Result<Option<yserver_core::core_loop::XdmcpService>> {
+    use yserver_core::core_loop::{XdmcpMode, XdmcpService, XdmcpSetup};
+
+    let Some(xdmcp) = opts.xdmcp.as_ref() else {
+        return Ok(None);
+    };
+    let mode = match xdmcp.initial_mode() {
+        launch::XdmcpQueryMode::Query(host) => XdmcpMode::Query(host.clone()),
+        launch::XdmcpQueryMode::Broadcast => XdmcpMode::Broadcast,
+        launch::XdmcpQueryMode::Indirect(host) => XdmcpMode::Indirect(host.clone()),
+    };
+    let service = XdmcpService::bind(&XdmcpSetup {
+        mode,
+        port: xdmcp.port,
+        from: xdmcp.from.clone(),
+        class: xdmcp.class.clone(),
+        display_id: xdmcp.display_id.clone(),
+        once: xdmcp.once,
+        display_number: display,
+    })?;
+    Ok(Some(service))
+}
+
+fn bind_client_listeners(
+    unix: std::os::unix::net::UnixListener,
+    display: u16,
+    opts: &launch::LaunchOptions,
+    auth: &core_loop::auth::AuthState,
+) -> io::Result<Vec<yserver_core::transport::Listener>> {
+    use std::net::{Ipv4Addr, TcpListener};
+    use yserver_core::transport::Listener;
+
+    let mut listeners = vec![Listener::Unix(unix)];
+    if opts.tcp_listen {
+        // Keep the validation adjacent to the first network bind as well as
+        // the early startup check. In particular AutoPick resolves its actual
+        // display only after the early validation.
+        auth.require_tcp_auth_at_startup()
+            .map_err(io::Error::other)?;
+        let port = launch::tcp_port(display).map_err(io::Error::other)?;
+        let tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("cannot listen on TCP port {port}: {err}"),
+            )
+        })?;
+        log::info!("yserver: listening on TCP 0.0.0.0:{port}");
+        listeners.push(Listener::Tcp(tcp));
+    }
+    Ok(listeners)
+}
+
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
@@ -102,6 +190,10 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // the whole crate at `info`. A log without the hash cannot say which commit
     // it measured — that bit the 2026-09-03 z400 runs.
     log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
+
+    // Validate TCP's startup invariants before opening devices or sockets.
+    let auth = build_auth_state(&opts);
+    validate_tcp_startup(&opts, &auth)?;
 
     // Capture the inherited SIGUSR1 disposition before signalfd masking.
     // If the DM started us with SIGUSR1 ignored, we signal it when ready.
@@ -337,20 +429,15 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // libinput directly, arming VT_PROCESS when a controlling console is
     // present.
     let mut backend = build_kms_backend(&device_paths, console_guard, opts.layout.clone())?;
-    let (fb_w, fb_h) = backend.fb_dimensions();
+    // One snapshot of everything `ServerState` needs from the live
+    // backend — screen extent, RandR outputs/modes/providers, backend
+    // capabilities. The server-reset boundary re-derives a generation
+    // through this same call, so a second session is seeded exactly the
+    // way the first one was.
+    let topology = BackendTopology::from_backend(&mut backend);
+    let (fb_w, fb_h) = (topology.width, topology.height);
     log::info!("yserver: scanout {fb_w}x{fb_h}");
-
-    let (randr_outputs, randr_mode_table) = backend.randr_outputs_and_modes();
-    let randr_providers = backend.randr_providers();
-    let capabilities = yserver_core::server::BackendCapabilities::from_backend(&backend);
-    let mut state = ServerState::with_randr_outputs_and_modes(
-        fb_w,
-        fb_h,
-        randr_outputs,
-        randr_mode_table,
-        capabilities,
-    );
-    state.randr.set_providers(randr_providers);
+    let mut state = topology.into_server_state();
     // Tie the libinput thread's `clock::server_time_ms()` baseline
     // to ServerState's `start_instant` so the input-event timestamps
     // and the `state.timestamp_now()` clock used by the
@@ -395,6 +482,21 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         }
     };
     log::info!("yserver: listening on unix socket DISPLAY=:{display}");
+    let listeners = bind_client_listeners(listener, display, &opts, &auth)?;
+    // XDMCP binds HERE, with the other listeners, and not later.
+    //
+    // It used to be built last — "so an unresolvable manager fails after the
+    // display is known but before the loop takes the thread". The display is
+    // known here too, and building it last meant a bad `-query` host or a
+    // UDP bind failure returned `Err` through `?` from a point where the
+    // input thread, the core channel and the signal handlers were all
+    // already live, and after the parent had been told the server was up.
+    // Every one of those is skipped by `?`; only process exit cleaned them.
+    //
+    // Everything this call can fail on — argument parsing, host resolution,
+    // the UDP bind — depends on nothing but `opts` and `display`, so there
+    // is no reason for it to run after resources it cannot use.
+    let xdmcp = build_xdmcp_service(&opts, display)?;
 
     // Initial composite+flip so the screen has a known frame before any
     // client connects.
@@ -499,6 +601,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // at readiness. Disposition-in, delivery-to-self, and signal-out
     // are separate.
     let signal_sender = sender.clone_handle();
+    let signal_reset_policy = opts.reset_policy;
     thread::Builder::new()
         .name("yserver-signalfd".into())
         .spawn(move || {
@@ -522,9 +625,13 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                             }
                             continue;
                         }
-                        log::info!("yserver: received signal {signo}, requesting shutdown");
-                        let _ = signal_sender.send(Message::Shutdown);
-                        return;
+                        let (message, what) = signal_action(signo, signal_reset_policy);
+                        log::info!("yserver: received signal {signo}, requesting {what}");
+                        let stop = matches!(message, Message::Shutdown);
+                        if signal_sender.send(message).is_err() || stop {
+                            return;
+                        }
+                        continue;
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -571,9 +678,12 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                             }
                             continue;
                         }
-                        log::info!("yserver: received signal {signo}, requesting shutdown");
-                        let _ = signal_sender.send(Message::Shutdown);
-                        return;
+                        let (message, what) = signal_action(signo, signal_reset_policy);
+                        log::info!("yserver: received signal {signo}, requesting {what}");
+                        let stop = matches!(message, Message::Shutdown);
+                        if signal_sender.send(message).is_err() || stop {
+                            return;
+                        }
                     }
                 }
             }
@@ -586,7 +696,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     launch::signal_ready(&opts, display, sigusr1_was_ignored, parent_pid);
 
     let alloc = ClientIdAllocator::new();
-    let auth = core_loop::auth::AuthState::new(opts.auth_file.clone());
     if opts.auth_file.is_some() {
         log::info!(
             "yserver: authorization enabled via -auth {:?}",
@@ -602,9 +711,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         sender,
         &mut state,
         &mut backend,
-        Some(listener),
+        listeners,
         &alloc,
         auth,
+        opts.reset_policy,
+        xdmcp,
     );
     if let Err(err) = &result {
         log::warn!("yserver: run_core returned error: {err}");
@@ -661,6 +772,29 @@ fn build_kms_backend(
     layout: Option<String>,
 ) -> io::Result<crate::kms::render::KmsBackend> {
     crate::kms::render::KmsBackend::open(device_paths, console_guard, layout)
+}
+
+/// Map a delivered signal to the core-loop message it requests, plus a
+/// word for the log line.
+///
+/// Only SIGHUP is policy-dependent. Xorg's `AutoResetServer`
+/// (`os/utils.c:407`) resets unconditionally on SIGHUP; we deliberately
+/// do not. Under `-noreset` — the default — SIGHUP keeps requesting a
+/// clean shutdown exactly as it does today, because adopting Xorg's
+/// behaviour would make SIGHUP destroy a default server's session where
+/// today it stops it cleanly. Under `-reset` / `-terminate` the operator
+/// has asked for generations, so SIGHUP forces one (a reset, not a
+/// terminate — matching `AutoResetServer` raising `DE_RESET`).
+///
+/// SIGINT/SIGTERM and anything else still map to `Shutdown` under every
+/// policy. SIGUSR1/SIGUSR2 never reach here — the signalfd loops handle
+/// the VT handshake before calling this.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
+    if signo == nix::libc::SIGHUP && policy != ResetPolicy::NoReset {
+        return (Message::ResetRequested, "a server reset");
+    }
+    (Message::Shutdown, "shutdown")
 }
 
 #[cfg(target_os = "linux")]
@@ -763,16 +897,84 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
 }
 
 #[cfg(test)]
+mod tcp_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
-        InputStartup, ensure_input_devices_opened, input_startup_action,
-        install_backend_root_bindings,
+        InputStartup, Message, ResetPolicy, build_auth_state, build_xdmcp_service,
+        ensure_input_devices_opened, input_startup_action, install_backend_root_bindings, launch,
+        signal_action, validate_tcp_startup,
     };
     use yserver_core::{
         backend::Backend,
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
         server::ServerState,
     };
+
+    #[test]
+    fn sighup_still_shuts_down_under_the_default_policy() {
+        // The deliberate deviation from Xorg's `AutoResetServer`
+        // (`os/utils.c:407`), which resets unconditionally. Adopting that
+        // would make SIGHUP destroy a default server's session where
+        // today it stops it cleanly — and SIGHUP is exactly what the
+        // kernel sends on logout.
+        let (message, _) = signal_action(nix::libc::SIGHUP, ResetPolicy::NoReset);
+        assert!(matches!(message, Message::Shutdown));
+    }
+
+    #[test]
+    fn sighup_requests_a_reset_once_a_reset_policy_is_asked_for() {
+        for policy in [ResetPolicy::Reset, ResetPolicy::Terminate] {
+            let (message, _) = signal_action(nix::libc::SIGHUP, policy);
+            assert!(
+                matches!(message, Message::ResetRequested),
+                "SIGHUP under {policy:?} must request a reset"
+            );
+        }
+    }
+
+    /// Design invariant 4: with no XDMCP option, no UDP socket is opened
+    /// and nothing else changes. Asserted at the one place a socket could
+    /// come from, so it cannot drift back in.
+    #[test]
+    fn no_xdmcp_option_opens_no_socket() {
+        let opts = launch::parse_args([":7".to_string()]).unwrap();
+        assert!(opts.xdmcp.is_none());
+        assert!(build_xdmcp_service(&opts, 7).unwrap().is_none());
+        assert_eq!(opts.reset_policy, ResetPolicy::NoReset);
+    }
+
+    /// And with one, the socket is opened and the policy follows.
+    #[test]
+    fn an_xdmcp_option_opens_a_socket_and_implies_a_reset() {
+        let opts = launch::parse_args(
+            [":7", "-query", "127.0.0.1", "-port", "17177"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(opts.reset_policy, ResetPolicy::Reset);
+        let service = build_xdmcp_service(&opts, 7).unwrap();
+        assert!(service.is_some(), "an XDMCP option must open the socket");
+    }
+
+    #[test]
+    fn every_other_signal_shuts_down_under_every_policy() {
+        for policy in [
+            ResetPolicy::NoReset,
+            ResetPolicy::Reset,
+            ResetPolicy::Terminate,
+        ] {
+            for signo in [nix::libc::SIGINT, nix::libc::SIGTERM] {
+                let (message, _) = signal_action(signo, policy);
+                assert!(
+                    matches!(message, Message::Shutdown),
+                    "signal {signo} under {policy:?} must shut down"
+                );
+            }
+        }
+    }
 
     #[test]
     fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {
@@ -837,5 +1039,85 @@ mod tests {
     #[test]
     fn with_input_ctx_spawns_input_thread() {
         assert_eq!(input_startup_action(true), InputStartup::DirectSpawn);
+    }
+
+    #[test]
+    fn listen_tcp_without_auth_is_rejected_before_startup() {
+        let opts = crate::launch::parse_args(["-listen".into(), "tcp".into()]).unwrap();
+        let auth = build_auth_state(&opts);
+
+        let err = validate_tcp_startup(&opts, &auth).expect_err("-auth is mandatory for TCP");
+        assert!(err.to_string().contains("-auth"));
+    }
+
+    #[test]
+    fn listen_tcp_with_an_xdmcp_option_needs_no_auth_file() {
+        // The stage-1 contradiction: XDMCP has no cookie at startup — it
+        // arrives in the `Accept` — but TCP has to be listening already for
+        // the manager's session to connect. XDMCP is therefore an approved
+        // dynamic authorization source for this check.
+        let opts = crate::launch::parse_args([
+            "-listen".into(),
+            "tcp".into(),
+            "-query".into(),
+            "manager.example".into(),
+        ])
+        .unwrap();
+        assert!(opts.xdmcp.is_some() && opts.auth_file.is_none());
+
+        let auth = build_auth_state(&opts);
+        validate_tcp_startup(&opts, &auth)
+            .expect("an XDMCP option satisfies the -listen tcp startup check");
+
+        // And it fails closed until an `Accept` arrives: passing the startup
+        // check authorizes nobody.
+        assert!(matches!(
+            auth.check(
+                yserver_core::core_loop::auth::AuthTransport::Tcp,
+                yserver_core::core_loop::generation::Generation::default(),
+                yserver_core::xauth::MIT_MAGIC_COOKIE.as_bytes(),
+                &[0u8; 16],
+            ),
+            yserver_core::core_loop::auth::AuthVerdict::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn tcp_startup_port_validation_accepts_65535_and_rejects_overflow() {
+        let path = std::env::temp_dir().join(format!(
+            "yserver-tcp-startup-port-test-{}",
+            std::process::id()
+        ));
+        let cookie = [0x7Bu8; 16];
+        let mut record = 256u16.to_be_bytes().to_vec(); // FamilyLocal
+        for field in [
+            b"host".as_slice(),
+            b"7".as_slice(),
+            b"MIT-MAGIC-COOKIE-1".as_slice(),
+            cookie.as_slice(),
+        ] {
+            record.extend_from_slice(&(field.len() as u16).to_be_bytes());
+            record.extend_from_slice(field);
+        }
+        std::fs::write(&path, record).unwrap();
+
+        for (display, succeeds) in [(59_535, true), (59_536, false)] {
+            let opts = crate::launch::parse_args([
+                format!(":{display}"),
+                "-listen".into(),
+                "tcp".into(),
+                "-auth".into(),
+                path.display().to_string(),
+            ])
+            .unwrap();
+            let auth = build_auth_state(&opts);
+            assert_eq!(
+                validate_tcp_startup(&opts, &auth).is_ok(),
+                succeeds,
+                "display :{display}"
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
     }
 }
