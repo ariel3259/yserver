@@ -10,12 +10,32 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Three configurations because two would not catch the interesting
+          # failure (design: docs/superpowers/specs/2026-09-15-build-features-design.md#ci).
+          # Legs are named for what they BUILD, not for which one happens to
+          # be the default: both features are off by default today, so
+          # `unix-only` is reached with no flags at all. If the default set
+          # ever changes, this leg follows it — which is the point, it tests
+          # what a plain `cargo build` gives a user — and a separate
+          # `--no-default-features` leg would then have to be added back.
+          - name: unix-only
+            flags: ""
+          - name: tcp-transport
+            flags: "--features tcp-transport"
+          # The full build. `xdmcp` implies `tcp-transport`; the leg above is
+          # what proves tcp-transport does not drag xdmcp back in.
+          - name: xdmcp
+            flags: "--features xdmcp"
     steps:
       - uses: actions/checkout@v7
       - name: Install packages needed for build
         run: sudo apt-get update && sudo apt-get install -y build-essential just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base xfonts-100dpi xfonts-75dpi mesa-vulkan-drivers vulkan-tools scdoc man-db shellcheck dash
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: clippy, rustfmt
           # setup-rust-toolchain makes the LAST listed toolchain the default,
@@ -28,43 +48,72 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
+        # rustfmt is syntactic: it formats `cfg`-gated code whether or not the
+        # feature is on, so the result is identical on every leg. Run once.
+        if: matrix.name == 'unix-only'
         run: cargo +nightly fmt -- --check
       - name: Clippy
         # TODO: also enable `-W clippy::pedantic` once the existing pedantic
         # warnings are cleaned up in a follow-up pass.
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
       - name: Build
-        run: cargo build --locked
+        # Matrixed: proves every configuration produces a linked binary, not
+        # just one that type-checks. Near-free — the leg's clippy and test
+        # steps share the artefact cache.
+        run: cargo build --locked ${{ matrix.flags }}
       - name: Run tests
-        run: cargo test --all-targets --locked
+        # --all-targets is what reaches feature-gated test code (e.g. the
+        # tcp_tests module, cfg'd on `feature = "tcp-transport"`); without it
+        # this leg would build the gated code but never execute it.
+        run: cargo test --all-targets ${{ matrix.flags }} --locked
       - name: Lint the shell scripts
         # starty is installed on every supported platform, so it must work
-        # beyond bash.
+        # beyond bash. No cargo involved, so feature-independent; run once.
+        if: matrix.name == 'unix-only'
         run: |
           shellcheck -s sh starty tools/install-smoke.sh
           dash ./starty --help > /dev/null
       - name: Render man pages
+        # scdoc only — feature-independent. Kept on the same leg as the two
+        # steps below, which consume target/man.
+        if: matrix.name == 'unix-only'
         run: PREFIX=/usr just man
       - name: Check man pages render without roff warnings
         # `man --warnings` prints to stderr but still exits 0, so assert
         # stderr is empty rather than trusting the exit status.
+        if: matrix.name == 'unix-only'
         run: |
           for p in yserver starty; do
             err=$(man --warnings -l "target/man/$p.1" 2>&1 >/dev/null)
             if [ -n "$err" ]; then echo "roff warnings in $p.1:"; echo "$err"; exit 1; fi
           done
       - name: Verify the install contract
+        # tools/install-smoke.sh stages, cmp's and checks modes — it never
+        # executes yserver, so nothing in it is feature-sensitive, and it
+        # needs target/man from the step above. Note this is CI's only
+        # release-profile build and it is therefore the unix-only one:
+        # `just install-smoke` runs its own `cargo build --release`, so
+        # covering another configuration here would need a features knob on
+        # the recipe.
+        if: matrix.name == 'unix-only'
         run: just install-smoke
       - name: Verify the version-stamp override
         # Two builds in the SAME target dir with different values — what
         # catches a missing rerun-if-env-changed. A clean one-shot build
         # passes either way.
+        #
+        # On the xdmcp leg, and built with --features xdmcp, because this is
+        # the only step that RUNS a built binary: before the default set was
+        # emptied it ran on the full build, and keeping it here is what
+        # preserves that. The rerun-if-env-changed contract itself is
+        # feature-independent.
+        if: matrix.name == 'xdmcp'
         run: |
           set -eu
-          YSERVER_GIT_COMMIT=deadbeefcafe cargo build --locked --bin yserver
+          YSERVER_GIT_COMMIT=deadbeefcafe cargo build --locked --features xdmcp --bin yserver
           ./target/debug/yserver --version | grep -q deadbeefcafe \
             || { echo "override ignored:"; ./target/debug/yserver --version; exit 1; }
-          YSERVER_GIT_COMMIT=feedfacefeed cargo build --locked --bin yserver
+          YSERVER_GIT_COMMIT=feedfacefeed cargo build --locked --features xdmcp --bin yserver
           ./target/debug/yserver --version | grep -q feedfacefeed \
             || { echo "stale stamp — rerun-if-env-changed missing:"; \
                  ./target/debug/yserver --version; exit 1; }
@@ -73,6 +122,13 @@ jobs:
         # the `#[ignore = "needs live Vulkan ICD"]` render tests run on
         # it. They self-skip if no Vulkan device is present. KMS/scanout
         # tests aren't in this set (no /dev/dri on the runner).
+        #
+        # On the xdmcp leg, with --features xdmcp, for the same reason as the
+        # step above: rendering is orthogonal to TCP and XDMCP, but these are
+        # the heaviest code CI actually executes and they ran on the full
+        # build before the default set was emptied. The leg has already
+        # compiled that lib, so this costs nothing extra.
+        if: matrix.name == 'xdmcp'
         env:
           YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
-        run: cargo test -p yserver --lib --locked -- --ignored
+        run: cargo test -p yserver --lib --locked --features xdmcp -- --ignored
