@@ -40,5 +40,15 @@ yserver-protocol.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 udev.workspace = true
 
+[features]
+# Both features are OFF by default, for two different reasons: enabling a TCP
+# listener lowers the server's security posture, so it must be an affirmative
+# decision by whoever builds the binary; and XDMCP is niche, 5,291 lines that
+# most deployments never negotiate a session over. `--features xdmcp` implies
+# `tcp-transport` because XDMCP's whole purpose is the TCP connect-back.
+default = []
+tcp-transport = []
+xdmcp = ["tcp-transport", "yserver-core/xdmcp"]
+
 [lints]
 workspace = true
