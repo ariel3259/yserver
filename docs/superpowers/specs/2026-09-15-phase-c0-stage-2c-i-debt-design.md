@@ -111,6 +111,13 @@ receipt is structurally harder to underflow.
 ### 3.3. R9 versus the server reset — a tripwire, declared as one
 
 Upstream's `feat #148` (merged here at `36ba48d5`) brought server reset.
+A follow-up, `#149` (merged at `50d86524`), put the TCP listener and XDMCP
+behind off-by-default build features but left **server reset unconditional**,
+deliberately — upstream's stated reasoning is that it is the generation
+boundary, unrelated to the network, and arriving in the same PR as XDMCP is
+not a reason to couple it. So this item's premise does not depend on a feature
+flag: `force_destroy_all_clients` is compiled and reachable in a default
+build.
 `force_destroy_all_clients` frees backend resources through
 `process_disconnect` and the `host_xid_still_referenced` orphan gate:
 **it frees on a reference gate, synchronously.** Stage 2c-i's model frees on a
