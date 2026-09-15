@@ -7,7 +7,8 @@ and `docs/status.md` carries the acceptance entry. Twenty-six mutations
 across the review: nineteen caught on first contact, seven exposed gaps,
 all seven now closed. **This file's job is done** — the remaining work
 lives in 2c-ii's spec, which opens with the systematic per-guard-clause
-pass over Tasks 5–7 and carries F13b-D1, F13c-m1 and F13c-m2.** If you are resuming this work cold — a new
+pass over Tasks 5–7 and carries F13c-m1 and F13c-m2. (F13b-D1 belongs to
+**2c-iii**, not 2c-ii — corrected 2026-09-15, see the rulings section.)** If you are resuming this work cold — a new
 Claude session, a local model, or a person — this file is the only
 context you need to pick the next session; the documents it links hold
 the detail.
@@ -85,7 +86,7 @@ not the calendar: split work small enough to finish inside one window.
 | F-14 | Tests only: S2-M1 (R6 retained-member clause), S2-M2 (R9 serviced-time pause), S2-m1 (cancel vs discharge + stale disposition) | **ACCEPTED** (F14-M1, F14-M2, F14-m1 opened by the second battery) | `e69d32c9`/`919952f2` | F14-review |
 | F-15 | Tests only: F14-M1, F14-M2, F14-m1 | **ACCEPTED** (F14-M1 downgraded to an observation on review — see below) | `b611c115`/`df599934` | F15-review |
 | **Stage** | Final acceptance + `docs/status.md` | **ACCEPTED 2026-09-14** | this commit | F15-review |
-| Next | 2c-ii's spec: systematic per-guard-clause pass over Tasks 5–7 first, then F13b-D1, F13c-m1, F13c-m2 | — | — | — |
+| Next | A small **prelude stage** before 2c-ii (user's call, 2026-09-15): the systematic per-guard-clause pass over Tasks 5–7, F13c-m1, F13c-m2, and the R9-versus-server-reset posture. Then 2c-ii proper: bounded intents and admission | — | — | — |
 
 Between sessions the coordinating reviewer (Opus) runs an adversarial
 review with **mutation checks** on the decisive assertions (delete the
@@ -122,6 +123,11 @@ not accepted until that passes. Then the next session is dispatched.
 - **F13b-D1 deferred to 2c-iii** (F13b-review): the managed direct seam's
   dispatched `CommitResources` carries no present-pin leases by value;
   that is the activation half R8 excludes. 2c-iii's spec must pick it up.
+  **Correction (2026-09-15):** three later summary lines in this file and in
+  the F13c/F14/F15 reviews said F13b-D1 was carried into *2c-ii*. That was
+  wrong and contradicted this ruling. Moving lease-by-value adoption earlier
+  would build exactly the production-activation half R8 excludes, and 2c-iii
+  is where the managed direct route gets its real caller. **2c-iii.**
 - **Findings state invariants, not edits** (F13c-review, 2026-09-14): a
   finding says *what must hold* and *which mutation must break which named
   test*. It does not enumerate call sites (F8-M1's two named sites became
@@ -170,7 +176,6 @@ not accepted until that passes. Then the next session is dispatched.
   This is a deliberate, recorded trade — not a clean bill of health for
   that surface.
 - **Carried out of the round into 2c-ii's spec** (not fix-session work):
-  **F13b-D1** (dispatched `CommitResources` carries no present-pin leases),
   **F13c-m1** (`detach_managed_entries(None)` lets the production route skip
   husk accounting silently — inert only while R8 holds; when the managed
   route goes production-active the fd-family barrier can never mint again),
