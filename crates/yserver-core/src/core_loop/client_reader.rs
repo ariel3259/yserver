@@ -31,10 +31,7 @@
 
 use std::{
     io::{self, ErrorKind},
-    os::{
-        fd::{FromRawFd, RawFd},
-        unix::net::UnixStream,
-    },
+    os::fd::{FromRawFd, RawFd},
 };
 
 use crossbeam_channel::{Receiver, TryRecvError};
@@ -43,8 +40,9 @@ use log::warn;
 use yserver_protocol::x11::{self, ClientByteOrder, ClientId, SequenceNumber};
 
 use crate::{
-    core_loop::{message::Message, sender::CoreSender},
+    core_loop::{message::Message, sender::BoundSender},
     server::ReaderControl,
+    transport::Transport,
     unix_fd::FdReader,
 };
 
@@ -84,14 +82,23 @@ impl ReaderIngressWindow {
 /// Spawn the reader thread. Returns immediately; the thread runs
 /// until it observes EOF, an unrecoverable framing error, or
 /// `ReaderControl::Shutdown`.
+///
+/// `sender` must carry the generation this *connection* was accepted in
+/// — the setup thread's binding, forwarded through
+/// `Message::ClientSetupComplete`. A reader thread can still be parked
+/// in `read` when a reset retires its session, and both messages it
+/// produces (`Request`, `ClientDisconnected`) are session-scoped: tagged
+/// with the generation running at send time they would be applied to the
+/// *next* session instead of discarded.
 pub fn spawn(
     id: ClientId,
-    stream: UnixStream,
+    stream: impl Into<Transport>,
     byte_order: ClientByteOrder,
     big_requests_major: u8,
     control_rx: Receiver<ReaderControl>,
-    sender: CoreSender,
+    sender: BoundSender,
 ) -> io::Result<()> {
+    let stream = stream.into();
     std::thread::Builder::new()
         .name(format!("yserver-reader-{}", id.0))
         .spawn(move || {
@@ -111,11 +118,11 @@ pub fn spawn(
 
 fn run(
     id: ClientId,
-    stream: UnixStream,
+    stream: Transport,
     byte_order: ClientByteOrder,
     big_requests_major: u8,
     control_rx: Receiver<ReaderControl>,
-    sender: &CoreSender,
+    sender: &BoundSender,
 ) -> io::Result<()> {
     let mut reader = BlockingFdReader::new(FdReader::new(stream));
     let mut big = false;
@@ -342,6 +349,8 @@ mod tests {
     use crossbeam_channel::unbounded;
     use std::{
         io::Write,
+        net::{TcpListener, TcpStream},
+        os::unix::net::UnixStream,
         time::{Duration, Instant},
     };
 
@@ -356,7 +365,7 @@ mod tests {
         None
     }
 
-    fn write_request_no_body(s: &mut UnixStream, opcode: u8, minor: u8, length_units: u16) {
+    fn write_request_no_body(s: &mut impl Write, opcode: u8, minor: u8, length_units: u16) {
         // 4-byte header: opcode | minor | length_lo | length_hi
         let buf = [
             opcode,
@@ -367,11 +376,19 @@ mod tests {
         s.write_all(&buf).unwrap();
     }
 
-    fn write_big_request(s: &mut UnixStream, opcode: u8, minor: u8, length_units: u32) {
+    fn write_big_request(s: &mut impl Write, opcode: u8, minor: u8, length_units: u32) {
         // length_units==0 in 16-bit field, then full 32-bit length.
         let buf = [opcode, minor, 0, 0];
         s.write_all(&buf).unwrap();
         s.write_all(&length_units.to_le_bytes()).unwrap();
+    }
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let client = TcpStream::connect(address).expect("connect loopback TCP client");
+        let (server, _) = listener.accept().expect("accept loopback TCP client");
+        (server, client)
     }
 
     const BIG_MAJOR: u8 = 135;
@@ -416,7 +433,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -450,6 +467,37 @@ mod tests {
     }
 
     #[test]
+    fn reader_accepts_tcp_request_without_an_attached_fd() {
+        let (poll, sender, rx) = channel().unwrap();
+        let _ = poll;
+        let (server_side, mut client_side) = tcp_pair();
+        let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
+
+        spawn(
+            ClientId(98),
+            Transport::Tcp(server_side),
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender.bind(),
+        )
+        .unwrap();
+
+        write_request_no_body(&mut client_side, 42, 0, 1);
+        let message =
+            recv_with_timeout(&rx, Duration::from_secs(2)).expect("TCP request reaches the core");
+        assert!(matches!(
+            message,
+            Message::Request {
+                header,
+                attached_fd: None,
+                ..
+            } if header.opcode == 42
+        ));
+        ctrl_tx.send(ReaderControl::Shutdown).unwrap();
+    }
+
+    #[test]
     fn reader_admits_one_request_larger_than_the_byte_window() {
         let (poll, sender, rx) = channel().unwrap();
         let _ = poll;
@@ -461,7 +509,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -505,7 +553,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -550,7 +598,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -594,7 +642,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
         // Very first byte the client ever sends is Enable.
@@ -617,7 +665,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -645,7 +693,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
         // Enable header — reader doesn't validate; it just parks.
@@ -675,7 +723,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
         write_request_no_body(&mut client_side, BIG_MAJOR, 0, 1);
@@ -708,7 +756,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
         drop(client_side);

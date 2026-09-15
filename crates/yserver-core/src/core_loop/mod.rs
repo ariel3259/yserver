@@ -12,22 +12,30 @@ pub mod client_reader;
 pub mod composite_overlay;
 pub mod damage_fanout;
 pub mod fanout;
+pub mod generation;
+pub mod input_inventory;
 pub mod key_fanout;
 pub mod message;
 pub mod pointer_fanout;
 pub mod poll_tokens;
 pub mod process_disconnect;
 pub mod process_request;
+pub mod reset;
 pub mod run;
 pub mod sender;
 pub mod setup_thread;
+pub mod xdmcp;
 pub mod xi1_focus;
 pub mod xi1_state_notify;
 pub mod xkb_layout;
 
+pub use generation::{Generation, GenerationCounter};
+pub use input_inventory::{DeviceNode, InputInventory};
 pub use message::{
     DeviceInfo, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT,
     SYNTH_SCROLL_UP, SetupAllocateResponse,
 };
+pub use reset::ResetPolicy;
 pub use run::{handle_host_input, run_core};
-pub use sender::{CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};
+pub use sender::{BoundSender, CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};
+pub use xdmcp::{XdmcpMode, XdmcpService, XdmcpSetup};

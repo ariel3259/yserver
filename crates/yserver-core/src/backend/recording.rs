@@ -153,6 +153,17 @@ pub enum RecordedCall {
         kind: u8,
         rects: Option<usize>,
     },
+    /// `fill_rectangle(host_xid, foreground, x, y, w, h)` called —
+    /// including via the trait's default `clear_area`, which is how the
+    /// server-reset boundary repaints the root.
+    FillRectangle {
+        host_xid: u32,
+        foreground: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    },
     /// Task 4: `mark_dirty()` called. Trait default is a no-op
     /// (`trait_def.rs:583`); recorded here so ordering tests (e.g. against
     /// `MaybeComposite`) can read it straight off the shared `calls` log.
@@ -242,6 +253,18 @@ pub struct RecordingBackend {
     /// Toggled by tests that want to exercise the ynest path
     /// (kms_capable=false) — default true.
     pub dpms_capable: bool,
+    /// Virtual-screen extent returned by `fb_dimensions()`. Settable
+    /// (rather than a hardcoded constant) so a reset test can prove the
+    /// new generation's root geometry was re-derived from the backend
+    /// and not carried over from the destroyed state.
+    pub fb_size: (u16, u16),
+    /// RandR topology returned by `randr_outputs_and_modes()` /
+    /// `randr_providers()`. Same reason: a generation boundary is only
+    /// provably re-seeding if the value it comes back with is one the
+    /// test put on the backend.
+    pub randr_outputs: Vec<crate::randr::RandrOutput>,
+    pub randr_modes: Vec<crate::randr::RandrMode>,
+    pub randr_providers: Vec<crate::randr::RandrProvider>,
     /// Value returned by `glx_vendor_names()`. Defaults to the trait
     /// default (`glx::VENDOR_NAMES`, "mesa"); tests that need to prove
     /// a value actually flows through from the backend (rather than a
@@ -333,6 +356,18 @@ pub struct RecordingBackend {
     /// flip this to a (1, 4)/`syncobj: true` surface so the `IMPORT_SYNCOBJ` /
     /// `FREE_SYNCOBJ` handlers pass their `caps.syncobj` gate.
     pub(crate) dri3_caps: crate::backend::Dri3Caps,
+    /// Live host-pixmap accounting: every xid handed out by
+    /// [`Backend::create_pixmap`] that has not yet come back through
+    /// [`Backend::free_pixmap`]. The call log alone cannot answer "does the
+    /// backend still hold storage?" — a create with no matching free leaves
+    /// no trace in it — so teardown tests assert against this set.
+    pub live_pixmaps: std::collections::BTreeSet<u32>,
+    /// Live GLX pixmap-export refcounts, keyed by host xid: incremented by
+    /// `acquire_glx_pixmap_export`, decremented by
+    /// `release_glx_pixmap_export`, entry dropped at zero. Mirrors the KMS
+    /// backend's `glx_refs`, so an unreleased export is visible as a
+    /// non-empty map rather than only as a missing call.
+    pub glx_pixmap_exports: std::collections::BTreeMap<u32, u32>,
     /// `present_id`s passed to `signal_present_wake`, in call order, so
     /// vblank-pacing tests can assert the deferred wake fired.
     pub signalled_present_wakes: Vec<u64>,
@@ -470,6 +505,10 @@ impl RecordingBackend {
             redirect_activation_supported: false,
             query_pointer_mask: 0,
             dpms_capable: true,
+            fb_size: (800, 600),
+            randr_outputs: Vec::new(),
+            randr_modes: Vec::new(),
+            randr_providers: Vec::new(),
             glx_vendor_names: glx::VENDOR_NAMES,
             dpms_set_returns_err: false,
             provider_output_source_changed: true,
@@ -497,6 +536,8 @@ impl RecordingBackend {
             signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
+            live_pixmaps: std::collections::BTreeSet::new(),
+            glx_pixmap_exports: std::collections::BTreeMap::new(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
             retired_present_idle_events_to_drain: Vec::new(),
@@ -1009,6 +1050,20 @@ impl Backend for RecordingBackend {
         None
     }
 
+    fn fb_dimensions(&self) -> (u16, u16) {
+        self.fb_size
+    }
+
+    fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (Vec<crate::randr::RandrOutput>, Vec<crate::randr::RandrMode>) {
+        (self.randr_outputs.clone(), self.randr_modes.clone())
+    }
+
+    fn randr_providers(&mut self) -> Vec<crate::randr::RandrProvider> {
+        self.randr_providers.clone()
+    }
+
     fn render_opcode(&self) -> Option<u8> {
         None
     }
@@ -1494,6 +1549,7 @@ impl Backend for RecordingBackend {
         height: u16,
     ) -> io::Result<PixmapHandle> {
         let xid = self.allocate_handle();
+        self.live_pixmaps.insert(xid);
         self.record(RecordedCall::CreatePixmap {
             depth,
             width,
@@ -1503,6 +1559,7 @@ impl Backend for RecordingBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.live_pixmaps.remove(&host_xid);
         self.record(RecordedCall::FreePixmap(host_xid));
         Ok(())
     }
@@ -1820,17 +1877,29 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: fill_poly")
     }
 
+    /// Recorded rather than `unimplemented!()` because the trait's
+    /// default `clear_area` lands here, and the server-reset boundary
+    /// clears the whole root through `clear_area` — its only sandbox
+    /// proof is that this call shows up.
     fn fill_rectangle(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _x: i16,
-        _y: i16,
-        _width: u16,
-        _height: u16,
+        host_xid: u32,
+        foreground: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: fill_rectangle")
+        self.record(RecordedCall::FillRectangle {
+            host_xid,
+            foreground,
+            x,
+            y,
+            width,
+            height,
+        });
+        Ok(())
     }
 
     fn poly_text8(
@@ -2257,6 +2326,7 @@ impl Backend for RecordingBackend {
     }
 
     fn acquire_glx_pixmap_export(&mut self, host_xid: u32) {
+        *self.glx_pixmap_exports.entry(host_xid).or_insert(0) += 1;
         self.calls
             .lock()
             .unwrap()
@@ -2264,6 +2334,14 @@ impl Backend for RecordingBackend {
     }
 
     fn release_glx_pixmap_export(&mut self, host_xid: u32) {
+        if let std::collections::btree_map::Entry::Occupied(mut e) =
+            self.glx_pixmap_exports.entry(host_xid)
+        {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
         self.calls
             .lock()
             .unwrap()

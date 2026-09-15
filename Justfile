@@ -164,6 +164,30 @@ yserver-hw log="warn":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
 
+# Local TCP transport smoke. Creates a temporary FamilyInternet Xauthority
+# record for 127.0.0.1:7, starts yserver with TCP explicitly enabled, then
+# proves a real TCP client can complete setup. Requires a real KMS-capable
+# environment plus xauth, mcookie and xdpyinfo.
+yserver-tcp-hw log="warn":
+    cargo build --release --bin yserver
+    bash -c '\
+        authfile=$(mktemp /tmp/yserver-tcp-auth.XXXXXX);\
+        cookie=$(mcookie);\
+        xauth -f "$authfile" add 127.0.0.1:7 . "$cookie";\
+        cleanup() { \
+            [ -z "${yserver_pid:-}" ] || kill -TERM "$yserver_pid" 2>/dev/null;\
+            [ -z "${yserver_pid:-}" ] || wait "$yserver_pid" 2>/dev/null;\
+            rm -f "$authfile";\
+        } ;\
+        trap cleanup EXIT INT TERM;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver 7 -listen tcp -auth "$authfile" > yserver-tcp-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 1 50); do DISPLAY=127.0.0.1:7 XAUTHORITY="$authfile" xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done;\
+        DISPLAY=127.0.0.1:7 XAUTHORITY="$authfile" xdpyinfo >/dev/null || { \
+            echo "yserver-tcp-hw: TCP setup failed; see yserver-tcp-hw.log" >&2; exit 1;\
+        } ;\
+        echo "yserver-tcp-hw: TCP setup succeeded; see yserver-tcp-hw.log"'
+
 # Picks the lowest free X display by scanning /tmp/.X11-unix/, brings
 # yserver up there, then runs ~/.xinitrc (or /etc/X11/xinit/xinitrc
 # fallback) with the matching DISPLAY. When xinitrc exits, yserver is
@@ -176,6 +200,8 @@ yserver-hw log="warn":
 # SERVER's copy — used only to validate incoming clients). The same cookie
 # is also added to the user's ~/.Xauthority keyed to :$display, and the
 # session runs with XAUTHORITY pointed at ~/.Xauthority (NOT the /tmp file).
+# Xlib/xauth deliberately use that FamilyLocal cookie for a loopback TCP
+# DISPLAY such as 127.0.0.1:$display too; a separate record is not needed.
 # So, exactly like real startx: the session's own clients authenticate; a
 # second terminal in the same login connects with a bare DISPLAY=:$display
 # (no hunting for the /tmp file); the session can also reach other X
@@ -204,6 +230,87 @@ yserver-hw log="warn":
 #     produces a completely empty log — verified the hard way.
 # Deliberately prints no summary: this runs from a bare TTY, where console
 # output cannot be copied. Ask for `yserver-hw-startx.log` and grep it here.
+# Needs a display manager with XDMCP ENABLED and reachable on UDP 177 --
+# lightdm's [XDMCPServer] enabled=true works; GNOME's gdm has removed XDMCP
+# entirely (no xdmcp strings in the binary), so it cannot be the manager.
+# Deliberately no -auth: the session cookie arrives in the manager's Accept,
+# and -query implies -reset, so logging out wipes the session and re-queries
+# for a fresh greeter. Runs in the FOREGROUND on this VT; stop it with
+# `pkill -TERM yserver` from another VT. Arguments are POSITIONAL:
+#   just yserver-xdmcp-hw 192.168.1.5 info 1
+# is manager, log level, and 1 for -once (which also exercises -once).
+# yserver as an XDMCP display, driven by a display manager.
+yserver-xdmcp-hw manager="127.0.0.1" log="info" once="0":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    bash -c '\
+        case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "xdmcp-hw: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
+        display=0;\
+        while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done;\
+        once="";\
+        [ "{{once}}" = "1" ] && once="-once";\
+        echo "xdmcp-hw: display :$display, manager {{manager}}:177, TCP port $((6000+display))";\
+        echo "xdmcp-hw: no -auth by design -- the cookie comes from the Accept";\
+        [ -n "$once" ] && echo "xdmcp-hw: -once, so the server exits after one session";\
+        echo "xdmcp-hw: if nothing appears, grep the log for Willing to tell";\
+        echo "xdmcp-hw:   \"manager never answered\" from \"negotiation failed\"";\
+        echo "";\
+        log="yserver-hw-xdmcp-$(date +%Y%m%d-%H%M%S).log";\
+        echo "xdmcp-hw: logging to $log";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -query "{{manager}}" -listen tcp $once > "$log" 2>&1;\
+        rc=$?;\
+        echo "";\
+        echo "xdmcp-hw: yserver exited ($rc). Please send $log from this directory.";\
+        echo "xdmcp-hw: $(grep -ciE "willing|accept|manage" "$log") negotiation lines";\
+        n=$(grep -c "outbound cap exceeded" "$log");\
+        [ "$n" != "0" ] && echo "xdmcp-hw: !! $n clients DISCONNECTED on the outbound cap -- see the log";\
+        true'
+
+# Session 1 stamps a root property WHILE its xterm holds the display open --
+# a one-shot client like xprop is itself the last client, so on a -reset
+# server its own exit resets away whatever it just set. The server resets
+# when session 1's xterm exits; session 2 must NOT see that property and
+# must still have working input. Watch the screen at the boundary: it should clear, and the display
+# must not blink or change mode.
+# Two consecutive sessions on ONE server — proves the #121 reset boundary.
+yserver-reset-hw log="info":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    bash -c '\
+        case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "reset-hw: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
+        display=0;\
+        while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done;\
+        authfile=$(mktemp /tmp/yserver-reset-auth.XXXXXX);\
+        userauth="${XAUTHORITY:-$HOME/.Xauthority}";\
+        cookie=$(mcookie);\
+        xauth -f "$authfile" add ":$display" . "$cookie";\
+        xauth -f "$userauth" add ":$display" . "$cookie";\
+        resetlog="yserver-hw-reset-$(date +%Y%m%d-%H%M%S).log";\
+        echo "reset-hw: DISPLAY=:$display, policy -reset, logging to $resetlog";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" -reset > "$resetlog" 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
+        export XAUTHORITY="$userauth" DISPLAY=":$display";\
+        echo "reset-hw: SESSION 1 — close the xterm to end it and trigger the reset";\
+        xterm -T "session 1 - close me" > /dev/null 2>&1 &\
+        xterm_pid=$!;\
+        sleep 3;\
+        xprop -root -f YSERVER_RESET_PROBE 8s -set YSERVER_RESET_PROBE session-one;\
+        echo "reset-hw: property stamped while session 1 holds the display";\
+        wait $xterm_pid;\
+        sleep 2;\
+        if ! kill -0 $yserver_pid 2>/dev/null; then echo "FAIL: the server exited instead of resetting"; exit 1; fi;\
+        echo "reset-hw: server survived the last client — reset fired";\
+        probe=$(xprop -root YSERVER_RESET_PROBE 2>&1);\
+        case "$probe" in *"not found"*|*"no such atom"*) echo "PASS: the root property did not survive the reset";; *) echo "FAIL: session 1 state leaked into session 2: $probe";; esac;\
+        echo "reset-hw: SESSION 2 — type in the xterm to check input, then close it";\
+        xterm -T "session 2 - type here, then close" > /dev/null 2>&1;\
+        sleep 2;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        xauth -f "$userauth" remove ":$display" 2>/dev/null;\
+        rm -f "$authfile";\
+        echo "";\
+        echo "reset-hw: done. Please send $resetlog from this directory."'
+
 startx log="info":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
     bash -c '\

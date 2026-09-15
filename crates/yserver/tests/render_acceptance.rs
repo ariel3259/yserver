@@ -11989,7 +11989,7 @@ impl ProtoFixture {
         state.clients.insert(
             1,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
                 byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0,
@@ -12004,6 +12004,8 @@ impl ProtoFixture {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         Some(Self {

@@ -187,6 +187,96 @@ Raise server verbosity with `RUST_LOG=debug starty`.
 From a source checkout you can also use `just startx`, which does the same
 thing against the in-tree debug build.
 
+## Remote clients over TCP
+
+**You probably want `ssh -X` instead.** It needs nothing below: it proxies
+through a UNIX socket on the remote host, so it never touches yserver's TCP
+listener at all, and it encrypts the connection. The TCP listener exists for
+XDMCP, where a display manager hands each session its own cookie.
+
+TCP is off by default, as on a modern Xorg build. To enable it:
+
+```sh
+yserver :7 -auth /path/to/authority -listen tcp
+```
+
+The port is 6000 plus the display number, and the server binds `0.0.0.0` —
+every interface, not only loopback. `-listen tcp` refuses to start without a
+`-auth` file containing a usable MIT-MAGIC-COOKIE-1, because the alternative
+would be an unauthenticated X server on the network.
+
+**There is no host-based access control.** `xhost` is not implemented, so the
+cookie is the entire boundary and there is no way to restrict which hosts may
+connect. The wire protocol is unencrypted, keystrokes included. Read the
+SECURITY section of `yserver(1)` before exposing a display this way.
+
+For a client on another machine, the cookie has to be keyed to how that client
+names the display:
+
+```sh
+# on the server, read the cookie yserver is validating against
+xauth -f /path/to/authority list
+
+# on the client, key it to the address the client will connect to
+xauth add 192.168.1.10:7 MIT-MAGIC-COOKIE-1 <cookie>
+DISPLAY=192.168.1.10:7 xterm
+```
+
+Two traps worth knowing. `xauth add hostname:7` may store an **IPv6** entry if
+the name resolves to IPv6 first, and yserver's listener is IPv4-only, so use
+the IPv4 address literal on both sides. And a loopback connection is different
+from a remote one: xtrans rewrites `127.0.0.1` to a local entry before looking
+up the cookie, so an ordinary `:7` cookie works for `127.0.0.1:7` and tells you
+nothing about whether a genuinely remote client will authenticate.
+
+Some capabilities are unavailable to any TCP client, because they pass file
+descriptors over the socket and that has no network equivalent: DRI3, MIT-SHM,
+and Present's buffer import. As on Xorg, the extensions are still advertised
+and the requests fail — DRI3 with `BadMatch`, MIT-SHM with `BadRequest` — so
+clients fall back the same way they do against a remote Xorg. In practice that
+means no GPU acceleration for remote clients.
+
+## XDMCP: getting your session from a display manager
+
+XDMCP inverts the usual arrangement. Instead of starting a session locally,
+yserver asks a display manager — possibly on another machine — for one, and
+the manager's greeter and session clients connect *back* to your display over
+TCP. It is the thin-client model, and it is what `-listen tcp` exists for.
+
+**The manager must speak XDMCP, and many no longer do.** GNOME's `gdm` has
+removed support entirely. `lightdm` works:
+
+```ini
+# /etc/lightdm/lightdm.conf
+[XDMCPServer]
+enabled=true
+port=177
+```
+
+Then, from a TTY on the machine that will *be* the display:
+
+```sh
+yserver :7 -query <manager-host> -listen tcp
+```
+
+or `just yserver-xdmcp-hw <manager-host>`, which does the same and captures a
+log. `just` arguments are positional, so the manager comes first, then the log
+level, then `1` for `-once`.
+
+No `-auth` is needed or wanted: the manager sends a per-session cookie in its
+reply, and while XDMCP is driving, that cookie is the **only** thing that
+authorizes a TCP client — a cookie in a local file will not do, because it
+does not belong to this session. `-query` also implies `-reset`, so logging
+out erases the session and queries again for the next user.
+
+Add `-once` to exit after one session instead of looping. That covers every
+renewal path, including failing to reach the manager at all.
+
+**Before trusting it on a network**, read the XDMCP section of `yserver(1)`.
+There is no authentication of the manager and no encryption of the
+connection; XDMCP assumes a trusted network, and that assumption is doing real
+work.
+
 ## Key bindings
 
 | Keys                           | Effect                                                          |

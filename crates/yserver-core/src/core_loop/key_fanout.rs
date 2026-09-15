@@ -781,7 +781,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0,
@@ -796,6 +796,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         b
@@ -842,7 +844,7 @@ mod tests {
     ) -> UnixStream {
         let (server_side, peer) = UnixStream::pair().unwrap();
         let client = ClientState {
-            writer: Arc::new(Mutex::new(server_side)),
+            writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(server_side))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
             resource_id_base: 0,
@@ -857,6 +859,8 @@ mod tests {
             watching_writable: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
+            is_local: true,
+            fd_passing: true,
         };
         state.clients.insert(id, client);
         peer

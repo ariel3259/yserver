@@ -6,7 +6,7 @@ yserver - X11 server for Linux KMS/DRM
 
 # SYNOPSIS
 
-*yserver* [:_display_] [vt_N_] [-auth _file_] [-displayfd _fd_] [-layout _layout_] [--version]
+*yserver* [:_display_] [vt_N_] [-auth _file_] [-displayfd _fd_] [-layout _layout_] [-listen _protocol_] [-nolisten _protocol_] [-noreset|-reset|-terminate] [-query _host_|-indirect _host_|-broadcast] [-port _n_] [-from _address_] [-class _string_] [-displayID _string_] [-once] [--version]
 
 # DESCRIPTION
 
@@ -52,6 +52,88 @@ how the server is started:
 *-layout* _layout_
 	XKB layout name, e.g. *be*.
 
+*-listen* _protocol_, *-nolisten* _protocol_
+	Enable or disable a transport. Only *tcp* is understood; any other
+	value is accepted and ignored so a display manager's argv does not
+	fail. The options are ordered and the last one for a transport wins,
+	so *-listen tcp -nolisten tcp* leaves TCP disabled.
+
+	TCP is *disabled by default*, as on a modern *Xorg*(1) build. With
+	*-listen tcp* the server binds *0.0.0.0* on port 6000 plus the display
+	number — every interface, not just loopback.
+
+	*-listen tcp* requires *-auth* with a usable MIT-MAGIC-COOKIE-1 file
+	and refuses to start without one, unless an XDMCP option supplies
+	the credential instead. Read the warning under *SECURITY* before
+	using it.
+
+	*A client that cannot keep up is disconnected.* Output that cannot
+	be written is buffered per client, and a client whose backlog grows
+	past 4 MiB is dropped rather than allowed to consume memory without
+	bound. A single large reply is always buffered whole, so this is
+	about sustained backlog, not one big transfer — but a burst to a
+	slow link, such as the event storm from a screen reconfiguration,
+	can reach it. *Xorg*(1) keeps buffering instead. If clients die
+	during a display-settings change over a slow link, look for
+	*outbound cap exceeded* in the log.
+
+*-noreset*, *-reset*, *-terminate*
+	What to do when the last client that completed connection setup
+	disconnects. *-noreset* is the default and does nothing, so the server
+	outlives its clients — this is what *starty*(1) and an ordinary
+	desktop session want. *-reset* destroys the session and returns the
+	server to a freshly-started state, ready for the next one. *-terminate*
+	exits instead. Ordered and last-wins.
+
+	Note the default is the opposite of *Xorg*(1), which resets. A stray
+	reset in a desktop session is indistinguishable from a crash, and
+	nothing that launches *yserver* today expects one.
+
+	Under *-reset*, *any* client that is the last one to disconnect
+	triggers a reset — including a one-shot tool. Running *xprop*(1) or
+	*xdpyinfo*(1) against an otherwise idle *-reset* server therefore
+	destroys the session as that tool exits. This matches *Xorg*(1), and it
+	means *-reset* only makes sense when something holds the display open
+	continuously, such as a display manager's session.
+
+*-query* _host_, *-indirect* _host_, *-broadcast*
+	Run as an *XDMCP* display: ask a display manager for a session
+	instead of starting one locally. *-query* asks one manager directly,
+	*-indirect* asks it to choose, *-broadcast* asks whoever answers.
+	Ordered and last-wins, so *-query a -broadcast* ends up broadcasting.
+
+	These imply *-reset*, and *-once* then implies *-terminate*: one
+	XDMCP session is one server generation, so logging out wipes the
+	session and queries again for the next user.
+
+	They also require *-listen tcp* in practice, because the session's
+	clients run on the manager's host. No *-auth* is needed — the
+	manager supplies a per-session cookie in its reply, and that cookie
+	is the *only* thing that authorizes a TCP client while XDMCP is
+	driving. See *SECURITY*.
+
+	*-broadcast* sends to the limited broadcast address rather than
+	enumerating each interface's broadcast address as *Xorg*(1) does.
+	That is correct for a single-homed machine, which is the case this
+	was built for; on a multi-homed host it will not reach the same set
+	of managers.
+
+*-port* _n_
+	UDP port of the display manager. Default *177*.
+
+*-from* _address_
+	Source address to send XDMCP packets from.
+
+*-class* _string_, *-displayID* _string_
+	Display class and identifier reported to the manager. The class
+	defaults to *MIT-unspecified*.
+
+*-once*
+	Exit rather than renewing. This covers every renewal condition, not
+	only a clean logout: a keepalive failure, or exhausting the
+	retransmission budget against a manager that never answers, also
+	exits.
+
 *--version*, *-version*
 	Print the version and the commit it was built from, then exit.
 
@@ -66,9 +148,8 @@ parses them so startup does not fail, but they have no effect:
 *-novtswitch*
 	No-op.
 
-*-nolisten* _protocol_, *-config* _file_, *-background* _spec_
-	Parsed with their value and discarded. TCP is never listened on
-	regardless of *-nolisten*.
+*-config* _file_, *-background* _spec_
+	Parsed with their value and discarded.
 
 # KEY BINDINGS
 
@@ -99,8 +180,26 @@ parses them so startup does not fail, but they have no effect:
 *SIGUSR2* (incoming)
 	Acquire the virtual console.
 
-*SIGTERM*, *SIGINT*, *SIGHUP*
+*SIGTERM*, *SIGINT*
 	Shut down, restoring the console.
+
+*SIGHUP*
+	Depends on the reset policy, and is deliberately not uniform:
+
+[[ *policy*
+:[ *SIGHUP does*
+|  *-noreset* (default)
+:  shuts down, restoring the console
+|  *-reset*
+:  forces a reset
+|  *-terminate*
+:  forces a reset, *not* a terminate
+
+	Forcing a reset under *-terminate* follows *Xorg*(1), where a hangup
+	always resets and *-terminate* governs only what the last client
+	leaving does. The *-noreset* row is the exception: a hangup has always
+	stopped *yserver*, and making it destroy a default session instead
+	would be a surprising change to a signal people already send.
 
 The diagnostic dumps are *not* signal-driven; they are the key bindings
 above.
@@ -150,6 +249,51 @@ above.
 
 Further *YSERVER_*\* variables exist for development tracing and are
 deliberately not documented here; see the project documentation.
+
+# SECURITY
+
+With the default options *yserver* listens on a UNIX socket only, and the
+socket's filesystem permissions are the access control.
+
+*-listen tcp* changes that completely. The server binds *0.0.0.0* — every
+interface — and the *only* thing standing between the network and the display
+is the MIT-MAGIC-COOKIE-1 cookie. There is no host-based access control:
+*xhost*(1) is not implemented yet, so there is nothing to restrict which hosts
+may connect, and no way to grant or revoke access per host.
+
+Consequences worth being explicit about:
+
+- Anyone who can reach the port and obtain the cookie has the display: all
+  input, all window contents, and the ability to inject events.
+- The cookie is the whole boundary, so treat the authority file as a secret.
+  *-listen tcp* refuses to start without one precisely because the failure
+  mode of forgetting it would be an open X server on the network.
+- The X11 wire protocol is *not encrypted*. Everything, including keystrokes,
+  crosses the network in clear text.
+
+For ordinary remote use, prefer *ssh -X*, which needs none of this: it proxies
+through a local UNIX socket on the remote host and never touches the TCP
+listener. *-listen tcp* exists for XDMCP, where the display manager supplies a
+per-session cookie and the network is assumed to be trusted.
+
+# XDMCP AND TRUST
+
+XDMCP as implemented here has *no authentication of the manager*.
+XDM-AUTHENTICATION-1, the protocol's optional mutual authentication, is not
+implemented — so anything on the network that can answer your query can offer
+you a session, and everything including keystrokes crosses the network in
+clear text. This is equally true of *Xorg*(1) in the same configuration, and
+is why XDMCP deployments assume a trusted, controlled network.
+
+Two hardening choices deliberately differ from *Xorg*(1), both because its
+behaviour looks like an oversight:
+
+- An *Unwilling* reply is acted on only while actually collecting replies, and
+  under *-query* only from the manager that was asked. In *Xorg* any host may
+  end a *running* session with a single packet.
+- The retransmission budget is reset only by a packet that is valid for the
+  current state. In *Xorg* any datagram resets it, so a peer sending rubbish
+  can keep a display retrying forever and stop *-once* from ever exiting.
 
 # FILES
 
