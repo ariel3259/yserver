@@ -1,12 +1,12 @@
 # Phase C.0 stage 2c-i debt — refusal proof, husk identity, reset boundary
 
-**Status:** design, revision 2 (2026-09-16). Revision 1 (`0a96e329`,
-`8f52e131`) was reviewed by codex in round 1
-(`docs/superpowers/findings/2026-09-16-stage-2c-i-debt-design-review-round1.md`:
-3 blocking, 1 major, all verified). This revision incorporates that review and
-the author's refusal inventory and `mod.rs` census
-(`docs/superpowers/findings/2026-09-16-stage-2c-i-debt-refusal-inventory.md`).
-Implementation plan to follow.
+**Status:** design, revision 3 (2026-09-16). Codex round 1 on revision 1
+(`…-debt-design-review-round1.md`: 3 blocking, 1 major) and round 2 on
+revision 2 (`…-debt-design-review-round2.md`: 0 blocking, 3 major) — same
+instrument, so the two counts compare — were both verified against the tree
+and are incorporated here, together with the author's refusal inventory and
+`mod.rs` census (`…-debt-refusal-inventory.md`). Implementation plan to
+follow.
 
 ## 1. Why this stage exists
 
@@ -80,21 +80,24 @@ session rather than the mechanism session: session 1's own acceptance
 criterion depends on it.
 
 The oracle (section 5.1) requires knowing which test is meant to kill each
-guard. That association lives **beside each test**, as a tag in its doc
-comment naming the family and function it proves; the tool reads the tags. No
-central list exists to drift.
+guard, and a family-and-function name is not enough: `apply_teardown_release`
+holds two identity guards and `validate_gpu_batch` three (round-2 M-1). So
+each guard gets a **stable identifier** — function plus the invariant it
+enforces, never a line number — and the association lives **beside each
+test**, as a tag in its doc comment naming the identifiers it proves. The tool
+reads the tags; no central list exists to drift.
+
+A tagged test failing is still not enough, because it can fail for a reason
+unrelated to the mutated guard — an earlier guard, a fixture panic, a shared
+postcondition. The tool must also confirm a **guard-specific observable**: the
+refusal the guard exists to produce (its error variant, disposition or state)
+is the one the test asserted and the one that went missing under the
+mutation.
 
 The tool mutates source files and runs cargo. It is a developer tool, not a CI
 step, and must restore every file it touches even on failure.
 
 ### 3.1. The families
-
-**A. Owner handover entry** (`transport.rs`, 5). `issue_handover_permit`
-refuses unless the gate is `Quiescing` and no owner write grant — helper grants
-included, which is how helper permissions are modelled — is outstanding.
-`publish_owner` refuses a permit bound to another device or incarnation, and
-refuses unless `Quiescing` with no outstanding grant. This is the transition
-into Owner that R7 governs, and none of its guards was proven.
 
 **B. Transport edges** (`transport.rs`, 2). `authorize_write` refuses every
 writer class while `Closed` (its `Quiescing` arm is already proven);
@@ -134,13 +137,19 @@ live file-owned alias; such a payload must go through `adopt_with_registry`.
 **I. Teardown precondition** (`mod.rs`, 1). `apply_teardown_release` refuses an
 entry that is not frozen.
 
-That is 33 of the 35 survivors. The other two are not test work — see 4.2.
+That is 28 of the 35 survivors. The Owner handover entry's five (family A)
+move to session 2, section 4.4, because they must be proven on handover
+evidence that session 2 first has to strengthen; proving them now would
+certify a state the contract forbids. The two `gpu.rs` survivors are not test
+work — see 4.2.
 
 ## 4. Session 2 — mechanism changes
 
-This session changes production code. It is kept apart from session 1 on
-purpose: if a session-1 test exposes a real defect, there must be no mechanism
-change in the same session to fix it into quietly.
+This session changes production code, and carries the one test family that
+depends on those changes (family A, section 4.4). It is kept apart from session
+1 on purpose: if a session-1 test exposes a real defect, there must be no
+mechanism change in the same session to fix it into quietly. Family letters are
+kept stable across revisions, so session 1 runs from B to I.
 
 ### 4.1. Husk accounting bound to identity (round-1 B-2, B-3)
 
@@ -211,16 +220,68 @@ through the reset's own entry point. With a service installed and a managed
 drawable holding a pending obligation, after `force_destroy_all_clients`:
 
 - the old XID no longer resolves — identity is erased;
-- the backing entry is still rooted in the service — physical release is gated;
-- once the obligation's proof is applied, the entry is destroyed.
+- the backing entry is still rooted in the service — physical release is gated.
 
-Its mutation: make the forced teardown physically destroy a backing whose
-obligation is still pending. **Not** "drop the lease" — that is required.
+Forced destruction is only half of the reset. The boundary then replaces
+session state, and the reset design's invariant 6 is the half that matters
+here: "No old-generation object, mapping or queued operation is ever
+interpreted as belonging to a newly reused numeric id" — numeric ids are
+reused deliberately (round-2 M-2). So the test continues across it:
+
+- the next generation allocates a drawable at **the same numeric XID**;
+- the old obligation's proof, arriving late, destroys only the old
+  incarnation's entry;
+- the new drawable and its backing remain valid and resolvable.
+
+The ledger is likely protected here by construction — `AllocationKey` carries
+`device`, `incarnation` and `generation`, so proofs are not keyed by XID — and
+the exposed layer is the store's XID-to-drawable mapping across the reset.
+"Likely protected by construction" is exactly the untested claim this stage
+exists to replace with a test.
+
+Its mutations: make the forced teardown physically destroy a backing whose
+obligation is still pending; and make the late proof resolve by XID so it
+reaches the new generation. **Not** "drop the lease" — that is required.
 
 The transfer of those retained backings into a teardown supervisor is
-**stage 3**, and this test does not claim it. If the reset entry point cannot be
-driven against a managed drawable in a test without new production wiring, that
-is an F8 stop to report, not a reason to add the wiring.
+**stage 3**, and this test does not claim it. Round 2 confirmed the forced half
+is drivable without production wiring: `force_destroy_all_clients` takes the
+real `Backend` trait object, `KmsBackend::free_pixmap` reaches the store
+decrement path, and a fixture-installed managed allocation is not production
+Owner publication under R8. If the generation-replacement half cannot be driven
+the same way, that is an F8 stop to report, not a reason to add wiring.
+
+### 4.4. Handover evidence, then the Owner handover entry (round-2 M-3)
+
+`WriterCoverageProof` is an empty token whose test constructor takes no
+arguments, and the `RecipientReservation` that `issue_handover_permit` receives
+carries no identity and is never inspected. Revision 2 deferred both to stages
+3/4 on the grounds that production issuers are activation material. That is
+right for the **production** issuers, which stay absent under R8. It is wrong
+for the **test** side: the 2c-i plan's Task 6 already requires that tests
+construct the coverage proof "only after explicit mock/disabled coverage for
+every class", and the stage-2c design allows Owner publication "only when all
+writer classes are either owner-mediated or disabled and the teardown receiver
+is installed". Tests built on the empty tokens would certify a handover the
+contract forbids.
+
+So, first:
+
+- `WriterCoverageProof`'s test constructor consumes explicit evidence — mock
+  or disabled — for **every** `WriterClass`, so possessing one proves the
+  coverage;
+- `RecipientReservation` identifies a compatible recipient slot's device and
+  incarnation, and `issue_handover_permit` refuses a reservation for another
+  device or incarnation. This is a new production guard, which is why the item
+  is in this session.
+
+Then, **family A** on that evidence (`transport.rs`, 5 guards):
+`issue_handover_permit` refuses unless the gate is `Quiescing` and no owner
+write grant — helper grants included, which is how helper permissions are
+modelled — is outstanding; `publish_owner` refuses a permit bound to another
+device or incarnation, and refuses unless `Quiescing` with no outstanding
+grant. This is the transition into Owner that R7 governs, and none of its
+guards was proven.
 
 ## 5. Evidence and review
 
@@ -232,7 +293,9 @@ section 2 **and** every killing test is the one tagged for that guard — a guar
 killed only by an untagged or unrelated test does not count.
 
 **Session 2:** 4.1's token fails closed on a foreign, unknown or dropped token,
-each proven by a named test; 4.2 and 4.3 as stated in their sections.
+each proven by a named test; 4.2 and 4.3 as stated in their sections; 4.4's
+strengthened evidence proven by construction, its new reservation guard by a
+named test, and family A's five guards under the same oracle as session 1.
 
 Both criteria are measured, so they **self-report incompleteness**: an item left
 open by an honest F8 stop shows up as a survivor or a failing criterion, and no
@@ -246,22 +309,19 @@ global census re-run closes session 1.
 
 ### 5.3. Risk
 
-Families A, C, E and F were whole unproven paths, and unproven paths are where
-real defects hide. If a session-1 test cannot pass because the code is wrong,
+Families C, E and F in session 1, and family A in session 2, were whole
+unproven paths, and unproven paths are where real defects hide. If a session-1 test cannot pass because the code is wrong,
 that is an F8 stop: report it, leave the family open, and decide the fix
 separately with its own review. The session split exists so that this is a
 boundary, not a temptation.
 
 ## 6. Out of scope
 
-- **Absent mechanisms left to stages 3/4** (inventory AB-1, AB-2).
-  `WriterCoverageProof` is an empty token whose test constructor demands no
-  coverage, and the `RecipientReservation` passed to `issue_handover_permit`
-  carries no identity — unlike the router's validated `RecipientSlot`. Both are
-  real gaps. Both are activation material: the production writer-coverage proof
-  and the reservation issuer are what stages 3/4 build, and neither sits on a
-  path production takes today. Contrast 4.1, whose counter production already
-  reaches.
+- **Production issuers for the handover evidence** — stages 3/4. The
+  production writer-coverage proof and the production reservation issuer are
+  what stages 3/4 build, and R8 keeps both absent. Their **test-side**
+  strengthening is not deferred: it is section 4.4, after round 2 showed that
+  tests built on the empty tokens would certify a forbidden handover.
 - **Admission and bounded intents** — stage 2c-ii.
 - **F13b-D1**, the dispatched `CommitResources` carrying no present-pin leases
   by value — stage 2c-iii, per the F-13b review.
