@@ -10,6 +10,7 @@
 #   tools/vng-shot.sh --dump drawables       # per-drawable storage too
 #   tools/vng-shot.sh --server xorg --dump none    # the Xorg baseline
 #   tools/vng-shot.sh --outputs 2                 # dual-head guest
+#   CPUS=8 tools/vng-shot.sh                      # wider guest (default 4)
 #
 # The guest boots the host's rootfs read-write (vng --rw), so the artifact
 # directory is the same path inside and out and the handshake is plain
@@ -26,6 +27,7 @@ set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 kernel=${KERNEL:-/boot/vmlinuz-linux-zen}
+cpus=${CPUS:-4}
 name=shot
 scenario=
 log=info
@@ -202,7 +204,7 @@ qemu_opts="$qemu_opts -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_
 qemu_opts="$qemu_opts -monitor unix:$mon,server=on,wait=off"
 
 echo "vng-shot: booting guest ($name) with ${binary:-Xorg}; artifacts in $out"
-timeout "$timeout_s" vng -r "$kernel" --disable-microvm --rw \
+timeout "$timeout_s" vng -r "$kernel" --cpus "$cpus" --disable-microvm --rw \
     ${overlay+"${overlay[@]}"} ${appends+"${appends[@]}"} \
     --qemu-opts="$qemu_opts" -- "$guest" > "$out/vng.log" 2>&1 < /dev/null &
 vm=$!
