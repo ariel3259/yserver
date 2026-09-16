@@ -57,6 +57,7 @@ Found while writing this plan; the spec is amended in Task 1's commit so plan an
   ```
   `<condition>` is the guard's condition with whitespace collapsed to single spaces — for an `if` guard, the text between `if ` and ` {`; for a refusing match arm, the pattern followed by ` =>`. `#<n>` is the 1-based occurrence among identical conditions in the same function, and is omitted when the condition is unique there. The guard's assertion message must contain `[census:<MARKER>]`.
 - Mutation strategies, tried in order until one compiles: an `if` guard's condition forced to `false`; only its refusal `return` replaced by a use of the payload (for `if let` guards whose bindings the body uses); its whole body replaced the same way (when statements before the `return` move a value the function still needs). A refusing match arm becomes `=> Ok(())`. A site no strategy compiles is `A_MANO` and never counts.
+- **Precondition:** before mutating anything the tool runs the suite once unmutated and refuses unless it compiles and is fully green. The suite includes the 18 hardware tests (`--include-ignored`); where the environment has no GPU or DRM access they fail on every run, which would make every mutation — survivors included — look caught.
 - Verdicts: `SURVIVES`, `CAUGHT` (untagged site), `CAUGHT_BY_ORACLE`, `CAUGHT_NOT_BY_ORACLE` (tagged, but no failing test carried the marker), `A_MANO` (no mutation strategy compiles), `ORPHAN_TAG` (a tag names no enumerated site).
 
 - [ ] **Step 1: Write the tool**
@@ -258,6 +259,17 @@ def main():
     rels = [str((RESOURCES / f).relative_to(ROOT)) for f in args.files]
     if not args.list and subprocess.run(["git", "diff", "--quiet", "--", *rels], cwd=ROOT).returncode:
         sys.exit("REFUSING: target files have uncommitted changes; the tool restores them with git checkout.")
+    if not args.list:
+        # A mutation counts as caught when a test fails. If the unmutated suite
+        # already fails -- typically hardware tests run where there is no GPU or
+        # DRM access, e.g. inside a sandbox -- every mutation would look caught,
+        # survivors included, with no warning. Require a green baseline.
+        failed, out = run_suite()
+        if failed is None:
+            sys.exit("REFUSING: the unmutated suite does not compile.")
+        if failed:
+            sys.exit("REFUSING: the unmutated suite already fails (" + ", ".join(failed[:5]) + "); "
+                     "every mutation would look caught. Hardware tests need GPU and DRM access.")
 
     tags = load_tags()
     matched, results = set(), []
