@@ -1,6 +1,6 @@
 # Stage 2c-i debt, session 1 — refusal proof (tests only) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Implementer:** codex (model `luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have (see *Execution split*): at an [H] step, stop and hand off.
 
 **Goal:** Prove every session-1 refusal guard of the stage 2c-i resource service with a test that fails when that guard is deleted, and ship the census that measures it.
 
@@ -20,8 +20,19 @@
 - Every guard assertion's message contains `[census:<MARKER>]`, and the test carries the matching `/// census:` tag (format in Task 1).
 - Guards are identified by **file + function + condition text (+ occurrence)**, never by line number.
 - Gate before each commit: `cargo +nightly fmt`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p yserver --lib c0_2ci`.
-- Commit trailer: `Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>`. Never a Claude session URL in a commit message.
+- Commit trailer for the implementer's commits: `Implemented-By: codex (model luna, reasoning effort xhigh)`. Commits the coordinating session makes for [H] steps carry its own trailer. Never a session URL in a commit message.
 - Do not push, squash, rebase, amend, or use `git stash`.
+
+## Execution split
+
+The census runs the `c0_2ci` suite with `--include-ignored`, which includes 18 hardware tests (real DRM nodes, a real Vulkan ICD). **Codex's `workspace-write` sandbox has neither**, probed on 2026-09-16: `/dev/dri` does not exist, the `_drm` test panics and the `_vulkan` test reports `environmental skip: no live Vulkan ICD available`. The tool's green-baseline precondition therefore refuses a full census there — correctly, since otherwise every mutation would look caught.
+
+So:
+
+- **The implementer** writes the tool, the tests and the spec amendments, runs every non-hardware gate, and proves each family's oracle with `tools/guard-census.py --deterministic-only --require-oracle`. That mode runs the suite without `--include-ignored` and checks **only tagged sites**; it is valid there because every session-1 test is deterministic, and it is never valid for counting survivors.
+- **The coordinating session** (which has GPU and DRM access) runs the steps marked **[H]**: the fidelity and baseline censuses of Task 1, and the full acceptance census and hardware gate of Task 8. It commits their transcripts, then hands back.
+
+Do not work around an [H] step by dropping `--include-ignored` from a full census.
 
 ## Scope corrections to the spec (applied in Task 1)
 
@@ -29,7 +40,8 @@ Found while writing this plan; the spec is amended in Task 1's commit so plan an
 
 1. **Family B loses `consume_owner_write`.** Testing "refuses unless Owner" needs a grant issued *in* Owner, and today Owner is reached only through `issue_handover_permit` with the empty `WriterCoverageProof::new_for_tests()` / `RecipientReservation::new_for_tests()` that session 2 (spec §4.4) reshapes. Written now, the test would be rewritten there. It moves to session 2 with family A. **Session 1 is 27 guards.**
 2. **Family C wording.** Spec §3.1 says `consume` "re-arms the direct role". The two `consume` guards are in `CompletionRetired`: one returns the error when moving the old `Current` into its reserved retirement slot fails, the other when moving the new `Submitted` into `Current` fails. Nothing is re-armed.
-3. **Guard 437's observable.** `on_available` checks `transition_error` twice. Deleting the first `return` still returns the same error at the second, so "returns `Err`" does not prove it. What the first guard protects is that **rejected resources are not processed after a releasing-half error**; that is its test's assertion.
+3. **Session-1 acceptance (spec §5.1).** §5.1 requires "zero survivors over the enumerated baseline of section 2", but that baseline includes session 2's guards; it was written before the stage was split. Amended so session 1 is accepted with all 27 of its guards proven by oracle and exactly the eight session-2 survivors left.
+4. **Guard 437's observable.** `on_available` checks `transition_error` twice. Deleting the first `return` still returns the same error at the second, so "returns `Err`" does not prove it. What the first guard protects is that **rejected resources are not processed after a releasing-half error**; that is its test's assertion.
 
 ## File Structure
 
@@ -41,24 +53,25 @@ Found while writing this plan; the spec is amended in Task 1's commit so plan an
 
 ---
 
-### Task 1: The census tool and its baseline
+### Task 1: The census tool, the spec amendments, and the baseline
 
 **Files:**
 - Create: `tools/guard-census.py`
-- Create: `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-baseline.md`
 - Modify: `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md`
+- Create ([H], coordinator): `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-baseline.md`
 
 **Interfaces:**
-- Produces: `tools/guard-census.py [--files …] [--fn SUBSTR] [--list] [--legacy-enumeration] [--json PATH] [--require-oracle]`.
-- Produces the **tag format** every later task uses, one line per guard a test proves, in the test's doc comment:
+- Produces: `tools/guard-census.py [--files …] [--fn SUBSTR] [--list] [--legacy-enumeration] [--json PATH] [--require-oracle] [--deterministic-only]`.
+- Produces the **tag format** every later task uses, in the test's doc comment, directly above its `fn` (other doc lines and attributes may sit between):
   ```
   /// census: <MARKER> <file>.rs <fn> `<condition>`
   /// census: <MARKER> <file>.rs <fn> `<condition>` #<n>
   ```
-  `<condition>` is the guard's condition with whitespace collapsed to single spaces — for an `if` guard, the text between `if ` and ` {`; for a refusing match arm, the pattern followed by ` =>`. `#<n>` is the 1-based occurrence among identical conditions in the same function, and is omitted when the condition is unique there. The guard's assertion message must contain `[census:<MARKER>]`.
-- Mutation strategies, tried in order until one compiles: an `if` guard's condition forced to `false`; only its refusal `return` replaced by a use of the payload (for `if let` guards whose bindings the body uses); its whole body replaced the same way (when statements before the `return` move a value the function still needs). A refusing match arm becomes `=> Ok(())`. A site no strategy compiles is `A_MANO` and never counts.
-- **Precondition:** before mutating anything the tool runs the suite once unmutated and refuses unless it compiles and is fully green. The suite includes the 18 hardware tests (`--include-ignored`); where the environment has no GPU or DRM access they fail on every run, which would make every mutation — survivors included — look caught.
-- Verdicts: `SURVIVES`, `CAUGHT` (untagged site), `CAUGHT_BY_ORACLE`, `CAUGHT_NOT_BY_ORACLE` (tagged, but no failing test carried the marker), `A_MANO` (no mutation strategy compiles), `ORPHAN_TAG` (a tag names no enumerated site).
+  `<condition>` is the guard's condition with whitespace collapsed — for an `if` guard, the text between `if ` and ` {`; for a refusing match arm, the pattern followed by ` =>`. `#<n>` is the 1-based occurrence among identical conditions in the same function, omitted when unique there. The guard's assertion message must contain `[census:<MARKER>]`.
+- **Binding rules, enforced by the tool:** every tag is bound to the `fn` directly below it; a marker appears once; a site is tagged at most once. One site, one marker, one test.
+- **Precondition:** the tool runs the suite once unmutated and refuses unless it compiles and is green.
+- **Mutation strategies**, tried in order until one compiles: an `if` guard's condition forced to `false`; only its refusal `return` replaced by a use of the payload (for `if let` guards whose bindings the body uses); its whole body replaced the same way (when statements before the `return` move a value the function still needs). A refusing match arm becomes `=> Ok(())`. A site no strategy compiles is `A_MANO` and never counts.
+- **Verdicts:** `SURVIVES`; `CAUGHT` (untagged site); `CAUGHT_BY_ORACLE` (the site's bound test failed and its failure carries the site's marker); `CAUGHT_NOT_BY_ORACLE` (tagged, but its own test did not fail with its marker); `CAUGHT_WHOLE_BODY` (tagged and killed only under the whole-body strategy, which also deletes the statements before the refusal — **not** an oracle proof); `A_MANO`; `ORPHAN_TAG` (a tag names no enumerated site).
 
 - [ ] **Step 1: Write the tool**
 
@@ -69,17 +82,19 @@ Create `tools/guard-census.py`:
 """Guard-clause mutation census for the stage 2c-i resource service.
 
 Enumerates every refusal guard in the resource-service files, neutralises
-each one in turn, runs the c0_2ci suite with hardware tests included, and
-classifies the guard. With tags (see the plan's Task 1), a guard counts as
-proven only when a test tagged for it fails carrying its [census:MARKER].
+each one in turn, runs the c0_2ci suite, and classifies the guard. With tags
+(see the plan's Task 1), a guard counts as proven only when the test the tag
+is bound to fails, carrying the guard's own [census:MARKER].
 
 Spec: docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md,
-sections 2 and 3.0.
+sections 2, 3.0 and 5.1.
 
 This mutates source files and runs cargo. It refuses to start if the target
-files have uncommitted changes, and restores every file it touches even on
-failure or Ctrl-C. It is a developer tool, not a CI step. A full run over the
-four default files takes roughly an hour.
+files have uncommitted changes or the unmutated suite is not green, and
+restores every file it touches even on failure or Ctrl-C. It is a developer
+tool, not a CI step. A full run over the four default files takes about an
+hour and needs GPU and DRM access for the hardware tests; see
+--deterministic-only for what can run without them.
 """
 import argparse
 import json
@@ -91,7 +106,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RESOURCES = ROOT / "crates/yserver/src/kms/render/resources"
 DEFAULT_FILES = ["mod.rs", "commit.rs", "gpu.rs", "transport.rs"]
-TEST_CMD = ["cargo", "test", "-p", "yserver", "--lib", "c0_2ci", "--", "--include-ignored"]
+BASE_CMD = ["cargo", "test", "-p", "yserver", "--lib", "c0_2ci"]
 
 REFUSAL = re.compile(r"\breturn (Err\(|false\b|None\b)")
 ARM = re.compile(r"^(\s*)(.+?)\s*=>\s*Err\((.+)\),\s*$")
@@ -168,15 +183,20 @@ def mutate_if_false(lines, s):
     return lines[:s["start"]] + [" " * ind + prefix] + lines[s["end"] + 1:]
 
 
-def mutate_swallow(lines, s):
-    """Neutralise only the refusal `return`, keeping the guard's bindings used."""
-    r = s["ret"]
-    m = re.search(r"return\s+(.*);\s*$", lines[r])
+def _payload(line):
+    m = re.search(r"return\s+(.*);\s*$", line)
     if not m:
         return None
-    expr = m.group(1)
-    inner = re.fullmatch(r"Err\((.*)\)", expr)
-    payload = inner.group(1) if inner else expr
+    inner = re.fullmatch(r"Err\((.*)\)", m.group(1))
+    return inner.group(1) if inner else m.group(1)
+
+
+def mutate_swallow(lines, s):
+    """Neutralise only the refusal `return`, keeping the guard's bindings used."""
+    payload = _payload(lines[s["ret"]])
+    if payload is None:
+        return None
+    r = s["ret"]
     ind = len(lines[r]) - len(lines[r].lstrip())
     return lines[:r] + [" " * ind + f"let _ = &({payload});"] + lines[r + 1:]
 
@@ -198,17 +218,15 @@ def body_range(lines, s):
 
 def mutate_swallow_body(lines, s):
     """Replace the whole guard body with a use of the refusal payload. Needed
-    when the statements before the `return` move a value the rest of the
-    function still uses (commit.rs discharge_commit_kms_obligations' validate-all
-    guard), which is how that site was mutated by hand in the published census."""
+    when statements before the `return` move a value the function still uses
+    (commit.rs discharge_commit_kms_obligations' validate-all guard). It also
+    deletes those statements, so a kill under this strategy never counts as an
+    oracle proof: see CAUGHT_WHOLE_BODY."""
     rng = body_range(lines, s)
-    m = re.search(r"return\s+(.*);\s*$", lines[s["ret"]])
-    if rng is None or not m:
+    payload = _payload(lines[s["ret"]])
+    if rng is None or payload is None:
         return None
     first, close = rng
-    expr = m.group(1)
-    inner = re.fullmatch(r"Err\((.*)\)", expr)
-    payload = inner.group(1) if inner else expr
     ind = len(lines[s["ret"]]) - len(lines[s["ret"]].lstrip())
     return lines[:first] + [" " * ind + f"let _ = &({payload});"] + lines[close:]
 
@@ -218,8 +236,9 @@ def mutate_arm(lines, s):
     return lines[:i] + [re.sub(r"=>\s*Err\(.+\),\s*$", "=> Ok(()),", lines[i])] + lines[i + 1:]
 
 
-def run_suite():
-    p = subprocess.run(TEST_CMD, cwd=ROOT, capture_output=True, text=True, timeout=1800)
+def run_suite(deterministic_only):
+    cmd = BASE_CMD if deterministic_only else BASE_CMD + ["--", "--include-ignored"]
+    p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=1800)
     out = p.stdout + p.stderr
     if "test result:" not in out:
         return None, out  # did not compile: nothing ran
@@ -233,15 +252,37 @@ def failure_block(out, test):
 
 
 def load_tags():
-    tags = {}
+    """Bind every tag to the fn directly below it (past doc comments and
+    attributes). Returns (by_marker: marker -> (site, test_fn), by_site: site
+    -> marker). Refuses unbound tags, duplicate markers, and sites tagged twice:
+    one site, one marker, one test."""
+    by_marker, by_site = {}, {}
     for path in (ROOT / "crates/yserver/src").rglob("*.rs"):
-        for line in path.read_text().split("\n"):
+        lines = path.read_text().split("\n")
+        for i, line in enumerate(lines):
             m = TAG.match(line)
-            if m:
-                marker, fname, fn, cond, occ = m.groups()
-                key = (fname, fn, norm(cond), int(occ) if occ else None)
-                tags.setdefault(key, []).append(marker)
-    return tags
+            if not m:
+                continue
+            marker, fname, fn, cond, occ = m.groups()
+            test_fn = None
+            for j in range(i + 1, min(i + 40, len(lines))):
+                stripped = lines[j].strip()
+                fm = re.match(r"(?:pub(?:\([^)]*\))?\s+)?fn\s+(\w+)\s*\(", stripped)
+                if fm:
+                    test_fn = fm.group(1)
+                    break
+                if not (stripped.startswith("///") or stripped.startswith("#[") or not stripped):
+                    break
+            if test_fn is None:
+                sys.exit(f"REFUSING: census tag {marker} in {path} is not directly above a fn")
+            site = (fname, fn, norm(cond), int(occ) if occ else None)
+            if marker in by_marker:
+                sys.exit(f"REFUSING: duplicate census marker {marker}")
+            if site in by_site:
+                sys.exit(f"REFUSING: site {site} is tagged twice ({by_site[site]}, {marker})")
+            by_marker[marker] = (site, test_fn)
+            by_site[site] = marker
+    return by_marker, by_site
 
 
 def main():
@@ -253,74 +294,91 @@ def main():
                     help="reproduce the published census (no `} else if` guards)")
     ap.add_argument("--json", type=pathlib.Path, help="write results as JSON")
     ap.add_argument("--require-oracle", action="store_true",
-                    help="exit 1 unless every tagged site is CAUGHT_BY_ORACLE and no tag is orphaned")
+                    help="exit 1 unless every tagged site in scope is CAUGHT_BY_ORACLE and no tag is orphaned")
+    ap.add_argument("--deterministic-only", action="store_true",
+                    help="run without --include-ignored and check only tagged sites' oracles; "
+                         "requires --require-oracle. Never valid for survivor accounting.")
     args = ap.parse_args()
+    if args.deterministic_only and not args.require_oracle:
+        sys.exit("REFUSING: --deterministic-only only proves tagged oracles; pass --require-oracle.")
 
+    by_marker, by_site = load_tags()
     rels = [str((RESOURCES / f).relative_to(ROOT)) for f in args.files]
-    if not args.list and subprocess.run(["git", "diff", "--quiet", "--", *rels], cwd=ROOT).returncode:
-        sys.exit("REFUSING: target files have uncommitted changes; the tool restores them with git checkout.")
     if not args.list:
+        if subprocess.run(["git", "diff", "--quiet", "--", *rels], cwd=ROOT).returncode:
+            sys.exit("REFUSING: target files have uncommitted changes; the tool restores them with git checkout.")
         # A mutation counts as caught when a test fails. If the unmutated suite
         # already fails -- typically hardware tests run where there is no GPU or
         # DRM access, e.g. inside a sandbox -- every mutation would look caught,
         # survivors included, with no warning. Require a green baseline.
-        failed, out = run_suite()
+        failed, out = run_suite(args.deterministic_only)
         if failed is None:
             sys.exit("REFUSING: the unmutated suite does not compile.")
         if failed:
             sys.exit("REFUSING: the unmutated suite already fails (" + ", ".join(failed[:5]) + "); "
-                     "every mutation would look caught. Hardware tests need GPU and DRM access.")
+                     "every mutation would look caught. Hardware tests need GPU and DRM access; "
+                     "without them use --deterministic-only --require-oracle.")
 
-    tags = load_tags()
     matched, results = set(), []
     for fname in args.files:
         path = RESOURCES / fname
         rel = str(path.relative_to(ROOT))
         lines, found = sites(path, args.legacy_enumeration)
         for s in found:
-            key = (fname, s["fn"], s["cond"], s["occ"])
-            if key in tags:
-                matched.add(key)
+            site = (fname, s["fn"], s["cond"], s["occ"])
+            marker = by_site.get(site)
+            if marker:
+                matched.add(site)
             if args.fn_filter and args.fn_filter not in s["fn"]:
                 continue
             if args.list:
                 print(ident(fname, s))
                 continue
-            markers = tags.get(key, [])
+            if args.deterministic_only and not marker:
+                continue
+            test_fn = by_marker[marker][1] if marker else None
             strategies = ([mutate_arm] if s["kind"] == "arm"
                           else [mutate_if_false, mutate_swallow, mutate_swallow_body])
-            verdict, killers = "A_MANO", []
+            verdict, killers, used = "A_MANO", [], None
             try:
                 for strategy in strategies:
                     mutated = strategy(lines, s)
                     if mutated is None:
                         continue
                     path.write_text("\n".join(mutated))
-                    failed, out = run_suite()
+                    failed, out = run_suite(args.deterministic_only)
                     if failed is None:
                         continue
+                    used = strategy.__name__
                     if not failed:
                         verdict = "SURVIVES"
-                    elif not markers:
+                    elif not marker:
                         verdict = "CAUGHT"
-                    elif any(f"[census:{m}]" in failure_block(out, t) for t in failed for m in markers):
-                        verdict = "CAUGHT_BY_ORACLE"
                     else:
-                        verdict = "CAUGHT_NOT_BY_ORACLE"
+                        own = [t for t in failed if t.endswith("::" + test_fn)
+                               and f"[census:{marker}]" in failure_block(out, t)]
+                        if own and used == "mutate_swallow_body":
+                            verdict = "CAUGHT_WHOLE_BODY"
+                        elif own:
+                            verdict = "CAUGHT_BY_ORACLE"
+                        else:
+                            verdict = "CAUGHT_NOT_BY_ORACLE"
                     killers = failed[:3]
                     break
             finally:
                 subprocess.run(["git", "checkout", "--", rel], cwd=ROOT, check=True)
-            results.append(dict(site=ident(fname, s), verdict=verdict, markers=markers, killers=killers))
-            print(f"{verdict:<22} {ident(fname, s)}", flush=True)
+            results.append(dict(site=ident(fname, s), verdict=verdict, marker=marker,
+                                test=test_fn, strategy=used, killers=killers))
+            print(f"{verdict:<22} {ident(fname, s)}" + (f"  [{marker}]" if marker else ""), flush=True)
 
     if args.list:
         return 0
-    orphans = [k for k in tags if k[0] in args.files and k not in matched]
-    for k in orphans:
-        results.append(dict(site=f"{k[0]} {k[1]} `{k[2]}`" + (f" #{k[3]}" if k[3] else ""),
-                            verdict="ORPHAN_TAG", markers=tags[k], killers=[]))
-        print(f"{'ORPHAN_TAG':<22} {results[-1]['site']}  {tags[k]}", flush=True)
+    for site, marker in by_site.items():
+        if site[0] in args.files and site not in matched:
+            results.append(dict(site=f"{site[0]} {site[1]} `{site[2]}`" + (f" #{site[3]}" if site[3] else ""),
+                                verdict="ORPHAN_TAG", marker=marker, test=by_marker[marker][1],
+                                strategy=None, killers=[]))
+            print(f"{'ORPHAN_TAG':<22} {results[-1]['site']}  [{marker}]", flush=True)
 
     counts = {}
     for r in results:
@@ -331,9 +389,9 @@ def main():
     if args.json:
         args.json.write_text(json.dumps(results, indent=1))
     if args.require_oracle:
-        bad = [r for r in results if r["markers"] and r["verdict"] != "CAUGHT_BY_ORACLE"]
+        bad = [r for r in results if r["marker"] and r["verdict"] != "CAUGHT_BY_ORACLE"]
         if bad:
-            print(f"\nFAIL: {len(bad)} tagged site(s) not proven by their oracle")
+            print(f"\nFAIL: {len(bad)} tagged site(s) not proven by their own test's oracle")
             return 1
     return 0
 
@@ -342,55 +400,53 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-Make it executable: `chmod +x tools/guard-census.py`.
+Make it executable: `chmod +x tools/guard-census.py`. Check: `python3 -m py_compile tools/guard-census.py` succeeds and `tools/guard-census.py --legacy-enumeration --list | wc -l` prints `67`.
 
-- [ ] **Step 2: Check enumeration matches the published census**
+- [ ] **Step 2: Amend the spec**
 
-Run: `tools/guard-census.py --legacy-enumeration --list | wc -l`
-Expected: `67`.
+In `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md`:
+- §3.1 family **B**: remove the `consume_owner_write` sentence, set the count to 1, and add: "`consume_owner_write`'s non-Owner refusal moves to session 2 with family A (section 4.4): proving it requires a grant issued in Owner, reached today only through the handover tokens 4.4 reshapes."
+- §3.1 family **C**: replace "`consume` propagates a recovered transition error and re-arms the direct role" with "`consume`, on `CompletionRetired`, returns the error when moving the old `Current` into its reserved retirement slot fails, and when moving the new `Submitted` into `Current` fails".
+- §3.1 closing count: "That is 27 of the 35 survivors."
+- §4.4: add `consume_owner_write`'s non-Owner guard after family A's five.
+- §5.1 **Session 1**: replace its acceptance paragraph with: "**Session 1:** each of its 27 guards is `CAUGHT_BY_ORACLE` — killed by the test its tag is bound to, carrying its own marker, under a strategy other than whole-body replacement. A census over the legacy enumeration of section 2 (67 sites) then reports exactly eight survivors, all session-2 scope: `issue_handover_permit` (2) and `publish_owner` (3), `consume_owner_write`'s non-Owner check, and the error arms of `cancel_pre_submit_batch` and `freeze_uncertain_batch`. Guards the full enumeration finds beyond the legacy 67 are reported with their verdicts and are not accepted or rejected by session 1: their scope is a separate decision."
 
-- [ ] **Step 3: Reproduce the published census**
-
-This is the tool's acceptance test: it must reproduce what the spec's section 2 measured by hand.
-
-Run: `tools/guard-census.py --legacy-enumeration --json /tmp/census-legacy.json` (about an hour)
-Expected summary: `CAUGHT: 32`, `SURVIVES: 35`, no `A_MANO`, no `TIMEOUT`.
-
-If any site classifies differently from the spec's section 2.1 lists, **stop**: the tool is not faithful, and no later task can trust it. Report the differing sites.
-
-- [ ] **Step 4: Run the full enumeration and record what the legacy census could not see**
-
-Run: `tools/guard-census.py --list > /tmp/sites-full.txt; tools/guard-census.py --legacy-enumeration --list > /tmp/sites-legacy.txt; diff /tmp/sites-legacy.txt /tmp/sites-full.txt`
-Expected: only added lines, each a `} else if` guard.
-
-Then run the new sites only (one `--fn` per function that gained a site), and record each verdict. **New survivors are reported, not added to session 1**: scope changes are the user's call.
-
-- [ ] **Step 5: Write the baseline finding**
-
-Create `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-baseline.md` with: the tool version (the commit that adds it), the command lines, the legacy summary (must be 67/32/35), the list of `} else if` sites found and their verdicts, and the statement that session 1's target is the 27 guards of Tasks 2–7.
-
-- [ ] **Step 6: Amend the spec**
-
-In `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md` section 3.1:
-- family **B**: remove the `consume_owner_write` sentence, set the count to 1, and add: "`consume_owner_write`'s non-Owner refusal moves to session 2 with family A (section 4.4): proving it requires a grant issued in Owner, reached today only through the handover tokens 4.4 reshapes."
-- family **C**: replace "`consume` propagates a recovered transition error and re-arms the direct role" with "`consume`, on `CompletionRetired`, returns the error when moving the old `Current` into its reserved retirement slot fails, and when moving the new `Submitted` into `Current` fails".
-- the closing count: "That is 27 of the 35 survivors."
-- section 4.4: add `consume_owner_write`'s guard after family A's five.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 3: Commit, then hand off**
 
 ```bash
-git add tools/guard-census.py docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-baseline.md docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md
-git commit -m "tools: add the resource-service guard census and its baseline
+git add tools/guard-census.py docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md
+git commit -m "tools: add the resource-service guard census; amend the debt spec for session 1
 
-Reproduces the published census (67 sites, 32 caught, 35 survivors) with
---legacy-enumeration, then records the else-if guards the legacy
-enumeration could not see. Amends the debt spec: consume_owner_write
-moves to session 2, family C's wording is corrected, session 1 is 27
-guards.
+The census enumerates refusal guards, mutates each, and proves a guard
+only when the test its tag is bound to fails with the guard's own marker.
+Spec amendments: consume_owner_write moves to session 2, family C's
+description is corrected, and session 1's acceptance is stated as 27
+guards proven with exactly the eight session-2 survivors left.
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+Implemented-By: codex (model luna, reasoning effort xhigh)"
 ```
+
+**Stop here and hand off.** Steps 4–6 are [H].
+
+- [ ] **Step 4 [H]: Reproduce the published census**
+
+The tool's acceptance test: it must reproduce what the spec's section 2 measured by hand.
+
+Run: `tools/guard-census.py --legacy-enumeration --json /tmp/census-legacy.json` (about an hour)
+Expected summary: `CAUGHT: 32`, `SURVIVES: 35`, nothing else.
+
+If any site classifies differently from the spec's section 2.1 lists, **stop**: the tool is not faithful, and no later task may rely on it.
+
+- [ ] **Step 5 [H]: Record what the legacy enumeration could not see**
+
+Run: `diff <(tools/guard-census.py --legacy-enumeration --list) <(tools/guard-census.py --list)`
+Expected: only added lines, each a `} else if` guard (one, in `commit.rs` `consume`, when this plan was written).
+
+Run each new site with `--fn <its function>` and record its verdict. New survivors are reported, not added to session 1.
+
+- [ ] **Step 6 [H]: Write the baseline finding and commit**
+
+Create `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-baseline.md` with the tool commit, the command lines, the legacy summary (must be 32/35 over 67), the `} else if` sites and their verdicts, and the statement that session 1's target is the 27 guards of Tasks 2–7. Commit it with the coordinator's trailer, then hand back to the implementer for Task 2.
 
 ---
 
@@ -422,7 +478,7 @@ Create `crates/yserver/src/kms/render/resources/guard_tests.rs`:
 ```rust
 //! Stage 2c-i debt, session 1: one test per refusal guard the census found
 //! unproven. Each guard's assertion carries `[census:<MARKER>]` and the test a
-//! matching `/// census:` tag, so `tools/guard-census.py --require-oracle`
+//! matching `/// census:` tag bound to the test, so `tools/guard-census.py --require-oracle`
 //! can confirm the guard is killed by its own assertion. Spec:
 //! docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md.
 
@@ -668,8 +724,8 @@ If a test fails, a guard does not behave as the spec states: that is an **F8 sto
 Run: `tools/guard-census.py --list | grep -E " (register|freeze|cancel|validate_proof_target|record_kms_discharged|apply_teardown_release|validate_gpu_batch) "`
 Expected: every condition used in this task's tags appears verbatim. If a condition differs (spacing, `#n`), copy the listed text into the tag.
 
-Run: `tools/guard-census.py --files mod.rs --fn register --require-oracle` and the same for `freeze`, `cancel`, `validate_proof_target`, `record_kms_discharged`, `apply_teardown_release`, `validate_gpu_batch`.
-Expected: every tagged site `CAUGHT_BY_ORACLE`, no `ORPHAN_TAG`, exit 0. (`register`'s `self.exhausted` site stays `SURVIVES` until Task 4, and `validate_gpu_batch`'s read-path `frozen`/pending sites until Task 3; those are untagged here and do not fail `--require-oracle`.)
+Run: `tools/guard-census.py --files mod.rs --deterministic-only --require-oracle --fn register` and the same with `--fn freeze`, `--fn cancel`, `--fn validate_proof_target`, `--fn record_kms_discharged`, `--fn apply_teardown_release`, `--fn validate_gpu_batch`.
+Expected: every tagged site `CAUGHT_BY_ORACLE`, no `ORPHAN_TAG`, exit 0. Deterministic mode skips untagged sites, so guards later tasks cover do not appear yet.
 
 - [ ] **Step 5: Gate and commit**
 
@@ -685,9 +741,9 @@ freeze, cancel, validate_proof_target, record_kms_discharged,
 apply_teardown_release and validate_gpu_batch's three check sets. Each
 test presents both a wrong device and a wrong incarnation and asserts
 WrongIncarnation, which a deleted guard turns into Detached. Proven by
-tools/guard-census.py --require-oracle.
+tools/guard-census.py --deterministic-only --require-oracle.
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+Implemented-By: codex (model luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -804,8 +860,8 @@ Expected: `7 passed` (Task 2's three plus these four). A failure is an F8 stop.
 
 - [ ] **Step 3: Run the oracle**
 
-Run: `tools/guard-census.py --files mod.rs --fn validate_gpu_batch --require-oracle`
-Expected: all seven tagged `validate_gpu_batch` sites `CAUGHT_BY_ORACLE`; the GPU-entry `frozen` and pending sites stay `CAUGHT` (already proven, untagged); exit 0.
+Run: `tools/guard-census.py --files mod.rs --deterministic-only --require-oracle --fn validate_gpu_batch`
+Expected: all seven tagged `validate_gpu_batch` sites `CAUGHT_BY_ORACLE`, exit 0. (The GPU-entry `frozen` and pending sites are already proven and untagged; deterministic mode skips them.)
 
 - [ ] **Step 4: Gate and commit**
 
@@ -819,7 +875,7 @@ Family F of the stage 2c-i debt: a read obligation is refused when its
 source or its staging lease is frozen or holds no matching pending
 obligation. Only the GPU-entry check set had coverage.
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+Implemented-By: codex (model luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -921,7 +977,7 @@ Expected: `19 passed`. A failure is an F8 stop.
 
 - [ ] **Step 3: Run the oracle**
 
-Run: `tools/guard-census.py --files mod.rs --fn adopt --require-oracle` (matches `adopt` and `adopt_unchecked`), then `--fn reserve`, `--fn register`, `--fn apply_teardown_release`, each with `--require-oracle`.
+Run: `tools/guard-census.py --files mod.rs --deterministic-only --require-oracle --fn adopt` (matches `adopt` and `adopt_unchecked`), then the same with `--fn reserve`, `--fn register`, `--fn apply_teardown_release`.
 Expected: every tagged site `CAUGHT_BY_ORACLE`, exit 0.
 
 - [ ] **Step 4: Gate and commit**
@@ -936,7 +992,7 @@ Families G, H and I of the stage 2c-i debt: adopt, reserve and register
 refuse once exhausted; adopt refuses a payload with a live file-owned
 alias; apply_teardown_release refuses an unfrozen entry.
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+Implemented-By: codex (model luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -947,7 +1003,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - Modify: `crates/yserver/src/kms/render/resources/guard_tests.rs` (append)
 
 **Interfaces:**
-- Consumes: `spy`; `CommitResourceConsumer::{new, consume, on_available, prereserve_retirement}` and its `pub(crate)` fields `releasing_resources`, `rejected_resources`, `capacity`; `RoleReservation::new_for_test(DirectRole, u64, Rc<Cell<bool>>)`; `CommitResources::{new, with_direct_role}`; `crate::kms::owner::ledger::Submitted::{new, accepted}`; `crate::kms::owner::device::OwnerEvent::CompletionRetired` (fully qualified: `OwnerEvent` is not re-exported by `resources`).
+- Consumes: `spy`; `CommitResourceConsumer::{new, consume, on_available, prereserve_retirement}` and its `pub(crate)` fields `releasing_resources`, `rejected_resources`, `released_presents`, `capacity`; `CommitResources`' `pub(crate)` field `allocations`; `RoleReservation::new_for_test(DirectRole, u64, Rc<Cell<bool>>)`; `CommitResources::{new, with_direct_role}`; `crate::kms::owner::ledger::Submitted::{new, accepted}`; `crate::kms::owner::device::OwnerEvent::CompletionRetired` (fully qualified: `OwnerEvent` is not re-exported by `resources`).
 
 **Why:** a `RoleReservation` built with `new_for_test` is never reserved in the consumer's `DirectCapacity`, so `move_into_reserved`, `move_role` and `finish_role` reject it with `InvalidState` — the same technique as `tests.rs`'s `c0_2ci_capacity_on_available_error_restores_all_resources_safely`. Dropping an undischarged `RoleReservation` only sets its `closed` cell; it does not panic. These four sites need a swallow strategy: the `if let` bindings make `if false` uncompilable.
 
@@ -1015,6 +1071,7 @@ fn c0_2ci_guard_completion_retired_returns_failed_submitted_to_current() {
 fn c0_2ci_guard_on_available_leaves_rejected_untouched_after_releasing_error() {
     let (mut service, releasing_alloc, _drops) = spy_service();
     let rejected_alloc = spy(&mut service);
+    let rejected_key = rejected_alloc.key();
     let mut consumer = CommitResourceConsumer::new();
     consumer.releasing_resources = vec![CommitResources::new(
         vec![releasing_alloc],
@@ -1041,10 +1098,17 @@ fn c0_2ci_guard_on_available_leaves_rejected_untouched_after_releasing_error() {
         consumer.on_available(&[], &mut service),
         Err(ResourceError::InvalidState)
     );
+    // "Untouched", not just "still one": the same resource, still holding the
+    // same allocation, and nothing released on its behalf.
+    let rejected: Vec<Vec<AllocationKey>> = consumer
+        .rejected_resources
+        .iter()
+        .map(|r| r.allocations.iter().map(|a| a.key()).collect())
+        .collect();
     assert_eq!(
-        consumer.rejected_resources.len(),
-        1,
-        "rejected resources must not be processed after a releasing-half error \
+        (rejected, consumer.released_presents.len()),
+        (vec![vec![rejected_key]], 0),
+        "rejected resources must be left untouched after a releasing-half error \
          [census:C-on-available-releasing-early-return]"
     );
 }
@@ -1079,8 +1143,8 @@ Expected: `23 passed`. A failure is an F8 stop.
 
 - [ ] **Step 3: Run the oracle**
 
-Run: `tools/guard-census.py --files commit.rs --fn consume --require-oracle`, then `--fn on_available --require-oracle`.
-Expected: the four tagged sites `CAUGHT_BY_ORACLE` via the swallow strategy, exit 0. If the tool reports `A_MANO` for one, its `return` spans lines the tool cannot rewrite: stop and report the site.
+Run: `tools/guard-census.py --files commit.rs --deterministic-only --require-oracle --fn consume`, then the same with `--fn on_available`.
+Expected: the four tagged sites `CAUGHT_BY_ORACLE`, exit 0. `CAUGHT_WHOLE_BODY` for one means only the whole-body strategy compiled there, which does not prove the guard: stop and report the site, as for `A_MANO`.
 
 - [ ] **Step 4: Gate and commit**
 
@@ -1097,7 +1161,7 @@ error, and after a releasing-half error leaves rejected resources
 untouched -- the observable its first transition_error check protects,
 since the second check returns the same error.
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+Implemented-By: codex (model luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -1217,7 +1281,7 @@ Expected: `26 passed`. A failure is an F8 stop.
 
 - [ ] **Step 3: Run the oracle**
 
-Run: `tools/guard-census.py --files commit.rs --fn is_resource_releasable --require-oracle`, then `--fn register_commit_dependencies --require-oracle`.
+Run: `tools/guard-census.py --files commit.rs --deterministic-only --require-oracle --fn is_resource_releasable`, then the same with `--fn register_commit_dependencies`.
 Expected: the three tagged sites `CAUGHT_BY_ORACLE`, exit 0.
 
 - [ ] **Step 4: Gate and commit**
@@ -1234,7 +1298,7 @@ siblings of the allocation and kms_obligations branches; and
 register_commit_dependencies refuses a new set that repeats a member, as
 it already provably does for the old set.
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+Implemented-By: codex (model luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -1290,7 +1354,7 @@ Expected: `1 passed`. A failure is an F8 stop.
 
 - [ ] **Step 3: Run the oracle**
 
-Run: `tools/guard-census.py --files transport.rs --fn authorize_write --require-oracle`
+Run: `tools/guard-census.py --files transport.rs --deterministic-only --require-oracle --fn authorize_write`
 Expected: the `TransportState::Closed =>` site `CAUGHT_BY_ORACLE`, exit 0.
 
 - [ ] **Step 4: Gate and commit**
@@ -1305,57 +1369,46 @@ Family B of the stage 2c-i debt. Only the Quiescing arm of
 authorize_write had coverage. consume_owner_write's non-Owner refusal
 moves to session 2, with family A.
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+Implemented-By: codex (model luna, reasoning effort xhigh)"
 ```
 
 ---
 
-### Task 8: Session acceptance — full census, gate, record
+### Task 8: Session acceptance — full census, hardware gate, record
 
 **Files:**
-- Create: `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md`
-- Modify: `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md` (status line)
+- Create ([H], coordinator): `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md`
+- Modify ([H], coordinator): `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md` (status line)
 
-- [ ] **Step 1: Run the full census with the oracle**
+- [ ] **Step 1: Implementer's final checks, then hand off**
 
-Run: `tools/guard-census.py --legacy-enumeration --require-oracle --json /tmp/census-session-1.json` (about an hour)
-Expected:
-- all 27 tagged sites `CAUGHT_BY_ORACLE`; no `CAUGHT_NOT_BY_ORACLE`, no `ORPHAN_TAG`, no `A_MANO`;
-- `CAUGHT`: 32 (unchanged, untagged);
-- `SURVIVES`: exactly **8**, all session-2 scope — `issue_handover_permit` (2) and `publish_owner` (3) in `transport.rs`, `consume_owner_write`'s non-Owner check in `transport.rs`, and the error arms of `cancel_pre_submit_batch` and `freeze_uncertain_batch` in `gpu.rs`;
-- exit 0.
-
-Any other survivor, or any of the 27 not proven by its oracle, means the session is not complete: report it.
-
-- [ ] **Step 2: Full gate**
-
-Run each and keep the output for the finding:
+Run and keep the output for the coordinator:
 - `cargo +nightly fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo clippy -p yserver --all-targets --features tcp-transport -- -D warnings`
 - `cargo clippy -p yserver --all-targets --features xdmcp -- -D warnings`
-- `cargo test -p yserver --lib c0_2ci` and `cargo test -p yserver --lib c0_2ci -- --ignored`
-- the twelve-run flake loop: `for i in $(seq 1 12); do cargo test -p yserver --lib c0_2ci 2>&1 | grep "test result"; done`
+- `cargo test -p yserver --lib c0_2ci`
+- `for i in $(seq 1 12); do cargo test -p yserver --lib c0_2ci 2>&1 | grep "test result"; done`
 - `cargo test --workspace`
+- `tools/guard-census.py --deterministic-only --require-oracle --json /tmp/census-oracle.json` — every one of the 27 tagged sites `CAUGHT_BY_ORACLE`, exit 0.
 
-Expected: all clean; `c0_2ci` gains 27 tests with zero flakes over twelve runs.
+Expected: all clean; `c0_2ci` gains 27 tests with zero failures over twelve runs. **Stop and hand off.**
 
-- [ ] **Step 3: Record the session**
+- [ ] **Step 2 [H]: Full acceptance census**
 
-Create `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md` with: the census summary and JSON-derived table (site, verdict, killing test), the eight remaining survivors and the session-2 section each belongs to, the Task 1 `} else if` findings, any F8 stops, and the gate transcript.
+Run: `tools/guard-census.py --legacy-enumeration --require-oracle --json /tmp/census-session-1.json` (about an hour)
+Expected:
+- all 27 tagged sites `CAUGHT_BY_ORACLE`; no `CAUGHT_NOT_BY_ORACLE`, `CAUGHT_WHOLE_BODY`, `ORPHAN_TAG` or `A_MANO`;
+- `CAUGHT`: 32, the already-proven untagged sites;
+- `SURVIVES`: exactly **8** — `issue_handover_permit` (2) and `publish_owner` (3) and `consume_owner_write`'s non-Owner check in `transport.rs`, and the error arms of `cancel_pre_submit_batch` and `freeze_uncertain_batch` in `gpu.rs`;
+- exit 0.
 
-In the spec's status line, add: "Session 1 executed: 27 guards proven by oracle; see `…-census-session-1.md`."
+Any other survivor, or any of the 27 not proven by its own oracle, means session 1 is not complete.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3 [H]: Hardware gate**
 
-```bash
-git add docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md
-git commit -m "docs(findings): stage 2c-i debt session 1 -- 27 guards proven by oracle
+Run: `cargo test -p yserver --lib c0_2ci -- --ignored`. Expected: all hardware tests pass.
 
-Full census with --require-oracle: the 27 session-1 guards are each
-killed by their own tagged assertion; the eight survivors left are all
-session-2 scope (the Owner handover entry, consume_owner_write, and the
-two swallowed GPU error arms).
+- [ ] **Step 4 [H]: Record and commit**
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
-```
+Create `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md` with: the census summary and a table of site, verdict, bound test and strategy; the eight remaining survivors and the session-2 section each belongs to; the Task 1 `} else if` findings; any F8 stops; and both the implementer's and the coordinator's gate transcripts. In the spec's status line add: "Session 1 executed: 27 guards proven by oracle; see `…-census-session-1.md`." Commit with the coordinator's trailer.
