@@ -1,6 +1,6 @@
 # Stage 2c-i debt, session 1 — refusal proof (tests only) Implementation Plan
 
-> **Implementer:** codex (model `luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have (see *Execution split*): at an [H] step, stop and hand off.
+> **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have (see *Execution split*): at an [H] step, stop and hand off. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox (probed: `Read-only file system` on `~/Projects/yserver/.git`). At each "hand off for commit" step, stop with the tree dirty; the coordinating session verifies and commits with the message given.
 
 **Goal:** Prove every session-1 refusal guard of the stage 2c-i resource service with a test that fails when that guard is deleted, and ship the census that measures it.
 
@@ -20,8 +20,8 @@
 - Every guard assertion's message contains `[census:<MARKER>]`, and the test carries the matching `/// census:` tag (format in Task 1).
 - Guards are identified by **file + function + condition text (+ occurrence)**, never by line number.
 - Gate before each commit: `cargo +nightly fmt`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p yserver --lib c0_2ci`.
-- Commit trailer for the implementer's commits: `Implemented-By: codex (model luna, reasoning effort xhigh)`. Commits the coordinating session makes for [H] steps carry its own trailer. Never a session URL in a commit message.
-- Do not push, squash, rebase, amend, or use `git stash`.
+- The implementer does not run `git commit`, `git add`, `git checkout`, `git stash` or `rm -f` (the sandbox's git directory is read-only, and codex's command policy rejects `rm -f`). The coordinating session commits every task after verifying it, using the message in the task, whose trailer records provenance: `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)`. Never a session URL in a commit message.
+- Nobody pushes, squashes, rebases or amends.
 
 ## Execution split
 
@@ -91,7 +91,9 @@ sections 2, 3.0 and 5.1.
 
 This mutates source files and runs cargo. It refuses to start if the target
 files have uncommitted changes or the unmutated suite is not green, and
-restores every file it touches even on failure or Ctrl-C. It is a developer
+restores every file it touches from its original contents held in memory --
+not with git, which a sandboxed implementer may not be able to write to --
+even on failure or Ctrl-C. It is a developer
 tool, not a CI step. A full run over the four default files takes about an
 hour and needs GPU and DRM access for the hardware tests; see
 --deterministic-only for what can run without them.
@@ -322,7 +324,7 @@ def main():
     matched, results = set(), []
     for fname in args.files:
         path = RESOURCES / fname
-        rel = str(path.relative_to(ROOT))
+        original = path.read_text()
         lines, found = sites(path, args.legacy_enumeration)
         for s in found:
             site = (fname, s["fn"], s["cond"], s["occ"])
@@ -366,7 +368,7 @@ def main():
                     killers = failed[:3]
                     break
             finally:
-                subprocess.run(["git", "checkout", "--", rel], cwd=ROOT, check=True)
+                path.write_text(original)
             results.append(dict(site=ident(fname, s), verdict=verdict, marker=marker,
                                 test=test_fn, strategy=used, killers=killers))
             print(f"{verdict:<22} {ident(fname, s)}" + (f"  [{marker}]" if marker else ""), flush=True)
@@ -411,7 +413,9 @@ In `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md`:
 - §4.4: add `consume_owner_write`'s non-Owner guard after family A's five.
 - §5.1 **Session 1**: replace its acceptance paragraph with: "**Session 1:** each of its 27 guards is `CAUGHT_BY_ORACLE` — killed by the test its tag is bound to, carrying its own marker, under a strategy other than whole-body replacement. A census over the legacy enumeration of section 2 (67 sites) then reports exactly eight survivors, all session-2 scope: `issue_handover_permit` (2) and `publish_owner` (3), `consume_owner_write`'s non-Owner check, and the error arms of `cancel_pre_submit_batch` and `freeze_uncertain_batch`. Guards the full enumeration finds beyond the legacy 67 are reported with their verdicts and are not accepted or rejected by session 1: their scope is a separate decision."
 
-- [ ] **Step 3: Commit, then hand off**
+- [ ] **Step 3: Hand off for commit**
+
+The coordinator commits, after verifying, with:
 
 ```bash
 git add tools/guard-census.py docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md
@@ -423,10 +427,10 @@ Spec amendments: consume_owner_write moves to session 2, family C's
 description is corrected, and session 1's acceptance is stated as 27
 guards proven with exactly the eight session-2 survivors left.
 
-Implemented-By: codex (model luna, reasoning effort xhigh)"
+Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
 
-**Stop here and hand off.** Steps 4–6 are [H].
+**Stop here and hand off.** The coordinator commits the tool and the spec amendments with the message above, then runs Steps 4–6 ([H]).
 
 - [ ] **Step 4 [H]: Reproduce the published census**
 
@@ -727,10 +731,12 @@ Expected: every condition used in this task's tags appears verbatim. If a condit
 Run: `tools/guard-census.py --files mod.rs --deterministic-only --require-oracle --fn register` and the same with `--fn freeze`, `--fn cancel`, `--fn validate_proof_target`, `--fn record_kms_discharged`, `--fn apply_teardown_release`, `--fn validate_gpu_batch`.
 Expected: every tagged site `CAUGHT_BY_ORACLE`, no `ORPHAN_TAG`, exit 0. Deterministic mode skips untagged sites, so guards later tasks cover do not appear yet.
 
-- [ ] **Step 5: Gate and commit**
+- [ ] **Step 5: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
 Expected: fmt clean, clippy clean (remove any import clippy reports unused), `c0_2ci` all pass.
+
+The coordinator commits, after verifying, with:
 
 ```bash
 git add crates/yserver/src/kms/render/resources/mod.rs crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -743,7 +749,7 @@ test presents both a wrong device and a wrong incarnation and asserts
 WrongIncarnation, which a deleted guard turns into Detached. Proven by
 tools/guard-census.py --deterministic-only --require-oracle.
 
-Implemented-By: codex (model luna, reasoning effort xhigh)"
+Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -863,9 +869,11 @@ Expected: `7 passed` (Task 2's three plus these four). A failure is an F8 stop.
 Run: `tools/guard-census.py --files mod.rs --deterministic-only --require-oracle --fn validate_gpu_batch`
 Expected: all seven tagged `validate_gpu_batch` sites `CAUGHT_BY_ORACLE`, exit 0. (The GPU-entry `frozen` and pending sites are already proven and untagged; deterministic mode skips them.)
 
-- [ ] **Step 4: Gate and commit**
+- [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
+
+The coordinator commits, after verifying, with:
 
 ```bash
 git add crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -875,7 +883,7 @@ Family F of the stage 2c-i debt: a read obligation is refused when its
 source or its staging lease is frozen or holds no matching pending
 obligation. Only the GPU-entry check set had coverage.
 
-Implemented-By: codex (model luna, reasoning effort xhigh)"
+Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -980,9 +988,11 @@ Expected: `19 passed`. A failure is an F8 stop.
 Run: `tools/guard-census.py --files mod.rs --deterministic-only --require-oracle --fn adopt` (matches `adopt` and `adopt_unchecked`), then the same with `--fn reserve`, `--fn register`, `--fn apply_teardown_release`.
 Expected: every tagged site `CAUGHT_BY_ORACLE`, exit 0.
 
-- [ ] **Step 4: Gate and commit**
+- [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
+
+The coordinator commits, after verifying, with:
 
 ```bash
 git add crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -992,7 +1002,7 @@ Families G, H and I of the stage 2c-i debt: adopt, reserve and register
 refuse once exhausted; adopt refuses a payload with a live file-owned
 alias; apply_teardown_release refuses an unfrozen entry.
 
-Implemented-By: codex (model luna, reasoning effort xhigh)"
+Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -1146,9 +1156,11 @@ Expected: `23 passed`. A failure is an F8 stop.
 Run: `tools/guard-census.py --files commit.rs --deterministic-only --require-oracle --fn consume`, then the same with `--fn on_available`.
 Expected: the four tagged sites `CAUGHT_BY_ORACLE`, exit 0. `CAUGHT_WHOLE_BODY` for one means only the whole-body strategy compiled there, which does not prove the guard: stop and report the site, as for `A_MANO`.
 
-- [ ] **Step 4: Gate and commit**
+- [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
+
+The coordinator commits, after verifying, with:
 
 ```bash
 git add crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -1161,7 +1173,7 @@ error, and after a releasing-half error leaves rejected resources
 untouched -- the observable its first transition_error check protects,
 since the second check returns the same error.
 
-Implemented-By: codex (model luna, reasoning effort xhigh)"
+Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -1284,9 +1296,11 @@ Expected: `26 passed`. A failure is an F8 stop.
 Run: `tools/guard-census.py --files commit.rs --deterministic-only --require-oracle --fn is_resource_releasable`, then the same with `--fn register_commit_dependencies`.
 Expected: the three tagged sites `CAUGHT_BY_ORACLE`, exit 0.
 
-- [ ] **Step 4: Gate and commit**
+- [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
+
+The coordinator commits, after verifying, with:
 
 ```bash
 git add crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -1298,7 +1312,7 @@ siblings of the allocation and kms_obligations branches; and
 register_commit_dependencies refuses a new set that repeats a member, as
 it already provably does for the old set.
 
-Implemented-By: codex (model luna, reasoning effort xhigh)"
+Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
 
 ---
@@ -1357,9 +1371,11 @@ Expected: `1 passed`. A failure is an F8 stop.
 Run: `tools/guard-census.py --files transport.rs --deterministic-only --require-oracle --fn authorize_write`
 Expected: the `TransportState::Closed =>` site `CAUGHT_BY_ORACLE`, exit 0.
 
-- [ ] **Step 4: Gate and commit**
+- [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
+
+The coordinator commits, after verifying, with:
 
 ```bash
 git add crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -1369,7 +1385,7 @@ Family B of the stage 2c-i debt. Only the Quiescing arm of
 authorize_write had coverage. consume_owner_write's non-Owner refusal
 moves to session 2, with family A.
 
-Implemented-By: codex (model luna, reasoning effort xhigh)"
+Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
 
 ---
