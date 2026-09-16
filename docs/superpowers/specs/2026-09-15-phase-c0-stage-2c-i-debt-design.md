@@ -1,194 +1,292 @@
-# Phase C.0 stage 2c-i debt — guard-clause proof, husk accounting, reset posture
+# Phase C.0 stage 2c-i debt — refusal proof, husk identity, reset boundary
 
-**Status:** design, 2026-09-15. A small prelude stage between the accepted
-stage 2c-i and stage 2c-ii. Implementation plan to follow.
+**Status:** design, revision 2 (2026-09-16). Revision 1 (`0a96e329`,
+`8f52e131`) was reviewed by codex in round 1
+(`docs/superpowers/findings/2026-09-16-stage-2c-i-debt-design-review-round1.md`:
+3 blocking, 1 major, all verified). This revision incorporates that review and
+the author's refusal inventory and `mod.rs` census
+(`docs/superpowers/findings/2026-09-16-stage-2c-i-debt-refusal-inventory.md`).
+Implementation plan to follow.
 
 ## 1. Why this stage exists
 
 Stage 2c-i was accepted on 2026-09-14 (`e00e5971`) with a recorded trade, not
-a clean bill of health. Mutation sampling of Tasks 5–7 never converged: two
-batteries, seventeen mutations, seven survivors, against fourteen mutations
-across Tasks 1–4 and 8–10 that produced one survivor — and that one
-(`record_device_barrier`'s device check) turned out to be redundancy with a
-second guard rather than a coverage gap, with the property still proven
-end to end. The user's call was to close the
-known findings and accept, with a **systematic pass** to follow rather than a
-third round of sampling.
+a clean bill of health: mutation sampling of its Tasks 5–7 surface never
+converged. This stage is the deferred systematic pass. It sits between 2c-i
+and 2c-ii so that 2c-ii stays what the stage-2c design scoped it as — bounded
+intents and admission — and does not grow by absorbing debt.
 
-This stage is that pass, plus the two carried findings that belong with it. It
-is deliberately separate from 2c-ii: 2c-ii is *bounded intents and admission*
-per the stage-2c design, and mixing 2c-i debt into it would grow a plan whose
-size is the measured predictor of defect density here (14 tasks → 2 blocking,
-21 → 24, 23 → 26).
+## 2. The measurement
 
-## 2. The census — measurement, not estimate
+Every refusal guard in the resource service —
+`resources/{mod,commit,gpu,transport}.rs` — was neutralised one at a time (an
+`if` guard's condition forced to `false`, a refusing match arm turned into its
+accepting counterpart) and the full `c0_2ci` suite, hardware included, run
+against each. A site whose mutation does not compile is never counted.
 
-The pass is defined by a measurement taken on 2026-09-15 at `b96e4e9e`, not by
-a prose description of "improving coverage".
+| File | Sites | Caught | Survivors |
+| --- | --- | --- | --- |
+| `mod.rs` | 34 | 15 | 19 |
+| `transport.rs` | 18 | 11 | 7 |
+| `commit.rs` | 12 | 5 | 7 |
+| `gpu.rs` | 3 | 1 | 2 |
+| **Total** | **67** | **32** | **35** |
 
-Every guard clause in `resources/{commit,gpu,transport}.rs` was enumerated and
-neutralised one at a time — an `if` guard's condition forced to `false`, a
-refusing match arm turned into its accepting counterpart — and the full
-`c0_2ci` suite (including hardware) run against each.
+**52% of the resource-service refusal surface is unproven.**
 
-| | |
+The first census (revision 1) covered only `commit`, `gpu` and `transport`.
+`mod.rs` — the ledger core and most of the GPU batch state machine, with more
+refusal points than the other three files together — was left out because the
+file list was taken from an earlier recommendation without checking where the
+guards live. That is corrected here.
+
+### 2.1. What the measurement does not cover
+
+Stated so that "zero survivors" is never read as more than it is:
+
+- **Absent guards.** A census mutates guards that exist. A refusal the
+  contract requires and the code lacks is invisible to it; section 4 covers
+  those, found by reading the contracts.
+- **Other control-flow forms.** `?`-propagated refusals, refusals returned
+  from helpers, assertions and state-transition APIs are not enumerated.
+- **Oracle strength (revision 1).** The first census counted a mutation as
+  caught when *any* test failed, so one killed by an incidental panic was
+  indistinguishable from one killed by the intended assertion. Section 5.1
+  closes this for the work this stage adds.
+
+### 2.2. The pattern behind the survivors
+
+The same shape appeared three times in two days of review: `cancel` proven on
+one of its three paths, the `frozen` check proven on one of
+`validate_gpu_batch`'s three check sets, and the identity check proven at two
+of the ledger's twelve entry points — the two by a single test that was never
+extended to the rest. **This stage's tests proved one instance of a guard and
+left its siblings unproven**, and sampling found the siblings one at a time.
+
+So every invariant below is stated **per family**: all siblings, and each
+sibling's deletion failing a named test.
+
+## 3. Session 1 — tests only
+
+Guards are identified by **function and invariant**. Line numbers would move as
+soon as the first item lands, so none are given as identity.
+
+### 3.0. The census, as a committed tool
+
+The census becomes a tool under `tools/`, run at the start of the session to
+record a dated baseline, and at the end as the acceptance measurement. It is
+test infrastructure, not a production change, which is why it opens this
+session rather than the mechanism session: session 1's own acceptance
+criterion depends on it.
+
+The oracle (section 5.1) requires knowing which test is meant to kill each
+guard. That association lives **beside each test**, as a tag in its doc
+comment naming the family and function it proves; the tool reads the tags. No
+central list exists to drift.
+
+The tool mutates source files and runs cargo. It is a developer tool, not a CI
+step, and must restore every file it touches even on failure.
+
+### 3.1. The families
+
+**A. Owner handover entry** (`transport.rs`, 5). `issue_handover_permit`
+refuses unless the gate is `Quiescing` and no owner write grant — helper grants
+included, which is how helper permissions are modelled — is outstanding.
+`publish_owner` refuses a permit bound to another device or incarnation, and
+refuses unless `Quiescing` with no outstanding grant. This is the transition
+into Owner that R7 governs, and none of its guards was proven.
+
+**B. Transport edges** (`transport.rs`, 2). `authorize_write` refuses every
+writer class while `Closed` (its `Quiescing` arm is already proven);
+`consume_owner_write` refuses unless the gate is `Owner`.
+
+**C. Consumer error propagation** (`commit.rs`, 4). `consume` propagates a
+recovered transition error and re-arms the direct role; `on_available` returns
+its transition error, in both its releasing and its rejected halves, rather
+than `Ok` with admission already closed. A failure reported as success is the
+class R9 exists to prevent.
+
+**D. Releasability and uniqueness** (`commit.rs`, 3). `is_resource_releasable`
+refuses while the `source` or the `fallback` present-pin allocation is not
+releasable — the siblings of the allocation and `kms_obligations` branches
+already proven. `register_commit_dependencies` refuses duplicate members in the
+**new** set, as it already provably does for the old set.
+
+**E. Cross-incarnation isolation** (`mod.rs`, 10). Every ledger entry point
+that accepts an `AllocationKey` or a proof refuses one from another device or
+incarnation: `register`, `freeze`, `cancel`, `validate_proof_target`,
+`record_kms_discharged`, `apply_teardown_release` (its key check and its proof
+incarnation check), and `validate_gpu_batch` in all three of its check sets.
+Only `reserve` and `apply_validated_proof` are proven today. R9's "stale
+evidence cannot release a newer allocation" rests on this family.
+
+**F. Read-obligation validation** (`mod.rs`, 4). `validate_gpu_batch` refuses a
+read obligation whose source entry, or whose staging entry, is frozen or holds
+no matching pending obligation. Together with family E's two read-path identity
+checks, this is the whole read-obligation path, of which no guard was proven.
+
+**G. Exhaustion** (`mod.rs`, 3). `adopt_unchecked`, `reserve` and `register`
+each refuse once the service is exhausted.
+
+**H. File-owned adoption** (`mod.rs`, 1). `adopt` refuses a payload carrying a
+live file-owned alias; such a payload must go through `adopt_with_registry`.
+
+**I. Teardown precondition** (`mod.rs`, 1). `apply_teardown_release` refuses an
+entry that is not frozen.
+
+That is 33 of the 35 survivors. The other two are not test work — see 4.2.
+
+## 4. Session 2 — mechanism changes
+
+This session changes production code. It is kept apart from session 1 on
+purpose: if a session-1 test exposes a real defect, there must be no mechanism
+change in the same session to fix it into quietly.
+
+### 4.1. Husk accounting bound to identity (round-1 B-2, B-3)
+
+Today `register_pool_husk` is `+= 1` and `unregister_pool_husk` is
+`saturating_sub(1)` on an unkeyed scalar, and
+`detach_managed_entries(Option<&mut DrmCleanupRegistry>)` can be called with
+`None` — which the production route `drain_scanout_pool_at`, reached from
+suspend, already does. Three defects follow: accounting can be skipped; a
+spurious unregister consumes another husk's count, so the registry can certify
+zero aliases while a husk is live; and nothing correlates an unregister with
+the registry that holds the registration.
+
+Revision 1 proposed a `#[must_use]` receipt and a `debug_assert!`. Both are
+withdrawn. `#[must_use]` rejects a bare expression statement but accepts
+`let _ =` and `drop(...)` — verified by compiling it — so it does not make
+accounting compulsory. A pre-decrement `debug_assert!(count > 0)` passes on a
+spurious unregister while any other husk is live, and release builds drop it.
+
+The required shape: **registering a husk yields a registration token bound to
+its device and incarnation; unregistering consumes that token by value; the
+registry validates it against its own identity.** An unknown or foreign token
+fails closed — the registry refuses to mint `FileFamilyClosed` — rather than
+saturating. A token dropped without being consumed also fails closed. This
+follows the house precedent of the lost-role-token rule, where a
+`RoleReservation` dropped undischarged closes admission.
+
+### 4.2. Swallowed GPU errors, and the transport close they owe (inventory AB-3)
+
+The two `gpu.rs` census survivors — the error arms of `cancel_pre_submit_batch`
+and `freeze_uncertain_batch` — cannot be proven by a test, because their only
+production callers, in the managed scanout write path of `scene.rs`, discard
+both results with `let _ =`. A test of either function alone would pass while
+the real path still ignores the failure. **The defect is the swallowed error.**
+
+Fixing it requires deciding what the caller does with the error, and the 2c-i
+design's section 4 already says: "Unknown submission retains its reservation
+**and closes the affected transport** until its specified recovery proof
+arrives." The retention half exists; the close half exists nowhere. So this
+item propagates the failure and closes the gate when one is installed. That is
+inert in production under R8, where no gate is installed.
+
+Acceptance: deleting the propagation, or the close, fails a named test that
+drives the real `scene.rs` path.
+
+### 4.3. The reset boundary (round-1 B-1)
+
+Upstream's server reset (`#148`, merged at `36ba48d5`; left unconditional by
+`#149`, merged at `50d86524`) frees backend objects through
+`force_destroy_all_clients` → `process_disconnect` → `backend.free_pixmap` →
+`store.decref` → `destroy_now` → `Storage::destroy`.
+
+Revision 1 framed this as a contradiction between the reset's promise that
+nothing client-created survives and proof-gated release, left "which wins"
+open, and proposed a tripwire that would fail if forced teardown dropped a
+managed lease. **That was wrong.** The 2c-i design already separates two
+levels: "Cache removal, drawable destruction and pool replacement detach
+logical owners; they cannot destroy backing allocations retained by a live or
+quarantined lease", and stage 3 transfers those retained owners into its
+teardown supervision. The reset's erasure is of protocol-visible state —
+resources, atoms, selections, grabs, properties — and a reset "never touches
+KMS, Vulkan". A proof-bearing backing that outlives its XID does not survive
+in any sense the reset promises against. And the proposed tripwire would have
+fired on correct code: `Storage::destroy`'s `Managed` arm drops that very
+`Retain` lease today, by design.
+
+The item is therefore a real test of the contract 2c-i already owns, driven
+through the reset's own entry point. With a service installed and a managed
+drawable holding a pending obligation, after `force_destroy_all_clients`:
+
+- the old XID no longer resolves — identity is erased;
+- the backing entry is still rooted in the service — physical release is gated;
+- once the obligation's proof is applied, the entry is destroyed.
+
+Its mutation: make the forced teardown physically destroy a backing whose
+obligation is still pending. **Not** "drop the lease" — that is required.
+
+The transfer of those retained backings into a teardown supervisor is
+**stage 3**, and this test does not claim it. If the reset entry point cannot be
+driven against a managed drawable in a test without new production wiring, that
+is an F8 stop to report, not a reason to add the wiring.
+
+## 5. Evidence and review
+
+### 5.1. Acceptance
+
+**Session 1:** each family's invariant holds with every sibling proven. The
+census tool, re-run, reports zero survivors over the enumerated baseline of
+section 2 **and** every killing test is the one tagged for that guard — a guard
+killed only by an untagged or unrelated test does not count.
+
+**Session 2:** 4.1's token fails closed on a foreign, unknown or dropped token,
+each proven by a named test; 4.2 and 4.3 as stated in their sections.
+
+Both criteria are measured, so they **self-report incompleteness**: an item left
+open by an honest F8 stop shows up as a survivor or a failing criterion, and no
+one has to rely on the report confessing it.
+
+### 5.2. Review
+
+Per item: the reviewer re-runs the named mutation, addressed by line number at
+review time and confirmed to have compiled. Per family, as families land. The
+global census re-run closes session 1.
+
+### 5.3. Risk
+
+Families A, C, E and F were whole unproven paths, and unproven paths are where
+real defects hide. If a session-1 test cannot pass because the code is wrong,
+that is an F8 stop: report it, leave the family open, and decide the fix
+separately with its own review. The session split exists so that this is a
+boundary, not a temptation.
+
+## 6. Out of scope
+
+- **Absent mechanisms left to stages 3/4** (inventory AB-1, AB-2).
+  `WriterCoverageProof` is an empty token whose test constructor demands no
+  coverage, and the `RecipientReservation` passed to `issue_handover_permit`
+  carries no identity — unlike the router's validated `RecipientSlot`. Both are
+  real gaps. Both are activation material: the production writer-coverage proof
+  and the reservation issuer are what stages 3/4 build, and neither sits on a
+  path production takes today. Contrast 4.1, whose counter production already
+  reaches.
+- **Admission and bounded intents** — stage 2c-ii.
+- **F13b-D1**, the dispatched `CommitResources` carrying no present-pin leases
+  by value — stage 2c-iii, per the F-13b review.
+- **Any production activation** — stages 3/4. Per the stage-2c design's
+  section 6, neither 2c-ii nor 2c-iii leaves the production route anything but
+  `Legacy` with readiness closed.
+
+## 7. Contract sources
+
+The Owner handover contract is **not** in the 2c-i design used as round 1's
+authority, which never mentions `publish_owner`, `HandoverPermit`, `Quiescing`
+or `LegacyDrained`. It lives in the 2c-i plan's Task 6 and the stage-2c
+design's section 6. By domain:
+
+| Domain | Sources |
 | --- | --- |
-| Guard sites | 33 |
-| **Caught** — deleting the guard fails at least one test | **17** |
-| **Survivors** — deleting the guard leaves the suite green | **16** |
+| Transport gate, Owner handover | 2c-i plan Task 6; stage-2c design §6; R7, R11 |
+| GPU batches, availability, completion routing | 2c-i design §4; R9 |
+| Commit consumer, KMS release | 2c-i design §4–§5; R6 |
+| Reset boundary | 2c-i design §3–§4 (logical vs. retained owners); server-reset design |
 
-Six of the 33 could not be neutralised generically (`if let` guards whose body
-binds the matched value) and were mutated by hand; two of those were caught,
-four survived. A site that does not compile is never counted as a result.
+## 8. Gate
 
-**48% of the guard surface in these three files is unproven.** That is the
-fact this stage exists to change, and it confirms that the earlier
-non-convergence was a property of the surface rather than of the sampling.
-
-### 2.1. The survivors, by mechanism
-
-Guards are identified by **function and invariant**. Line numbers are given as
-a dated convenience at `b96e4e9e` and are **not authoritative** — they move as
-soon as the first item lands.
-
-**A. Owner handover entry — five survivors, the whole path.**
-`TransportGate::issue_handover_permit` (both guards) and
-`TransportGate::publish_owner` (all three). This pair *is* the transition into
-Owner that R7 governs, and not one of its guards has decisive coverage:
-quiescing state, outstanding owner writes, and the permit's device/incarnation
-binding can each be deleted with the suite staying green. An entire unproven
-path is where defects hide, which is why this group is called out first.
-
-**B. Error propagation — six survivors across two files.**
-`CommitResourceConsumer::consume` swallowing a recovered transition error
-(~263) and failing to re-arm the direct role (~285); `on_available` swallowing
-its transition error in both halves (~437 releasing, ~490 rejected);
-`gpu.rs`'s `cancel_pre_submit_batch` (~383) and `freeze_uncertain_batch` (~406)
-error arms. `on_available` can swallow a transition error and return `Ok` with
-admission already closed, and nothing notices — a failure reported as success,
-which is the class R9 exists to prevent.
-
-**C. Releasability and uniqueness — three survivors.**
-`is_resource_releasable`'s `source` and `fallback` branches (~510, ~515) — the
-`allocations` branch is covered and F14-M1 closed the `kms_obligations` one, so
-these are the two siblings left; and `register_commit_dependencies`'s
-`validate_unique` over the **new** members (~593), where the same check over
-the old members is covered.
-
-**D. Transport edges — two survivors.**
-`authorize_write`'s `Closed` arm (~356), where the `Quiescing` arm is covered;
-and `consume_owner_write`'s non-Owner state check (~402).
-
-## 3. The three items that are not census survivors
-
-### 3.1. F13c-m1 — husk accounting must not be skippable
-
-`OutputScanout::detach_managed_entries(Option<&mut DrmCleanupRegistry>)` can be
-called with `None`, dropping managed leases with no accounting, and the
-production route (`drain_scanout_pool_at`, reached from suspend) already takes
-that arm. It is inert only while R8 holds; once managed entries can exist in
-production, the fd-family barrier's inventory stops following the husk and the
-barrier can never mint again.
-
-Making the registry mandatory is rejected: `PlatformBackend` has none in scope,
-and plumbing one in is activation work R8 excludes. Instead the function
-**returns what it released**, as a `#[must_use]` receipt discharged either by
-handing it to a registry or by explicitly asserting it was empty. This matches
-the vocabulary already in use — `FileFamilyClosed` sealed with `_private: ()`,
-`DeviceBarrier` taking its proof by value.
-
-**Its acceptance criterion is compile-time, not test-time:** with clippy at
-`-D warnings`, ignoring the receipt fails the build. That is stronger than any
-mutation, and it is the only item in this stage with that property.
-
-### 3.2. F13c-m2 — silent underflow
-
-`unregister_pool_husk`'s `saturating_sub(1)` absorbs an unregister with nothing
-registered. A `debug_assert!` before the subtraction, and a test that trips it.
-This item may shrink on its own once 3.1 lands: a count that travels as a
-receipt is structurally harder to underflow.
-
-### 3.3. R9 versus the server reset — a tripwire, declared as one
-
-Upstream's `feat #148` (merged here at `36ba48d5`) brought server reset.
-A follow-up, `#149` (merged at `50d86524`), put the TCP listener and XDMCP
-behind off-by-default build features but left **server reset unconditional**,
-deliberately — upstream's stated reasoning is that it is the generation
-boundary, unrelated to the network, and arriving in the same PR as XDMCP is
-not a reason to couple it. So this item's premise does not depend on a feature
-flag: `force_destroy_all_clients` is compiled and reachable in a default
-build.
-`force_destroy_all_clients` frees backend resources through
-`process_disconnect` and the `host_xid_still_referenced` orphan gate:
-**it frees on a reference gate, synchronously.** Stage 2c-i's model frees on a
-correlated proof (R9) and retains failed or timed-out tickets for teardown.
-
-The concrete path is `force_destroy_all_clients` → `process_disconnect` →
-`backend.free_pixmap` → `store.decref` → `destroy_now` → `Storage::destroy`,
-whose `Managed` arm drops the lease and lets the service decide destruction on
-its own terms via `can_destroy`. Today that arm is unreachable in production —
-R8 keeps `resource_service: None`, so nothing is ever `Managed` there and the
-chain always takes the `Legacy` arm.
-
-**The tension runs the opposite way from the obvious reading.** Our model does
-not drop resources undischarged under a reset; it *gates* them. An entry with
-an outstanding `KmsRelease` survives until its proof lands — and the reset
-design states that nothing client-created survives, by design, because a reset
-erases the session. So proof-gating and erasure contradict each other, and the
-open question is which wins. That question belongs to whichever stage first
-makes managed entries reachable in production, which per the stage-2c design's
-section 6 is **stages 3/4** — not 2c-ii and not 2c-iii, both of which keep the
-production route `Legacy` with readiness closed.
-
-Because there is no mechanism yet, this item cannot have a
-delete-the-mechanism mutation, and pretending otherwise would be the vacuous
-test this project keeps punishing. It is a **tripwire**: a test that constructs
-a backend with an installed service holding an entry with a pending
-obligation, drives the reset's forced teardown against it, and asserts the
-entry's fate. It passes trivially today. Its job is to fail on the day someone
-wires the reset to the ledger, and force the question to be answered then.
-
-**Its acceptance criterion is a mutation toward the future:** add the wiring
-that does not yet exist — make the forced teardown drop a managed lease — and
-the test must fail. A tripwire that does not fail under that is observing
-nothing and must not be kept.
-
-## 4. Evidence and review
-
-The stage delivers: the census as a committed tool under `tools/` with its
-dated baseline run; decisive coverage for all sixteen survivors, each
-recording the mutation that must fail a named test — how many tests that
-takes, and where they live, is the implementer's call, and one test may
-cover more than one guard; the F13c-m1 receipt; the F13c-m2 assertion and its
-test; and the R9 tripwire with its future-mutation criterion written beside it.
-
-Review is per item — the named mutation re-run by the reviewer, addressed **by
-line number and confirmed to have compiled** — and per group as groups land,
-rather than once at the end. The global criterion is the census re-run at
-**zero survivors** in the three files, with the six hand-mutated sites named
-explicitly as outside the tool's reach.
-
-That global criterion has a property worth stating: **it self-reports
-incompleteness.** If an item cannot be closed honestly and the session takes an
-F8 stop, no one needs to trust the report — the census shows the survivor and
-the stage does not reach zero.
-
-**Risk, stated because it can break this stage's frame.** This is declared a
-tests-only stage apart from 3.1 and 3.2. That is a hypothesis, not a fact:
-groups A and B are entire unproven paths, and unproven paths are where real
-defects live. If a test cannot be made to pass because the code is wrong, that
-is an F8 stop — report it, leave the item open, and decide the mechanism fix
-separately with its own review. It is not fixed quietly inside a test session.
-The pressure to make a test go green by touching the mechanism is the original
-failure of this whole round.
-
-**Out of scope:** admission and bounded intents (2c-ii); F13b-D1, the
-dispatched `CommitResources` carrying no present-pin leases by value (2c-iii,
-per the F-13b review — three later summary lines said 2c-ii and were wrong);
-and any activation whatsoever.
-
-**Gate:** `cargo +nightly fmt`; `cargo clippy --all-targets -- -D warnings`;
-`cargo test -p yserver --lib c0_2ci` plus its hardware run; the twelve-run
-flake loop; the full workspace suite, which now matters because XDMCP, TCP
-transport and server reset are on the branch; and the gnu/musl/freebsd target
-checks, because 3.1 touches `drm_cleanup.rs`.
+`cargo +nightly fmt`; `cargo clippy --all-targets -- -D warnings`, in the
+default build and with `--features tcp-transport` and `--features xdmcp`;
+`cargo test -p yserver --lib c0_2ci` with its hardware run; the twelve-run flake
+loop; the full workspace suite; and the gnu, musl and freebsd target checks,
+since 4.1 touches `drm_cleanup.rs`.
