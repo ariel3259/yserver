@@ -5,8 +5,10 @@
 revision 2 (`…-debt-design-review-round2.md`: 0 blocking, 3 major) — same
 instrument, so the two counts compare — were both verified against the tree
 and are incorporated here, together with the author's refusal inventory and
-`mod.rs` census (`…-debt-refusal-inventory.md`). Implementation plan to
-follow.
+`mod.rs` census (`…-debt-refusal-inventory.md`). Revision 3 also adds a third
+part, section 9: a partial run of the flip-accepted path with DRM master, which
+this box can only exercise from an active VT such as tty2. Implementation plan
+to follow.
 
 ## 1. Why this stage exists
 
@@ -292,6 +294,9 @@ census tool, re-run, reports zero survivors over the enumerated baseline of
 section 2 **and** every killing test is the one tagged for that guard — a guard
 killed only by an untagged or unrelated test does not count.
 
+**Part 3:** as stated in section 9 — run by the user on an active VT with DRM
+master, mutations included, output reviewed before acceptance.
+
 **Session 2:** 4.1's token fails closed on a foreign, unknown or dropped token,
 each proven by a named test; 4.2 and 4.3 as stated in their sections; 4.4's
 strengthened evidence proven by construction, its new reservation guard by a
@@ -325,6 +330,10 @@ boundary, not a temptation.
 - **Admission and bounded intents** — stage 2c-ii.
 - **F13b-D1**, the dispatched `CommitResources` carrying no present-pin leases
   by value — stage 2c-iii, per the F-13b review.
+- **The bounded delivery check** of the C.0 design's section 16.3 revision 3 —
+  stages 3/4. It exercises real transitions through owner machinery that is
+  complete only then. Section 9 is not it and must never be reported as it.
+  See `docs/superpowers/findings/2026-09-16-phase-c0-verification-regime-decision.md`.
 - **Any production activation** — stages 3/4. Per the stage-2c design's
   section 6, neither 2c-ii nor 2c-iii leaves the production route anything but
   `Legacy` with readiness closed.
@@ -350,3 +359,57 @@ default build and with `--features tcp-transport` and `--features xdmcp`;
 `cargo test -p yserver --lib c0_2ci` with its hardware run; the twelve-run flake
 loop; the full workspace suite; and the gnu, musl and freebsd target checks,
 since 4.1 touches `drm_cleanup.rs`.
+
+## 9. Part 3 — the flip-accepted path, with DRM master
+
+### 9.1. Why this box has never run it
+
+The hardware test fixtures open the card deliberately **without DRM master**
+(`backend.rs`, around line 6003), because the desktop session already holds it.
+Without master the kernel rejects page flips, so the flip-accepted path has
+never run on hardware here: a managed buffer actually going on screen, a real
+page-flip completion, a real out-fence. Every test that exercises the discharge
+of a `KmsRelease` obligation feeds it a synthesized completion event. The census
+cannot see this gap — it asks whether a test notices a deleted guard, not
+whether the evidence that test uses is real.
+
+### 9.2. What it must show
+
+Stated as invariants; the shape of the tests is the implementer's call.
+
+- **P3-1.** A managed scanout buffer submitted in a flip the kernel **accepts**
+  becomes the current buffer — the flip-accepted path actually executes.
+- **P3-2.** The displaced buffer's `KmsRelease` obligation is discharged by the
+  **real** kernel completion, and the buffer is not released before it.
+- **P3-3.** A buffer retained across the flip registers no obligation and is not
+  released — R6's retained-member clause, with real evidence.
+- **P3-4.** The flip's out-fence resolves through its canonical status query.
+
+Every test here carries the `_drm` suffix and `#[ignore]`, and **detects whether
+it holds master**. Run without it, the test reports an environmental skip as a
+failure (R12) — it never passes. The implementer also identifies which existing
+hardware tests encode the no-master outcome, by running them with master, and
+records the result rather than assuming it.
+
+### 9.3. How it is run
+
+The implementer writes the tests and cannot run them: DRM master is granted by
+logind to the **active** session on the seat, and an agent's shell runs inside
+the session that launched it. So the user runs them:
+
+1. switch to a VT that becomes the active session on the seat — on this machine
+   tty2 — so the desktop on tty1 drops master;
+2. run the exact commands the plan supplies, which select the card driving the
+   connected output (this machine has two) and report which card was used;
+3. run the named mutations for P3-2 and P3-3 with the census tool from section
+   3.0, under the same filter;
+4. save both outputs to a file the reviewer reads.
+
+### 9.4. What it is not
+
+It is **not** the bounded delivery check of the C.0 design's section 16.3
+revision 3. That check exercises DPMS, VT release and acquire, and direct,
+composed and fullscreen entry and exit through the owner machinery, which is
+complete only in stages 3/4, and it is scheduled there. Part 3 is an early,
+partial falsification of the stage 2c-i ledger on real kernel evidence. It
+satisfies no section-16.3 requirement and is never reported as doing so.
