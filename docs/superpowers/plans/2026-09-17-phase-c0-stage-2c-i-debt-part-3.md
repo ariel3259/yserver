@@ -2,6 +2,8 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. Stop with the tree dirty; the coordinating session verifies and commits.
 
+**Revision 3 (2026-09-17)** — incorporates codex round 2 (`…-part-3-plan-review-round2.md`: 0 blocking, 2 major; four of round 1's five audited APPLIED, M-3 PARTIAL). See *Corrections from review round 2*.
+
 **Revision 2 (2026-09-17)** — incorporates codex round 1 (`docs/superpowers/findings/2026-09-17-part-3-plan-review-round1.md`: 2 blocking, 3 major), all five verified against the tree. See *Corrections from review round 1*.
 
 **Goal:** Put a managed scanout buffer on screen through a page flip the kernel actually accepts, and prove the stage 2c-i ledger against the kernel's own completion and out-fence instead of a synthesized event.
@@ -19,6 +21,13 @@
 Session 2's plan handed the implementer verbatim blocks, because the coordinating session had prototyped and measured every one of them first. That is impossible here: these tests only run with DRM master, which logind grants to the **active** session on the seat, so neither the implementer's sandbox nor the coordinating session can execute them while writing them. Prescribing unrunnable code would be prescribing guesses. Spec 9.2 says so too — "the shape of the tests is the implementer's call".
 
 So this plan fixes the **fixture contract**, the **invariants**, and the **commands the user runs**, and leaves the test bodies to the implementer. What the implementer can still verify mechanically is stated per task: it compiles, it lints, the deterministic suite is unaffected, and the new tests **fail** rather than pass when run without master.
+
+## Corrections from review round 2
+
+| Finding | Disposition |
+| --- | --- |
+| **M-1** — Task 6 substituted a *new* test for running the identified existing one with master, so round 1's M-3 was only PARTIAL | **Fixed.** Verified: `c0_2ci_sink_gamma_gate_four_states_drm` opens its own node through `TestDevice::open_real_drm_or_ignore` — without master — and drives **four** gate states. A new test over a different fixture would prove something else. Task 6 now parameterises that test's own body into a helper taking the device, leaves the existing test calling it with its current non-master device (unchanged in meaning), and adds a master-held invocation of **the same helper over the same four states**. The record names the existing test and carries both outcomes. |
+| **M-2** — no bounded, ordered completion contract: a flip is asynchronous, so "read the CRTC afterwards" is timing-dependent, and a lost event or stuck fence would hang the run *and* skip the display restoration | **Fixed.** A new Global Constraint: every hardware observation waits for the **matching** completion under a deadline, P3-1's readback and P3-2's discharge assertion happen only after that completion is correlated to the submitted output and BO, and P3-4 polls the canonical `sync_file::query_status` until `Success`, `Error(_)` or the deadline. A deadline or error **panics through normal unwinding**, so the fixture's restoration runs; the record distinguishes a timeout from a fence error. |
 
 ## Corrections from review round 1
 
@@ -39,6 +48,7 @@ So this plan fixes the **fixture contract**, the **invariants**, and the **comma
 - **The existing fixtures keep opening the node without master.** `KmsBackend::for_tests_with_vk*` and `PlatformBackend::for_tests` are not touched. `c0_2ci_sink_gamma_gate_four_states_drm` asserts the gamma ioctl is *reached and fails* — true only without master (see the prior measurement). If a change here would put master under it, that is an F8 stop, not a silent edit of its assertion.
 - **The console comes back, even from a panic (round-1 B-1).** The fixture snapshots the CRTC configuration it found and tears down in this order, in `Drop` as well as on the success path: **restore** the original connector/CRTC/framebuffer, with master and the test framebuffers still alive; **then** destroy the test resources; **then** drop master. A restoration that fails is reported loudly — a panicking test must not hide it.
 - **One live-KMS fixture at a time (round-1 M-1).** Master is per-fd and the CRTC is shared, so two fixtures in one process would fight. The fixture takes a process-wide exclusive guard for its lifetime, and the run command pins `--test-threads=1`. Both, not either.
+- **Every hardware observation is bounded and correlated (round-2 M-2).** A flip is accepted asynchronously: `on_page_flip_complete` is what retires the pending BO, and `sync_file::query_status` distinguishes `Pending`, `Success` and `Error(_)`. So no test reads state "afterwards": it waits for the **matching** completion — correlated to the output and BO it submitted — under an explicit deadline, and only then asserts. P3-4 polls the canonical status until `Success`, `Error(_)` or that deadline. **A timeout or a fence error panics**, through ordinary unwinding, so the fixture's restoration runs; a test that blocks forever would strand the console, which is the outcome this constraint exists to prevent. The record says which of timeout or error occurred.
 - **`OUT_FENCE_PTR` writes an `s32`.** Read it into `i32`, as `scene.rs` already does. A wider destination reads a bogus fd — measured: `0xFFFFFFFF00000004` for fd `4`.
 - **The out-fence has exactly one owner (round-1 B-2).** `submit_flip_with_fences` hands the fd to `bo.state.transition_to_pending`, which keeps it as `release_fence_fd`. Tests observe it **through that owner** and close nothing; an independent observation `dup`s the fd and closes only the duplicate. A test that closes the BO's fd leaves a dead descriptor behind and can later double-close it.
 - Every new test name starts with `c0_2ci_` (the census runs `cargo test -p yserver --lib c0_2ci`).
@@ -184,7 +194,7 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 - the buffer is **managed**: converted through `PlatformBackend::register_managed_scanout_bo`, rooted by its lease, exactly as `c0_2ci_scene_managed_shared_compose_vulkan` does today — that test is the closest existing relative and the right starting point;
 - the frame goes through the **real** submission path, the one that calls `crate::drm::page_flip::submit_flip_with_fences`, not a hand-rolled commit;
 - the flip is **accepted**: the submission returns `Ok`, and the assertion says so in terms of the kernel's answer, not of a fixture flag;
-- the buffer is the CRTC's current one afterwards, read back from the device rather than from the backend's own bookkeeping.
+- the buffer is the CRTC's current one **after the matching completion has been consumed** (round-2 M-2), read back from the device rather than from the backend's own bookkeeping. Reading before that observes the old framebuffer and proves nothing.
 
 - [ ] **Step 1: Write the test**
 
@@ -203,7 +213,7 @@ Expected: clean; **180 passed, 19 ignored** — the new test is ignored, and no 
 - Modify: `crates/yserver/src/kms/render/part3_tests.rs`
 
 **Invariants:**
-- **P3-2:** the displaced buffer's `KmsRelease` obligation is discharged by the **real** kernel completion, and the buffer is **not released before it**. Both halves matter: the test must observe the entry still rooted while the completion has not arrived, and released after it has. The completion must come from the kernel's event, read through the backend's own completion path — not a synthesized `OwnerEvent`.
+- **P3-2:** the displaced buffer's `KmsRelease` obligation is discharged by the **real** kernel completion, and the buffer is **not released before it**. Both halves matter: the test must observe the entry still rooted while the completion has not arrived, and released after it has. The completion must come from the kernel's event, read through the backend's own completion path — not a synthesized `OwnerEvent` — and must be the completion **matching** this submission, awaited under the deadline the Global Constraints impose (round-2 M-2).
 - **P3-3:** a buffer **retained** across the flip registers no obligation and is not released — R6's retained-member clause, on real evidence.
 
 - [ ] **Step 1: Write both tests**
@@ -224,7 +234,7 @@ Expected: clean; **180 passed, 21 ignored**.
 **Invariant (P3-4):** the flip's out-fence resolves through its canonical status query.
 
 - The fence comes back through `submit_flip_with_fences`'s `out_fence` parameter, which is an `i32` — see the Global Constraints; a wider type reads a bogus fd.
-- "Canonical status query" means the same query the production code uses to decide a fence is signalled; find it and use it, rather than inventing a poll.
+- "Canonical status query" means the same query the production code uses to decide a fence is signalled — `crate::platform::sync_file::query_status`, whose `FenceStatus` is `Pending | Success | Error(i32)`. Poll it until `Success`, `Error(_)` or the deadline; never invent a poll, and never treat `Pending` at the deadline as anything but a failure to report (round-2 M-2).
 - **The test does not own the fd** (round-1 B-2): `submit_flip_with_fences` hands it to `bo.state.transition_to_pending`, which keeps it as `release_fence_fd`. Observe the fence through that owner. If an independent observation is genuinely needed, `dup` the fd and close only the duplicate, saying in the test which owner closes which descriptor.
 
 - [ ] **Step 1: Write the test**
@@ -254,16 +264,29 @@ succeeds or fails for a reason that is not "no master", and the result is
 recorded. This test does not change the existing one; it measures what the
 existing one's assertion rests on.
 
-- [ ] **Step 1: Write the test** over the live-KMS fixture, driving the same
-  gamma entry point the existing test drives. If the outcome contradicts what
-  the existing test encodes, **do not edit that test**: report it as an F8 stop
-  for Task 7's record and a decision for the stage owner.
+**How, precisely (round-2 M-1).** Do **not** write a new test that merely
+drives the same entry point over a different fixture: that would change the
+fixture, the output selection and possibly which arms run, and would prove
+something other than what the existing test's assertion rests on.
 
-- [ ] **Step 2: Compile, lint, deterministic suite**
+- [ ] **Step 1: Parameterise the existing test's body** into a helper that
+  takes the DRM device (and whatever else it opens today) as arguments, leaving
+  `c0_2ci_sink_gamma_gate_four_states_drm` calling it with its current
+  `open_real_drm_or_ignore` device. Its meaning must not change: same four gate
+  states, same assertions, same name.
 
-Expected: clean; **180 passed, 23 ignored**.
+- [ ] **Step 2: Add the master-held invocation** of that same helper, over the
+  same four states, with the live-KMS fixture's master-holding device, as a new
+  `_drm` test. Record what each state does. If the Legacy arm's outcome
+  contradicts what the existing test encodes, **do not edit the existing
+  test**: report it as an F8 stop for Task 7's record and a decision for the
+  stage owner.
 
-- [ ] **Step 3: Hand off for commit.**
+- [ ] **Step 3: Compile, lint, deterministic suite**
+
+Expected: clean; **180 passed, 23 ignored** — the refactor must not move the deterministic count, and `c0_2ci_sink_gamma_gate_four_states_drm` must still exist under that name.
+
+- [ ] **Step 4: Hand off for commit.**
 
 ---
 
@@ -293,7 +316,7 @@ Neither mutation counts unless the tool reports that it compiled.
 
 - [ ] **Step 4 (coordinator): record**
 
-Create `docs/superpowers/findings/2026-09-17-part-3-flip-accepted.md` with: the card, connector and mode the fixture reported; the four invariants and what was observed for each; both mutations and the test that caught each; the full log; and, prominently, spec 9.4's boundary — **part 3 is not the bounded delivery check of the C.0 design's section 16.3, satisfies none of its requirements, and is never reported as doing so**. Any F8 stop goes here too, including the one this plan expects most: whether a **PRIME-imported Vulkan image**, rather than a dumb buffer, can be flipped on this NVIDIA driver at all. The feasibility probe did not answer that, and a negative answer is a finding about the driver, not a failure of the plan.
+Create `docs/superpowers/findings/2026-09-17-part-3-flip-accepted.md` with: the card, connector and mode the fixture reported; for every observation, whether it completed within its deadline, and for any that did not, whether it was a timeout or a fence `Error(_)` (round-2 M-2); the named existing gamma test and what its four states did with and without master (round-2 M-1); the four invariants and what was observed for each; both mutations and the test that caught each; the full log; and, prominently, spec 9.4's boundary — **part 3 is not the bounded delivery check of the C.0 design's section 16.3, satisfies none of its requirements, and is never reported as doing so**. Any F8 stop goes here too, including the one this plan expects most: whether a **PRIME-imported Vulkan image**, rather than a dumb buffer, can be flipped on this NVIDIA driver at all. The feasibility probe did not answer that, and a negative answer is a finding about the driver, not a failure of the plan.
 
 Then add to the spec's status line: "Part 3 executed: …", naming what was proven and what was not.
 
