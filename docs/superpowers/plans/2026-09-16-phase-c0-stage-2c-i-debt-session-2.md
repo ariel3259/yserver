@@ -2,6 +2,8 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have: at an [H] step, stop and hand off. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. At each "hand off for commit" step, stop with the tree dirty; the coordinating session verifies and commits with the message given.
 
+**Revision 5 (2026-09-17)** — the extractor in *How to apply a block* contained backticks; run inside `bash -lc "..."` they were read as command substitution, the pattern came back empty, and codex stopped under F8 at Task 4 Step 1. It is now written to a file first and builds its fence with `chr(96)`, so it carries no backtick at all. Tasks 1-3 were committed before this and are unaffected.
+
 **Revision 4 (2026-09-17)** — Task 2's terminal-close test referenced `permit_for`, which Task 4 introduces, and a permit needs the evidence API Task 4 reshapes; codex stopped at it under F8 while executing Task 2. The test is split in two, one half per task, and **every task has now been applied in order with `patch`, compiled and tested at each step** — 171, 172, 173, 180 — which is the check whose absence let a cross-task reference through.
 
 **Revision 3 (2026-09-17)** — incorporates codex round 2 (`…-session-2-plan-review-round2.md`: 2 blocking, 1 major; round 1's B-1, B-2 and B-3 audited APPLIED) on top of revision 2's answer to round 1. See *Corrections from the reviews*.
@@ -48,19 +50,23 @@
 
 ## How to apply a block
 
-Every diff and every Rust block below is exact, and is applied **mechanically, never retyped**. Extract a task's `n`th fenced block of a language to a file with:
+Every diff and every Rust block below is exact, and is applied **mechanically, never retyped**. Write the extractor to a file once, then use it for every block: it builds its fence with `chr(96)` and contains no backtick itself, so no shell quoting -- including `bash -lc "..."`, which cost an earlier run its pattern to command substitution -- can mangle it. Extract a task's `n`th fenced block of a language with:
 
 ```bash
-python3 - docs/superpowers/plans/2026-09-16-phase-c0-stage-2c-i-debt-session-2.md "Task N" diff 1 > /tmp/s2-taskN.patch <<'PY'
+cat > /tmp/s2-extract.py <<'XPY'
 import re, sys
 plan, task, lang, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-text = open(plan).read()
-start = text.index(f"### {task}:")
+fence = chr(96) * 3          # built, never written: no backtick in this file,
+text = open(plan).read()     # so no shell quoting can eat the pattern
+start = text.index("### " + task + ":")
 end = text.find("\n### Task ", start + 1)
 body = text[start:] if end == -1 else text[start:end]
-blocks = re.findall(rf"^```{lang}\n(.*?)^```$", body, re.S | re.M)
+blocks = re.findall("^" + fence + lang + "\n(.*?)^" + fence + "$", body, re.S | re.M)
+if len(blocks) < n:
+    sys.exit("no " + lang + " block " + str(n) + " in " + task)
 sys.stdout.write(blocks[n - 1])
-PY
+XPY
+python3 /tmp/s2-extract.py docs/superpowers/plans/2026-09-16-phase-c0-stage-2c-i-debt-session-2.md "Task N" diff 1 > /tmp/s2-taskN.patch
 ```
 
 Then apply a diff with `patch -p1 --no-backup-if-mismatch < /tmp/s2-taskN.patch`, and append a Rust block with `cat /tmp/s2-taskN.rs >> <file>`. `patch` must report no rejected hunk and no fuzz; an offset is fine. Anything else is an F8 stop.
