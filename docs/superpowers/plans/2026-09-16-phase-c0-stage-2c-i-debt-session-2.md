@@ -108,7 +108,7 @@ Found while prototyping; Task 1 records them in the spec so plan and spec agree:
 - Produces: `ScanoutBo::{take_husk_alias, set_husk_registration, take_husk_registration}`; `ScanoutBo::take_physical_backing` now returns `Option<ScanoutBoBacking>` (`None` once the alias has moved); `detach_managed_entries`' signature is unchanged.
 - Invariants: the registration owns the alias it counts, so consuming it ends both together, and no registry can certify zero aliases while a husk's alias lives; any registration other than one this registry minted for this device and incarnation is refused and closes both registries' barriers; a registration dropped undischarged closes its registry's barrier.
 
-- [ ] **Step 1: Amend the spec**
+- [x] **Step 1: Amend the spec**
 
 In `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md`, insert this subsection immediately before the heading `## 5. Evidence and review`:
 
@@ -168,7 +168,7 @@ carries the detail.
    with 4.2's real-path half and 4.3's crossing recorded as open.
 ```
 
-- [ ] **Step 2: Apply the production diff**
+- [x] **Step 2: Apply the production diff**
 
 Extract this task's `diff` block 1 to `/tmp/s2-task1.patch` and apply it (see *How to apply a block*).
 
@@ -654,7 +654,7 @@ diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/sc
 
 Expected: `patch` reports four files patched, no rejects, no fuzz.
 
-- [ ] **Step 3: Append the tests**
+- [x] **Step 3: Append the tests**
 
 Extract this task's `rust` block 1 to `/tmp/s2-task1.rs` and append it to `crates/yserver/src/kms/render/resources/guard_tests.rs`.
 
@@ -788,17 +788,17 @@ fn c0_2ci_guard_unknown_husk_registration_cannot_consume_another_husks_count() {
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo +nightly fmt && cargo test -p yserver --lib husk`
 Expected: `4 passed`, plus the `_vulkan` husk test ignored. A failure is an F8 stop.
 
-- [ ] **Step 5: Run the oracle**
+- [x] **Step 5: Run the oracle**
 
 Run: `python3 tools/guard-census.py --files drm_cleanup.rs --deterministic-only --require-oracle`
 Expected: `S2-husk-foreign`, `S2-husk-unknown` and `S2-husk-mint-poisoned` each `CAUGHT_BY_ORACLE`; summary `CAUGHT_BY_ORACLE: 3`; exit 0.
 
-- [ ] **Step 6: Gate, then hand off for commit**
+- [x] **Step 6: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
 Expected: clean; `c0_2ci` 163 passed, 18 ignored.

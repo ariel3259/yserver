@@ -43,7 +43,7 @@ pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
 #[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
     CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
-    FamilyInventory, FileFamilyClosed, GemOwner, RightState,
+    FamilyInventory, FileFamilyClosed, GemOwner, PoolHuskRegistration, RightState,
 };
 #[allow(unused_imports)]
 use gpu::ValidatedGpuBatch;

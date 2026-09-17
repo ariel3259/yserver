@@ -524,9 +524,15 @@ pub struct ScanoutBo {
     /// sized for the bo (XRGB8888 → 4 bytes × width × height), and
     /// the device memory backing it.
     pub vk_transfer: TransferResources,
-    /// Shared DRM device handle (for un-registering the framebuffer
-    /// + closing the GEM handle in Drop).
-    drm: Rc<crate::drm::Device>,
+    /// Shared DRM device handle, for un-registering the framebuffer and
+    /// closing the GEM handle in Drop.
+    ///
+    /// Spec 4.1 (stage 2c-i debt): `None` once managed conversion moved this
+    /// alias into the `PoolHuskRegistration` that accounts for it, which is
+    /// what makes the registry's alias count true -- consuming the
+    /// registration drops this very `Rc`. A husk has no framebuffer or GEM
+    /// handle left, so nothing below needs the device again.
+    drm: Option<Rc<crate::drm::Device>>,
     /// Held to keep image+memory destructors anchored to a live
     /// device. Cloned per bo from the pool's Arc so individual bos
     /// can be moved/dropped independently.
@@ -562,6 +568,11 @@ pub struct ScanoutBo {
     /// the pool slot leaves the entry with zero live uses, dirty, and
     /// destroyable on the very next `service_ready` tick.
     managed: Option<crate::kms::render::resources::AllocationLease>,
+    /// Spec 4.1 (stage 2c-i debt): the registration proving this bo's husk
+    /// alias was counted, held beside the lease it accompanies and consumed
+    /// by `ScanoutPool::detach_managed_entries`. Dropped undischarged (the
+    /// bo dropped, or detached with no registry) it fails closed.
+    husk_registration: Option<crate::kms::render::resources::PoolHuskRegistration>,
 }
 
 /// Per-bo transfer-side resources (command pool/buffer + staging
@@ -636,6 +647,27 @@ pub struct ScanoutBoPool {
     /// refactors.
     #[allow(dead_code)]
     gbm_device: Option<Rc<GbmDevice>>,
+}
+
+/// Spec 4.1: consumes `bo`'s husk registration through `registry`, or drops
+/// it undischarged -- failing closed -- when there is none. A refused
+/// registration has already failed closed inside the registry; the log is
+/// the only other channel left (F6).
+fn discharge_husk_registration(
+    bo: &mut ScanoutBo,
+    registry: Option<&mut crate::kms::render::resources::DrmCleanupRegistry>,
+) {
+    let Some(registration) = bo.take_husk_registration() else {
+        return;
+    };
+    match registry {
+        Some(registry) => {
+            if let Err(err) = registry.unregister_pool_husk(registration) {
+                log::error!("scanout: pool husk registration refused on detach: {err:?}");
+            }
+        }
+        None => drop(registration),
+    }
 }
 
 #[cfg(test)]
@@ -766,17 +798,18 @@ impl OutputScanout {
 
     /// F8-M1: `registry` accounts for the husk's `Rc<drm::Device>` clone
     /// left behind by `take_physical_backing` (F2-m1) -- every `ScanoutBo`
-    /// whose managed lease this call actually drops (`take_managed()`
-    /// returned `Some`) had that clone registered once at conversion time
-    /// (`PlatformBackend::register_managed_scanout_bo`), and this is the
-    /// real, non-test site that unregisters it: `take_managed()` alone
-    /// releases the pool's retain reservation and makes the entry
-    /// destroyable, but the husk's own `self.drm` field is untouched by it
-    /// and outlives the managed key -- the fd-family barrier's inventory
-    /// must stop counting it here or it can never mint (R5). `None` is the
-    /// production shape (`reset_scanout_bos_for_suspend` calls this with no
-    /// registry in scope, and no production bo is ever managed to begin
-    /// with -- R8), and a no-op there is correct.
+    /// converted by `PlatformBackend::register_managed_scanout_bo` holds the
+    /// `PoolHuskRegistration` that counted that clone, and this is the real,
+    /// non-test site that consumes it: `take_managed()` alone releases the
+    /// pool's retain reservation and makes the entry destroyable, but the
+    /// husk's own `self.drm` field is untouched by it and outlives the
+    /// managed key -- the fd-family barrier's inventory must stop counting
+    /// it here or it can never mint (R5). Spec 4.1 (stage 2c-i debt): with
+    /// `None`, a bo that holds a registration drops it undischarged, which
+    /// closes the barrier for good instead of silently skipping the
+    /// accounting. `None` remains the production shape
+    /// (`drain_scanout_pool_at` has no registry in scope), and there no bo
+    /// is ever managed (R8), so no registration exists to drop.
     pub(crate) fn detach_managed_entries(
         &mut self,
         mut registry: Option<&mut crate::kms::render::resources::DrmCleanupRegistry>,
@@ -787,20 +820,14 @@ impl OutputScanout {
         match self {
             Self::Shared(pool) => {
                 for bo in &mut pool.bos {
-                    if bo.take_managed().is_some()
-                        && let Some(registry) = registry.as_deref_mut()
-                    {
-                        registry.unregister_pool_husk();
-                    }
+                    bo.take_managed();
+                    discharge_husk_registration(bo, registry.as_deref_mut());
                 }
             }
             Self::Copied(pool) => {
                 for bo in &mut pool.destinations.bos {
-                    if bo.take_managed().is_some()
-                        && let Some(registry) = registry.as_deref_mut()
-                    {
-                        registry.unregister_pool_husk();
-                    }
+                    bo.take_managed();
+                    discharge_husk_registration(bo, registry.as_deref_mut());
                 }
                 for src in &mut pool.sources {
                     // F8-M1 (resolved open question): no `unregister_pool_husk()`
@@ -3232,18 +3259,21 @@ impl ScanoutBo {
     /// pool-slot state (phase, width/height, `managed_key`) is untouched —
     /// building a `ScanoutAllocation` over the same handles while this bo
     /// still owns them is exactly the two-closers shape R3 forbids.
-    pub(crate) fn take_physical_backing(&mut self) -> ScanoutBoBacking {
-        ScanoutBoBacking {
+    /// `None` once this bo's device alias has moved into a
+    /// `PoolHuskRegistration` (spec 4.1): a bo cannot be converted twice.
+    pub(crate) fn take_physical_backing(&mut self) -> Option<ScanoutBoBacking> {
+        let drm = Rc::clone(self.drm.as_ref()?);
+        Some(ScanoutBoBacking {
             fb_handle: self.fb_handle.take(),
             gem_handle: self.gem_handle.take(),
             gbm_bo: self.gbm_bo.take(),
-            drm: Rc::clone(&self.drm),
+            drm,
             image: std::mem::replace(&mut self.vk_image, vk::Image::null()),
             memory: std::mem::replace(&mut self.vk_memory, vk::DeviceMemory::null()),
             view: std::mem::replace(&mut self.vk_image_view, vk::ImageView::null()),
             transfer: std::mem::replace(&mut self.vk_transfer, TransferResources::empty()),
             vk: Arc::clone(&self.vk),
-        }
+        })
     }
 }
 
@@ -3271,11 +3301,12 @@ impl ScanoutBo {
             fb_handle: None,
             gem_handle: None,
             vk_transfer: TransferResources::empty(),
-            drm,
+            drm: Some(drm),
             vk,
             disarmed: false,
             gbm_bo: None,
             managed: None,
+            husk_registration: None,
         }
     }
 }
@@ -3564,11 +3595,12 @@ impl ScanoutBo {
             fb_handle: framebuffer,
             gem_handle: gem,
             vk_transfer: transfer.expect("completed allocation has transfer resources"),
-            drm,
+            drm: Some(drm),
             vk,
             disarmed: false,
             gbm_bo,
             managed: None,
+            husk_registration: None,
         })
     }
 
@@ -3584,6 +3616,27 @@ impl ScanoutBo {
     /// tick finds zero live uses.
     pub(crate) fn set_managed(&mut self, lease: crate::kms::render::resources::AllocationLease) {
         self.managed = Some(lease);
+    }
+
+    /// Spec 4.1: takes this bo's own device alias, so it can be moved into
+    /// the registration that accounts for it. `None` once taken.
+    pub(crate) fn take_husk_alias(&mut self) -> Option<Rc<crate::drm::Device>> {
+        self.drm.take()
+    }
+
+    /// Spec 4.1: keeps the registration for this bo's husk alias until
+    /// `detach_managed_entries` consumes it.
+    pub(crate) fn set_husk_registration(
+        &mut self,
+        registration: crate::kms::render::resources::PoolHuskRegistration,
+    ) {
+        self.husk_registration = Some(registration);
+    }
+
+    pub(crate) fn take_husk_registration(
+        &mut self,
+    ) -> Option<crate::kms::render::resources::PoolHuskRegistration> {
+        self.husk_registration.take()
     }
 
     /// Ends this slot's managed reservation (F2-B1): `detach_managed_entries`
@@ -3781,11 +3834,16 @@ impl ScanoutBo {
     /// succeeds, so a caller can retain the complete object graph when cleanup
     /// fails instead of letting ordinary Drop free still-referenced backing.
     fn release_disposable_drm_resources(&mut self) -> io::Result<()> {
+        // A converted husk has neither handle left and no device alias
+        // (spec 4.1), so there is nothing to release.
+        let Some(drm) = self.drm.as_ref() else {
+            return Ok(());
+        };
         release_drm_handles_strict(
             &mut self.fb_handle,
             &mut self.gem_handle,
             |framebuffer| {
-                self.drm.destroy_framebuffer(framebuffer).map_err(|error| {
+                drm.destroy_framebuffer(framebuffer).map_err(|error| {
                     scanout_io_context(
                         format!("destroy disposable framebuffer {framebuffer:?}"),
                         error,
@@ -3793,7 +3851,7 @@ impl ScanoutBo {
                 })
             },
             |gem| {
-                self.drm.close_buffer(gem).map_err(|error| {
+                drm.close_buffer(gem).map_err(|error| {
                     scanout_io_context(format!("close disposable GEM handle {gem:?}"), error)
                 })
             },
@@ -3850,15 +3908,17 @@ impl Drop for ScanoutBo {
         // DRM-side teardown next: framebuffer references the GEM
         // handle; both must be released before we free the underlying
         // memory the dma-buf was exported from.
-        if let Some(fb) = self.fb_handle.take()
-            && let Err(e) = self.drm.destroy_framebuffer(fb)
-        {
-            log::warn!("drm destroy_framebuffer failed: {e}");
-        }
-        if let Some(h) = self.gem_handle.take()
-            && let Err(e) = self.drm.close_buffer(h)
-        {
-            log::warn!("drm close_buffer (gem) failed: {e}");
+        if let Some(drm) = self.drm.as_ref() {
+            if let Some(fb) = self.fb_handle.take()
+                && let Err(e) = drm.destroy_framebuffer(fb)
+            {
+                log::warn!("drm destroy_framebuffer failed: {e}");
+            }
+            if let Some(h) = self.gem_handle.take()
+                && let Err(e) = drm.close_buffer(h)
+            {
+                log::warn!("drm close_buffer (gem) failed: {e}");
+            }
         }
 
         unsafe {

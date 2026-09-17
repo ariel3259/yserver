@@ -688,3 +688,130 @@ fn c0_2ci_guard_authorize_write_refuses_every_class_when_closed() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session 2, spec 4.1: pool-husk accounting bound to identity.
+// ---------------------------------------------------------------------------
+
+/// A registry on `incarnation` whose every other `FileFamilyClosed`
+/// precondition already holds, so a mint refusal can only come from husk
+/// accounting.
+fn husk_registry(incarnation: IncarnationId) -> DrmCleanupRegistry {
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        incarnation,
+        Box::new(super::tests::MockCleanupIo::new(Rc::new(
+            std::cell::RefCell::new(Vec::new()),
+        ))),
+    );
+    registry.detach_fake_submitters();
+    registry.reap_fake_helper();
+    registry.close_fake_control();
+    registry
+}
+
+/// A stub device alias for a husk registration: `Device::for_tests` opens
+/// no DRM node, and what the test needs is only the `Rc` whose lifetime the
+/// registration now owns.
+fn husk_alias() -> Rc<crate::drm::Device> {
+    Rc::new(crate::drm::Device::for_tests().expect("stub drm device"))
+}
+
+fn mint_refusal(registry: &mut DrmCleanupRegistry) -> Option<String> {
+    registry
+        .try_mint_file_family_closed(|_, _| Ok(()))
+        .err()
+        .map(|err| err.to_string())
+}
+
+/// Round-1 B-1: the alias and the count that names it end together, so the
+/// inventory cannot reach zero while the husk's `Rc<drm::Device>` is alive.
+#[test]
+fn c0_2ci_husk_registration_owns_the_alias_it_counts() {
+    let mut registry = husk_registry(IncarnationId::first());
+    let alias = husk_alias();
+    let watch = Rc::clone(&alias);
+    let registration = registry.register_pool_husk(alias);
+    assert_eq!(
+        Rc::strong_count(&watch),
+        2,
+        "the registration must own the husk's alias"
+    );
+    assert_eq!(
+        mint_refusal(&mut registry).as_deref(),
+        Some("non-payload aliases still active"),
+        "the family cannot close while the husk alias is counted"
+    );
+    registry.unregister_pool_husk(registration).unwrap();
+    assert_eq!(
+        Rc::strong_count(&watch),
+        1,
+        "consuming the registration must drop the alias it counted"
+    );
+    assert_eq!(mint_refusal(&mut registry), None);
+}
+
+/// census: S2-husk-mint-poisoned drm_cleanup.rs try_mint_file_family_closed `self.husk_accounting_failed.get()`
+#[test]
+fn c0_2ci_guard_dropped_husk_registration_closes_the_family_barrier() {
+    let mut registry = husk_registry(IncarnationId::first());
+    drop(registry.register_pool_husk(husk_alias()));
+    assert_eq!(
+        mint_refusal(&mut registry).as_deref(),
+        Some("pool husk accounting failed"),
+        "a husk registration dropped undischarged must fail closed [census:S2-husk-mint-poisoned]"
+    );
+}
+
+/// census: S2-husk-foreign drm_cleanup.rs unregister_pool_husk `registration.device_key != self.device_key || registration.incarnation != self.incarnation`
+#[test]
+fn c0_2ci_guard_foreign_husk_registration_is_refused_and_fails_closed() {
+    let mut minted_by = husk_registry(IncarnationId::first());
+    let mut presented_to = husk_registry(IncarnationId::first().next());
+    let own = presented_to.register_pool_husk(husk_alias());
+    let foreign = minted_by.register_pool_husk(husk_alias());
+    assert_eq!(
+        presented_to.unregister_pool_husk(foreign),
+        Err(ResourceError::WrongIncarnation),
+        "a registration from another incarnation must be refused as such [census:S2-husk-foreign]"
+    );
+    // The refused registration must not have consumed `own`'s count...
+    presented_to.unregister_pool_husk(own).unwrap();
+    // ...and both registries now refuse to certify the family closed.
+    assert_eq!(
+        mint_refusal(&mut presented_to).as_deref(),
+        Some("pool husk accounting failed")
+    );
+    assert_eq!(
+        mint_refusal(&mut minted_by).as_deref(),
+        Some("pool husk accounting failed")
+    );
+}
+
+/// census: S2-husk-unknown drm_cleanup.rs unregister_pool_husk `!Rc::ptr_eq(&registration.accounting, &self.husk_accounting_failed)`
+#[test]
+fn c0_2ci_guard_unknown_husk_registration_cannot_consume_another_husks_count() {
+    // Same device and incarnation, different registry: identity alone
+    // cannot tell them apart, so only the registry's own correlation can.
+    let mut minted_by = husk_registry(IncarnationId::first());
+    let mut presented_to = husk_registry(IncarnationId::first());
+    let own = presented_to.register_pool_husk(husk_alias());
+    let unknown = minted_by.register_pool_husk(husk_alias());
+    assert_eq!(
+        presented_to.unregister_pool_husk(unknown),
+        Err(ResourceError::InvalidProof),
+        "a registration another registry minted must be refused [census:S2-husk-unknown]"
+    );
+    presented_to.unregister_pool_husk(own).unwrap();
+    assert_eq!(
+        mint_refusal(&mut presented_to).as_deref(),
+        Some("pool husk accounting failed")
+    );
+    assert_eq!(
+        mint_refusal(&mut minted_by).as_deref(),
+        Some("pool husk accounting failed")
+    );
+}

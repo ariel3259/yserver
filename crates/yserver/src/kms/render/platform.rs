@@ -5785,12 +5785,17 @@ impl PlatformBackend {
             None => None,
         };
 
+        // Spec 4.1 (stage 2c-i debt): `None` means this bo's device alias
+        // already moved into a registration -- it was converted once
+        // already, and converting it again would leave that registration
+        // accounting for nothing.
         let display_backing = scanout
             .display_pool_mut()
             .bos
             .get_mut(bo_idx)
             .ok_or(ResourceError::InvalidState)?
-            .take_physical_backing();
+            .take_physical_backing()
+            .ok_or(ResourceError::InvalidState)?;
 
         // fb_handle/gem_handle presence was validated above, so the only
         // error `from_scanout_bo_backing` can return cannot occur here.
@@ -5872,19 +5877,25 @@ impl PlatformBackend {
             .get_mut(output_idx)
             .and_then(Option::as_mut)
             .ok_or(ResourceError::InvalidState)?;
-        scanout
+        let display_bo = scanout
             .display_pool_mut()
             .bos
             .get_mut(bo_idx)
-            .ok_or(ResourceError::InvalidState)?
-            .set_managed(display_lease);
+            .ok_or(ResourceError::InvalidState)?;
+        display_bo.set_managed(display_lease);
         // F8-M1: the display husk keeps its own `Rc<drm::Device>` clone
         // (`take_physical_backing` above only moved the file-owned handles
         // and shared Vulkan backing out, not `self.drm`); count that alias
         // now that the conversion has committed, so the fd-family barrier's
         // inventory sees it. `detach_managed_entries` is the real
-        // unregister site (F2-m1).
-        registry.register_pool_husk();
+        // unregister site (F2-m1). Spec 4.1 (stage 2c-i debt): the alias
+        // itself moves into the registration, so consuming the registration
+        // is what drops it -- the count cannot reach zero while the husk's
+        // alias lives. The bo holds the registration until detach.
+        let alias = display_bo
+            .take_husk_alias()
+            .ok_or(ResourceError::InvalidState)?;
+        display_bo.set_husk_registration(registry.register_pool_husk(alias));
         if let Some(renderer_lease) = renderer_lease {
             scanout
                 .copied_mut()

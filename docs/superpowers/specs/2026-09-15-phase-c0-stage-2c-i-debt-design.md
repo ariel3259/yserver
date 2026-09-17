@@ -298,6 +298,60 @@ guards was proven.
 The `consume_owner_write` non-Owner refusal (family B) is also session-2
 scope, after family A's five guards.
 
+### 4.5. Plan corrections (session 2, 2026-09-17)
+
+From prototyping session 2 and from codex round 1 on its plan
+(`…-session-2-plan-review-round1.md`). The plan
+(`docs/superpowers/plans/2026-09-16-phase-c0-stage-2c-i-debt-session-2.md`)
+carries the detail.
+
+1. **4.1.** The husk registration **owns** the alias it accounts for: the
+   scanout bo's own `Rc<drm::Device>` moves into it at conversion, and
+   consuming the registration drops it. Round 1's B-1 showed that keeping the
+   alias on the bo let the inventory reach zero while the alias was still
+   alive.
+2. **4.2.** The transport gate handle is installed on the `ResourceService`,
+   the only thing `submit_shared_scanout_frame` receives, and the handle
+   names its gate's device, incarnation and instance so the service refuses a
+   foreign gate or a silent replacement (round-1 B-2). A close arriving
+   through that handle is terminal: every transition consults the effective
+   state, never the raw field (round-2 B-1). The unwind moves into
+   `scene::managed_submit_failure`, which both failure arms of the real path
+   return as their `Err` value, and which keeps its cause structurally in
+   `PresentError::ManagedUnwind`, so a device loss survives a failed unwind
+   and still latches the fatal renderer state (round-2 B-2).
+3. **4.2 — acceptance, unmet half.** The named tests drive
+   `managed_submit_failure`, not the real `scene.rs` path: failing that path's
+   unwind needs Vulkan, DRM and fault injection. **4.2's requirement of a
+   named test driving the real path is therefore NOT met**, and this
+   amendment does not weaken it — it records it as open, next to 4.3's F8
+   stop. That a call site still calls the helper is checked by reading, at
+   review (round-1 M-1, carried forward as round-2 M-1).
+4. **4.2.** The transport closes whenever the submission may have reached
+   the GPU, even when the freeze succeeds (2c-i design section 4), and, when
+   it provably did not, only if cancelling its obligations fails.
+5. **4.3 — F8 stop.** `reset_generation` is `pub(crate)` in `yserver-core`
+   and needs a live poller, setup registry and input inventory, so the
+   generation-replacement half of 4.3 is **not driven**, and this is the F8
+   stop 4.3 itself calls for rather than a reason to add wiring (round-1
+   B-3). The test drives the forced teardown through
+   `force_destroy_all_clients` and then reuses the numeric XIDs over the same
+   backend: it proves proofs are keyed by allocation and not by XID, and it
+   does not prove the reset's invariant 6. The crossing stays open for
+   whoever owns the boundary next.
+6. **4.4.** No public transition reaches `Quiescing` with a grant
+   outstanding; the two outstanding-grant tests build that state with
+   `set_outstanding_owner_writes_for_tests`. Coverage evidence stays
+   test-side and per-class as 4.4 specifies: minting it from fixtures that
+   install or disable each writer, and reservations from a live
+   `RecipientSlot`, is production-issuer work section 6 defers to stages 3/4
+   (round-1 M-2, not taken).
+7. **5.1.** The full enumeration is 71 sites (the reservation guard and the
+   two `set_transport_gate` guards are new). Session 2 is accepted with
+   `CAUGHT_BY_ORACLE` 39, `CAUGHT` 32 and zero survivors, and the three new
+   `drm_cleanup.rs` guards proven by oracle with `--files drm_cleanup.rs` --
+   with 4.2's real-path half and 4.3's crossing recorded as open.
+
 ## 5. Evidence and review
 
 ### 5.1. Acceptance
