@@ -2,11 +2,11 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have: at an [H] step, stop and hand off. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. At each "hand off for commit" step, stop with the tree dirty; the coordinating session verifies and commits with the message given.
 
-**Revision 2 (2026-09-17)** — incorporates codex round 1 (`docs/superpowers/findings/2026-09-17-stage-2c-i-debt-session-2-plan-review-round1.md`: 3 blocking, 2 major) and the user's decisions on it. See *Corrections from review round 1*.
+**Revision 3 (2026-09-17)** — incorporates codex round 2 (`…-session-2-plan-review-round2.md`: 2 blocking, 1 major; round 1's B-1, B-2 and B-3 audited APPLIED) on top of revision 2's answer to round 1. See *Corrections from the reviews*.
 
 **Goal:** Land the four mechanism items of spec section 4 — husk accounting bound to identity, propagated GPU unwind errors with the transport close they owe, the reset-boundary test, and handover evidence — and prove family A and `consume_owner_write`'s non-Owner refusal on that evidence, so the census over the resource service reports zero survivors.
 
-**Architecture:** Every code change in this plan was prototyped on `b46830c0` by the coordinating session, and the prototype passed the full gate, hardware included (see *Provenance*). The production edits are unified diffs, applied mechanically with `patch`; the tests are verbatim blocks appended to `resources/guard_tests.rs`, plus one new module, `resources/reset_boundary_tests.rs`. Guards get `/// census:` tags so `tools/guard-census.py` proves each by its own oracle, as in session 1.
+**Architecture:** Every code change in this plan was prototyped on `12a32854` by the coordinating session, and the prototype passed the full gate, hardware included (see *Provenance*). The production edits are unified diffs, applied mechanically with `patch`; the tests are verbatim blocks appended to `resources/guard_tests.rs`, plus one new module, `resources/reset_boundary_tests.rs`. Guards get `/// census:` tags so `tools/guard-census.py` proves each by its own oracle, as in session 1.
 
 **Tech Stack:** Rust (`cargo test`), `patch`, Python 3 (`tools/guard-census.py`, committed in session 1).
 
@@ -24,7 +24,17 @@
 - The implementer does not run `git commit`, `git add`, `git checkout`, `git stash`, `git apply` or `rm -f`. The coordinating session commits every task after verifying it, using the message in the task, whose trailer records provenance: `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)`. Never a session URL in a commit message.
 - Nobody pushes, squashes, rebases or amends.
 
-## Corrections from review round 1
+## Corrections from the reviews
+
+### Round 2 (2 blocking, 1 major)
+
+| Finding | Disposition |
+| --- | --- |
+| **B-1** — a close arriving through the handle was not terminal: five transitions read the raw `self.state`, so after a service-driven close a gate still quiesced, issued a permit, published Owner and minted grants | **Fixed.** `begin_quiescing`, `authorize_owner_write`, `consume_owner_write`, `issue_handover_permit` and `publish_owner` now consult the effective `state()`, which `state()`'s own doc explains. Proven by `c0_2ci_service_driven_close_is_terminal_for_the_gate`, which fails when any one of them goes back to the raw field. The three census tags whose condition text changed were updated with it. |
+| **B-2** — flattening the cause into `PresentError::Io` cost a `ERROR_DEVICE_LOST` its identity, so the caller stopped latching `renderer_failed` | **Fixed.** A new `PresentError::ManagedUnwind { cause: Box<PresentError>, unwind: String }` keeps the cause structural, and `present_error_is_device_lost` recurses through it. Proven by `c0_2ci_failed_unwind_keeps_a_device_loss_recognisable`, which fails when the recursion is removed. The consuming handler itself (the scene tick's `renderer_failed` latch) is hardware-only; the test covers the classifier it calls. |
+| **M-1** — carried forward: a plan cannot satisfy its authoritative criterion by amending it | **Taken, in the honest direction.** The spec amendment no longer rewrites 4.2's acceptance criterion: it records the real-path half as **not met**, open like 4.3's F8 stop, and Task 6 carries both into the acceptance record. The mechanism change still lands; what is not claimed is the evidence. |
+
+### Round 1 (3 blocking, 2 major)
 
 | Finding | Disposition |
 | --- | --- |
@@ -66,7 +76,8 @@ Found while prototyping; Task 1 records them in the spec so plan and spec agree:
 2. **4.2 — when the transport closes.** Following the 2c-i design's section 4 ("Unknown submission retains its reservation and closes the affected transport"): always, when the submission may have reached the GPU, even if the freeze succeeds; and, when it provably did not, only if cancelling its obligations fails.
 3. **4.3 — the generation-replacement half is an F8 stop.** `force_destroy_all_clients` is `pub`, but `reset_generation` is `pub(crate)` in `yserver-core` and needs a live poller, setup registry and input inventory. Spec 4.3 says an undrivable half is an F8 stop to report, not a reason to add wiring, so that is what this is: the test drives the forced teardown through the real entry point and then reuses the numeric XIDs over the same backend, proving that proofs are keyed by allocation and not by XID. It does not prove the reset's invariant 6, and its module doc says so.
 4. **4.4 — the outstanding-grant guards.** `begin_quiescing` refuses while a grant is outstanding, so no public transition reaches `Quiescing` with one. The tests for the two outstanding-grant guards build that state with the existing `set_outstanding_owner_writes_for_tests`.
-5. **Acceptance census.** The full enumeration grows to **71** sites: session 1's 68, `issue_handover_permit`'s new reservation guard, and the two new `set_transport_gate` guards. Expected: `CAUGHT_BY_ORACLE` 39, `CAUGHT` 32, `SURVIVES` **0**. The three new guards in `drm_cleanup.rs` sit outside the census's default files and are proven with `--files drm_cleanup.rs`.
+5. **4.2 — the real-path criterion stays open.** Round-2 M-1: the plan does not amend 4.2's acceptance criterion to accept inspection. The mechanism lands and is proven at `managed_submit_failure`; the criterion's real-path half is recorded as unmet, beside 4.3's F8 stop, and Task 6 says so in the acceptance record.
+6. **Acceptance census.** The full enumeration grows to **71** sites: session 1's 68, `issue_handover_permit`'s new reservation guard, and the two new `set_transport_gate` guards. Expected: `CAUGHT_BY_ORACLE` 39, `CAUGHT` 32, `SURVIVES` **0**. The three new guards in `drm_cleanup.rs` sit outside the census's default files and are proven with `--files drm_cleanup.rs`.
 
 ## File Structure
 
@@ -117,16 +128,24 @@ carries the detail.
 2. **4.2.** The transport gate handle is installed on the `ResourceService`,
    the only thing `submit_shared_scanout_frame` receives, and the handle
    names its gate's device, incarnation and instance so the service refuses a
-   foreign gate or a silent replacement (round-1 B-2). The unwind moves into
+   foreign gate or a silent replacement (round-1 B-2). A close arriving
+   through that handle is terminal: every transition consults the effective
+   state, never the raw field (round-2 B-1). The unwind moves into
    `scene::managed_submit_failure`, which both failure arms of the real path
-   return as their `Err` value, and the named tests drive that function:
-   failing the real path's unwind needs Vulkan, DRM and fault injection. That
-   a call site still calls it is checked by reading, at review; the 4.2
-   criterion is met that far and no further (round-1 M-1).
-3. **4.2.** The transport closes whenever the submission may have reached
+   return as their `Err` value, and which keeps its cause structurally in
+   `PresentError::ManagedUnwind`, so a device loss survives a failed unwind
+   and still latches the fatal renderer state (round-2 B-2).
+3. **4.2 — acceptance, unmet half.** The named tests drive
+   `managed_submit_failure`, not the real `scene.rs` path: failing that path's
+   unwind needs Vulkan, DRM and fault injection. **4.2's requirement of a
+   named test driving the real path is therefore NOT met**, and this
+   amendment does not weaken it — it records it as open, next to 4.3's F8
+   stop. That a call site still calls the helper is checked by reading, at
+   review (round-1 M-1, carried forward as round-2 M-1).
+4. **4.2.** The transport closes whenever the submission may have reached
    the GPU, even when the freeze succeeds (2c-i design section 4), and, when
    it provably did not, only if cancelling its obligations fails.
-4. **4.3 — F8 stop.** `reset_generation` is `pub(crate)` in `yserver-core`
+5. **4.3 — F8 stop.** `reset_generation` is `pub(crate)` in `yserver-core`
    and needs a live poller, setup registry and input inventory, so the
    generation-replacement half of 4.3 is **not driven**, and this is the F8
    stop 4.3 itself calls for rather than a reason to add wiring (round-1
@@ -135,17 +154,18 @@ carries the detail.
    backend: it proves proofs are keyed by allocation and not by XID, and it
    does not prove the reset's invariant 6. The crossing stays open for
    whoever owns the boundary next.
-5. **4.4.** No public transition reaches `Quiescing` with a grant
+6. **4.4.** No public transition reaches `Quiescing` with a grant
    outstanding; the two outstanding-grant tests build that state with
    `set_outstanding_owner_writes_for_tests`. Coverage evidence stays
    test-side and per-class as 4.4 specifies: minting it from fixtures that
    install or disable each writer, and reservations from a live
    `RecipientSlot`, is production-issuer work section 6 defers to stages 3/4
    (round-1 M-2, not taken).
-6. **5.1.** The full enumeration is 71 sites (the reservation guard and the
+7. **5.1.** The full enumeration is 71 sites (the reservation guard and the
    two `set_transport_gate` guards are new). Session 2 is accepted with
    `CAUGHT_BY_ORACLE` 39, `CAUGHT` 32 and zero survivors, and the three new
-   `drm_cleanup.rs` guards proven by oracle with `--files drm_cleanup.rs`.
+   `drm_cleanup.rs` guards proven by oracle with `--files drm_cleanup.rs` --
+   with 4.2's real-path half and 4.3's crossing recorded as open.
 ```
 
 - [ ] **Step 2: Apply the production diff**
@@ -812,13 +832,13 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ### Task 2: Swallowed GPU errors, and the transport close they owe (spec 4.2)
 
 **Files:**
-- Modify: `crates/yserver/src/kms/render/resources/mod.rs`, `crates/yserver/src/kms/render/resources/transport.rs`, `crates/yserver/src/kms/render/resources/gpu.rs`, `crates/yserver/src/kms/render/scene.rs`
+- Modify: `crates/yserver/src/kms/render/resources/mod.rs`, `crates/yserver/src/kms/render/resources/transport.rs`, `crates/yserver/src/kms/render/resources/gpu.rs`, `crates/yserver/src/kms/render/scene.rs`, `crates/yserver/src/kms/vk/compositor.rs`
 - Modify: `crates/yserver/src/kms/render/resources/guard_tests.rs` (append)
 
 **Interfaces:**
 - Consumes: `gpu::{cancel_pre_submit_batch, freeze_uncertain_batch}`.
-- Produces: `TransportGateHandle::{device, incarnation, same_gate}`, filled by `TransportGate::handle`; `ResourceService::set_transport_gate(TransportGateHandle) -> Result<(), ResourceError>` and `ResourceService::close_transport_gate(&self)`; `gpu::abandon_unsubmitted_batch(&mut ResourceService, &[(AllocationKey, ObligationId)], gpu_submitted: bool) -> Result<(), ResourceError>`; `scene::managed_submit_failure(&mut ResourceService, &[(AllocationKey, ObligationId)], gpu_submitted: bool, cause: PresentError) -> PresentError`.
-- Invariants: a service closes only its own transport, and never silently swaps it; an unwind failure is part of the returned error, never discarded; an uncertain submission closes the transport; a pre-submit failure closes it only when its cancel fails.
+- Produces: `TransportGateHandle::{device, incarnation, same_gate}`, filled by `TransportGate::handle`; every `TransportGate` transition reading the effective `state()`; `PresentError::ManagedUnwind { cause, unwind }` and a recursive `scene::present_error_is_device_lost`; `ResourceService::set_transport_gate(TransportGateHandle) -> Result<(), ResourceError>` and `ResourceService::close_transport_gate(&self)`; `gpu::abandon_unsubmitted_batch(&mut ResourceService, &[(AllocationKey, ObligationId)], gpu_submitted: bool) -> Result<(), ResourceError>`; `scene::managed_submit_failure(&mut ResourceService, &[(AllocationKey, ObligationId)], gpu_submitted: bool, cause: PresentError) -> PresentError`.
+- Invariants: a service closes only its own transport, and never silently swaps it; a handle-driven close is terminal — no quiescing, permit, publication or grant after it; an unwind failure is part of the returned error, never discarded, and never costs the cause its identity; an uncertain submission closes the transport; a pre-submit failure closes it only when its cancel fails.
 
 - [ ] **Step 1: Apply the production diff**
 
@@ -947,7 +967,16 @@ diff --git a/crates/yserver/src/kms/render/resources/transport.rs b/crates/yserv
  }
  
  #[derive(Debug)]
-@@ -315,6 +389,8 @@ impl TransportGate {
+@@ -277,7 +351,7 @@ impl TransportGate {
+     /// and not retired -- read live from the real state given at
+     /// construction (M-13), never from a setter on this gate.
+     pub(crate) fn begin_quiescing(&mut self) -> Result<(), ResourceError> {
+-        if self.state == TransportState::Closed {
++        if self.state() == TransportState::Closed {
+             return Err(ResourceError::Detached);
+         }
+         if self.ownership.direct_ownership_busy()
+@@ -315,10 +389,18 @@ impl TransportGate {
  
      pub(crate) fn handle(&self) -> TransportGateHandle {
          TransportGateHandle {
@@ -956,10 +985,65 @@ diff --git a/crates/yserver/src/kms/render/resources/transport.rs b/crates/yserv
              forced_closed: Rc::clone(&self.forced_closed),
          }
      }
+ 
++    /// The effective state. Round-2 B-1: every transition below consults
++    /// this, never the raw `self.state`, because a close can arrive through a
++    /// `TransportGateHandle` -- which owns no `&mut TransportGate` and can
++    /// only set the shared flag. A handle-driven close must be as terminal as
++    /// `close()` itself: no quiescing, no permit, no publication, no grant
++    /// after it.
+     pub(crate) fn state(&self) -> TransportState {
+         if self.forced_closed.get() {
+             TransportState::Closed
+@@ -368,7 +450,7 @@ impl TransportGate {
+         &mut self,
+         class: WriterClass,
+     ) -> Result<OwnerWriteGrant, ResourceError> {
+-        if self.state != TransportState::Owner {
++        if self.state() != TransportState::Owner {
+             return Err(ResourceError::Detached);
+         }
+         if self.closed_admission.get() {
+@@ -399,7 +481,7 @@ impl TransportGate {
+             self.force_close();
+             return Err((ResourceError::WrongIncarnation, grant));
+         }
+-        if self.state != TransportState::Owner {
++        if self.state() != TransportState::Owner {
+             return Err((ResourceError::Detached, grant));
+         }
+         if !self.issued_serials.remove(&grant.serial) {
+@@ -488,7 +573,7 @@ impl TransportGate {
+         if permit.device != self.device || permit.incarnation != self.incarnation {
+             return Err(ResourceError::WrongIncarnation);
+         }
+-        if self.state != TransportState::Quiescing {
++        if self.state() != TransportState::Quiescing {
+             return Err(ResourceError::Busy);
+         }
+         if self.outstanding_owner_writes != 0 {
 diff --git a/crates/yserver/src/kms/render/scene.rs b/crates/yserver/src/kms/render/scene.rs
 --- a/crates/yserver/src/kms/render/scene.rs
 +++ b/crates/yserver/src/kms/render/scene.rs
-@@ -7967,26 +7967,22 @@ fn submit_shared_scanout_frame(
+@@ -137,8 +137,15 @@ fn kms_retirement_matches(
+     pending_bo_idx == presented_bo_idx && stage.is_kms_flip_pending()
+ }
+ 
+-fn present_error_is_device_lost(error: &PresentError) -> bool {
+-    matches!(error, PresentError::Vk(vk::Result::ERROR_DEVICE_LOST))
++pub(crate) fn present_error_is_device_lost(error: &PresentError) -> bool {
++    match error {
++        PresentError::Vk(vk::Result::ERROR_DEVICE_LOST) => true,
++        // Round-2 B-2: a failed unwind wraps its cause; the classification
++        // has to reach through it or a lost device stops being recognised
++        // exactly when the frame also failed to unwind.
++        PresentError::ManagedUnwind { cause, .. } => present_error_is_device_lost(cause),
++        _ => false,
++    }
+ }
+ 
+ enum CopiedRenderSubmitError {
+@@ -7967,26 +7974,22 @@ fn submit_shared_scanout_frame(
      let (submitted, fb_handle) = match render_res {
          Ok(Ok((sub, fb))) => (sub, fb),
          Ok(Err(render_err)) => {
@@ -1000,7 +1084,7 @@ diff --git a/crates/yserver/src/kms/render/scene.rs b/crates/yserver/src/kms/ren
          }
      };
  
-@@ -8037,6 +8033,28 @@ fn submit_shared_scanout_frame(
+@@ -8037,6 +8040,29 @@ fn submit_shared_scanout_frame(
      }
  }
  
@@ -1020,18 +1104,40 @@ diff --git a/crates/yserver/src/kms/render/scene.rs b/crates/yserver/src/kms/ren
 +        gpu_submitted,
 +    ) {
 +        Ok(()) => cause,
-+        Err(unwind) => PresentError::Io(std::io::Error::other(format!(
-+            "{cause}; unwinding the managed batch also failed: {unwind:?}"
-+        ))),
++        Err(unwind) => PresentError::ManagedUnwind {
++            cause: Box::new(cause),
++            unwind: format!("{unwind:?}"),
++        },
 +    }
 +}
 +
  /// Render into A's exportable source. The paired destination phase reserves
  /// the same BO index until readiness advances the frame to B's copy + KMS
  /// submission on the main-loop boundary.
+diff --git a/crates/yserver/src/kms/vk/compositor.rs b/crates/yserver/src/kms/vk/compositor.rs
+--- a/crates/yserver/src/kms/vk/compositor.rs
++++ b/crates/yserver/src/kms/vk/compositor.rs
+@@ -39,6 +39,17 @@ pub enum PresentError {
+     NoFb,
+     #[error("scanout bo state machine wrong phase: {0:?}")]
+     WrongPhase(BoPhase),
++    /// Round-2 B-2 (stage 2c-i debt): a managed submission that failed AND
++    /// whose batch could not be unwound. `cause` is kept structurally, not
++    /// flattened into text, because callers classify it -- a device loss
++    /// buried in a formatted string stops latching the fatal renderer state.
++    /// `unwind` is the ledger error, rendered, since this layer sits below
++    /// `resources`.
++    #[error("{cause}; unwinding the managed batch also failed: {unwind}")]
++    ManagedUnwind {
++        cause: Box<PresentError>,
++        unwind: String,
++    },
+ }
+ 
+ impl From<vk::Result> for PresentError {
 ```
 
-Expected: four files patched, no rejects, no fuzz.
+Expected: five files patched, no rejects, no fuzz.
 
 - [ ] **Step 2: Append the tests**
 
@@ -1105,6 +1211,30 @@ fn c0_2ci_guard_service_refuses_a_second_transport_gate() {
     assert_eq!(replacement.state(), TransportState::Legacy);
 }
 
+/// Round-2 B-2: a failed unwind must not cost the cause its identity. The
+/// caller latches the fatal renderer state on a device loss, and it
+/// classifies the error it is handed.
+#[test]
+fn c0_2ci_failed_unwind_keeps_a_device_loss_recognisable() {
+    let (mut service, held, obligation, _gate) = submission_fixture();
+    service.cancel(held.key(), obligation).unwrap();
+    let err = managed_submit_failure(
+        &mut service,
+        &[(held.key(), obligation)],
+        false,
+        PresentError::Vk(ash::vk::Result::ERROR_DEVICE_LOST),
+    );
+    assert!(
+        crate::kms::render::scene::present_error_is_device_lost(&err),
+        "a device loss must survive a failed unwind, got {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("unwinding the managed batch also failed"),
+        "and the unwind failure must still be reported, got {err}"
+    );
+}
+
 /// census: S2-cancel-pre-submit-error gpu.rs cancel_pre_submit_batch `Some(err) =>`
 #[test]
 fn c0_2ci_guard_failed_pre_submit_cancel_is_reported_and_closes_transport() {
@@ -1142,6 +1272,37 @@ fn c0_2ci_guard_failed_uncertain_freeze_is_reported_and_closes_transport() {
         "a failed freeze of an uncertain submission must reach the caller, got {err} [census:S2-freeze-uncertain-error]"
     );
     assert_eq!(gate.state(), TransportState::Closed);
+}
+
+/// Round-2 B-1: a close that arrives through the service's handle is as
+/// terminal as `close()`. The handle can only set the shared flag, so every
+/// transition has to read the effective state, not the raw field.
+#[test]
+fn c0_2ci_service_driven_close_is_terminal_for_the_gate() {
+    let (service, _held, _obligation, mut gate) = submission_fixture();
+    service.close_transport_gate();
+    assert_eq!(gate.state(), TransportState::Closed);
+    assert_eq!(gate.begin_quiescing(), Err(ResourceError::Detached));
+    assert!(
+        matches!(permit_for(&mut gate), Err(ResourceError::Busy)),
+        "a closed transport must not issue a handover permit"
+    );
+    assert!(
+        matches!(
+            gate.authorize_owner_write(WriterClass::Primary),
+            Err(ResourceError::Detached)
+        ),
+        "a closed transport must not mint an owner write grant"
+    );
+
+    // And a permit taken before the close cannot publish Owner after it.
+    // `open` is the gate this second service already holds.
+    let (service, _held2, _obligation2, mut open) = submission_fixture();
+    open.begin_quiescing().unwrap();
+    let permit = permit_for(&mut open).unwrap();
+    service.close_transport_gate();
+    assert_eq!(open.publish_owner(permit), Err(ResourceError::Busy));
+    assert_eq!(open.state(), TransportState::Closed);
 }
 
 #[test]
@@ -1183,7 +1344,7 @@ fn c0_2ci_pre_submit_failure_cancels_and_leaves_transport_open() {
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo +nightly fmt && cargo test -p yserver --lib _transport`
-Expected: the six new tests pass — the two `…transport_gate…` install guards and the four submission-failure tests — along with any other matching tests. A failure is an F8 stop.
+Expected: the eight new tests pass — the two gate-install guards, the four submission-failure tests, the terminal-close test and the device-loss test — along with any other matching tests. A failure is an F8 stop.
 
 - [ ] **Step 4: Run the oracle**
 
@@ -1193,9 +1354,9 @@ Expected: `S2-cancel-pre-submit-error` and `S2-freeze-uncertain-error` `CAUGHT_B
 - [ ] **Step 5: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 169 passed, 18 ignored.
+Expected: clean; `c0_2ci` 171 passed, 18 ignored.
 
-*Reviewer mutations* (coordinator): delete `service.close_transport_gate();` from the `gpu_submitted` branch of `abandon_unsubmitted_batch` (fails `…failed_uncertain_freeze…` and `…uncertain_submission_freezes…`); delete the `if result.is_err() { … }` close (fails `…failed_pre_submit_cancel…`); and read both `return Err(managed_submit_failure(` arms in `submit_shared_scanout_frame` (plan correction 1).
+*Reviewer mutations* (coordinator): delete `service.close_transport_gate();` from the `gpu_submitted` branch of `abandon_unsubmitted_batch` (fails `…failed_uncertain_freeze…` and `…uncertain_submission_freezes…`); delete the `if result.is_err() { … }` close (fails `…failed_pre_submit_cancel…`); revert any one of the five `self.state()` checks in `transport.rs` to the raw `self.state` (fails `c0_2ci_service_driven_close_is_terminal_for_the_gate`); delete the `PresentError::ManagedUnwind` arm of `present_error_is_device_lost` (fails `c0_2ci_failed_unwind_keeps_a_device_loss_recognisable`); and read both `return Err(managed_submit_failure(` arms in `submit_shared_scanout_frame` (plan correction 1).
 
 ```bash
 git add crates/yserver/src/kms/render/resources/mod.rs crates/yserver/src/kms/render/resources/transport.rs crates/yserver/src/kms/render/resources/gpu.rs crates/yserver/src/kms/render/scene.rs crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -1211,6 +1372,11 @@ section 4), and so does a failed pre-submit cancel. The gate handle now
 names its gate, and a service refuses one for another transport or a
 silent replacement (review round 1, B-2). Inert in production, where no
 gate is installed (R8).
+
+Round 2: a close arriving through the handle is terminal -- every
+transition now reads the effective state (B-1) -- and a failed unwind
+keeps its cause structurally in PresentError::ManagedUnwind, so a
+device loss still latches the fatal renderer state (B-2).
 
 Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
@@ -1472,7 +1638,7 @@ Expected: `1 passed`. A failure is an F8 stop.
 - [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 170 passed, 18 ignored.
+Expected: clean; `c0_2ci` 172 passed, 18 ignored.
 
 *Reviewer mutations* (coordinator, the first two prototyped): in `availability.rs` `can_destroy`, drop `&& entry.pending_obligation_count() == 0` (fails at "the forced teardown released a backing whose GPU obligation is pending"); in `store.rs` `destroy_now`, force `if self.by_xid.get(&drawable.xid).copied() == Some(id)` to `if false` (fails at "the old host XID still resolves"); in `ResourceService::apply_validated_proof`, resolve the key's newest sibling entry of the same device and incarnation instead of the key itself (must fail the test).
 
@@ -1803,16 +1969,19 @@ diff --git a/crates/yserver/src/kms/render/resources/transport.rs b/crates/yserv
          Self { _private: () }
      }
  }
-@@ -456,7 +532,7 @@ impl TransportGate {
+@@ -456,9 +538,9 @@ impl TransportGate {
          proof: crate::kms::render::platform::LegacyDrained,
          dispositions: &[crate::kms::render::backend::LegacyEventDisposition],
          _coverage: &WriterCoverageProof,
 -        _reservation: RecipientReservation,
 +        reservation: RecipientReservation,
      ) -> Result<HandoverPermit, ResourceError> {
-         if self.state != TransportState::Quiescing {
+-        if self.state != TransportState::Quiescing {
++        if self.state() != TransportState::Quiescing {
              return Err(ResourceError::Busy);
-@@ -467,6 +543,9 @@ impl TransportGate {
+         }
+         if self.outstanding_owner_writes != 0 {
+@@ -467,6 +549,9 @@ impl TransportGate {
          if proof.incarnation != self.incarnation {
              return Err(ResourceError::WrongIncarnation);
          }
@@ -1909,7 +2078,7 @@ Expected: `S2-permit-reservation-identity` `CAUGHT_BY_ORACLE`; exit 0.
 - [ ] **Step 5: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 171 passed, 18 ignored.
+Expected: clean; `c0_2ci` 173 passed, 18 ignored.
 
 ```bash
 git add crates/yserver/src/kms/render/resources/transport.rs crates/yserver/src/kms/render/resources/handoff.rs crates/yserver/src/kms/render/resources/tests.rs crates/yserver/src/kms/render/platform.rs crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -1940,7 +2109,7 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 Extract this task's `rust` block 1 to `/tmp/s2-task5.rs` and append it to `guard_tests.rs`.
 
 ```rust
-/// census: A-permit-quiescing transport.rs issue_handover_permit `self.state != TransportState::Quiescing`
+/// census: A-permit-quiescing transport.rs issue_handover_permit `self.state() != TransportState::Quiescing`
 #[test]
 fn c0_2ci_guard_handover_permit_refuses_outside_quiescing() {
     let mut gate = TransportGate::for_tests(handover_device(), IncarnationId::first());
@@ -1981,7 +2150,7 @@ fn c0_2ci_guard_publish_owner_refuses_a_permit_for_another_incarnation() {
     assert_eq!(gate.state(), TransportState::Quiescing);
 }
 
-/// census: A-publish-quiescing transport.rs publish_owner `self.state != TransportState::Quiescing`
+/// census: A-publish-quiescing transport.rs publish_owner `self.state() != TransportState::Quiescing`
 #[test]
 fn c0_2ci_guard_publish_owner_refuses_once_the_gate_left_quiescing() {
     let mut gate = quiescing_gate(handover_device(), IncarnationId::first());
@@ -2010,7 +2179,7 @@ fn c0_2ci_guard_publish_owner_refuses_with_an_outstanding_grant() {
     assert_eq!(gate.state(), TransportState::Quiescing);
 }
 
-/// census: B-consume-owner-write-state transport.rs consume_owner_write `self.state != TransportState::Owner`
+/// census: B-consume-owner-write-state transport.rs consume_owner_write `self.state() != TransportState::Owner`
 #[test]
 fn c0_2ci_guard_consume_owner_write_refuses_once_the_gate_left_owner() {
     let mut gate = quiescing_gate(handover_device(), IncarnationId::first());
@@ -2040,7 +2209,7 @@ Expected: eight tagged sites, all `CAUGHT_BY_ORACLE` — `B-authorize-write-clos
 - [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 177 passed, 18 ignored.
+Expected: clean; `c0_2ci` 179 passed, 18 ignored.
 
 ```bash
 git add crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -2086,12 +2255,12 @@ Expected: `CAUGHT_BY_ORACLE` 39, `CAUGHT` 32, `SURVIVES` 0; no `CAUGHT_NOT_BY_OR
 
 - [ ] **Step 3 [H]: Hardware gate and reviewer mutations**
 
-Run: `cargo test -p yserver --lib c0_2ci -- --ignored`. Expected: 18 passed — Task 1 changed `ScanoutBo`'s device alias, which these exercise. Then run every *Reviewer mutation* of Tasks 1–3, each confirmed to have compiled, and record which test failed.
+Run: `cargo test -p yserver --lib c0_2ci -- --ignored`. Expected: 18 passed — Task 1 changed `ScanoutBo`'s device alias and Task 2 the compositor's error type, which these exercise. Then run every *Reviewer mutation* of Tasks 1–3, each confirmed to have compiled, and record which test failed.
 
 - [ ] **Step 4 [H]: Record and commit**
 
-Create `docs/superpowers/findings/2026-09-17-stage-2c-i-debt-census-session-2.md` with: the census summary and a table of site, verdict, bound test and strategy; the `drm_cleanup.rs` oracle result; each reviewer mutation and the test that caught it, and the arms checked by reading; the plan corrections, the 4.3 F8 stop and any others found while executing; and both gate transcripts. In the spec's status line add: "Session 2 executed: 71 census sites, zero survivors; 4.3's generation-replacement half left open as an F8 stop; see `…-census-session-2.md`." Commit with the coordinator's trailer.
+Create `docs/superpowers/findings/2026-09-17-stage-2c-i-debt-census-session-2.md` with: the census summary and a table of site, verdict, bound test and strategy; the `drm_cleanup.rs` oracle result; each reviewer mutation and the test that caught it, and the arms checked by reading; the plan corrections, the 4.3 F8 stop and any others found while executing; and both gate transcripts. In the spec's status line add: "Session 2 executed: 71 census sites, zero survivors; 4.2's real-path acceptance half and 4.3's generation-replacement half left open, recorded; see `…-census-session-2.md`." Commit with the coordinator's trailer.
 
 ## Provenance
 
-The coordinating session prototyped every block above on `b46830c0`, then restored the tree. On the prototype: `cargo test -p yserver --lib c0_2ci` 177 passed, 18 ignored; the hardware run 18 passed; `cargo clippy --all-targets -- -D warnings` clean; `cargo +nightly fmt --check` clean; `cargo check` clean for musl and FreeBSD; `guard-census.py --deterministic-only --require-oracle` gave `CAUGHT_BY_ORACLE` for all 39 tagged sites in the default files and all 3 in `drm_cleanup.rs`; and the reset test failed under the `can_destroy` and `destroy_now` mutations of Task 3. The diffs were cut from the prototype per task and re-applied in order with `patch` to a clean export of `b46830c0`, reproducing every prototype file byte for byte.
+The coordinating session prototyped every block above on `12a32854`, then restored the tree. On the prototype: `cargo test -p yserver --lib c0_2ci` 179 passed, 18 ignored; the hardware run 18 passed; `cargo clippy --all-targets -- -D warnings` clean; `cargo +nightly fmt --check` clean; `cargo check` clean for musl and FreeBSD; `guard-census.py --deterministic-only --require-oracle` gave `CAUGHT_BY_ORACLE` for all 39 tagged sites in the default files and all 3 in `drm_cleanup.rs`; and every *Reviewer mutation* named above that the prototype could run was run: the reset test failed under Task 3's `can_destroy` and `destroy_now` mutations, and Task 2's two round-2 mutations each failed their named test. The diffs were cut from the prototype per task and re-applied in order with `patch` to a clean export of `12a32854`, reproducing every prototype file byte for byte.
