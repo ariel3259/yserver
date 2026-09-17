@@ -2612,6 +2612,24 @@ fn c0_2ci_completion_waiter_registration_and_recheck() {
     assert!(wakes.contains(&ResourceConsumer::DirectCapacity));
 }
 
+/// Spec 4.4 (stage 2c-i debt): a writer-coverage proof built from explicit
+/// evidence for every writer class. Every class is an owner-mediated mock
+/// here; a test that needs one disabled builds its own evidence.
+pub(crate) fn writer_coverage_for_tests() -> WriterCoverageProof {
+    use super::transport::{TestWriterCoverage::OwnerMediatedMock, TestWriterCoverageEvidence};
+    WriterCoverageProof::new_for_tests(TestWriterCoverageEvidence {
+        primary: OwnerMediatedMock,
+        unflip: OwnerMediatedMock,
+        modeset: OwnerMediatedMock,
+        dpms: OwnerMediatedMock,
+        vt: OwnerMediatedMock,
+        topology: OwnerMediatedMock,
+        cursor: OwnerMediatedMock,
+        gamma: OwnerMediatedMock,
+        helper_mutation: OwnerMediatedMock,
+    })
+}
+
 /// M-14: a real-shaped `LegacyDrained` proof for `issue_handover_permit`,
 /// matching `incarnation` the way the backend's genuine
 /// `issue_legacy_drained` output would.
@@ -2674,8 +2692,8 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -2788,8 +2806,8 @@ fn c0_2ci_transport_gate_owner_write_contract() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -2834,8 +2852,8 @@ fn c0_2ci_transport_gate_owner_write_contract() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate2.device(), gate2.incarnation()),
         )
         .unwrap();
     gate2.publish_owner(permit2).unwrap();
@@ -2903,8 +2921,8 @@ fn c0_2ci_transport_gate_consume_owner_write_checked_subtraction() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -2942,8 +2960,8 @@ fn c0_2ci_transport_gate_close_refuses_outstanding_grants() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -2990,8 +3008,8 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
         .issue_handover_permit(
             legacy_drained_for_tests(foreign_incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap_err();
     assert_eq!(err, ResourceError::WrongIncarnation);
@@ -3008,8 +3026,8 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
             &[LegacyEventDisposition::Cancelled(
                 LegacyEventCancellation::BackendFailure,
             )],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap_err();
     assert_eq!(err2, ResourceError::InvalidProof);
@@ -3019,8 +3037,8 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[LegacyEventDisposition::Applied],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     assert!(gate.publish_owner(permit).is_ok());
@@ -3050,8 +3068,8 @@ pub(crate) fn owner_gate_for_tests(
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -3089,8 +3107,8 @@ fn sink_gate_at_state(target: TransportState) -> TransportGate {
             .issue_handover_permit(
                 legacy_drained_for_tests(incarnation),
                 &[],
-                &WriterCoverageProof::new_for_tests(),
-                RecipientReservation::new_for_tests(),
+                &writer_coverage_for_tests(),
+                RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
             )
             .unwrap();
         gate.publish_owner(permit).unwrap();
@@ -3273,8 +3291,8 @@ fn c0_2ci_sink_gamma_gate_four_states_drm() {
                     .issue_handover_permit(
                         legacy_drained_for_tests(IncarnationId::first()),
                         &[],
-                        &WriterCoverageProof::new_for_tests(),
-                        RecipientReservation::new_for_tests(),
+                        &writer_coverage_for_tests(),
+                        RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
                     )
                     .unwrap();
                 gate.publish_owner(permit).unwrap();
@@ -5390,8 +5408,8 @@ fn c0_2ci_handoff_under_executor_stalled_revokes_grant_and_quarantines() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();

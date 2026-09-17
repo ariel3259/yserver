@@ -7919,7 +7919,7 @@ mod tests {
     #[test]
     fn c0_2ci_sink_cursor_gate_four_states() {
         use crate::kms::render::resources::{
-            FakeDirectOwnershipState, RecipientReservation, TransportGate, WriterCoverageProof,
+            FakeDirectOwnershipState, RecipientReservation, TransportGate,
         };
 
         let mut platform = PlatformBackend::for_tests();
@@ -7971,8 +7971,8 @@ mod tests {
                     lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId::first(),
                 },
                 &[],
-                &WriterCoverageProof::new_for_tests(),
-                RecipientReservation::new_for_tests(),
+                &crate::kms::render::resources::tests::writer_coverage_for_tests(),
+                RecipientReservation::new_for_tests(key, incarnation),
             )
             .unwrap();
         platform

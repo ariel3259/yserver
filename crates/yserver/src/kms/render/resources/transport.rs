@@ -84,9 +84,13 @@ impl Drop for OwnerWriteGrant {
     }
 }
 
-/// Opaque capability representing reservation of the recipient endpoint for Owner publication.
+/// Opaque capability representing reservation of the recipient endpoint for
+/// Owner publication. Spec 4.4 (stage 2c-i debt): it names the device and
+/// incarnation of the recipient slot it reserves, and `issue_handover_permit`
+/// refuses one reserved for another.
 pub(crate) struct RecipientReservation {
-    _private: (),
+    device: DrmDeviceKey,
+    incarnation: IncarnationId,
 }
 
 impl RecipientReservation {
@@ -98,8 +102,11 @@ impl RecipientReservation {
     // back under `#[cfg(test)]` in `handoff.rs`, so this constructor can
     // live under `#[cfg(test)]` again with no production caller needing it.
     #[cfg(test)]
-    pub(crate) fn new_for_tests() -> Self {
-        Self { _private: () }
+    pub(crate) fn new_for_tests(device: DrmDeviceKey, incarnation: IncarnationId) -> Self {
+        Self {
+            device,
+            incarnation,
+        }
     }
 }
 
@@ -108,9 +115,56 @@ pub(crate) struct WriterCoverageProof {
     _private: (),
 }
 
+/// Test-only coverage for one writer class (spec 4.4, stage 2c-i debt): the
+/// stage-2c design allows Owner publication only when every writer class is
+/// owner-mediated or disabled.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestWriterCoverage {
+    OwnerMediatedMock,
+    Disabled,
+}
+
+/// Test-only evidence naming the coverage of every `WriterClass`, one field
+/// each, so none can be left out.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TestWriterCoverageEvidence {
+    pub(crate) primary: TestWriterCoverage,
+    pub(crate) unflip: TestWriterCoverage,
+    pub(crate) modeset: TestWriterCoverage,
+    pub(crate) dpms: TestWriterCoverage,
+    pub(crate) vt: TestWriterCoverage,
+    pub(crate) topology: TestWriterCoverage,
+    pub(crate) cursor: TestWriterCoverage,
+    pub(crate) gamma: TestWriterCoverage,
+    pub(crate) helper_mutation: TestWriterCoverage,
+}
+
+#[cfg(test)]
+impl TestWriterCoverageEvidence {
+    /// Exhaustive over `WriterClass`: a class added without a field here
+    /// stops this from compiling, and so every test that builds a proof.
+    pub(crate) fn coverage(&self, class: WriterClass) -> TestWriterCoverage {
+        match class {
+            WriterClass::Primary => self.primary,
+            WriterClass::Unflip => self.unflip,
+            WriterClass::Modeset => self.modeset,
+            WriterClass::Dpms => self.dpms,
+            WriterClass::Vt => self.vt,
+            WriterClass::Topology => self.topology,
+            WriterClass::Cursor => self.cursor,
+            WriterClass::Gamma => self.gamma,
+            WriterClass::HelperMutation => self.helper_mutation,
+        }
+    }
+}
+
 impl WriterCoverageProof {
+    /// Spec 4.4: consumes explicit coverage evidence for every writer class,
+    /// so possessing a proof proves the coverage.
     #[cfg(test)]
-    pub(crate) fn new_for_tests() -> Self {
+    pub(crate) fn new_for_tests(_evidence: TestWriterCoverageEvidence) -> Self {
         Self { _private: () }
     }
 }
@@ -484,15 +538,18 @@ impl TransportGate {
         proof: crate::kms::render::platform::LegacyDrained,
         dispositions: &[crate::kms::render::backend::LegacyEventDisposition],
         _coverage: &WriterCoverageProof,
-        _reservation: RecipientReservation,
+        reservation: RecipientReservation,
     ) -> Result<HandoverPermit, ResourceError> {
-        if self.state != TransportState::Quiescing {
+        if self.state() != TransportState::Quiescing {
             return Err(ResourceError::Busy);
         }
         if self.outstanding_owner_writes != 0 {
             return Err(ResourceError::Busy);
         }
         if proof.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        if reservation.device != self.device || reservation.incarnation != self.incarnation {
             return Err(ResourceError::WrongIncarnation);
         }
         let backend_failure = dispositions.iter().any(|d| {

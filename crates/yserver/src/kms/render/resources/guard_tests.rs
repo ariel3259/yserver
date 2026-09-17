@@ -996,3 +996,54 @@ fn c0_2ci_pre_submit_failure_cancels_and_leaves_transport_open() {
     assert_eq!(gate.state(), TransportState::Legacy);
     assert!(!service.has_pending_obligation(&held.key(), obligation));
 }
+
+// ---------------------------------------------------------------------------
+// Session 2, spec 4.4: the Owner handover, on evidence that proves coverage
+// of every writer class and a reservation bound to the recipient's identity.
+// ---------------------------------------------------------------------------
+
+fn handover_device() -> DrmDeviceKey {
+    DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    }
+}
+
+fn drained(incarnation: IncarnationId) -> crate::kms::render::platform::LegacyDrained {
+    crate::kms::render::platform::LegacyDrained {
+        incarnation,
+        lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId::first(),
+    }
+}
+
+fn quiescing_gate(device: DrmDeviceKey, incarnation: IncarnationId) -> TransportGate {
+    let mut gate = TransportGate::for_tests(device, incarnation);
+    gate.begin_quiescing().unwrap();
+    gate
+}
+
+/// census: S2-permit-reservation-identity transport.rs issue_handover_permit `reservation.device != self.device || reservation.incarnation != self.incarnation`
+#[test]
+fn c0_2ci_guard_handover_permit_refuses_a_reservation_for_another_recipient() {
+    let incarnation = IncarnationId::first();
+    let other_device = DrmDeviceKey {
+        major: 226,
+        minor: 1,
+    };
+    for reservation in [
+        RecipientReservation::new_for_tests(other_device, incarnation),
+        RecipientReservation::new_for_tests(handover_device(), incarnation.next()),
+    ] {
+        let mut gate = quiescing_gate(handover_device(), incarnation);
+        let result = gate.issue_handover_permit(
+            drained(incarnation),
+            &[],
+            &super::tests::writer_coverage_for_tests(),
+            reservation,
+        );
+        assert!(
+            matches!(result, Err(ResourceError::WrongIncarnation)),
+            "a reservation for another recipient must be refused, got {result:?} [census:S2-permit-reservation-identity]"
+        );
+    }
+}
