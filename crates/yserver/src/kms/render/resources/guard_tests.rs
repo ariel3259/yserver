@@ -321,3 +321,82 @@ fn c0_2ci_guard_gpu_batch_refuses_read_staging_without_pending_obligation() {
         "a staging obligation that is no longer pending must be refused [census:F-read-staging-pending]"
     );
 }
+
+/// census: G-adopt-exhausted mod.rs adopt_unchecked `self.exhausted`
+#[test]
+fn c0_2ci_guard_adopt_refuses_when_exhausted() {
+    let (mut service, _held, _drops) = spy_service();
+    service.force_exhausted_for_tests();
+    let result = service.adopt(AllocationPayload::Spy(SpyAllocation {
+        drops: Rc::new(Cell::new(0)),
+    }));
+    assert!(
+        matches!(result, Err((ResourceError::Exhausted, _))),
+        "an exhausted service must refuse adoption [census:G-adopt-exhausted]"
+    );
+}
+
+/// census: G-reserve-exhausted mod.rs reserve `self.exhausted`
+#[test]
+fn c0_2ci_guard_reserve_refuses_when_exhausted() {
+    let (mut service, held, _drops) = spy_service();
+    service.force_exhausted_for_tests();
+    assert_eq!(
+        service.reserve(held.key(), UseKind::Read).err(),
+        Some(ResourceError::Exhausted),
+        "an exhausted service must refuse a reservation [census:G-reserve-exhausted]"
+    );
+}
+
+/// census: G-register-exhausted mod.rs register `self.exhausted`
+#[test]
+fn c0_2ci_guard_register_refuses_when_exhausted() {
+    let (mut service, held, _drops) = spy_service();
+    service.force_exhausted_for_tests();
+    assert_eq!(
+        service.register(held.key(), ObligationKind::Gpu),
+        Err(ResourceError::Exhausted),
+        "an exhausted service must refuse a new obligation [census:G-register-exhausted]"
+    );
+}
+
+/// census: H-adopt-file-owned mod.rs adopt `payload.file_owned_alias_present()`
+#[test]
+fn c0_2ci_guard_adopt_refuses_live_file_owned_payload() {
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let right = DrmCleanupRight::new(device_key, IncarnationId::first(), 70, 71, GemOwner::Right);
+    let file_owned = FileOwnedBacking::new(right, None, device).unwrap();
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let payload = AllocationPayload::Scanout(ScanoutAllocation::new(Some(file_owned), shared));
+    let mut service = ResourceService::new(device_key, IncarnationId::first());
+    assert!(
+        matches!(
+            service.adopt(payload),
+            Err((ResourceError::InvalidState, _))
+        ),
+        "adopt must refuse a payload with a live file-owned alias [census:H-adopt-file-owned]"
+    );
+}
+
+/// census: I-teardown-requires-frozen mod.rs apply_teardown_release `!avail.frozen`
+#[test]
+fn c0_2ci_guard_teardown_release_refuses_unfrozen_entry() {
+    let (mut service, held, _drops) = spy_service();
+    let supervisor = RetainingSupervisor::new();
+    let proof = supervisor.issue_teardown_release(IncarnationId::first(), vec![held.key()]);
+    assert_eq!(
+        service.apply_teardown_release(proof),
+        Err(ResourceError::InvalidState),
+        "teardown release must refuse an entry that is not frozen [census:I-teardown-requires-frozen]"
+    );
+}
