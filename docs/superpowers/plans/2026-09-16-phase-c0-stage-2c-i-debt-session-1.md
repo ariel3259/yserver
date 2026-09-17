@@ -2,7 +2,7 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have (see *Execution split*): at an [H] step, stop and hand off. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox (probed: `Read-only file system` on `~/Projects/yserver/.git`). At each "hand off for commit" step, stop with the tree dirty; the coordinating session verifies and commits with the message given.
 
-**Goal:** Prove every session-1 refusal guard of the stage 2c-i resource service with a test that fails when that guard is deleted, and ship the census that measures it.
+**Goal:** Prove every session-1 refusal guard (28) of the stage 2c-i resource service with a test that fails when that guard is deleted, and ship the census that measures it.
 
 **Architecture:** A committed mutation-census tool (`tools/guard-census.py`) neutralises each guard and runs the `c0_2ci` suite; a guard counts as proven only when a test **tagged** for it fails with that guard's own assertion marker. New tests live in one focused module, `resources/guard_tests.rs`, one family per task. No production code changes in this session.
 
@@ -38,10 +38,11 @@ Do not work around an [H] step by dropping `--include-ignored` from a full censu
 
 Found while writing this plan; the spec is amended in Task 1's commit so plan and spec agree:
 
-1. **Family B loses `consume_owner_write`.** Testing "refuses unless Owner" needs a grant issued *in* Owner, and today Owner is reached only through `issue_handover_permit` with the empty `WriterCoverageProof::new_for_tests()` / `RecipientReservation::new_for_tests()` that session 2 (spec §4.4) reshapes. Written now, the test would be rewritten there. It moves to session 2 with family A. **Session 1 is 27 guards.**
+1. **Family B loses `consume_owner_write`.** Testing "refuses unless Owner" needs a grant issued *in* Owner, and today Owner is reached only through `issue_handover_permit` with the empty `WriterCoverageProof::new_for_tests()` / `RecipientReservation::new_for_tests()` that session 2 (spec §4.4) reshapes. Written now, the test would be rewritten there. It moves to session 2 with family A.
 2. **Family C wording.** Spec §3.1 says `consume` "re-arms the direct role". The two `consume` guards are in `CompletionRetired`: one returns the error when moving the old `Current` into its reserved retirement slot fails, the other when moving the new `Submitted` into `Current` fails. Nothing is re-armed.
-3. **Session-1 acceptance (spec §5.1).** §5.1 requires "zero survivors over the enumerated baseline of section 2", but that baseline includes session 2's guards; it was written before the stage was split. Amended so session 1 is accepted with all 27 of its guards proven by oracle and exactly the eight session-2 survivors left.
-4. **Guard 437's observable.** `on_available` checks `transition_error` twice. Deleting the first `return` still returns the same error at the second, so "returns `Err`" does not prove it. What the first guard protects is that **rejected resources are not processed after a releasing-half error**; that is its test's assertion.
+3. **Session-1 acceptance (spec §5.1).** §5.1 requires "zero survivors over the enumerated baseline of section 2", but that baseline includes session 2's guards; it was written before the stage was split. Amended so session 1 is accepted with all of its guards proven by oracle and exactly the eight session-2 survivors left.
+4. **Family C gains a sibling (user's call, 2026-09-16).** Task 1's full enumeration found one `} else if` guard the published census could not see, in `consume`: when no retirement slot was pre-reserved and `OrdinaryRetirement` is vacant, a failed move of the old `Current` into it is returned. It survives, and it is the same invariant in the same path as family C's two `consume` guards. It joins Task 5. **Session 1 is 28 guards.** Task 8's census therefore uses the full enumeration (68 sites): under `--legacy-enumeration` the new tag would name a site that enumeration does not list.
+5. **Guard 437's observable.** `on_available` checks `transition_error` twice. Deleting the first `return` still returns the same error at the second, so "returns `Err`" does not prove it. What the first guard protects is that **rejected resources are not processed after a releasing-half error**; that is its test's assertion.
 
 ## File Structure
 
@@ -1014,7 +1015,7 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 
 ---
 
-### Task 5: Family C — consumer error propagation (4 guards)
+### Task 5: Family C — consumer error propagation (5 guards)
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/resources/guard_tests.rs` (append)
@@ -1022,7 +1023,9 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 **Interfaces:**
 - Consumes: `spy`; `CommitResourceConsumer::{new, consume, on_available, prereserve_retirement}` and its `pub(crate)` fields `releasing_resources`, `rejected_resources`, `released_presents`, `capacity`; `CommitResources`' `pub(crate)` field `allocations`; `RoleReservation::new_for_test(DirectRole, u64, Rc<Cell<bool>>)`; `CommitResources::{new, with_direct_role}`; `crate::kms::owner::ledger::Submitted::{new, accepted}`; `crate::kms::owner::device::OwnerEvent::CompletionRetired` (fully qualified: `OwnerEvent` is not re-exported by `resources`).
 
-**Why:** a `RoleReservation` built with `new_for_test` is never reserved in the consumer's `DirectCapacity`, so `move_into_reserved`, `move_role` and `finish_role` reject it with `InvalidState` — the same technique as `tests.rs`'s `c0_2ci_capacity_on_available_error_restores_all_resources_safely`. Dropping an undischarged `RoleReservation` only sets its `closed` cell; it does not panic. These four sites need a swallow strategy: the `if let` bindings make `if false` uncompilable.
+**Why:** a `RoleReservation` built with `new_for_test` is never reserved in the consumer's `DirectCapacity`, so `move_into_reserved`, `move_role` and `finish_role` reject it with `InvalidState` — the same technique as `tests.rs`'s `c0_2ci_capacity_on_available_error_restores_all_resources_safely`. Dropping an undischarged `RoleReservation` only sets its `closed` cell; it does not panic. These five sites need a swallow strategy: the `if let` bindings make `if false` uncompilable.
+
+The fifth guard is the `} else if` branch Task 1 found: with no retirement slot pre-reserved for the commit and `OrdinaryRetirement` vacant, `consume` moves the old `Current` there and returns the error if that move fails. Its tag must reproduce the tool's identity exactly, including the spaces its line-join leaves inside the method chain (`self .capacity .move_role`).
 
 - [ ] **Step 1: Append the tests**
 
@@ -1056,6 +1059,32 @@ fn c0_2ci_guard_completion_retired_returns_failed_move_into_reserved() {
         Err(ResourceError::InvalidState),
         "a failed move of the old Current into its reserved slot must be returned \
          [census:C-retire-move-into-reserved]"
+    );
+    assert!(consumer.capacity.is_admission_closed());
+}
+
+/// census: C-retire-move-into-ordinary-retirement commit.rs consume `self.capacity.is_vacant(DirectRole::OrdinaryRetirement) && let Err(err) = self .capacity .move_role(role, DirectRole::OrdinaryRetirement)`
+#[test]
+fn c0_2ci_guard_completion_retired_returns_failed_move_into_ordinary_retirement() {
+    let (mut service, old_alloc, _drops) = spy_service();
+    let mut consumer = CommitResourceConsumer::new();
+    // No retirement slot pre-reserved for this commit and OrdinaryRetirement
+    // vacant: consume takes the `else if` branch. The Current token was never
+    // reserved in the consumer's capacity, so move_role rejects it.
+    let old = CommitResources::new(vec![old_alloc], None, None, None, vec![], vec![])
+        .with_direct_role(RoleReservation::new_for_test(DirectRole::Current, 999, closed_cell()));
+    let accepted = crate::kms::owner::ledger::Submitted::new(vec![old], vec![]).accepted();
+    assert_eq!(
+        consumer.consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: CommitId::for_tests(922),
+                resources: accepted,
+            },
+            &mut service,
+        ),
+        Err(ResourceError::InvalidState),
+        "a failed move of the old Current into a vacant OrdinaryRetirement must be returned \
+         [census:C-retire-move-into-ordinary-retirement]"
     );
     assert!(consumer.capacity.is_admission_closed());
 }
@@ -1156,12 +1185,12 @@ fn c0_2ci_guard_on_available_returns_rejected_half_error() {
 - [ ] **Step 2: Run the tests; they pass**
 
 Run: `cargo test -p yserver --lib c0_2ci_guard_`
-Expected: `23 passed`. A failure is an F8 stop.
+Expected: `24 passed`. A failure is an F8 stop.
 
 - [ ] **Step 3: Run the oracle**
 
 Run: `tools/guard-census.py --files commit.rs --deterministic-only --require-oracle --fn consume`, then the same with `--fn on_available`.
-Expected: the four tagged sites `CAUGHT_BY_ORACLE`, exit 0. `CAUGHT_WHOLE_BODY` for one means only the whole-body strategy compiled there, which does not prove the guard: stop and report the site, as for `A_MANO`.
+Expected: the five tagged sites `CAUGHT_BY_ORACLE`, exit 0. `CAUGHT_WHOLE_BODY` for one means only the whole-body strategy compiled there, which does not prove the guard: stop and report the site, as for `A_MANO`.
 
 - [ ] **Step 4: Gate, then hand off for commit**
 
@@ -1174,8 +1203,9 @@ git add crates/yserver/src/kms/render/resources/guard_tests.rs
 git commit -m "test(kms): prove the commit consumer reports transition failures
 
 Family C of the stage 2c-i debt. CompletionRetired returns the error when
-moving the old Current into its reserved slot fails and when moving the
-new Submitted into Current fails; on_available returns its rejected-half
+moving the old Current into its reserved slot fails, when moving it into a
+vacant OrdinaryRetirement fails (the else-if sibling the census tool
+found), and when moving the new Submitted into Current fails; on_available returns its rejected-half
 error, and after a releasing-half error leaves rejected resources
 untouched -- the observable its first transition_error check protects,
 since the second check returns the same error.
@@ -1296,7 +1326,7 @@ fn c0_2ci_guard_commit_dependencies_refuse_duplicate_new_members() {
 - [ ] **Step 2: Run the tests; they pass**
 
 Run: `cargo test -p yserver --lib c0_2ci_guard_`
-Expected: `26 passed`. A failure is an F8 stop.
+Expected: `27 passed`. A failure is an F8 stop.
 
 - [ ] **Step 3: Run the oracle**
 
@@ -1413,20 +1443,20 @@ Run and keep the output for the coordinator:
 - `cargo test -p yserver --lib c0_2ci`
 - `for i in $(seq 1 12); do cargo test -p yserver --lib c0_2ci 2>&1 | grep "test result"; done`
 - `cargo test --workspace`
-- `tools/guard-census.py --deterministic-only --require-oracle --json /tmp/census-oracle.json` — every one of the 27 tagged sites `CAUGHT_BY_ORACLE`, exit 0.
+- `tools/guard-census.py --deterministic-only --require-oracle --json /tmp/census-oracle.json` — every one of the 28 tagged sites `CAUGHT_BY_ORACLE`, exit 0.
 
-Expected: all clean; `c0_2ci` gains 27 tests with zero failures over twelve runs. **Stop and hand off.**
+Expected: all clean; `c0_2ci` gains 28 tests with zero failures over twelve runs. **Stop and hand off.**
 
 - [ ] **Step 2 [H]: Full acceptance census**
 
-Run: `tools/guard-census.py --legacy-enumeration --require-oracle --json /tmp/census-session-1.json` (about an hour)
+Run: `tools/guard-census.py --require-oracle --json /tmp/census-session-1.json` (about an hour; full enumeration, 68 sites — the legacy one does not list the `else if` guard Task 5 tags)
 Expected:
-- all 27 tagged sites `CAUGHT_BY_ORACLE`; no `CAUGHT_NOT_BY_ORACLE`, `CAUGHT_WHOLE_BODY`, `ORPHAN_TAG` or `A_MANO`;
+- all 28 tagged sites `CAUGHT_BY_ORACLE`; no `CAUGHT_NOT_BY_ORACLE`, `CAUGHT_WHOLE_BODY`, `ORPHAN_TAG` or `A_MANO`;
 - `CAUGHT`: 32, the already-proven untagged sites;
 - `SURVIVES`: exactly **8** — `issue_handover_permit` (2) and `publish_owner` (3) and `consume_owner_write`'s non-Owner check in `transport.rs`, and the error arms of `cancel_pre_submit_batch` and `freeze_uncertain_batch` in `gpu.rs`;
 - exit 0.
 
-Any other survivor, or any of the 27 not proven by its own oracle, means session 1 is not complete.
+Any other survivor, or any of the 28 not proven by its own oracle, means session 1 is not complete.
 
 - [ ] **Step 3 [H]: Hardware gate**
 
@@ -1434,4 +1464,4 @@ Run: `cargo test -p yserver --lib c0_2ci -- --ignored`. Expected: all hardware t
 
 - [ ] **Step 4 [H]: Record and commit**
 
-Create `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md` with: the census summary and a table of site, verdict, bound test and strategy; the eight remaining survivors and the session-2 section each belongs to; the Task 1 `} else if` findings; any F8 stops; and both the implementer's and the coordinator's gate transcripts. In the spec's status line add: "Session 1 executed: 27 guards proven by oracle; see `…-census-session-1.md`." Commit with the coordinator's trailer.
+Create `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md` with: the census summary and a table of site, verdict, bound test and strategy; the eight remaining survivors and the session-2 section each belongs to; the Task 1 `} else if` findings; any F8 stops; and both the implementer's and the coordinator's gate transcripts. In the spec's status line add: "Session 1 executed: 28 guards proven by oracle; see `…-census-session-1.md`." Commit with the coordinator's trailer.

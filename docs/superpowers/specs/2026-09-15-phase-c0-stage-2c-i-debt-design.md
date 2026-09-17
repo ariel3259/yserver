@@ -107,9 +107,10 @@ writer class while `Closed` (its `Quiescing` arm is already proven).
 (section 4.4): proving it requires a grant issued in Owner, reached today
 only through the handover tokens 4.4 reshapes.
 
-**C. Consumer error propagation** (`commit.rs`, 4). `consume`, on
+**C. Consumer error propagation** (`commit.rs`, 5). `consume`, on
 `CompletionRetired`, returns the error when moving the old `Current` into its
-reserved retirement slot fails, and when moving the new `Submitted` into
+reserved retirement slot fails, when moving it into a vacant
+`OrdinaryRetirement` fails, and when moving the new `Submitted` into
 `Current` fails; `on_available` returns its transition error, in both its
 releasing and its rejected halves, rather than `Ok` with admission already
 closed. A failure reported as success is the class R9 exists to prevent.
@@ -142,7 +143,10 @@ live file-owned alias; such a payload must go through `adopt_with_registry`.
 **I. Teardown precondition** (`mod.rs`, 1). `apply_teardown_release` refuses an
 entry that is not frozen.
 
-That is 27 of the 35 survivors. The Owner handover entry's five (family A)
+That is 28 guards: 27 of the published census's 35 survivors, plus the
+`} else if` sibling in family C that the census tool's full enumeration found
+and the published census could not see (see
+`docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-baseline.md`). The Owner handover entry's five (family A)
 move to session 2, section 4.4, because they must be proven on handover
 evidence that session 2 first has to strengthen; proving them now would
 certify a state the contract forbids. The two `gpu.rs` survivors are not test
@@ -295,15 +299,14 @@ scope, after family A's five guards.
 
 ### 5.1. Acceptance
 
-**Session 1:** each of its 27 guards is `CAUGHT_BY_ORACLE` — killed by the test
+**Session 1:** each of its 28 guards is `CAUGHT_BY_ORACLE` — killed by the test
 its tag is bound to, carrying its own marker, under a strategy other than
-whole-body replacement. A census over the legacy enumeration of section 2 (67
-sites) then reports exactly eight survivors, all session-2 scope:
+whole-body replacement. A census over the full enumeration (68 sites: section
+2's 67 plus the `} else if` guard) then reports exactly eight survivors, all
+session-2 scope:
 `issue_handover_permit` (2) and `publish_owner` (3), `consume_owner_write`'s
 non-Owner check, and the error arms of `cancel_pre_submit_batch` and
-`freeze_uncertain_batch`. Guards the full enumeration finds beyond the legacy
-67 are reported with their verdicts and are not accepted or rejected by
-session 1: their scope is a separate decision.
+`freeze_uncertain_batch`.
 
 **Part 3:** as stated in section 9 — run by the user on an active VT with DRM
 master, mutations included, output reviewed before acceptance.
