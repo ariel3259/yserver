@@ -2,6 +2,8 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. Stop with the tree dirty; the coordinating session verifies and commits.
 
+**Revision 2 (2026-09-17)** — incorporates codex round 1 (`docs/superpowers/findings/2026-09-17-part-3-plan-review-round1.md`: 2 blocking, 3 major), all five verified against the tree. See *Corrections from review round 1*.
+
 **Goal:** Put a managed scanout buffer on screen through a page flip the kernel actually accepts, and prove the stage 2c-i ledger against the kernel's own completion and out-fence instead of a synthesized event.
 
 **Architecture:** A second hardware fixture, beside the existing ones, that takes DRM master and builds its output from the live card through the production probe. Four `_drm` tests over it, one per invariant of spec section 9.2. Nothing existing changes shape: the current fixtures keep opening the node without master, so the tests that encode the no-master outcome keep meaning what they mean.
@@ -18,6 +20,16 @@ Session 2's plan handed the implementer verbatim blocks, because the coordinatin
 
 So this plan fixes the **fixture contract**, the **invariants**, and the **commands the user runs**, and leaves the test bodies to the implementer. What the implementer can still verify mechanically is stated per task: it compiles, it lints, the deterministic suite is unaffected, and the new tests **fail** rather than pass when run without master.
 
+## Corrections from review round 1
+
+| Finding | Disposition |
+| --- | --- |
+| **B-1** — the fixture had no display-restoration contract, only "drops master on drop"; a panicking test (which the mutations deliberately cause) could leave the console on test contents | **Fixed.** The fixture snapshots the prior CRTC state and tears down in a stated, unwind-safe order: restore the original connector/CRTC/framebuffer **while master and the test resources are still alive**, then destroy the test resources, then drop master. A failed restoration is reported loudly rather than swallowed by the panic in flight. This is what the feasibility probe already did; the plan had not carried it over. |
+| **B-2** — P3-4 gave the out-fence two owners | **Fixed.** Verified in the tree: `submit_flip_with_fences` hands the fd to `bo.state.transition_to_pending(out_fence)`, which keeps it as `release_fence_fd` — the BO state is the canonical owner. The test observes fence status through that owner and closes nothing; if it needs an independent fd it `dup`s one and closes only its own copy. |
+| **M-1** — nothing serialised tests sharing one device, one master and one CRTC | **Fixed.** The run command pins `--test-threads=1`, and the fixture additionally takes a process-wide exclusive guard, so a future filter or a stray parallel invocation cannot make two fixtures contend for master or consume each other's DRM events. |
+| **M-2** — the census tool cannot produce the two named mutations | **Fixed, by extending the instrument.** Verified: the P3-3 mutation must make `if !retained_in_new` register anyway, and the tool only forces conditions to `false` and only enumerates refusal guards. Task 1 adds a `--named-mutation` mode carrying those two edits explicitly, reusing the tool's restore-from-memory and compile-check discipline, so spec 9.3 step 3 is satisfied literally — the mutations still run through the census tool. |
+| **M-3** — the master-held audit of the existing tests was inferred, not executed | **Fixed.** Correct: the suite ran while master was *available*, but the fixtures' own fds never held it, so the gamma test's behaviour under master was never observed. Task 6 adds a scoped, master-held execution of that exact path on the fixture's master-holding fd, and records what the kernel actually does. The ordinary fixture keeps its no-master semantics untouched. |
+
 ## Global Constraints
 
 - **R12, sharpened.** Every test here carries the `_drm` suffix and `#[ignore]`, and **detects whether it holds master**. Without master it reports an environmental failure — `panic!` with a message naming the cause — and never passes. A test that cannot tell "no master" from "passed" is the one defect this part exists to avoid.
@@ -25,8 +37,10 @@ So this plan fixes the **fixture contract**, the **invariants**, and the **comma
 - **F3:** do not mock `ResourceService`; the tests drive the real service.
 - **F8:** if an invariant cannot be proven because the code or the driver does not do what the spec assumes, **stop and report it**. A part-3 test that cannot pass is a finding about the ledger or the driver, which is the point of the exercise; it is never something to weaken into a pass.
 - **The existing fixtures keep opening the node without master.** `KmsBackend::for_tests_with_vk*` and `PlatformBackend::for_tests` are not touched. `c0_2ci_sink_gamma_gate_four_states_drm` asserts the gamma ioctl is *reached and fails* — true only without master (see the prior measurement). If a change here would put master under it, that is an F8 stop, not a silent edit of its assertion.
-- **Master is released on drop.** The fixture drops master in its `Drop`, so a panicking test still returns the console.
+- **The console comes back, even from a panic (round-1 B-1).** The fixture snapshots the CRTC configuration it found and tears down in this order, in `Drop` as well as on the success path: **restore** the original connector/CRTC/framebuffer, with master and the test framebuffers still alive; **then** destroy the test resources; **then** drop master. A restoration that fails is reported loudly — a panicking test must not hide it.
+- **One live-KMS fixture at a time (round-1 M-1).** Master is per-fd and the CRTC is shared, so two fixtures in one process would fight. The fixture takes a process-wide exclusive guard for its lifetime, and the run command pins `--test-threads=1`. Both, not either.
 - **`OUT_FENCE_PTR` writes an `s32`.** Read it into `i32`, as `scene.rs` already does. A wider destination reads a bogus fd — measured: `0xFFFFFFFF00000004` for fd `4`.
+- **The out-fence has exactly one owner (round-1 B-2).** `submit_flip_with_fences` hands the fd to `bo.state.transition_to_pending`, which keeps it as `release_fence_fd`. Tests observe it **through that owner** and close nothing; an independent observation `dup`s the fd and closes only the duplicate. A test that closes the BO's fd leaves a dead descriptor behind and can later double-close it.
 - Every new test name starts with `c0_2ci_` (the census runs `cargo test -p yserver --lib c0_2ci`).
 - Gate before each hand-off: `cargo +nightly fmt`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p yserver --lib c0_2ci`.
 - The implementer does not run `git commit`, `git add`, `git checkout`, `git stash`, `git apply` or `rm -f`, and does not claim any `_drm` test passes: its sandbox has no `/dev/dri`. The coordinating session commits each task, with the trailer `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)`. Never a session URL in a commit message.
@@ -44,24 +58,76 @@ So this plan fixes the **fixture contract**, the **invariants**, and the **comma
 
 - Modify: `crates/yserver/src/kms/executor/test_support.rs` — master acquisition on an already-open node, with the R12 failure message (Task 1).
 - Modify: `crates/yserver/src/kms/render/backend.rs` — the live-KMS fixture beside the existing ones (Task 1).
-- Create: `crates/yserver/src/kms/render/part3_tests.rs` — the four `_drm` tests (Tasks 2–4), declared from `render/mod.rs` under `#[cfg(test)]`.
-- Create ([H], user + coordinator): `docs/superpowers/findings/2026-09-17-part-3-flip-accepted.md` (Task 5).
+- Create: `crates/yserver/src/kms/render/part3_tests.rs` — the `_drm` tests (Tasks 3–6), declared from `render/mod.rs` under `#[cfg(test)]`.
+- Modify: `tools/guard-census.py` — a `--named-mutation` mode for the two lifecycle mutations spec 9.3 step 3 names (Task 1).
+- Create ([H], user + coordinator): `docs/superpowers/findings/2026-09-17-part-3-flip-accepted.md` (Task 7).
 
 ---
 
-### Task 1: The live-KMS fixture
+### Task 1: The mutation instrument for part 3's two named mutations
+
+**Files:**
+- Modify: `tools/guard-census.py`
+
+**Why this comes first.** Spec 9.3 step 3 requires part 3's named mutations to
+be run "with the census tool from section 3.0". Round-1 M-2 showed the tool
+cannot express them: it enumerates **refusal guards** (`return Err/false/None`)
+and forces their conditions to `false`, while P3-2's mutation relocates a
+lifecycle step and P3-3's must make `if !retained_in_new` register **anyway**.
+The instrument is extended rather than bypassed, so the discipline that makes a
+mutation trustworthy -- restore from memory even on failure or Ctrl-C, and count
+nothing that did not compile -- still applies.
+
+**Interfaces:**
+- Produces: `tools/guard-census.py --named-mutation {p3-2,p3-3} --filter <cargo test filter> [--dry-run]`, which refuses unless the unmutated filtered suite is green; applies the one edit its name carries; **refuses to count a mutant that did not compile**; runs the filtered suite; reports which tests failed; and restores the file from memory in a `finally`, as the existing census already does. `--dry-run` applies the edit, confirms it compiles, prints the diff and restores, without running the suite.
+- The two edits, by name:
+  - **`p3-2`** -- discharge the `KmsRelease` obligation at submission instead of at the kernel completion, so "not released before the completion" becomes false;
+  - **`p3-3`** -- register a KMS obligation for a **retained** member, by making `commit.rs`'s `if !retained_in_new` branch register regardless.
+- Each edit is anchored by the exact source text it replaces, never by line number, and the tool **fails loudly when its anchor no longer matches**: a silently skipped mutation is the failure mode this whole stage exists to prevent.
+
+- [ ] **Step 1: Extend the tool**
+
+- [ ] **Step 2: Prove both anchors still match**
+
+Run: `python3 tools/guard-census.py --named-mutation p3-3 --filter c0_2ci_commit --dry-run`, then the same for `p3-2`.
+Expected: each edit applies and compiles, and the printed diff is the edit its name promises. A non-matching anchor is an F8 stop, not a guess at the intended site.
+
+- [ ] **Step 3: Gate, then hand off for commit**
+
+Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
+Expected: clean; **180 passed, 18 ignored** -- this task touches no Rust source.
+
+```bash
+git add tools/guard-census.py
+git commit -m "tools(census): named mutations for part 3
+
+Spec 9.3 step 3 requires part 3's two mutations to run through the
+census tool, but the tool only neutralises refusal guards: P3-2's
+mutation relocates a lifecycle step and P3-3's must make a branch
+register where it currently skips (review round 1, M-2).
+--named-mutation carries those two edits explicitly, anchored by source
+text, and reuses the tool's restore-from-memory and compile-check
+discipline.
+
+Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
+```
+
+---
+
+### Task 2: The live-KMS fixture
 
 **Files:**
 - Modify: `crates/yserver/src/kms/executor/test_support.rs`, `crates/yserver/src/kms/render/backend.rs`
 
 **Interfaces:**
 - Produces: `KmsBackend::for_tests_with_live_kms() -> Result<LiveKmsFixture, io::Error>`, where `LiveKmsFixture` owns the backend and drops master on drop. Its contract:
+  0. takes the process-wide exclusive guard (round-1 M-1) and holds it for its whole lifetime;
   1. builds the `VkContext` first, and opens **the primary node that `VK_EXT_physical_device_drm` reports for the physical device Vulkan selected** — the existing `TestDevice::open_real_drm_matching` path, not a blind `card0`;
   2. takes DRM master on it. On `EACCES` it **panics** with a message that names the cause: master is granted to the seat's active session, so the test must run from an active VT. Never a skip, never a pass;
   3. probes that device's connectors, picks the first **connected** one with modes, resolves its encoder, CRTC and primary plane, and builds the output through the production path `crate::drm::modeset::output_for_exact_probe_assignment`, with the connector's preferred mode. A box with no connected output panics with that reason;
   4. installs that `ActiveOutput`, and allocates the scanout pool at the mode's real resolution;
   5. **reports, on stdout, the card path, the connector name and the mode it selected** — spec 9.3 step 2 requires the run to say which card was used;
-  6. drops master in `Drop`.
+  6. **snapshots the CRTC configuration it found before touching it** and, on teardown — success or panic alike — restores it **while master and the test framebuffers are still alive**, then destroys the test resources, then drops master (round-1 B-1). A failed restoration is reported loudly, never swallowed by the panic in flight.
 - Consumes: `TestDevice::open_real_drm_matching`, `output_for_exact_probe_assignment`, `ActiveOutput::new`, and whatever the existing `for_tests_with_vk_live_scene` uses to attach the Vulkan context and build pools — reuse it rather than duplicating it.
 
 - [ ] **Step 1: Write the master helper**
@@ -107,7 +173,7 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 
 ---
 
-### Task 2: P3-1 — a managed buffer goes on screen through an accepted flip
+### Task 3: P3-1 — a managed buffer goes on screen through an accepted flip
 
 **Files:**
 - Create: `crates/yserver/src/kms/render/part3_tests.rs`; modify `crates/yserver/src/kms/render/mod.rs` to declare it under `#[cfg(test)]`.
@@ -131,7 +197,7 @@ Expected: clean; **180 passed, 19 ignored** — the new test is ignored, and no 
 
 ---
 
-### Task 3: P3-2 and P3-3 — the ledger against real kernel evidence
+### Task 4: P3-2 and P3-3 — the ledger against real kernel evidence
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/part3_tests.rs`
@@ -150,7 +216,7 @@ Expected: clean; **180 passed, 21 ignored**.
 
 ---
 
-### Task 4: P3-4 — the out-fence resolves
+### Task 5: P3-4 — the out-fence resolves
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/part3_tests.rs`
@@ -159,7 +225,7 @@ Expected: clean; **180 passed, 21 ignored**.
 
 - The fence comes back through `submit_flip_with_fences`'s `out_fence` parameter, which is an `i32` — see the Global Constraints; a wider type reads a bogus fd.
 - "Canonical status query" means the same query the production code uses to decide a fence is signalled; find it and use it, rather than inventing a poll.
-- The test owns the fd it receives and closes it.
+- **The test does not own the fd** (round-1 B-2): `submit_flip_with_fences` hands it to `bo.state.transition_to_pending`, which keeps it as `release_fence_fd`. Observe the fence through that owner. If an independent observation is genuinely needed, `dup` the fd and close only the duplicate, saying in the test which owner closes which descriptor.
 
 - [ ] **Step 1: Write the test**
 
@@ -171,7 +237,37 @@ Expected: clean; **180 passed, 22 ignored**.
 
 ---
 
-### Task 5: The run protocol, the mutations, and the record
+### Task 6: What the gamma path does when its own fd holds master
+
+**Files:**
+- Modify: `crates/yserver/src/kms/render/part3_tests.rs`
+
+**Why (round-1 M-3).** Spec 9.2's last paragraph asks which existing hardware
+tests encode the no-master outcome, answered **by running them with master**.
+The feasibility measurement ran the suite while master was merely *available*;
+the fixtures' own fds never held it, so
+`c0_2ci_sink_gamma_gate_four_states_drm`'s Legacy arm -- which asserts the gamma
+ioctl is reached **and fails** -- was only ever inferred to be master-dependent.
+
+**Invariant:** on a fd that **does** hold master, the same gamma path either
+succeeds or fails for a reason that is not "no master", and the result is
+recorded. This test does not change the existing one; it measures what the
+existing one's assertion rests on.
+
+- [ ] **Step 1: Write the test** over the live-KMS fixture, driving the same
+  gamma entry point the existing test drives. If the outcome contradicts what
+  the existing test encodes, **do not edit that test**: report it as an F8 stop
+  for Task 7's record and a decision for the stage owner.
+
+- [ ] **Step 2: Compile, lint, deterministic suite**
+
+Expected: clean; **180 passed, 23 ignored**.
+
+- [ ] **Step 3: Hand off for commit.**
+
+---
+
+### Task 7: The run protocol, the mutations, and the record
 
 This task is **not** the implementer's to execute. The implementer writes Step 1's command file; the user runs it from an active VT; the coordinator records the result.
 
@@ -179,8 +275,8 @@ This task is **not** the implementer's to execute. The implementer writes Step 1
 
 Write `docs/superpowers/plans/part-3-run.sh` — the exact, copy-pasteable sequence spec 9.3 step 2 requires, which:
 - refuses to start unless `loginctl show-seat seat0 -p ActiveSession` names this session (the check the user would otherwise forget, and the one that turns a confusing failure into a clear refusal);
-- runs `cargo test -p yserver --lib c0_2ci -- --ignored --nocapture` filtered to the part-3 tests, so the fixture's card/connector/mode report is visible;
-- then runs the mutations of Step 3 below, under the same filter, through `tools/guard-census.py`;
+- runs `cargo test -p yserver --lib c0_2ci -- --ignored --nocapture --test-threads=1` filtered to the part-3 tests, so the fixture's card/connector/mode report is visible and no two of them hold the device at once (round-1 M-1);
+- then runs the mutations of Step 3 below, under the same filter, through `tools/guard-census.py --named-mutation` (Task 1);
 - writes everything to `/tmp/part3-run.log` and prints where it put it.
 
 - [ ] **Step 2 (user): run it**
@@ -190,8 +286,10 @@ From a VT that is the seat's **active** session — on this box tty2, with the d
 - [ ] **Step 3 (user, inside that script): the named mutations**
 
 Each must fail its named test, and each must be confirmed to have compiled:
-- **for P3-2:** discharge the `KmsRelease` obligation on submission instead of on the kernel completion — the test must fail on the "not released before" half, which is the half that distinguishes real evidence from a synthesized event;
-- **for P3-3:** register an obligation for the retained buffer — the test must fail on R6's retained-member clause.
+- **`--named-mutation p3-2`:** discharge the `KmsRelease` obligation on submission instead of on the kernel completion — the test must fail on the "not released before" half, the half that distinguishes real evidence from a synthesized event;
+- **`--named-mutation p3-3`:** register an obligation for the retained buffer — the test must fail on R6's retained-member clause.
+
+Neither mutation counts unless the tool reports that it compiled.
 
 - [ ] **Step 4 (coordinator): record**
 
@@ -201,6 +299,7 @@ Then add to the spec's status line: "Part 3 executed: …", naming what was prov
 
 ## Self-review notes
 
-- **Spec coverage.** 9.2's four invariants map to Tasks 2–4; 9.2's last paragraph (which existing tests encode the no-master outcome) was already answered by the prior measurement and is carried into the Global Constraints as a "do not touch". 9.3's four steps map to Task 5. 9.4 is carried into Task 5's record.
+- **Spec coverage.** 9.2's four invariants map to Tasks 3-5; its last paragraph — which existing tests encode the no-master outcome — maps to Task 6, which **executes** it on a master-holding fd instead of inferring it (round-1 M-3). 9.3's four steps map to Task 7, whose mutations run through the instrument Task 1 adds (round-1 M-2). 9.4 is carried into Task 7's record.
 - **The one thing this plan cannot promise.** Whether P3-1 is achievable at all on this driver. The feasibility probe proved the kernel path with dumb buffers; the managed path imports a Vulkan image through PRIME and flips *that*. If NVIDIA refuses it, the honest output of this plan is an F8 report, and the stage still gains the fixture and the three other invariants.
 - **Why no verbatim code.** Stated above, under "Why this plan states invariants instead of supplying code". The trade is deliberate: unrunnable prescribed code would be worse than an invariant the implementer must satisfy and the user must witness.
+- **What round 1 changed about the risk profile.** Two of its five findings were about what happens when a test *fails*: the console left on test contents (B-1) and an fd closed twice (B-2). Both matter more here than in an ordinary stage, because part 3's mutations deliberately make tests panic on a live display. The teardown order and the fd ownership are now stated as constraints, not left to the test body.
