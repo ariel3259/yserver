@@ -400,3 +400,158 @@ fn c0_2ci_guard_teardown_release_refuses_unfrozen_entry() {
         "teardown release must refuse an entry that is not frozen [census:I-teardown-requires-frozen]"
     );
 }
+
+fn closed_cell() -> Rc<Cell<bool>> {
+    Rc::new(Cell::new(false))
+}
+
+/// census: C-retire-move-into-reserved commit.rs consume `let Err((err, recovered)) = self.capacity.move_into_reserved(role, reserved)`
+#[test]
+fn c0_2ci_guard_completion_retired_returns_failed_move_into_reserved() {
+    let (mut service, old_alloc, _drops) = spy_service();
+    let mut consumer = CommitResourceConsumer::new();
+    let commit = CommitId::for_tests(920);
+    // Never reserved in the consumer's capacity: move_into_reserved rejects it.
+    consumer.prereserve_retirement(
+        commit,
+        RoleReservation::new_for_test(DirectRole::OrdinaryRetirement, 998, closed_cell()),
+    );
+    let old =
+        CommitResources::new(vec![old_alloc], None, None, None, vec![], vec![]).with_direct_role(
+            RoleReservation::new_for_test(DirectRole::Current, 999, closed_cell()),
+        );
+    let accepted = crate::kms::owner::ledger::Submitted::new(vec![old], vec![]).accepted();
+    assert_eq!(
+        consumer.consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit,
+                resources: accepted,
+            },
+            &mut service,
+        ),
+        Err(ResourceError::InvalidState),
+        "a failed move of the old Current into its reserved slot must be returned \
+         [census:C-retire-move-into-reserved]"
+    );
+    assert!(consumer.capacity.is_admission_closed());
+}
+
+/// census: C-retire-move-into-ordinary-retirement commit.rs consume `self.capacity.is_vacant(DirectRole::OrdinaryRetirement) && let Err(err) = self .capacity .move_role(role, DirectRole::OrdinaryRetirement)`
+#[test]
+fn c0_2ci_guard_completion_retired_returns_failed_move_into_ordinary_retirement() {
+    let (mut service, old_alloc, _drops) = spy_service();
+    let mut consumer = CommitResourceConsumer::new();
+    // No retirement slot pre-reserved for this commit and OrdinaryRetirement
+    // vacant: consume takes the `else if` branch. The Current token was never
+    // reserved in the consumer's capacity, so move_role rejects it.
+    let old =
+        CommitResources::new(vec![old_alloc], None, None, None, vec![], vec![]).with_direct_role(
+            RoleReservation::new_for_test(DirectRole::Current, 999, closed_cell()),
+        );
+    let accepted = crate::kms::owner::ledger::Submitted::new(vec![old], vec![]).accepted();
+    assert_eq!(
+        consumer.consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: CommitId::for_tests(922),
+                resources: accepted,
+            },
+            &mut service,
+        ),
+        Err(ResourceError::InvalidState),
+        "a failed move of the old Current into a vacant OrdinaryRetirement must be returned \
+         [census:C-retire-move-into-ordinary-retirement]"
+    );
+    assert!(consumer.capacity.is_admission_closed());
+}
+
+/// census: C-retire-submitted-to-current commit.rs consume `let Some(ref mut role) = res.direct_role && role.role == DirectRole::Submitted && let Err(err) = self.capacity.move_role(role, DirectRole::Current)`
+#[test]
+fn c0_2ci_guard_completion_retired_returns_failed_submitted_to_current() {
+    let (mut service, new_alloc, _drops) = spy_service();
+    let mut consumer = CommitResourceConsumer::new();
+    let new =
+        CommitResources::new(vec![new_alloc], None, None, None, vec![], vec![]).with_direct_role(
+            RoleReservation::new_for_test(DirectRole::Submitted, 997, closed_cell()),
+        );
+    let accepted = crate::kms::owner::ledger::Submitted::new(vec![], vec![new]).accepted();
+    assert_eq!(
+        consumer.consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: CommitId::for_tests(921),
+                resources: accepted,
+            },
+            &mut service,
+        ),
+        Err(ResourceError::InvalidState),
+        "a failed move of the new Submitted into Current must be returned \
+         [census:C-retire-submitted-to-current]"
+    );
+    assert!(consumer.capacity.is_admission_closed());
+}
+
+/// census: C-on-available-releasing-early-return commit.rs on_available `let Some(err) = transition_error` #1
+#[test]
+fn c0_2ci_guard_on_available_leaves_rejected_untouched_after_releasing_error() {
+    let (mut service, releasing_alloc, _drops) = spy_service();
+    let rejected_alloc = spy(&mut service);
+    let rejected_key = rejected_alloc.key();
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.releasing_resources = vec![
+        CommitResources::new(vec![releasing_alloc], None, None, None, vec![], vec![])
+            .with_direct_role(RoleReservation::new_for_test(
+                DirectRole::Preparing,
+                999,
+                closed_cell(),
+            )),
+    ];
+    // Releasable and roleless: processing it would drop it.
+    consumer.rejected_resources = vec![CommitResources::new(
+        vec![rejected_alloc],
+        None,
+        None,
+        None,
+        vec![],
+        vec![],
+    )];
+    // Both the first and the second transition_error check return the same
+    // error, so the return value cannot tell them apart. What the first one
+    // protects is the rejected half: it must not be processed after an error.
+    assert_eq!(
+        consumer.on_available(&[], &mut service),
+        Err(ResourceError::InvalidState)
+    );
+    // "Untouched", not just "still one": the same resource, still holding the
+    // same allocation, and nothing released on its behalf.
+    let rejected: Vec<Vec<AllocationKey>> = consumer
+        .rejected_resources
+        .iter()
+        .map(|r| r.allocations.iter().map(|a| a.key()).collect())
+        .collect();
+    assert_eq!(
+        (rejected, consumer.released_presents.len()),
+        (vec![vec![rejected_key]], 0),
+        "rejected resources must be left untouched after a releasing-half error \
+         [census:C-on-available-releasing-early-return]"
+    );
+}
+
+/// census: C-on-available-rejected-error commit.rs on_available `let Some(err) = transition_error` #2
+#[test]
+fn c0_2ci_guard_on_available_returns_rejected_half_error() {
+    let (mut service, rejected_alloc, _drops) = spy_service();
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.rejected_resources = vec![
+        CommitResources::new(vec![rejected_alloc], None, None, None, vec![], vec![])
+            .with_direct_role(RoleReservation::new_for_test(
+                DirectRole::Preparing,
+                999,
+                closed_cell(),
+            )),
+    ];
+    assert_eq!(
+        consumer.on_available(&[], &mut service),
+        Err(ResourceError::InvalidState),
+        "a failed finish_role on a rejected resource must be returned \
+         [census:C-on-available-rejected-error]"
+    );
+}
