@@ -69,7 +69,7 @@ Found while writing this plan; the spec is amended in Task 1's commit so plan an
   ```
   `<condition>` is the guard's condition with whitespace collapsed — for an `if` guard, the text between `if ` and ` {`; for a refusing match arm, the pattern followed by ` =>`. `#<n>` is the 1-based occurrence among identical conditions in the same function, omitted when unique there. The guard's assertion message must contain `[census:<MARKER>]`.
 - **Binding rules, enforced by the tool:** every tag is bound to the `fn` directly below it; a marker appears once; a site is tagged at most once. One site, one marker, one test.
-- **Precondition:** the tool runs the suite once unmutated and refuses unless it compiles and is green.
+- **Preconditions:** every run executes the suite once unmutated and refuses unless it compiles and is green. A full census (authoritative, attributable to a commit) also refuses uncommitted changes in its target files; a `--deterministic-only` oracle check does not, because it is never authoritative and must run over an implementer's uncommitted edits, which restoring from memory preserves.
 - **Mutation strategies**, tried in order until one compiles: an `if` guard's condition forced to `false`; only its refusal `return` replaced by a use of the payload (for `if let` guards whose bindings the body uses); its whole body replaced the same way (when statements before the `return` move a value the function still needs). A refusing match arm becomes `=> Ok(())`. A site no strategy compiles is `A_MANO` and never counts.
 - **Verdicts:** `SURVIVES`; `CAUGHT` (untagged site); `CAUGHT_BY_ORACLE` (the site's bound test failed and its failure carries the site's marker); `CAUGHT_NOT_BY_ORACLE` (tagged, but its own test did not fail with its marker); `CAUGHT_WHOLE_BODY` (tagged and killed only under the whole-body strategy, which also deletes the statements before the refusal — **not** an oracle proof); `A_MANO`; `ORPHAN_TAG` (a tag names no enumerated site).
 
@@ -89,8 +89,9 @@ is bound to fails, carrying the guard's own [census:MARKER].
 Spec: docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md,
 sections 2, 3.0 and 5.1.
 
-This mutates source files and runs cargo. It refuses to start if the target
-files have uncommitted changes or the unmutated suite is not green, and
+This mutates source files and runs cargo. A full census refuses to start if
+the target files have uncommitted changes; every run refuses if the unmutated
+suite is not green; and it
 restores every file it touches from its original contents held in memory --
 not with git, which a sandboxed implementer may not be able to write to --
 even on failure or Ctrl-C. It is a developer
@@ -307,8 +308,14 @@ def main():
     by_marker, by_site = load_tags()
     rels = [str((RESOURCES / f).relative_to(ROOT)) for f in args.files]
     if not args.list:
-        if subprocess.run(["git", "diff", "--quiet", "--", *rels], cwd=ROOT).returncode:
-            sys.exit("REFUSING: target files have uncommitted changes; the tool restores them with git checkout.")
+        # A full census is authoritative evidence and must be attributable to a
+        # commit, so it requires the target files clean. A --deterministic-only
+        # oracle check is never authoritative and runs while an implementer's
+        # edits are uncommitted; restoring from memory preserves those edits.
+        if not args.deterministic_only and subprocess.run(
+                ["git", "diff", "--quiet", "--", *rels], cwd=ROOT).returncode:
+            sys.exit("REFUSING: a full census must run on committed target files; "
+                     "commit first, or use --deterministic-only --require-oracle for an oracle check.")
         # A mutation counts as caught when a test fails. If the unmutated suite
         # already fails -- typically hardware tests run where there is no GPU or
         # DRM access, e.g. inside a sandbox -- every mutation would look caught,

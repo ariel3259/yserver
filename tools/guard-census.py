@@ -9,8 +9,9 @@ is bound to fails, carrying the guard's own [census:MARKER].
 Spec: docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md,
 sections 2, 3.0 and 5.1.
 
-This mutates source files and runs cargo. It refuses to start if the target
-files have uncommitted changes or the unmutated suite is not green, and
+This mutates source files and runs cargo. A full census refuses to start if
+the target files have uncommitted changes; every run refuses if the unmutated
+suite is not green; and it
 restores every file it touches from its original contents held in memory --
 not with git, which a sandboxed implementer may not be able to write to --
 even on failure or Ctrl-C. It is a developer
@@ -227,8 +228,14 @@ def main():
     by_marker, by_site = load_tags()
     rels = [str((RESOURCES / f).relative_to(ROOT)) for f in args.files]
     if not args.list:
-        if subprocess.run(["git", "diff", "--quiet", "--", *rels], cwd=ROOT).returncode:
-            sys.exit("REFUSING: target files have uncommitted changes; the tool restores them with git checkout.")
+        # A full census is authoritative evidence and must be attributable to a
+        # commit, so it requires the target files clean. A --deterministic-only
+        # oracle check is never authoritative and runs while an implementer's
+        # edits are uncommitted; restoring from memory preserves those edits.
+        if not args.deterministic_only and subprocess.run(
+                ["git", "diff", "--quiet", "--", *rels], cwd=ROOT).returncode:
+            sys.exit("REFUSING: a full census must run on committed target files; "
+                     "commit first, or use --deterministic-only --require-oracle for an oracle check.")
         # A mutation counts as caught when a test fails. If the unmutated suite
         # already fails -- typically hardware tests run where there is no GPU or
         # DRM access, e.g. inside a sandbox -- every mutation would look caught,
