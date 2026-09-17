@@ -39,6 +39,17 @@ pub enum PresentError {
     NoFb,
     #[error("scanout bo state machine wrong phase: {0:?}")]
     WrongPhase(BoPhase),
+    /// Round-2 B-2 (stage 2c-i debt): a managed submission that failed AND
+    /// whose batch could not be unwound. `cause` is kept structurally, not
+    /// flattened into text, because callers classify it -- a device loss
+    /// buried in a formatted string stops latching the fatal renderer state.
+    /// `unwind` is the ledger error, rendered, since this layer sits below
+    /// `resources`.
+    #[error("{cause}; unwinding the managed batch also failed: {unwind}")]
+    ManagedUnwind {
+        cause: Box<PresentError>,
+        unwind: String,
+    },
 }
 
 impl From<vk::Result> for PresentError {

@@ -208,8 +208,14 @@ impl DirectOwnershipState for FakeDirectOwnershipState {
     }
 }
 
+/// Spec 4.2 (stage 2c-i debt), round-1 B-2: a handle names the gate it
+/// closes. `device`/`incarnation` are what a holder validates against its
+/// own identity before installing one; `forced_closed` doubles as the gate's
+/// instance identity, since it is the very cell that gate reads.
 #[derive(Clone, Debug)]
 pub(crate) struct TransportGateHandle {
+    device: DrmDeviceKey,
+    incarnation: IncarnationId,
     forced_closed: Rc<Cell<bool>>,
 }
 
@@ -220,6 +226,20 @@ impl TransportGateHandle {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.forced_closed.get()
+    }
+
+    pub(crate) fn device(&self) -> DrmDeviceKey {
+        self.device
+    }
+
+    pub(crate) fn incarnation(&self) -> IncarnationId {
+        self.incarnation
+    }
+
+    /// True when both handles name the same gate instance, not merely the
+    /// same device and incarnation.
+    pub(crate) fn same_gate(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.forced_closed, &other.forced_closed)
     }
 }
 
@@ -277,7 +297,7 @@ impl TransportGate {
     /// and not retired -- read live from the real state given at
     /// construction (M-13), never from a setter on this gate.
     pub(crate) fn begin_quiescing(&mut self) -> Result<(), ResourceError> {
-        if self.state == TransportState::Closed {
+        if self.state() == TransportState::Closed {
             return Err(ResourceError::Detached);
         }
         if self.ownership.direct_ownership_busy()
@@ -315,10 +335,18 @@ impl TransportGate {
 
     pub(crate) fn handle(&self) -> TransportGateHandle {
         TransportGateHandle {
+            device: self.device,
+            incarnation: self.incarnation,
             forced_closed: Rc::clone(&self.forced_closed),
         }
     }
 
+    /// The effective state. Round-2 B-1: every transition below consults
+    /// this, never the raw `self.state`, because a close can arrive through a
+    /// `TransportGateHandle` -- which owns no `&mut TransportGate` and can
+    /// only set the shared flag. A handle-driven close must be as terminal as
+    /// `close()` itself: no quiescing, no permit, no publication, no grant
+    /// after it.
     pub(crate) fn state(&self) -> TransportState {
         if self.forced_closed.get() {
             TransportState::Closed
@@ -368,7 +396,7 @@ impl TransportGate {
         &mut self,
         class: WriterClass,
     ) -> Result<OwnerWriteGrant, ResourceError> {
-        if self.state != TransportState::Owner {
+        if self.state() != TransportState::Owner {
             return Err(ResourceError::Detached);
         }
         if self.closed_admission.get() {
@@ -399,7 +427,7 @@ impl TransportGate {
             self.force_close();
             return Err((ResourceError::WrongIncarnation, grant));
         }
-        if self.state != TransportState::Owner {
+        if self.state() != TransportState::Owner {
             return Err((ResourceError::Detached, grant));
         }
         if !self.issued_serials.remove(&grant.serial) {
@@ -488,7 +516,7 @@ impl TransportGate {
         if permit.device != self.device || permit.incarnation != self.incarnation {
             return Err(ResourceError::WrongIncarnation);
         }
-        if self.state != TransportState::Quiescing {
+        if self.state() != TransportState::Quiescing {
             return Err(ResourceError::Busy);
         }
         if self.outstanding_owner_writes != 0 {

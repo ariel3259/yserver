@@ -385,6 +385,29 @@ pub(crate) fn cancel_pre_submit_batch(
     }
 }
 
+/// Spec 4.2 (stage 2c-i debt): unwinds a managed batch whose submission
+/// failed, for the caller to propagate. A submission that may have reached
+/// the GPU freezes its entries and closes the transport (2c-i design section
+/// 4: "Unknown submission retains its reservation and closes the affected
+/// transport"); one that provably did not cancels them, and closes the
+/// transport only if that cancel fails -- the ledger no longer matches what
+/// the batch registered.
+pub(crate) fn abandon_unsubmitted_batch(
+    service: &mut ResourceService,
+    entries: &[(AllocationKey, ObligationId)],
+    gpu_submitted: bool,
+) -> Result<(), ResourceError> {
+    if gpu_submitted {
+        service.close_transport_gate();
+        return freeze_uncertain_batch(service, entries);
+    }
+    let result = cancel_pre_submit_batch(service, entries);
+    if result.is_err() {
+        service.close_transport_gate();
+    }
+    result
+}
+
 /// Task 5.3: a submission whose outcome is uncertain (dispatch may or may
 /// not have reached the GPU) freezes every obligation it was about to
 /// register, rather than cancelling them -- the allocations must not be

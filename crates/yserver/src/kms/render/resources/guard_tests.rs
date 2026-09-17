@@ -815,3 +815,184 @@ fn c0_2ci_guard_unknown_husk_registration_cannot_consume_another_husks_count() {
         Some("pool husk accounting failed")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Session 2, spec 4.2: a failed managed submission's unwind is propagated,
+// and the transport closes when the submission is uncertain or unwinding
+// fails.
+// ---------------------------------------------------------------------------
+
+use crate::kms::{render::scene::managed_submit_failure, vk::compositor::PresentError};
+
+/// A service with one spy entry holding a pending GPU obligation, and a
+/// legacy transport gate installed on it.
+fn submission_fixture() -> (
+    ResourceService,
+    AllocationLease,
+    ObligationId,
+    TransportGate,
+) {
+    let (mut service, held, _drops) = spy_service();
+    let obligation = service.register(held.key(), ObligationKind::Gpu).unwrap();
+    let gate = TransportGate::for_tests(service.device(), IncarnationId::first());
+    service.set_transport_gate(gate.handle()).unwrap();
+    (service, held, obligation, gate)
+}
+
+/// census: S2-gate-install-identity mod.rs set_transport_gate `gate.device() != self.device || gate.incarnation() != self.incarnation`
+#[test]
+fn c0_2ci_guard_service_refuses_a_transport_gate_for_another_transport() {
+    let (mut service, _held, _obligation, _gate) = submission_fixture();
+    let other_device = TransportGate::for_tests(
+        DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        },
+        IncarnationId::first(),
+    );
+    let other_incarnation =
+        TransportGate::for_tests(service.device(), IncarnationId::first().next());
+    for foreign in [&other_device, &other_incarnation] {
+        assert_eq!(
+            service.set_transport_gate(foreign.handle()),
+            Err(ResourceError::WrongIncarnation),
+            "a service must refuse a gate for another transport [census:S2-gate-install-identity]"
+        );
+    }
+    service.close_transport_gate();
+    assert_eq!(other_device.state(), TransportState::Legacy);
+    assert_eq!(other_incarnation.state(), TransportState::Legacy);
+}
+
+/// census: S2-gate-install-replacement mod.rs set_transport_gate `let Some(installed) = &self.transport_gate && !installed.same_gate(&gate)`
+#[test]
+fn c0_2ci_guard_service_refuses_a_second_transport_gate() {
+    let (mut service, _held, _obligation, gate) = submission_fixture();
+    // Same device and incarnation, a different gate instance.
+    let replacement = TransportGate::for_tests(service.device(), IncarnationId::first());
+    assert_eq!(
+        service.set_transport_gate(replacement.handle()),
+        Err(ResourceError::InvalidState),
+        "a service must refuse to swap the transport it closes [census:S2-gate-install-replacement]"
+    );
+    // Re-installing the gate already there is idempotent.
+    service.set_transport_gate(gate.handle()).unwrap();
+    service.close_transport_gate();
+    assert_eq!(gate.state(), TransportState::Closed);
+    assert_eq!(replacement.state(), TransportState::Legacy);
+}
+
+/// Round-2 B-2: a failed unwind must not cost the cause its identity. The
+/// caller latches the fatal renderer state on a device loss, and it
+/// classifies the error it is handed.
+#[test]
+fn c0_2ci_failed_unwind_keeps_a_device_loss_recognisable() {
+    let (mut service, held, obligation, _gate) = submission_fixture();
+    service.cancel(held.key(), obligation).unwrap();
+    let err = managed_submit_failure(
+        &mut service,
+        &[(held.key(), obligation)],
+        false,
+        PresentError::Vk(ash::vk::Result::ERROR_DEVICE_LOST),
+    );
+    assert!(
+        crate::kms::render::scene::present_error_is_device_lost(&err),
+        "a device loss must survive a failed unwind, got {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("unwinding the managed batch also failed"),
+        "and the unwind failure must still be reported, got {err}"
+    );
+}
+
+/// census: S2-cancel-pre-submit-error gpu.rs cancel_pre_submit_batch `Some(err) =>`
+#[test]
+fn c0_2ci_guard_failed_pre_submit_cancel_is_reported_and_closes_transport() {
+    let (mut service, held, obligation, gate) = submission_fixture();
+    // The obligation is already gone, so the unwind's cancel must fail.
+    service.cancel(held.key(), obligation).unwrap();
+    let err = managed_submit_failure(
+        &mut service,
+        &[(held.key(), obligation)],
+        false,
+        PresentError::NoFb,
+    );
+    assert!(
+        err.to_string()
+            .contains("unwinding the managed batch also failed"),
+        "a failed pre-submit cancel must reach the caller, got {err} [census:S2-cancel-pre-submit-error]"
+    );
+    assert_eq!(gate.state(), TransportState::Closed);
+}
+
+/// census: S2-freeze-uncertain-error gpu.rs freeze_uncertain_batch `Some(err) =>`
+#[test]
+fn c0_2ci_guard_failed_uncertain_freeze_is_reported_and_closes_transport() {
+    let (mut service, held, obligation, gate) = submission_fixture();
+    // A key from another incarnation cannot be frozen here.
+    let err = managed_submit_failure(
+        &mut service,
+        &[(wrong_incarnation(held.key()), obligation)],
+        true,
+        PresentError::NoFb,
+    );
+    assert!(
+        err.to_string()
+            .contains("unwinding the managed batch also failed"),
+        "a failed freeze of an uncertain submission must reach the caller, got {err} [census:S2-freeze-uncertain-error]"
+    );
+    assert_eq!(gate.state(), TransportState::Closed);
+}
+
+/// Round-2 B-1: a close that arrives through the service's handle is as
+/// terminal as `close()`. The handle can only set the shared flag, so every
+/// transition has to read the effective state, not the raw field. This
+/// covers `begin_quiescing`; the Owner-side transitions need the handover
+/// evidence Task 4 reshapes, so they are proven in Task 5.
+#[test]
+fn c0_2ci_service_driven_close_stops_the_gate_quiescing() {
+    let (service, _held, _obligation, mut gate) = submission_fixture();
+    service.close_transport_gate();
+    assert_eq!(gate.state(), TransportState::Closed);
+    assert_eq!(
+        gate.begin_quiescing(),
+        Err(ResourceError::Detached),
+        "a transport closed through its handle must refuse to quiesce"
+    );
+}
+
+#[test]
+fn c0_2ci_uncertain_submission_freezes_and_closes_transport() {
+    let (mut service, held, obligation, gate) = submission_fixture();
+    let err = managed_submit_failure(
+        &mut service,
+        &[(held.key(), obligation)],
+        true,
+        PresentError::NoFb,
+    );
+    assert!(matches!(err, PresentError::NoFb), "got {err}");
+    assert_eq!(
+        gate.state(),
+        TransportState::Closed,
+        "an uncertain submission must close the transport"
+    );
+    assert!(
+        service.is_frozen(&held.key()),
+        "an uncertain submission must freeze its entries"
+    );
+}
+
+#[test]
+fn c0_2ci_pre_submit_failure_cancels_and_leaves_transport_open() {
+    let (mut service, held, obligation, gate) = submission_fixture();
+    let err = managed_submit_failure(
+        &mut service,
+        &[(held.key(), obligation)],
+        false,
+        PresentError::NoFb,
+    );
+    assert!(matches!(err, PresentError::NoFb), "got {err}");
+    assert_eq!(gate.state(), TransportState::Legacy);
+    assert!(!service.has_pending_obligation(&held.key(), obligation));
+}
