@@ -14,6 +14,8 @@ pub(crate) mod transport;
 #[cfg(test)]
 mod adapter_tests;
 #[cfg(test)]
+mod guard_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 use std::{
