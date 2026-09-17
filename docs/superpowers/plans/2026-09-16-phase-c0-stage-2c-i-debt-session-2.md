@@ -2,9 +2,11 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have: at an [H] step, stop and hand off. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. At each "hand off for commit" step, stop with the tree dirty; the coordinating session verifies and commits with the message given.
 
+**Revision 2 (2026-09-17)** — incorporates codex round 1 (`docs/superpowers/findings/2026-09-17-stage-2c-i-debt-session-2-plan-review-round1.md`: 3 blocking, 2 major) and the user's decisions on it. See *Corrections from review round 1*.
+
 **Goal:** Land the four mechanism items of spec section 4 — husk accounting bound to identity, propagated GPU unwind errors with the transport close they owe, the reset-boundary test, and handover evidence — and prove family A and `consume_owner_write`'s non-Owner refusal on that evidence, so the census over the resource service reports zero survivors.
 
-**Architecture:** Every code change in this plan was prototyped on `fd02ae6e` by the coordinating session, and the prototype passed the full gate (see *Provenance*). The production edits are unified diffs, applied mechanically with `patch`; the tests are verbatim blocks appended to `resources/guard_tests.rs`, plus one new module, `resources/reset_boundary_tests.rs`. Guards get `/// census:` tags so `tools/guard-census.py` proves each by its own oracle, as in session 1.
+**Architecture:** Every code change in this plan was prototyped on `b46830c0` by the coordinating session, and the prototype passed the full gate, hardware included (see *Provenance*). The production edits are unified diffs, applied mechanically with `patch`; the tests are verbatim blocks appended to `resources/guard_tests.rs`, plus one new module, `resources/reset_boundary_tests.rs`. Guards get `/// census:` tags so `tools/guard-census.py` proves each by its own oracle, as in session 1.
 
 **Tech Stack:** Rust (`cargo test`), `patch`, Python 3 (`tools/guard-census.py`, committed in session 1).
 
@@ -12,15 +14,25 @@
 
 ## Global Constraints
 
-- **R8:** nothing built here is production-active. The only production-route edits are: the husk registration now travels with the scanout bo it counts, and `submit_shared_scanout_frame` propagates its unwind error instead of discarding it. Both are inert in production, where no bo is managed and no gate is installed.
+- **R8:** nothing built here is production-active. The production-route edits are: a converted scanout bo hands its own device alias to the registration that counts it, and `submit_shared_scanout_frame` propagates its unwind error instead of discarding it. Both are inert in production, where no bo is managed and no gate is installed.
 - **F3:** do not mock `ResourceService`; tests drive the real service.
 - **F8:** if a step's expected result does not happen, stop and report the exact step, command and output. Never adapt a diff or a test to make it pass.
-- **R12:** hardware tests use a `_vulkan`/`_drm` suffix and `#[ignore]`, and panic on a missing device. None of this session's new tests need hardware.
+- **R12:** hardware tests use a `_vulkan`/`_drm` suffix and `#[ignore]`, and panic on a missing device. None of this session's new tests need hardware, but Task 1 changes code the hardware tests exercise, so Task 6's hardware run is not optional.
 - Every new test name starts with `c0_2ci_`.
 - Every guard assertion's message contains `[census:<MARKER>]`, and the test carries the matching `/// census:` tag (format: session 1 plan, Task 1).
 - Gate before each hand-off: `cargo +nightly fmt`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p yserver --lib c0_2ci`.
 - The implementer does not run `git commit`, `git add`, `git checkout`, `git stash`, `git apply` or `rm -f`. The coordinating session commits every task after verifying it, using the message in the task, whose trailer records provenance: `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)`. Never a session URL in a commit message.
 - Nobody pushes, squashes, rebases or amends.
+
+## Corrections from review round 1
+
+| Finding | Disposition |
+| --- | --- |
+| **B-1** — the husk registration was discharged while the bo's `Rc<drm::Device>` alias stayed alive | **Fixed.** The alias itself now moves into the registration: `ScanoutBo::drm` becomes `Option`, `register_pool_husk` takes the alias by value, and `unregister_pool_husk` drops it as it uncounts it. The count cannot reach zero while the husk's alias lives. Proven by `c0_2ci_husk_registration_owns_the_alias_it_counts`, which watches `Rc::strong_count`. |
+| **B-2** — `ResourceService` could not identify the transport it closed | **Fixed.** `TransportGateHandle` carries its gate's device, incarnation and instance identity; `set_transport_gate` returns `Result` and refuses a handle for another transport (`WrongIncarnation`) or a second, different gate (`InvalidState`), while re-installing the same gate is idempotent. Two new census guards, both proven by oracle. |
+| **B-3** — the reset correction modelled the generation replacement instead of driving it | **Recorded as the F8 stop the spec asks for** (user's decision). The test's module doc states what it does not prove and why, and it is renamed to claim only what it drives: the forced teardown, and the numeric reuse the replacement would produce. The crossing itself stays open for whoever owns the boundary next. |
+| **M-1** — 4.2's real-path criterion replaced by inspection | **Accepted and written down** (user's decision). Both failure arms of the real path return `managed_submit_failure`, so no result can be discarded there; that a call site still calls it is checked by reading, at review, and the spec amendment says the criterion is met that far and no further. |
+| **M-2** — handover evidence still self-asserted | **Not taken** (user's decision). Spec 4.4 asks for explicit evidence for every `WriterClass`, which the plan supplies, with an exhaustive match that fails to compile when a class is added. Minting witnesses from fixtures that install or disable each writer, and reservations from a live `RecipientSlot`, is production-issuer work the spec defers to stages 3/4 (section 6). |
 
 ## How to apply a block
 
@@ -50,26 +62,26 @@ Then apply a diff with `patch -p1 --no-backup-if-mismatch < /tmp/s2-taskN.patch`
 
 Found while prototyping; Task 1 records them in the spec so plan and spec agree:
 
-1. **4.2 — where the close comes from, and what the test drives.** `submit_shared_scanout_frame` receives no transport gate, only the `ResourceService`. The gate handle is therefore installed on the service (`ResourceService::set_transport_gate`), the way `CommitResourceConsumer` already holds one. The real path cannot be made to fail its unwind without Vulkan, DRM and fault injection, so the unwind moves into `scene::managed_submit_failure`, which both failure arms of the real path now return as their `Err` value — there is no result left for the call site to discard. The named tests drive that function. What they cannot see is a call site that stops calling it; that residue is checked by reading the two `return Err(managed_submit_failure(...))` arms at review.
+1. **4.2 — where the close comes from, and what the test drives.** `submit_shared_scanout_frame` receives no transport gate, only the `ResourceService`. The gate handle is therefore installed on the service, the way `CommitResourceConsumer` already holds one, and the handle names its gate so the service can refuse a foreign one. The real path cannot be made to fail its unwind without Vulkan, DRM and fault injection, so the unwind moves into `scene::managed_submit_failure`, which both failure arms of the real path now return as their `Err` value — there is no result left for the call site to discard. The named tests drive that function. What they cannot see is a call site that stops calling it; that residue is checked by reading the two `return Err(managed_submit_failure(...))` arms at review.
 2. **4.2 — when the transport closes.** Following the 2c-i design's section 4 ("Unknown submission retains its reservation and closes the affected transport"): always, when the submission may have reached the GPU, even if the freeze succeeds; and, when it provably did not, only if cancelling its obligations fails.
-3. **4.3 — the generation-replacement half.** `force_destroy_all_clients` is `pub`, but `reset_generation` is `pub(crate)` in `yserver-core` and needs a live poller, setup registry and input inventory. The test therefore drives the forced teardown through the real entry point and models the replacement as what it is at this layer: a fresh `ServerState` over the same backend, whose store and service survive the reset. It does not add wiring. And no code path resolves a proof by XID — proofs carry an `AllocationKey` — so the "resolve by XID" mutation is expressed as resolving the key's newest sibling entry.
+3. **4.3 — the generation-replacement half is an F8 stop.** `force_destroy_all_clients` is `pub`, but `reset_generation` is `pub(crate)` in `yserver-core` and needs a live poller, setup registry and input inventory. Spec 4.3 says an undrivable half is an F8 stop to report, not a reason to add wiring, so that is what this is: the test drives the forced teardown through the real entry point and then reuses the numeric XIDs over the same backend, proving that proofs are keyed by allocation and not by XID. It does not prove the reset's invariant 6, and its module doc says so.
 4. **4.4 — the outstanding-grant guards.** `begin_quiescing` refuses while a grant is outstanding, so no public transition reaches `Quiescing` with one. The tests for the two outstanding-grant guards build that state with the existing `set_outstanding_owner_writes_for_tests`.
-5. **Acceptance census.** The full enumeration grows to **69** sites: session 1's 68 plus `issue_handover_permit`'s new reservation guard. Expected: `CAUGHT_BY_ORACLE` 37 (session 1's 28, family A's 5, `consume_owner_write`'s non-Owner check, the two `gpu.rs` arms and the reservation guard), `CAUGHT` 32, `SURVIVES` **0**. The three new guards in `drm_cleanup.rs` sit outside the census's default files and are proven with `--files drm_cleanup.rs`.
+5. **Acceptance census.** The full enumeration grows to **71** sites: session 1's 68, `issue_handover_permit`'s new reservation guard, and the two new `set_transport_gate` guards. Expected: `CAUGHT_BY_ORACLE` 39, `CAUGHT` 32, `SURVIVES` **0**. The three new guards in `drm_cleanup.rs` sit outside the census's default files and are proven with `--files drm_cleanup.rs`.
 
 ## File Structure
 
-- Modify: `crates/yserver/src/kms/render/resources/drm_cleanup.rs` — `PoolHuskRegistration`; the registry's accounting flag; the token-consuming unregister (Task 1).
-- Modify: `crates/yserver/src/kms/vk/scanout.rs` — `ScanoutBo` holds its registration; `detach_managed_entries` consumes it (Task 1).
-- Modify: `crates/yserver/src/kms/render/platform.rs` — `register_managed_scanout_bo` hands the registration to the bo (Task 1); one test's handover evidence (Task 4).
-- Modify: `crates/yserver/src/kms/render/resources/mod.rs` — re-export (Task 1); the service's transport gate (Task 2); `mod reset_boundary_tests` (Task 3).
+- Modify: `crates/yserver/src/kms/render/resources/drm_cleanup.rs` — `PoolHuskRegistration`, which owns the husk's device alias; the registry's accounting flag; the token-consuming unregister (Task 1).
+- Modify: `crates/yserver/src/kms/vk/scanout.rs` — `ScanoutBo::drm` becomes `Option`; the bo holds its registration; `detach_managed_entries` consumes it (Task 1).
+- Modify: `crates/yserver/src/kms/render/platform.rs` — `register_managed_scanout_bo` moves the alias into the registration (Task 1); one test's handover evidence (Task 4).
+- Modify: `crates/yserver/src/kms/render/resources/mod.rs` — re-export (Task 1); the service's transport gate and its identity guards (Task 2); `mod reset_boundary_tests` (Task 3).
 - Modify: `crates/yserver/src/kms/render/resources/gpu.rs` — `abandon_unsubmitted_batch` (Task 2).
 - Modify: `crates/yserver/src/kms/render/scene.rs` — `managed_submit_failure` and its two call sites (Task 2).
 - Create: `crates/yserver/src/kms/render/resources/reset_boundary_tests.rs` (Task 3).
-- Modify: `crates/yserver/src/kms/render/resources/transport.rs` — identity-bound `RecipientReservation`, test coverage evidence, the reservation guard (Task 4).
+- Modify: `crates/yserver/src/kms/render/resources/transport.rs` — the identified gate handle (Task 2); identity-bound `RecipientReservation`, test coverage evidence, the reservation guard (Task 4).
 - Modify: `crates/yserver/src/kms/render/resources/handoff.rs`, `resources/tests.rs` — callers of the reshaped evidence (Task 4).
 - Modify: `crates/yserver/src/kms/render/resources/guard_tests.rs` — appended sections (Tasks 1, 2, 4, 5).
 - Modify: `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md` (Task 1, corrections; Task 6, status).
-- Create ([H], coordinator): `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-2.md` (Task 6).
+- Create ([H], coordinator): `docs/superpowers/findings/2026-09-17-stage-2c-i-debt-census-session-2.md` (Task 6).
 
 ---
 
@@ -81,42 +93,59 @@ Found while prototyping; Task 1 records them in the spec so plan and spec agree:
 - Modify: `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md`
 
 **Interfaces:**
-- Produces: `DrmCleanupRegistry::register_pool_husk(&mut self) -> PoolHuskRegistration`; `DrmCleanupRegistry::unregister_pool_husk(&mut self, PoolHuskRegistration) -> Result<(), ResourceError>` (`WrongIncarnation` for another device or incarnation, `InvalidProof` for another registry's registration; both set the accounting flag); `try_mint_file_family_closed` refuses with `"pool husk accounting failed"` once the flag is set, checked before the alias count.
-- Produces: `ScanoutBo::{set_husk_registration, take_husk_registration}`; `detach_managed_entries` signature unchanged.
-- Invariants: a registration consumed by its own registry uncounts exactly one alias; any other registration is refused and closes both registries' barriers; a registration dropped undischarged closes its registry's barrier.
+- Produces: `DrmCleanupRegistry::register_pool_husk(&mut self, alias: Rc<crate::drm::Device>) -> PoolHuskRegistration`; `DrmCleanupRegistry::unregister_pool_husk(&mut self, PoolHuskRegistration) -> Result<(), ResourceError>` (`WrongIncarnation` for another device or incarnation, `InvalidProof` for another registry's registration; both set the accounting flag); `try_mint_file_family_closed` refuses with `"pool husk accounting failed"` once the flag is set, checked before the alias count.
+- Produces: `ScanoutBo::{take_husk_alias, set_husk_registration, take_husk_registration}`; `ScanoutBo::take_physical_backing` now returns `Option<ScanoutBoBacking>` (`None` once the alias has moved); `detach_managed_entries`' signature is unchanged.
+- Invariants: the registration owns the alias it counts, so consuming it ends both together, and no registry can certify zero aliases while a husk's alias lives; any registration other than one this registry minted for this device and incarnation is refused and closes both registries' barriers; a registration dropped undischarged closes its registry's barrier.
 
 - [ ] **Step 1: Amend the spec**
 
 In `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md`, insert this subsection immediately before the heading `## 5. Evidence and review`:
 
 ```markdown
-### 4.5. Plan corrections (session 2, 2026-09-16)
+### 4.5. Plan corrections (session 2, 2026-09-17)
 
-Found while prototyping session 2; the plan
+From prototyping session 2 and from codex round 1 on its plan
+(`…-session-2-plan-review-round1.md`). The plan
 (`docs/superpowers/plans/2026-09-16-phase-c0-stage-2c-i-debt-session-2.md`)
 carries the detail.
 
-1. **4.2.** The transport gate handle is installed on the `ResourceService`,
-   the only thing `submit_shared_scanout_frame` receives. The unwind moves
-   into `scene::managed_submit_failure`, which both failure arms of the real
-   path return as their `Err` value, and the named tests drive that function:
-   failing the real path's unwind needs Vulkan, DRM and fault injection. A
-   call site that stops calling it is checked by reading, at review.
-2. **4.2.** The transport closes whenever the submission may have reached
+1. **4.1.** The husk registration **owns** the alias it accounts for: the
+   scanout bo's own `Rc<drm::Device>` moves into it at conversion, and
+   consuming the registration drops it. Round 1's B-1 showed that keeping the
+   alias on the bo let the inventory reach zero while the alias was still
+   alive.
+2. **4.2.** The transport gate handle is installed on the `ResourceService`,
+   the only thing `submit_shared_scanout_frame` receives, and the handle
+   names its gate's device, incarnation and instance so the service refuses a
+   foreign gate or a silent replacement (round-1 B-2). The unwind moves into
+   `scene::managed_submit_failure`, which both failure arms of the real path
+   return as their `Err` value, and the named tests drive that function:
+   failing the real path's unwind needs Vulkan, DRM and fault injection. That
+   a call site still calls it is checked by reading, at review; the 4.2
+   criterion is met that far and no further (round-1 M-1).
+3. **4.2.** The transport closes whenever the submission may have reached
    the GPU, even when the freeze succeeds (2c-i design section 4), and, when
    it provably did not, only if cancelling its obligations fails.
-3. **4.3.** `reset_generation` is `pub(crate)` in `yserver-core`, so the test
-   drives the forced teardown through `force_destroy_all_clients` and models
-   the replacement as a fresh `ServerState` over the same backend. No wiring
-   is added. Proofs carry an `AllocationKey`, so "resolve by XID" is
-   expressed as resolving the key's newest sibling entry.
-4. **4.4.** No public transition reaches `Quiescing` with a grant
+4. **4.3 — F8 stop.** `reset_generation` is `pub(crate)` in `yserver-core`
+   and needs a live poller, setup registry and input inventory, so the
+   generation-replacement half of 4.3 is **not driven**, and this is the F8
+   stop 4.3 itself calls for rather than a reason to add wiring (round-1
+   B-3). The test drives the forced teardown through
+   `force_destroy_all_clients` and then reuses the numeric XIDs over the same
+   backend: it proves proofs are keyed by allocation and not by XID, and it
+   does not prove the reset's invariant 6. The crossing stays open for
+   whoever owns the boundary next.
+5. **4.4.** No public transition reaches `Quiescing` with a grant
    outstanding; the two outstanding-grant tests build that state with
-   `set_outstanding_owner_writes_for_tests`.
-5. **5.1.** The full enumeration is 69 sites (the reservation guard is new).
-   Session 2 is accepted with `CAUGHT_BY_ORACLE` 37, `CAUGHT` 32 and zero
-   survivors, and the three new `drm_cleanup.rs` guards proven by oracle
-   with `--files drm_cleanup.rs`.
+   `set_outstanding_owner_writes_for_tests`. Coverage evidence stays
+   test-side and per-class as 4.4 specifies: minting it from fixtures that
+   install or disable each writer, and reservations from a live
+   `RecipientSlot`, is production-issuer work section 6 defers to stages 3/4
+   (round-1 M-2, not taken).
+6. **5.1.** The full enumeration is 71 sites (the reservation guard and the
+   two `set_transport_gate` guards are new). Session 2 is accepted with
+   `CAUGHT_BY_ORACLE` 39, `CAUGHT` 32 and zero survivors, and the three new
+   `drm_cleanup.rs` guards proven by oracle with `--files drm_cleanup.rs`.
 ```
 
 - [ ] **Step 2: Apply the production diff**
@@ -127,7 +156,26 @@ Extract this task's `diff` block 1 to `/tmp/s2-task1.patch` and apply it (see *H
 diff --git a/crates/yserver/src/kms/render/platform.rs b/crates/yserver/src/kms/render/platform.rs
 --- a/crates/yserver/src/kms/render/platform.rs
 +++ b/crates/yserver/src/kms/render/platform.rs
-@@ -5872,19 +5872,20 @@ impl PlatformBackend {
+@@ -5785,12 +5785,17 @@ impl PlatformBackend {
+             None => None,
+         };
+ 
++        // Spec 4.1 (stage 2c-i debt): `None` means this bo's device alias
++        // already moved into a registration -- it was converted once
++        // already, and converting it again would leave that registration
++        // accounting for nothing.
+         let display_backing = scanout
+             .display_pool_mut()
+             .bos
+             .get_mut(bo_idx)
+             .ok_or(ResourceError::InvalidState)?
+-            .take_physical_backing();
++            .take_physical_backing()
++            .ok_or(ResourceError::InvalidState)?;
+ 
+         // fb_handle/gem_handle presence was validated above, so the only
+         // error `from_scanout_bo_backing` can return cannot occur here.
+@@ -5872,19 +5877,25 @@ impl PlatformBackend {
              .get_mut(output_idx)
              .and_then(Option::as_mut)
              .ok_or(ResourceError::InvalidState)?;
@@ -147,9 +195,14 @@ diff --git a/crates/yserver/src/kms/render/platform.rs b/crates/yserver/src/kms/
          // inventory sees it. `detach_managed_entries` is the real
 -        // unregister site (F2-m1).
 -        registry.register_pool_husk();
-+        // unregister site (F2-m1). Spec 4.1 (stage 2c-i debt): the bo holds
-+        // the registration until then.
-+        display_bo.set_husk_registration(registry.register_pool_husk());
++        // unregister site (F2-m1). Spec 4.1 (stage 2c-i debt): the alias
++        // itself moves into the registration, so consuming the registration
++        // is what drops it -- the count cannot reach zero while the husk's
++        // alias lives. The bo holds the registration until detach.
++        let alias = display_bo
++            .take_husk_alias()
++            .ok_or(ResourceError::InvalidState)?;
++        display_bo.set_husk_registration(registry.register_pool_husk(alias));
          if let Some(renderer_lease) = renderer_lease {
              scanout
                  .copied_mut()
@@ -162,22 +215,36 @@ diff --git a/crates/yserver/src/kms/render/resources/drm_cleanup.rs b/crates/yse
  
  use drm::{
      buffer::Handle as DrmBufferHandle,
-@@ -81,6 +81,28 @@ pub(crate) struct FileFamilyClosed {
+@@ -81,6 +81,42 @@ pub(crate) struct FileFamilyClosed {
      _private: (),
  }
  
-+/// Spec 4.1 (stage 2c-i debt): the proof that one pool husk's
-+/// `Rc<drm::Device>` alias was counted by one specific registry. Minted only
-+/// by `DrmCleanupRegistry::register_pool_husk`; consumed by value by
-+/// `unregister_pool_husk`, which validates it against the registry's own
-+/// identity. Dropping it undischarged fails closed: its registry can never
-+/// mint `FileFamilyClosed` again (the lost-role-token rule).
-+#[derive(Debug)]
++/// Spec 4.1 (stage 2c-i debt): one pool husk's `Rc<drm::Device>` alias,
++/// held by the registry entry that counts it. Minted only by
++/// `DrmCleanupRegistry::register_pool_husk`, which takes the alias by value;
++/// consumed by value by `unregister_pool_husk`, which validates it against
++/// the registry's own identity and drops the alias as it uncounts it -- so
++/// the inventory can never reach zero while the alias is still alive
++/// (round-1 B-1). Dropping the registration undischarged fails closed: its
++/// registry can never mint `FileFamilyClosed` again (the lost-role-token
++/// rule).
 +pub(crate) struct PoolHuskRegistration {
 +    device_key: DrmDeviceKey,
 +    incarnation: IncarnationId,
 +    accounting: Rc<Cell<bool>>,
++    alias: Option<Rc<crate::drm::Device>>,
 +    discharged: bool,
++}
++
++impl std::fmt::Debug for PoolHuskRegistration {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("PoolHuskRegistration")
++            .field("device_key", &self.device_key)
++            .field("incarnation", &self.incarnation)
++            .field("alias_held", &self.alias.is_some())
++            .field("discharged", &self.discharged)
++            .finish()
++    }
 +}
 +
 +impl Drop for PoolHuskRegistration {
@@ -191,7 +258,7 @@ diff --git a/crates/yserver/src/kms/render/resources/drm_cleanup.rs b/crates/yse
  #[allow(dead_code)]
  pub(crate) trait CleanupIo {
      fn remove_fb(&mut self, fb: u32) -> io::Result<()>;
-@@ -155,6 +177,12 @@ pub(crate) struct DrmCleanupRegistry {
+@@ -155,6 +191,12 @@ pub(crate) struct DrmCleanupRegistry {
      payload_alias_keys: BTreeSet<AllocationKey>,
      family_inventory: FamilyInventory,
      returned_descriptors: Vec<std::os::fd::OwnedFd>,
@@ -204,7 +271,7 @@ diff --git a/crates/yserver/src/kms/render/resources/drm_cleanup.rs b/crates/yse
  }
  
  impl std::fmt::Debug for DrmCleanupRegistry {
-@@ -188,6 +216,7 @@ impl DrmCleanupRegistry {
+@@ -188,6 +230,7 @@ impl DrmCleanupRegistry {
              payload_alias_keys: BTreeSet::new(),
              family_inventory: FamilyInventory::default(),
              returned_descriptors: Vec::new(),
@@ -212,7 +279,7 @@ diff --git a/crates/yserver/src/kms/render/resources/drm_cleanup.rs b/crates/yse
          }
      }
  
-@@ -206,6 +235,7 @@ impl DrmCleanupRegistry {
+@@ -206,6 +249,7 @@ impl DrmCleanupRegistry {
              payload_alias_keys: BTreeSet::new(),
              family_inventory: FamilyInventory::default(),
              returned_descriptors: Vec::new(),
@@ -220,7 +287,7 @@ diff --git a/crates/yserver/src/kms/render/resources/drm_cleanup.rs b/crates/yse
          }
      }
  
-@@ -225,6 +255,7 @@ impl DrmCleanupRegistry {
+@@ -225,6 +269,7 @@ impl DrmCleanupRegistry {
              payload_alias_keys: BTreeSet::new(),
              family_inventory: FamilyInventory::default(),
              returned_descriptors: Vec::new(),
@@ -228,17 +295,24 @@ diff --git a/crates/yserver/src/kms/render/resources/drm_cleanup.rs b/crates/yse
          }
      }
  
-@@ -373,13 +404,42 @@ impl DrmCleanupRegistry {
+@@ -373,13 +418,52 @@ impl DrmCleanupRegistry {
              .saturating_sub(count);
      }
  
 -    pub(crate) fn register_pool_husk(&mut self) {
-+    pub(crate) fn register_pool_husk(&mut self) -> PoolHuskRegistration {
++    /// Takes the husk's device alias by value (round-1 B-1): the
++    /// registration owns it from here, and only consuming the registration
++    /// releases it.
++    pub(crate) fn register_pool_husk(
++        &mut self,
++        alias: Rc<crate::drm::Device>,
++    ) -> PoolHuskRegistration {
          self.family_inventory.non_payload_aliases += 1;
 +        PoolHuskRegistration {
 +            device_key: self.device_key,
 +            incarnation: self.incarnation,
 +            accounting: Rc::clone(&self.husk_accounting_failed),
++            alias: Some(alias),
 +            discharged: false,
 +        }
      }
@@ -271,11 +345,14 @@ diff --git a/crates/yserver/src/kms/render/resources/drm_cleanup.rs b/crates/yse
 +        };
 +        self.family_inventory.non_payload_aliases = remaining;
 +        registration.discharged = true;
++        // The alias this registration accounted for ends here, with the
++        // count that named it (round-1 B-1).
++        drop(registration.alias.take());
 +        Ok(())
      }
  
      /// Becomes mintable when every submitter is detached, the helper is
-@@ -418,6 +478,12 @@ impl DrmCleanupRegistry {
+@@ -418,6 +502,12 @@ impl DrmCleanupRegistry {
          if !self.family_inventory.control_closed {
              return Err(io::Error::other("control fd is not closed"));
          }
@@ -303,7 +380,26 @@ diff --git a/crates/yserver/src/kms/render/resources/mod.rs b/crates/yserver/src
 diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/scanout.rs
 --- a/crates/yserver/src/kms/vk/scanout.rs
 +++ b/crates/yserver/src/kms/vk/scanout.rs
-@@ -562,6 +562,11 @@ pub struct ScanoutBo {
+@@ -524,9 +524,15 @@ pub struct ScanoutBo {
+     /// sized for the bo (XRGB8888 → 4 bytes × width × height), and
+     /// the device memory backing it.
+     pub vk_transfer: TransferResources,
+-    /// Shared DRM device handle (for un-registering the framebuffer
+-    /// + closing the GEM handle in Drop).
+-    drm: Rc<crate::drm::Device>,
++    /// Shared DRM device handle, for un-registering the framebuffer and
++    /// closing the GEM handle in Drop.
++    ///
++    /// Spec 4.1 (stage 2c-i debt): `None` once managed conversion moved this
++    /// alias into the `PoolHuskRegistration` that accounts for it, which is
++    /// what makes the registry's alias count true -- consuming the
++    /// registration drops this very `Rc`. A husk has no framebuffer or GEM
++    /// handle left, so nothing below needs the device again.
++    drm: Option<Rc<crate::drm::Device>>,
+     /// Held to keep image+memory destructors anchored to a live
+     /// device. Cloned per bo from the pool's Arc so individual bos
+     /// can be moved/dropped independently.
+@@ -562,6 +568,11 @@ pub struct ScanoutBo {
      /// the pool slot leaves the entry with zero live uses, dirty, and
      /// destroyable on the very next `service_ready` tick.
      managed: Option<crate::kms::render::resources::AllocationLease>,
@@ -315,7 +411,7 @@ diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/sc
  }
  
  /// Per-bo transfer-side resources (command pool/buffer + staging
-@@ -638,6 +643,27 @@ pub struct ScanoutBoPool {
+@@ -638,6 +649,27 @@ pub struct ScanoutBoPool {
      gbm_device: Option<Rc<GbmDevice>>,
  }
  
@@ -343,7 +439,7 @@ diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/sc
  #[cfg(test)]
  impl ScanoutBoPool {
      pub(crate) fn for_tests() -> Self {
-@@ -766,17 +792,18 @@ impl OutputScanout {
+@@ -766,17 +798,18 @@ impl OutputScanout {
  
      /// F8-M1: `registry` accounts for the husk's `Rc<drm::Device>` clone
      /// left behind by `take_physical_backing` (F2-m1) -- every `ScanoutBo`
@@ -373,7 +469,7 @@ diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/sc
      pub(crate) fn detach_managed_entries(
          &mut self,
          mut registry: Option<&mut crate::kms::render::resources::DrmCleanupRegistry>,
-@@ -787,20 +814,14 @@ impl OutputScanout {
+@@ -787,20 +820,14 @@ impl OutputScanout {
          match self {
              Self::Shared(pool) => {
                  for bo in &mut pool.bos {
@@ -398,7 +494,39 @@ diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/sc
                  }
                  for src in &mut pool.sources {
                      // F8-M1 (resolved open question): no `unregister_pool_husk()`
-@@ -3276,6 +3297,7 @@ impl ScanoutBo {
+@@ -3232,18 +3259,21 @@ impl ScanoutBo {
+     /// pool-slot state (phase, width/height, `managed_key`) is untouched —
+     /// building a `ScanoutAllocation` over the same handles while this bo
+     /// still owns them is exactly the two-closers shape R3 forbids.
+-    pub(crate) fn take_physical_backing(&mut self) -> ScanoutBoBacking {
+-        ScanoutBoBacking {
++    /// `None` once this bo's device alias has moved into a
++    /// `PoolHuskRegistration` (spec 4.1): a bo cannot be converted twice.
++    pub(crate) fn take_physical_backing(&mut self) -> Option<ScanoutBoBacking> {
++        let drm = Rc::clone(self.drm.as_ref()?);
++        Some(ScanoutBoBacking {
+             fb_handle: self.fb_handle.take(),
+             gem_handle: self.gem_handle.take(),
+             gbm_bo: self.gbm_bo.take(),
+-            drm: Rc::clone(&self.drm),
++            drm,
+             image: std::mem::replace(&mut self.vk_image, vk::Image::null()),
+             memory: std::mem::replace(&mut self.vk_memory, vk::DeviceMemory::null()),
+             view: std::mem::replace(&mut self.vk_image_view, vk::ImageView::null()),
+             transfer: std::mem::replace(&mut self.vk_transfer, TransferResources::empty()),
+             vk: Arc::clone(&self.vk),
+-        }
++        })
+     }
+ }
+ 
+@@ -3271,11 +3301,12 @@ impl ScanoutBo {
+             fb_handle: None,
+             gem_handle: None,
+             vk_transfer: TransferResources::empty(),
+-            drm,
++            drm: Some(drm),
+             vk,
              disarmed: false,
              gbm_bo: None,
              managed: None,
@@ -406,7 +534,13 @@ diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/sc
          }
      }
  }
-@@ -3569,6 +3591,7 @@ impl ScanoutBo {
+@@ -3564,11 +3595,12 @@ impl ScanoutBo {
+             fb_handle: framebuffer,
+             gem_handle: gem,
+             vk_transfer: transfer.expect("completed allocation has transfer resources"),
+-            drm,
++            drm: Some(drm),
+             vk,
              disarmed: false,
              gbm_bo,
              managed: None,
@@ -414,10 +548,16 @@ diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/sc
          })
      }
  
-@@ -3586,6 +3609,21 @@ impl ScanoutBo {
+@@ -3586,6 +3618,27 @@ impl ScanoutBo {
          self.managed = Some(lease);
      }
  
++    /// Spec 4.1: takes this bo's own device alias, so it can be moved into
++    /// the registration that accounts for it. `None` once taken.
++    pub(crate) fn take_husk_alias(&mut self) -> Option<Rc<crate::drm::Device>> {
++        self.drm.take()
++    }
++
 +    /// Spec 4.1: keeps the registration for this bo's husk alias until
 +    /// `detach_managed_entries` consumes it.
 +    pub(crate) fn set_husk_registration(
@@ -436,6 +576,60 @@ diff --git a/crates/yserver/src/kms/vk/scanout.rs b/crates/yserver/src/kms/vk/sc
      /// Ends this slot's managed reservation (F2-B1): `detach_managed_entries`
      /// and pool drain/replacement call this, which is what makes the entry
      /// destroyable on the next tick -- not a mere key clear.
+@@ -3781,11 +3834,16 @@ impl ScanoutBo {
+     /// succeeds, so a caller can retain the complete object graph when cleanup
+     /// fails instead of letting ordinary Drop free still-referenced backing.
+     fn release_disposable_drm_resources(&mut self) -> io::Result<()> {
++        // A converted husk has neither handle left and no device alias
++        // (spec 4.1), so there is nothing to release.
++        let Some(drm) = self.drm.as_ref() else {
++            return Ok(());
++        };
+         release_drm_handles_strict(
+             &mut self.fb_handle,
+             &mut self.gem_handle,
+             |framebuffer| {
+-                self.drm.destroy_framebuffer(framebuffer).map_err(|error| {
++                drm.destroy_framebuffer(framebuffer).map_err(|error| {
+                     scanout_io_context(
+                         format!("destroy disposable framebuffer {framebuffer:?}"),
+                         error,
+@@ -3793,7 +3851,7 @@ impl ScanoutBo {
+                 })
+             },
+             |gem| {
+-                self.drm.close_buffer(gem).map_err(|error| {
++                drm.close_buffer(gem).map_err(|error| {
+                     scanout_io_context(format!("close disposable GEM handle {gem:?}"), error)
+                 })
+             },
+@@ -3850,15 +3908,17 @@ impl Drop for ScanoutBo {
+         // DRM-side teardown next: framebuffer references the GEM
+         // handle; both must be released before we free the underlying
+         // memory the dma-buf was exported from.
+-        if let Some(fb) = self.fb_handle.take()
+-            && let Err(e) = self.drm.destroy_framebuffer(fb)
+-        {
+-            log::warn!("drm destroy_framebuffer failed: {e}");
+-        }
+-        if let Some(h) = self.gem_handle.take()
+-            && let Err(e) = self.drm.close_buffer(h)
+-        {
+-            log::warn!("drm close_buffer (gem) failed: {e}");
++        if let Some(drm) = self.drm.as_ref() {
++            if let Some(fb) = self.fb_handle.take()
++                && let Err(e) = drm.destroy_framebuffer(fb)
++            {
++                log::warn!("drm destroy_framebuffer failed: {e}");
++            }
++            if let Some(h) = self.gem_handle.take()
++                && let Err(e) = drm.close_buffer(h)
++            {
++                log::warn!("drm close_buffer (gem) failed: {e}");
++            }
+         }
+ 
+         unsafe {
 ```
 
 Expected: `patch` reports four files patched, no rejects, no fuzz.
@@ -470,6 +664,13 @@ fn husk_registry(incarnation: IncarnationId) -> DrmCleanupRegistry {
     registry
 }
 
+/// A stub device alias for a husk registration: `Device::for_tests` opens
+/// no DRM node, and what the test needs is only the `Rc` whose lifetime the
+/// registration now owns.
+fn husk_alias() -> Rc<crate::drm::Device> {
+    Rc::new(crate::drm::Device::for_tests().expect("stub drm device"))
+}
+
 fn mint_refusal(registry: &mut DrmCleanupRegistry) -> Option<String> {
     registry
         .try_mint_file_family_closed(|_, _| Ok(()))
@@ -477,15 +678,30 @@ fn mint_refusal(registry: &mut DrmCleanupRegistry) -> Option<String> {
         .map(|err| err.to_string())
 }
 
+/// Round-1 B-1: the alias and the count that names it end together, so the
+/// inventory cannot reach zero while the husk's `Rc<drm::Device>` is alive.
 #[test]
-fn c0_2ci_husk_registration_consumed_by_its_registry_lets_the_family_close() {
+fn c0_2ci_husk_registration_owns_the_alias_it_counts() {
     let mut registry = husk_registry(IncarnationId::first());
-    let registration = registry.register_pool_husk();
+    let alias = husk_alias();
+    let watch = Rc::clone(&alias);
+    let registration = registry.register_pool_husk(alias);
+    assert_eq!(
+        Rc::strong_count(&watch),
+        2,
+        "the registration must own the husk's alias"
+    );
     assert_eq!(
         mint_refusal(&mut registry).as_deref(),
-        Some("non-payload aliases still active")
+        Some("non-payload aliases still active"),
+        "the family cannot close while the husk alias is counted"
     );
     registry.unregister_pool_husk(registration).unwrap();
+    assert_eq!(
+        Rc::strong_count(&watch),
+        1,
+        "consuming the registration must drop the alias it counted"
+    );
     assert_eq!(mint_refusal(&mut registry), None);
 }
 
@@ -493,7 +709,7 @@ fn c0_2ci_husk_registration_consumed_by_its_registry_lets_the_family_close() {
 #[test]
 fn c0_2ci_guard_dropped_husk_registration_closes_the_family_barrier() {
     let mut registry = husk_registry(IncarnationId::first());
-    drop(registry.register_pool_husk());
+    drop(registry.register_pool_husk(husk_alias()));
     assert_eq!(
         mint_refusal(&mut registry).as_deref(),
         Some("pool husk accounting failed"),
@@ -506,8 +722,8 @@ fn c0_2ci_guard_dropped_husk_registration_closes_the_family_barrier() {
 fn c0_2ci_guard_foreign_husk_registration_is_refused_and_fails_closed() {
     let mut minted_by = husk_registry(IncarnationId::first());
     let mut presented_to = husk_registry(IncarnationId::first().next());
-    let own = presented_to.register_pool_husk();
-    let foreign = minted_by.register_pool_husk();
+    let own = presented_to.register_pool_husk(husk_alias());
+    let foreign = minted_by.register_pool_husk(husk_alias());
     assert_eq!(
         presented_to.unregister_pool_husk(foreign),
         Err(ResourceError::WrongIncarnation),
@@ -533,8 +749,8 @@ fn c0_2ci_guard_unknown_husk_registration_cannot_consume_another_husks_count() {
     // cannot tell them apart, so only the registry's own correlation can.
     let mut minted_by = husk_registry(IncarnationId::first());
     let mut presented_to = husk_registry(IncarnationId::first());
-    let own = presented_to.register_pool_husk();
-    let unknown = minted_by.register_pool_husk();
+    let own = presented_to.register_pool_husk(husk_alias());
+    let unknown = minted_by.register_pool_husk(husk_alias());
     assert_eq!(
         presented_to.unregister_pool_husk(unknown),
         Err(ResourceError::InvalidProof),
@@ -554,8 +770,8 @@ fn c0_2ci_guard_unknown_husk_registration_cannot_consume_another_husks_count() {
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo +nightly fmt && cargo test -p yserver --lib husk_registration`
-Expected: `4 passed`. A failure is an F8 stop.
+Run: `cargo +nightly fmt && cargo test -p yserver --lib husk`
+Expected: `4 passed`, plus the `_vulkan` husk test ignored. A failure is an F8 stop.
 
 - [ ] **Step 5: Run the oracle**
 
@@ -567,21 +783,24 @@ Expected: `S2-husk-foreign`, `S2-husk-unknown` and `S2-husk-mint-poisoned` each 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
 Expected: clean; `c0_2ci` 163 passed, 18 ignored.
 
-*Reviewer mutations* (coordinator, each must fail a named test): delete `self.accounting.set(true);` from `PoolHuskRegistration::drop` (fails `c0_2ci_guard_dropped_husk_registration_closes_the_family_barrier`); and read `discharge_husk_registration`'s `None => drop(registration),` arm. No test reaches that arm: `detach_managed_entries` needs a Vulkan scanout pool, and every existing detach test passes a registry. What it relies on — a dropped registration fails closed — is proven by the dropped-registration test; the finding records the arm as checked by reading.
+*Reviewer mutations* (coordinator, each must fail a named test): delete `self.accounting.set(true);` from `PoolHuskRegistration::drop` (fails `c0_2ci_guard_dropped_husk_registration_closes_the_family_barrier`); replace `drop(registration.alias.take());` in `unregister_pool_husk` with `std::mem::forget(registration.alias.take());` (fails `c0_2ci_husk_registration_owns_the_alias_it_counts` at the `Rc::strong_count` assertion). Also read `discharge_husk_registration`'s `None => drop(registration),` arm: no deterministic test reaches it, since `detach_managed_entries` needs a Vulkan scanout pool and every existing detach test passes a registry; what it relies on — a dropped registration fails closed — is proven by the dropped-registration test.
 
 The coordinator commits, after verifying, with:
 
 ```bash
 git add crates/yserver/src/kms/render/resources/drm_cleanup.rs crates/yserver/src/kms/render/resources/mod.rs crates/yserver/src/kms/vk/scanout.rs crates/yserver/src/kms/render/platform.rs crates/yserver/src/kms/render/resources/guard_tests.rs docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md
-git commit -m "fix(kms): bind pool-husk accounting to the registry that counted it
+git commit -m "fix(kms): give the pool-husk registration the alias it accounts for
 
 Stage 2c-i debt, spec 4.1. register_pool_husk was an unkeyed += 1 and
 unregister_pool_husk a saturating -= 1, so accounting could be skipped
 and a spurious unregister could consume another husk's count.
-Registering now yields a PoolHuskRegistration the scanout bo holds;
-unregistering consumes it by value and validates it against the
-registry's identity. A foreign, unknown or dropped registration fails
-closed: the registry refuses to mint FileFamilyClosed.
+Registering now takes the husk's own Rc<drm::Device> by value and
+yields a PoolHuskRegistration the scanout bo holds; unregistering
+consumes it, validates it against the registry's identity and drops the
+alias with the count that named it, so the inventory cannot reach zero
+while the husk's alias lives (review round 1, B-1). A foreign, unknown
+or dropped registration fails closed: the registry refuses to mint
+FileFamilyClosed.
 
 Also records the session-2 plan corrections in the spec (4.5).
 
@@ -593,13 +812,13 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ### Task 2: Swallowed GPU errors, and the transport close they owe (spec 4.2)
 
 **Files:**
-- Modify: `crates/yserver/src/kms/render/resources/mod.rs`, `crates/yserver/src/kms/render/resources/gpu.rs`, `crates/yserver/src/kms/render/scene.rs`
+- Modify: `crates/yserver/src/kms/render/resources/mod.rs`, `crates/yserver/src/kms/render/resources/transport.rs`, `crates/yserver/src/kms/render/resources/gpu.rs`, `crates/yserver/src/kms/render/scene.rs`
 - Modify: `crates/yserver/src/kms/render/resources/guard_tests.rs` (append)
 
 **Interfaces:**
-- Consumes: `gpu::{cancel_pre_submit_batch, freeze_uncertain_batch}`; `TransportGateHandle::close_gate`.
-- Produces: `ResourceService::{set_transport_gate(TransportGateHandle), close_transport_gate(&self)}`; `gpu::abandon_unsubmitted_batch(&mut ResourceService, &[(AllocationKey, ObligationId)], gpu_submitted: bool) -> Result<(), ResourceError>`; `scene::managed_submit_failure(&mut ResourceService, &[(AllocationKey, ObligationId)], gpu_submitted: bool, cause: PresentError) -> PresentError`.
-- Invariants: an unwind failure is part of the returned error, never discarded; an uncertain submission closes the transport; a pre-submit failure closes it only when its cancel fails.
+- Consumes: `gpu::{cancel_pre_submit_batch, freeze_uncertain_batch}`.
+- Produces: `TransportGateHandle::{device, incarnation, same_gate}`, filled by `TransportGate::handle`; `ResourceService::set_transport_gate(TransportGateHandle) -> Result<(), ResourceError>` and `ResourceService::close_transport_gate(&self)`; `gpu::abandon_unsubmitted_batch(&mut ResourceService, &[(AllocationKey, ObligationId)], gpu_submitted: bool) -> Result<(), ResourceError>`; `scene::managed_submit_failure(&mut ResourceService, &[(AllocationKey, ObligationId)], gpu_submitted: bool, cause: PresentError) -> PresentError`.
+- Invariants: a service closes only its own transport, and never silently swaps it; an unwind failure is part of the returned error, never discarded; an uncertain submission closes the transport; a pre-submit failure closes it only when its cancel fails.
 
 - [ ] **Step 1: Apply the production diff**
 
@@ -653,7 +872,7 @@ diff --git a/crates/yserver/src/kms/render/resources/mod.rs b/crates/yserver/src
  }
  
  #[allow(dead_code)]
-@@ -174,6 +180,18 @@ impl ResourceService {
+@@ -174,6 +180,35 @@ impl ResourceService {
              serviced_elapsed: std::time::Duration::ZERO,
              last_serviced: None,
              max_serviced_duration: std::time::Duration::from_secs(5),
@@ -661,8 +880,25 @@ diff --git a/crates/yserver/src/kms/render/resources/mod.rs b/crates/yserver/src
 +        }
 +    }
 +
-+    pub(crate) fn set_transport_gate(&mut self, gate: TransportGateHandle) {
++    /// Round-1 B-2: the gate this service closes must be this service's own
++    /// transport. A handle for another device or incarnation is refused, and
++    /// so is a second, different gate -- replacing one would leave the
++    /// transport the service's outstanding work belongs to open. Re-installing
++    /// the same gate is idempotent.
++    pub(crate) fn set_transport_gate(
++        &mut self,
++        gate: TransportGateHandle,
++    ) -> Result<(), ResourceError> {
++        if gate.device() != self.device || gate.incarnation() != self.incarnation {
++            return Err(ResourceError::WrongIncarnation);
++        }
++        if let Some(installed) = &self.transport_gate
++            && !installed.same_gate(&gate)
++        {
++            return Err(ResourceError::InvalidState);
++        }
 +        self.transport_gate = Some(gate);
++        Ok(())
 +    }
 +
 +    /// Closes the installed transport gate, if any.
@@ -672,6 +908,54 @@ diff --git a/crates/yserver/src/kms/render/resources/mod.rs b/crates/yserver/src
          }
      }
  
+diff --git a/crates/yserver/src/kms/render/resources/transport.rs b/crates/yserver/src/kms/render/resources/transport.rs
+--- a/crates/yserver/src/kms/render/resources/transport.rs
++++ b/crates/yserver/src/kms/render/resources/transport.rs
+@@ -208,8 +262,14 @@ impl DirectOwnershipState for FakeDirectOwnershipState {
+     }
+ }
+ 
++/// Spec 4.2 (stage 2c-i debt), round-1 B-2: a handle names the gate it
++/// closes. `device`/`incarnation` are what a holder validates against its
++/// own identity before installing one; `forced_closed` doubles as the gate's
++/// instance identity, since it is the very cell that gate reads.
+ #[derive(Clone, Debug)]
+ pub(crate) struct TransportGateHandle {
++    device: DrmDeviceKey,
++    incarnation: IncarnationId,
+     forced_closed: Rc<Cell<bool>>,
+ }
+ 
+@@ -221,6 +281,20 @@ impl TransportGateHandle {
+     pub(crate) fn is_closed(&self) -> bool {
+         self.forced_closed.get()
+     }
++
++    pub(crate) fn device(&self) -> DrmDeviceKey {
++        self.device
++    }
++
++    pub(crate) fn incarnation(&self) -> IncarnationId {
++        self.incarnation
++    }
++
++    /// True when both handles name the same gate instance, not merely the
++    /// same device and incarnation.
++    pub(crate) fn same_gate(&self, other: &Self) -> bool {
++        Rc::ptr_eq(&self.forced_closed, &other.forced_closed)
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -315,6 +389,8 @@ impl TransportGate {
+ 
+     pub(crate) fn handle(&self) -> TransportGateHandle {
+         TransportGateHandle {
++            device: self.device,
++            incarnation: self.incarnation,
+             forced_closed: Rc::clone(&self.forced_closed),
+         }
+     }
 diff --git a/crates/yserver/src/kms/render/scene.rs b/crates/yserver/src/kms/render/scene.rs
 --- a/crates/yserver/src/kms/render/scene.rs
 +++ b/crates/yserver/src/kms/render/scene.rs
@@ -747,7 +1031,7 @@ diff --git a/crates/yserver/src/kms/render/scene.rs b/crates/yserver/src/kms/ren
  /// submission on the main-loop boundary.
 ```
 
-Expected: three files patched, no rejects, no fuzz.
+Expected: four files patched, no rejects, no fuzz.
 
 - [ ] **Step 2: Append the tests**
 
@@ -774,8 +1058,51 @@ fn submission_fixture() -> (
     let (mut service, held, _drops) = spy_service();
     let obligation = service.register(held.key(), ObligationKind::Gpu).unwrap();
     let gate = TransportGate::for_tests(service.device(), IncarnationId::first());
-    service.set_transport_gate(gate.handle());
+    service.set_transport_gate(gate.handle()).unwrap();
     (service, held, obligation, gate)
+}
+
+/// census: S2-gate-install-identity mod.rs set_transport_gate `gate.device() != self.device || gate.incarnation() != self.incarnation`
+#[test]
+fn c0_2ci_guard_service_refuses_a_transport_gate_for_another_transport() {
+    let (mut service, _held, _obligation, _gate) = submission_fixture();
+    let other_device = TransportGate::for_tests(
+        DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        },
+        IncarnationId::first(),
+    );
+    let other_incarnation =
+        TransportGate::for_tests(service.device(), IncarnationId::first().next());
+    for foreign in [&other_device, &other_incarnation] {
+        assert_eq!(
+            service.set_transport_gate(foreign.handle()),
+            Err(ResourceError::WrongIncarnation),
+            "a service must refuse a gate for another transport [census:S2-gate-install-identity]"
+        );
+    }
+    service.close_transport_gate();
+    assert_eq!(other_device.state(), TransportState::Legacy);
+    assert_eq!(other_incarnation.state(), TransportState::Legacy);
+}
+
+/// census: S2-gate-install-replacement mod.rs set_transport_gate `let Some(installed) = &self.transport_gate && !installed.same_gate(&gate)`
+#[test]
+fn c0_2ci_guard_service_refuses_a_second_transport_gate() {
+    let (mut service, _held, _obligation, gate) = submission_fixture();
+    // Same device and incarnation, a different gate instance.
+    let replacement = TransportGate::for_tests(service.device(), IncarnationId::first());
+    assert_eq!(
+        service.set_transport_gate(replacement.handle()),
+        Err(ResourceError::InvalidState),
+        "a service must refuse to swap the transport it closes [census:S2-gate-install-replacement]"
+    );
+    // Re-installing the gate already there is idempotent.
+    service.set_transport_gate(gate.handle()).unwrap();
+    service.close_transport_gate();
+    assert_eq!(gate.state(), TransportState::Closed);
+    assert_eq!(replacement.state(), TransportState::Legacy);
 }
 
 /// census: S2-cancel-pre-submit-error gpu.rs cancel_pre_submit_batch `Some(err) =>`
@@ -856,22 +1183,22 @@ fn c0_2ci_pre_submit_failure_cancels_and_leaves_transport_open() {
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo +nightly fmt && cargo test -p yserver --lib _transport`
-Expected: the four new tests (`…failed_pre_submit_cancel…`, `…failed_uncertain_freeze…`, `…uncertain_submission_freezes…`, `…pre_submit_failure_cancels…`) pass, with any other matching tests. A failure is an F8 stop.
+Expected: the six new tests pass — the two `…transport_gate…` install guards and the four submission-failure tests — along with any other matching tests. A failure is an F8 stop.
 
 - [ ] **Step 4: Run the oracle**
 
-Run: `python3 tools/guard-census.py --files gpu.rs --deterministic-only --require-oracle`
-Expected: `S2-cancel-pre-submit-error` and `S2-freeze-uncertain-error` `CAUGHT_BY_ORACLE`; summary `CAUGHT_BY_ORACLE: 2`; exit 0.
+Run: `python3 tools/guard-census.py --files gpu.rs --deterministic-only --require-oracle`, then `python3 tools/guard-census.py --files mod.rs --fn set_transport_gate --deterministic-only --require-oracle`
+Expected: `S2-cancel-pre-submit-error` and `S2-freeze-uncertain-error` `CAUGHT_BY_ORACLE` (summary 2); then `S2-gate-install-identity` and `S2-gate-install-replacement` `CAUGHT_BY_ORACLE` (summary 2); exit 0 both times.
 
 - [ ] **Step 5: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 167 passed, 18 ignored.
+Expected: clean; `c0_2ci` 169 passed, 18 ignored.
 
 *Reviewer mutations* (coordinator): delete `service.close_transport_gate();` from the `gpu_submitted` branch of `abandon_unsubmitted_batch` (fails `…failed_uncertain_freeze…` and `…uncertain_submission_freezes…`); delete the `if result.is_err() { … }` close (fails `…failed_pre_submit_cancel…`); and read both `return Err(managed_submit_failure(` arms in `submit_shared_scanout_frame` (plan correction 1).
 
 ```bash
-git add crates/yserver/src/kms/render/resources/mod.rs crates/yserver/src/kms/render/resources/gpu.rs crates/yserver/src/kms/render/scene.rs crates/yserver/src/kms/render/resources/guard_tests.rs
+git add crates/yserver/src/kms/render/resources/mod.rs crates/yserver/src/kms/render/resources/transport.rs crates/yserver/src/kms/render/resources/gpu.rs crates/yserver/src/kms/render/scene.rs crates/yserver/src/kms/render/resources/guard_tests.rs
 git commit -m "fix(kms): propagate a failed managed-batch unwind and close the transport
 
 Stage 2c-i debt, spec 4.2. submit_shared_scanout_frame discarded the
@@ -880,15 +1207,17 @@ let _, so their error arms could not be proven and an unwind failure
 vanished. Both failure arms now return managed_submit_failure, which
 reports an unwind failure alongside the cause. An uncertain submission
 closes the transport installed on the ResourceService (2c-i design
-section 4), and so does a failed pre-submit cancel. Inert in
-production, where no gate is installed (R8).
+section 4), and so does a failed pre-submit cancel. The gate handle now
+names its gate, and a service refuses one for another transport or a
+silent replacement (review round 1, B-2). Inert in production, where no
+gate is installed (R8).
 
 Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
 
 ---
 
-### Task 3: The reset boundary (spec 4.3)
+### Task 3: The reset boundary (spec 4.3, with its F8 stop)
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/resources/mod.rs`
@@ -896,7 +1225,8 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 
 **Interfaces:**
 - Consumes: `yserver_core::core_loop::reset::force_destroy_all_clients`; `KmsBackend::{for_tests, install_resource_service, resource_service_mut}` and its `store` field; `resources::tests::SpyAllocation`.
-- Invariants proven: after the forced teardown the old XID no longer resolves while its backing stays rooted; after the next generation reuses the same protocol and host XIDs, the old generation's late proof releases only the old entry, and the new drawable resolves to its own backing.
+- Invariants proven: after the forced teardown the old XID no longer resolves while its backing stays rooted; after the numeric protocol and host XIDs are reused over the same backend, the old generation's late proof releases only the old entry, and the new drawable resolves to its own backing.
+- **Not proven, by decision:** the reset's own generation replacement. The module doc carries the F8 stop; do not add wiring to close it.
 
 - [ ] **Step 1: Declare the module**
 
@@ -919,14 +1249,25 @@ diff --git a/crates/yserver/src/kms/render/resources/mod.rs b/crates/yserver/src
 
 - [ ] **Step 2: Create the test module**
 
-Extract this task's `rust` block 1 to `crates/yserver/src/kms/render/resources/reset_boundary_tests.rs` (redirect the extractor's output straight to that path).
+Extract this task's `rust` block 1 straight to `crates/yserver/src/kms/render/resources/reset_boundary_tests.rs`.
 
 ```rust
 //! Stage 2c-i debt, session 2, item 4.3: the server reset's forced teardown
 //! erases a managed drawable's identity but not its proof-gated backing, and
-//! a proof arriving after the next generation reuses the numeric XID reaches
-//! only the old incarnation's entry. Spec:
+//! a proof arriving after the numeric XIDs are reused reaches only the old
+//! incarnation's entry. Spec:
 //! docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md §4.3.
+//!
+//! **What this does NOT prove (F8 stop, round-1 B-3).** Spec 4.3 asks the
+//! test to continue across the reset's own generation replacement.
+//! `reset_generation` is `pub(crate)` in `yserver-core` and needs a live
+//! poller, a setup registry and an input inventory, none of which this crate
+//! can supply, and spec 4.3 says that an undrivable half is an F8 stop to
+//! report rather than a reason to add wiring. So the second half below
+//! reuses the numeric XIDs over the same backend without crossing the real
+//! boundary: it proves the ledger keys proofs by allocation and not by XID,
+//! and it does not prove the reset's invariant 6. The crossing itself stays
+//! open, for whoever owns the boundary next.
 
 use std::{
     cell::Cell,
@@ -1048,7 +1389,7 @@ fn seed_managed_pixmap(
 }
 
 #[test]
-fn c0_2ci_reset_erases_identity_keeps_backing_and_late_proof_skips_reused_xid() {
+fn c0_2ci_reset_forced_teardown_keeps_gated_backing_and_late_proof_skips_reused_xid() {
     let mut backend = KmsBackend::for_tests();
     backend.install_resource_service(ResourceService::new(
         DrmDeviceKey {
@@ -1086,7 +1427,9 @@ fn c0_2ci_reset_erases_identity_keeps_backing_and_late_proof_skips_reused_xid() 
     );
     assert_eq!(old_drops.get(), 0, "the pending backing was destroyed");
 
-    // Generation 2: a fresh session reuses both numeric XIDs.
+    // A second session reuses both numeric XIDs over the same backend. This
+    // is not the reset's own generation replacement -- see the module's F8
+    // stop -- it is the numeric reuse that replacement would produce.
     let mut state = ServerState::new();
     let (new_id, new_key, new_drops) = seed_managed_pixmap(&mut state, &mut backend);
     assert_ne!(new_id, old_id);
@@ -1129,21 +1472,25 @@ Expected: `1 passed`. A failure is an F8 stop.
 - [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 168 passed, 18 ignored.
+Expected: clean; `c0_2ci` 170 passed, 18 ignored.
 
-*Reviewer mutations* (coordinator, all prototyped except the third): in `availability.rs` `can_destroy`, drop `&& entry.pending_obligation_count() == 0` (fails at "the forced teardown released a backing whose GPU obligation is pending"); in `store.rs` `destroy_now`, force `if self.by_xid.get(&drawable.xid).copied() == Some(id)` to `if false` (fails at "the old host XID still resolves"); in `ResourceService::apply_validated_proof`, resolve the key's newest sibling entry of the same device and incarnation instead of the key itself (must fail the test).
+*Reviewer mutations* (coordinator, the first two prototyped): in `availability.rs` `can_destroy`, drop `&& entry.pending_obligation_count() == 0` (fails at "the forced teardown released a backing whose GPU obligation is pending"); in `store.rs` `destroy_now`, force `if self.by_xid.get(&drawable.xid).copied() == Some(id)` to `if false` (fails at "the old host XID still resolves"); in `ResourceService::apply_validated_proof`, resolve the key's newest sibling entry of the same device and incarnation instead of the key itself (must fail the test).
 
 ```bash
 git add crates/yserver/src/kms/render/resources/mod.rs crates/yserver/src/kms/render/resources/reset_boundary_tests.rs
-git commit -m "test(kms): prove the server reset erases identity but not a gated backing
+git commit -m "test(kms): prove the forced teardown keeps a proof-gated backing
 
 Stage 2c-i debt, spec 4.3. Drives force_destroy_all_clients over a
 KmsBackend holding a managed drawable with GPU work pending: the XID
-stops resolving while the backing stays rooted. A fresh generation then
-reuses the same protocol and host XIDs, and the old generation's late
-proof releases only the old entry. The replacement half is modelled as
-a fresh ServerState, since reset_generation is pub(crate) in
-yserver-core (plan correction 3).
+stops resolving while the backing stays rooted. Reusing both numeric
+XIDs afterwards shows the late proof releases only the old entry, since
+the ledger keys proofs by allocation, not by XID.
+
+The reset's own generation replacement is NOT driven: reset_generation
+is pub(crate) in yserver-core and needs a live poller, setup registry
+and input inventory. Spec 4.3 calls that an F8 stop to report rather
+than a reason to add wiring, and the module doc records it (review
+round 1, B-3).
 
 Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ```
@@ -1169,7 +1516,7 @@ Extract this task's `diff` block 1 to `/tmp/s2-task4.patch` and apply it.
 diff --git a/crates/yserver/src/kms/render/platform.rs b/crates/yserver/src/kms/render/platform.rs
 --- a/crates/yserver/src/kms/render/platform.rs
 +++ b/crates/yserver/src/kms/render/platform.rs
-@@ -7908,7 +7909,7 @@ mod tests {
+@@ -7908,7 +7919,7 @@ mod tests {
      #[test]
      fn c0_2ci_sink_cursor_gate_four_states() {
          use crate::kms::render::resources::{
@@ -1178,7 +1525,7 @@ diff --git a/crates/yserver/src/kms/render/platform.rs b/crates/yserver/src/kms/
          };
  
          let mut platform = PlatformBackend::for_tests();
-@@ -7960,8 +7961,8 @@ mod tests {
+@@ -7960,8 +7971,8 @@ mod tests {
                      lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId::first(),
                  },
                  &[],
@@ -1456,7 +1803,7 @@ diff --git a/crates/yserver/src/kms/render/resources/transport.rs b/crates/yserv
          Self { _private: () }
      }
  }
-@@ -456,7 +510,7 @@ impl TransportGate {
+@@ -456,7 +532,7 @@ impl TransportGate {
          proof: crate::kms::render::platform::LegacyDrained,
          dispositions: &[crate::kms::render::backend::LegacyEventDisposition],
          _coverage: &WriterCoverageProof,
@@ -1465,7 +1812,7 @@ diff --git a/crates/yserver/src/kms/render/resources/transport.rs b/crates/yserv
      ) -> Result<HandoverPermit, ResourceError> {
          if self.state != TransportState::Quiescing {
              return Err(ResourceError::Busy);
-@@ -467,6 +521,9 @@ impl TransportGate {
+@@ -467,6 +543,9 @@ impl TransportGate {
          if proof.incarnation != self.incarnation {
              return Err(ResourceError::WrongIncarnation);
          }
@@ -1562,7 +1909,7 @@ Expected: `S2-permit-reservation-identity` `CAUGHT_BY_ORACLE`; exit 0.
 - [ ] **Step 5: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 169 passed, 18 ignored.
+Expected: clean; `c0_2ci` 171 passed, 18 ignored.
 
 ```bash
 git add crates/yserver/src/kms/render/resources/transport.rs crates/yserver/src/kms/render/resources/handoff.rs crates/yserver/src/kms/render/resources/tests.rs crates/yserver/src/kms/render/platform.rs crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -1693,7 +2040,7 @@ Expected: eight tagged sites, all `CAUGHT_BY_ORACLE` — `B-authorize-write-clos
 - [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 175 passed, 18 ignored.
+Expected: clean; `c0_2ci` 177 passed, 18 ignored.
 
 ```bash
 git add crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -1713,7 +2060,7 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 ### Task 6: Session acceptance — full census, hardware gate, record
 
 **Files:**
-- Create ([H], coordinator): `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-2.md`
+- Create ([H], coordinator): `docs/superpowers/findings/2026-09-17-stage-2c-i-debt-census-session-2.md`
 - Modify ([H], coordinator): `docs/superpowers/specs/2026-09-15-phase-c0-stage-2c-i-debt-design.md` (status line)
 
 - [ ] **Step 1: Implementer's final checks, then hand off**
@@ -1727,24 +2074,24 @@ Run and keep the output for the coordinator:
 - `cargo check -p yserver --target x86_64-unknown-freebsd`
 - `for i in $(seq 1 12); do cargo test -p yserver --lib c0_2ci 2>&1 | grep "test result"; done`
 - `cargo test --workspace`
-- `python3 tools/guard-census.py --deterministic-only --require-oracle` — 37 tagged sites, all `CAUGHT_BY_ORACLE`, exit 0.
+- `python3 tools/guard-census.py --deterministic-only --require-oracle` — 39 tagged sites, all `CAUGHT_BY_ORACLE`, exit 0.
 - `python3 tools/guard-census.py --files drm_cleanup.rs --deterministic-only --require-oracle` — 3 tagged sites, all `CAUGHT_BY_ORACLE`, exit 0.
 
 Expected: all clean; twelve identical `c0_2ci` results with zero failures. **Stop and hand off.**
 
 - [ ] **Step 2 [H]: Full acceptance census**
 
-Run: `python3 tools/guard-census.py --require-oracle --json /tmp/census-session-2.json` (about an hour; 69 sites)
-Expected: `CAUGHT_BY_ORACLE` 37, `CAUGHT` 32, `SURVIVES` 0; no `CAUGHT_NOT_BY_ORACLE`, `CAUGHT_WHOLE_BODY`, `ORPHAN_TAG` or `A_MANO`; exit 0.
+Run: `python3 tools/guard-census.py --require-oracle --json /tmp/census-session-2.json` (about an hour; 71 sites)
+Expected: `CAUGHT_BY_ORACLE` 39, `CAUGHT` 32, `SURVIVES` 0; no `CAUGHT_NOT_BY_ORACLE`, `CAUGHT_WHOLE_BODY`, `ORPHAN_TAG` or `A_MANO`; exit 0.
 
 - [ ] **Step 3 [H]: Hardware gate and reviewer mutations**
 
-Run: `cargo test -p yserver --lib c0_2ci -- --ignored`. Expected: all hardware tests pass. Then run every *Reviewer mutation* of Tasks 1–3, each confirmed to have compiled, and record which test failed.
+Run: `cargo test -p yserver --lib c0_2ci -- --ignored`. Expected: 18 passed — Task 1 changed `ScanoutBo`'s device alias, which these exercise. Then run every *Reviewer mutation* of Tasks 1–3, each confirmed to have compiled, and record which test failed.
 
 - [ ] **Step 4 [H]: Record and commit**
 
-Create `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-2.md` with: the census summary and a table of site, verdict, bound test and strategy; the `drm_cleanup.rs` oracle result; each reviewer mutation and the test that caught it, and the arms checked by reading; the plan corrections and any F8 stops; and both gate transcripts. In the spec's status line add: "Session 2 executed: 69 census sites, zero survivors; see `…-census-session-2.md`." Commit with the coordinator's trailer.
+Create `docs/superpowers/findings/2026-09-17-stage-2c-i-debt-census-session-2.md` with: the census summary and a table of site, verdict, bound test and strategy; the `drm_cleanup.rs` oracle result; each reviewer mutation and the test that caught it, and the arms checked by reading; the plan corrections, the 4.3 F8 stop and any others found while executing; and both gate transcripts. In the spec's status line add: "Session 2 executed: 71 census sites, zero survivors; 4.3's generation-replacement half left open as an F8 stop; see `…-census-session-2.md`." Commit with the coordinator's trailer.
 
 ## Provenance
 
-The coordinating session prototyped every block above on `fd02ae6e`, then restored the tree. On the prototype: `cargo test -p yserver --lib c0_2ci` 175 passed, 18 ignored; `cargo clippy --all-targets -- -D warnings` clean; `cargo check` clean for musl and FreeBSD; `guard-census.py --deterministic-only --require-oracle` gave `CAUGHT_BY_ORACLE` for all 3 `drm_cleanup.rs`, both `gpu.rs` and all 8 `transport.rs` tagged sites; and the reset test failed under the `can_destroy` and `destroy_now` mutations of Task 3. The diffs were cut from the prototype per task and re-applied in order with `patch` to a clean export of `fd02ae6e`, reproducing every prototype file byte for byte.
+The coordinating session prototyped every block above on `b46830c0`, then restored the tree. On the prototype: `cargo test -p yserver --lib c0_2ci` 177 passed, 18 ignored; the hardware run 18 passed; `cargo clippy --all-targets -- -D warnings` clean; `cargo +nightly fmt --check` clean; `cargo check` clean for musl and FreeBSD; `guard-census.py --deterministic-only --require-oracle` gave `CAUGHT_BY_ORACLE` for all 39 tagged sites in the default files and all 3 in `drm_cleanup.rs`; and the reset test failed under the `can_destroy` and `destroy_now` mutations of Task 3. The diffs were cut from the prototype per task and re-applied in order with `patch` to a clean export of `b46830c0`, reproducing every prototype file byte for byte.
