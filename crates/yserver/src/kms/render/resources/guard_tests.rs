@@ -1047,3 +1047,144 @@ fn c0_2ci_guard_handover_permit_refuses_a_reservation_for_another_recipient() {
         );
     }
 }
+/// Issues a permit from `gate` on complete evidence for its own identity.
+fn permit_for(gate: &mut TransportGate) -> Result<HandoverPermit, ResourceError> {
+    let (device, incarnation) = (gate.device(), gate.incarnation());
+    gate.issue_handover_permit(
+        drained(incarnation),
+        &[],
+        &super::tests::writer_coverage_for_tests(),
+        RecipientReservation::new_for_tests(device, incarnation),
+    )
+}
+
+/// census: A-permit-quiescing transport.rs issue_handover_permit `self.state() != TransportState::Quiescing`
+#[test]
+fn c0_2ci_guard_handover_permit_refuses_outside_quiescing() {
+    let mut gate = TransportGate::for_tests(handover_device(), IncarnationId::first());
+    let result = permit_for(&mut gate);
+    assert!(
+        matches!(result, Err(ResourceError::Busy)),
+        "a permit must not be issued from Legacy, got {result:?} [census:A-permit-quiescing]"
+    );
+}
+
+/// No public transition reaches `Quiescing` with a grant outstanding --
+/// `begin_quiescing` refuses one -- so the test setter builds the state the
+/// guard exists to refuse.
+/// census: A-permit-outstanding transport.rs issue_handover_permit `self.outstanding_owner_writes != 0`
+#[test]
+fn c0_2ci_guard_handover_permit_refuses_with_an_outstanding_grant() {
+    let mut gate = quiescing_gate(handover_device(), IncarnationId::first());
+    gate.set_outstanding_owner_writes_for_tests(1);
+    let result = permit_for(&mut gate);
+    assert!(
+        matches!(result, Err(ResourceError::Busy)),
+        "a permit must not be issued while an owner write grant is outstanding, got {result:?} [census:A-permit-outstanding]"
+    );
+}
+
+/// census: A-publish-identity transport.rs publish_owner `permit.device != self.device || permit.incarnation != self.incarnation`
+#[test]
+fn c0_2ci_guard_publish_owner_refuses_a_permit_for_another_incarnation() {
+    let incarnation = IncarnationId::first();
+    let mut gate = quiescing_gate(handover_device(), incarnation);
+    let mut other = quiescing_gate(handover_device(), incarnation.next());
+    let foreign = permit_for(&mut other).unwrap();
+    assert_eq!(
+        gate.publish_owner(foreign),
+        Err(ResourceError::WrongIncarnation),
+        "a permit issued for another incarnation must be refused [census:A-publish-identity]"
+    );
+    assert_eq!(gate.state(), TransportState::Quiescing);
+}
+
+/// census: A-publish-quiescing transport.rs publish_owner `self.state() != TransportState::Quiescing`
+#[test]
+fn c0_2ci_guard_publish_owner_refuses_once_the_gate_left_quiescing() {
+    let mut gate = quiescing_gate(handover_device(), IncarnationId::first());
+    let permit = permit_for(&mut gate).unwrap();
+    gate.force_close();
+    assert_eq!(
+        gate.publish_owner(permit),
+        Err(ResourceError::Busy),
+        "a permit must not publish Owner once the gate left Quiescing [census:A-publish-quiescing]"
+    );
+}
+
+/// As for the permit: only the test setter reaches `Quiescing` with a grant
+/// outstanding.
+/// census: A-publish-outstanding transport.rs publish_owner `self.outstanding_owner_writes != 0`
+#[test]
+fn c0_2ci_guard_publish_owner_refuses_with_an_outstanding_grant() {
+    let mut gate = quiescing_gate(handover_device(), IncarnationId::first());
+    let permit = permit_for(&mut gate).unwrap();
+    gate.set_outstanding_owner_writes_for_tests(1);
+    assert_eq!(
+        gate.publish_owner(permit),
+        Err(ResourceError::Busy),
+        "Owner must not be published while an owner write grant is outstanding [census:A-publish-outstanding]"
+    );
+    assert_eq!(gate.state(), TransportState::Quiescing);
+}
+
+/// census: B-consume-owner-write-state transport.rs consume_owner_write `self.state() != TransportState::Owner`
+#[test]
+fn c0_2ci_guard_consume_owner_write_refuses_once_the_gate_left_owner() {
+    let mut gate = quiescing_gate(handover_device(), IncarnationId::first());
+    let permit = permit_for(&mut gate).unwrap();
+    gate.publish_owner(permit).unwrap();
+    let grant = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    gate.force_close();
+    let result = gate.consume_owner_write(grant);
+    assert!(
+        matches!(result, Err((ResourceError::Detached, _))),
+        "a grant issued in Owner must not be consumed once the gate left Owner [census:B-consume-owner-write-state]"
+    );
+    assert_eq!(gate.outstanding_owner_writes(), 1);
+}
+
+/// Round-2 B-1, Owner side: the same close, arriving through the service's
+/// handle, must also stop a permit being issued or published and a grant
+/// being minted or consumed. Task 2 proved the `begin_quiescing` half; these
+/// need Task 4's handover evidence to reach Owner at all.
+#[test]
+fn c0_2ci_service_driven_close_is_terminal_for_owner_transitions() {
+    // A permit in hand before the close cannot publish Owner after it, and
+    // the closed gate issues no further permit.
+    let (service, _held, _obligation, mut gate) = submission_fixture();
+    gate.begin_quiescing().unwrap();
+    let permit = permit_for(&mut gate).unwrap();
+    service.close_transport_gate();
+    assert_eq!(
+        gate.publish_owner(permit),
+        Err(ResourceError::Busy),
+        "a transport closed through its handle must refuse to publish Owner"
+    );
+    assert!(
+        matches!(permit_for(&mut gate), Err(ResourceError::Busy)),
+        "a transport closed through its handle must issue no handover permit"
+    );
+
+    // And in Owner: no new grant, and no consumption of one taken earlier.
+    let (service, _held2, _obligation2, mut owner) = submission_fixture();
+    owner.begin_quiescing().unwrap();
+    let permit = permit_for(&mut owner).unwrap();
+    owner.publish_owner(permit).unwrap();
+    let grant = owner.authorize_owner_write(WriterClass::Primary).unwrap();
+    service.close_transport_gate();
+    assert!(
+        matches!(
+            owner.authorize_owner_write(WriterClass::Primary),
+            Err(ResourceError::Detached)
+        ),
+        "a transport closed through its handle must mint no owner write grant"
+    );
+    assert!(
+        matches!(
+            owner.consume_owner_write(grant),
+            Err((ResourceError::Detached, _))
+        ),
+        "a transport closed through its handle must consume no owner write grant"
+    );
+}
