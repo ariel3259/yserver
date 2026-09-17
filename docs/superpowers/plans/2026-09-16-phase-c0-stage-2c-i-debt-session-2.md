@@ -2,6 +2,8 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have: at an [H] step, stop and hand off. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. At each "hand off for commit" step, stop with the tree dirty; the coordinating session verifies and commits with the message given.
 
+**Revision 6 (2026-09-17)** — `permit_for` sat in Task 4's block but has no caller until Task 5, and each task's gate runs `clippy -D warnings`, where that is an error: codex stopped under F8 at Task 4's gate. The helper moves to the head of Task 5's block. Both this and revision 4's defect came from verifying the task sequence with `fmt` and `cargo test` only; **the incremental check now runs each task's full gate, clippy included**, which is how this was caught the second time.
+
 **Revision 5 (2026-09-17)** — the extractor in *How to apply a block* contained backticks; run inside `bash -lc "..."` they were read as command substitution, the pattern came back empty, and codex stopped under F8 at Task 4 Step 1. It is now written to a file first and builds its fence with `chr(96)`, so it carries no backtick at all. Tasks 1-3 were committed before this and are unaffected.
 
 **Revision 4 (2026-09-17)** — Task 2's terminal-close test referenced `permit_for`, which Task 4 introduces, and a permit needs the evidence API Task 4 reshapes; codex stopped at it under F8 while executing Task 2. The test is split in two, one half per task, and **every task has now been applied in order with `patch`, compiled and tested at each step** — 171, 172, 173, 180 — which is the check whose absence let a cross-task reference through.
@@ -1666,7 +1668,7 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 **Interfaces:**
 - Produces: `RecipientReservation::new_for_tests(DrmDeviceKey, IncarnationId)`; `TestWriterCoverage::{OwnerMediatedMock, Disabled}`; `TestWriterCoverageEvidence` (one field per `WriterClass`, with an exhaustive `coverage(WriterClass)`); `WriterCoverageProof::new_for_tests(TestWriterCoverageEvidence)`; `resources::tests::writer_coverage_for_tests() -> WriterCoverageProof`.
 - Produces: `issue_handover_permit` refuses a reservation for another device or incarnation with `WrongIncarnation` — a new production guard, after the proof's incarnation check.
-- Produces for Task 5 (in the appended block): `handover_device()`, `drained(IncarnationId)`, `quiescing_gate(DrmDeviceKey, IncarnationId)`, `permit_for(&mut TransportGate)`.
+- Produces for Task 5 (in the appended block): `handover_device()`, `drained(IncarnationId)`, `quiescing_gate(DrmDeviceKey, IncarnationId)`. `permit_for` belongs to Task 5's block: Task 4 has no caller for it, and this task's gate runs `clippy -D warnings`, where an unused helper is an error.
 
 - [ ] **Step 1: Apply the production diff**
 
@@ -2020,17 +2022,6 @@ fn quiescing_gate(device: DrmDeviceKey, incarnation: IncarnationId) -> Transport
     gate
 }
 
-/// Issues a permit from `gate` on complete evidence for its own identity.
-fn permit_for(gate: &mut TransportGate) -> Result<HandoverPermit, ResourceError> {
-    let (device, incarnation) = (gate.device(), gate.incarnation());
-    gate.issue_handover_permit(
-        drained(incarnation),
-        &[],
-        &super::tests::writer_coverage_for_tests(),
-        RecipientReservation::new_for_tests(device, incarnation),
-    )
-}
-
 /// census: S2-permit-reservation-identity transport.rs issue_handover_permit `reservation.device != self.device || reservation.incarnation != self.incarnation`
 #[test]
 fn c0_2ci_guard_handover_permit_refuses_a_reservation_for_another_recipient() {
@@ -2096,13 +2087,24 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 - Modify: `crates/yserver/src/kms/render/resources/guard_tests.rs` (append)
 
 **Interfaces:**
-- Consumes: Task 4's `handover_device`, `quiescing_gate`, `permit_for`; `TransportGate::{for_tests, force_close, publish_owner, authorize_owner_write, consume_owner_write, set_outstanding_owner_writes_for_tests, outstanding_owner_writes}`.
+- Consumes: Task 4's `handover_device`, `drained` and `quiescing_gate`; defines `permit_for` at the head of its own block, since Task 4 has no caller for it. `TransportGate::{for_tests, force_close, publish_owner, authorize_owner_write, consume_owner_write, set_outstanding_owner_writes_for_tests, outstanding_owner_writes}`.
 
 - [ ] **Step 1: Append the tests**
 
 Extract this task's `rust` block 1 to `/tmp/s2-task5.rs` and append it to `guard_tests.rs`.
 
 ```rust
+/// Issues a permit from `gate` on complete evidence for its own identity.
+fn permit_for(gate: &mut TransportGate) -> Result<HandoverPermit, ResourceError> {
+    let (device, incarnation) = (gate.device(), gate.incarnation());
+    gate.issue_handover_permit(
+        drained(incarnation),
+        &[],
+        &super::tests::writer_coverage_for_tests(),
+        RecipientReservation::new_for_tests(device, incarnation),
+    )
+}
+
 /// census: A-permit-quiescing transport.rs issue_handover_permit `self.state() != TransportState::Quiescing`
 #[test]
 fn c0_2ci_guard_handover_permit_refuses_outside_quiescing() {
