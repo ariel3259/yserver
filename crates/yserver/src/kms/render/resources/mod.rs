@@ -16,6 +16,8 @@ mod adapter_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
+mod reset_boundary_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 use std::{
