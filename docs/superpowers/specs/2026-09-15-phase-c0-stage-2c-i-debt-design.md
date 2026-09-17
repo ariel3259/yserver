@@ -10,6 +10,9 @@ part, section 9: a partial run of the flip-accepted path with DRM master, which
 this box can only exercise from an active VT such as tty2. Implementation plan
 to follow.
 
+**Session 1 executed (2026-09-16): 28 guards proven by oracle; see
+`docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md`.**
+
 ## 1. Why this stage exists
 
 Stage 2c-i was accepted on 2026-09-14 (`e00e5971`) with a recorded trade, not
