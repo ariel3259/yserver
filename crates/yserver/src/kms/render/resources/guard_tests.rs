@@ -656,3 +656,35 @@ fn c0_2ci_guard_commit_dependencies_refuse_duplicate_new_members() {
         "a commit whose new set repeats a member must be refused [census:D-unique-new-members]"
     );
 }
+
+/// census: B-authorize-write-closed transport.rs authorize_write `TransportState::Closed =>`
+#[test]
+fn c0_2ci_guard_authorize_write_refuses_every_class_when_closed() {
+    let ownership = FakeDirectOwnershipState::new();
+    let mut gate = TransportGate::new_legacy(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        IncarnationId::first(),
+        Box::new(ownership.clone()),
+    );
+    gate.force_close();
+    for class in [
+        WriterClass::Primary,
+        WriterClass::Unflip,
+        WriterClass::Modeset,
+        WriterClass::Dpms,
+        WriterClass::Vt,
+        WriterClass::Topology,
+        WriterClass::Cursor,
+        WriterClass::Gamma,
+        WriterClass::HelperMutation,
+    ] {
+        assert_eq!(
+            gate.authorize_write(class, None),
+            Err(ResourceError::Detached),
+            "a closed transport must refuse every writer class [census:B-authorize-write-closed]"
+        );
+    }
+}
