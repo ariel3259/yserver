@@ -230,3 +230,94 @@ fn c0_2ci_guard_gpu_batch_refuses_foreign_read_staging() {
         "a read obligation whose staging lease is foreign must be refused [census:E-batch-read-staging]"
     );
 }
+
+fn read_batch(
+    source: AllocationLease,
+    source_ob: ObligationId,
+    staging: Option<(AllocationLease, ObligationId)>,
+) -> CoreRetirementBatch {
+    let mut batch = CoreRetirementBatch::new(Vec::new(), Vec::new(), true);
+    let (staging_lease, staging_ob) = match staging {
+        Some((lease, ob)) => (Some(lease), Some(ob)),
+        None => (None, None),
+    };
+    batch.bind_read_obligation(super::gpu::ReadObligation::new(
+        source,
+        source_ob,
+        staging_lease,
+        staging_ob,
+    ));
+    batch
+}
+
+/// census: F-read-source-frozen mod.rs validate_gpu_batch `avail.frozen` #2
+#[test]
+fn c0_2ci_guard_gpu_batch_refuses_frozen_read_source() {
+    let (mut service, held, _drops) = spy_service();
+    let key = held.key();
+    let ob = service.register(key, ObligationKind::Read).unwrap();
+    service.freeze(key).unwrap();
+    assert_eq!(
+        service
+            .validate_gpu_batch(read_batch(held, ob, None))
+            .err()
+            .map(|(e, _)| e),
+        Some(ResourceError::Frozen),
+        "a read obligation on a frozen source must be refused [census:F-read-source-frozen]"
+    );
+}
+
+/// census: F-read-source-pending mod.rs validate_gpu_batch `!avail.pending_obligations.contains_key(&obligation_id)` #2
+#[test]
+fn c0_2ci_guard_gpu_batch_refuses_read_source_without_pending_obligation() {
+    let (mut service, held, _drops) = spy_service();
+    let key = held.key();
+    let ob = service.register(key, ObligationKind::Read).unwrap();
+    service.cancel(key, ob).unwrap();
+    assert_eq!(
+        service
+            .validate_gpu_batch(read_batch(held, ob, None))
+            .err()
+            .map(|(e, _)| e),
+        Some(ResourceError::InvalidProof),
+        "a read obligation that is no longer pending must be refused [census:F-read-source-pending]"
+    );
+}
+
+/// census: F-read-staging-frozen mod.rs validate_gpu_batch `s_avail.frozen`
+#[test]
+fn c0_2ci_guard_gpu_batch_refuses_frozen_read_staging() {
+    let (mut service, held, _drops) = spy_service();
+    let source_ob = service.register(held.key(), ObligationKind::Read).unwrap();
+    let staging = spy(&mut service);
+    let staging_key = staging.key();
+    let staging_ob = service.register(staging_key, ObligationKind::Read).unwrap();
+    service.freeze(staging_key).unwrap();
+    assert_eq!(
+        service
+            .validate_gpu_batch(read_batch(held, source_ob, Some((staging, staging_ob))))
+            .err()
+            .map(|(e, _)| e),
+        Some(ResourceError::Frozen),
+        "a read obligation with a frozen staging lease must be refused [census:F-read-staging-frozen]"
+    );
+}
+
+/// census: F-read-staging-pending mod.rs validate_gpu_batch `!s_avail.pending_obligations.contains_key(&staging_ob)`
+#[test]
+fn c0_2ci_guard_gpu_batch_refuses_read_staging_without_pending_obligation() {
+    let (mut service, held, _drops) = spy_service();
+    let source_ob = service.register(held.key(), ObligationKind::Read).unwrap();
+    let staging = spy(&mut service);
+    let staging_key = staging.key();
+    let staging_ob = service.register(staging_key, ObligationKind::Read).unwrap();
+    service.cancel(staging_key, staging_ob).unwrap();
+    assert_eq!(
+        service
+            .validate_gpu_batch(read_batch(held, source_ob, Some((staging, staging_ob))))
+            .err()
+            .map(|(e, _)| e),
+        Some(ResourceError::InvalidProof),
+        "a staging obligation that is no longer pending must be refused [census:F-read-staging-pending]"
+    );
+}
