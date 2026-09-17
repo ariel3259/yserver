@@ -13,6 +13,11 @@ to follow.
 **Session 1 executed (2026-09-16): 28 guards proven by oracle; see
 `docs/superpowers/findings/2026-09-16-stage-2c-i-debt-census-session-1.md`.**
 
+**Session 2 executed (2026-09-17): 71 census sites, zero survivors; 4.2's
+real-path acceptance half and 4.3's generation-replacement half left open and
+recorded; see
+`docs/superpowers/findings/2026-09-17-stage-2c-i-debt-census-session-2.md`.**
+
 ## 1. Why this stage exists
 
 Stage 2c-i was accepted on 2026-09-14 (`e00e5971`) with a recorded trade, not
