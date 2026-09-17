@@ -2,11 +2,13 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. Steps marked **[H]** need GPU and DRM access, which this sandbox does not have: at an [H] step, stop and hand off. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. At each "hand off for commit" step, stop with the tree dirty; the coordinating session verifies and commits with the message given.
 
+**Revision 4 (2026-09-17)** — Task 2's terminal-close test referenced `permit_for`, which Task 4 introduces, and a permit needs the evidence API Task 4 reshapes; codex stopped at it under F8 while executing Task 2. The test is split in two, one half per task, and **every task has now been applied in order with `patch`, compiled and tested at each step** — 171, 172, 173, 180 — which is the check whose absence let a cross-task reference through.
+
 **Revision 3 (2026-09-17)** — incorporates codex round 2 (`…-session-2-plan-review-round2.md`: 2 blocking, 1 major; round 1's B-1, B-2 and B-3 audited APPLIED) on top of revision 2's answer to round 1. See *Corrections from the reviews*.
 
 **Goal:** Land the four mechanism items of spec section 4 — husk accounting bound to identity, propagated GPU unwind errors with the transport close they owe, the reset-boundary test, and handover evidence — and prove family A and `consume_owner_write`'s non-Owner refusal on that evidence, so the census over the resource service reports zero survivors.
 
-**Architecture:** Every code change in this plan was prototyped on `12a32854` by the coordinating session, and the prototype passed the full gate, hardware included (see *Provenance*). The production edits are unified diffs, applied mechanically with `patch`; the tests are verbatim blocks appended to `resources/guard_tests.rs`, plus one new module, `resources/reset_boundary_tests.rs`. Guards get `/// census:` tags so `tools/guard-census.py` proves each by its own oracle, as in session 1.
+**Architecture:** Every code change in this plan was prototyped on `12a32854`, and every task re-applied in order on `a87601c2` with a compile and test run after each by the coordinating session, and the prototype passed the full gate, hardware included (see *Provenance*). The production edits are unified diffs, applied mechanically with `patch`; the tests are verbatim blocks appended to `resources/guard_tests.rs`, plus one new module, `resources/reset_boundary_tests.rs`. Guards get `/// census:` tags so `tools/guard-census.py` proves each by its own oracle, as in session 1.
 
 **Tech Stack:** Rust (`cargo test`), `patch`, Python 3 (`tools/guard-census.py`, committed in session 1).
 
@@ -30,7 +32,7 @@
 
 | Finding | Disposition |
 | --- | --- |
-| **B-1** — a close arriving through the handle was not terminal: five transitions read the raw `self.state`, so after a service-driven close a gate still quiesced, issued a permit, published Owner and minted grants | **Fixed.** `begin_quiescing`, `authorize_owner_write`, `consume_owner_write`, `issue_handover_permit` and `publish_owner` now consult the effective `state()`, which `state()`'s own doc explains. Proven by `c0_2ci_service_driven_close_is_terminal_for_the_gate`, which fails when any one of them goes back to the raw field. The three census tags whose condition text changed were updated with it. |
+| **B-1** — a close arriving through the handle was not terminal: five transitions read the raw `self.state`, so after a service-driven close a gate still quiesced, issued a permit, published Owner and minted grants | **Fixed.** `begin_quiescing`, `authorize_owner_write`, `consume_owner_write`, `issue_handover_permit` and `publish_owner` now consult the effective `state()`, which `state()`'s own doc explains. Proven in two halves, because reaching Owner needs Task 4's evidence: `c0_2ci_service_driven_close_stops_the_gate_quiescing` (Task 2) and `c0_2ci_service_driven_close_is_terminal_for_owner_transitions` (Task 5). The three census tags whose condition text changed were updated with it. |
 | **B-2** — flattening the cause into `PresentError::Io` cost a `ERROR_DEVICE_LOST` its identity, so the caller stopped latching `renderer_failed` | **Fixed.** A new `PresentError::ManagedUnwind { cause: Box<PresentError>, unwind: String }` keeps the cause structural, and `present_error_is_device_lost` recurses through it. Proven by `c0_2ci_failed_unwind_keeps_a_device_loss_recognisable`, which fails when the recursion is removed. The consuming handler itself (the scene tick's `renderer_failed` latch) is hardware-only; the test covers the classifier it calls. |
 | **M-1** — carried forward: a plan cannot satisfy its authoritative criterion by amending it | **Taken, in the honest direction.** The spec amendment no longer rewrites 4.2's acceptance criterion: it records the real-path half as **not met**, open like 4.3's F8 stop, and Task 6 carries both into the acceptance record. The mechanism change still lands; what is not claimed is the evidence. |
 
@@ -1276,33 +1278,19 @@ fn c0_2ci_guard_failed_uncertain_freeze_is_reported_and_closes_transport() {
 
 /// Round-2 B-1: a close that arrives through the service's handle is as
 /// terminal as `close()`. The handle can only set the shared flag, so every
-/// transition has to read the effective state, not the raw field.
+/// transition has to read the effective state, not the raw field. This
+/// covers `begin_quiescing`; the Owner-side transitions need the handover
+/// evidence Task 4 reshapes, so they are proven in Task 5.
 #[test]
-fn c0_2ci_service_driven_close_is_terminal_for_the_gate() {
+fn c0_2ci_service_driven_close_stops_the_gate_quiescing() {
     let (service, _held, _obligation, mut gate) = submission_fixture();
     service.close_transport_gate();
     assert_eq!(gate.state(), TransportState::Closed);
-    assert_eq!(gate.begin_quiescing(), Err(ResourceError::Detached));
-    assert!(
-        matches!(permit_for(&mut gate), Err(ResourceError::Busy)),
-        "a closed transport must not issue a handover permit"
+    assert_eq!(
+        gate.begin_quiescing(),
+        Err(ResourceError::Detached),
+        "a transport closed through its handle must refuse to quiesce"
     );
-    assert!(
-        matches!(
-            gate.authorize_owner_write(WriterClass::Primary),
-            Err(ResourceError::Detached)
-        ),
-        "a closed transport must not mint an owner write grant"
-    );
-
-    // And a permit taken before the close cannot publish Owner after it.
-    // `open` is the gate this second service already holds.
-    let (service, _held2, _obligation2, mut open) = submission_fixture();
-    open.begin_quiescing().unwrap();
-    let permit = permit_for(&mut open).unwrap();
-    service.close_transport_gate();
-    assert_eq!(open.publish_owner(permit), Err(ResourceError::Busy));
-    assert_eq!(open.state(), TransportState::Closed);
 }
 
 #[test]
@@ -1344,7 +1332,7 @@ fn c0_2ci_pre_submit_failure_cancels_and_leaves_transport_open() {
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo +nightly fmt && cargo test -p yserver --lib _transport`
-Expected: the eight new tests pass — the two gate-install guards, the four submission-failure tests, the terminal-close test and the device-loss test — along with any other matching tests. A failure is an F8 stop.
+Expected: the eight new tests pass — the two gate-install guards, the four submission-failure tests, the quiescing half of the terminal-close test and the device-loss test — along with any other matching tests. A failure is an F8 stop.
 
 - [ ] **Step 4: Run the oracle**
 
@@ -1356,7 +1344,7 @@ Expected: `S2-cancel-pre-submit-error` and `S2-freeze-uncertain-error` `CAUGHT_B
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
 Expected: clean; `c0_2ci` 171 passed, 18 ignored.
 
-*Reviewer mutations* (coordinator): delete `service.close_transport_gate();` from the `gpu_submitted` branch of `abandon_unsubmitted_batch` (fails `…failed_uncertain_freeze…` and `…uncertain_submission_freezes…`); delete the `if result.is_err() { … }` close (fails `…failed_pre_submit_cancel…`); revert any one of the five `self.state()` checks in `transport.rs` to the raw `self.state` (fails `c0_2ci_service_driven_close_is_terminal_for_the_gate`); delete the `PresentError::ManagedUnwind` arm of `present_error_is_device_lost` (fails `c0_2ci_failed_unwind_keeps_a_device_loss_recognisable`); and read both `return Err(managed_submit_failure(` arms in `submit_shared_scanout_frame` (plan correction 1).
+*Reviewer mutations* (coordinator): delete `service.close_transport_gate();` from the `gpu_submitted` branch of `abandon_unsubmitted_batch` (fails `…failed_uncertain_freeze…` and `…uncertain_submission_freezes…`); delete the `if result.is_err() { … }` close (fails `…failed_pre_submit_cancel…`); revert `begin_quiescing`'s `self.state()` check to the raw `self.state` (fails `c0_2ci_service_driven_close_stops_the_gate_quiescing`; the other four are Task 5's); delete the `PresentError::ManagedUnwind` arm of `present_error_is_device_lost` (fails `c0_2ci_failed_unwind_keeps_a_device_loss_recognisable`); and read both `return Err(managed_submit_failure(` arms in `submit_shared_scanout_frame` (plan correction 1).
 
 ```bash
 git add crates/yserver/src/kms/render/resources/mod.rs crates/yserver/src/kms/render/resources/transport.rs crates/yserver/src/kms/render/resources/gpu.rs crates/yserver/src/kms/render/scene.rs crates/yserver/src/kms/render/resources/guard_tests.rs
@@ -2194,6 +2182,51 @@ fn c0_2ci_guard_consume_owner_write_refuses_once_the_gate_left_owner() {
     );
     assert_eq!(gate.outstanding_owner_writes(), 1);
 }
+
+/// Round-2 B-1, Owner side: the same close, arriving through the service's
+/// handle, must also stop a permit being issued or published and a grant
+/// being minted or consumed. Task 2 proved the `begin_quiescing` half; these
+/// need Task 4's handover evidence to reach Owner at all.
+#[test]
+fn c0_2ci_service_driven_close_is_terminal_for_owner_transitions() {
+    // A permit in hand before the close cannot publish Owner after it, and
+    // the closed gate issues no further permit.
+    let (service, _held, _obligation, mut gate) = submission_fixture();
+    gate.begin_quiescing().unwrap();
+    let permit = permit_for(&mut gate).unwrap();
+    service.close_transport_gate();
+    assert_eq!(
+        gate.publish_owner(permit),
+        Err(ResourceError::Busy),
+        "a transport closed through its handle must refuse to publish Owner"
+    );
+    assert!(
+        matches!(permit_for(&mut gate), Err(ResourceError::Busy)),
+        "a transport closed through its handle must issue no handover permit"
+    );
+
+    // And in Owner: no new grant, and no consumption of one taken earlier.
+    let (service, _held2, _obligation2, mut owner) = submission_fixture();
+    owner.begin_quiescing().unwrap();
+    let permit = permit_for(&mut owner).unwrap();
+    owner.publish_owner(permit).unwrap();
+    let grant = owner.authorize_owner_write(WriterClass::Primary).unwrap();
+    service.close_transport_gate();
+    assert!(
+        matches!(
+            owner.authorize_owner_write(WriterClass::Primary),
+            Err(ResourceError::Detached)
+        ),
+        "a transport closed through its handle must mint no owner write grant"
+    );
+    assert!(
+        matches!(
+            owner.consume_owner_write(grant),
+            Err((ResourceError::Detached, _))
+        ),
+        "a transport closed through its handle must consume no owner write grant"
+    );
+}
 ```
 
 - [ ] **Step 2: Run the tests**
@@ -2209,7 +2242,7 @@ Expected: eight tagged sites, all `CAUGHT_BY_ORACLE` — `B-authorize-write-clos
 - [ ] **Step 4: Gate, then hand off for commit**
 
 Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; `c0_2ci` 179 passed, 18 ignored.
+Expected: clean; `c0_2ci` 180 passed, 18 ignored.
 
 ```bash
 git add crates/yserver/src/kms/render/resources/guard_tests.rs
