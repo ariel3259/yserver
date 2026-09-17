@@ -555,3 +555,104 @@ fn c0_2ci_guard_on_available_returns_rejected_half_error() {
          [census:C-on-available-rejected-error]"
     );
 }
+
+fn storage_lease(allocation: AllocationLease) -> super::storage::StorageLease {
+    let key = allocation.key();
+    super::storage::StorageLease {
+        allocation,
+        pixels: super::storage::PixelIdentity {
+            target: crate::kms::render::target::PaintTarget::new(
+                crate::kms::render::store::DrawableId::for_tests(1),
+                (0, 0),
+                None,
+                24,
+            ),
+            allocation: key,
+            content_offset: (0, 0),
+            extent: ash::vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            format: ash::vk::Format::B8G8R8A8_UNORM,
+            image_view: ash::vk::ImageView::null(),
+            sample_view: ash::vk::ImageView::null(),
+            image: ash::vk::Image::null(),
+        },
+    }
+}
+
+/// census: D-releasable-source commit.rs is_resource_releasable `let Some(source) = &res.source && !service.is_releasable(&source.allocation.key())`
+#[test]
+fn c0_2ci_guard_on_available_retains_resource_with_busy_source() {
+    let (mut service, held, _drops) = spy_service();
+    let _pending = service.register(held.key(), ObligationKind::Gpu).unwrap();
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.releasing_resources = vec![CommitResources::new(
+        vec![],
+        Some(storage_lease(held)),
+        None,
+        None,
+        vec![],
+        vec![],
+    )];
+    consumer.on_available(&[], &mut service).unwrap();
+    assert_eq!(
+        consumer.releasing_resources.len(),
+        1,
+        "a resource whose source allocation is not releasable must stay releasing \
+         [census:D-releasable-source]"
+    );
+}
+
+/// census: D-releasable-fallback commit.rs is_resource_releasable `let Some(fallback) = &res.fallback && !service.is_releasable(&fallback.allocation.key())`
+#[test]
+fn c0_2ci_guard_on_available_retains_resource_with_busy_fallback() {
+    let (mut service, held, _drops) = spy_service();
+    let _pending = service.register(held.key(), ObligationKind::Gpu).unwrap();
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.releasing_resources = vec![CommitResources::new(
+        vec![],
+        None,
+        Some(storage_lease(held)),
+        None,
+        vec![],
+        vec![],
+    )];
+    consumer.on_available(&[], &mut service).unwrap();
+    assert_eq!(
+        consumer.releasing_resources.len(),
+        1,
+        "a resource whose fallback allocation is not releasable must stay releasing \
+         [census:D-releasable-fallback]"
+    );
+}
+
+/// census: D-unique-new-members commit.rs register_commit_dependencies `!GroupMember::validate_unique(&new_members)`
+#[test]
+fn c0_2ci_guard_commit_dependencies_refuse_duplicate_new_members() {
+    let (mut service, old_alloc, _drops) = spy_service();
+    let new_alloc = spy(&mut service);
+    let old = vec![CommitResources::new(
+        vec![old_alloc],
+        None,
+        None,
+        None,
+        vec![member()],
+        vec![],
+    )];
+    let new = vec![CommitResources::new(
+        vec![new_alloc],
+        None,
+        None,
+        None,
+        vec![member(), member()],
+        vec![],
+    )];
+    assert!(
+        matches!(
+            register_commit_dependencies(CommitId::for_tests(930), old, new, &mut service),
+            Err((ResourceError::InvalidProof, _, _))
+        ),
+        "a commit whose new set repeats a member must be refused [census:D-unique-new-members]"
+    );
+}
