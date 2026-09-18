@@ -1,11 +1,15 @@
 # Phase C.0 stage 2c-ii — bounded intents and admission
 
-**Status:** design, revision 1 (2026-09-18). Its five design sections (units,
+**Status:** design, revision 2 (2026-09-18). Its five design sections (units,
 readiness, the decision, the conductor, verification — here sections 3–7 and 10)
 were approved one by one with the user in brainstorming, and the wlroots
-comparison (section 9) was requested there; the written whole has not yet been
-reviewed.
-Codex review to follow, then two implementation plans (section 10.3).
+comparison (section 9) was requested there. Revision 2 incorporates codex round 1
+(`../findings/2026-09-18-stage-2c-ii-design-review-round1.md`: 3 blocking, 1
+major, all four verified against the tree and accepted): fairness per CRTC
+(B-1), the confirmation boundary moved to the send (B-2), tier 5 takes every
+ready CRTC (B-3), barriers counted apart from the bound and ticket-lifecycle
+mutations (M-1). One question C.0 does not answer is open in section 11.1.
+Two implementation plans follow (section 10.3).
 
 **Authority**, most general first. This document elaborates the 2c-ii block; it
 does not replace or relax any of them.
@@ -73,7 +77,7 @@ Two parts, with a strict boundary.
   `AdmissionDecision`.
 - **The conductor** — one `AdmissionConductor` per device, on the platform side.
   The only component that talks to all three of: the decider, the
-  `DeviceCommitOwner` (`begin`/`dispatch`), and 2c-i's resources (to build the
+  `DeviceCommitOwner` (`begin`/`send_on`), and 2c-i's resources (to build the
   snapshot and to carry out what the decider decides).
 
 The file the conductor lives in is the plan's decision; this document fixes the
@@ -92,12 +96,13 @@ model, not its callers (section 11).
   partial or disjoint direct ownership needs its own bounded representation
   before admission (C.0 §9.1).
 
-Round-robin and fairness are computed **per unit** (section 5 records how this
-maps onto C.0's per-CRTC wording). This answers the fourth question stage 2c §7
-left open — how grouped direct frames map to per-device admission: one grouped
-unit is admitted as a whole, while per-output evidence and the shared source's
-release stay with 2c-i's ledger, which does not release a shared source at the
-first output.
+Units are **storage and resource containers**. Round-robin and fairness are
+accounted **per CRTC**, as C.0 §9.2.1 states (section 5). This answers the
+fourth question stage 2c §7 left open — how grouped direct frames map to
+per-device admission: one grouped unit is admitted as a whole and counts as a
+service for every CRTC it covers, while per-output evidence and the shared
+source's release stay with 2c-i's ledger, which does not release a shared source
+at the first output.
 
 **What the decider holds per unit** — descriptors, never resources:
 
@@ -166,10 +171,10 @@ tiers in order and returns the first that applies:
 | --- | --- | --- |
 | 1 | Topology barrier | One is waiting |
 | 2 | Unflip/recovery | Ready, and needed to restore a visible/correct desktop |
-| 3 | Direct successor | Absorbs **every** aged maintenance identity that would otherwise win, **and** its unit holds the round-robin turn |
+| 3 | Direct successor | Absorbs **every** aged maintenance identity that would otherwise win, **and** the round-robin rule permits every CRTC it covers |
 | 4 | Aged maintenance | Oldest ticket; stable `(CRTC, class)` tie-break |
-| 5 | Homogeneous bundle | At least two CRTCs of the qualified group with ready generations, no barrier, all changed aged maintenance absorbed or serviced first |
-| 6 | Primary | Oldest ready, round-robin per unit; the retirement successor is preferred when no other unit holds the turn |
+| 5 | Homogeneous bundle | At least two CRTCs of the qualified group ready, no barrier, all changed aged maintenance absorbed or serviced first; the bundle includes **every** ready CRTC of the group |
+| 6 | Primary | Oldest ready, round-robin per CRTC; the retirement successor is preferred when no different CRTC is owed the turn |
 | 7 | Non-aged maintenance | Oldest ticket |
 
 **The decision carries**, so that it can be confirmed and tested unambiguously:
@@ -196,50 +201,77 @@ direct/unflip rules) and the maintenance wins first (C.0 §9.2.1).
 arrival, keeping its original ticket. Barriers age the maintenance they overtake
 (C.0 §9.2.1).
 
-**Round-robin turn.** Each unit records the sequence number of its last primary
-admission. Among units with a ready primary, the lowest sequence holds the turn,
-so no unit takes two successive slots while another waits (C.0 §9.2.1).
+**Round-robin turn — per CRTC (C.0 §9.2.1).** Each CRTC records the sequence
+number of the last admission that carried a primary for it. A primary admission
+that covers several CRTCs (a grouped direct unit, a tier-5 bundle) marks
+**every** CRTC it includes as served. A candidate is eligible for tiers 3 and 6
+only if **none** of the CRTCs it covers would take a second successive slot while
+another CRTC has a ready primary and is owed service. So neither a composed
+intent on a CRTC just served by a grouped commit, nor a grouped commit right
+after one of its CRTCs was served alone, can jump the queue.
 
-*Mapping onto C.0, stated so review can challenge it:* §9.2.1 phrases the
-round-robin "across CRTCs", while §9.1 defines intents per primary-plane
-ownership unit. For a composed unit the two coincide. A grouped direct unit
-spans several CRTCs and is **one** round-robin participant: its commit replaces
-the whole output set at once, so treating it as several CRTCs would let one
-logical owner collect several turns. This is a reading of C.0, not a change to
-it; if review finds it wrong, the correction goes to C.0 as well.
+Revision 1 counted turns per unit instead. The round-1 review (B-1) showed that
+this is weaker than C.0: after a grouped `AB` commit, a composed `A` could win the
+next slot while `B` waited, with no *unit* taking two turns. Units remain only
+the storage of section 3.
 
-**Tier 5 details (C.0 §9.2.1).** A CRTC not ready when the bundle is built is
-not represented by carried state and earns no logical retirement; each distinct
-included generation retires once from the same physical commit. With fewer than
-two ready CRTCs, tier 6 applies: **there is no timer waiting for a bundle.**
+**Tier 5 details (C.0 §9.2.1).** The bundle takes the oldest ready synchronous
+generation of **every** ready CRTC in the `HomogeneousCompletionGroup`, each
+with canonical completion coverage — never a subset of the ready ones, which a
+continuous two-CRTC stream could otherwise use to starve a third. A CRTC not
+ready when the bundle is built is not represented by carried state and earns no
+logical retirement; each distinct included generation retires once from the same
+physical commit. With fewer than two ready CRTCs, tier 6 applies: **there is no
+timer waiting for a bundle.**
 
-**Bounds as invariants (C.0 §9.2.1):** an aged maintenance identity is admitted
-after at most the commit in flight when it aged plus `N - 1` older-ticket
-maintenance admissions; no unit takes two successive slots while another has a
-ready primary. The decider keeps the per-class counts of intervening admissions,
-and exceeding a bound is an **invariant failure**, not a statistic.
+**Bounds as invariants (C.0 §9.2.1):**
+
+- With `N` incompatible aged maintenance identities, each is admitted after at
+  most the one commit already submitted when it aged, `N - 1` older-ticket
+  maintenance admissions, and owner dispatch latency.
+- **Finite topology/unflip/recovery barriers may interrupt that bound.** They are
+  counted separately and are not a violation; what they may never do is reset or
+  reorder a surviving ticket.
+- No CRTC takes two successive slots while another CRTC has a ready primary.
+
+The decider counts intervening admissions per class, with barrier admissions in
+their own count. Exceeding a bound **after discounting the barriers** is an
+**invariant failure**, not a statistic.
 
 ## 6. Two-phase confirmation
 
 Admitting consumes state: tickets are spent, the round-robin turn advances,
-losers age. The conductor may be unable to carry out a decision — the owner
-refuses `begin`, qualification closed, the transport left `Owner`. Consuming
-state before knowing would lose a ticket or skip a turn with nothing dispatched,
-violating exactly the bounds section 5 measures.
+losers age. The conductor may be unable to carry out a decision, and not only at
+`begin`: `DeviceCommitOwner::begin_with_context` installs a live record, reserves
+the slot and takes the ledger, but the later `send_on` can still refuse **before
+any IPC** (`Reaped`, `Stalled`, `AlreadyInFlight`, `ReservationMismatch`,
+`BoundaryViolation`, `TransportGateRefused`), terminalizing the record as
+`NeverDispatched`. Consuming state before the send boundary would lose a ticket
+or skip a turn with nothing dispatched, violating exactly the bounds section 5
+measures.
 
-So admission is **decide, then confirm**:
+The confirmation boundary is therefore **the send boundary, not `begin`**:
 
-- `decide` is pure and changes nothing.
-- The conductor attempts `begin`. On success it calls `commit(decision)`, which
-  consumes the tickets, advances the turn and ages the losers. On failure it
-  calls nothing, and the decider's state is untouched.
-- `commit` verifies that every generation the decision named is still the
-  current one before consuming anything (section 7 says what a mismatch means).
+1. `decide` is pure and changes nothing.
+2. `lock(decision) -> AdmissionToken` checks that every generation the decision
+   names is still current and marks one admission as pending. It consumes no
+   fairness state. While a token exists the decider refuses another `lock`. This
+   is where a generation mismatch is detected — **before** anything is handed to
+   the owner.
+3. The conductor calls `begin`, then `send_on`.
+4. The token is consumed exactly once, by value:
+   - **`confirm(token)`** when the owner reports `Dispatched` — `send` returned
+     `Ok`, or `SendError::Ipc`, which means the write was attempted and the owner
+     already treats the record as dispatched. Only now are the tickets consumed,
+     the turn advanced and the losers aged.
+   - **`abort(token)`** when `begin` refuses, or when `send_on` refuses before
+     IPC. Nothing is consumed; the decider is exactly as before `lock`.
 
 Rejected alternatives: mutating in `decide` and undoing on failure (an error path
 that fails to undo corrupts fairness silently — the class of defect 2c-i kept
-meeting); the decider calling the owner itself (breaks purity and ties the tests
-to the owner).
+meeting); confirming at `begin` (revision 1 — the round-1 review, B-2, showed it
+loses a ticket on a pre-IPC send refusal); the decider calling the owner itself
+(breaks purity and ties the tests to the owner).
 
 ## 7. The conductor
 
@@ -248,13 +280,22 @@ to the owner).
 1. **On a retirement** (`CompletionRetired`): first enqueue the predecessor's
    completion and its deferred `Skip`s through 2c-i's protocol ledger. Nothing is
    published yet.
-2. **If the device slot is free:** snapshot → `decide`. On a decision, build the
-   request from its exact generations and 2c-i's resources and call
-   `owner.begin`.
-   - `begin` succeeds → `commit(decision)` and dispatch **in the same wake**
-     (`DispatchTimingPolicy::ImmediateOnRetirement`, C.0 §9.2.1).
-   - `begin` refuses → **nothing is confirmed**; record the reason; stop.
-     **No retry**: the next real wake re-evaluates.
+2. **If the device slot is free:** snapshot → `decide` → `lock`. Build the
+   request from the decision's exact generations and 2c-i's resources, then
+   `begin` and `send_on` **in the same wake**
+   (`DispatchTimingPolicy::ImmediateOnRetirement`, C.0 §9.2.1).
+   - Dispatched → `confirm(token)`.
+   - `begin` refuses → `abort(token)`; the owner took nothing.
+   - `send_on` refuses before IPC → `abort(token)`. The owner has already retired
+     the record as `NeverDispatched` and returned its ledger in the refusal's
+     events (`Terminal`, `ResourcesReleased`, `ResourcesStillCurrent`); the
+     conductor hands those to 2c-i's ledger, which disposes of each resource on
+     its never-dispatched path. Composed generations and maintenance desired
+     state are desired state and stay in the decider. A direct successor whose
+     leases that path terminalized is **withdrawn** from its slot — a withdrawal
+     consumes no ticket and advances no turn.
+   - In every refusal: record the reason, stop. **No retry**: the next real wake
+     re-evaluates.
 3. Only when the handler returns does the core publish the enqueued events. So
    admission and the kernel submission happen before wire publication, without
    breaking predecessor-before-`Skip` order (C.0 §9.2.1).
@@ -262,10 +303,17 @@ to the owner).
 **At most one dispatch per wake:** there is one device slot, so after a
 successful `begin` nothing else fits.
 
-**A generation mismatch at `commit`.** The conductor runs on the core thread, so
-nothing can change between `decide`, `begin` and `commit`. A mismatch is a
-programming error and is treated as an **invariant failure that closes the
-transport** through the existing failure path, consuming nothing half-way.
+**A generation mismatch at `lock`.** The conductor runs on the core thread, so
+nothing can change between `decide` and `lock`. A mismatch is a programming
+error and is treated as an **invariant failure that closes the transport**
+through the existing failure path. Because `lock` precedes `begin`, the owner
+holds nothing at that point and no `cancel_live` is needed. Between `lock` and
+`confirm` only the conductor runs, and it changes no descriptor, so `confirm`
+cannot see a mismatch.
+
+**After dispatch**, the commit follows the owner's normal lifecycle (C.0 §10) and
+2c-i's ledger. Its admission is already confirmed: the slot really was
+occupied.
 
 **Successor replacement.** When the decider returns a displaced generation, the
 conductor runs it through 2c-i's never-submitted path — idle exactly once,
@@ -359,8 +407,13 @@ confirmed to have compiled.
 | Supersession bounds: one slot per category (stage 2c §2) | Allow a second successor |
 | No dispatch before readiness (stage 2c §2) | Admit a `Waiting` intent |
 | Retirement ordering: predecessor, `Skip`, admission, publication (stage 2c §2, §4) | Publish before admitting |
-| Two-phase: a refused `begin` consumes nothing (section 6) | Consume state inside `decide` |
-| Round-robin: no unit takes two successive slots (C.0 §9.2.1) | Drop the last-admission record |
+| Two-phase: a refused `begin` **and each pre-IPC `send_on` refusal** (`Reaped`, `Stalled`, `AlreadyInFlight`, `ReservationMismatch`, `BoundaryViolation`, `TransportGateRefused`) consume nothing; `Ok` and `SendError::Ipc` confirm (section 6) | Confirm at `begin` instead of at the send; consume state inside `decide` |
+| A generation mismatch is caught at `lock`, before the owner holds anything (section 7) | Move the check after `begin` |
+| Round-robin per CRTC: no CRTC takes two successive slots, including grouped→composed and composed→grouped transitions (C.0 §9.2.1) | Mark only one CRTC of a multi-CRTC admission as served; drop the last-admission record |
+| Tier 5 includes **every** ready CRTC of the group, tested with three or more CRTCs (C.0 §9.2.1) | Drop one ready member from the bundle |
+| A ticket survives payload replacement (C.0 §9.2.1) | Reset the ticket on replacement |
+| An update arriving while its identity is submitted gets a **new** ticket (C.0 §9.2.1) | Reuse the consumed ticket |
+| A barrier interrupts the bound without resetting or reordering surviving tickets, and is counted apart (C.0 §9.2.1) | Reset relative age at a barrier; count barrier admissions against the maintenance bound |
 | Fairness under a **continuous direct-successor stream** (stage 2c §7) | Drop ageing on loss |
 | Aged incompatible maintenance, symmetric absorption, **unchanged-cursor omission** (stage 2c §4) | Absorb an unchanged cursor |
 
@@ -410,3 +463,17 @@ the decisions above.
   named mutations of section 10.2 alone.
 - How the `HomogeneousCompletionGroup` membership reaches the snapshot; qualifying
   the group on hardware remains stage 3 and C.0 §16.3.
+
+### 11.1. Open design question — must be settled before plan B
+
+**What happens to absorbed maintenance when a dispatched commit is rejected
+by the kernel?** Section 6 confirms at the send boundary, so the tickets are
+spent. C.0 §9.2 says a failure leaves the prior current state authoritative, but
+nowhere says whether a cursor or gamma generation carried by the rejected commit
+re-enters admission with its original ticket (aged), gets a new one, or is
+dropped as incompatible. The choice affects the starvation bound: a new ticket
+could push it back indefinitely, while re-entering with the old ticket could
+loop on a payload the kernel will always reject. This is a gap in C.0, not
+plumbing; it is recorded here per the authority rule and answered in C.0 (or by
+the user) before plan B, which owns tickets. Plan A (primary only) does not
+depend on it.
