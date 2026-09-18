@@ -2,13 +2,15 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. Execute tasks in order, one at a time; tick steps (`- [ ]` → `- [x]`) only with the evidence each names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. Stop with the tree dirty; the coordinating session verifies and commits.
 
+**Revision 4 (2026-09-17)** — **scope reduced: P3-2 and P3-3 are an F8 stop** (spec section 9.5, user's decision). While verifying Task 1's instrument, the coordinator traced `KmsRelease` registration to its callers and found that no production path registers that obligation in stage 2c-i: `register_kms` is called only from `register_commit_dependencies`, which is called only from tests. The real flip path registers a GPU retirement batch and never a `KmsRelease`. So P3-2 and P3-3 have nothing on the real path to observe, the named mutations (anchored in `register_commit_dependencies`) would survive for a reason unrelated to the tests, and both are removed together with the instrument task. Part 3 now proves P3-1 and P3-4 and runs the gamma audit. Tasks renumbered: 7 → 5.
+
 **Revision 3 (2026-09-17)** — incorporates codex round 2 (`…-part-3-plan-review-round2.md`: 0 blocking, 2 major; four of round 1's five audited APPLIED, M-3 PARTIAL). See *Corrections from review round 2*.
 
 **Revision 2 (2026-09-17)** — incorporates codex round 1 (`docs/superpowers/findings/2026-09-17-part-3-plan-review-round1.md`: 2 blocking, 3 major), all five verified against the tree. See *Corrections from review round 1*.
 
-**Goal:** Put a managed scanout buffer on screen through a page flip the kernel actually accepts, and prove the stage 2c-i ledger against the kernel's own completion and out-fence instead of a synthesized event.
+**Goal:** Put a managed scanout buffer on screen through a page flip the kernel actually accepts (P3-1), resolve that flip's out-fence through its canonical status query (P3-4), and run the existing no-master gamma test's path with master — on the kernel's own evidence instead of a synthesized event. P3-2 and P3-3 are out, as an F8 stop: spec section 9.5.
 
-**Architecture:** A second hardware fixture, beside the existing ones, that takes DRM master and builds its output from the live card through the production probe. Four `_drm` tests over it, one per invariant of spec section 9.2. Nothing existing changes shape: the current fixtures keep opening the node without master, so the tests that encode the no-master outcome keep meaning what they mean.
+**Architecture:** A second hardware fixture, beside the existing ones, that takes DRM master and builds its output from the live card through the production probe. `_drm` tests over it for P3-1 and P3-4, plus a master-held run of the existing gamma test's own body. Nothing existing changes shape: the current fixtures keep opening the node without master, so the tests that encode the no-master outcome keep meaning what they mean.
 
 **Tech Stack:** Rust (`cargo test`), libdrm through the `drm` crate, a live Vulkan ICD, a real DRM card with a connected output.
 
@@ -23,6 +25,13 @@ Session 2's plan handed the implementer verbatim blocks, because the coordinatin
 So this plan fixes the **fixture contract**, the **invariants**, and the **commands the user runs**, and leaves the test bodies to the implementer. What the implementer can still verify mechanically is stated per task: it compiles, it lints, the deterministic suite is unaffected, and the new tests **fail** rather than pass when run without master.
 
 ## Corrections from review round 2
+
+> The two tables below are the record of what each review round found and how
+> revisions 2 and 3 answered it, **in those revisions' task numbering**. Revision
+> 4 superseded the rows about P3-2, P3-3 and the named-mutation instrument (the
+> old Task 1): they fell with the F8 stop of spec 9.5. The rows about the
+> fixture's teardown, out-fence ownership, serialisation, bounded waits and the
+> gamma audit still hold, under the new numbering.
 
 | Finding | Disposition |
 | --- | --- |
@@ -68,63 +77,12 @@ So this plan fixes the **fixture contract**, the **invariants**, and the **comma
 
 - Modify: `crates/yserver/src/kms/executor/test_support.rs` — master acquisition on an already-open node, with the R12 failure message (Task 1).
 - Modify: `crates/yserver/src/kms/render/backend.rs` — the live-KMS fixture beside the existing ones (Task 1).
-- Create: `crates/yserver/src/kms/render/part3_tests.rs` — the `_drm` tests (Tasks 3–6), declared from `render/mod.rs` under `#[cfg(test)]`.
-- Modify: `tools/guard-census.py` — a `--named-mutation` mode for the two lifecycle mutations spec 9.3 step 3 names (Task 1).
-- Create ([H], user + coordinator): `docs/superpowers/findings/2026-09-17-part-3-flip-accepted.md` (Task 7).
+- Create: `crates/yserver/src/kms/render/part3_tests.rs` — the `_drm` tests (Tasks 2–4), declared from `render/mod.rs` under `#[cfg(test)]`.
+- Create ([H], user + coordinator): `docs/superpowers/findings/2026-09-17-part-3-flip-accepted.md` (Task 5).
 
 ---
 
-### Task 1: The mutation instrument for part 3's two named mutations
-
-**Files:**
-- Modify: `tools/guard-census.py`
-
-**Why this comes first.** Spec 9.3 step 3 requires part 3's named mutations to
-be run "with the census tool from section 3.0". Round-1 M-2 showed the tool
-cannot express them: it enumerates **refusal guards** (`return Err/false/None`)
-and forces their conditions to `false`, while P3-2's mutation relocates a
-lifecycle step and P3-3's must make `if !retained_in_new` register **anyway**.
-The instrument is extended rather than bypassed, so the discipline that makes a
-mutation trustworthy -- restore from memory even on failure or Ctrl-C, and count
-nothing that did not compile -- still applies.
-
-**Interfaces:**
-- Produces: `tools/guard-census.py --named-mutation {p3-2,p3-3} --filter <cargo test filter> [--dry-run]`, which refuses unless the unmutated filtered suite is green; applies the one edit its name carries; **refuses to count a mutant that did not compile**; runs the filtered suite; reports which tests failed; and restores the file from memory in a `finally`, as the existing census already does. `--dry-run` applies the edit, confirms it compiles, prints the diff and restores, without running the suite.
-- The two edits, by name:
-  - **`p3-2`** -- discharge the `KmsRelease` obligation at submission instead of at the kernel completion, so "not released before the completion" becomes false;
-  - **`p3-3`** -- register a KMS obligation for a **retained** member, by making `commit.rs`'s `if !retained_in_new` branch register regardless.
-- Each edit is anchored by the exact source text it replaces, never by line number, and the tool **fails loudly when its anchor no longer matches**: a silently skipped mutation is the failure mode this whole stage exists to prevent.
-
-- [ ] **Step 1: Extend the tool**
-
-- [ ] **Step 2: Prove both anchors still match**
-
-Run: `python3 tools/guard-census.py --named-mutation p3-3 --filter c0_2ci_commit --dry-run`, then the same for `p3-2`.
-Expected: each edit applies and compiles, and the printed diff is the edit its name promises. A non-matching anchor is an F8 stop, not a guess at the intended site.
-
-- [ ] **Step 3: Gate, then hand off for commit**
-
-Run: `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings && cargo test -p yserver --lib c0_2ci`
-Expected: clean; **180 passed, 18 ignored** -- this task touches no Rust source.
-
-```bash
-git add tools/guard-census.py
-git commit -m "tools(census): named mutations for part 3
-
-Spec 9.3 step 3 requires part 3's two mutations to run through the
-census tool, but the tool only neutralises refusal guards: P3-2's
-mutation relocates a lifecycle step and P3-3's must make a branch
-register where it currently skips (review round 1, M-2).
---named-mutation carries those two edits explicitly, anchored by source
-text, and reuses the tool's restore-from-memory and compile-check
-discipline.
-
-Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
-```
-
----
-
-### Task 2: The live-KMS fixture
+### Task 1: The live-KMS fixture
 
 **Files:**
 - Modify: `crates/yserver/src/kms/executor/test_support.rs`, `crates/yserver/src/kms/render/backend.rs`
@@ -183,7 +141,7 @@ Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)"
 
 ---
 
-### Task 3: P3-1 — a managed buffer goes on screen through an accepted flip
+### Task 2: P3-1 — a managed buffer goes on screen through an accepted flip
 
 **Files:**
 - Create: `crates/yserver/src/kms/render/part3_tests.rs`; modify `crates/yserver/src/kms/render/mod.rs` to declare it under `#[cfg(test)]`.
@@ -207,26 +165,7 @@ Expected: clean; **180 passed, 19 ignored** — the new test is ignored, and no 
 
 ---
 
-### Task 4: P3-2 and P3-3 — the ledger against real kernel evidence
-
-**Files:**
-- Modify: `crates/yserver/src/kms/render/part3_tests.rs`
-
-**Invariants:**
-- **P3-2:** the displaced buffer's `KmsRelease` obligation is discharged by the **real** kernel completion, and the buffer is **not released before it**. Both halves matter: the test must observe the entry still rooted while the completion has not arrived, and released after it has. The completion must come from the kernel's event, read through the backend's own completion path — not a synthesized `OwnerEvent` — and must be the completion **matching** this submission, awaited under the deadline the Global Constraints impose (round-2 M-2).
-- **P3-3:** a buffer **retained** across the flip registers no obligation and is not released — R6's retained-member clause, on real evidence.
-
-- [ ] **Step 1: Write both tests**
-
-- [ ] **Step 2: Compile, lint, deterministic suite**
-
-Expected: clean; **180 passed, 21 ignored**.
-
-- [ ] **Step 3: Hand off.** Same no-master check by the coordinator, then commit.
-
----
-
-### Task 5: P3-4 — the out-fence resolves
+### Task 3: P3-4 — the out-fence resolves
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/part3_tests.rs`
@@ -241,13 +180,13 @@ Expected: clean; **180 passed, 21 ignored**.
 
 - [ ] **Step 2: Compile, lint, deterministic suite**
 
-Expected: clean; **180 passed, 22 ignored**.
+Expected: clean; **180 passed, 20 ignored**.
 
 - [ ] **Step 3: Hand off for commit.**
 
 ---
 
-### Task 6: What the gamma path does when its own fd holds master
+### Task 4: What the gamma path does when its own fd holds master
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/part3_tests.rs`
@@ -279,50 +218,43 @@ something other than what the existing test's assertion rests on.
   same four states, with the live-KMS fixture's master-holding device, as a new
   `_drm` test. Record what each state does. If the Legacy arm's outcome
   contradicts what the existing test encodes, **do not edit the existing
-  test**: report it as an F8 stop for Task 7's record and a decision for the
+  test**: report it as an F8 stop for Task 5's record and a decision for the
   stage owner.
 
 - [ ] **Step 3: Compile, lint, deterministic suite**
 
-Expected: clean; **180 passed, 23 ignored** — the refactor must not move the deterministic count, and `c0_2ci_sink_gamma_gate_four_states_drm` must still exist under that name.
+Expected: clean; **180 passed, 21 ignored** — the refactor must not move the deterministic count, and `c0_2ci_sink_gamma_gate_four_states_drm` must still exist under that name.
 
 - [ ] **Step 4: Hand off for commit.**
 
 ---
 
-### Task 7: The run protocol, the mutations, and the record
+### Task 5: The run protocol and the record
 
 This task is **not** the implementer's to execute. The implementer writes Step 1's command file; the user runs it from an active VT; the coordinator records the result.
+
+There are no named mutations here any more. Spec 9.3 step 3 named them for P3-2 and P3-3 only, and those two are an F8 stop (spec 9.5). What keeps P3-1 and P3-4 from being vacuous is their own falsifiability, checked per task: each **fails** when run without master (R12), and each asserts on the kernel's answer rather than on the backend's bookkeeping.
 
 - [ ] **Step 1 (implementer): supply the exact commands**
 
 Write `docs/superpowers/plans/part-3-run.sh` — the exact, copy-pasteable sequence spec 9.3 step 2 requires, which:
 - refuses to start unless `loginctl show-seat seat0 -p ActiveSession` names this session (the check the user would otherwise forget, and the one that turns a confusing failure into a clear refusal);
 - runs `cargo test -p yserver --lib c0_2ci -- --ignored --nocapture --test-threads=1` filtered to the part-3 tests, so the fixture's card/connector/mode report is visible and no two of them hold the device at once (round-1 M-1);
-- then runs the mutations of Step 3 below, under the same filter, through `tools/guard-census.py --named-mutation` (Task 1);
 - writes everything to `/tmp/part3-run.log` and prints where it put it.
 
 - [ ] **Step 2 (user): run it**
 
 From a VT that is the seat's **active** session — on this box tty2, with the desktop logged out — run `bash docs/superpowers/plans/part-3-run.sh` and hand back `/tmp/part3-run.log`.
 
-- [ ] **Step 3 (user, inside that script): the named mutations**
+- [ ] **Step 3 (coordinator): record**
 
-Each must fail its named test, and each must be confirmed to have compiled:
-- **`--named-mutation p3-2`:** discharge the `KmsRelease` obligation on submission instead of on the kernel completion — the test must fail on the "not released before" half, the half that distinguishes real evidence from a synthesized event;
-- **`--named-mutation p3-3`:** register an obligation for the retained buffer — the test must fail on R6's retained-member clause.
+Create `docs/superpowers/findings/2026-09-17-part-3-flip-accepted.md` with: the card, connector and mode the fixture reported; for every observation, whether it completed within its deadline, and for any that did not, whether it was a timeout or a fence `Error(_)` (round-2 M-2); P3-1 and P3-4 and what was observed for each; the named existing gamma test and what its four states did with and without master (round-2 M-1); the full log; **the F8 stop of spec 9.5 — P3-2 and P3-3 not provable on real evidence in 2c-i, with its evidence**; and, prominently, spec 9.4's boundary — **part 3 is not the bounded delivery check of the C.0 design's section 16.3, satisfies none of its requirements, and is never reported as doing so**. Any further F8 stop goes here too, including the one this plan expects most: whether a **PRIME-imported Vulkan image**, rather than a dumb buffer, can be flipped on this NVIDIA driver at all. The feasibility probe did not answer that, and a negative answer is a finding about the driver, not a failure of the plan.
 
-Neither mutation counts unless the tool reports that it compiled.
-
-- [ ] **Step 4 (coordinator): record**
-
-Create `docs/superpowers/findings/2026-09-17-part-3-flip-accepted.md` with: the card, connector and mode the fixture reported; for every observation, whether it completed within its deadline, and for any that did not, whether it was a timeout or a fence `Error(_)` (round-2 M-2); the named existing gamma test and what its four states did with and without master (round-2 M-1); the four invariants and what was observed for each; both mutations and the test that caught each; the full log; and, prominently, spec 9.4's boundary — **part 3 is not the bounded delivery check of the C.0 design's section 16.3, satisfies none of its requirements, and is never reported as doing so**. Any F8 stop goes here too, including the one this plan expects most: whether a **PRIME-imported Vulkan image**, rather than a dumb buffer, can be flipped on this NVIDIA driver at all. The feasibility probe did not answer that, and a negative answer is a finding about the driver, not a failure of the plan.
-
-Then add to the spec's status line: "Part 3 executed: …", naming what was proven and what was not.
+Then add to the spec's status line: "Part 3 executed: …", naming what was proven and what was not — P3-2 and P3-3 among the latter.
 
 ## Self-review notes
 
-- **Spec coverage.** 9.2's four invariants map to Tasks 3-5; its last paragraph — which existing tests encode the no-master outcome — maps to Task 6, which **executes** it on a master-holding fd instead of inferring it (round-1 M-3). 9.3's four steps map to Task 7, whose mutations run through the instrument Task 1 adds (round-1 M-2). 9.4 is carried into Task 7's record.
+- **Spec coverage (revision 4).** P3-1 maps to Task 2 and P3-4 to Task 3. P3-2 and P3-3 are an F8 stop, recorded in spec 9.5 with its evidence and carried into Task 5's record. 9.2's last paragraph — which existing tests encode the no-master outcome — maps to Task 4, which **executes** the identified test's own body on a master-holding fd (round-1 M-3, round-2 M-1). 9.3's steps 1, 2 and 4 map to Task 5; step 3 fell with P3-2 and P3-3. 9.4 is carried into Task 5's record.
 - **The one thing this plan cannot promise.** Whether P3-1 is achievable at all on this driver. The feasibility probe proved the kernel path with dumb buffers; the managed path imports a Vulkan image through PRIME and flips *that*. If NVIDIA refuses it, the honest output of this plan is an F8 report, and the stage still gains the fixture and the three other invariants.
 - **Why no verbatim code.** Stated above, under "Why this plan states invariants instead of supplying code". The trade is deliberate: unrunnable prescribed code would be worse than an invariant the implementer must satisfy and the user must witness.
 - **What round 1 changed about the risk profile.** Two of its five findings were about what happens when a test *fails*: the console left on test contents (B-1) and an fd closed twice (B-2). Both matter more here than in an ordinary stage, because part 3's mutations deliberately make tests panic on a live display. The teardown order and the fd ownership are now stated as constraints, not left to the test body.

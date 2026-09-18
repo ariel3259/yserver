@@ -489,3 +489,44 @@ composed and fullscreen entry and exit through the owner machinery, which is
 complete only in stages 3/4, and it is scheduled there. Part 3 is an early,
 partial falsification of the stage 2c-i ledger on real kernel evidence. It
 satisfies no section-16.3 requirement and is never reported as doing so.
+
+### 9.5. P3-2 and P3-3 — F8 stop (2026-09-17)
+
+**P3-2 and P3-3 are not provable on real kernel evidence in stage 2c-i, and
+this is recorded as the F8 stop the stage's own discipline calls for** — not
+weakened into a pass, and not closed by pulling stages-3/4 machinery forward
+(user's decision, 2026-09-17).
+
+The evidence, from the tree at `c0b83627`:
+
+- the only code that registers a `KmsRelease` obligation is
+  `ResourceService::register_kms`, and its only caller is
+  `commit::register_commit_dependencies`;
+- `register_commit_dependencies` has **no caller outside tests** — the line
+  naming it in `resources/mod.rs` is a re-export, and the three
+  `register(…, KmsRelease)` calls in `store.rs` are all inside test functions;
+- the discharge side lives in `CommitResourceConsumer::consume`, on the owner's
+  `HardwareComplete` / `CompletionRetired` events, which the owner machinery
+  produces through its executor — the activation stages 3/4 own (section 6,
+  and section 9.4 itself);
+- the flip path that **is** real today — the scene's shared scanout, through
+  `submit_flip_with_fences` — registers a GPU retirement batch and never a
+  `KmsRelease` obligation.
+
+So on the only real flip path there is no `KmsRelease` obligation to discharge
+(P3-2) and no retained-member registration to refuse (P3-3). The premise of
+section 9.2 for these two — that a real route produces them — does not hold in
+2c-i. It was the author's premise, and neither codex review of the part-3 plan
+traced it to a production caller. Their first real evidence comes with the
+owner commit path in stages 3/4, and the delivery check scheduled there should
+carry them.
+
+Consequences for the rest of section 9:
+
+- part 3 proves **P3-1 and P3-4**, and answers section 9.2's last paragraph by
+  running the identified no-master test with master;
+- section 9.3 step 3 — the named mutations — fell with P3-2 and P3-3, which
+  were the only invariants it named mutations for. A mutation anchored in
+  `register_commit_dependencies` would survive under part 3's filter, not
+  because the tests are weak but because the code under mutation is not on the
+  path they drive.
