@@ -161,11 +161,11 @@ pub fn crtcs(ids: &[CrtcId]) -> BTreeSet<CrtcId>;   // test/fixture convenience
 - `c0_adm_topology_requests_are_monotonic` — a repeated generation is `StaleGeneration`; a newer one replaces it.
 - `c0_adm_a_second_unflip_request_widens_the_barrier` — `request_unflip({1})` then `request_unflip({2})`: the barrier holds `{1, 2}`.
 
-- [ ] **Step 1:** Register the module and write the tests against the interfaces above.
-- [ ] **Step 2:** Run `cargo test -p yserver --lib c0_adm` and record the failure (a compile error, since the storage does not exist yet).
-- [ ] **Step 3:** Implement the storage.
-- [ ] **Step 4:** Run the gate. Expected: fmt and clippy clean; `c0_adm` **9 passed, 0 failed**; full `--lib` 0 failed.
-- [ ] **Step 5:** Stop dirty and report: files touched, gate output, and anything this task's text did not settle.
+- [x] **Step 1:** Register the module and write the tests against the interfaces above.
+- [x] **Step 2:** Run `cargo test -p yserver --lib c0_adm` and record the failure (a compile error, since the storage does not exist yet).
+- [x] **Step 3:** Implement the storage.
+- [x] **Step 4:** Run the gate. Expected: fmt and clippy clean; `c0_adm` **9 passed, 0 failed**; full `--lib` 0 failed.
+- [x] **Step 5:** Stop dirty and report: files touched, gate output, and anything this task's text did not settle.
 
 ---
 
