@@ -1658,6 +1658,122 @@ pub struct KmsBackend {
     pub legacy_dispositions_for_tests: Vec<LegacyEventDisposition>,
 }
 
+/// A test-only KMS backend whose DRM fd holds master for its whole lifetime.
+/// The backend field remains borrowed by the tests; keeping it private to the
+/// crate prevents callers from moving it out and bypassing the restoration
+/// order enforced by `Drop`.
+#[cfg(test)]
+pub struct LiveKmsFixture {
+    // FIELD ORDER IS LOAD-BEARING. `Drop::drop` restores the CRTC first; Rust
+    // then drops the fields in declaration order, which gives the teardown the
+    // plan requires: restore -> destroy the test resources (`backend`) -> drop
+    // master (`_master`) -> release the process-wide guard (`_exclusive`).
+    // Reordering these fields silently breaks it.
+    pub(crate) backend: KmsBackend,
+    snapshot: Option<LiveKmsCrtcSnapshot>,
+    // Held only for their `Drop`: never read, by design.
+    _master: crate::kms::executor::test_support::DrmMasterGuard,
+    _exclusive: crate::kms::executor::test_support::LiveKmsFixtureGuard,
+}
+
+#[cfg(test)]
+impl Drop for LiveKmsFixture {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take()
+            && let Err(error) = snapshot.restore()
+        {
+            eprintln!(
+                "LIVE-KMS FIXTURE RESTORATION FAILED: {error}; the test may have left the active CRTC configuration changed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+struct LiveKmsCrtcSnapshot {
+    device: Rc<drm::Device>,
+    crtc: ::drm::control::crtc::Handle,
+    framebuffer: Option<::drm::control::framebuffer::Handle>,
+    position: (u32, u32),
+    mode: Option<::drm::control::Mode>,
+    connectors: Vec<::drm::control::connector::Handle>,
+}
+
+#[cfg(test)]
+impl LiveKmsCrtcSnapshot {
+    fn capture(device: Rc<drm::Device>, crtc: ::drm::control::crtc::Handle) -> io::Result<Self> {
+        use ::drm::control::Device as ControlDevice;
+
+        let crtc_info = device.get_crtc(crtc)?;
+        let resources = device.resource_handles()?;
+        let mut connectors = Vec::new();
+        for connector in resources.connectors() {
+            let connector_info = device.get_connector(*connector, false)?;
+            let mut encoders = connector_info.encoders().to_vec();
+            if let Some(current) = connector_info.current_encoder()
+                && !encoders.contains(&current)
+            {
+                encoders.push(current);
+            }
+            let mut attached = false;
+            for encoder in encoders {
+                if device.get_encoder(encoder)?.crtc() == Some(crtc) {
+                    attached = true;
+                    break;
+                }
+            }
+            if attached {
+                connectors.push(*connector);
+            }
+        }
+
+        Ok(Self {
+            device,
+            crtc,
+            framebuffer: crtc_info.framebuffer(),
+            position: crtc_info.position(),
+            mode: crtc_info.mode(),
+            connectors,
+        })
+    }
+
+    fn restore(&self) -> io::Result<()> {
+        use ::drm::control::Device as ControlDevice;
+
+        self.device.set_crtc(
+            self.crtc,
+            self.framebuffer,
+            self.position,
+            &self.connectors,
+            self.mode,
+        )
+    }
+}
+
+#[cfg(test)]
+fn card_path_for_key(key: crate::platform::drm::DrmDeviceKey) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    for minor in 0..64 {
+        let path = std::path::PathBuf::from(format!("/dev/dri/card{minor}"));
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let (major, node_minor) = (
+            libc::major(metadata.rdev()) as u32,
+            libc::minor(metadata.rdev()) as u32,
+        );
+        if (major, node_minor) == (key.major, key.minor) {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no /dev/dri/cardN path has primary identity {key}"),
+    ))
+}
+
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.
 struct ExportedBacking {
     /// A dup of the exported dma-buf fd, kept for implicit-sync fence
@@ -6091,6 +6207,200 @@ impl KmsBackend {
             })?;
         base.init_root_storage();
         Ok(base)
+    }
+
+    /// Test-only fixture for the live flip-accepted path.
+    ///
+    /// This deliberately builds on the existing Vulkan-backed scene fixture
+    /// for its context and pool setup, then replaces only its synthetic KMS
+    /// topology with the exact live connector/CRTC/plane assignment selected
+    /// from the matching primary node. The fixture owns the master guard and
+    /// the original CRTC snapshot so a test panic restores the display before
+    /// any test framebuffer or the DRM fd is dropped.
+    #[cfg(test)]
+    pub fn for_tests_with_live_kms() -> Result<LiveKmsFixture, io::Error> {
+        use std::{os::fd::AsRawFd, sync::Arc};
+
+        use crate::kms::{
+            backend::ActiveOutput,
+            executor::test_support::{DrmMasterGuard, acquire_live_kms_fixture_guard},
+        };
+        use ::drm::{ClientCapability, Device as DrmDevice};
+
+        let exclusive = acquire_live_kms_fixture_guard();
+        let mut backend = Self::for_tests_with_vk_live_scene()?;
+        let reported_primary = backend
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .unwrap_or_else(|| {
+                panic!(
+                    "live-KMS fixture requires Vulkan to report a primary DRM node through VK_EXT_physical_device_drm"
+                )
+            });
+        assert_eq!(
+            backend.platform.devices.len(),
+            1,
+            "live-KMS fixture expects one KMS device from the existing live-scene fixture"
+        );
+
+        let device = Rc::clone(&backend.platform.devices[0].device);
+        let actual_primary = crate::platform::drm::primary_device_key_from_fd(device.as_fd())?;
+        assert_eq!(
+            actual_primary, reported_primary,
+            "live-KMS fixture opened a DRM primary different from the one Vulkan reported"
+        );
+        let card_path = card_path_for_key(actual_primary).unwrap_or_else(|error| {
+            panic!(
+                "live-KMS fixture could not identify the card path for Vulkan's reported primary {actual_primary}: {error}"
+            )
+        });
+
+        crate::drm::Device::set_and_verify_nonblocking_for_tests(device.as_fd().as_raw_fd())?;
+        let master = DrmMasterGuard::acquire(Rc::clone(&device))?;
+
+        for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
+            if let Err(error) = device.set_client_capability(capability, true) {
+                log::warn!(
+                    "live-KMS fixture: DRM client capability {capability:?} was rejected: {error}"
+                );
+            }
+        }
+
+        let probe = crate::platform::drm::discover_outputs(&device)?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                panic!(
+                    "live-KMS fixture requires a connected DRM output with at least one mode; none was found"
+                )
+            });
+        let preferred_mode = probe
+            .modes
+            .iter()
+            .find(|mode| mode.preferred)
+            .or_else(|| probe.modes.first())
+            .expect("a discovered live output has at least one mode");
+        let requested_mode = yserver_core::backend::ModeSpec {
+            width: preferred_mode.width,
+            height: preferred_mode.height,
+            vrefresh: preferred_mode.vrefresh,
+        };
+        let output = crate::drm::modeset::output_for_exact_probe_assignment(
+            &device,
+            probe.connector,
+            probe.encoder,
+            probe.crtc,
+            probe.plane,
+            requested_mode,
+        )?;
+
+        let snapshot = LiveKmsCrtcSnapshot::capture(Rc::clone(&device), output.crtc)?;
+        println!(
+            "live-KMS fixture: card={} connector={} mode={} ({}x{}@{})",
+            card_path.display(),
+            output.connector_name,
+            output.picked.name,
+            output.picked.width,
+            output.picked.height,
+            output.picked.vrefresh,
+        );
+
+        // The existing fixture's pool is deliberately non-master and sized
+        // for its synthetic 800x600 output. Release it before installing the
+        // real topology; no CRTC has been touched yet.
+        backend.platform.scanout_pools.clear();
+        backend.platform.bo_generations.clear();
+        backend.platform.devices[0].key = actual_primary;
+        backend.platform.devices[0].device = Rc::clone(&device);
+        let route = backend.platform.scanout_route_for_kms(actual_primary)?;
+        let vk = Arc::clone(
+            backend
+                .platform
+                .vk
+                .as_ref()
+                .expect("live-scene fixture has a Vulkan context"),
+        );
+        let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
+            vk,
+            Rc::clone(&device),
+            route,
+            u32::from(output.picked.width),
+            u32::from(output.picked.height),
+            3,
+            &output.scanout_modifiers,
+        )
+        .map_err(|error| {
+            io::Error::other(format!(
+                "live-KMS fixture: scanout pool allocation at {}x{} failed: {error}",
+                output.picked.width, output.picked.height
+            ))
+        })?;
+        let pool_len = pool.bos.len();
+
+        backend.platform.outputs = vec![ActiveOutput::new(
+            route,
+            output,
+            crate::drm::Swapchain::empty_for_tests(),
+            0,
+            0,
+        )];
+        backend.platform.fb_w = backend.platform.outputs[0].width;
+        backend.platform.fb_h = backend.platform.outputs[0].height;
+        backend.platform.scanout_pools =
+            vec![Some(crate::kms::vk::scanout::OutputScanout::Shared(pool))];
+        let (front_index, front_framebuffer) = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live output has a scanout pool")
+            .display_pool()
+            .bos
+            .iter()
+            .enumerate()
+            .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+            .expect("live scanout pool has a framebuffer for the initial modeset");
+        let legacy_write_permitted = backend.platform.allows_legacy(
+            &actual_primary,
+            crate::kms::render::resources::WriterClass::Modeset,
+        );
+        crate::drm::modeset::commit_modeset(
+            &device,
+            &backend.platform.outputs[0].output,
+            front_framebuffer,
+            legacy_write_permitted,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("live-KMS fixture: initial modeset failed: {error}"),
+            )
+        })?;
+        backend.platform.scanout_pools[0]
+            .as_mut()
+            .expect("live output has a scanout pool")
+            .display_pool_mut()
+            .bos[front_index]
+            .state
+            .mark_on_screen_after_modeset();
+        backend.platform.bo_generations = vec![vec![
+            crate::kms::render::platform::BoGenerationEntry::default();
+            pool_len
+        ]];
+        backend.platform.first_pageflip_logged = vec![false];
+        backend.engine = RenderEngine::new(&backend.platform).map_err(|error| {
+            io::Error::other(format!("live-KMS fixture: RenderEngine: {error:?}"))
+        })?;
+        backend.scene = SceneCompositor::new(&backend.platform).map_err(|error| {
+            io::Error::other(format!("live-KMS fixture: SceneCompositor: {error:?}"))
+        })?;
+
+        Ok(LiveKmsFixture {
+            backend,
+            snapshot: Some(snapshot),
+            _master: master,
+            _exclusive: exclusive,
+        })
     }
 
     /// Stage 4b — test-only read of the alias registry. Returns

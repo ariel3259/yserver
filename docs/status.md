@@ -33,6 +33,25 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-16 C.0 specification section 16.3 revision 4 — first review of the
+  evidence regime.** Revision 3 (2026-09-10, `39c9b75e`), which replaced the
+  eight-hour soak with runtime qualification, had entered without a review or a
+  finding; both are now recorded (`docs/superpowers/findings/2026-09-16-phase-c0-verification-regime-decision.md`
+  and `…-verification-regime-review-round1.md`: 2 blocking, 2 major, all
+  verified). Revision 4 fixes them. **Release disposition:** runtime
+  qualification is containment, not a zero-occurrence budget — revision 3's claim
+  otherwise is withdrawn — and a completion-safety occurrence is driver-local,
+  non-blocking and non-generalizing only with non-reproduction on the other
+  device, correct fail-closed handling, **and positive evidence of the driver's
+  own contract violation**; otherwise it blocks. **Lifecycle bootstrap
+  deadline** (section 10.3): unmeasured cohorts qualify under the 30 s ceiling,
+  which revision 3 had left impossible. **Resource return:** a warm-up pass plus
+  at least 50 passes of the transition set with zero growth in fds, helpers,
+  framebuffers, blobs, aliases and leases. **Execution contract:** sole DRM
+  master, externally driven VT switching, and a completed atomic transaction per
+  counted transition, or the row is invalid. None of this blocks the stage 2c-i
+  debt stage or 2c-ii; it is required before stages 3/4 and the C.0 merge.
+
 - **2026-09-14 Phase C.0 stage 2c-i ACCEPTED.** Every fix session F-1..F-15 is accepted and the
   final stage review is complete (`docs/superpowers/findings/2026-09-14-stage-2c-i-final-review-scope1.md`,
   `…-scope2.md`, `…-scope3.md`, plus `…-fix-F14-review.md` and `…-fix-F15-review.md`).

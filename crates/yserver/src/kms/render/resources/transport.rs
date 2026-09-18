@@ -84,9 +84,13 @@ impl Drop for OwnerWriteGrant {
     }
 }
 
-/// Opaque capability representing reservation of the recipient endpoint for Owner publication.
+/// Opaque capability representing reservation of the recipient endpoint for
+/// Owner publication. Spec 4.4 (stage 2c-i debt): it names the device and
+/// incarnation of the recipient slot it reserves, and `issue_handover_permit`
+/// refuses one reserved for another.
 pub(crate) struct RecipientReservation {
-    _private: (),
+    device: DrmDeviceKey,
+    incarnation: IncarnationId,
 }
 
 impl RecipientReservation {
@@ -98,8 +102,11 @@ impl RecipientReservation {
     // back under `#[cfg(test)]` in `handoff.rs`, so this constructor can
     // live under `#[cfg(test)]` again with no production caller needing it.
     #[cfg(test)]
-    pub(crate) fn new_for_tests() -> Self {
-        Self { _private: () }
+    pub(crate) fn new_for_tests(device: DrmDeviceKey, incarnation: IncarnationId) -> Self {
+        Self {
+            device,
+            incarnation,
+        }
     }
 }
 
@@ -108,9 +115,56 @@ pub(crate) struct WriterCoverageProof {
     _private: (),
 }
 
+/// Test-only coverage for one writer class (spec 4.4, stage 2c-i debt): the
+/// stage-2c design allows Owner publication only when every writer class is
+/// owner-mediated or disabled.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestWriterCoverage {
+    OwnerMediatedMock,
+    Disabled,
+}
+
+/// Test-only evidence naming the coverage of every `WriterClass`, one field
+/// each, so none can be left out.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TestWriterCoverageEvidence {
+    pub(crate) primary: TestWriterCoverage,
+    pub(crate) unflip: TestWriterCoverage,
+    pub(crate) modeset: TestWriterCoverage,
+    pub(crate) dpms: TestWriterCoverage,
+    pub(crate) vt: TestWriterCoverage,
+    pub(crate) topology: TestWriterCoverage,
+    pub(crate) cursor: TestWriterCoverage,
+    pub(crate) gamma: TestWriterCoverage,
+    pub(crate) helper_mutation: TestWriterCoverage,
+}
+
+#[cfg(test)]
+impl TestWriterCoverageEvidence {
+    /// Exhaustive over `WriterClass`: a class added without a field here
+    /// stops this from compiling, and so every test that builds a proof.
+    pub(crate) fn coverage(&self, class: WriterClass) -> TestWriterCoverage {
+        match class {
+            WriterClass::Primary => self.primary,
+            WriterClass::Unflip => self.unflip,
+            WriterClass::Modeset => self.modeset,
+            WriterClass::Dpms => self.dpms,
+            WriterClass::Vt => self.vt,
+            WriterClass::Topology => self.topology,
+            WriterClass::Cursor => self.cursor,
+            WriterClass::Gamma => self.gamma,
+            WriterClass::HelperMutation => self.helper_mutation,
+        }
+    }
+}
+
 impl WriterCoverageProof {
+    /// Spec 4.4: consumes explicit coverage evidence for every writer class,
+    /// so possessing a proof proves the coverage.
     #[cfg(test)]
-    pub(crate) fn new_for_tests() -> Self {
+    pub(crate) fn new_for_tests(_evidence: TestWriterCoverageEvidence) -> Self {
         Self { _private: () }
     }
 }
@@ -208,8 +262,14 @@ impl DirectOwnershipState for FakeDirectOwnershipState {
     }
 }
 
+/// Spec 4.2 (stage 2c-i debt), round-1 B-2: a handle names the gate it
+/// closes. `device`/`incarnation` are what a holder validates against its
+/// own identity before installing one; `forced_closed` doubles as the gate's
+/// instance identity, since it is the very cell that gate reads.
 #[derive(Clone, Debug)]
 pub(crate) struct TransportGateHandle {
+    device: DrmDeviceKey,
+    incarnation: IncarnationId,
     forced_closed: Rc<Cell<bool>>,
 }
 
@@ -220,6 +280,20 @@ impl TransportGateHandle {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.forced_closed.get()
+    }
+
+    pub(crate) fn device(&self) -> DrmDeviceKey {
+        self.device
+    }
+
+    pub(crate) fn incarnation(&self) -> IncarnationId {
+        self.incarnation
+    }
+
+    /// True when both handles name the same gate instance, not merely the
+    /// same device and incarnation.
+    pub(crate) fn same_gate(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.forced_closed, &other.forced_closed)
     }
 }
 
@@ -277,7 +351,7 @@ impl TransportGate {
     /// and not retired -- read live from the real state given at
     /// construction (M-13), never from a setter on this gate.
     pub(crate) fn begin_quiescing(&mut self) -> Result<(), ResourceError> {
-        if self.state == TransportState::Closed {
+        if self.state() == TransportState::Closed {
             return Err(ResourceError::Detached);
         }
         if self.ownership.direct_ownership_busy()
@@ -315,10 +389,18 @@ impl TransportGate {
 
     pub(crate) fn handle(&self) -> TransportGateHandle {
         TransportGateHandle {
+            device: self.device,
+            incarnation: self.incarnation,
             forced_closed: Rc::clone(&self.forced_closed),
         }
     }
 
+    /// The effective state. Round-2 B-1: every transition below consults
+    /// this, never the raw `self.state`, because a close can arrive through a
+    /// `TransportGateHandle` -- which owns no `&mut TransportGate` and can
+    /// only set the shared flag. A handle-driven close must be as terminal as
+    /// `close()` itself: no quiescing, no permit, no publication, no grant
+    /// after it.
     pub(crate) fn state(&self) -> TransportState {
         if self.forced_closed.get() {
             TransportState::Closed
@@ -368,7 +450,7 @@ impl TransportGate {
         &mut self,
         class: WriterClass,
     ) -> Result<OwnerWriteGrant, ResourceError> {
-        if self.state != TransportState::Owner {
+        if self.state() != TransportState::Owner {
             return Err(ResourceError::Detached);
         }
         if self.closed_admission.get() {
@@ -399,7 +481,7 @@ impl TransportGate {
             self.force_close();
             return Err((ResourceError::WrongIncarnation, grant));
         }
-        if self.state != TransportState::Owner {
+        if self.state() != TransportState::Owner {
             return Err((ResourceError::Detached, grant));
         }
         if !self.issued_serials.remove(&grant.serial) {
@@ -456,15 +538,18 @@ impl TransportGate {
         proof: crate::kms::render::platform::LegacyDrained,
         dispositions: &[crate::kms::render::backend::LegacyEventDisposition],
         _coverage: &WriterCoverageProof,
-        _reservation: RecipientReservation,
+        reservation: RecipientReservation,
     ) -> Result<HandoverPermit, ResourceError> {
-        if self.state != TransportState::Quiescing {
+        if self.state() != TransportState::Quiescing {
             return Err(ResourceError::Busy);
         }
         if self.outstanding_owner_writes != 0 {
             return Err(ResourceError::Busy);
         }
         if proof.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        if reservation.device != self.device || reservation.incarnation != self.incarnation {
             return Err(ResourceError::WrongIncarnation);
         }
         let backend_failure = dispositions.iter().any(|d| {
@@ -488,7 +573,7 @@ impl TransportGate {
         if permit.device != self.device || permit.incarnation != self.incarnation {
             return Err(ResourceError::WrongIncarnation);
         }
-        if self.state != TransportState::Quiescing {
+        if self.state() != TransportState::Quiescing {
             return Err(ResourceError::Busy);
         }
         if self.outstanding_owner_writes != 0 {

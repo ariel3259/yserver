@@ -137,8 +137,15 @@ fn kms_retirement_matches(
     pending_bo_idx == presented_bo_idx && stage.is_kms_flip_pending()
 }
 
-fn present_error_is_device_lost(error: &PresentError) -> bool {
-    matches!(error, PresentError::Vk(vk::Result::ERROR_DEVICE_LOST))
+pub(crate) fn present_error_is_device_lost(error: &PresentError) -> bool {
+    match error {
+        PresentError::Vk(vk::Result::ERROR_DEVICE_LOST) => true,
+        // Round-2 B-2: a failed unwind wraps its cause; the classification
+        // has to reach through it or a lost device stops being recognised
+        // exactly when the frame also failed to unwind.
+        PresentError::ManagedUnwind { cause, .. } => present_error_is_device_lost(cause),
+        _ => false,
+    }
 }
 
 enum CopiedRenderSubmitError {
@@ -7967,26 +7974,22 @@ fn submit_shared_scanout_frame(
     let (submitted, fb_handle) = match render_res {
         Ok(Ok((sub, fb))) => (sub, fb),
         Ok(Err(render_err)) => {
-            if *gpu_submitted {
-                let _ =
-                    crate::kms::render::resources::gpu::freeze_uncertain_batch(service, &entries);
-            } else {
-                let _ =
-                    crate::kms::render::resources::gpu::cancel_pre_submit_batch(service, &entries);
-            }
-            return Err(render_err);
+            return Err(managed_submit_failure(
+                service,
+                &entries,
+                *gpu_submitted,
+                render_err,
+            ));
         }
         Err(res_err) => {
-            if *gpu_submitted {
-                let _ =
-                    crate::kms::render::resources::gpu::freeze_uncertain_batch(service, &entries);
-            } else {
-                let _ =
-                    crate::kms::render::resources::gpu::cancel_pre_submit_batch(service, &entries);
-            }
-            return Err(PresentError::Io(std::io::Error::other(format!(
-                "with_scanout_write: {res_err:?}"
-            ))));
+            return Err(managed_submit_failure(
+                service,
+                &entries,
+                *gpu_submitted,
+                PresentError::Io(std::io::Error::other(format!(
+                    "with_scanout_write: {res_err:?}"
+                ))),
+            ));
         }
     };
 
@@ -8034,6 +8037,29 @@ fn submit_shared_scanout_frame(
             service.register_batch(batch);
             Err(PresentError::Io(error))
         }
+    }
+}
+
+/// Spec 4.2 (stage 2c-i debt): the error a failed managed submission reports.
+/// Unwinding its batch is not best-effort: a failure there is part of the
+/// result, never discarded, and `abandon_unsubmitted_batch` has already
+/// closed the transport for it.
+pub(crate) fn managed_submit_failure(
+    service: &mut ResourceService,
+    entries: &[(AllocationKey, crate::kms::render::resources::ObligationId)],
+    gpu_submitted: bool,
+    cause: PresentError,
+) -> PresentError {
+    match crate::kms::render::resources::gpu::abandon_unsubmitted_batch(
+        service,
+        entries,
+        gpu_submitted,
+    ) {
+        Ok(()) => cause,
+        Err(unwind) => PresentError::ManagedUnwind {
+            cause: Box::new(cause),
+            unwind: format!("{unwind:?}"),
+        },
     }
 }
 

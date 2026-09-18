@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, io, num::NonZeroU32, rc::Rc};
+use std::{cell::Cell, collections::BTreeSet, io, num::NonZeroU32, rc::Rc};
 
 use drm::{
     buffer::Handle as DrmBufferHandle,
@@ -81,6 +81,42 @@ pub(crate) struct FileFamilyClosed {
     _private: (),
 }
 
+/// Spec 4.1 (stage 2c-i debt): one pool husk's `Rc<drm::Device>` alias,
+/// held by the registry entry that counts it. Minted only by
+/// `DrmCleanupRegistry::register_pool_husk`, which takes the alias by value;
+/// consumed by value by `unregister_pool_husk`, which validates it against
+/// the registry's own identity and drops the alias as it uncounts it -- so
+/// the inventory can never reach zero while the alias is still alive
+/// (round-1 B-1). Dropping the registration undischarged fails closed: its
+/// registry can never mint `FileFamilyClosed` again (the lost-role-token
+/// rule).
+pub(crate) struct PoolHuskRegistration {
+    device_key: DrmDeviceKey,
+    incarnation: IncarnationId,
+    accounting: Rc<Cell<bool>>,
+    alias: Option<Rc<crate::drm::Device>>,
+    discharged: bool,
+}
+
+impl std::fmt::Debug for PoolHuskRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolHuskRegistration")
+            .field("device_key", &self.device_key)
+            .field("incarnation", &self.incarnation)
+            .field("alias_held", &self.alias.is_some())
+            .field("discharged", &self.discharged)
+            .finish()
+    }
+}
+
+impl Drop for PoolHuskRegistration {
+    fn drop(&mut self) {
+        if !self.discharged {
+            self.accounting.set(true);
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) trait CleanupIo {
     fn remove_fb(&mut self, fb: u32) -> io::Result<()>;
@@ -155,6 +191,12 @@ pub(crate) struct DrmCleanupRegistry {
     payload_alias_keys: BTreeSet<AllocationKey>,
     family_inventory: FamilyInventory,
     returned_descriptors: Vec<std::os::fd::OwnedFd>,
+    /// Spec 4.1: set once pool-husk accounting can no longer be trusted --
+    /// a registration dropped undischarged, or a foreign or unknown one
+    /// presented. Shared with every `PoolHuskRegistration` this registry
+    /// mints, whose pointer identity is also what proves a registration was
+    /// minted here. Never cleared.
+    husk_accounting_failed: Rc<Cell<bool>>,
 }
 
 impl std::fmt::Debug for DrmCleanupRegistry {
@@ -188,6 +230,7 @@ impl DrmCleanupRegistry {
             payload_alias_keys: BTreeSet::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
+            husk_accounting_failed: Rc::new(Cell::new(false)),
         }
     }
 
@@ -206,6 +249,7 @@ impl DrmCleanupRegistry {
             payload_alias_keys: BTreeSet::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
+            husk_accounting_failed: Rc::new(Cell::new(false)),
         }
     }
 
@@ -225,6 +269,7 @@ impl DrmCleanupRegistry {
             payload_alias_keys: BTreeSet::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
+            husk_accounting_failed: Rc::new(Cell::new(false)),
         }
     }
 
@@ -373,13 +418,52 @@ impl DrmCleanupRegistry {
             .saturating_sub(count);
     }
 
-    pub(crate) fn register_pool_husk(&mut self) {
+    /// Takes the husk's device alias by value (round-1 B-1): the
+    /// registration owns it from here, and only consuming the registration
+    /// releases it.
+    pub(crate) fn register_pool_husk(
+        &mut self,
+        alias: Rc<crate::drm::Device>,
+    ) -> PoolHuskRegistration {
         self.family_inventory.non_payload_aliases += 1;
+        PoolHuskRegistration {
+            device_key: self.device_key,
+            incarnation: self.incarnation,
+            accounting: Rc::clone(&self.husk_accounting_failed),
+            alias: Some(alias),
+            discharged: false,
+        }
     }
 
-    pub(crate) fn unregister_pool_husk(&mut self) {
-        self.family_inventory.non_payload_aliases =
-            self.family_inventory.non_payload_aliases.saturating_sub(1);
+    /// Spec 4.1: uncounts the husk `registration` proves this registry
+    /// counted. A registration for another device or incarnation, or one
+    /// another registry minted, is refused and fails closed on both sides:
+    /// this registry refuses to mint from now on, and so does the one that
+    /// minted it, when the refused registration drops undischarged.
+    pub(crate) fn unregister_pool_husk(
+        &mut self,
+        mut registration: PoolHuskRegistration,
+    ) -> Result<(), ResourceError> {
+        if registration.device_key != self.device_key
+            || registration.incarnation != self.incarnation
+        {
+            self.husk_accounting_failed.set(true);
+            return Err(ResourceError::WrongIncarnation);
+        }
+        if !Rc::ptr_eq(&registration.accounting, &self.husk_accounting_failed) {
+            self.husk_accounting_failed.set(true);
+            return Err(ResourceError::InvalidProof);
+        }
+        let Some(remaining) = self.family_inventory.non_payload_aliases.checked_sub(1) else {
+            self.husk_accounting_failed.set(true);
+            return Err(ResourceError::InvalidState);
+        };
+        self.family_inventory.non_payload_aliases = remaining;
+        registration.discharged = true;
+        // The alias this registration accounted for ends here, with the
+        // count that named it (round-1 B-1).
+        drop(registration.alias.take());
+        Ok(())
     }
 
     /// Becomes mintable when every submitter is detached, the helper is
@@ -417,6 +501,12 @@ impl DrmCleanupRegistry {
         }
         if !self.family_inventory.control_closed {
             return Err(io::Error::other("control fd is not closed"));
+        }
+        // Spec 4.1: checked before the alias count, so a refusal says which
+        // of the two it is -- a dropped registration also leaves its alias
+        // counted.
+        if self.husk_accounting_failed.get() {
+            return Err(io::Error::other("pool husk accounting failed"));
         }
         if self.family_inventory.non_payload_aliases > 0 {
             return Err(io::Error::other("non-payload aliases still active"));

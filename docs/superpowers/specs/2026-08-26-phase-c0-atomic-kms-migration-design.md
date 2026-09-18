@@ -1,6 +1,6 @@
 # Phase C.0 — complete KMS ownership and atomic state migration
 
-**Date:** 2026-09-10 (revision 3: runtime qualification as the release gate)
+**Date:** 2026-09-16 (section 16.3 revision 4: containment disposition, lifecycle bootstrap deadline, resource return and execution contract; revision 3 of 2026-09-10 made runtime qualification the release gate)
 **Status:** Approved — concurrency, evidence, delivery, driver-eligibility,
 composition-predicate, driver-expansion, fixed-executor and shutdown-barrier
 dispositions incorporated. Revision 2 replaces the `CAP-4` cohort allowlist with
@@ -2188,10 +2188,22 @@ The owner separates four timers:
    instead use the release cohort's audited/measured
    `LifecycleCompletionObservedMax` and
    `LifecycleHardwareCompletionDeadline =
-   min(30 s, max(10 s, LifecycleCompletionObservedMax + 2 s))`. Missing evidence,
-   an unrepresentable calculation, or an observed healthy completion above the
-   28-second representable margin leaves that cohort unvalidated rather than
+   min(30 s, max(10 s, LifecycleCompletionObservedMax + 2 s))`. An
+   unrepresentable calculation, or an observed healthy completion above the
+   28-second representable margin, leaves that cohort unvalidated rather than
    poisoning it under the fast-update timer.
+   **Bootstrap (section 16.3 revision 4).** When no audited or measured
+   `LifecycleCompletionObservedMax` exists for the cohort — the case for every
+   cohort nobody in this project owns — the lifecycle deadline is the ceiling,
+   `LifecycleHardwareCompletionDeadline = 30 s`, so the qualification commit is
+   bounded from the first incarnation. A completion within it qualifies
+   normally; expiry is handled as any lifecycle hardware-completion expiry and
+   does not qualify the incarnation. Nothing observed under the bootstrap
+   deadline is persisted or transferred to another incarnation, device or
+   cohort: a measured value comes only from the section 16.3 fault-injection row
+   on a device actually available. Without this, the qualification commit of an
+   unmeasured cohort could never be bounded, and the cohort could never
+   qualify.
 4. **Primary Present event:** after `HardwareComplete`, create one timer for each
    required Present CRTC whose event has not already arrived:
    `deadline[crtc] = hardware_complete_observed_at +
@@ -3147,7 +3159,7 @@ applicable, hardware evidence is incomplete.
     performs no measured-path filesystem I/O, allocation, flush or additional
     supervisor IPC and cannot wrap its checked preallocated record buffer. The
     required executor IPC is itself measured. No cohort is nominated for
-    `OwnerMediatedLegacyMove` in C.0 (section 16.3, revision 3), so the quota
+    `OwnerMediatedLegacyMove` in C.0 (section 16.3, revisions 3–4), so the quota
     gate below has no subject and collects nothing; it remains specified for a
     later phase that completes the audit. Where a cohort is nominated, for each
     composed/direct production-omitted stratum, qualified initial attempts reach
@@ -3203,7 +3215,16 @@ applicable, hardware evidence is incomplete.
 
 ### 16.3. Hardware validation
 
-#### Evidence regime — revision 3, 2026-09-10
+#### Evidence regime — revision 4, 2026-09-16
+
+Revision 4 corrects revision 3 (2026-09-10, `39c9b75e`), which entered
+unreviewed. Its first review
+(`docs/superpowers/findings/2026-09-16-phase-c0-verification-regime-review-round1.md`)
+found two blocking and two major defects, all verified: two contradictory
+release dispositions for a completion-safety occurrence; a lifecycle-deadline
+circularity that left every unmeasured cohort unable to qualify; no detector for
+accumulating resource leaks; and no DRM-master or supervision contract for the
+delivery check. The regime below is otherwise revision 3's.
 
 C.0 qualifies devices at runtime; it does not certify cohorts in advance. This
 replaces the per-cohort campaign structure of the previous revisions, which
@@ -3236,10 +3257,14 @@ boot.** Its mechanism is implemented and deterministic:
   the X11 core responsive.
 
 The soak's release budget was zero occurrences of those four classes. Runtime
-qualification does not lower that budget; it changes who enforces it and when.
-Detection, classification and safe degradation happen on the user's machine, on
-hardware nobody in this project owns, at every boot — which no eight-hour run on
-two boards can do.
+qualification does **not** preserve that budget, and revision 3 was wrong to say
+it did: poison and quarantine contain a failure after it occurs; they do not
+establish that it never occurs. The guarantee C.0 actually makes is containment
+— every occurrence is detected, terminalizes fail-closed, degrades truthfully
+and is legible in section 15 telemetry — on the user's machine, on hardware
+nobody in this project owns, at every boot, which no eight-hour run on two
+boards can do. Which occurrences block merge is the release disposition stated
+with the delivery check below.
 
 **Physical evidence falsifies the machinery; it never certifies a cohort.** Runs
 on the devices the author actually has exist to refute the qualifier itself: a
@@ -3271,7 +3296,7 @@ RDNA2/DCN 3.1.5, `amdgpu`, PCI `1002:164e`) and RTX 5060 Ti (GB206/Blackwell),
 both in one machine.
 
 Earlier revisions required a Radeon RX 6800 XT and then substituted the Raphael
-iGPU. Under revision 3 neither is a required board, but the reasoning behind the
+iGPU. Under revisions 3–4 neither is a required board, but the reasoning behind the
 substitution survives as the reason results do not transfer: Navi 21 is DCN 3.0
 and Raphael is DCN 3.1.5, and every physical row here exercises display IP
 rather than shader IP. Cursor-plane behaviour, hotspot support, off-transition
@@ -3284,14 +3309,18 @@ transport stays unreachable rather than being allowlisted on transferred
 reasoning. The historical Polaris/RX 580 captures remain provenance only.
 
 An executor, owner-completion, poison, watchdog, or off-transition-fence failure
-on either device invalidates the shared design and blocks merge. Those are
-architecture and completion-safety properties, not cohort properties.
+on either device blocks merge **unless** it is classified driver-local under the
+release disposition stated with the delivery check below. How the machinery
+handles such a failure is an architecture property on every device; what
+triggers it may be a driver's own contract violation, and only positive evidence
+of that makes it driver-local.
 
 No cursor-policy outcome blocks merge, and no device's unavailability produces
-`EvidenceInsufficient` for the release, because under `CAP-4` and revision 3 no
+`EvidenceInsufficient` for the release, because under `CAP-4` and revisions 3–4 no
 cohort depends on a campaign for anything. Intel, Asahi, other AMD
 generations and other NVIDIA cohorts need no campaign at all: they select
-`AtomicHardware` optimistically at runtime and are protected by measured
+`AtomicHardware` optimistically at runtime, qualify their lifecycle commits
+under the bootstrap deadline of section 10.3, and are protected by measured
 demotion. A campaign is required only to allowlist `OwnerMediatedLegacyMove` for
 a cohort, or to justify a degradation prior and its driver-version bound.
 
@@ -3542,12 +3571,59 @@ disable — is repeated until every transition class has been exercised, with
 section 15 telemetry exported. Its purpose is delivery, not rarity: that the
 driver actually returns a signalled off-transition fence and resolves
 cursor-plane detach, which a deterministic deadline can only survive rather than
-observe. Any occurrence of the four completion-safety classes is explained and
-classified before merge — as a defect in shared machinery, which blocks, or as a
-defect of that driver on that device, which is recorded with its exact identity
-and does not generalize. Zero occurrences over a longer run is neither required
-nor claimed. Device time is whatever the transition set costs; there is no hour
-budget, and a repair reruns the transition set on the devices at hand.
+observe. Zero occurrences over a longer run is neither required nor claimed.
+Device time is whatever the transition set costs; there is no hour budget, and a
+repair reruns the transition set on the devices at hand.
+
+**Release disposition (revision 4).** Any occurrence of the four
+completion-safety classes on an available device is explained and classified
+before merge. It is **driver-local** — recorded with its exact identity (driver
+and driver version, kernel, device, firmware), neither blocking merge nor
+generalizing to any other driver or device — only if all three hold:
+
+1. it does not reproduce on the other available device under the same
+   transition;
+2. the machinery handled it correctly: fail-closed terminalization, readiness
+   closed, both possible resource sets quarantined, the X11 core responsive, and
+   the occurrence legible in section 15 telemetry; and
+3. there is **positive evidence** that the trigger is the driver's own contract
+   violation — for example an advertised off-transition fence that is never
+   signalled, shown at the kernel/driver interface. Absence of reproduction is
+   not that evidence: the two available devices are from different vendors, so
+   criterion 1 alone would hold for nearly any driver-specific trigger,
+   including machinery bugs only one driver's timing exposes.
+
+Otherwise it is a defect in shared machinery and blocks merge.
+
+**Resource return (revision 4).** The delivery check proves each transition
+class delivers; it cannot see accumulation, and neither can runtime
+qualification — a transition that leaks one file descriptor or framebuffer per
+cycle completes every fence and trips none of the four classes. So each
+available device also runs a finite resource-return arm: one warm-up pass of the
+full transition set, then **at least 50 further passes**. The baseline is taken
+after the warm-up pass, once lazily filled caches have settled, and the final
+measurement after the last pass. Between them, process-owned file descriptors,
+live helper processes, DRM framebuffers and property blobs, and
+`IncarnationFdSet` aliases and leases must show **zero growth**, apart from
+caches enumerated in advance with their bounds. Resident memory is too noisy for
+zero growth; it must show no monotonic growth across the final ten passes.
+Measurements come from section 15 telemetry where it exports them and from the
+process and DRM debug interfaces otherwise. This is not a rarity soak: it has a
+declared pass count, which the evidence owner may raise but not lower, and no
+hour budget; fifty passes turn a one-unit leak per pass into a growth no noise
+hides.
+
+**Execution contract (revision 4).** A row of the delivery check or the
+resource-return arm is valid only if its record shows all of: the exact
+release-tip build running as the **sole DRM master** of the device under test,
+as the active session on its seat with no other display server holding master
+on that card; the device identity, incarnation and master acquisition, in
+section 15 telemetry; VT switching driven from **outside** the server, since the
+server gives up control during VT release; master released and reacquired on
+every VT cycle; and, for every transition class counted, an atomic transaction
+accepted by the kernel and reaching completion on that device. A transition that
+failed before KMS submission, or ran without master, is not counted. A row
+missing any of these records is invalid, not passing.
 
 Record a reproducible before/after performance table using the current shipping
 baseline and C.0 on identical hardware, modes, and workload. On a cohort whose

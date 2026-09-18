@@ -14,6 +14,10 @@ pub(crate) mod transport;
 #[cfg(test)]
 mod adapter_tests;
 #[cfg(test)]
+mod guard_tests;
+#[cfg(test)]
+mod reset_boundary_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 use std::{
@@ -41,7 +45,7 @@ pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
 #[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
     CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
-    FamilyInventory, FileFamilyClosed, GemOwner, RightState,
+    FamilyInventory, FileFamilyClosed, GemOwner, PoolHuskRegistration, RightState,
 };
 #[allow(unused_imports)]
 use gpu::ValidatedGpuBatch;
@@ -151,6 +155,10 @@ pub(crate) struct ResourceService {
     serviced_elapsed: std::time::Duration,
     last_serviced: Option<Instant>,
     max_serviced_duration: std::time::Duration,
+    /// Spec 4.2 (stage 2c-i debt): the transport an uncertain or unwindable
+    /// GPU submission must close (2c-i design section 4). `None` in
+    /// production, where no gate is installed (R8).
+    transport_gate: Option<TransportGateHandle>,
 }
 
 #[allow(dead_code)]
@@ -172,6 +180,35 @@ impl ResourceService {
             serviced_elapsed: std::time::Duration::ZERO,
             last_serviced: None,
             max_serviced_duration: std::time::Duration::from_secs(5),
+            transport_gate: None,
+        }
+    }
+
+    /// Round-1 B-2: the gate this service closes must be this service's own
+    /// transport. A handle for another device or incarnation is refused, and
+    /// so is a second, different gate -- replacing one would leave the
+    /// transport the service's outstanding work belongs to open. Re-installing
+    /// the same gate is idempotent.
+    pub(crate) fn set_transport_gate(
+        &mut self,
+        gate: TransportGateHandle,
+    ) -> Result<(), ResourceError> {
+        if gate.device() != self.device || gate.incarnation() != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        if let Some(installed) = &self.transport_gate
+            && !installed.same_gate(&gate)
+        {
+            return Err(ResourceError::InvalidState);
+        }
+        self.transport_gate = Some(gate);
+        Ok(())
+    }
+
+    /// Closes the installed transport gate, if any.
+    pub(crate) fn close_transport_gate(&self) {
+        if let Some(gate) = &self.transport_gate {
+            gate.close_gate();
         }
     }
 

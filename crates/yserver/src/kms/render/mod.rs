@@ -18,6 +18,8 @@ pub(crate) mod glyph_atlas;
 pub(crate) mod glyph_pixels;
 pub(crate) mod imported_syncobj;
 pub(crate) mod owned_semaphore;
+#[cfg(test)]
+mod part3_tests;
 #[doc(hidden)]
 pub mod platform;
 pub(crate) mod present_completion;

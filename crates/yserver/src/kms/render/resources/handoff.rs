@@ -337,7 +337,11 @@ impl RetainingSupervisor {
         device: DrmDeviceKey,
         incarnation: IncarnationId,
     ) -> RecipientSlot {
-        RecipientSlot::new(device, incarnation, RecipientReservation::new_for_tests())
+        RecipientSlot::new(
+            device,
+            incarnation,
+            RecipientReservation::new_for_tests(device, incarnation),
+        )
     }
 
     pub(crate) fn issue_teardown_release(

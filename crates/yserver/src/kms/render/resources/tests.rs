@@ -2612,6 +2612,24 @@ fn c0_2ci_completion_waiter_registration_and_recheck() {
     assert!(wakes.contains(&ResourceConsumer::DirectCapacity));
 }
 
+/// Spec 4.4 (stage 2c-i debt): a writer-coverage proof built from explicit
+/// evidence for every writer class. Every class is an owner-mediated mock
+/// here; a test that needs one disabled builds its own evidence.
+pub(crate) fn writer_coverage_for_tests() -> WriterCoverageProof {
+    use super::transport::{TestWriterCoverage::OwnerMediatedMock, TestWriterCoverageEvidence};
+    WriterCoverageProof::new_for_tests(TestWriterCoverageEvidence {
+        primary: OwnerMediatedMock,
+        unflip: OwnerMediatedMock,
+        modeset: OwnerMediatedMock,
+        dpms: OwnerMediatedMock,
+        vt: OwnerMediatedMock,
+        topology: OwnerMediatedMock,
+        cursor: OwnerMediatedMock,
+        gamma: OwnerMediatedMock,
+        helper_mutation: OwnerMediatedMock,
+    })
+}
+
 /// M-14: a real-shaped `LegacyDrained` proof for `issue_handover_permit`,
 /// matching `incarnation` the way the backend's genuine
 /// `issue_legacy_drained` output would.
@@ -2674,8 +2692,8 @@ fn c0_2ci_transport_gate_vocabulary_and_table() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -2788,8 +2806,8 @@ fn c0_2ci_transport_gate_owner_write_contract() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -2834,8 +2852,8 @@ fn c0_2ci_transport_gate_owner_write_contract() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate2.device(), gate2.incarnation()),
         )
         .unwrap();
     gate2.publish_owner(permit2).unwrap();
@@ -2903,8 +2921,8 @@ fn c0_2ci_transport_gate_consume_owner_write_checked_subtraction() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -2942,8 +2960,8 @@ fn c0_2ci_transport_gate_close_refuses_outstanding_grants() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -2990,8 +3008,8 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
         .issue_handover_permit(
             legacy_drained_for_tests(foreign_incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap_err();
     assert_eq!(err, ResourceError::WrongIncarnation);
@@ -3008,8 +3026,8 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
             &[LegacyEventDisposition::Cancelled(
                 LegacyEventCancellation::BackendFailure,
             )],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap_err();
     assert_eq!(err2, ResourceError::InvalidProof);
@@ -3019,8 +3037,8 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[LegacyEventDisposition::Applied],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     assert!(gate.publish_owner(permit).is_ok());
@@ -3031,6 +3049,84 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
 // its device-B "unrelated device unaffected" claim proved nothing about any
 // real sink. Deleted per the fix handoff; the real per-sink tests
 // (`c0_2ci_sink_*`) beneath the real entry points replace it.
+
+#[derive(Debug)]
+pub(crate) struct GammaGateOutcome {
+    pub(crate) state: TransportState,
+    pub(crate) reached_ioctl: bool,
+    pub(crate) result: std::io::Result<()>,
+}
+
+pub(crate) fn run_sink_gamma_gate_four_states(
+    device: Rc<crate::drm::Device>,
+    device_key: DrmDeviceKey,
+) -> Vec<GammaGateOutcome> {
+    use ::drm::control::Device as ControlDevice;
+
+    let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
+    backend.platform.devices = vec![crate::kms::render::platform::KmsDevice {
+        key: device_key,
+        device: Rc::clone(&device),
+        cursor: crate::kms::render::platform::KmsCursorState::new(),
+        executor: None,
+        owner: None,
+    }];
+    let output_key = crate::kms::backend::OutputKey::new(device_key, "gamma_test_output");
+    let mut output = backend.platform.outputs.remove(0);
+    let crtc = *device
+        .resource_handles()
+        .expect("drm resource handles on gamma test device")
+        .crtcs()
+        .first()
+        .expect("gamma test device has at least one crtc");
+    output.key = output_key.clone();
+    output.output.crtc = crtc;
+    backend.platform.outputs.push(output);
+
+    [
+        TransportState::Legacy,
+        TransportState::Quiescing,
+        TransportState::Owner,
+        TransportState::Closed,
+    ]
+    .into_iter()
+    .map(|state| {
+        let mut gate = TransportGate::new_legacy(
+            device_key,
+            IncarnationId::first(),
+            Box::new(FakeDirectOwnershipState::new()),
+        );
+        if state != TransportState::Legacy {
+            gate.begin_quiescing().unwrap();
+            if state == TransportState::Owner {
+                let permit = gate
+                    .issue_handover_permit(
+                        legacy_drained_for_tests(IncarnationId::first()),
+                        &[],
+                        &writer_coverage_for_tests(),
+                        RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
+                    )
+                    .unwrap();
+                gate.publish_owner(permit).unwrap();
+            } else if state == TransportState::Closed {
+                gate.close().unwrap();
+            }
+        }
+        backend.platform.transport_gates.insert(device_key, gate);
+
+        let result = backend.apply_gamma_to_live_output(&output_key);
+        let reached_ioctl = match &result {
+            Ok(()) => true,
+            Err(error) => error.raw_os_error().is_some(),
+        };
+        GammaGateOutcome {
+            state,
+            reached_ioctl,
+            result,
+        }
+    })
+    .collect()
+}
 
 /// B-10/R11: a `TransportGate` for `device`/`incarnation`, driven all the
 /// way to `Owner` (Legacy -> Quiescing -> handover -> publish), for tests
@@ -3050,8 +3146,8 @@ pub(crate) fn owner_gate_for_tests(
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
@@ -3089,8 +3185,8 @@ fn sink_gate_at_state(target: TransportState) -> TransportGate {
             .issue_handover_permit(
                 legacy_drained_for_tests(incarnation),
                 &[],
-                &WriterCoverageProof::new_for_tests(),
-                RecipientReservation::new_for_tests(),
+                &writer_coverage_for_tests(),
+                RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
             )
             .unwrap();
         gate.publish_owner(permit).unwrap();
@@ -3232,71 +3328,24 @@ fn c0_2ci_sink_gamma_gate_four_states_drm() {
         minor: libc::minor(stat.st_rdev) as u32,
     };
     let device = Rc::new(crate::drm::Device::from_file_for_tests(file));
-    use ::drm::control::Device as ControlDevice;
-    let res = device
-        .resource_handles()
-        .expect("drm resource handles on real primary node");
-    let crtc = *res
-        .crtcs()
-        .first()
-        .expect("real drm device has at least one crtc");
-
-    let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
-    backend.platform.devices = vec![crate::kms::render::platform::KmsDevice {
-        key: device_key,
-        device: Rc::clone(&device),
-        cursor: crate::kms::render::platform::KmsCursorState::new(),
-        executor: None,
-        owner: None,
-    }];
-    let output_key = crate::kms::backend::OutputKey::new(device_key, "gamma_test_output");
-    let mut output = backend.platform.outputs.remove(0);
-    output.key = output_key.clone();
-    output.output.crtc = crtc;
-    backend.platform.outputs.push(output);
-
-    for state in [
-        TransportState::Legacy,
-        TransportState::Quiescing,
-        TransportState::Owner,
-        TransportState::Closed,
-    ] {
-        let mut gate = TransportGate::new_legacy(
-            device_key,
-            IncarnationId::first(),
-            Box::new(FakeDirectOwnershipState::new()),
-        );
-        if state != TransportState::Legacy {
-            gate.begin_quiescing().unwrap();
-            if state == TransportState::Owner {
-                let permit = gate
-                    .issue_handover_permit(
-                        legacy_drained_for_tests(IncarnationId::first()),
-                        &[],
-                        &WriterCoverageProof::new_for_tests(),
-                        RecipientReservation::new_for_tests(),
-                    )
-                    .unwrap();
-                gate.publish_owner(permit).unwrap();
-            } else if state == TransportState::Closed {
-                gate.close().unwrap();
-            }
-        }
-        backend.platform.transport_gates.insert(device_key, gate);
-
-        let res = backend.apply_gamma_to_live_output(&output_key);
-        let err = res.expect_err("apply_gamma_to_live_output without master must fail");
+    for outcome in run_sink_gamma_gate_four_states(device, device_key) {
+        let err = outcome
+            .result
+            .as_ref()
+            .expect_err("apply_gamma_to_live_output without master must fail");
         let reached_ioctl = err.raw_os_error().is_some();
         assert_eq!(
             reached_ioctl,
-            state == TransportState::Legacy,
-            "state={state:?} reached_ioctl={reached_ioctl} err={err}",
+            outcome.state == TransportState::Legacy,
+            "state={:?} reached_ioctl={reached_ioctl} err={err}",
+            outcome.state,
         );
-        if state != TransportState::Legacy {
+        if outcome.state != TransportState::Legacy {
             assert!(
                 err.to_string()
                     .contains("transport gate: legacy gamma write refused"),
-                "state={state:?} err={err}",
+                "state={:?} err={err}",
+                outcome.state,
             );
         }
     }
@@ -5390,8 +5439,8 @@ fn c0_2ci_handoff_under_executor_stalled_revokes_grant_and_quarantines() {
         .issue_handover_permit(
             legacy_drained_for_tests(incarnation),
             &[],
-            &WriterCoverageProof::new_for_tests(),
-            RecipientReservation::new_for_tests(),
+            &writer_coverage_for_tests(),
+            RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
         )
         .unwrap();
     gate.publish_owner(permit).unwrap();
