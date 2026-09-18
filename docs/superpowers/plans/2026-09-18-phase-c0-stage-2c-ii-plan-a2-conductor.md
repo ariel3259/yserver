@@ -312,7 +312,7 @@ Building the request:
 **Invariant (spec §7, stage 2c §4):** when `route_owner_event` sees `OwnerEvent::CompletionRetired` for a device with an active conductor, in this order:
 
 1. `commit_consumer.consume` the event (as today);
-2. enqueue the predecessor's completion — move `scanout_m2.pending`'s event into `scanout_m2.completed` with the frame's pins released, as the legacy retirement does — and then append `scanout_m2.deferred_successor_skips`;
+2. enqueue the predecessor's completion — push `scanout_m2.pending`'s event (Flip mode) into `scanout_m2.completed` — and then append `scanout_m2.deferred_successor_skips`. The retired frame becomes `scanout_m2.current` **keeping its pins**, because it is now on screen; the **previous** `current` is released through `release_direct_frame`. This is what the legacy retirement in `backend.rs` does. *(Corrected 2026-09-18: revision 3 said to release the retired frame's pins, which the legacy path does not do, and Task 4's first implementation followed that text.)*
 3. `admission_wake(device, true)`;
 4. return **without** draining `scanout_m2.completed`: the core publishes through `drain_completed_present_events` afterwards.
 
