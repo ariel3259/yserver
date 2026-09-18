@@ -91,6 +91,7 @@ After Task 5 the coordinator applies each mutation to your code and runs the tes
 cargo +nightly fmt
 cargo clippy --all-targets -- -D warnings
 for i in 1 2 3 4 5; do cargo test -p yserver --lib c0_adm; done
+cargo build --release -p yserver --bin yserver   # the release tests spawn target/release/yserver as their helper
 cargo test --release -p yserver --lib c0_adm
 cargo test -p yserver --lib c0_2ci
 cargo test -p yserver --lib

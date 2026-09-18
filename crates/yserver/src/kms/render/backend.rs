@@ -2615,6 +2615,22 @@ impl KmsBackend {
         true
     }
 
+    /// Move a managed successor into the in-flight frame slot after its owner
+    /// transaction was confirmed at the send boundary.
+    pub(crate) fn managed_confirm_direct_dispatch(&mut self, source_generation: u64) -> bool {
+        let Some(frame) = self.scanout_m2.queued_successor.take() else {
+            return false;
+        };
+        if frame.admission_source_generation != Some(source_generation) {
+            self.scanout_m2.queued_successor = Some(frame);
+            return false;
+        }
+        self.scanout_m2.pending = Some(frame);
+        self.scanout_m2.hold_direct = true;
+        self.scanout_m2.sync_ownership();
+        true
+    }
+
     #[allow(dead_code)]
     pub(crate) fn managed_publish_deferred_successor_skips_if_no_predecessor(&mut self) {
         if self.scanout_m2.pending.is_none() {
@@ -49108,6 +49124,7 @@ mod tests {
                 &mut service,
             )
             .unwrap();
+        backend.install_resource_service(service);
 
         let (id_b, candidate_b, event_b) =
             managed_prepare_ready_candidate(&mut backend, 0x7303, 0x7304, 40, 2);
@@ -49565,6 +49582,9 @@ mod tests {
             >,
         >,
         direct_eligible: std::rc::Rc<std::cell::Cell<bool>>,
+        describe_page_flip: std::rc::Rc<std::cell::Cell<bool>>,
+        composed_resource_calls: std::rc::Rc<std::cell::Cell<usize>>,
+        composed_resource_dropped: std::rc::Rc<std::cell::Cell<bool>>,
     }
 
     impl AdmissionSourceFixture {
@@ -49584,13 +49604,57 @@ mod tests {
             let readiness =
                 std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
+            let describe_page_flip = std::rc::Rc::new(std::cell::Cell::new(false));
+            let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
             (
                 Box::new(Self {
                     readiness: std::rc::Rc::clone(&readiness),
                     direct_eligible: std::rc::Rc::clone(&direct_eligible),
+                    describe_page_flip,
+                    composed_resource_calls,
+                    composed_resource_dropped,
                 }),
                 readiness,
                 direct_eligible,
+            )
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn new_with_controls() -> (
+            Box<dyn crate::kms::render::admission::AdmissionSource>,
+            std::rc::Rc<
+                std::cell::RefCell<
+                    std::collections::BTreeMap<
+                        crate::kms::owner::admission::IntentKey,
+                        crate::kms::owner::admission::Readiness,
+                    >,
+                >,
+            >,
+            std::rc::Rc<std::cell::Cell<bool>>,
+            std::rc::Rc<std::cell::Cell<bool>>,
+            std::rc::Rc<std::cell::Cell<usize>>,
+            std::rc::Rc<std::cell::Cell<bool>>,
+        ) {
+            let readiness =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
+            let describe_page_flip = std::rc::Rc::new(std::cell::Cell::new(false));
+            let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            (
+                Box::new(Self {
+                    readiness: std::rc::Rc::clone(&readiness),
+                    direct_eligible: std::rc::Rc::clone(&direct_eligible),
+                    describe_page_flip: std::rc::Rc::clone(&describe_page_flip),
+                    composed_resource_calls: std::rc::Rc::clone(&composed_resource_calls),
+                    composed_resource_dropped: std::rc::Rc::clone(&composed_resource_dropped),
+                }),
+                readiness,
+                direct_eligible,
+                describe_page_flip,
+                composed_resource_calls,
+                composed_resource_dropped,
             )
         }
 
@@ -49626,7 +49690,11 @@ mod tests {
             &mut self,
             _admitted: &crate::kms::owner::admission::Admitted,
         ) -> crate::kms::owner::build::CommitDescription {
-            crate::kms::owner::test_fixtures::single_active_crtc()
+            if self.describe_page_flip.get() {
+                crate::kms::owner::test_fixtures::single_active_crtc_with_present(1)
+            } else {
+                crate::kms::owner::test_fixtures::single_active_crtc()
+            }
         }
 
         fn composed_resources(
@@ -49634,7 +49702,25 @@ mod tests {
             _crtc: crate::kms::owner::admission::CrtcId,
             _generation: u64,
         ) -> Vec<crate::kms::render::resources::CommitResources> {
-            Vec::new()
+            self.composed_resource_calls
+                .set(self.composed_resource_calls.get() + 1);
+            vec![
+                crate::kms::render::resources::CommitResources::new(
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_direct_role(
+                    crate::kms::render::resources::RoleReservation::new_for_test(
+                        crate::kms::render::resources::DirectRole::Successor,
+                        1,
+                        std::rc::Rc::clone(&self.composed_resource_dropped),
+                    ),
+                ),
+            ]
         }
 
         fn direct_eligible(&self, _source_generation: u64) -> bool {
@@ -49652,6 +49738,19 @@ mod tests {
         backend.platform.install_transport_gate(gate);
     }
 
+    fn install_admission_resource_service(backend: &mut super::KmsBackend) {
+        let device = backend.platform.primary_device().unwrap().key;
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("fixture owner")
+            .incarnation();
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            device,
+            incarnation,
+        ));
+    }
+
     fn install_admission_legacy_gate(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
         let incarnation = backend
             .platform
@@ -49664,6 +49763,40 @@ mod tests {
             Box::new(backend.direct_ownership_handle()),
         );
         backend.platform.install_transport_gate(gate);
+    }
+
+    fn admission_backend_with_stub_executor() -> super::KmsBackend {
+        let mut backend = super::KmsBackend::for_tests();
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+        )
+        .expect("spawn stub executor");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        let device = backend.platform.primary_device().unwrap().key;
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            device,
+            incarnation,
+        ));
+        backend
+    }
+
+    fn admission_install_executor(
+        backend: &mut super::KmsBackend,
+        executor: crate::kms::executor::KmsIoExecutor,
+    ) {
+        let (incarnation, lifecycle) = executor.owner_identity();
+        let device = backend.platform.primary_device().unwrap().key;
+        backend.platform.devices[0].executor = Some(executor);
+        *backend.platform.owner_for(device).unwrap() =
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1);
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            device,
+            incarnation,
+        ));
     }
 
     fn admission_direct_candidate(
@@ -50065,6 +50198,642 @@ mod tests {
                 .filter(|output| output.key.device_key == device)
                 .map(|output| u32::from(output.output.crtc))
                 .collect()
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_dispatch_confirms_after_send() {
+        let mut composed = admission_backend_with_stub_executor();
+        let device = composed.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut composed, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        composed.install_admission_conductor_for_tests(device, source);
+        composed
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+
+        let outcome = composed.admission_wake(device, false);
+        assert!(
+            matches!(
+                outcome,
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ),
+            "outcome: {outcome:?}"
+        );
+        let owner = composed.device_owner_for_tests(0);
+        assert!(
+            owner
+                .live_record()
+                .expect("live owner record")
+                .milestones()
+                .dispatched
+        );
+        assert_eq!(
+            composed.admission_conductors[&device].admission.sequence(),
+            1
+        );
+        assert!(
+            composed.admission_conductors[&device]
+                .admission
+                .composed(1)
+                .is_none()
+        );
+        let mut direct = admission_backend_with_stub_executor();
+        let device = direct.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut direct, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        direct.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut direct, 40);
+        assert!(
+            direct
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+
+        let outcome = direct.admission_wake(device, false);
+        assert!(
+            matches!(
+                outcome,
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ),
+            "outcome: {outcome:?}"
+        );
+        assert!(direct.scanout_m2.pending.is_some());
+        assert!(direct.scanout_m2.queued_successor.is_none());
+        assert!(direct.scanout_m2.queued_successor_role.is_none());
+        assert!(
+            direct
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("live owner record")
+                .milestones()
+                .dispatched
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_pre_ipc_refusal_consumes_no_admission_state() {
+        use crate::kms::owner::record::RefusalCause;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::owner::test_fixtures::reaped_executor_for_tests(),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 41);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+
+        let outcome = backend.admission_wake(device, false);
+        assert!(
+            matches!(
+                outcome,
+                crate::kms::render::admission::AdmissionOutcome::SendRefused(RefusalCause::Reaped)
+            ),
+            "outcome: {outcome:?}"
+        );
+        assert_eq!(
+            backend.admission_conductors[&device].admission.sequence(),
+            0
+        );
+        assert!(!backend.admission_conductors[&device].admission.is_locked());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_none()
+        );
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(backend.scanout_m2.idled.len(), 1);
+        assert_eq!(backend.scanout_m2.deferred_successor_skips.len(), 0);
+        assert_eq!(backend.scanout_m2.completed.len(), 1);
+        assert_eq!(backend.commit_consumer.rejected_resources.len(), 1);
+        assert!(!backend.commit_consumer.capacity.is_admission_closed());
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .slot()
+                .occupant()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_refusal_consume_failure_closes_transport() {
+        use std::{cell::Cell, rc::Rc};
+
+        use crate::kms::{
+            owner::{
+                device::{DispatchError, OwnerEvent},
+                identity::CommitId,
+                ledger::Submitted,
+                record::RefusalCause,
+            },
+            render::resources::{CommitResources, DirectRole, RoleReservation},
+        };
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        install_admission_resource_service(&mut backend);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 42);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+
+        let snapshot = backend.admission_snapshot(device, false).expect("snapshot");
+        let decision = backend.admission_conductors[&device]
+            .admission
+            .decide(&snapshot)
+            .expect("direct decision");
+        let token = backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("conductor")
+            .admission
+            .lock(decision.clone(), &snapshot)
+            .expect("lock");
+        let invalid_current =
+            CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new())
+                .with_direct_role(RoleReservation::new_for_test(
+                    DirectRole::Current,
+                    u64::MAX,
+                    Rc::new(Cell::new(false)),
+                ));
+
+        let outcome = backend.admission_dispose_refusal_for_tests(
+            device,
+            token,
+            decision.admitted,
+            DispatchError::Refused {
+                cause: RefusalCause::Reaped,
+                events: vec![OwnerEvent::CompletionRetired {
+                    commit: CommitId::for_tests(10_042),
+                    resources: Submitted::new(vec![invalid_current], Vec::new()).accepted(),
+                }],
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            crate::kms::render::admission::AdmissionOutcome::TransportClosed
+        ));
+        assert_eq!(
+            backend.platform.transport_gate(&device).unwrap().state(),
+            crate::kms::render::resources::TransportState::Closed
+        );
+        assert!(!backend.admission_conductors[&device].admission.is_locked());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_none()
+        );
+        assert!(backend.scanout_m2.queued_successor.is_none());
+    }
+
+    #[test]
+    fn c0_adm_conductor_refusal_without_resource_service_closes_transport() {
+        use crate::kms::owner::{device::DispatchError, record::RefusalCause};
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 43);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+
+        let snapshot = backend.admission_snapshot(device, false).expect("snapshot");
+        let decision = backend.admission_conductors[&device]
+            .admission
+            .decide(&snapshot)
+            .expect("direct decision");
+        let token = backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("conductor")
+            .admission
+            .lock(decision.clone(), &snapshot)
+            .expect("lock");
+        assert!(matches!(
+            backend.admission_dispose_refusal_for_tests(
+                device,
+                token,
+                decision.admitted,
+                DispatchError::Refused {
+                    cause: RefusalCause::Reaped,
+                    events: Vec::new(),
+                },
+            ),
+            crate::kms::render::admission::AdmissionOutcome::TransportClosed
+        ));
+        assert_eq!(
+            backend.platform.transport_gate(&device).unwrap().state(),
+            crate::kms::render::resources::TransportState::Closed
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_refusal_disposition_covers_every_pre_ipc_cause() {
+        use crate::kms::{
+            owner::{
+                device::{DispatchError, OwnerEvent},
+                identity::CommitId,
+                record::RefusalCause,
+            },
+            render::resources::DirectRole,
+        };
+
+        let causes = [
+            RefusalCause::Reaped,
+            RefusalCause::Stalled,
+            RefusalCause::AlreadyInFlight,
+            RefusalCause::ReservationMismatch,
+            RefusalCause::BoundaryViolation,
+            RefusalCause::TransportGateRefused,
+        ];
+        for cause in causes {
+            let mut backend = super::KmsBackend::for_tests();
+            let device = backend.platform.primary_device().unwrap().key;
+            install_admission_owner_gate(&mut backend, device);
+            install_admission_resource_service(&mut backend);
+            let (source, _, _) = AdmissionSourceFixture::new();
+            backend.install_admission_conductor_for_tests(device, source);
+            let (source_id, candidate, event) =
+                admission_direct_candidate(&mut backend, 50 + cause as u32);
+            assert!(
+                backend
+                    .admission_offer_direct(device, source_id, candidate, event)
+                    .expect("direct offer")
+            );
+            let snapshot = backend.admission_snapshot(device, false).expect("snapshot");
+            let decision = backend.admission_conductors[&device]
+                .admission
+                .decide(&snapshot)
+                .expect("direct decision");
+            let token = backend
+                .admission_conductors
+                .get_mut(&device)
+                .unwrap()
+                .admission
+                .lock(decision.clone(), &snapshot)
+                .expect("lock");
+            let prepared = backend
+                .managed_prepare_direct_dispatch()
+                .expect("prepare")
+                .expect("direct preparation");
+            let commit = CommitId::for_tests(10_000 + cause as u64);
+
+            let outcome = backend.admission_dispose_refusal_for_tests(
+                device,
+                token,
+                decision.admitted,
+                DispatchError::Refused {
+                    cause,
+                    events: vec![
+                        OwnerEvent::ResourcesReleased {
+                            commit,
+                            resources: vec![prepared.resources.with_commit_id(commit)],
+                        },
+                        OwnerEvent::ResourcesStillCurrent {
+                            commit,
+                            resources: Vec::new(),
+                        },
+                    ],
+                },
+            );
+            assert!(matches!(
+                outcome,
+                crate::kms::render::admission::AdmissionOutcome::SendRefused(actual) if actual == cause
+            ));
+            assert_eq!(
+                backend.admission_conductors[&device].admission.sequence(),
+                0
+            );
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert!(
+                backend.admission_conductors[&device]
+                    .admission
+                    .direct()
+                    .is_none()
+            );
+            assert!(backend.scanout_m2.queued_successor.is_none());
+            assert_eq!(backend.scanout_m2.idled.len(), 1);
+            assert_eq!(backend.scanout_m2.deferred_successor_skips.len(), 0);
+            assert_eq!(backend.scanout_m2.completed.len(), 1);
+            assert_eq!(backend.commit_consumer.rejected_resources.len(), 1);
+            assert_eq!(
+                backend.commit_consumer.rejected_resources[0]
+                    .direct_role
+                    .as_ref()
+                    .expect("released submitted role")
+                    .role(),
+                DirectRole::Submitted
+            );
+            assert!(!backend.commit_consumer.capacity.is_admission_closed());
+        }
+    }
+
+    #[test]
+    fn c0_adm_conductor_begin_refusal_undoes_the_seam() {
+        use crate::kms::render::resources::DirectRole;
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("spawn stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _, describe_page_flip, _, _) = AdmissionSourceFixture::new_with_controls();
+        backend.install_admission_conductor_for_tests(device, source);
+        let idled_before = backend.scanout_m2.idled.len();
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 60);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        describe_page_flip.set(true);
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::BeginRefused
+        ));
+        assert_eq!(
+            backend.admission_conductors[&device].admission.sequence(),
+            0
+        );
+        assert!(!backend.admission_conductors[&device].admission.is_locked());
+        assert_eq!(
+            backend
+                .scanout_m2
+                .queued_successor_role
+                .as_ref()
+                .expect("undo restores successor")
+                .role(),
+            DirectRole::Successor
+        );
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(backend.scanout_m2.idled.len(), idled_before + 1);
+        assert!(!backend.commit_consumer.capacity.is_admission_closed());
+    }
+
+    #[test]
+    fn c0_adm_conductor_send_refusal_restores_a_nonempty_current() {
+        use crate::kms::{owner::record::RefusalCause, render::resources::DirectRole};
+
+        let mut direct = backend_with_current_and_successor_for_admission_seam();
+        let device = direct.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut direct,
+            crate::kms::owner::test_fixtures::reaped_executor_for_tests(),
+        );
+        install_admission_owner_gate(&mut direct, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        direct.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut direct, 61);
+        assert!(
+            direct
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        let outcome = direct.admission_wake(device, false);
+        assert!(
+            matches!(
+                outcome,
+                crate::kms::render::admission::AdmissionOutcome::SendRefused(RefusalCause::Reaped)
+            ),
+            "outcome: {outcome:?}"
+        );
+        assert_eq!(direct.commit_consumer.current_resources.len(), 1);
+        assert_eq!(
+            direct.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("current role")
+                .role(),
+            DirectRole::Current
+        );
+        assert_eq!(direct.commit_consumer.rejected_resources.len(), 1);
+        assert_eq!(
+            direct.commit_consumer.rejected_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("submitted role retained")
+                .role(),
+            DirectRole::Submitted
+        );
+        assert!(
+            direct
+                .commit_consumer
+                .capacity
+                .is_vacant(DirectRole::OrdinaryRetirement)
+        );
+        assert!(!direct.commit_consumer.capacity.is_admission_closed());
+
+        let mut composed = backend_with_current_and_successor_for_admission_seam();
+        let device = composed.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut composed,
+            crate::kms::owner::test_fixtures::reaped_executor_for_tests(),
+        );
+        install_admission_owner_gate(&mut composed, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        composed.install_admission_conductor_for_tests(device, source);
+        composed
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+        assert!(matches!(
+            composed.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::SendRefused(RefusalCause::Reaped)
+        ));
+        assert_eq!(composed.commit_consumer.current_resources.len(), 1);
+        assert_eq!(
+            composed.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("current role")
+                .role(),
+            DirectRole::Current
+        );
+        assert!(!composed.commit_consumer.capacity.is_admission_closed());
+    }
+
+    #[test]
+    fn c0_adm_conductor_preparation_refusal_aborts_the_token() {
+        let mut close = backend_with_current_and_successor_for_admission_seam();
+        let device = close.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut close, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        close.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut close, 62);
+        assert!(
+            close
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        close
+            .admission_conductors
+            .get_mut(&device)
+            .unwrap()
+            .prepare_hook =
+            Some(crate::kms::render::admission::AdmissionPreparationHook::CloseAdmission);
+        assert!(matches!(
+            close.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::PreparationRefused
+        ));
+        assert!(!close.admission_conductors[&device].admission.is_locked());
+        assert_eq!(close.admission_conductors[&device].admission.sequence(), 0);
+        assert!(
+            close.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_some()
+        );
+        assert!(close.scanout_m2.queued_successor_role.is_some());
+        assert!(close.commit_consumer.rejected_resources.is_empty());
+
+        let mut occupied = backend_with_current_and_successor_for_admission_seam();
+        let device = occupied.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut occupied, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        occupied.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut occupied, 63);
+        assert!(
+            occupied
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        occupied
+            .admission_conductors
+            .get_mut(&device)
+            .unwrap()
+            .prepare_hook =
+            Some(crate::kms::render::admission::AdmissionPreparationHook::OccupyOrdinaryRetirement);
+        assert!(matches!(
+            occupied.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::PreparationRefused
+        ));
+        assert!(!occupied.admission_conductors[&device].admission.is_locked());
+        assert_eq!(
+            occupied.admission_conductors[&device].admission.sequence(),
+            0
+        );
+        assert!(
+            occupied.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_some()
+        );
+        assert!(occupied.scanout_m2.queued_successor_role.is_some());
+        assert!(occupied.commit_consumer.rejected_resources.is_empty());
+    }
+
+    #[test]
+    fn c0_adm_conductor_composed_begin_refusal_keeps_resources_with_the_source() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _, describe_page_flip, composed_resource_calls, composed_resource_dropped) =
+            AdmissionSourceFixture::new_with_controls();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+        describe_page_flip.set(true);
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::BeginRefused
+        ));
+        assert_eq!(composed_resource_calls.get(), 0);
+        assert!(!composed_resource_dropped.get());
+        assert!(backend.commit_consumer.current_resources.is_empty());
+        assert!(backend.commit_consumer.rejected_resources.is_empty());
+        assert!(!backend.admission_conductors[&device].admission.is_locked());
+    }
+
+    #[test]
+    fn c0_adm_conductor_one_dispatch_per_wake() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("first composed offer");
+        backend
+            .admission_offer_composed(device, 2, 1)
+            .expect("second composed offer");
+
+        let outcome = backend.admission_wake(device, false);
+        assert!(
+            matches!(
+                outcome,
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ),
+            "outcome: {outcome:?}"
+        );
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::SlotBusy
+        ));
+        assert_eq!(
+            backend.admission_conductors[&device].admission.sequence(),
+            1
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_lock_mismatch_closes_the_transport() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .unwrap()
+            .force_lock_mismatch = true;
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::TransportClosed
+        ));
+        assert_eq!(
+            backend.platform.transport_gate(&device).unwrap().state(),
+            crate::kms::render::resources::TransportState::Closed
+        );
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .slot()
+                .occupant()
+                .is_none()
         );
     }
 }
