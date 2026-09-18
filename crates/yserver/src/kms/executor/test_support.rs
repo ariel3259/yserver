@@ -784,6 +784,15 @@ pub struct TestDevice {
 }
 
 impl TestDevice {
+    /// Release DRM master that the kernel may grant automatically when a
+    /// primary node is opened from a bare VT. `EINVAL` means this fd was not
+    /// master, which is already the state these test openers require.
+    fn drop_auto_granted_drm_master(file: &std::fs::File) {
+        const DRM_IOCTL_DROP_MASTER: u32 = 0x641f;
+
+        let _ = unsafe { libc::ioctl(file.as_raw_fd(), DRM_IOCTL_DROP_MASTER as _) };
+    }
+
     pub fn open_stub() -> Self {
         let file = std::fs::File::open("/dev/null").expect("open /dev/null");
         Self {
@@ -808,6 +817,7 @@ impl TestDevice {
                 .write(true)
                 .open(&path)
             {
+                Self::drop_auto_granted_drm_master(&file);
                 return Some(Self {
                     file,
                     is_stub: false,
@@ -838,6 +848,7 @@ impl TestDevice {
             else {
                 continue;
             };
+            Self::drop_auto_granted_drm_master(&file);
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
             let rc = unsafe { libc::fstat(file.as_raw_fd(), &mut stat) };
             if rc < 0 {
