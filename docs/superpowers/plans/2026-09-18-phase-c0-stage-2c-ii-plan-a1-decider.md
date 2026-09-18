@@ -250,11 +250,11 @@ There is no `IntentKey` for topology: a waiting topology request is ready by def
 - `c0_adm_composed_on_an_unflip_crtc_does_not_overtake_the_barrier` — barrier on CRTC 1 not ready; composed on 1 queued **before** composed on 2, both ready: composed 2 is chosen. The order matters: with composed 1 older, only the barrier's suppression can make 2 win, so M4 is caught.
 - `c0_adm_decide_is_pure` — two calls, same result; the composed intent is still queued.
 
-- [ ] **Step 1:** Append the tests.
-- [ ] **Step 2:** Run `cargo test -p yserver --lib c0_adm` and record the failure (compile errors: the snapshot and `decide` do not exist yet).
-- [ ] **Step 3:** Implement the snapshot and `decide`.
-- [ ] **Step 4:** Run the gate. Expected: `c0_adm` **16 passed, 0 failed**; full `--lib` 0 failed.
-- [ ] **Step 5:** Stop dirty and report.
+- [x] **Step 1:** Append the tests.
+- [x] **Step 2:** Run `cargo test -p yserver --lib c0_adm` and record the failure (compile errors: the snapshot and `decide` do not exist yet).
+- [x] **Step 3:** Implement the snapshot and `decide`.
+- [x] **Step 4:** Run the gate. Expected: `c0_adm` **16 passed, 0 failed**; full `--lib` 0 failed.
+- [x] **Step 5:** Stop dirty and report.
 
 ---
 

@@ -143,6 +143,10 @@ impl Admission {
         self.composed.get(&crtc).copied()
     }
 
+    pub(super) fn composed_intents(&self) -> impl Iterator<Item = (CrtcId, ComposedIntent)> + '_ {
+        self.composed.iter().map(|(&crtc, &intent)| (crtc, intent))
+    }
+
     pub fn direct(&self) -> Option<&QueuedDirect> {
         self.direct.as_ref()
     }

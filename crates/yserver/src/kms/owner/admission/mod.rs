@@ -12,11 +12,15 @@ pub enum AdmissionError {
     EmptyCrtcSet,
 }
 
+mod decide;
 mod intents;
+mod snapshot;
 
+pub use decide::{AdmissionDecision, Admitted, Tier};
 pub use intents::{
     Admission, ComposedIntent, DirectSuccessor, PrimaryOrdinal, QueuedDirect, UnflipBarrier,
 };
+pub use snapshot::{IntentKey, Readiness, ReadinessSnapshot, WaitReason};
 
 #[doc(hidden)]
 pub fn crtcs(ids: &[CrtcId]) -> BTreeSet<CrtcId> {
