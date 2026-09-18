@@ -5,6 +5,7 @@
 //! B.3 close). Implements the `Backend` trait directly; `lib.rs`
 //! constructs `KmsBackend` at startup.
 
+pub(crate) mod admission;
 mod backend;
 pub(crate) mod batch_resource;
 #[doc(hidden)]

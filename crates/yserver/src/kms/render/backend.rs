@@ -599,6 +599,7 @@ struct DirectPresentFrame {
     /// from this reference sample rather than the last/max output.
     completion_clock: Option<yserver_core::backend::PresentClockSample>,
     awaiting_outputs: HashSet<usize>,
+    admission_source_generation: Option<u64>,
 }
 
 /// Require a short stable run before entering direct ownership. Compositors
@@ -1346,16 +1347,17 @@ impl PartialEq<PresentPinEntry> for crate::kms::render::store::DrawableId {
     }
 }
 
-/// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
-/// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
-/// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
-/// that fill in across Stages 2b–2e. Paint / RENDER / scene ops
-/// log gaps until those substages land.
+/// Prepared resources for the managed direct-dispatch seam.
 pub(crate) struct PreparedDirectDispatch {
     pub(crate) resources: crate::kms::render::resources::CommitResources,
     pub(crate) retirement: Option<crate::kms::render::resources::RoleReservation>,
 }
 
+/// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
+/// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
+/// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
+/// that fill in across Stages 2b–2e. Paint / RENDER / scene ops
+/// log gaps until those substages land.
 pub struct KmsBackend {
     /// Shared protocol-bookkeeping state. Identical to v1's
     /// `KmsBackend.core` — same struct, same construction path.
@@ -1425,6 +1427,9 @@ pub struct KmsBackend {
     scanout_m0: ScanoutM0Telemetry,
     scanout_m1: ScanoutM1ProbeCache,
     scanout_m2: ScanoutM2State,
+    #[allow(dead_code)]
+    pub(crate) admission_conductors:
+        std::collections::BTreeMap<DrmDeviceKey, crate::kms::render::admission::AdmissionConductor>,
     pub(crate) resource_service: Option<crate::kms::render::resources::ResourceService>,
     pub(crate) commit_consumer: crate::kms::render::resources::CommitResourceConsumer,
 
@@ -2211,7 +2216,7 @@ impl KmsBackend {
         }
     }
 
-    fn request_direct_unflip(&mut self, reason: &'static str) {
+    pub(crate) fn request_direct_unflip(&mut self, reason: &'static str) {
         if !self.scanout_m2.active() {
             return;
         }
@@ -2569,6 +2574,56 @@ impl KmsBackend {
         self.note_present_skip();
     }
 
+    /// Associate a queued managed successor with its admission descriptor.
+    /// The association lets a later unflip or eligibility invalidation
+    /// terminalize the exact frame that the decider named.
+    #[allow(dead_code)]
+    pub(crate) fn managed_tag_queued_direct_successor(&mut self, source_generation: u64) {
+        self.scanout_m2
+            .queued_successor
+            .as_mut()
+            .expect("managed candidate preparation queued a frame")
+            .admission_source_generation = Some(source_generation);
+    }
+
+    /// Discharge and terminalize a never-submitted managed successor. `Some`
+    /// matches the conductor's descriptor; `None` is the legacy unflip path,
+    /// which owns the only queued frame by construction.
+    pub(crate) fn managed_terminalize_queued_direct_successor(
+        &mut self,
+        source_generation: Option<u64>,
+    ) -> bool {
+        let matches = self
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .is_some_and(|frame| {
+                source_generation.is_none()
+                    || frame.admission_source_generation == source_generation
+            });
+        if !matches {
+            return false;
+        }
+        let Some(queued) = self.scanout_m2.queued_successor.take() else {
+            return false;
+        };
+        if let Some(role) = self.scanout_m2.queued_successor_role.take() {
+            self.discharge_bare_reservation(role);
+        }
+        self.defer_direct_successor_skip(queued);
+        self.scanout_m2.sync_ownership();
+        true
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn managed_publish_deferred_successor_skips_if_no_predecessor(&mut self) {
+        if self.scanout_m2.pending.is_none() {
+            self.scanout_m2
+                .completed
+                .append(&mut self.scanout_m2.deferred_successor_skips);
+        }
+    }
+
     fn queue_direct_successor(&mut self, frame: DirectPresentFrame) {
         if let Some(superseded) = self.scanout_m2.queued_successor.replace(frame) {
             self.defer_direct_successor_skip(superseded);
@@ -2594,12 +2649,7 @@ impl KmsBackend {
             <Self as Backend>::release_present_source(self, pending.source_pin);
             <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
         }
-        if let Some(queued) = self.scanout_m2.queued_successor.take() {
-            if let Some(role) = self.scanout_m2.queued_successor_role.take() {
-                self.discharge_bare_reservation(role);
-            }
-            self.defer_direct_successor_skip(queued);
-        }
+        self.managed_terminalize_queued_direct_successor(None);
         self.scanout_m2
             .completed
             .append(&mut self.scanout_m2.deferred_successor_skips);
@@ -5538,6 +5588,7 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            admission_conductors: std::collections::BTreeMap::new(),
             resource_service: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
@@ -6811,6 +6862,7 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            admission_conductors: std::collections::BTreeMap::new(),
             resource_service: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
@@ -19762,6 +19814,7 @@ impl KmsBackend {
             completion_output_idx,
             completion_clock: None,
             awaiting_outputs: HashSet::new(),
+            admission_source_generation: None,
         };
 
         // Idle/release the victim frame and retain its ordered Skip
@@ -19978,12 +20031,7 @@ impl KmsBackend {
 
         // 1. Cancel unsent direct work: discharge the queued successor's
         // charge before dropping the frame.
-        if let Some(queued) = self.scanout_m2.queued_successor.take() {
-            if let Some(role) = self.scanout_m2.queued_successor_role.take() {
-                self.discharge_bare_reservation(role);
-            }
-            self.defer_direct_successor_skip(queued);
-        }
+        self.managed_terminalize_queued_direct_successor(None);
 
         // 3. Move Current into ExitRetirement even if OrdinaryRetirement is
         // occupied (8.5). At most one `CommitResources` in
@@ -21016,6 +21064,7 @@ impl Backend for KmsBackend {
             completion_output_idx,
             completion_clock: None,
             awaiting_outputs: HashSet::new(),
+            admission_source_generation: None,
         };
 
         if self.scanout_m2.pending.is_some() {
@@ -43592,6 +43641,7 @@ mod tests {
             completion_output_idx: 0,
             completion_clock,
             awaiting_outputs: std::collections::HashSet::new(),
+            admission_source_generation: None,
         });
         b.scanout_m2.hold_direct = true;
     }
@@ -46799,6 +46849,7 @@ mod tests {
             } else {
                 std::collections::HashSet::from([0])
             },
+            admission_source_generation: None,
         };
         if current {
             b.scanout_m2.current = Some(frame);
@@ -47374,6 +47425,7 @@ mod tests {
             completion_output_idx: 0,
             completion_clock: None,
             awaiting_outputs: std::collections::HashSet::from([0, 1]),
+            admission_source_generation: None,
         });
 
         let reference = PresentClockSample {
@@ -49499,6 +49551,520 @@ mod tests {
             b.scanout_m0.last_shape_by_dst[&0xD57], after_first,
             "a Present that carries no update region at all is a different \
              shape and must still be logged",
+        );
+    }
+
+    #[derive(Clone)]
+    struct AdmissionSourceFixture {
+        readiness: std::rc::Rc<
+            std::cell::RefCell<
+                std::collections::BTreeMap<
+                    crate::kms::owner::admission::IntentKey,
+                    crate::kms::owner::admission::Readiness,
+                >,
+            >,
+        >,
+        direct_eligible: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl AdmissionSourceFixture {
+        #[allow(clippy::new_ret_no_self, clippy::type_complexity)]
+        fn new() -> (
+            Box<dyn crate::kms::render::admission::AdmissionSource>,
+            std::rc::Rc<
+                std::cell::RefCell<
+                    std::collections::BTreeMap<
+                        crate::kms::owner::admission::IntentKey,
+                        crate::kms::owner::admission::Readiness,
+                    >,
+                >,
+            >,
+            std::rc::Rc<std::cell::Cell<bool>>,
+        ) {
+            let readiness =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
+            (
+                Box::new(Self {
+                    readiness: std::rc::Rc::clone(&readiness),
+                    direct_eligible: std::rc::Rc::clone(&direct_eligible),
+                }),
+                readiness,
+                direct_eligible,
+            )
+        }
+
+        fn set_readiness(
+            readiness: &std::rc::Rc<
+                std::cell::RefCell<
+                    std::collections::BTreeMap<
+                        crate::kms::owner::admission::IntentKey,
+                        crate::kms::owner::admission::Readiness,
+                    >,
+                >,
+            >,
+            key: crate::kms::owner::admission::IntentKey,
+            value: crate::kms::owner::admission::Readiness,
+        ) {
+            readiness.borrow_mut().insert(key, value);
+        }
+    }
+
+    impl crate::kms::render::admission::AdmissionSource for AdmissionSourceFixture {
+        fn producer_readiness(
+            &self,
+            key: crate::kms::owner::admission::IntentKey,
+        ) -> crate::kms::owner::admission::Readiness {
+            self.readiness
+                .borrow()
+                .get(&key)
+                .copied()
+                .unwrap_or(crate::kms::owner::admission::Readiness::Ready)
+        }
+
+        fn describe(
+            &mut self,
+            _admitted: &crate::kms::owner::admission::Admitted,
+        ) -> crate::kms::owner::build::CommitDescription {
+            crate::kms::owner::test_fixtures::single_active_crtc()
+        }
+
+        fn composed_resources(
+            &mut self,
+            _crtc: crate::kms::owner::admission::CrtcId,
+            _generation: u64,
+        ) -> Vec<crate::kms::render::resources::CommitResources> {
+            Vec::new()
+        }
+
+        fn direct_eligible(&self, _source_generation: u64) -> bool {
+            self.direct_eligible.get()
+        }
+    }
+
+    fn install_admission_owner_gate(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("fixture owner")
+            .incarnation();
+        let gate = crate::kms::render::resources::tests::owner_gate_for_tests(device, incarnation);
+        backend.platform.install_transport_gate(gate);
+    }
+
+    fn install_admission_legacy_gate(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("fixture owner")
+            .incarnation();
+        let gate = crate::kms::render::resources::TransportGate::new_legacy(
+            device,
+            incarnation,
+            Box::new(backend.direct_ownership_handle()),
+        );
+        backend.platform.install_transport_gate(gate);
+    }
+
+    fn admission_direct_candidate(
+        backend: &mut super::KmsBackend,
+        suffix: u32,
+    ) -> (
+        crate::kms::render::store::DrawableId,
+        yserver_core::backend::PresentScanoutCandidate,
+        yserver_core::backend::CompletedPresentEvent,
+    ) {
+        managed_prepare_ready_candidate(
+            backend,
+            0xA000 + suffix * 4,
+            0xA001 + suffix * 4,
+            40,
+            suffix,
+        )
+    }
+
+    #[test]
+    fn c0_adm_conductor_is_inert_without_an_owner_transport() {
+        use crate::kms::owner::admission::{IntentKey, Readiness};
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        let (source, readiness, _) = AdmissionSourceFixture::new();
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            IntentKey::Composed {
+                crtc: 1,
+                generation: 1,
+            },
+            Readiness::Ready,
+        );
+        backend.install_admission_conductor_for_tests(device, source);
+
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("inert composed offer");
+        assert!(backend.admission_snapshot(device, false).is_none());
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 1);
+        assert!(
+            !backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("inert direct offer")
+        );
+        assert_eq!(backend.commit_consumer.capacity.occupied(), 0);
+
+        install_admission_legacy_gate(&mut backend, device);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("legacy composed offer");
+        assert!(backend.admission_snapshot(device, false).is_none());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .composed(1)
+                .is_none()
+        );
+
+        backend
+            .platform
+            .transport_gate_mut(&device)
+            .unwrap()
+            .begin_quiescing()
+            .expect("quiesce gate");
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("quiescing composed offer");
+        assert!(backend.admission_snapshot(device, false).is_none());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .composed(1)
+                .is_none()
+        );
+
+        install_admission_owner_gate(&mut backend, device);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("owner composed offer");
+        assert!(backend.admission_snapshot(device, false).is_some());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .composed(1)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_snapshot_waits_on_ordinary_retirement() {
+        use crate::kms::{
+            owner::admission::{IntentKey, Readiness, WaitReason},
+            render::resources::{CommitResources, DirectRole},
+        };
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let reservation = backend
+            .commit_consumer
+            .capacity
+            .reserve(DirectRole::OrdinaryRetirement)
+            .expect("ordinary retirement reservation");
+        let occupied = backend
+            .commit_consumer
+            .capacity
+            .attach(
+                reservation,
+                CommitResources::new(vec![], None, None, None, vec![], vec![]),
+            )
+            .expect("ordinary retirement attachment");
+        backend.commit_consumer.releasing_resources.push(occupied);
+
+        let (source, readiness, _) = AdmissionSourceFixture::new();
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+            Readiness::Ready,
+        );
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 2);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+
+        let snapshot = backend
+            .admission_snapshot(device, false)
+            .expect("owner snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Direct {
+                source_generation: 1,
+            }),
+            Some(Readiness::Waiting(WaitReason::OrdinaryRetirementOccupied))
+        );
+        assert_eq!(snapshot.layout_generation, 0);
+        assert_eq!(snapshot.topology_generation, 1);
+        assert!(!snapshot.retirement_wake);
+
+        let occupied = backend.commit_consumer.releasing_resources.pop().unwrap();
+        backend
+            .commit_consumer
+            .capacity
+            .finish_role(occupied.direct_role.expect("ordinary role"))
+            .expect("finish test retirement");
+    }
+
+    #[test]
+    fn c0_adm_conductor_snapshot_combines_producer_readiness() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, readiness, _) = AdmissionSourceFixture::new();
+        let key = IntentKey::Composed {
+            crtc: 1,
+            generation: 9,
+        };
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            key,
+            Readiness::Waiting(WaitReason::NoReusableBuffer),
+        );
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 9)
+            .expect("composed offer");
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .unwrap()
+                .readiness(key),
+            Some(Readiness::Waiting(WaitReason::NoReusableBuffer))
+        );
+
+        AdmissionSourceFixture::set_readiness(&readiness, key, Readiness::Ready);
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .unwrap()
+                .readiness(key),
+            Some(Readiness::Ready)
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_unflip_waits_without_a_composed_return() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+        use std::collections::BTreeSet;
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<BTreeSet<_>>();
+        backend
+            .admission_request_unflip(device, crtcs)
+            .expect("unflip request");
+        let snapshot = backend
+            .admission_snapshot(device, false)
+            .expect("owner snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Unflip),
+            Some(Readiness::Waiting(WaitReason::ComposedReturnNotEstablished))
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_direct_offer_is_refused_before_the_seam_while_unflip_is_pending() {
+        use std::collections::BTreeSet;
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<BTreeSet<_>>();
+        backend
+            .admission_request_unflip(device, crtcs)
+            .expect("unflip request");
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 3);
+        let occupied = backend.commit_consumer.capacity.occupied();
+        assert!(
+            !backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer refusal")
+        );
+        assert_eq!(backend.commit_consumer.capacity.occupied(), occupied);
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_unflip_request_terminalizes_the_queued_frame() {
+        use std::collections::BTreeSet;
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 4);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        let occupied = backend.commit_consumer.capacity.occupied();
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<BTreeSet<_>>();
+        backend
+            .admission_request_unflip(device, crtcs)
+            .expect("unflip request");
+
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_none()
+        );
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert!(backend.scanout_m2.queued_successor_role.is_none());
+        assert_eq!(backend.commit_consumer.capacity.occupied(), occupied - 1);
+        assert!(!backend.commit_consumer.capacity.is_admission_closed());
+        assert_eq!(backend.scanout_m2.idled.len(), 1);
+        assert!(backend.scanout_m2.deferred_successor_skips.is_empty());
+        assert_eq!(backend.scanout_m2.completed.len(), 1);
+        assert_eq!(backend.scanout_m2.idled[0].present_id, 4);
+        assert_eq!(backend.scanout_m2.completed[0].present_id, 4);
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_ineligible_direct_successor_is_invalidated() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, readiness, eligible) = AdmissionSourceFixture::new();
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+            Readiness::Ready,
+        );
+        eligible.set(false);
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 5);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        let snapshot = backend.admission_snapshot(device, false).expect("snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Direct {
+                source_generation: 1,
+            }),
+            Some(Readiness::Waiting(WaitReason::NotDirectEligible))
+        );
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_none()
+        );
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(backend.scanout_m2.idled.len(), 1);
+        assert_eq!(backend.scanout_m2.deferred_successor_skips.len(), 1);
+        assert_eq!(backend.commit_consumer.capacity.occupied(), 0);
+    }
+
+    #[test]
+    fn c0_adm_conductor_direct_offer_replaces_frame_and_descriptor_together() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_a, candidate_a, event_a) = admission_direct_candidate(&mut backend, 6);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_a, candidate_a, event_a)
+                .expect("first direct offer")
+        );
+        let (source_b, candidate_b, event_b) = admission_direct_candidate(&mut backend, 7);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_b, candidate_b, event_b)
+                .expect("second direct offer")
+        );
+
+        assert_eq!(backend.commit_consumer.capacity.occupied(), 1);
+        assert_eq!(
+            backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .unwrap()
+                .candidate
+                .present_id,
+            7
+        );
+        assert_eq!(backend.scanout_m2.idled.len(), 1);
+        assert_eq!(backend.scanout_m2.deferred_successor_skips.len(), 1);
+        assert_eq!(backend.scanout_m2.idled[0].present_id, 6);
+        assert_eq!(backend.scanout_m2.deferred_successor_skips[0].present_id, 6);
+        assert_eq!(
+            backend.scanout_m2.deferred_successor_skips[0].completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        let queued = backend.admission_conductors[&device]
+            .admission
+            .direct()
+            .expect("direct descriptor");
+        assert_eq!(queued.successor.source_generation, 2);
+        assert_eq!(
+            queued.successor.crtcs,
+            backend
+                .platform
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == device)
+                .map(|output| u32::from(output.output.crtc))
+                .collect()
         );
     }
 }
