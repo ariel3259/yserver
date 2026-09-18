@@ -878,6 +878,65 @@ impl AsFd for TestDevice {
     }
 }
 
+/// Process-wide serialisation for tests which take DRM master and reconfigure
+/// a live CRTC. The kernel's master lock is per-file, but the CRTC and the
+/// connector are shared by every test process using the seat.
+#[cfg(test)]
+pub struct LiveKmsFixtureGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub fn acquire_live_kms_fixture_guard() -> LiveKmsFixtureGuard {
+    static LIVE_KMS_FIXTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let guard = LIVE_KMS_FIXTURE_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    LiveKmsFixtureGuard { _guard: guard }
+}
+
+/// DRM-master ownership for a live-KMS test fd.
+#[cfg(test)]
+pub struct DrmMasterGuard {
+    device: std::rc::Rc<crate::drm::Device>,
+}
+
+#[cfg(test)]
+impl DrmMasterGuard {
+    /// Acquire master on an already-open primary node.
+    ///
+    /// DRM master is granted to the seat's active session. An EACCES here is
+    /// therefore an environmental failure, not a test skip: the caller must
+    /// run the live-KMS test from an active VT.
+    pub fn acquire(device: std::rc::Rc<crate::drm::Device>) -> io::Result<Self> {
+        use ::drm::Device as _;
+
+        match device.acquire_master_lock() {
+            Ok(()) => Ok(Self { device }),
+            Err(error) if error.raw_os_error() == Some(libc::EACCES) => panic!(
+                "live-KMS test could not acquire DRM master: master is granted to the seat's active session, so this test must run from an active VT; {error}"
+            ),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DrmMasterGuard {
+    fn drop(&mut self) {
+        use ::drm::Device as _;
+
+        if let Err(error) = self.device.release_master_lock() {
+            eprintln!(
+                "LIVE-KMS FIXTURE: failed to drop DRM master on {}: {error}",
+                self.device.path()
+            );
+        }
+    }
+}
+
 /// Spawn a real helper process connected to `device`.
 #[doc(hidden)]
 pub fn spawn_real_helper_for_tests(device: &TestDevice) -> KmsIoExecutor {
