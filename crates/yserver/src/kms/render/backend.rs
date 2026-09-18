@@ -1669,10 +1669,6 @@ pub struct LiveKmsFixture {
     // plan requires: restore -> destroy the test resources (`backend`) -> drop
     // master (`_master`) -> release the process-wide guard (`_exclusive`).
     // Reordering these fields silently breaks it.
-    #[expect(
-        dead_code,
-        reason = "read by the part-3 tests from Task 2 on; this expectation then fails and must be removed"
-    )]
     pub(crate) backend: KmsBackend,
     snapshot: Option<LiveKmsCrtcSnapshot>,
     // Held only for their `Drop`: never read, by design.
@@ -6355,6 +6351,38 @@ impl KmsBackend {
         backend.platform.fb_h = backend.platform.outputs[0].height;
         backend.platform.scanout_pools =
             vec![Some(crate::kms::vk::scanout::OutputScanout::Shared(pool))];
+        let (front_index, front_framebuffer) = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live output has a scanout pool")
+            .display_pool()
+            .bos
+            .iter()
+            .enumerate()
+            .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+            .expect("live scanout pool has a framebuffer for the initial modeset");
+        let legacy_write_permitted = backend.platform.allows_legacy(
+            &actual_primary,
+            crate::kms::render::resources::WriterClass::Modeset,
+        );
+        crate::drm::modeset::commit_modeset(
+            &device,
+            &backend.platform.outputs[0].output,
+            front_framebuffer,
+            legacy_write_permitted,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("live-KMS fixture: initial modeset failed: {error}"),
+            )
+        })?;
+        backend.platform.scanout_pools[0]
+            .as_mut()
+            .expect("live output has a scanout pool")
+            .display_pool_mut()
+            .bos[front_index]
+            .state
+            .mark_on_screen_after_modeset();
         backend.platform.bo_generations = vec![vec![
             crate::kms::render::platform::BoGenerationEntry::default();
             pool_len
