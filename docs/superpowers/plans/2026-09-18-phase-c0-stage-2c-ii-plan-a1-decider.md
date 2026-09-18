@@ -353,11 +353,11 @@ impl Admission {
 - `c0_adm_a_multi_crtc_unflip_serves_every_crtc_it_covers` — confirm an unflip over {1, 2}; then composed intents on 1, 2 and 3, queued in that order and ready: composed 3 wins.
 - `c0_adm_retirement_preference_needs_no_other_crtc_owed` — after a topology admission (so nothing is successive), a composed on 3 queued before a successor over {1}, both ready on a retirement wake: composed 3 wins. This isolates M10: the successor passes the round-robin here, so only the preference's own "owed" condition can hold it back.
 
-- [ ] **Step 1:** Append the tests.
-- [ ] **Step 2:** Run and record which fail. Expected: at least the two round-robin transition tests and both retirement-successor tests fail. The stream test and `c0_adm_retirement_preference_needs_no_other_crtc_owed` may already pass on age alone; they exist to catch M10 once the preference is in. Report the exact list.
-- [ ] **Step 3:** Implement the round-robin and the preference.
-- [ ] **Step 4:** Run the gate, including Task 4's additions. Expected: clippy clean in all three configurations; `cargo check` clean on the three targets; `c0_adm` **36 passed, 0 failed**; full `--lib` 0 failed.
-- [ ] **Step 5:** Stop dirty and report.
+- [x] **Step 1:** Append the tests.
+- [x] **Step 2:** Run and record which fail. Expected: at least the two round-robin transition tests and both retirement-successor tests fail. The stream test and `c0_adm_retirement_preference_needs_no_other_crtc_owed` may already pass on age alone; they exist to catch M10 once the preference is in. Report the exact list.
+- [x] **Step 3:** Implement the round-robin and the preference.
+- [x] **Step 4:** Run the gate, including Task 4's additions. Expected: clippy clean in all three configurations; `cargo check` clean on the three targets; `c0_adm` **36 passed, 0 failed**; full `--lib` 0 failed.
+- [x] **Step 5:** Stop dirty and report.
 
 ---
 

@@ -53,6 +53,7 @@ impl Admission {
         }
 
         self.consume(&decision.admitted);
+        self.last_primary_crtcs = decision.primary_crtcs();
         self.locked = None;
         self.sequence = self
             .sequence

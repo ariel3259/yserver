@@ -39,6 +39,7 @@ pub struct Admission {
     next_ordinal: u64,
     pub(super) locked: Option<u64>,
     pub(super) sequence: u64,
+    pub(super) last_primary_crtcs: BTreeSet<CrtcId>,
 }
 
 impl Admission {

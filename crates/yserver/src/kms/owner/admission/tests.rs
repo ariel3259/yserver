@@ -735,3 +735,516 @@ fn c0_adm_confirm_consumes_a_direct_unflip_or_topology_admission_exactly() {
         assert_eq!(admission.composed(2).unwrap().generation, 40);
     }
 }
+
+#[test]
+fn c0_adm_grouped_then_composed_on_its_crtcs_yields_to_the_owed_crtc() {
+    let mut admission = Admission::new();
+    admission
+        .set_direct_successor(successor(10, 20, 30, &[1, 2]))
+        .unwrap();
+
+    let mut direct_snapshot = ReadinessSnapshot::new(20, 30);
+    direct_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let direct_decision = admission.decide(&direct_snapshot).unwrap();
+    let direct_token = admission.lock(direct_decision, &direct_snapshot).unwrap();
+    admission.confirm(direct_token).unwrap();
+
+    admission.set_composed(1, 11).unwrap();
+    admission.set_composed(2, 12).unwrap();
+    admission.set_composed(3, 13).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    for (crtc, generation) in [(1, 11), (2, 12), (3, 13)] {
+        snapshot.report(IntentKey::Composed { crtc, generation }, Readiness::Ready);
+    }
+
+    assert_eq!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 3,
+                generation: 13,
+            },
+        })
+    );
+}
+
+#[test]
+fn c0_adm_composed_then_grouped_yields_to_the_owed_crtc() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+
+    let mut first_snapshot = ReadinessSnapshot::new(0, 0);
+    first_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let first_decision = admission.decide(&first_snapshot).unwrap();
+    let first_token = admission.lock(first_decision, &first_snapshot).unwrap();
+    admission.confirm(first_token).unwrap();
+
+    admission
+        .set_direct_successor(successor(20, 30, 40, &[1, 2]))
+        .unwrap();
+    admission.set_composed(3, 30).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(30, 40);
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 3,
+            generation: 30,
+        },
+        Readiness::Ready,
+    );
+
+    assert_eq!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 3,
+                generation: 30,
+            },
+        })
+    );
+
+    let decision = admission.decide(&snapshot).unwrap();
+    let token = admission.lock(decision, &snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    assert!(matches!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            admitted: Admitted::Direct { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn c0_adm_when_every_ready_crtc_was_just_served_the_oldest_wins() {
+    let mut admission = Admission::new();
+    admission
+        .set_direct_successor(successor(10, 20, 30, &[1, 2]))
+        .unwrap();
+
+    let mut direct_snapshot = ReadinessSnapshot::new(20, 30);
+    direct_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let direct_decision = admission.decide(&direct_snapshot).unwrap();
+    let direct_token = admission.lock(direct_decision, &direct_snapshot).unwrap();
+    admission.confirm(direct_token).unwrap();
+
+    admission.set_composed(2, 20).unwrap();
+    admission.set_composed(1, 10).unwrap();
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 2,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+
+    assert_eq!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 2,
+                generation: 20,
+            },
+        })
+    );
+}
+
+#[test]
+fn c0_adm_an_intervening_admission_ends_the_successive_run() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+
+    let mut composed_snapshot = ReadinessSnapshot::new(0, 0);
+    composed_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let composed_decision = admission.decide(&composed_snapshot).unwrap();
+    let composed_token = admission
+        .lock(composed_decision, &composed_snapshot)
+        .unwrap();
+    admission.confirm(composed_token).unwrap();
+
+    admission.request_topology(20).unwrap();
+    let topology_decision = admission.decide(&ReadinessSnapshot::new(0, 0)).unwrap();
+    let topology_token = admission
+        .lock(topology_decision, &ReadinessSnapshot::new(0, 0))
+        .unwrap();
+    admission.confirm(topology_token).unwrap();
+
+    admission.set_composed(1, 11).unwrap();
+    admission.set_composed(2, 20).unwrap();
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 11,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 2,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+
+    assert_eq!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 1,
+                generation: 11,
+            },
+        })
+    );
+}
+
+#[test]
+fn c0_adm_retirement_successor_is_preferred_when_no_other_crtc_is_owed() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+    admission
+        .set_direct_successor(successor(20, 30, 40, &[1, 2]))
+        .unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(30, 40);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+
+    assert!(matches!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            admitted: Admitted::Composed { crtc: 1, .. },
+            ..
+        })
+    ));
+
+    snapshot.retirement_wake = true;
+    assert!(matches!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            admitted: Admitted::Direct { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn c0_adm_retirement_successor_yields_to_an_owed_crtc() {
+    let mut admission = Admission::new();
+    admission
+        .set_direct_successor(successor(10, 20, 30, &[1, 2]))
+        .unwrap();
+
+    let mut first_snapshot = ReadinessSnapshot::new(20, 30);
+    first_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let first_decision = admission.decide(&first_snapshot).unwrap();
+    let first_token = admission.lock(first_decision, &first_snapshot).unwrap();
+    admission.confirm(first_token).unwrap();
+
+    admission
+        .set_direct_successor(successor(11, 20, 30, &[1, 2]))
+        .unwrap();
+    admission.set_composed(3, 30).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(20, 30);
+    snapshot.retirement_wake = true;
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 11,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 3,
+            generation: 30,
+        },
+        Readiness::Ready,
+    );
+
+    assert_eq!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 3,
+                generation: 30,
+            },
+        })
+    );
+}
+
+#[test]
+fn c0_adm_a_retirement_successor_stream_cannot_starve_another_crtc() {
+    let mut admission = Admission::new();
+    admission
+        .set_direct_successor(successor(10, 20, 30, &[1]))
+        .unwrap();
+    admission.set_composed(2, 20).unwrap();
+
+    let mut first_snapshot = ReadinessSnapshot::new(20, 30);
+    first_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 10,
+        },
+        Readiness::Ready,
+    );
+    first_snapshot.report(
+        IntentKey::Composed {
+            crtc: 2,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+    let first_decision = admission.decide(&first_snapshot).unwrap();
+    let first_token = admission.lock(first_decision, &first_snapshot).unwrap();
+    admission.confirm(first_token).unwrap();
+
+    admission
+        .set_direct_successor(successor(11, 20, 30, &[1]))
+        .unwrap();
+    let mut retirement_snapshot = ReadinessSnapshot::new(20, 30);
+    retirement_snapshot.retirement_wake = true;
+    retirement_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 11,
+        },
+        Readiness::Ready,
+    );
+    retirement_snapshot.report(
+        IntentKey::Composed {
+            crtc: 2,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+
+    assert_eq!(
+        admission.decide(&retirement_snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 2,
+                generation: 20,
+            },
+        })
+    );
+}
+
+#[test]
+fn c0_adm_a_grouped_candidate_yields_to_an_owed_crtc_it_contains() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+
+    let mut first_snapshot = ReadinessSnapshot::new(0, 0);
+    first_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let first_decision = admission.decide(&first_snapshot).unwrap();
+    let first_token = admission.lock(first_decision, &first_snapshot).unwrap();
+    admission.confirm(first_token).unwrap();
+
+    admission
+        .set_direct_successor(successor(20, 30, 40, &[1, 2]))
+        .unwrap();
+    admission.set_composed(2, 20).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(30, 40);
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 2,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+
+    assert_eq!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 2,
+                generation: 20,
+            },
+        })
+    );
+}
+
+#[test]
+fn c0_adm_a_lone_grouped_candidate_is_not_held_back_by_itself() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+
+    let mut first_snapshot = ReadinessSnapshot::new(0, 0);
+    first_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let first_decision = admission.decide(&first_snapshot).unwrap();
+    let first_token = admission.lock(first_decision, &first_snapshot).unwrap();
+    admission.confirm(first_token).unwrap();
+
+    admission
+        .set_direct_successor(successor(20, 30, 40, &[1, 2]))
+        .unwrap();
+    let mut snapshot = ReadinessSnapshot::new(30, 40);
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+
+    assert!(matches!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            admitted: Admitted::Direct { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn c0_adm_a_multi_crtc_unflip_serves_every_crtc_it_covers() {
+    let mut admission = Admission::new();
+    admission.request_unflip(super::crtcs(&[1, 2])).unwrap();
+
+    let mut unflip_snapshot = ReadinessSnapshot::new(0, 0);
+    unflip_snapshot.report(IntentKey::Unflip, Readiness::Ready);
+    let unflip_decision = admission.decide(&unflip_snapshot).unwrap();
+    let unflip_token = admission.lock(unflip_decision, &unflip_snapshot).unwrap();
+    admission.confirm(unflip_token).unwrap();
+
+    admission.set_composed(1, 10).unwrap();
+    admission.set_composed(2, 20).unwrap();
+    admission.set_composed(3, 30).unwrap();
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    for (crtc, generation) in [(1, 10), (2, 20), (3, 30)] {
+        snapshot.report(IntentKey::Composed { crtc, generation }, Readiness::Ready);
+    }
+
+    assert_eq!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 3,
+                generation: 30,
+            },
+        })
+    );
+}
+
+#[test]
+fn c0_adm_retirement_preference_needs_no_other_crtc_owed() {
+    let mut admission = Admission::new();
+    admission.request_topology(10).unwrap();
+    let topology_snapshot = ReadinessSnapshot::new(0, 0);
+    let topology_decision = admission.decide(&topology_snapshot).unwrap();
+    let topology_token = admission
+        .lock(topology_decision, &topology_snapshot)
+        .unwrap();
+    admission.confirm(topology_token).unwrap();
+
+    admission.set_composed(3, 30).unwrap();
+    admission
+        .set_direct_successor(successor(20, 40, 50, &[1]))
+        .unwrap();
+    let mut snapshot = ReadinessSnapshot::new(40, 50);
+    snapshot.retirement_wake = true;
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 3,
+            generation: 30,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+
+    assert_eq!(
+        admission.decide(&snapshot),
+        Some(AdmissionDecision {
+            tier: Tier::Primary,
+            admitted: Admitted::Composed {
+                crtc: 3,
+                generation: 30,
+            },
+        })
+    );
+}

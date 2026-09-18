@@ -22,7 +22,7 @@ impl Admission {
             });
         }
 
-        let mut candidate = None;
+        let mut candidates = Vec::new();
 
         for (crtc, composed) in self.composed_intents() {
             if self
@@ -37,14 +37,14 @@ impl Admission {
                 generation: composed.generation,
             };
             if snapshot.is_ready(key) {
-                consider_candidate(
-                    &mut candidate,
-                    composed.ordinal,
-                    Admitted::Composed {
+                candidates.push(Candidate {
+                    ordinal: composed.ordinal,
+                    crtcs: BTreeSet::from([crtc]),
+                    admitted: Admitted::Composed {
                         crtc,
                         generation: composed.generation,
                     },
-                );
+                });
             }
         }
 
@@ -55,33 +55,62 @@ impl Admission {
                 source_generation: direct.successor.source_generation,
             })
         {
-            consider_candidate(
-                &mut candidate,
-                direct.ordinal,
-                Admitted::Direct {
+            candidates.push(Candidate {
+                ordinal: direct.ordinal,
+                crtcs: direct.successor.crtcs.clone(),
+                admitted: Admitted::Direct {
                     successor: direct.successor.clone(),
                 },
-            );
+            });
         }
 
-        candidate.map(|(_, admitted)| AdmissionDecision {
-            tier: Tier::Primary,
-            admitted,
-        })
+        let owed = owed_crtcs(&candidates, &self.last_primary_crtcs);
+
+        if snapshot.retirement_wake
+            && let Some(direct) = candidates.iter().find(|candidate| {
+                matches!(candidate.admitted, Admitted::Direct { .. })
+                    && round_robin_allows(candidate, &self.last_primary_crtcs, &owed)
+                    && owed.is_subset(&candidate.crtcs)
+            })
+        {
+            return Some(AdmissionDecision {
+                tier: Tier::Primary,
+                admitted: direct.admitted.clone(),
+            });
+        }
+
+        candidates
+            .into_iter()
+            .filter(|candidate| round_robin_allows(candidate, &self.last_primary_crtcs, &owed))
+            .min_by_key(|candidate| candidate.ordinal)
+            .map(|candidate| AdmissionDecision {
+                tier: Tier::Primary,
+                admitted: candidate.admitted,
+            })
     }
 }
 
-fn consider_candidate(
-    candidate: &mut Option<(PrimaryOrdinal, Admitted)>,
+#[derive(Debug)]
+struct Candidate {
     ordinal: PrimaryOrdinal,
+    crtcs: BTreeSet<CrtcId>,
     admitted: Admitted,
-) {
-    let replace = candidate
-        .as_ref()
-        .is_none_or(|(current, _)| ordinal < *current);
-    if replace {
-        *candidate = Some((ordinal, admitted));
-    }
+}
+
+fn owed_crtcs(candidates: &[Candidate], last_primary_crtcs: &BTreeSet<CrtcId>) -> BTreeSet<CrtcId> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.crtcs.is_disjoint(last_primary_crtcs))
+        .flat_map(|candidate| candidate.crtcs.iter().copied())
+        .collect()
+}
+
+fn round_robin_allows(
+    candidate: &Candidate,
+    last_primary_crtcs: &BTreeSet<CrtcId>,
+    owed: &BTreeSet<CrtcId>,
+) -> bool {
+    candidate.crtcs.is_disjoint(last_primary_crtcs) || owed.is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
