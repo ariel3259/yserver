@@ -13,11 +13,59 @@ use crate::kms::{
     render::{
         backend::LiveKmsFixture,
         resources::{
-            AllocationKey, DrmCleanupRegistry, ResourceService, UseKind, tests::MockCleanupIo,
+            AllocationKey, DrmCleanupRegistry, ResourceService, TransportState, UseKind,
+            tests::{MockCleanupIo, run_sink_gamma_gate_four_states},
         },
     },
     vk::scanout::BoPhase,
 };
+
+struct GammaRestoreGuard {
+    device: Rc<crate::drm::Device>,
+    crtc: ::drm::control::crtc::Handle,
+    red: Vec<u16>,
+    green: Vec<u16>,
+    blue: Vec<u16>,
+}
+
+impl GammaRestoreGuard {
+    fn capture(
+        device: Rc<crate::drm::Device>,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> std::io::Result<Self> {
+        use ::drm::control::Device as ControlDevice;
+
+        let gamma_length = usize::try_from(device.get_crtc(crtc)?.gamma_length())
+            .expect("DRM CRTC gamma length fits in usize");
+        let mut red = vec![0; gamma_length];
+        let mut green = vec![0; gamma_length];
+        let mut blue = vec![0; gamma_length];
+        device.get_gamma(crtc, &mut red, &mut green, &mut blue)?;
+        Ok(Self {
+            device,
+            crtc,
+            red,
+            green,
+            blue,
+        })
+    }
+}
+
+impl Drop for GammaRestoreGuard {
+    fn drop(&mut self) {
+        use ::drm::control::Device as ControlDevice;
+
+        if let Err(error) = self
+            .device
+            .set_gamma(self.crtc, &self.red, &self.green, &self.blue)
+        {
+            eprintln!(
+                "LIVE-KMS GAMMA RESTORATION FAILED: CRTC {:?}: {error}; the test may have left the active CRTC gamma changed",
+                self.crtc,
+            );
+        }
+    }
+}
 
 struct ManagedScanoutFlip {
     fixture: LiveKmsFixture,
@@ -378,4 +426,95 @@ fn c0_2ci_managed_scanout_out_fence_resolves_drm() {
         Some(release_fence_fd),
         "successful fence observation must not take the BO-owned descriptor"
     );
+}
+
+#[test]
+#[ignore = "needs live DRM master and Vulkan ICD"]
+fn c0_2ci_sink_gamma_gate_four_states_master_drm() {
+    use ::drm::control::Device as ControlDevice;
+
+    let fixture = KmsBackend::for_tests_with_live_kms()
+        .expect("live-KMS fixture requires a usable primary DRM device and Vulkan ICD");
+    let device_key = fixture
+        .backend
+        .platform
+        .outputs
+        .first()
+        .expect("live-KMS fixture has an output")
+        .key
+        .device_key;
+    let device = fixture
+        .backend
+        .platform
+        .device_for_key(device_key)
+        .expect("live-KMS fixture has its master-holding device")
+        .device
+        .clone();
+    let crtc = *device
+        .resource_handles()
+        .expect("drm resource handles on live master-holding device")
+        .crtcs()
+        .first()
+        .expect("live master-holding device has at least one crtc");
+    let gamma_restore = GammaRestoreGuard::capture(Rc::clone(&device), crtc)
+        .expect("snapshot the live CRTC gamma before the master-held gamma test");
+
+    let outcomes = run_sink_gamma_gate_four_states(device, device_key);
+    drop(gamma_restore);
+
+    for outcome in outcomes
+        .iter()
+        .filter(|outcome| outcome.state != TransportState::Legacy)
+    {
+        let error = outcome
+            .result
+            .as_ref()
+            .expect_err("transport gate must refuse non-Legacy gamma writes");
+        assert!(
+            !outcome.reached_ioctl,
+            "state={:?} reached the ioctl",
+            outcome.state
+        );
+        assert_eq!(
+            error.raw_os_error(),
+            None,
+            "state={:?} transport refusal unexpectedly has an OS errno: {error}",
+            outcome.state,
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("transport gate: legacy gamma write refused"),
+            "state={:?} err={error}",
+            outcome.state,
+        );
+    }
+
+    let legacy = outcomes
+        .iter()
+        .find(|outcome| outcome.state == TransportState::Legacy)
+        .expect("gamma helper returned the Legacy outcome");
+    match legacy.result.as_ref() {
+        Ok(()) => println!("master-held gamma Legacy outcome: Ok"),
+        Err(error) => println!(
+            "master-held gamma Legacy outcome: Err errno={:?}: {error}",
+            error.raw_os_error(),
+        ),
+    }
+    assert!(
+        legacy.reached_ioctl,
+        "master-held Legacy gamma arm did not reach the ioctl: {:?}",
+        legacy
+            .result
+            .as_ref()
+            .err()
+            .and_then(std::io::Error::raw_os_error),
+    );
+    if let Err(error) = legacy.result.as_ref() {
+        assert_ne!(
+            error.raw_os_error(),
+            Some(libc::EACCES),
+            "master-held Legacy gamma arm unexpectedly failed with EACCES",
+        );
+    }
 }

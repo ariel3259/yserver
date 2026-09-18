@@ -3050,6 +3050,84 @@ fn c0_2ci_transport_gate_handover_validates_proof_and_dispositions() {
 // real sink. Deleted per the fix handoff; the real per-sink tests
 // (`c0_2ci_sink_*`) beneath the real entry points replace it.
 
+#[derive(Debug)]
+pub(crate) struct GammaGateOutcome {
+    pub(crate) state: TransportState,
+    pub(crate) reached_ioctl: bool,
+    pub(crate) result: std::io::Result<()>,
+}
+
+pub(crate) fn run_sink_gamma_gate_four_states(
+    device: Rc<crate::drm::Device>,
+    device_key: DrmDeviceKey,
+) -> Vec<GammaGateOutcome> {
+    use ::drm::control::Device as ControlDevice;
+
+    let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
+    backend.platform.devices = vec![crate::kms::render::platform::KmsDevice {
+        key: device_key,
+        device: Rc::clone(&device),
+        cursor: crate::kms::render::platform::KmsCursorState::new(),
+        executor: None,
+        owner: None,
+    }];
+    let output_key = crate::kms::backend::OutputKey::new(device_key, "gamma_test_output");
+    let mut output = backend.platform.outputs.remove(0);
+    let crtc = *device
+        .resource_handles()
+        .expect("drm resource handles on gamma test device")
+        .crtcs()
+        .first()
+        .expect("gamma test device has at least one crtc");
+    output.key = output_key.clone();
+    output.output.crtc = crtc;
+    backend.platform.outputs.push(output);
+
+    [
+        TransportState::Legacy,
+        TransportState::Quiescing,
+        TransportState::Owner,
+        TransportState::Closed,
+    ]
+    .into_iter()
+    .map(|state| {
+        let mut gate = TransportGate::new_legacy(
+            device_key,
+            IncarnationId::first(),
+            Box::new(FakeDirectOwnershipState::new()),
+        );
+        if state != TransportState::Legacy {
+            gate.begin_quiescing().unwrap();
+            if state == TransportState::Owner {
+                let permit = gate
+                    .issue_handover_permit(
+                        legacy_drained_for_tests(IncarnationId::first()),
+                        &[],
+                        &writer_coverage_for_tests(),
+                        RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
+                    )
+                    .unwrap();
+                gate.publish_owner(permit).unwrap();
+            } else if state == TransportState::Closed {
+                gate.close().unwrap();
+            }
+        }
+        backend.platform.transport_gates.insert(device_key, gate);
+
+        let result = backend.apply_gamma_to_live_output(&output_key);
+        let reached_ioctl = match &result {
+            Ok(()) => true,
+            Err(error) => error.raw_os_error().is_some(),
+        };
+        GammaGateOutcome {
+            state,
+            reached_ioctl,
+            result,
+        }
+    })
+    .collect()
+}
+
 /// B-10/R11: a `TransportGate` for `device`/`incarnation`, driven all the
 /// way to `Owner` (Legacy -> Quiescing -> handover -> publish), for tests
 /// that need to mint a real `OwnerWriteGrant` matching a specific device/
@@ -3250,71 +3328,24 @@ fn c0_2ci_sink_gamma_gate_four_states_drm() {
         minor: libc::minor(stat.st_rdev) as u32,
     };
     let device = Rc::new(crate::drm::Device::from_file_for_tests(file));
-    use ::drm::control::Device as ControlDevice;
-    let res = device
-        .resource_handles()
-        .expect("drm resource handles on real primary node");
-    let crtc = *res
-        .crtcs()
-        .first()
-        .expect("real drm device has at least one crtc");
-
-    let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
-    backend.platform.devices = vec![crate::kms::render::platform::KmsDevice {
-        key: device_key,
-        device: Rc::clone(&device),
-        cursor: crate::kms::render::platform::KmsCursorState::new(),
-        executor: None,
-        owner: None,
-    }];
-    let output_key = crate::kms::backend::OutputKey::new(device_key, "gamma_test_output");
-    let mut output = backend.platform.outputs.remove(0);
-    output.key = output_key.clone();
-    output.output.crtc = crtc;
-    backend.platform.outputs.push(output);
-
-    for state in [
-        TransportState::Legacy,
-        TransportState::Quiescing,
-        TransportState::Owner,
-        TransportState::Closed,
-    ] {
-        let mut gate = TransportGate::new_legacy(
-            device_key,
-            IncarnationId::first(),
-            Box::new(FakeDirectOwnershipState::new()),
-        );
-        if state != TransportState::Legacy {
-            gate.begin_quiescing().unwrap();
-            if state == TransportState::Owner {
-                let permit = gate
-                    .issue_handover_permit(
-                        legacy_drained_for_tests(IncarnationId::first()),
-                        &[],
-                        &writer_coverage_for_tests(),
-                        RecipientReservation::new_for_tests(gate.device(), gate.incarnation()),
-                    )
-                    .unwrap();
-                gate.publish_owner(permit).unwrap();
-            } else if state == TransportState::Closed {
-                gate.close().unwrap();
-            }
-        }
-        backend.platform.transport_gates.insert(device_key, gate);
-
-        let res = backend.apply_gamma_to_live_output(&output_key);
-        let err = res.expect_err("apply_gamma_to_live_output without master must fail");
+    for outcome in run_sink_gamma_gate_four_states(device, device_key) {
+        let err = outcome
+            .result
+            .as_ref()
+            .expect_err("apply_gamma_to_live_output without master must fail");
         let reached_ioctl = err.raw_os_error().is_some();
         assert_eq!(
             reached_ioctl,
-            state == TransportState::Legacy,
-            "state={state:?} reached_ioctl={reached_ioctl} err={err}",
+            outcome.state == TransportState::Legacy,
+            "state={:?} reached_ioctl={reached_ioctl} err={err}",
+            outcome.state,
         );
-        if state != TransportState::Legacy {
+        if outcome.state != TransportState::Legacy {
             assert!(
                 err.to_string()
                     .contains("transport gate: legacy gamma write refused"),
-                "state={state:?} err={err}",
+                "state={:?} err={err}",
+                outcome.state,
             );
         }
     }
