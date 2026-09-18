@@ -16,6 +16,8 @@ pub enum AdmissionError {
     DecisionMismatch,
     #[error("the admission token belongs to another decider or is stale")]
     TokenMismatch,
+    #[error("the maintenance admission ticket counter overflowed")]
+    TicketOverflow,
 }
 
 mod decide;
@@ -25,7 +27,9 @@ mod token;
 
 pub use decide::{AdmissionDecision, Admitted, Tier};
 pub use intents::{
-    Admission, ComposedIntent, DirectSuccessor, PrimaryOrdinal, QueuedDirect, UnflipBarrier,
+    Admission, AdmissionTicket, ComposedIntent, DirectSuccessor, MaintenanceClass,
+    MaintenanceIntent, MaintenanceKey, PrimaryOrdinal, QueuedDirect, Reentry, ReentryKind,
+    UnflipBarrier,
 };
 pub use snapshot::{IntentKey, Readiness, ReadinessSnapshot, WaitReason};
 pub use token::{AdmissionToken, Confirmed};

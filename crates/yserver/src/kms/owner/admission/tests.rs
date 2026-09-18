@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use super::{
     Admission, AdmissionDecision, AdmissionError, Admitted, CrtcId, DirectSuccessor, IntentKey,
-    Readiness, ReadinessSnapshot, Tier, WaitReason,
+    MaintenanceClass, MaintenanceKey, Readiness, ReadinessSnapshot, Reentry, ReentryKind, Tier,
+    WaitReason,
 };
 
 fn successor(
@@ -17,6 +18,253 @@ fn successor(
         topology_generation,
         crtcs: super::crtcs(ids),
     }
+}
+
+fn cursor_key(crtc: CrtcId) -> MaintenanceKey {
+    MaintenanceKey {
+        crtc,
+        class: MaintenanceClass::Cursor,
+    }
+}
+
+fn gamma_key(crtc: CrtcId) -> MaintenanceKey {
+    MaintenanceKey {
+        crtc,
+        class: MaintenanceClass::Gamma,
+    }
+}
+
+fn ticket_from_completed_generation(
+    admission: &mut Admission,
+    key: MaintenanceKey,
+    generation: u64,
+) -> super::AdmissionTicket {
+    admission.set_maintenance(key, generation, false).unwrap();
+    let ticket = admission.maintenance(key).unwrap().ticket;
+    admission.note_completed(key, generation);
+    ticket
+}
+
+#[test]
+fn c0_adm_maint_ticket_survives_replacement() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+
+    admission.set_maintenance(key, 10, false).unwrap();
+    let first = admission.maintenance(key).unwrap();
+
+    admission.set_maintenance(key, 11, false).unwrap();
+    let replacement = admission.maintenance(key).unwrap();
+
+    assert_eq!(replacement.generation, 11);
+    assert_eq!(replacement.ticket, first.ticket);
+    assert!(!replacement.aged);
+}
+
+#[test]
+fn c0_adm_maint_update_while_submitted_gets_a_new_ticket() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+
+    admission.set_maintenance(key, 10, false).unwrap();
+    let submitted_ticket = admission.maintenance(key).unwrap().ticket;
+    admission.maintenance_slots.remove(&key);
+    admission.maintenance_submitted.insert(
+        key,
+        super::intents::SubmittedMaintenance {
+            generation: 10,
+            ticket: submitted_ticket,
+        },
+    );
+
+    admission.set_maintenance(key, 11, false).unwrap();
+    let first_update = admission.maintenance(key).unwrap();
+    admission.set_maintenance(key, 12, false).unwrap();
+    let second_update = admission.maintenance(key).unwrap();
+
+    assert!(submitted_ticket < first_update.ticket);
+    assert_eq!(second_update.ticket, first_update.ticket);
+    assert!(first_update.aged);
+}
+
+#[test]
+fn c0_adm_maint_refuses_a_stale_generation() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+
+    admission.set_maintenance(key, 10, false).unwrap();
+    assert_eq!(
+        admission.set_maintenance(key, 10, false),
+        Err(AdmissionError::StaleGeneration {
+            queued: 10,
+            offered: 10,
+        })
+    );
+    assert_eq!(admission.maintenance(key).unwrap().generation, 10);
+}
+
+#[test]
+fn c0_adm_maint_unchanged_generation_is_never_carried() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+
+    admission.note_completed(key, 5);
+    admission.set_maintenance(key, 5, false).unwrap();
+
+    assert!(admission.maintenance(key).is_none());
+}
+
+#[test]
+fn c0_adm_maint_ages_on_arrival_behind_a_commit() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+
+    admission.set_maintenance(key, 7, true).unwrap();
+
+    assert!(admission.maintenance(key).unwrap().aged);
+}
+
+#[test]
+fn c0_adm_maint_rejected_generation_reenters_aged_with_its_ticket() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+    let ticket = ticket_from_completed_generation(&mut admission, key, 5);
+
+    assert_eq!(
+        admission.reenter(key, 5, ticket, ReentryKind::Rejected),
+        Reentry::Reentered
+    );
+    assert_eq!(
+        admission.maintenance(key),
+        Some(super::MaintenanceIntent {
+            generation: 5,
+            ticket,
+            aged: true,
+        })
+    );
+    assert_eq!(admission.rejection_count(key), 1);
+}
+
+#[test]
+fn c0_adm_maint_second_consecutive_rejection_drops() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+    let ticket = ticket_from_completed_generation(&mut admission, key, 5);
+
+    assert_eq!(
+        admission.reenter(key, 5, ticket, ReentryKind::Rejected),
+        Reentry::Reentered
+    );
+    assert_eq!(
+        admission.reenter(key, 5, ticket, ReentryKind::Rejected),
+        Reentry::Dropped
+    );
+    assert!(admission.maintenance(key).is_none());
+    assert_eq!(admission.rejection_count(key), 2);
+}
+
+#[test]
+fn c0_adm_maint_collision_keeps_older_ticket_and_inherits_the_count() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+    let older_ticket = ticket_from_completed_generation(&mut admission, key, 5);
+
+    admission.set_maintenance(key, 6, false).unwrap();
+    let newer_ticket = admission.maintenance(key).unwrap().ticket;
+    assert!(older_ticket < newer_ticket);
+
+    assert_eq!(
+        admission.reenter(key, 5, older_ticket, ReentryKind::Rejected),
+        Reentry::Reentered
+    );
+    assert_eq!(
+        admission.maintenance(key),
+        Some(super::MaintenanceIntent {
+            generation: 6,
+            ticket: older_ticket,
+            aged: true,
+        })
+    );
+    assert_eq!(admission.rejection_count(key), 1);
+
+    assert_eq!(
+        admission.reenter(key, 4, older_ticket, ReentryKind::Rejected),
+        Reentry::Dropped
+    );
+    assert!(admission.maintenance(key).is_none());
+}
+
+#[test]
+fn c0_adm_maint_unknown_is_not_a_rejection() {
+    let mut admission = Admission::new();
+    let key = gamma_key(2);
+    let ticket = ticket_from_completed_generation(&mut admission, key, 8);
+
+    assert_eq!(
+        admission.reenter(key, 8, ticket, ReentryKind::Unknown),
+        Reentry::Reentered
+    );
+    assert_eq!(
+        admission.reenter(key, 8, ticket, ReentryKind::Unknown),
+        Reentry::Reentered
+    );
+    assert_eq!(admission.rejection_count(key), 0);
+    assert_eq!(admission.maintenance(key).unwrap().ticket, ticket);
+}
+
+#[test]
+fn c0_adm_maint_completed_resets_the_count() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+    let ticket = ticket_from_completed_generation(&mut admission, key, 5);
+
+    assert_eq!(
+        admission.reenter(key, 5, ticket, ReentryKind::Rejected),
+        Reentry::Reentered
+    );
+    admission.note_completed(key, 5);
+    assert_eq!(admission.rejection_count(key), 0);
+
+    assert_eq!(
+        admission.reenter(key, 5, ticket, ReentryKind::Rejected),
+        Reentry::Reentered
+    );
+}
+
+#[test]
+fn c0_adm_maint_cursor_recovery_is_stored_per_crtc() {
+    let mut admission = Admission::new();
+
+    admission.request_cursor_recovery(1);
+    admission.request_cursor_recovery(1);
+    admission.request_cursor_recovery(2);
+
+    assert_eq!(admission.cursor_recovery(), &BTreeSet::from([1, 2]));
+}
+
+#[test]
+fn c0_adm_maint_a_generation_after_a_drop_drops_on_its_first_rejection() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+    let first_ticket = ticket_from_completed_generation(&mut admission, key, 5);
+
+    assert_eq!(
+        admission.reenter(key, 5, first_ticket, ReentryKind::Rejected),
+        Reentry::Reentered
+    );
+    assert_eq!(
+        admission.reenter(key, 5, first_ticket, ReentryKind::Rejected),
+        Reentry::Dropped
+    );
+
+    admission.set_maintenance(key, 6, false).unwrap();
+    let second_ticket = admission.maintenance(key).unwrap().ticket;
+    assert!(first_ticket < second_ticket);
+    assert_eq!(
+        admission.reenter(key, 6, second_ticket, ReentryKind::Rejected),
+        Reentry::Dropped
+    );
+    assert!(admission.maintenance(key).is_none());
 }
 
 #[test]
