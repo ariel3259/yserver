@@ -4,6 +4,17 @@
 
 **Coverage: COMPLETE FOR DECLARED SCOPE**
 
+**Target:** plan B1 revision 1 (`56641180`).
+**Reviewer:** `codex exec --sandbox read-only`, single pass
+**Instrument:** `docs/superpowers/review/` @ `69c6d6e2`;
+model `gpt-5.6-sol`; reasoning effort `xhigh`; `codex-cli 0.154.0`.
+**Recorded usage:** 68,723 tokens (exit 0). 12/12 excerpts.
+
+**Author verification (2026-09-18):** all five CONFIRMED.
+- B-1: A2's `admission_wake` routes solely on `decision.admitted` (`kms/render/admission.rs` ~471).
+- B-2: the reviewer's sequence is legal under revision 1's rules and trips a frozen allowance.
+- M-1, M-2, m-1: the named gaps are real; each got a scenario and a mutation (P19–P25) or a single gate.
+
 ## Incorporation audit
 
 | Prior finding | Status |

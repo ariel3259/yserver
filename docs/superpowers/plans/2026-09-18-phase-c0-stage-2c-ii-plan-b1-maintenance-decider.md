@@ -2,7 +2,14 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time. Tick steps (`- [ ]` → `- [x]`) only with the evidence each one names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. Stop with the tree dirty after each task; the coordinating session verifies and commits.
 
-**Revision 1 (2026-09-18).**
+**Revision 2 (2026-09-18)** — incorporates codex round 1 (`../findings/2026-09-18-stage-2c-ii-plan-b1-review-round1.md`: 2 blocking, 2 major, 1 minor, all verified and accepted).
+- **B-1:** A2 aborts every decision that carries maintenance, a tier-6 primary included.
+- **B-2:** the bound's allowance grows when an older-ticket identity ages later, instead of freezing when the identity first ages.
+- **M-1:** negative scenarios for tier 3 on an ordinary wake, an incompatible symmetric primary, the extra compatible maintenance, and compatible-but-waiting maintenance.
+- **M-2:** the counters are proven through `confirm`, and the rejection count survives a drop.
+- **m-1:** there is one authoritative gate.
+
+Mutations P19–P25 were added.
 
 **Goal:** Extend A1's pure decider with maintenance: cursor and gamma intents with device-monotonic tickets, ageing, the per-identity rejection count, tiers 3, 4, 5 and 7, the software-cursor recovery barrier, absorption, the homogeneous bundle, and the starvation bound as a checked invariant.
 
@@ -18,7 +25,7 @@
 2. **An admission carries a primary and maintenance together.** `AdmissionDecision` keeps `tier` and `admitted` (the tier's winner, as today) and gains three fields: the maintenance generations the commit carries, a primary combined into a maintenance admission (symmetric absorption), and the identities that age if the decision is confirmed. `Admitted` gains variants for a maintenance admission, a bundle and a cursor recovery.
 3. **Compatibility and group membership are snapshot inputs.** Whether a maintenance generation can ride in a given primary, and which CRTCs form the qualified `HomogeneousCompletionGroup`, are reported by the snapshot. The decider does not compute them (spec §4). Stages 3 and 4 supply the real values.
 4. **A software-cursor recovery barrier** joins tier 2. B1 stores and admits it; B2 cannot dispatch it (the software cursor is stage 4's) and aborts it as `Unsupported`, as A2 does for the unflip.
-5. **The bound is checked.** The decider counts, per aged identity, the older-ticket maintenance admissions it waited through. Barrier admissions are counted apart and do not count. `bound_violation()` reports an identity past `2 × (older aged identities when it aged)`. B2 closes the transport on a violation.
+5. **The bound is checked.** The decider counts, per aged identity `X`, the older-ticket maintenance admissions `X` waited through. Barrier admissions are counted apart and do not count. `X`'s **allowance** is `2 ×` the number of **distinct identities with a ticket older than `X`'s that have been aged at any moment since `X` aged**. It is not frozen when `X` first ages (round-1 B-2): an older identity that ages later still adds its two admissions. The allowance only grows, and it is discarded when `X` is carried or dropped. `bound_violation()` reports an `X` whose count exceeds its allowance. B2 closes the transport on a violation.
 
 ## Semantics this plan pins down (read before Task 1)
 
@@ -47,7 +54,7 @@ These follow from C.0 §9.2.1 and spec revision 4; where C.0 left a choice, the 
 
 - The decider stays pure: `decide` takes `&self`; nothing in B1 owns a payload or performs I/O.
 - **No semantic change to A1 or A2 behaviour except tier 3**, which by C.0 moves a qualifying retirement-wake direct admission from `Tier::Primary` to the new tier 3. Every A1/A2 test assertion that changes because of that must be listed in your report with the reason. Everything else — adding the new decision fields to existing literals, new match arms — is mechanical and changes no expectation.
-- A2's conductor must keep compiling and passing. For every new `Admitted` variant and for tier-3/4/5/7 decisions carrying maintenance, the conductor **aborts the token and returns `Unsupported(tier)`**, with no dispatch and no state change. Implementing those admissions is B2's job.
+- A2's conductor must keep compiling and passing, and must never dispatch a decision it cannot carry in full. **Before** matching on `decision.admitted`, it aborts the token and returns `Unsupported(tier)`, with no dispatch and no state change, for any decision that has a non-empty `carried`, has a `combined_primary`, is one of the new `Admitted` variants, or has tier 3, 4, 5 or 7. This includes a tier-6 composed or direct decision that carries maintenance (round-1 B-1): dispatching its primary alone would confirm the whole decision, spend the maintenance tickets and lose the payload, which has no home until B2. Implementing those admissions is B2's job.
 - No side effect inside `debug_assert!` (the gate runs `c0_adm` in release).
 - Test names start with `c0_adm_` (for the decider: `c0_adm_maint_`).
 - `cargo test -p yserver --lib` needs `target/debug/yserver` built, and the release run needs a fresh `target/release/yserver`. In your sandbox the full `--lib` suite's helper, device-lock and socket tests may fail or hang. Report what you observe and do not retry in a loop; the coordinator runs it outside the sandbox.
@@ -61,13 +68,14 @@ These follow from C.0 §9.2.1 and spec revision 4; where C.0 left a choice, the 
 | Unchanged cursor omitted | `c0_adm_maint_unchanged_generation_is_never_carried` | P3: queue a generation equal to current |
 | Ageing: on arrival behind a commit, on losing an admission, on a barrier | `c0_adm_maint_ages_on_arrival_behind_a_commit`, `c0_adm_maint_ages_after_losing_an_admission`, `c0_adm_maint_barrier_ages_overtaken_maintenance_without_resetting_tickets` | P4: skip ageing on loss; P5: reset relative age at a barrier |
 | Tiers 1–7 in order, with the maintenance tiers | `c0_adm_maint_seven_tiers_in_order` | P6: swap tiers 4 and 5 |
-| Tier 3 only on a retirement wake and only if it absorbs every aged identity | `c0_adm_maint_tier3_absorbs_every_aged_identity`, `c0_adm_maint_tier3_yields_to_unabsorbable_aged_maintenance` | P7: tier 3 ignores aged identities it cannot absorb |
-| Symmetric absorption in tiers 4 and 7, never across a barrier or against the round-robin | `c0_adm_maint_symmetric_absorption_combines_the_oldest_compatible_primary`, `c0_adm_maint_symmetric_absorption_respects_barriers_and_round_robin` | P8: combine an incompatible primary; P9: combine across a barrier |
-| Absorption into primaries carries only ready, compatible generations and consumes their tickets | `c0_adm_maint_primary_absorbs_compatible_maintenance`, `c0_adm_maint_incompatible_maintenance_is_not_absorbed` | P10: absorb an incompatible generation |
+| Tier 3 only on a retirement wake and only if it absorbs every aged identity | `c0_adm_maint_tier3_absorbs_every_aged_identity`, `c0_adm_maint_tier3_yields_to_unabsorbable_aged_maintenance`, `c0_adm_maint_tier3_never_applies_on_an_ordinary_wake` | P7: tier 3 ignores aged identities it cannot absorb; P19: tier 3 also on ordinary wakes |
+| A2 never dispatches a decision carrying maintenance (round-1 B-1) | `c0_adm_conductor_maintenance_carrying_tier6_is_unsupported` | P20: A2 dispatches a tier-6 decision whose `carried` is non-empty |
+| Symmetric absorption in tiers 4 and 7, never across a barrier or against the round-robin | `c0_adm_maint_symmetric_absorption_combines_the_oldest_compatible_primary`, `c0_adm_maint_symmetric_absorption_respects_barriers_and_round_robin`, `c0_adm_maint_symmetric_absorption_skips_an_incompatible_primary` | P8: combine an incompatible primary; P9: combine across a barrier; P21: carry only the winner, not the other ready compatible maintenance on that CRTC |
+| Absorption into primaries carries only ready, compatible generations and consumes their tickets | `c0_adm_maint_primary_absorbs_compatible_maintenance`, `c0_adm_maint_incompatible_maintenance_is_not_absorbed`, `c0_adm_maint_waiting_maintenance_is_not_absorbed` | P10: absorb an incompatible generation; P22: absorb a compatible but `Waiting` generation |
 | Tier 5: every ready group CRTC, the round-robin, no timer | `c0_adm_maint_bundle_takes_every_ready_group_crtc`, `c0_adm_maint_bundle_obeys_the_round_robin`, `c0_adm_maint_one_ready_group_crtc_is_tier6` | P11: drop one ready member; P12: skip the round-robin in tier 5 |
-| Rejection re-entry per identity: original ticket, aged; second consecutive rejection drops; collision inherits the count; unknown not counted; completed resets | `c0_adm_maint_rejected_generation_reenters_aged_with_its_ticket`, `c0_adm_maint_second_consecutive_rejection_drops`, `c0_adm_maint_collision_keeps_older_ticket_and_inherits_the_count`, `c0_adm_maint_unknown_is_not_a_rejection`, `c0_adm_maint_completed_resets_the_count` | P13: count per generation (reset on collision); P14: count an unknown |
+| Rejection re-entry per identity: original ticket, aged; second consecutive rejection drops; collision inherits the count; unknown not counted; completed resets; the count survives a drop | `c0_adm_maint_rejected_generation_reenters_aged_with_its_ticket`, `c0_adm_maint_second_consecutive_rejection_drops`, `c0_adm_maint_collision_keeps_older_ticket_and_inherits_the_count`, `c0_adm_maint_unknown_is_not_a_rejection`, `c0_adm_maint_completed_resets_the_count`, `c0_adm_maint_a_generation_after_a_drop_drops_on_its_first_rejection` | P13: count per generation (reset on collision); P14: count an unknown; P23: reset the count on drop |
 | Cursor recovery barrier in tier 2, not superseded | `c0_adm_maint_cursor_recovery_is_a_tier2_barrier` | P15: let a primary on that CRTC overtake it |
-| The bound: `1 + 2(N − 1)`, checked, barriers apart; continuous collision | `c0_adm_maint_two_identities_progress_under_continuous_collision`, `c0_adm_maint_bound_violation_is_reported`, `c0_adm_maint_barriers_do_not_count_against_the_bound` | P16: count barrier admissions toward the bound; P17: never report a violation |
+| The bound: `1 + 2(N − 1)`, checked, barriers apart; continuous collision; the allowance grows with late-aged older identities; counting happens in `confirm` | `c0_adm_maint_two_identities_progress_under_continuous_collision`, `c0_adm_maint_bound_violation_is_reported`, `c0_adm_maint_barriers_do_not_count_against_the_bound`, `c0_adm_maint_allowance_grows_when_an_older_identity_ages_later`, `c0_adm_maint_confirm_counts_and_carry_clears_the_counter` | P16: count barrier admissions toward the bound; P17: never report a violation; P24: freeze the allowance at ageing; P25: skip the increment in `confirm` |
 | Fairness under a continuous direct-successor stream, with maintenance | `c0_adm_maint_direct_stream_cannot_starve_maintenance` | P18: tier 3 ignores aged identities (same as P7, on the stream) |
 
 ---
@@ -132,6 +140,7 @@ A stale `generation` offered to `set_maintenance` (not newer than the queued one
 - `c0_adm_maint_unknown_is_not_a_rejection` — `Unknown` re-entries do not move the count, however many there are.
 - `c0_adm_maint_completed_resets_the_count` — rejected once, `note_completed`, rejected again: `Reentered`, not `Dropped`.
 - `c0_adm_maint_cursor_recovery_is_stored_per_crtc` — two requests for the same CRTC keep one entry.
+- `c0_adm_maint_a_generation_after_a_drop_drops_on_its_first_rejection` — two rejections drop the identity; a new generation is offered (new ticket, at the back); its first rejection returns `Dropped`.
 
 - [ ] Step 1: tests. Step 2: record the red state. Step 3: implement. Step 4: gate. Step 5: stop dirty and report.
 
@@ -178,7 +187,7 @@ pub struct AdmissionDecision {
 4. `lock` keeps comparing the whole decision, the new fields included.
 5. A2's conductor aborts the new kinds as `Unsupported` (Global Constraints); its existing tests keep passing unchanged.
 
-**Named tests:** `c0_adm_maint_update_while_submitted_gets_a_new_ticket` (if not in Task 1), `c0_adm_maint_ages_after_losing_an_admission`, `c0_adm_maint_barrier_ages_overtaken_maintenance_without_resetting_tickets`, `c0_adm_maint_symmetric_absorption_combines_the_oldest_compatible_primary` (a cursor wins tier 7 and two composed generations on its CRTC are ready and compatible, queued at different times: the older one is combined, and the carried set holds the cursor), `c0_adm_maint_symmetric_absorption_respects_barriers_and_round_robin` (a compatible primary on a CRTC with a pending unflip is not combined; nor is one whose CRTC was just served while another is owed), `c0_adm_maint_cursor_recovery_is_a_tier2_barrier` (a ready cursor recovery wins over an older ready composed on another CRTC; a composed on its own CRTC does not compete), and a tier-4-over-tier-7 test of your naming.
+**Named tests:** `c0_adm_maint_update_while_submitted_gets_a_new_ticket` (if not in Task 1), `c0_adm_maint_ages_after_losing_an_admission`, `c0_adm_maint_barrier_ages_overtaken_maintenance_without_resetting_tickets`, `c0_adm_maint_symmetric_absorption_combines_the_oldest_compatible_primary` (a cursor wins tier 7 and two composed generations on its CRTC are ready and compatible, queued at different times: the older one is combined, and the carried set holds the cursor), `c0_adm_maint_symmetric_absorption_respects_barriers_and_round_robin` (a compatible primary on a CRTC with a pending unflip is not combined; nor is one whose CRTC was just served while another is owed), `c0_adm_maint_cursor_recovery_is_a_tier2_barrier` (a ready cursor recovery wins over an older ready composed on another CRTC; a composed on its own CRTC does not compete), and a tier-4-over-tier-7 test of your naming. Also: `c0_adm_maint_symmetric_absorption_skips_an_incompatible_primary` — the older composed on the winner's CRTC is incompatible and a younger one is compatible, so the younger is combined; with none compatible, none is. The combines test gets a second case, where another ready, compatible maintenance identity on that CRTC rides along in `carried`. And `c0_adm_conductor_maintenance_carrying_tier6_is_unsupported` — in A2, a tier-6 composed decision that carries a gamma: the conductor returns `Unsupported`, the source's `describe` and `composed_resources` were never called, the owner's slot is free, and the decider is unlocked with the gamma still queued.
 
 - [ ] Steps as above.
 
@@ -190,7 +199,7 @@ pub struct AdmissionDecision {
 
 **Invariants:** the semantics section's tier-3, absorption-into-primaries and tier-5 bullets. Tier 5 sits between tier 4 and tier 6; with fewer than two ready group CRTCs it does not apply and nothing waits.
 
-**Named tests:** `c0_adm_maint_tier3_absorbs_every_aged_identity` (retirement wake, a ready successor over {1, 2}, aged cursors on 1 and 2 both compatible: tier 3, both carried, both tickets spent), `c0_adm_maint_tier3_yields_to_unabsorbable_aged_maintenance` (the same with the cursor on 2 incompatible: tier 4 wins), `c0_adm_maint_primary_absorbs_compatible_maintenance` (a tier-6 composed carries a ready, compatible gamma on its CRTC and spends its ticket), `c0_adm_maint_incompatible_maintenance_is_not_absorbed`, `c0_adm_maint_bundle_takes_every_ready_group_crtc` (group {1, 2, 3}, all three ready: one bundle with three members), `c0_adm_maint_bundle_obeys_the_round_robin` (CRTC 1 just served, 1 and 2 ready in the group: tier 6 serves 2 first), `c0_adm_maint_one_ready_group_crtc_is_tier6`, and `c0_adm_maint_seven_tiers_in_order` (one fixture per adjacent pair of tiers, each showing the higher one wins).
+**Named tests:** `c0_adm_maint_tier3_absorbs_every_aged_identity` (retirement wake, a ready successor over {1, 2}, aged cursors on 1 and 2 both compatible: tier 3, both carried, both tickets spent), `c0_adm_maint_tier3_yields_to_unabsorbable_aged_maintenance` (the same with the cursor on 2 incompatible: tier 4 wins), `c0_adm_maint_primary_absorbs_compatible_maintenance` (a tier-6 composed carries a ready, compatible gamma on its CRTC and spends its ticket), `c0_adm_maint_incompatible_maintenance_is_not_absorbed`, `c0_adm_maint_bundle_takes_every_ready_group_crtc` (group {1, 2, 3}, all three ready: one bundle with three members), `c0_adm_maint_bundle_obeys_the_round_robin` (CRTC 1 just served, 1 and 2 ready in the group: tier 6 serves 2 first), `c0_adm_maint_one_ready_group_crtc_is_tier6`, and `c0_adm_maint_seven_tiers_in_order` (one fixture per adjacent pair of tiers, each showing the higher one wins). Also: `c0_adm_maint_waiting_maintenance_is_not_absorbed` — compatible but reported `Waiting`: not carried, ticket unspent. And `c0_adm_maint_tier3_never_applies_on_an_ordinary_wake` — the tier-3 fixture without `retirement_wake`: the decision is tier 6 by age, or tier 4, never tier 3.
 
 - [ ] Steps as above.
 
@@ -212,17 +221,23 @@ impl Admission {
 
 **Invariants:** the design decision 5 definition. A confirmed admission that carries a ticket older than an aged identity's counts one toward that identity. Barrier admissions do not count. An identity's count is removed when it is carried or dropped.
 
-**Named tests:** `c0_adm_maint_two_identities_progress_under_continuous_collision` (spec §11.1: cursor A and gamma B, both aged and both absorbable only alone. A is rejected on every admission, and before each re-entry a newer A generation arrives. B is admitted within `1 + 2(N − 1)` admissions, A is dropped at its second consecutive rejection, and `bound_violation()` stays `None` throughout), `c0_adm_maint_bound_violation_is_reported` (drive the counter past the bound through a test-only hook, or by a sequence the invariants allow if one exists — name which), `c0_adm_maint_barriers_do_not_count_against_the_bound`, `c0_adm_maint_direct_stream_cannot_starve_maintenance` (a direct successor re-queued on every retirement wake and an aged cursor on another CRTC that the successor cannot absorb: the cursor is admitted within the bound).
+**Evidence through `confirm`** (round-1 M-2): the counters must be driven by real `lock` / `confirm` sequences. A test-only hook may be used only where no legal sequence reaches the state, and the report must say where.
 
-- [ ] Steps as above, then the **full gate including the release run, clippy with `--features tcp-transport` and `--features xdmcp`, and `cargo check --workspace` for the three targets**.
+**Named tests:** `c0_adm_maint_allowance_grows_when_an_older_identity_ages_later` (round-1 B-2's sequence: A has the older ticket but is `Waiting` and not aged; B ages behind a commit; A becomes ready and a barrier ages it; A is admitted before B: no violation), `c0_adm_maint_confirm_counts_and_carry_clears_the_counter` (through real confirms: an older-ticket admission increments the younger aged identity's count; carrying that identity clears it), `c0_adm_maint_two_identities_progress_under_continuous_collision` (spec §11.1: cursor A and gamma B, both aged and both absorbable only alone. A is rejected on every admission, and before each re-entry a newer A generation arrives. B is admitted within `1 + 2(N − 1)` admissions, A is dropped at its second consecutive rejection, and `bound_violation()` stays `None` throughout), `c0_adm_maint_bound_violation_is_reported` (drive the counter past the bound through a test-only hook, or by a sequence the invariants allow if one exists — name which), `c0_adm_maint_barriers_do_not_count_against_the_bound`, `c0_adm_maint_direct_stream_cannot_starve_maintenance` (a direct successor re-queued on every retirement wake and an aged cursor on another CRTC that the successor cannot absorb: the cursor is admitted within the bound).
+
+- [ ] Steps as above, then the gate below.
 
 ---
 
-## Gate (every task)
+## Gate — the one authoritative list (round-1 m-1)
+
+Every task:
 
 ```bash
 cargo +nightly fmt
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features tcp-transport -- -D warnings
+cargo clippy --all-targets --features xdmcp -- -D warnings
 for i in 1 2 3; do cargo test -p yserver --lib c0_adm; done
 cargo build --release -p yserver --bin yserver
 cargo test --release -p yserver --lib c0_adm
@@ -230,9 +245,11 @@ cargo test -p yserver --lib c0_2ci
 cargo test -p yserver --lib
 ```
 
+Task 4 also runs `cargo check --workspace --target <t>` for `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl` and `x86_64-unknown-freebsd`. The hardware gate (spec §10.4) is the coordinator's, after Task 4, and only with the user's go-ahead for GPU use.
+
 ## What the coordinator does after each task
 
 1. Reads the diff against the task's interfaces, invariants and the semantics section, and checks every named test sets up its stated scenario and every tier-3 assertion change is justified.
 2. Reruns the gate outside the sandbox.
-3. After Task 4: applies P1–P18 to your code and records which tests fail; a survivor goes back as a finding.
+3. After Task 4: applies P1–P25 to your code and records which tests fail; a survivor goes back as a finding.
 4. Commits each task with `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)` and `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
