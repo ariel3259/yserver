@@ -7284,8 +7284,9 @@ fn visit_window_subtree(
         // `src` denominators: under `Off` the host window size, which is
         // what the pre-step-1 emitter divided by; under `On` the SAMPLED
         // source's extent. They differ only for a redirected window whose
-        // backing is larger than its host geometry (a shrink keeps the old
-        // backing: `redirected_backing_can_fit` accepts `extent >= size`),
+        // backing is larger than its host geometry (the bordered extent
+        // carries the ring; #143 made `redirected_backing_can_fit` exact,
+        // so a resize no longer leaves an oversized backing behind),
         // where the window's content sits at the backing's origin
         // (`resolve_paint_target` routes with offset (0,0)) and dividing by
         // the host size stretches it — the pre-step-1 behaviour, kept under
