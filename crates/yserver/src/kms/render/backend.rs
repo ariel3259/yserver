@@ -895,6 +895,67 @@ pub(crate) enum ConnectorConfig {
     },
 }
 
+/// Everything a relight needs to put a remembered route back exactly where it
+/// was, read out of a [`ConnectorConfig::Enabled`].
+///
+/// P3b adds the assigned CRTC XID to `ConnectorConfig::Enabled` and to this
+/// struct; every relight reader goes through
+/// [`ConnectorConfig::restorable_route`], so that addition stays local
+/// instead of touching each consumer (design, "P3 extends `last_enabled`").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RememberedRoute {
+    pub mode: yserver_core::backend::ModeSpec,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl ConnectorConfig {
+    /// The route policy this config remembers, or `None` when it is `Off`.
+    pub(crate) fn restorable_route(self) -> Option<RememberedRoute> {
+        match self {
+            Self::Off => None,
+            Self::Enabled {
+                mode_w,
+                mode_h,
+                vrefresh,
+                x,
+                y,
+            } => Some(RememberedRoute {
+                mode: yserver_core::backend::ModeSpec {
+                    width: mode_w,
+                    height: mode_h,
+                    vrefresh,
+                },
+                x,
+                y,
+            }),
+        }
+    }
+
+    /// The layout rectangle this config occupies, or `None` when it is `Off`.
+    pub(crate) fn placed_rect(self) -> Option<crate::kms::render::platform::LayoutRect> {
+        match self {
+            Self::Off => None,
+            Self::Enabled {
+                mode_w,
+                mode_h,
+                x,
+                y,
+                ..
+            } => Some((x, y, mode_w, mode_h)),
+        }
+    }
+}
+
+/// One route [`KmsBackend::take_relight_requests`] decided to restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelightRequest {
+    key: OutputKey,
+    mode: yserver_core::backend::ModeSpec,
+    x: i32,
+    y: i32,
+}
+
 /// Owned request handed to the asynchronous PRIME route qualifier.
 ///
 /// The duplicate KMS fd keeps the exact DRM open-file description alive until
@@ -968,12 +1029,30 @@ pub(crate) struct ConnectorEntry {
     pub ids: ConnectorIds,
     pub connected: bool,
     pub config: ConnectorConfig,
+    /// Whether `GetOutputInfo.crtc` retains this connector's former CRTC.
+    /// Physical loss retains the association; an explicit client disable
+    /// clears it. It cannot be inferred from `connected` or `config`: both
+    /// physical loss and a deliberate disable leave the route Off.
+    pub crtc_associated: bool,
     /// `true` once a client SetCrtcConfig/SetScreenSize touched this
     /// output. The auto-layout (recompact / boot extend-right) only
     /// ever touches `!client_configured` outputs. A lightweight connection
     /// query retains it because that query does not detach the CRTC; the
     /// later heavy physical-topology apply clears it when the route goes.
     pub client_configured: bool,
+    /// Route policy of a connector retired by a **physical** disconnect,
+    /// kept so the reconnect edge relights it with no client request
+    /// (design P1b, invariant 1). `None` whenever nothing is remembered: a
+    /// client's explicit `SetCrtcConfig`, an incompatible-mode reconnect and
+    /// a successful relight all clear it.
+    ///
+    /// This is also the reservation record. While it is `Some` and the route
+    /// is not live, the remembered rectangle is excluded from auto-layout
+    /// packing and unioned into the virtual-screen extent, so a survivor
+    /// never moves into the hole a restorable route left (invariant 7).
+    /// Releasing a reservation is exactly clearing this field — there is no
+    /// second record to drop.
+    pub last_enabled: Option<ConnectorConfig>,
     /// Last-known advertised mode list, preferred-first. Retained across
     /// disconnect so a momentarily-gone monitor keeps reporting stable mode
     /// resources until reconnect refreshes them.
@@ -1079,7 +1158,9 @@ impl RandrIdAllocator {
                 ids,
                 connected: false,
                 config: ConnectorConfig::Off,
+                crtc_associated: false,
                 client_configured: false,
+                last_enabled: None,
                 modes: Vec::new(),
                 edid: Vec::new(),
                 mm_width: 0,
@@ -8647,7 +8728,7 @@ impl KmsBackend {
             }
         }
         // Entries seen only by cached inventory remain default-disconnected.
-        let _ = self.reconcile_connector_registry(snapshots, &[]);
+        let _ = self.reconcile_connector_registry(snapshots, &[], &[]);
 
         let live_configs: Vec<_> = self
             .platform
@@ -8670,6 +8751,7 @@ impl KmsBackend {
             let entry = self.randr_id_alloc.entry_mut(&key);
             if entry.connected && !entry.modes.is_empty() {
                 entry.config = config;
+                entry.crtc_associated = true;
             }
         }
     }
@@ -8680,14 +8762,24 @@ impl KmsBackend {
     /// RANDR config-timestamp bumps. Retiring an already-light-disconnected
     /// CRTC still clears its internal config below, but is deliberately not a
     /// second advertised-config delta.
+    ///
+    /// `dropped_layouts` carries the live rectangle of every route the
+    /// connector snapshot removed. The registry's own `config` can be stale
+    /// after an auto-layout repack (nothing writes `(x, y)` back to it), so
+    /// the remembered route is taken from the layout that actually departed.
     fn reconcile_connector_registry(
         &mut self,
         connected: &[ConnectorSnapshot],
         dropped: &[OutputKey],
+        dropped_layouts: &[crate::kms::render::platform::DroppedRoute],
     ) -> ConnectorRegistryDelta {
         let mut delta = ConnectorRegistryDelta::default();
         let connected_keys: HashSet<_> = connected.iter().map(|snapshot| &snapshot.key).collect();
         for key in dropped {
+            let departed = dropped_layouts
+                .iter()
+                .find(|route| &route.key == key)
+                .cloned();
             let entry = self.randr_id_alloc.entry_mut(key);
             if connected_keys.contains(key) {
                 // Physically connected but no longer usable by the live CRTC
@@ -8695,9 +8787,28 @@ impl KmsBackend {
                 // snapshot below owns advertised state; this arm retires only
                 // the route policy, so do not fabricate a disconnect/reconnect
                 // pair or a second config timestamp.
+                entry.crtc_associated |= matches!(entry.config, ConnectorConfig::Enabled { .. });
                 entry.config = ConnectorConfig::Off;
                 entry.client_configured = false;
+                // Not a physical departure — the connector is still here, it
+                // just lost its route. There is nothing to relight on a
+                // reconnect edge that will not come, and nothing to reserve.
+                entry.last_enabled = None;
                 continue;
+            }
+            // The connector physically departed. Remember the route it was
+            // scanning out so the reconnect relights it without a client
+            // request, and so its slot stays reserved meanwhile.
+            if matches!(entry.config, ConnectorConfig::Enabled { .. })
+                && let Some(route) = departed
+            {
+                entry.last_enabled = Some(ConnectorConfig::Enabled {
+                    mode_w: route.width,
+                    mode_h: route.height,
+                    vrefresh: route.vrefresh,
+                    x: route.x,
+                    y: route.y,
+                });
             }
             let config_changed = entry.connected;
             let output_changed = config_changed
@@ -8708,6 +8819,7 @@ impl KmsBackend {
                 delta.changed_keys.push(key.clone());
             }
             delta.config_changed |= config_changed;
+            entry.crtc_associated |= matches!(entry.config, ConnectorConfig::Enabled { .. });
             entry.connected = false;
             entry.config = ConnectorConfig::Off;
             entry.client_configured = false;
@@ -9163,7 +9275,13 @@ impl KmsBackend {
                         x: layout.x,
                         y: layout.y,
                     };
+                    entry.crtc_associated = true;
                 }
+                // A live KMS route is necessarily attached. This also seeds
+                // fixtures whose registry entry predates the active-output
+                // projection, before a later physical disconnect preserves
+                // the association while retiring the route.
+                entry.crtc_associated = true;
                 (
                     entry.connected,
                     entry.modes.clone(),
@@ -9341,6 +9459,10 @@ impl KmsBackend {
     /// forward across every rebuild — a re-probe or CRTC set never
     /// collapses a client-resized screen back to the bounding box
     /// (Xorg keeps `pScreen->width/height` until the client resizes).
+    /// The extent the projection *derives* underneath that carry-forward
+    /// covers the live outputs unioned with the slots still reserved by
+    /// departed-but-restorable routes, so it never describes a screen that
+    /// shrank around a monitor we are about to re-light.
     fn rebuild_randr_state(
         &mut self,
         state: &mut ServerState,
@@ -9360,10 +9482,18 @@ impl KmsBackend {
         );
         let (outputs, mode_table) = self.randr_outputs_and_modes();
         let providers = self.randr_providers();
+        let reserved = self.reserved_layout_slots();
         let new_ts = set_time.unwrap_or(prev_ts);
         let ts_now = state.timestamp_now();
-        state.randr =
-            yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
+        state.randr = yserver_core::randr::RandrState::from_outputs_with_modes_and_reservations(
+            new_ts, outputs, mode_table, &reserved,
+        );
+        let associations = self
+            .randr_id_alloc
+            .entries()
+            .filter(|(_, entry)| entry.crtc_associated)
+            .map(|(_, entry)| (entry.ids.output_id, entry.ids.crtc_id));
+        state.randr.set_output_crtc_associations(associations);
         state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds
         // it to the bbox; that is only correct at boot, where prev_screen
@@ -12559,12 +12689,27 @@ impl KmsBackend {
 
         let configured = self.randr_id_alloc.client_configured_keys();
         let known_connected = self.randr_id_alloc.connected_keys();
-        let rescan =
-            self.platform
-                .apply_connector_snapshot(snapshot, &configured, &known_connected);
-        let registry_delta =
-            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
+        let rescan = self
+            .platform
+            .apply_connector_snapshot(snapshot, &known_connected);
+        let registry_delta = self.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
         let active_topology_changed = !rescan.dropped_old_indices.is_empty();
+        // Layout policy is the caller's (see the connector-snapshot doc
+        // comment). A VT resume does not relight remembered routes — the
+        // rescan that owns that runs once the VT is Active again — but it
+        // must still honour the reserved slots, or a survivor packs into a
+        // hole the later relight lands in (invariant 7).
+        if active_topology_changed {
+            let reserved = self.reserved_layout_slots();
+            self.platform
+                .recompact_horizontal_layout(&configured, &reserved);
+            self.platform
+                .recompute_fb_extent_with_reservations(&reserved);
+        }
         if (!registry_delta.is_empty() || active_topology_changed)
             && !self.fire_randr_changes(
                 state,
@@ -12723,6 +12868,39 @@ impl KmsBackend {
             return false;
         }
 
+        // A relit or newly enabled output can extend the virtual screen past
+        // the root backing storage the last logical resize allocated: the
+        // enable path recomputes `fb_w`/`fb_h`, but nothing else resizes
+        // root/COW storage, so the newly covered columns have no root pixels
+        // behind them and the relit monitor shows no background at all
+        // (measured on a dual-head MATE session: a client `RRSetScreenSize`
+        // shrank root storage to the survivor on the unplug, the relight grew
+        // the extent back, and the reconnected monitor stayed blank).
+        //
+        // Route through the same helper `set_logical_screen_size` uses -- the
+        // direct-unflip preamble before the reallocation is load-bearing.
+        //
+        // Grow-to-cover only: an extent that SHRANK leaves storage that still
+        // covers every visible pixel, so reallocating it would wipe root
+        // content that is still on screen and buy nothing.
+        let (fb_w, fb_h) = (self.platform.fb_w, self.platform.fb_h);
+        let undersized = self.root_storage_extent().is_some_and(|extent| {
+            extent.width < u32::from(fb_w) || extent.height < u32::from(fb_h)
+        });
+        if undersized {
+            if let Err(error) = self.apply_virtual_screen_extent(fb_w, fb_h) {
+                // Not fatal: the old storage still covers the outputs it
+                // covered before, so keep publishing the topology rather
+                // than dropping the whole change.
+                log::error!(
+                    "kms: root storage could not be grown to {fb_w}×{fb_h} after a \
+                     topology change: {error}"
+                );
+            } else {
+                log::info!("kms: grew root storage to {fb_w}×{fb_h} for the new output topology");
+            }
+        }
+
         // Asynchronous physical discovery never represents a client Set, so
         // it preserves lastSetTime even when a live CRTC is retired. A fresh
         // connection or mode-list delta advances lastConfigTime; monitor
@@ -12813,6 +12991,429 @@ impl KmsBackend {
         true
     }
 
+    /// Re-point the virtual screen -- `platform.fb_w`/`fb_h` plus the root
+    /// (and, if materialised, the COW) backing storage -- at a `w`x`h`
+    /// extent, and tell the compositor what just changed under it.
+    ///
+    /// Shared by the two paths that change the virtual extent:
+    /// `set_logical_screen_size` (a client `RRSetScreenSize`) and
+    /// `fire_randr_changes` (a connector hotplug/relight that grew it).
+    /// The ordering inside is load-bearing and is the reason the hotplug
+    /// path routes through here instead of reallocating storage itself:
+    ///
+    /// 1. An active direct frame is snapshotted into its old COW and
+    ///    unflipped FIRST -- reallocating root/COW storage changes the
+    ///    fallback identity that frame holds.
+    /// 2. Only then are `fb_w`/`fb_h`, the input extent and the root/COW
+    ///    storage replaced.
+    /// 3. The per-BO scanout damage model is invalidated, because the
+    ///    storage under every scanout BO just changed while the BOs
+    ///    themselves stayed valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns the direct-scanout materialisation error when an active
+    /// direct frame cannot be snapshotted. In that case the old extent and
+    /// every storage owner/pin are left untouched.
+    fn apply_virtual_screen_extent(&mut self, w: u16, h: u16) -> io::Result<()> {
+        // Reallocating root/COW storage changes the fallback identity held by
+        // an active direct frame. Snapshot that frame into its old COW and
+        // request the synchronized replacement first. On failure, leave the
+        // old dimensions and every storage owner/pin untouched.
+        if self.scanout_m2.active() {
+            self.materialize_direct_shadow_for_unflip()?;
+            self.request_direct_unflip("virtual_screen_extent_before_storage_reallocation");
+        }
+
+        // ── 1. Update the platform's logical extent ───────────────────────
+        self.bump_crtc_config_topology_epoch("virtual screen extent changed");
+        self.platform.fb_w = w;
+        self.platform.fb_h = h;
+
+        // Propagate the new extent to the input thread's cursor accumulator so
+        // the pointer can reach the full virtual screen after a resize.
+        self.update_input_extent(w, h);
+
+        // ── 2. Resize root backing storage ────────────────────────────────
+        // The root drawable is always allocated (init_root_storage runs at
+        // boot). Resize it with the same detach→decref→allocate→fill
+        // pattern used by configure_subwindow.
+        let root_xid = self.core.window_id;
+        if let Some(old_id) = self.store.lookup(root_xid) {
+            self.store.detach_xid(root_xid);
+            self.store_decref_with_invalidate(old_id);
+            match self.platform.allocate_drawable_storage(w, h, 32) {
+                Ok(storage) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    match self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage) {
+                        Ok(new_id) => {
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(w),
+                                    height: u32::from(h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                &mut self.platform,
+                                Dst::server_internal(new_id),
+                                rect,
+                                decode_x11_pixel_for_storage(
+                                    self.core.bg_pixel.unwrap_or(0x0050_5050),
+                                    24,
+                                    PlatformBackend::format_for_depth(24),
+                                ),
+                            ) && self.platform.vk.is_some()
+                            {
+                                log::warn!(
+                                    "render apply_virtual_screen_extent: root fill failed: {e:?}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "render apply_virtual_screen_extent: root store.allocate failed: {e:?}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // No Vk (test fixture): allocate a null-view stub so the
+                    // xid remains live and tests can continue.
+                    log::debug!(
+                        "render apply_virtual_screen_extent: no Vk, stub root storage: {e:?}"
+                    );
+                    let storage = Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        PlatformBackend::format_for_depth(32),
+                    );
+                    if let Err(e) =
+                        self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage)
+                    {
+                        log::warn!(
+                            "render apply_virtual_screen_extent: root stub alloc failed: {e:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── 3. Resize COW backing storage (if materialised) ──────────────
+        // The COW is lazily allocated on the first CompositeGetOverlayWindow
+        // call. If it hasn't been created yet, fb_w/fb_h are already updated
+        // above so the first allocation will use the new dimensions.
+        if let Some(old_cow_id) = self.cow_id.take() {
+            let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+            self.store.detach_xid(cow_xid);
+            self.store_decref_with_invalidate(old_cow_id);
+            match self.platform.allocate_drawable_storage(w, h, 24) {
+                Ok(storage) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
+                        Ok(new_cow_id) => {
+                            // Fill so the compositor doesn't see
+                            // recycled GPU content on its next paint.
+                            // OPAQUE black, not transparent: the COW is
+                            // a depth-24 drawable, and on X11 depth-24
+                            // has no alpha channel — it is opaque by
+                            // definition. See `default_window_init_color`.
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(w),
+                                    height: u32::from(h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                &mut self.platform,
+                                Dst::server_internal(new_cow_id),
+                                rect,
+                                default_window_init_color(24),
+                            ) && self.platform.vk.is_some()
+                            {
+                                log::warn!(
+                                    "render apply_virtual_screen_extent: COW init fill failed: {e:?}"
+                                );
+                            }
+                            self.cow_id = Some(new_cow_id);
+                            // Update the windows geometry so scene assembly
+                            // uses the new dimensions.
+                            if let Some(geom) = self.windows.get_mut(&cow_xid) {
+                                geom.width = w;
+                                geom.height = h;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "render apply_virtual_screen_extent: COW store.allocate failed: {e:?}"
+                            );
+                            // cow_id stays None (taken above); the COW will be
+                            // re-materialised on the next CompositeGetOverlayWindow.
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::debug!(
+                        "render apply_virtual_screen_extent: no Vk, stub COW storage: {e:?}"
+                    );
+                    let storage = crate::kms::render::store::Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        PlatformBackend::format_for_depth(24),
+                    );
+                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
+                        Ok(new_cow_id) => {
+                            self.cow_id = Some(new_cow_id);
+                            if let Some(geom) = self.windows.get_mut(&cow_xid) {
+                                geom.width = w;
+                                geom.height = h;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "render apply_virtual_screen_extent: COW stub alloc failed: {e:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. Mark scene dirty — no drain/rebuild needed ─────────────────
+        // A logical resize (RRSetScreenSize) does NOT change per-output
+        // scanout pool geometry or output positions; only the root/COW
+        // *source* dimensions change.  The scene resolves root and COW
+        // storage by xid on every frame (see `build_scene` → `store.lookup(
+        // core.window_id)`), so the reallocated storage above will be picked
+        // up automatically on the next compose tick.
+        //
+        // Crucially, we must NOT call `drain_all` + `rebuild_outputs` here.
+        // Those paths clear the scene's `pending_acks` queue (the per-output
+        // "flip in flight" gate) but do NOT drain the kernel's DRM event
+        // queue.  If output N has a pending atomic flip when we call
+        // drain_all, the scene thinks the CRTC is free and immediately
+        // attempts a new commit on the next tick — but the kernel still has
+        // the old flip pending, returning EBUSY.  This is what caused the
+        // observed "output 1 freezes black after RRSetScreenSize" on a live
+        // 2-monitor session.
+        //
+        // The existing per-output flip-pending gate (`pending_acks.is_empty()`
+        // in `tick_one_output`) already prevents EBUSY: if a flip is in
+        // flight the tick skips that output until the page-flip-complete event
+        // arrives.  So the correct fix is simply to defer to that gate.
+        //
+        // Old storage (root/COW) is released safely: `store_decref_with_
+        // invalidate` parks the DrawableId in `pending_retire` if the GPU
+        // fence has not yet signaled, deferring the VkImage destroy until the
+        // compose CB finishes — no `wait_idle_bounded` needed.
+        //
+        // root-overlay is root-absolute + layout-dependent; drop it on
+        // topology change. `rebuild_outputs` isn't called here (see above),
+        // so this logical-resize path needs its own explicit clear.
+        self.request_direct_unflip("virtual_screen_extent_complete");
+        self.scene.root_overlay_clear();
+        // Step 3 — the root/COW storage under every scanout BO just changed
+        // size, while the BOs themselves stay valid. Nothing else tells the
+        // per-BO damage model that: the `RRSetScreenSize` caller deliberately
+        // skips `drain_all` + `rebuild_outputs` (see above), and
+        // `wake_for_damage` adds no region.
+        //
+        // For the hotplug caller this is belt-and-braces rather than load
+        // bearing: `fire_randr_changes` grows the extent only on a topology
+        // change, which has already run `scene.rebuild_outputs`, and that
+        // replaces EVERY output's `ScanoutDamage` with a fresh one whose every
+        // BO starts wholly missing (`ScanoutDamage::new`) — the relit output
+        // and the survivors alike. It is kept unconditional because it is the
+        // storage reallocation, not the scene rebuild, that makes the per-BO
+        // history meaningless, and the cost is at most one full repaint that
+        // was already going to happen.
+        self.scene.invalidate_all_scanout_damage();
+        self.scene.wake_for_damage();
+
+        Ok(())
+    }
+
+    /// Extent of the root drawable's backing storage, or `None` on a
+    /// fixture whose root xid is not in the store.
+    fn root_storage_extent(&self) -> Option<ash::vk::Extent2D> {
+        let id = self.store.lookup(self.core.window_id)?;
+        self.store.get(id).map(|drawable| drawable.storage.extent)
+    }
+
+    /// Rectangles held by routes that are physically gone but restorable.
+    ///
+    /// The reservation record *is* [`ConnectorEntry::last_enabled`], so a
+    /// slot is released exactly by clearing that field — there is no second
+    /// record that could go out of step with it. A remembered route that is
+    /// live again reserves nothing, which is why the live output list is
+    /// subtracted here rather than tracked separately.
+    fn reserved_layout_slots(&self) -> Vec<crate::kms::render::platform::LayoutRect> {
+        let live: HashSet<&OutputKey> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| &layout.key)
+            .collect();
+        let mut reserved: Vec<_> = self
+            .randr_id_alloc
+            .entries()
+            .filter(|(key, _)| !live.contains(key))
+            .filter_map(|(_, entry)| entry.last_enabled?.placed_rect())
+            .collect();
+        // `entries()` walks a HashMap; keep the result order stable so the
+        // packing decision does not depend on hash iteration order.
+        reserved.sort_unstable();
+        reserved
+    }
+
+    /// Decide which remembered routes this rescan restores, and release the
+    /// slots of the ones it can no longer restore.
+    ///
+    /// Registry-only — no DRM object is touched — so the whole P1 policy is
+    /// deterministic and unit testable. A returning connector whose refreshed
+    /// mode list still advertises the remembered mode is restored; one whose
+    /// refreshed list no longer does is left connected-but-Off with
+    /// `last_enabled` cleared, which both retires the route and releases its
+    /// reserved slot so the next compaction can reclaim it. A connector that
+    /// has not come back keeps its reservation untouched.
+    fn take_relight_requests(&mut self) -> Vec<RelightRequest> {
+        let mut restore: Vec<RelightRequest> = Vec::new();
+        let mut stale: Vec<OutputKey> = Vec::new();
+        for (key, entry) in self.randr_id_alloc.entries() {
+            let Some(route) = entry
+                .last_enabled
+                .and_then(ConnectorConfig::restorable_route)
+            else {
+                continue;
+            };
+            if !entry.connected {
+                // Still away. Keep the reservation; nothing to relight yet.
+                continue;
+            }
+            if !matches!(entry.config, ConnectorConfig::Off) {
+                continue;
+            }
+            if entry.modes.iter().any(|mode| {
+                mode.width == route.mode.width
+                    && mode.height == route.mode.height
+                    && mode.vrefresh == route.mode.vrefresh
+            }) {
+                restore.push(RelightRequest {
+                    key: key.clone(),
+                    mode: route.mode,
+                    x: route.x,
+                    y: route.y,
+                });
+            } else {
+                stale.push(key.clone());
+            }
+        }
+        for key in stale {
+            log::info!(
+                "kms: {} on {} returned without its previous mode; leaving it off and \
+                 releasing its reserved slot",
+                key.connector_name,
+                key.device_key,
+            );
+            self.randr_id_alloc.entry_mut(&key).last_enabled = None;
+        }
+        // `entries()` walks a HashMap; relight in a deterministic order.
+        restore.sort_by(|a, b| a.key.cmp(&b.key));
+        restore
+    }
+
+    /// Restore one remembered route through the ordinary enable path — the
+    /// same `enable_connector` a client `SetCrtcConfig` drives, so pool
+    /// allocation, the modeset and the `ActiveOutput` update are all handled.
+    ///
+    /// The caller must have quiesced the old topology first. Returns whether
+    /// the output is scanning out again.
+    fn relight_remembered_route(&mut self, request: &RelightRequest) -> bool {
+        let connector = request.key.connector_name.clone();
+        let Some(device) = self
+            .platform
+            .device_for_output(&request.key)
+            .map(|kms| Rc::clone(&kms.device))
+        else {
+            log::warn!(
+                "kms: relight of {connector} skipped: DRM device {} is gone",
+                request.key.device_key,
+            );
+            return false;
+        };
+        let reserved_routes: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| {
+                layout.key.device_key == request.key.device_key && layout.key != request.key
+            })
+            .map(|layout| {
+                (
+                    layout.output.encoder,
+                    layout.output.crtc,
+                    layout.output.plane,
+                )
+            })
+            .collect();
+        let output = match crate::platform::drm::discover_output_for_connector(
+            &device,
+            &connector,
+            &reserved_routes,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                log::error!("kms: relight of {connector}: target discovery failed: {error}");
+                return false;
+            }
+        };
+        if let Err(error) =
+            self.platform
+                .enable_connector(&request.key, output, request.mode, request.x, request.y)
+        {
+            log::error!("kms: relight of {connector}: enable_connector failed: {error}");
+            return false;
+        }
+        self.commit_relit_route(request);
+        log::info!(
+            "kms: relit {connector} {}x{}@{} at ({},{}) after reconnect",
+            request.mode.width,
+            request.mode.height,
+            request.mode.vrefresh,
+            request.x,
+            request.y,
+        );
+        true
+    }
+
+    /// Record a route the relight has just put back on the hardware.
+    ///
+    /// Releases the reservation (clearing `last_enabled` *is* the release) and
+    /// deliberately does **not** set `client_configured`: an auto-relight
+    /// restores a previous state, it does not record a new client intent, so
+    /// the auto-layout stays free to move this output later.
+    fn commit_relit_route(&mut self, request: &RelightRequest) {
+        let entry = self.randr_id_alloc.entry_mut(&request.key);
+        entry.config = ConnectorConfig::Enabled {
+            mode_w: request.mode.width,
+            mode_h: request.mode.height,
+            vrefresh: request.mode.vrefresh,
+            x: request.x,
+            y: request.y,
+        };
+        entry.connected = true;
+        entry.last_enabled = None;
+    }
+
     fn run_display_rescan(&mut self, state: &mut ServerState) {
         // Defer while VT-suspended: DRM master is dropped, so a rescan's
         // modeset ioctls would fail/wedge. (The old guard also required
@@ -12839,9 +13440,10 @@ impl KmsBackend {
         // Only an active removal can drop a pool or invalidate the scene's
         // output-index ledger. Metadata and inactive-connector changes leave
         // normal composition and direct scanout undisturbed.
+        let mut quiesced = false;
         if active_removed {
             match self.quiesce_before_topology_mutation("display hotplug rescan") {
-                Ok(()) => {}
+                Ok(()) => quiesced = true,
                 Err(error) => {
                     log::error!("kms: display rescan could not quiesce old topology: {error}");
                     return;
@@ -12849,14 +13451,70 @@ impl KmsBackend {
             }
         }
 
+        // The five steps below are ordered so that clients never observe the
+        // intermediate output-less state: the relight sits between registry
+        // reconciliation and publication, and layout policy runs only once
+        // the relight decision is known. See the design's
+        // "Ordering inside `run_display_rescan` is load-bearing".
+
+        // ── 1. Apply the physical snapshot (topology ownership only) ──────
         let configured = self.randr_id_alloc.client_configured_keys();
         let known_connected = self.randr_id_alloc.connected_keys();
-        let rescan =
+        let rescan = self
+            .platform
+            .apply_connector_snapshot(snapshot, &known_connected);
+
+        // ── 2. Reconcile the registry (connection bits, modes, EDID) ──────
+        let registry_delta = self.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+
+        // ── 3. Relight every route lost to a physical disconnect whose
+        //       connector has returned with a compatible mode. Not gated on
+        //       `client_configured`: a boot auto-layout session never sets it
+        //       and is exactly the reported configuration.
+        let relight_requests = self.take_relight_requests();
+        let mut relit = false;
+        if !relight_requests.is_empty() {
+            if !quiesced {
+                match self.quiesce_before_topology_mutation("display hotplug relight") {
+                    Ok(()) => quiesced = true,
+                    Err(error) => {
+                        log::error!(
+                            "kms: display rescan could not quiesce before relight: {error}"
+                        );
+                        return;
+                    }
+                }
+            }
+            for request in relight_requests {
+                relit |= self.relight_remembered_route(&request);
+            }
+        }
+
+        // ── 4. Layout policy: pack the auto-layout outputs around the slots
+        //       still reserved by departed-but-restorable routes, then take
+        //       the extent over the live layouts unioned with those slots.
+        let reserved = self.reserved_layout_slots();
+        if !rescan.dropped_old_indices.is_empty() {
             self.platform
-                .apply_connector_snapshot(snapshot, &configured, &known_connected);
-        let registry_delta =
-            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
-        let should_publish = !registry_delta.is_empty() || active_removed;
+                .recompact_horizontal_layout(&configured, &reserved);
+        }
+        if !rescan.dropped_old_indices.is_empty() || relit {
+            // `enable_connector` already recomputed the extent over the live
+            // layouts alone; redo it so surviving reservations are counted.
+            self.platform
+                .recompute_fb_extent_with_reservations(&reserved);
+        }
+
+        // ── 5. Publish ────────────────────────────────────────────────────
+        // `quiesced` subsumes `active_removed`. Publishing is also what
+        // re-lights the topology we tore down, so a quiesce whose relight then
+        // failed must still go through `fire_randr_changes` rather than
+        // returning with every CRTC dark.
+        let should_publish = !registry_delta.is_empty() || quiesced || relit;
         if !should_publish {
             log::debug!("kms: display rescan found no connector or active-topology change");
             return;
@@ -12866,8 +13524,8 @@ impl KmsBackend {
             rescan,
             &registry_delta.changed_keys,
             registry_delta.config_changed,
-            active_removed,
-            active_removed && state.dpms.power_level == 0,
+            active_removed || relit,
+            quiesced && state.dpms.power_level == 0,
         ) {
             return;
         }
@@ -21327,6 +21985,9 @@ impl Backend for KmsBackend {
             };
             entry.client_configured = true;
             entry.connected = true;
+            // The client has placed this output itself; the remembered route
+            // and its reserved slot are released.
+            entry.last_enabled = None;
         }
         log::info!(
             "finish_crtc_config: enabled {} {}x{}@{} at ({},{}) with qualified plan",
@@ -21476,6 +22137,11 @@ impl Backend for KmsBackend {
             // on a real change) — this is what breaks MATE's re-assert loop.
             let entry = self.randr_id_alloc.entry_mut(&output_key);
             entry.config = requested;
+            // A client asserting a config is an explicit statement of intent
+            // about this output, so it releases any remembered route (and
+            // with it the reserved slot). Never resurrect a route the client
+            // has spoken for.
+            entry.last_enabled = None;
             return Ok(false);
         }
 
@@ -21568,9 +22234,14 @@ impl Backend for KmsBackend {
                 {
                     let entry = self.randr_id_alloc.entry_mut(&output_key);
                     entry.config = ConnectorConfig::Off;
+                    entry.crtc_associated = false;
                     // client_configured is set to record that a client
                     // explicitly disabled this output (not an auto-layout op).
                     entry.client_configured = true;
+                    // An explicit disable must not be undone by a later
+                    // auto-relight (invariant 6): unplugging a deliberately
+                    // disabled monitor may not resurrect it.
+                    entry.last_enabled = None;
                 }
             }
             Some(mode_spec) => {
@@ -21636,8 +22307,12 @@ impl Backend for KmsBackend {
                         x,
                         y,
                     };
+                    entry.crtc_associated = true;
                     entry.client_configured = true;
                     entry.connected = true;
+                    // The client has placed this output itself; the
+                    // remembered route and its reserved slot are released.
+                    entry.last_enabled = None;
                 }
 
                 log::info!(
@@ -21706,213 +22381,7 @@ impl Backend for KmsBackend {
             return Ok(());
         }
 
-        // Reallocating root/COW storage changes the fallback identity held by
-        // an active direct frame. Snapshot that frame into its old COW and
-        // request the synchronized replacement first. On failure, leave the
-        // old dimensions and every storage owner/pin untouched.
-        if self.scanout_m2.active() {
-            self.materialize_direct_shadow_for_unflip()?;
-            self.request_direct_unflip("logical_screen_resize_before_storage_reallocation");
-        }
-
-        // ── 1. Update the platform's logical extent ───────────────────────
-        self.bump_crtc_config_topology_epoch("logical screen size changed");
-        self.platform.fb_w = w;
-        self.platform.fb_h = h;
-
-        // Propagate the new extent to the input thread's cursor accumulator so
-        // the pointer can reach the full virtual screen after a resize.
-        self.update_input_extent(w, h);
-
-        // ── 2. Resize root backing storage ────────────────────────────────
-        // The root drawable is always allocated (init_root_storage runs at
-        // boot). Resize it with the same detach→decref→allocate→fill
-        // pattern used by configure_subwindow.
-        let root_xid = self.core.window_id;
-        if let Some(old_id) = self.store.lookup(root_xid) {
-            self.store.detach_xid(root_xid);
-            self.store_decref_with_invalidate(old_id);
-            match self.platform.allocate_drawable_storage(w, h, 32) {
-                Ok(storage) => {
-                    self.telemetry.record_storage_allocation();
-                    self.telemetry.record_image_view_create();
-                    match self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage) {
-                        Ok(new_id) => {
-                            let rect = ash::vk::Rect2D {
-                                offset: ash::vk::Offset2D::default(),
-                                extent: ash::vk::Extent2D {
-                                    width: u32::from(w),
-                                    height: u32::from(h),
-                                },
-                            };
-                            if let Err(e) = self.engine.fill_rect(
-                                &mut self.store,
-                                &mut self.platform,
-                                Dst::server_internal(new_id),
-                                rect,
-                                decode_x11_pixel_for_storage(
-                                    self.core.bg_pixel.unwrap_or(0x0050_5050),
-                                    24,
-                                    PlatformBackend::format_for_depth(24),
-                                ),
-                            ) && self.platform.vk.is_some()
-                            {
-                                log::warn!(
-                                    "render set_logical_screen_size: root fill failed: {e:?}"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "render set_logical_screen_size: root store.allocate failed: {e:?}"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    // No Vk (test fixture): allocate a null-view stub so the
-                    // xid remains live and tests can continue.
-                    log::debug!("render set_logical_screen_size: no Vk, stub root storage: {e:?}");
-                    let storage = Storage::for_tests_null(
-                        ash::vk::Extent2D {
-                            width: u32::from(w),
-                            height: u32::from(h),
-                        },
-                        PlatformBackend::format_for_depth(32),
-                    );
-                    if let Err(e) =
-                        self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage)
-                    {
-                        log::warn!("render set_logical_screen_size: root stub alloc failed: {e:?}");
-                    }
-                }
-            }
-        }
-
-        // ── 3. Resize COW backing storage (if materialised) ──────────────
-        // The COW is lazily allocated on the first CompositeGetOverlayWindow
-        // call. If it hasn't been created yet, fb_w/fb_h are already updated
-        // above so the first allocation will use the new dimensions.
-        if let Some(old_cow_id) = self.cow_id.take() {
-            let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-            self.store.detach_xid(cow_xid);
-            self.store_decref_with_invalidate(old_cow_id);
-            match self.platform.allocate_drawable_storage(w, h, 24) {
-                Ok(storage) => {
-                    self.telemetry.record_storage_allocation();
-                    self.telemetry.record_image_view_create();
-                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
-                        Ok(new_cow_id) => {
-                            // Fill so the compositor doesn't see
-                            // recycled GPU content on its next paint.
-                            // OPAQUE black, not transparent: the COW is
-                            // a depth-24 drawable, and on X11 depth-24
-                            // has no alpha channel — it is opaque by
-                            // definition. See `default_window_init_color`.
-                            let rect = ash::vk::Rect2D {
-                                offset: ash::vk::Offset2D::default(),
-                                extent: ash::vk::Extent2D {
-                                    width: u32::from(w),
-                                    height: u32::from(h),
-                                },
-                            };
-                            if let Err(e) = self.engine.fill_rect(
-                                &mut self.store,
-                                &mut self.platform,
-                                Dst::server_internal(new_cow_id),
-                                rect,
-                                default_window_init_color(24),
-                            ) && self.platform.vk.is_some()
-                            {
-                                log::warn!(
-                                    "render set_logical_screen_size: COW init fill failed: {e:?}"
-                                );
-                            }
-                            self.cow_id = Some(new_cow_id);
-                            // Update the windows geometry so scene assembly
-                            // uses the new dimensions.
-                            if let Some(geom) = self.windows.get_mut(&cow_xid) {
-                                geom.width = w;
-                                geom.height = h;
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "render set_logical_screen_size: COW store.allocate failed: {e:?}"
-                            );
-                            // cow_id stays None (taken above); the COW will be
-                            // re-materialised on the next CompositeGetOverlayWindow.
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::debug!("render set_logical_screen_size: no Vk, stub COW storage: {e:?}");
-                    let storage = crate::kms::render::store::Storage::for_tests_null(
-                        ash::vk::Extent2D {
-                            width: u32::from(w),
-                            height: u32::from(h),
-                        },
-                        PlatformBackend::format_for_depth(24),
-                    );
-                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
-                        Ok(new_cow_id) => {
-                            self.cow_id = Some(new_cow_id);
-                            if let Some(geom) = self.windows.get_mut(&cow_xid) {
-                                geom.width = w;
-                                geom.height = h;
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "render set_logical_screen_size: COW stub alloc failed: {e:?}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── 4. Mark scene dirty — no drain/rebuild needed ─────────────────
-        // A logical resize (RRSetScreenSize) does NOT change per-output
-        // scanout pool geometry or output positions; only the root/COW
-        // *source* dimensions change.  The scene resolves root and COW
-        // storage by xid on every frame (see `build_scene` → `store.lookup(
-        // core.window_id)`), so the reallocated storage above will be picked
-        // up automatically on the next compose tick.
-        //
-        // Crucially, we must NOT call `drain_all` + `rebuild_outputs` here.
-        // Those paths clear the scene's `pending_acks` queue (the per-output
-        // "flip in flight" gate) but do NOT drain the kernel's DRM event
-        // queue.  If output N has a pending atomic flip when we call
-        // drain_all, the scene thinks the CRTC is free and immediately
-        // attempts a new commit on the next tick — but the kernel still has
-        // the old flip pending, returning EBUSY.  This is what caused the
-        // observed "output 1 freezes black after RRSetScreenSize" on a live
-        // 2-monitor session.
-        //
-        // The existing per-output flip-pending gate (`pending_acks.is_empty()`
-        // in `tick_one_output`) already prevents EBUSY: if a flip is in
-        // flight the tick skips that output until the page-flip-complete event
-        // arrives.  So the correct fix is simply to defer to that gate.
-        //
-        // Old storage (root/COW) is released safely: `store_decref_with_
-        // invalidate` parks the DrawableId in `pending_retire` if the GPU
-        // fence has not yet signaled, deferring the VkImage destroy until the
-        // compose CB finishes — no `wait_idle_bounded` needed.
-        //
-        // root-overlay is root-absolute + layout-dependent; drop it on
-        // topology change. `rebuild_outputs` isn't called here (see above),
-        // so this logical-resize path needs its own explicit clear.
-        self.request_direct_unflip("logical_screen_resize_complete");
-        self.scene.root_overlay_clear();
-        // Step 3 — the root/COW storage under every scanout BO just changed
-        // size, while the BOs themselves stay valid. Nothing else tells the
-        // per-BO damage model that: this path deliberately skips
-        // `drain_all` + `rebuild_outputs` (see above), and `wake_for_damage`
-        // adds no region.
-        self.scene.invalidate_all_scanout_damage();
-        self.scene.wake_for_damage();
-
+        self.apply_virtual_screen_extent(w, h)?;
         log::info!("render set_logical_screen_size: resized virtual screen to {w}×{h}");
         Ok(())
     }
@@ -30799,6 +31268,7 @@ mod tests {
                         connector_type: "unknown".to_string(),
                     }],
                     &[],
+                    &[],
                 )
                 .is_empty()
         );
@@ -30917,6 +31387,7 @@ mod tests {
                         connector_type: "DisplayPort".to_string(),
                     }],
                     &[],
+                    &[],
                 )
                 .is_empty()
         );
@@ -30980,7 +31451,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(&[], std::slice::from_ref(&sink_output))
+                .reconcile_connector_registry(&[], std::slice::from_ref(&sink_output), &[])
                 .is_empty()
         );
         backend.rebuild_randr_state(&mut state, None, true);
@@ -31005,6 +31476,7 @@ mod tests {
                         edid: Vec::new(),
                         connector_type: "DisplayPort".to_string(),
                     }],
+                    &[],
                     &[],
                 )
                 .is_empty()
@@ -31501,6 +31973,506 @@ mod tests {
         );
     }
 
+    // ── P1: hotplug relight, remembered routes and reserved slots ────────
+    //
+    // Design:
+    // `docs/superpowers/specs/2026-09-17-randr-crtc-model-and-hotplug-relight-design.md`,
+    // "P1 — restore the reconnect relight".
+
+    fn relight_test_snapshot(
+        key: &OutputKey,
+        modes: Vec<crate::platform::drm::Mode>,
+    ) -> ConnectorSnapshot {
+        ConnectorSnapshot {
+            key: key.clone(),
+            modes,
+            mm_width: 0,
+            mm_height: 0,
+            edid: Vec::new(),
+            connector_type: "unknown".to_string(),
+        }
+    }
+
+    /// Place a live output on the fixture at `(x, y)` with a `width x height`
+    /// mode, and mark its registry entry connected and scanning out there —
+    /// the state a boot auto-layout session reaches with no client request.
+    fn push_enabled_test_output(
+        b: &mut super::KmsBackend,
+        connector_name: &str,
+        raw_crtc: u32,
+        x: i32,
+        y: i32,
+        width: u16,
+        height: u16,
+    ) -> OutputKey {
+        use crate::kms::backend::ActiveOutput;
+        let device_key = b
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
+        let scanout_route = b
+            .platform
+            .scanout_route_for_kms(device_key)
+            .expect("test fixture has a scanout route");
+        let mode = test_advertised_mode(width, height, 60, true);
+        let output = crate::platform::drm::Output {
+            connector: ::drm::control::from_u32(raw_crtc).unwrap(),
+            connector_name: connector_name.to_string(),
+            encoder: ::drm::control::from_u32(raw_crtc).unwrap(),
+            crtc: ::drm::control::from_u32(raw_crtc).unwrap(),
+            plane: ::drm::control::from_u32(raw_crtc).unwrap(),
+            // SAFETY: tests never pass this mode to DRM.
+            mode: unsafe { std::mem::zeroed() },
+            picked: mode.clone(),
+            plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_src_x_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_src_y_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_src_w_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_src_h_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_crtc_x_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_crtc_y_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_crtc_w_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_crtc_h_prop: ::drm::control::from_u32(1).unwrap(),
+            plane_in_fence_fd_prop: None,
+            crtc_out_fence_ptr_prop: None,
+            scanout_modifiers: Vec::new(),
+            mm_width: 0,
+            mm_height: 0,
+            edid: Vec::new(),
+            connector_type: "unknown".to_string(),
+            modes: vec![mode.clone()],
+        };
+        let active = ActiveOutput::new(
+            scanout_route,
+            output,
+            crate::drm::Swapchain::empty_for_tests(),
+            x,
+            y,
+        );
+        let key = active.key.clone();
+        b.platform.outputs.push(active);
+        b.platform.scanout_pools.push(None);
+        b.platform.bo_generations.push(Vec::new());
+        b.platform.first_pageflip_logged.push(false);
+        let entry = b.randr_id_alloc.entry_mut(&key);
+        entry.connected = true;
+        entry.modes = vec![mode];
+        entry.config = super::ConnectorConfig::Enabled {
+            mode_w: width,
+            mode_h: height,
+            vrefresh: 60,
+            x,
+            y,
+        };
+        key
+    }
+
+    fn clear_test_outputs(b: &mut super::KmsBackend) {
+        b.platform.outputs.clear();
+        b.platform.scanout_pools.clear();
+        b.platform.bo_generations.clear();
+        b.platform.first_pageflip_logged.clear();
+    }
+
+    fn rects_overlap(
+        a: crate::kms::render::platform::LayoutRect,
+        b: crate::kms::render::platform::LayoutRect,
+    ) -> bool {
+        let (ax, ay, aw, ah) = a;
+        let (bx, by, bw, bh) = b;
+        ax < bx + i32::from(bw)
+            && bx < ax + i32::from(aw)
+            && ay < by + i32::from(bh)
+            && by < ay + i32::from(ah)
+    }
+
+    #[test]
+    fn a_physical_disconnect_remembers_the_route_and_the_reconnect_relights_it() {
+        let mut backend = KmsBackend::for_tests();
+        clear_test_outputs(&mut backend);
+        let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
+        let snapshot =
+            relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
+
+        // ── Physical departure ───────────────────────────────────────────
+        let rescan = backend
+            .platform
+            .apply_connector_snapshot(Vec::new(), &std::collections::HashSet::from([key.clone()]));
+        let _ = backend.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert!(!entry.connected);
+        assert_eq!(entry.config, super::ConnectorConfig::Off);
+        assert_eq!(
+            entry.last_enabled,
+            Some(super::ConnectorConfig::Enabled {
+                mode_w: 1920,
+                mode_h: 1080,
+                vrefresh: 60,
+                x: 0,
+                y: 0,
+            }),
+            "the departed route is remembered from the layout that actually departed",
+        );
+        assert_eq!(backend.reserved_layout_slots(), vec![(0, 0, 1920, 1080)]);
+        assert!(
+            backend.take_relight_requests().is_empty(),
+            "a connector that has not come back is not relit",
+        );
+        assert!(
+            backend
+                .randr_id_alloc
+                .entry(&key)
+                .unwrap()
+                .last_enabled
+                .is_some(),
+            "and it keeps its reservation while it is away",
+        );
+
+        // ── Reconnect ────────────────────────────────────────────────────
+        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[]);
+        let requests = backend.take_relight_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].key, key);
+        assert_eq!(
+            requests[0].mode,
+            yserver_core::backend::ModeSpec {
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+            },
+        );
+        assert_eq!((requests[0].x, requests[0].y), (0, 0));
+
+        backend.commit_relit_route(&requests[0]);
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(
+            entry.config,
+            super::ConnectorConfig::Enabled {
+                mode_w: 1920,
+                mode_h: 1080,
+                vrefresh: 60,
+                x: 0,
+                y: 0,
+            },
+        );
+        assert!(
+            !entry.client_configured,
+            "an auto-relight restores a previous state; it is not a client intent",
+        );
+        assert!(entry.last_enabled.is_none(), "the reservation is released");
+        assert!(backend.reserved_layout_slots().is_empty());
+    }
+
+    #[test]
+    fn a_route_that_was_already_off_when_it_departed_is_never_relit() {
+        // A client's explicit SetCrtcConfig(mode=None) leaves the entry Off,
+        // so the later unplug has no route to remember. Unplugging a
+        // deliberately disabled monitor must not resurrect it (invariant 6).
+        let mut backend = KmsBackend::for_tests();
+        clear_test_outputs(&mut backend);
+        let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
+        backend.randr_id_alloc.entry_mut(&key).config = super::ConnectorConfig::Off;
+        backend.randr_id_alloc.entry_mut(&key).client_configured = true;
+        let snapshot =
+            relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
+
+        let rescan = backend
+            .platform
+            .apply_connector_snapshot(Vec::new(), &std::collections::HashSet::from([key.clone()]));
+        assert_eq!(
+            rescan.dropped_layouts.len(),
+            1,
+            "the live route was still there to drop",
+        );
+        let _ = backend.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+
+        assert!(
+            backend
+                .randr_id_alloc
+                .entry(&key)
+                .unwrap()
+                .last_enabled
+                .is_none(),
+        );
+        assert!(backend.reserved_layout_slots().is_empty());
+
+        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[]);
+        assert!(backend.take_relight_requests().is_empty());
+    }
+
+    #[test]
+    fn a_client_config_on_a_departed_output_releases_its_reservation() {
+        // Design, "Layout policy — reserved slots" point 4: a client
+        // SetCrtcConfig on a departed output releases the reservation, and
+        // releasing it is exactly clearing `last_enabled`.
+        let mut backend = KmsBackend::for_tests();
+        clear_test_outputs(&mut backend);
+        let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
+        let output_id = backend.randr_id_alloc.ids_for(&key).output_id;
+        let snapshot =
+            relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
+
+        let rescan = backend
+            .platform
+            .apply_connector_snapshot(Vec::new(), &std::collections::HashSet::from([key.clone()]));
+        let _ = backend.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+        assert_eq!(backend.reserved_layout_slots(), vec![(0, 0, 1920, 1080)]);
+
+        // Publish, so the request path can resolve the output XID.
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        backend.rebuild_randr_state(&mut state, None, false);
+
+        // The route is already gone, so this disable is the no-op path: it
+        // touches no hardware but is still an explicit client statement.
+        assert!(
+            !backend
+                .apply_crtc_config(output_id, "HDMI-3", None, 0, 0)
+                .expect("disabling an already-off output is a no-op"),
+        );
+
+        assert!(
+            backend
+                .randr_id_alloc
+                .entry(&key)
+                .unwrap()
+                .last_enabled
+                .is_none(),
+        );
+        assert!(backend.reserved_layout_slots().is_empty());
+        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[]);
+        assert!(backend.take_relight_requests().is_empty());
+    }
+
+    #[test]
+    fn an_incompatible_mode_reconnect_leaves_the_output_off_and_does_not_re_reserve() {
+        let mut backend = KmsBackend::for_tests();
+        clear_test_outputs(&mut backend);
+        let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
+        // The monitor is replaced by a panel that cannot do 1920x1080@60.
+        let replacement =
+            relight_test_snapshot(&key, vec![test_advertised_mode(1024, 768, 60, true)]);
+
+        let rescan = backend
+            .platform
+            .apply_connector_snapshot(Vec::new(), &std::collections::HashSet::from([key.clone()]));
+        let _ = backend.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+        assert_eq!(backend.reserved_layout_slots(), vec![(0, 0, 1920, 1080)]);
+
+        // First rescan after the replacement panel appears.
+        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
+        assert!(backend.take_relight_requests().is_empty());
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(entry.config, super::ConnectorConfig::Off);
+        assert!(
+            entry.last_enabled.is_none(),
+            "the remembered route is cleared, which is what releases the slot",
+        );
+        assert!(backend.reserved_layout_slots().is_empty());
+
+        // A SECOND rescan: a stale reservation would re-reserve the slot here,
+        // and the single-rescan assertion above would not have caught it.
+        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
+        assert!(backend.take_relight_requests().is_empty());
+        assert!(backend.reserved_layout_slots().is_empty());
+        assert_eq!(
+            backend.randr_id_alloc.entry(&key).unwrap().config,
+            super::ConnectorConfig::Off,
+        );
+    }
+
+    #[test]
+    fn a_reserved_slot_keeps_the_survivor_in_place_and_the_relight_cannot_overlap_it() {
+        // codex's counterexample: A at x=0, B at x=1920. Without the
+        // reservation, unplugging A compacts B to x=0 and shrinks the extent,
+        // so restoring A at its remembered x=0 overlaps B (invariant 7).
+        let mut backend = KmsBackend::for_tests();
+        clear_test_outputs(&mut backend);
+        let a = push_enabled_test_output(&mut backend, "A", 7, 0, 0, 1920, 1080);
+        let b = push_enabled_test_output(&mut backend, "B", 8, 1920, 0, 3200, 1440);
+        backend.platform.fb_w = 5120;
+        backend.platform.fb_h = 1440;
+        let snapshot_a =
+            relight_test_snapshot(&a, vec![test_advertised_mode(1920, 1080, 60, true)]);
+        let snapshot_b =
+            relight_test_snapshot(&b, vec![test_advertised_mode(3200, 1440, 60, true)]);
+
+        // ── Unplug A ─────────────────────────────────────────────────────
+        let rescan = backend.platform.apply_connector_snapshot(
+            vec![snapshot_b.clone()],
+            &std::collections::HashSet::from([a.clone(), b.clone()]),
+        );
+        let _ = backend.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+        let reserved = backend.reserved_layout_slots();
+        assert_eq!(reserved, vec![(0, 0, 1920, 1080)]);
+        let configured = backend.randr_id_alloc.client_configured_keys();
+        assert!(configured.is_empty(), "a bare session pins nothing");
+        backend
+            .platform
+            .recompact_horizontal_layout(&configured, &reserved);
+        backend
+            .platform
+            .recompute_fb_extent_with_reservations(&reserved);
+
+        assert_eq!(backend.platform.outputs.len(), 1);
+        assert_eq!(
+            (backend.platform.outputs[0].x, backend.platform.outputs[0].y),
+            (1920, 0),
+            "B must not move into A's reserved slot",
+        );
+        assert_eq!(backend.platform.fb_dimensions(), (5120, 1440));
+
+        // ── Replug A ─────────────────────────────────────────────────────
+        let _ = backend.reconcile_connector_registry(&[snapshot_a, snapshot_b], &[], &[]);
+        let requests = backend.take_relight_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].key, a);
+        assert_eq!(
+            (requests[0].x, requests[0].y),
+            (0, 0),
+            "A returns to its own slot"
+        );
+
+        let a_rect = (
+            requests[0].x,
+            requests[0].y,
+            requests[0].mode.width,
+            requests[0].mode.height,
+        );
+        let survivor = &backend.platform.outputs[0];
+        let b_rect = (survivor.x, survivor.y, survivor.width, survivor.height);
+        assert!(
+            !rects_overlap(a_rect, b_rect),
+            "the relit route {a_rect:?} must not overlap the survivor {b_rect:?}",
+        );
+    }
+
+    /// The reservation feeds the DERIVED extent only. `rebuild_randr_state`
+    /// still carries a client-set logical size forward over it, so a desktop
+    /// that laid itself out with `RRSetScreenSize` keeps the size it asked
+    /// for while a slot is reserved (Xorg keeps `pScreen->width/height`
+    /// until the client resizes).
+    #[test]
+    fn a_client_set_logical_size_survives_a_rebuild_while_a_slot_is_reserved() {
+        let mut backend = KmsBackend::for_tests();
+        clear_test_outputs(&mut backend);
+        let a = push_enabled_test_output(&mut backend, "A", 7, 0, 0, 1920, 1080);
+        let b = push_enabled_test_output(&mut backend, "B", 8, 1920, 0, 1920, 1080);
+        let snapshot_a =
+            relight_test_snapshot(&a, vec![test_advertised_mode(1920, 1080, 60, true)]);
+
+        // B departs physically: its slot is reserved, the extent holds.
+        let rescan = backend
+            .platform
+            .apply_connector_snapshot(vec![snapshot_a], &std::collections::HashSet::from([a, b]));
+        let _ = backend.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+        let reserved = backend.reserved_layout_slots();
+        assert_eq!(reserved, vec![(1920, 0, 1920, 1080)]);
+        backend
+            .platform
+            .recompute_fb_extent_with_reservations(&reserved);
+        assert_eq!(backend.platform.fb_dimensions(), (3840, 1080));
+
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let (fb_w, fb_h) = backend.fb_dimensions();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            fb_w,
+            fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        // The desktop shrank the logical screen around the survivor.
+        let ts = state.timestamp_now();
+        state.randr.set_logical_size(ts, 1920, 1080, 508, 286);
+
+        backend.rebuild_randr_state(&mut state, None, true);
+
+        assert_eq!(
+            (
+                state.randr.screen_width,
+                state.randr.screen_height,
+                state.randr.width_mm,
+                state.randr.height_mm,
+            ),
+            (1920, 1080, 508, 286),
+            "the client-owned logical size is carried forward verbatim",
+        );
+    }
+
+    #[test]
+    fn dropping_a_never_enabled_output_reserves_nothing_and_survivors_compact() {
+        // The reservation must not freeze the layout unconditionally.
+        let mut backend = KmsBackend::for_tests();
+        clear_test_outputs(&mut backend);
+        let a = push_enabled_test_output(&mut backend, "A", 7, 0, 0, 1920, 1080);
+        let b = push_enabled_test_output(&mut backend, "B", 8, 1920, 0, 3200, 1440);
+        // A was never enabled — it is connected-but-Off, as a runtime-added
+        // connector enters the registry.
+        backend.randr_id_alloc.entry_mut(&a).config = super::ConnectorConfig::Off;
+        let snapshot_b =
+            relight_test_snapshot(&b, vec![test_advertised_mode(3200, 1440, 60, true)]);
+
+        let rescan = backend.platform.apply_connector_snapshot(
+            vec![snapshot_b],
+            &std::collections::HashSet::from([a.clone(), b]),
+        );
+        let _ = backend.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+
+        let reserved = backend.reserved_layout_slots();
+        assert!(reserved.is_empty(), "nothing enabled, nothing to reserve");
+        let configured = backend.randr_id_alloc.client_configured_keys();
+        backend
+            .platform
+            .recompact_horizontal_layout(&configured, &reserved);
+        backend
+            .platform
+            .recompute_fb_extent_with_reservations(&reserved);
+
+        assert_eq!(
+            (backend.platform.outputs[0].x, backend.platform.outputs[0].y),
+            (0, 0),
+        );
+        assert_eq!(backend.platform.fb_dimensions(), (3200, 1440));
+    }
+
     #[test]
     fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() {
         use crate::platform::drm::ConnectorProbe;
@@ -31646,12 +32618,12 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(std::slice::from_ref(&first), &[])
+                .reconcile_connector_registry(std::slice::from_ref(&first), &[], &[])
                 .is_empty()
         );
         let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
         let replacement_delta =
-            backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[]);
+            backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
         assert!(
             !replacement_delta.is_empty(),
             "a changed EDID must invalidate the heavy RANDR projection"
@@ -31665,7 +32637,7 @@ mod tests {
         assert_eq!(entry.edid, replacement.edid);
         assert!(
             backend
-                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[])
+                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[])
                 .is_empty(),
             "the refreshed heavy snapshot is idempotent"
         );
@@ -31689,7 +32661,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[])
+                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[])
                 .is_empty()
         );
         let (refreshed, mode_table) = backend.randr_outputs_and_modes();
@@ -31724,7 +32696,7 @@ mod tests {
         };
         assert!(
             !backend
-                .reconcile_connector_registry(std::slice::from_ref(&snapshot), &[])
+                .reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[])
                 .is_empty()
         );
         let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
@@ -31744,7 +32716,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key), &[])
                 .is_empty()
         );
         let (outputs, _) = backend.randr_outputs_and_modes();
@@ -31874,7 +32846,7 @@ mod tests {
         let light_config_timestamp = state.randr.config_timestamp;
         assert!(
             backend
-                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key), &[])
                 .is_empty(),
             "the later heavy boundary sees no second advertised connector delta",
         );
@@ -31973,6 +32945,7 @@ mod tests {
         let heavy_delta = backend.reconcile_connector_registry(
             std::slice::from_ref(&snapshot),
             std::slice::from_ref(&key),
+            &[],
         );
         assert!(heavy_delta.is_empty());
         assert!(!heavy_delta.config_changed);
@@ -32011,7 +32984,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key), &[])
                 .is_empty()
         );
         let projected = backend.randr_outputs();
@@ -32023,6 +32996,17 @@ mod tests {
         assert_eq!(output.crtc_id, ids.1);
         assert!(!output.connected);
         assert_eq!(output.mode_id, 0);
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert_eq!(
+            state
+                .randr
+                .output_info(ids.0, 0)
+                .expect("disconnected output remains queryable")
+                .crtc,
+            ids.1,
+            "physical loss retains the former CRTC association until a client disables it",
+        );
         assert!(
             !backend.randr_id_alloc.entry(&key).unwrap().connected,
             "stale platform output state must not overwrite a heavy disconnect"
@@ -32088,7 +33072,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(&[replacement], &[])
+                .reconcile_connector_registry(&[replacement], &[], &[])
                 .is_empty()
         );
         let (outputs, modes) = backend.randr_outputs_and_modes();
@@ -43918,6 +44902,180 @@ mod tests {
         assert!(
             b.cow_host_xid().is_none(),
             "cow_host_xid getter returns None after final release"
+        );
+    }
+
+    /// A hotplug that GREW the virtual extent must grow root backing
+    /// storage with it.
+    ///
+    /// Measured chain this guards (dual-head MATE, HDMI-3 unplug/replug):
+    /// the desktop reacted to the unplug with `RRSetScreenSize(2560x1440)`,
+    /// which reallocated root storage down to the survivor; the relight then
+    /// grew the extent back to 5120x1440 but nothing resized root storage,
+    /// so x=2560..5120 -- exactly the relit monitor -- had no root pixels
+    /// behind it and the monitor showed no background at all.
+    #[test]
+    fn a_hotplug_that_grew_the_extent_grows_root_backing_storage() {
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackend::for_tests();
+        clear_test_outputs(&mut b);
+        let survivor = push_enabled_test_output(&mut b, "A", 7, 0, 0, 1920, 1080);
+
+        // The desktop shrank the logical screen around the survivor while the
+        // second monitor was away; root storage followed it down.
+        b.set_logical_screen_size(1920, 1080)
+            .expect("logical resize must not fail on the test fixture");
+        assert_eq!(
+            b.root_storage_extent().map(|e| (e.width, e.height)),
+            Some((1920, 1080)),
+            "the client resize is what leaves root storage too small",
+        );
+
+        // The relight puts the second monitor back at its remembered slot and
+        // the enable path recomputes the extent over both live layouts.
+        let relit = push_enabled_test_output(&mut b, "B", 8, 1920, 0, 1920, 1080);
+        b.platform.recompute_fb_extent_with_reservations(&[]);
+        assert_eq!(b.platform.fb_dimensions(), (3840, 1080));
+
+        let (outputs, modes) = b.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            1920,
+            1080,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&b),
+        );
+        let rescan = crate::kms::render::platform::RescanResult {
+            added_keys: vec![relit],
+            dropped_keys: Vec::new(),
+            dropped_old_indices: Vec::new(),
+            dropped_layouts: Vec::new(),
+            added_count: 1,
+            connected: Vec::new(),
+        };
+        assert!(
+            b.fire_randr_changes(&mut state, rescan, &[survivor], true, true, false),
+            "publishing the relit topology must succeed",
+        );
+
+        assert_eq!(
+            b.root_storage_extent().map(|e| (e.width, e.height)),
+            Some((3840, 1080)),
+            "root storage must cover the grown extent, or the relit output \
+             has nothing to sample",
+        );
+    }
+
+    /// The counterpart: an extent that SHRANK leaves root storage alone.
+    /// Oversized storage still covers every visible pixel, and reallocating
+    /// it would wipe root content that is still on screen.
+    #[test]
+    fn a_hotplug_that_shrank_the_extent_leaves_root_storage_alone() {
+        let mut b = KmsBackend::for_tests();
+        clear_test_outputs(&mut b);
+        let a = push_enabled_test_output(&mut b, "A", 7, 0, 0, 1920, 1080);
+        let departing = push_enabled_test_output(&mut b, "B", 8, 1920, 0, 1920, 1080);
+        b.platform.recompute_fb_extent_with_reservations(&[]);
+        // Start from storage that actually covers the dual-head extent.
+        // `set_logical_screen_size` would early-return here: the extent
+        // recompute above already moved `fb_w`/`fb_h`, so drive the shared
+        // helper it delegates to.
+        b.apply_virtual_screen_extent(3840, 1080)
+            .expect("growing the virtual extent must not fail");
+        assert_eq!(
+            b.root_storage_extent().map(|e| (e.width, e.height)),
+            Some((3840, 1080)),
+        );
+
+        // B departs for good: no reservation, so the extent shrinks.
+        b.randr_id_alloc.entry_mut(&departing).last_enabled = None;
+        b.platform.outputs.pop();
+        b.platform.scanout_pools.pop();
+        b.platform.bo_generations.pop();
+        b.platform.first_pageflip_logged.pop();
+        b.platform.recompute_fb_extent_with_reservations(&[]);
+        assert_eq!(b.platform.fb_dimensions(), (1920, 1080));
+
+        let (outputs, modes) = b.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            1920,
+            1080,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&b),
+        );
+        let rescan = crate::kms::render::platform::RescanResult {
+            added_keys: Vec::new(),
+            dropped_keys: vec![departing],
+            dropped_old_indices: vec![1],
+            dropped_layouts: Vec::new(),
+            added_count: 0,
+            connected: Vec::new(),
+        };
+        assert!(b.fire_randr_changes(&mut state, rescan, &[a], true, true, false));
+
+        assert_eq!(
+            b.root_storage_extent().map(|e| (e.width, e.height)),
+            Some((3840, 1080)),
+            "a shrink must not reallocate root storage",
+        );
+    }
+
+    /// The newly covered region carries the ROOT BACKGROUND, not recycled GPU
+    /// content: the shared helper fills the whole reallocated root storage
+    /// with `core.bg_pixel`. Needs real Vk -- the headless fixture cannot
+    /// allocate storage, so it stubs a null view and never fills.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn a_grown_root_storage_is_filled_with_the_root_background() {
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // A background nothing else in the fixture paints, so a wrong or
+        // missing fill cannot pass by accident.
+        b.core.bg_pixel = Some(0x00ff_0000);
+
+        let old_w = b.platform.fb_w;
+        let new_w = old_w.saturating_add(1280);
+        b.apply_virtual_screen_extent(new_w, b.platform.fb_h)
+            .expect("growing the virtual extent must not fail");
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close open frame");
+        b.engine_drain_all_for_tests();
+
+        let root_id = b
+            .store
+            .lookup(b.core.window_id)
+            .expect("root must be live after the grow");
+        let bytes = b
+            .engine
+            .get_image(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::target::Src::server_internal(root_id),
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: i32::from(old_w) + 4,
+                        y: 4,
+                    },
+                    extent: ash::vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                },
+                32,
+            )
+            .expect("readback of the newly covered region");
+        assert_eq!(
+            (bytes[0], bytes[1], bytes[2], bytes[3]),
+            (0x00, 0x00, 0xff, 0xff),
+            "the newly covered region must hold the opaque root background \
+             (B8G8R8A8), not recycled content",
         );
     }
 
