@@ -44,10 +44,24 @@ readiness, and retirement promotion ordering — section 10.
 - implement any Phase C.1 async behaviour (section 9);
 - activate anything in production (R8): the production transport stays `Legacy`.
 
-**Carried items.** F13c-m1 and F13c-m2, which the 2c-i F-13c review assigned to
-2c-ii's spec, are **closed**: session 2 of the 2c-i debt stage bound pool-husk
-accounting to an identity-bearing registration that fails closed when dropped or
-skipped (`a87601c2`). F13b-D1 belongs to 2c-iii, per the F-13b review.
+**Carried items.** The 2c-i F-15 review listed four things 2c-ii's spec must
+carry. Their disposition:
+
+1. *The per-guard-clause pass over `resources/{mod,commit,gpu,transport}.rs`* —
+   **done**, by the 2c-i debt stage inserted before this one: 71 census sites,
+   39 proven by their own test, 32 caught by others, zero survivors (finding
+   `2026-09-17-stage-2c-i-debt-census-session-2.md`). 2c-ii's own guards follow
+   the same rule through section 10.2's named mutations.
+2. *F13c-m1* and 3. *F13c-m2* — **closed**: session 2 of the debt stage bound
+   pool-husk accounting to an identity-bearing registration that fails closed
+   when dropped or skipped (`a87601c2`).
+4. *F13b-D1* — the dispatched `CommitResources` carries no present-pin leases
+   by value. **Stays with 2c-iii**, as the F-13b review decided: adopting leases
+   by value is the activation half, and the leases come from the real producer,
+   which 2c-iii converts. 2c-ii must not make it worse: the conductor's request
+   builder **takes the primary's leases as an input** and moves them into the
+   request, so 2c-iii supplies real ones without changing the conductor. A
+   builder that constructs an empty lease set on its own is out of bounds.
 
 ## 2. Architecture
 
