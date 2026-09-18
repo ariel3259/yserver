@@ -32,11 +32,13 @@ pub struct UnflipBarrier {
 
 #[derive(Debug, Default)]
 pub struct Admission {
-    composed: BTreeMap<CrtcId, ComposedIntent>,
-    direct: Option<QueuedDirect>,
-    unflip: Option<UnflipBarrier>,
-    topology: Option<u64>,
+    pub(super) composed: BTreeMap<CrtcId, ComposedIntent>,
+    pub(super) direct: Option<QueuedDirect>,
+    pub(super) unflip: Option<UnflipBarrier>,
+    pub(super) topology: Option<u64>,
     next_ordinal: u64,
+    pub(super) locked: Option<u64>,
+    pub(super) sequence: u64,
 }
 
 impl Admission {

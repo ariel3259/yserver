@@ -416,3 +416,322 @@ fn c0_adm_decide_is_pure() {
     assert_eq!(first, second);
     assert_eq!(admission.composed(1).unwrap().generation, 10);
 }
+
+#[test]
+fn c0_adm_lock_refuses_a_second_lock_while_a_token_exists() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let decision = admission.decide(&snapshot).unwrap();
+    let token = admission.lock(decision.clone(), &snapshot).unwrap();
+
+    assert!(matches!(
+        admission.lock(decision, &snapshot),
+        Err(AdmissionError::AlreadyLocked)
+    ));
+    assert!(admission.is_locked());
+    admission.abort(token).unwrap();
+}
+
+#[test]
+fn c0_adm_abort_leaves_the_decider_exactly_as_before() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let before = admission.decide(&snapshot).unwrap();
+    let ordinal = admission.composed(1).unwrap().ordinal;
+    let token = admission.lock(before.clone(), &snapshot).unwrap();
+
+    assert_eq!(admission.sequence(), 0);
+    admission.abort(token).unwrap();
+
+    assert!(!admission.is_locked());
+    assert_eq!(admission.sequence(), 0);
+    assert_eq!(admission.decide(&snapshot), Some(before));
+    assert_eq!(admission.composed(1).unwrap().ordinal, ordinal);
+}
+
+#[test]
+fn c0_adm_confirm_consumes_the_admitted_intent_only() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+    admission.set_composed(2, 20).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 2,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+    let decision = admission.decide(&snapshot).unwrap();
+    let token = admission.lock(decision.clone(), &snapshot).unwrap();
+
+    let confirmed = admission.confirm(token).unwrap();
+
+    assert_eq!(confirmed.sequence, 1);
+    assert_eq!(confirmed.decision, decision);
+    assert!(admission.composed(1).is_none());
+    assert_eq!(admission.composed(2).unwrap().generation, 20);
+    assert!(!admission.is_locked());
+}
+
+#[test]
+fn c0_adm_lock_detects_a_generation_that_changed_since_decide() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+
+    let mut old_snapshot = ReadinessSnapshot::new(0, 0);
+    old_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let old_decision = admission.decide(&old_snapshot).unwrap();
+
+    admission.set_composed(1, 11).unwrap();
+    let mut new_snapshot = ReadinessSnapshot::new(0, 0);
+    new_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 11,
+        },
+        Readiness::Ready,
+    );
+
+    assert!(matches!(
+        admission.lock(old_decision, &new_snapshot),
+        Err(AdmissionError::DecisionMismatch)
+    ));
+    assert!(!admission.is_locked());
+    assert_eq!(admission.sequence(), 0);
+}
+
+#[test]
+fn c0_adm_lock_rejects_a_direct_successor_whose_layout_changed() {
+    let mut admission = Admission::new();
+    admission
+        .set_direct_successor(successor(10, 20, 30, &[1]))
+        .unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(20, 30);
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let decision = admission.decide(&snapshot).unwrap();
+
+    snapshot.layout_generation = 21;
+    assert!(matches!(
+        admission.lock(decision, &snapshot),
+        Err(AdmissionError::DecisionMismatch)
+    ));
+    assert!(!admission.is_locked());
+    assert_eq!(admission.direct().unwrap().successor.layout_generation, 20);
+}
+
+#[test]
+fn c0_adm_a_dropped_token_keeps_the_decider_locked() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let decision = admission.decide(&snapshot).unwrap();
+    let _token = admission.lock(decision, &snapshot).unwrap();
+
+    assert!(admission.is_locked());
+    assert_eq!(admission.sequence(), 0);
+}
+
+#[test]
+fn c0_adm_a_foreign_token_is_refused() {
+    let mut first = Admission::new();
+    let mut second = Admission::new();
+    first.set_composed(1, 10).unwrap();
+    second.set_composed(1, 20).unwrap();
+
+    let mut first_snapshot = ReadinessSnapshot::new(0, 0);
+    first_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let mut second_snapshot = ReadinessSnapshot::new(0, 0);
+    second_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+    let first_decision = first.decide(&first_snapshot).unwrap();
+    let second_decision = second.decide(&second_snapshot).unwrap();
+    let first_token = first.lock(first_decision, &first_snapshot).unwrap();
+    let second_token = second.lock(second_decision, &second_snapshot).unwrap();
+
+    assert_eq!(
+        first.confirm(second_token),
+        Err(AdmissionError::TokenMismatch)
+    );
+    assert!(first.is_locked());
+    assert_eq!(first.sequence(), 0);
+
+    let confirmed = first.confirm(first_token).unwrap();
+    assert_eq!(confirmed.sequence, 1);
+    assert!(!first.is_locked());
+}
+
+#[test]
+fn c0_adm_a_foreign_token_cannot_abort() {
+    let mut first = Admission::new();
+    let mut second = Admission::new();
+    first.set_composed(1, 10).unwrap();
+    second.set_composed(1, 20).unwrap();
+
+    let mut first_snapshot = ReadinessSnapshot::new(0, 0);
+    first_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let mut second_snapshot = ReadinessSnapshot::new(0, 0);
+    second_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+    let first_decision = first.decide(&first_snapshot).unwrap();
+    let second_decision = second.decide(&second_snapshot).unwrap();
+    let first_token = first.lock(first_decision, &first_snapshot).unwrap();
+    let second_token = second.lock(second_decision, &second_snapshot).unwrap();
+
+    assert_eq!(
+        first.abort(second_token),
+        Err(AdmissionError::TokenMismatch)
+    );
+    assert!(first.is_locked());
+    assert_eq!(first.sequence(), 0);
+
+    let confirmed = first.confirm(first_token).unwrap();
+    assert_eq!(confirmed.sequence, 1);
+    assert!(!first.is_locked());
+}
+
+#[test]
+fn c0_adm_confirm_consumes_a_direct_unflip_or_topology_admission_exactly() {
+    {
+        let mut admission = Admission::new();
+        admission
+            .set_direct_successor(successor(10, 20, 30, &[1]))
+            .unwrap();
+        admission.set_composed(2, 40).unwrap();
+
+        let mut snapshot = ReadinessSnapshot::new(20, 30);
+        snapshot.report(
+            IntentKey::Direct {
+                source_generation: 10,
+            },
+            Readiness::Ready,
+        );
+        snapshot.report(
+            IntentKey::Composed {
+                crtc: 2,
+                generation: 40,
+            },
+            Readiness::Ready,
+        );
+        let decision = admission.decide(&snapshot).unwrap();
+        assert!(matches!(decision.admitted, Admitted::Direct { .. }));
+        let token = admission.lock(decision, &snapshot).unwrap();
+        admission.confirm(token).unwrap();
+
+        assert!(admission.direct().is_none());
+        assert_eq!(admission.composed(2).unwrap().generation, 40);
+    }
+
+    {
+        let mut admission = Admission::new();
+        admission.set_composed(2, 40).unwrap();
+        admission.request_unflip(super::crtcs(&[1])).unwrap();
+
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.report(IntentKey::Unflip, Readiness::Ready);
+        snapshot.report(
+            IntentKey::Composed {
+                crtc: 2,
+                generation: 40,
+            },
+            Readiness::Ready,
+        );
+        let decision = admission.decide(&snapshot).unwrap();
+        assert!(matches!(decision.admitted, Admitted::Unflip { .. }));
+        let token = admission.lock(decision, &snapshot).unwrap();
+        admission.confirm(token).unwrap();
+
+        assert!(admission.unflip().is_none());
+        assert_eq!(admission.composed(2).unwrap().generation, 40);
+    }
+
+    {
+        let mut admission = Admission::new();
+        admission.set_composed(2, 40).unwrap();
+        admission.request_topology(50).unwrap();
+
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.report(
+            IntentKey::Composed {
+                crtc: 2,
+                generation: 40,
+            },
+            Readiness::Ready,
+        );
+        let decision = admission.decide(&snapshot).unwrap();
+        assert_eq!(decision.admitted, Admitted::Topology { generation: 50 });
+        let token = admission.lock(decision, &snapshot).unwrap();
+        admission.confirm(token).unwrap();
+
+        assert!(admission.topology().is_none());
+        assert_eq!(admission.composed(2).unwrap().generation, 40);
+    }
+}

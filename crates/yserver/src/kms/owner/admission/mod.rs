@@ -10,17 +10,25 @@ pub enum AdmissionError {
     UnflipPending,
     #[error("the CRTC set is empty")]
     EmptyCrtcSet,
+    #[error("an admission token is already outstanding")]
+    AlreadyLocked,
+    #[error("the admission decision no longer matches the queued state")]
+    DecisionMismatch,
+    #[error("the admission token belongs to another decider or is stale")]
+    TokenMismatch,
 }
 
 mod decide;
 mod intents;
 mod snapshot;
+mod token;
 
 pub use decide::{AdmissionDecision, Admitted, Tier};
 pub use intents::{
     Admission, ComposedIntent, DirectSuccessor, PrimaryOrdinal, QueuedDirect, UnflipBarrier,
 };
 pub use snapshot::{IntentKey, Readiness, ReadinessSnapshot, WaitReason};
+pub use token::{AdmissionToken, Confirmed};
 
 #[doc(hidden)]
 pub fn crtcs(ids: &[CrtcId]) -> BTreeSet<CrtcId> {
