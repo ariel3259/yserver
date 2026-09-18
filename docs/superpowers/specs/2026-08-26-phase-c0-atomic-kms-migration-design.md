@@ -1592,10 +1592,16 @@ tickets.
 admission crosses the send boundary. If the kernel then rejects the commit, the
 prior current state stays authoritative and each cursor or gamma generation that
 commit carried re-enters admission as desired state **with its original ticket,
-aged**, so the bound above still holds. A second kernel rejection of the **same**
-generation marks it incompatible: it is dropped rather than re-admitted, and its
-CRTC is serviced under the incompatible-maintenance rules of this section. A
-newer generation arriving meanwhile replaces it latest-wins and keeps the ticket.
+aged**, so the bound above still holds; `CompletionUnknown` re-enters the same
+way without counting as a rejection. If a newer generation of the same
+`(CRTC, class)` arrived meanwhile, it already holds a newer ticket; the slot keeps
+the newer payload with the **older** ticket, aged, and a fresh rejection count.
+A second kernel rejection of the **same** generation drops it: the desired state
+of that `(CRTC, class)` returns to its current state, so it blocks no primary. A
+dropped cursor raises the software-cursor recovery barrier of tier 2; a dropped
+gamma leaves the prior LUT authoritative and is recorded as a gamma-transport
+failure for that CRTC. The stage 2c-ii design (section 7) assigns the receipt
+that carries this state across the commit.
 
 Likewise, a continuously ready primary CRTC may not take two successive device
 slots while another CRTC has a ready primary intent. C.1 uses the inherited per-CRTC

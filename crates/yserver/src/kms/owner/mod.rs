@@ -1,4 +1,6 @@
 #[doc(hidden)]
+pub mod admission;
+#[doc(hidden)]
 pub mod build;
 #[doc(hidden)]
 pub mod clock;
