@@ -27,7 +27,8 @@ spec/source excerpts of at most 120 lines each, with bounded searches. It must
 report incomplete coverage when that allowance is insufficient, not invent a
 clean verdict. This is a prompt-level reading allowance, **not an enforced
 token, time or dollar cap**. Model, reasoning effort and single-pass dispatch
-remain unchanged.
+remain unchanged by the brief itself; the effort was raised from `medium` to
+`xhigh` on 2026-09-18 at the user's request (see Lineage).
 
 Do not automatically chain correction/review rounds or retry interrupted
 reviews. After a pass, verify findings locally, fix the design issues, and
@@ -114,6 +115,7 @@ this is enforced rather than remembered.
 | v1, instrument `38aee673` | Includes stage 2b-ii rounds 1–2 on 2026-09-06 | reviews citing that instrument only |
 | **v2**, bounded design review (2026-09-06) | Starts after this instrument change is committed | reviews citing the new instrument SHA only; never v1 |
 | **v2 / claude dispatcher** (2026-09-10) | Reviews run through `review-claude.sh` while codex is unavailable | other `review-claude.sh` reviews citing the same SHA; never a codex round |
+| **v2 / effort xhigh** (2026-09-18) | Codex reviews from stage 2c-ii on; the user set reviews to `gpt-5.6-sol` at `xhigh` | reviews citing the new instrument SHA only; never a `medium` round |
 
 v1 reconstructed the five-check brief used for stage 2a round 2. Earlier briefs
 were not preserved, so their historical counts are not comparable. v2 removes
