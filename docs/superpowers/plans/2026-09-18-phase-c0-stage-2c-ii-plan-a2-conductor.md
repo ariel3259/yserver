@@ -11,6 +11,13 @@
 
 Four mutations were added (N14–N17).
 
+**Revision 3 (2026-09-18)** — incorporates codex round 2 (`../findings/2026-09-18-stage-2c-ii-plan-a2-review-round2.md`: 2 blocking, 1 major, all verified and accepted; round 1's B-2, M-1, M-2 and M-3 audited APPLIED, B-1 PARTIAL):
+- **B-1:** a `Skip` deferred with no predecessor left in flight was stranded. It is now published at the end of the conductor operation that created it.
+- **B-2:** a preparation failure after `lock` had no disposition, so the token could stay locked. Preparation is now transactional (reserve first, then move — the existing seam's `reserve(..)?` after `attach` drops the attached resources), and every post-`lock` exit aborts the token.
+- **M-1:** the ledger builder now owns `take_current` and `composed_resources`, and is tested across every refusal point of `begin`.
+
+Mutations N18–N20 were added.
+
 **Goal:** Connect plan A1's decider to the real `DeviceCommitOwner` and to 2c-i's managed seams: one conductor per device that assembles the readiness snapshot, admits, dispatches through `lock` → `begin` → `send_on` → `confirm`/`abort`, disposes of refusals, orders retirement before publication, and withdraws a direct successor whose layout changed. Fixture-level only (R8).
 
 **Architecture:** A new file `crates/yserver/src/kms/render/admission.rs` holds `AdmissionConductor` (the decider plus the conductor's own state) and an `impl KmsBackend` block with the conductor's operations, so they borrow `KmsBackend`'s fields disjointly instead of holding references into it. `KmsBackend` stores conductors by device; only tests install one. What 2c-ii cannot observe — the producer side, which 2c-iii converts — reaches the conductor through an injected `AdmissionSource`.
@@ -40,6 +47,8 @@ Four mutations were added (N14–N17).
 - **At most one dispatch per wake**, and none while the owner's slot is occupied.
 - **No retry on refusal or capacity pressure**: a refusal records its reason and returns; the next real wake re-evaluates (2c-i §6).
 - **Retirement order** (spec §7): on `CompletionRetired`, first enqueue the predecessor's completion and the deferred `Skip`s onto `scanout_m2.completed`, then admit and dispatch, and **never** drain `completed` inside the handler — the core publishes after the handler returns.
+- **A deferred `Skip` waits only behind an in-flight predecessor** (round-2 B-1). At the end of every conductor entry point (`admission_wake`, the retirement hook, `admission_note_layout_change`, `admission_request_unflip`), if no direct predecessor is in flight (`scanout_m2.pending` is `None`), `deferred_successor_skips` is appended to `completed`, after anything already enqueued. The core still publishes; nothing is drained inside the handler.
+- **Every token is consumed exactly once** (spec §6): every exit after `lock` — refusal, preparation failure, unsupported tier, or success — ends in exactly one `confirm` or `abort`.
 - **Resources travel by value** into the ledger and back through `CommitResourceConsumer::consume`; nothing is bare-dropped (a bare-dropped `RoleReservation` closes admission).
 - Test names start with `c0_adm_conductor_`, so `cargo test c0_adm` covers A1 and A2 together and `c0_2ci` is untouched.
 - `cargo test -p yserver --lib` needs the `yserver` binary built (helper tests). If helper tests fail with `HelperExited` or a device-lock timeout, run `cargo build -p yserver --bin yserver` and rerun before reporting.
@@ -55,7 +64,9 @@ After Task 5 the coordinator applies each mutation to your code and runs the tes
 | Snapshot: capacity, producer readiness and eligibility combined (§4) | `c0_adm_conductor_snapshot_waits_on_ordinary_retirement`, `c0_adm_conductor_snapshot_combines_producer_readiness`, `c0_adm_conductor_unflip_waits_without_a_composed_return` | N2: ignore `OrdinaryRetirement` occupancy; N3: report `Ready` without asking the source |
 | Direct offer: descriptor and managed frame replaced together; the victim idles once with its `Skip` deferred (§3, C.0 §9.1) | `c0_adm_conductor_direct_offer_replaces_frame_and_descriptor_together` | N4: skip `set_direct_successor` on offer |
 | The split seam: undo restores exactly (decision 2) | `c0_adm_conductor_seam_undo_restores_the_successor_charge`, existing `c0_2ci_backend_managed_dispatch_direct_successor_charges_submitted_then_retires` | N5: undo cancels the charge instead of moving it back to `Successor` |
-| `begin_with_ledger` builds the ledger only past the last refusal point, and hands the builder back uncalled on refusal (round-1 B-1) | `c0_adm_conductor_begin_with_ledger_returns_the_builder_uncalled_on_refusal` | N14: call the builder before the slot reservation |
+| `begin_with_ledger` builds the ledger only past the last refusal point, and hands the builder back uncalled on refusal (round-1 B-1, round-2 M-1) | `c0_adm_conductor_begin_with_ledger_returns_the_builder_uncalled_on_refusal`, `c0_adm_conductor_composed_begin_refusal_keeps_resources_with_the_source` | N14: call the builder before the slot reservation; N20: fetch `composed_resources` before `begin_with_ledger` |
+| A preparation failure after `lock` aborts the token and moves nothing (round-2 B-2) | `c0_adm_conductor_preparation_refusal_aborts_the_token` | N18: return without `abort` when preparation fails |
+| A `Skip` created with no predecessor in flight is published, not stranded (round-2 B-1) | `c0_adm_conductor_retirement_wake_refusal_publishes_the_skip`, `c0_adm_conductor_retirement_wake_invalidation_publishes_the_skip`, `c0_adm_conductor_layout_change_with_nothing_in_flight_publishes_the_skip` | N19: skip the end-of-entry-point append |
 | Direct offer and unflip request are two-sided transactions (round-1 B-2) | `c0_adm_conductor_direct_offer_is_refused_before_the_seam_while_unflip_is_pending`, `c0_adm_conductor_unflip_request_terminalizes_the_queued_frame` | N15: the unflip request drops the descriptor but leaves the frame and its `Successor` charge |
 | An ineligible direct successor is never dispatched and is terminalized (round-1 M-1) | `c0_adm_conductor_ineligible_direct_successor_is_invalidated` | N16: the snapshot treats every successor as eligible |
 | Dispatch confirms only at the send (§6) | `c0_adm_conductor_dispatch_confirms_after_send`, `c0_adm_conductor_pre_ipc_refusal_consumes_no_admission_state` | N6: confirm right after `begin` |
@@ -145,6 +156,7 @@ impl KmsBackend {
 
 **Invariants:**
 
+0. **Prepare is transactional** (round-2 B-2). When displacing, it reserves `OrdinaryRetirement` **before** moving the successor's role and attaching. On any error it restores every step already taken — `queued_successor_role` back in `Successor`, the reservation cancelled — and returns `Err` with nothing moved and nothing dropped. The existing seam reserves after `attach` with `?`, which drops the attached resources; the split version must not inherit that. Since the existing `managed_dispatch_direct_successor` becomes prepare + bind, it gets the fixed order too. This fixes a latent 2c-i defect, which is hard to reach because the seam checks `is_vacant(OrdinaryRetirement)` first; name it in your report.
 1. prepare + bind is observably identical to the old `managed_dispatch_direct_successor` (same roles, same occupancy, same `reserved_retirements` entry).
 2. prepare + undo leaves `DirectCapacity` exactly as before prepare: the same roles occupied, the successor charged as `Successor` again, no `OrdinaryRetirement` reservation, and admission **not** closed.
 3. Nothing is bare-dropped on any path.
@@ -154,7 +166,7 @@ impl KmsBackend {
 - `c0_adm_conductor_seam_undo_restores_the_successor_charge` — with a current direct frame (so prepare pre-reserves retirement) and a prepared successor: record `occupied()` and the successor's role before prepare; prepare, then undo; `occupied()` equals the recorded value, `queued_successor_role` is `Some` with role `Successor`, `OrdinaryRetirement` is vacant, `is_admission_closed()` is false.
 - `c0_adm_conductor_seam_prepare_then_bind_matches_the_old_seam` — the same fixture twice: once through `managed_dispatch_direct_successor(commit)`, once through prepare + bind with the same `commit`; roles, occupancy and `reserved_retirements` keys agree.
 - The existing `c0_2ci_backend_managed_dispatch_direct_successor_charges_submitted_then_retires` must still pass unmodified.
-- `c0_adm_conductor_begin_with_ledger_returns_the_builder_uncalled_on_refusal` — an owner whose slot is already occupied, and a separate case with a description `begin` rejects (e.g. `page_flip_event = true`). In both cases the builder is a closure that records whether it ran: `begin_with_ledger` returns `Err` with the builder, and the builder never ran. With a free slot and a valid description it runs exactly once, with the returned `CommitId`.
+- `c0_adm_conductor_begin_with_ledger_returns_the_builder_uncalled_on_refusal` — an owner-level test (in `device.rs`'s test module, where the private fields are reachable) with **one case per refusal point of `begin_with_context`, in its order**: the legacy transport (`new_legacy` owner), identity exhaustion (force `next_seq` to `u64::MAX`, as `sequence_exhaustion_refuses_without_reserving` does), a description `build_atomic_request_with_modeset` rejects, a completion context `begin` rejects (e.g. `page_flip_event = true`), and an occupied slot. The builder is a closure that records whether it ran **and owns a non-empty value whose drop is observable**. In each case `begin_with_ledger` returns `Err` with the builder, the builder never ran, and the owned value is intact inside it. With a free slot and a valid description the builder runs exactly once, with the returned `CommitId`.
 
 - [ ] **Step 1:** Write the two tests. **Step 2:** run and record the failure. **Step 3:** split the seam. **Step 4:** gate. **Step 5:** stop dirty and report.
 
@@ -254,6 +266,8 @@ pub(crate) enum AdmissionOutcome {
     BeginRefused(/* the DispatchError or its kind */),
     SendRefused(RefusalCause),
     TransportClosed,                        // lock mismatch
+    PreparationRefused,                     // direct prepare returned Err or Ok(None) after lock
+    Unsupported(Tier),                      // topology/unflip admitted; aborted, left queued
 }
 ```
 
@@ -261,7 +275,8 @@ Building the request:
 
 - **Composed:** `describe` + `composed_resources`; the ledger is `Submitted::new(old, new)` with `old` = `commit_consumer.take_current()` and `new` = the source's resources.
 - **Direct:** `managed_prepare_direct_dispatch`, then `begin_with_ledger` with a builder that takes the current state (`commit_consumer.take_current()`), stamps the prepared resources with the `CommitId`, and returns `Submitted::new(old, vec![resources])`. After `Ok`, key the retirement reservation by the `CommitId` (`prereserve_retirement`). On `Err((error, builder))` the builder is uncalled: nothing was taken, so undo the prepared seam and abort.
-- **Composed** uses `begin_with_ledger` the same way, so a refused `begin` never takes or drops the current state.
+- **Composed** uses `begin_with_ledger` the same way: **both** `commit_consumer.take_current()` and `source.composed_resources(..)` are called **inside** the builder (round-2 M-1), so a refused `begin` never takes the current state and never takes resources from the source.
+- **Direct preparation after `lock`:** if `managed_prepare_direct_dispatch` returns `Err` or `Ok(None)`, `abort` the token and return `PreparationRefused`. Transactional prepare means nothing was moved. The successor stays queued, and there is no retry.
 - **Topology and unflip admissions:** out of A2's dispatch — if the decider admits one, return it **unconsumed** (`abort`) with an outcome that says so. A1 proves their order; their commits are lifecycle/unflip work outside this plan. Report if this is not reachable as stated.
 
 **Invariants:**
@@ -279,6 +294,8 @@ Building the request:
 - `c0_adm_conductor_refusal_disposition_covers_every_pre_ipc_cause` — the conductor's refusal handling, driven with a constructed `DispatchError::Refused { cause, events }` for each of `Reaped`, `Stalled`, `AlreadyInFlight`, `ReservationMismatch`, `BoundaryViolation` and `TransportGateRefused`: each leaves the same state as the `Reaped` case. (Factor the handling so it can be driven this way; say how.)
 - `c0_adm_conductor_begin_refusal_undoes_the_seam` — a source whose `describe` returns a description `begin` rejects (e.g. `page_flip_event = true`, which `begin` refuses with `InvalidCompletionContext`): `BeginRefused`, the decider unchanged, the successor charge back in `Successor`, `current_resources` restored.
 - `c0_adm_conductor_send_refusal_restores_a_nonempty_current` — round-1 M-3: with direct A **current** (its `CommitResources` holding the `Current` role) and a ready successor B, a reaped executor: after the refusal, `current_resources` holds A again with role `Current`, B's resources went to `rejected_resources` still holding their role (2c-i's `consume` of `ResourcesReleased` records them there; nothing is bare-dropped), the pre-reserved `OrdinaryRetirement` was cancelled, and admission is not closed. Repeat with a composed admission over a non-empty current. If both shapes go through one event-consumption function, say so and show it.
+- `c0_adm_conductor_preparation_refusal_aborts_the_token` — a queued, ready direct successor; close `commit_consumer.capacity` admission (so prepare fails) after the snapshot is taken but before preparation (use a `#[cfg(test)]` hook between `lock` and prepare), then wake: `PreparationRefused`, the decider **not locked** afterwards, `sequence()` unchanged, the successor charge still `Successor`, nothing in `rejected_resources`. A second case makes prepare return `Ok(None)` the same way (occupy `OrdinaryRetirement` through the hook) with the same assertions.
+- `c0_adm_conductor_composed_begin_refusal_keeps_resources_with_the_source` — a composed admission whose source hands out non-empty resources (with an observable drop) and a description `begin` rejects: `BeginRefused`, the source's `composed_resources` was **never called**, `current_resources` untouched, nothing dropped.
 - `c0_adm_conductor_one_dispatch_per_wake` — two ready composed intents on different CRTCs: one wake dispatches one; a second wake returns `SlotBusy` while the first is in flight.
 - `c0_adm_conductor_lock_mismatch_closes_the_transport` — with a `#[cfg(test)]` hook that changes a generation between `decide` and `lock` (yours to add; the mismatch is otherwise unreachable on one thread): `TransportClosed`, the gate no longer `Owner`, the owner's slot free.
 
@@ -305,7 +322,10 @@ A device without an active conductor behaves exactly as today.
 
 **Prove the order with an operation trace** (round-1 M-2): observing the result afterwards cannot tell "enqueue, then admit" from "admit, then enqueue". Give the conductor a `#[cfg(test)]` trace, a `Vec` of steps appended as they happen — at least `Consumed(commit)`, `Enqueued { completions, skips }`, `Decided`, `Dispatched(commit)` — and have the handler record into it. The test asserts the exact sequence `Consumed(A) → Enqueued → Decided → Dispatched(C)`, the `Enqueued` entry naming A's completion and B's `Skip`. It then asserts that `drain_completed_present_events` returns A's completion before B's `Skip` and nothing of C, and that nothing was drained inside the handler. N11 must break the trace assertion and N12 the drain assertion.
 
-- [ ] **Step 1:** Write the test. **Step 2:** run and record the failure. **Step 3:** implement. **Step 4:** gate. **Step 5:** stop dirty and report.
+- `c0_adm_conductor_retirement_wake_refusal_publishes_the_skip` — direct A in flight, successor B queued and ready; the executor reaped **before** A's `CompletionRetired` is routed: the retirement wake tries B and gets `SendRefused(Reaped)`. Before the handler returns, `completed` holds A's completion then B's `Skip`; `deferred_successor_skips` is empty.
+- `c0_adm_conductor_retirement_wake_invalidation_publishes_the_skip` — the same, but B turns ineligible (`direct_eligible` false) before the retirement: the wake invalidates B; `completed` holds A's completion then B's `Skip`.
+
+- [ ] **Step 1:** Write the tests. **Step 2:** run and record the failure. **Step 3:** implement. **Step 4:** gate. **Step 5:** stop dirty and report.
 
 ---
 
@@ -335,6 +355,7 @@ impl KmsBackend {
 **Named tests:**
 
 - `c0_adm_conductor_layout_change_withdraws_the_queued_successor` — Owner; a queued, ready direct successor; `admission_note_layout_change`: the decider's direct slot is empty, the frame's event is idled once and its `Skip` deferred once, `occupied()` dropped by one, admission not closed, and no dispatch of that successor happened.
+- `c0_adm_conductor_layout_change_with_nothing_in_flight_publishes_the_skip` — no direct predecessor in flight, successor B queued; `admission_note_layout_change`: B's `Skip` is in `completed` when the call returns, not left in `deferred_successor_skips`.
 - `c0_adm_conductor_layout_change_blocks_retirement_promotion` — direct A in flight, successor B queued, a layout change, then `CompletionRetired` for A: B is not dispatched on the retirement wake, and its `Skip` is published after A's completion.
 
 - [ ] **Step 1:** Write the tests. **Step 2:** run and record the failure. **Step 3:** implement. **Step 4:** the full gate, including Task 5's additions. **Step 5:** stop dirty and report.
@@ -345,5 +366,5 @@ impl KmsBackend {
 
 1. Reads the diff against the task's interfaces and invariants, and checks that every named test sets up its stated scenario.
 2. Reruns the task's gate, including the five `c0_adm` runs.
-3. After Task 5: applies N1–N17 to **your** code, one at a time, confirms each run compiled, and records which tests fail. A survivor goes back as a finding naming the invariant and the mutation.
+3. After Task 5: applies N1–N20 to **your** code, one at a time, confirms each run compiled, and records which tests fail. A survivor goes back as a finding naming the invariant and the mutation.
 4. Commits each task with `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)` and `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
