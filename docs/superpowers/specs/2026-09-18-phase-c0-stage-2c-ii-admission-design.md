@@ -510,7 +510,7 @@ and the owner's executor.
   with the token, retirement ordering through the protocol ledger, the pre-IPC
   refusal disposition and withdrawal, invalidation on a layout change as a wake,
   and successor displacement through 2c-i's never-submitted path.
-- **Plan B — maintenance:** tickets and ageing, tiers 3, 4, 5 and 7, symmetric
+- **Plan B — maintenance**, split like A on 2026-09-18 (user's decision) into **B1**, the decider (`../plans/2026-09-18-phase-c0-stage-2c-ii-plan-b1-maintenance-decider.md`), and **B2**, the conductor's maintenance store, receipt and terminal routing. Its scope: tickets and ageing, tiers 3, 4, 5 and 7, symmetric
   absorption, the homogeneous bundle under the round-robin rule, the admission
   receipt and post-rejection handling (section 11.1), and the bounds measured
   under a continuous stream. Preceded by a codex round on sections 7 (receipt)
