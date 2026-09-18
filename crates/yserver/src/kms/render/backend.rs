@@ -51135,4 +51135,136 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn c0_adm_conductor_layout_change_withdraws_the_queued_successor() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 31);
+        let present_id = event.present_id;
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        let occupied_before = backend.commit_consumer.capacity.occupied();
+
+        let outcome = backend.admission_note_layout_change(device);
+
+        assert!(matches!(
+            outcome,
+            crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+        ));
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_none()
+        );
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert!(backend.scanout_m2.queued_successor_role.is_none());
+        assert_eq!(
+            backend.commit_consumer.capacity.occupied(),
+            occupied_before - 1
+        );
+        assert_eq!(backend.scanout_m2.idled.len(), 1);
+        assert_eq!(backend.scanout_m2.idled[0].present_id, present_id);
+        assert!(backend.scanout_m2.deferred_successor_skips.is_empty());
+        assert_eq!(backend.scanout_m2.completed.len(), 1);
+        assert_eq!(backend.scanout_m2.completed[0].present_id, present_id);
+        assert_eq!(
+            backend.scanout_m2.completed[0].completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert!(!backend.commit_consumer.capacity.is_admission_closed());
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert_eq!(backend.admission_conductors[&device].layout_generation, 1);
+        assert_eq!(
+            backend.admission_conductors[&device].admission.direct(),
+            None
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_layout_change_with_nothing_in_flight_publishes_the_skip() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 32);
+        let present_id = event.present_id;
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.completed.is_empty());
+        assert!(backend.scanout_m2.deferred_successor_skips.is_empty());
+
+        let _ = backend.admission_note_layout_change(device);
+
+        assert_eq!(backend.scanout_m2.completed.len(), 1);
+        assert_eq!(backend.scanout_m2.completed[0].present_id, present_id);
+        assert_eq!(
+            backend.scanout_m2.completed[0].completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert!(backend.scanout_m2.deferred_successor_skips.is_empty());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert!(backend.scanout_m2.queued_successor_role.is_none());
+    }
+
+    #[test]
+    fn c0_adm_conductor_layout_change_blocks_retirement_promotion() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let (commit_a, resources_a) = admission_stage_direct_predecessor(&mut backend, 33);
+        let (source_b, candidate_b, event_b) = admission_direct_candidate(&mut backend, 34);
+        let present_id_b = event_b.present_id;
+        assert!(
+            backend
+                .admission_offer_direct(device, source_b, candidate_b, event_b)
+                .expect("direct offer")
+        );
+
+        let _ = backend.admission_note_layout_change(device);
+        assert!(backend.scanout_m2.pending.is_some());
+        assert!(backend.scanout_m2.completed.is_empty());
+
+        backend.route_owner_event(
+            device,
+            admission_completion_retired_event(commit_a, resources_a),
+            std::time::Instant::now(),
+        );
+
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(backend.scanout_m2.completed.len(), 2);
+        assert_eq!(backend.scanout_m2.completed[0].present_id, 33);
+        assert_eq!(backend.scanout_m2.completed[1].present_id, present_id_b);
+        assert_eq!(
+            backend.scanout_m2.completed[1].completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert!(backend.scanout_m2.deferred_successor_skips.is_empty());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_none()
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
 }

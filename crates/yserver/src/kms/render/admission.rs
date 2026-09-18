@@ -267,6 +267,58 @@ impl KmsBackend {
         Ok(())
     }
 
+    /// Invalidate a queued direct successor whose layout generation is no
+    /// longer current, then give another ready primary the admission slot.
+    pub(crate) fn admission_note_layout_change(
+        &mut self,
+        device: DrmDeviceKey,
+    ) -> AdmissionOutcome {
+        if !self.admission_is_active(device) {
+            return AdmissionOutcome::Inert;
+        }
+
+        let Some(layout_generation) = self
+            .admission_conductors
+            .get(&device)
+            .and_then(|conductor| conductor.layout_generation.checked_add(1))
+        else {
+            if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                gate.force_close();
+            }
+            return AdmissionOutcome::TransportClosed;
+        };
+
+        let queued_source_generation = {
+            let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+                return AdmissionOutcome::Inert;
+            };
+            conductor.layout_generation = layout_generation;
+            conductor.admission.direct().and_then(|queued| {
+                (queued.successor.layout_generation != layout_generation)
+                    .then_some(queued.successor.source_generation)
+            })
+        };
+
+        if let Some(source_generation) = queued_source_generation {
+            let withdrawn = self
+                .admission_conductors
+                .get_mut(&device)
+                .and_then(|conductor| conductor.admission.withdraw_direct(source_generation));
+            if withdrawn.is_some() {
+                let terminalized =
+                    self.managed_terminalize_queued_direct_successor(Some(source_generation));
+                if !terminalized {
+                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                        gate.force_close();
+                    }
+                    return AdmissionOutcome::TransportClosed;
+                }
+            }
+        }
+
+        self.admission_wake(device, false)
+    }
+
     /// Build the readiness input consumed by A1. This is mutable because an
     /// ineligible direct successor is invalidated at the first snapshot that
     /// observes the lost eligibility.
