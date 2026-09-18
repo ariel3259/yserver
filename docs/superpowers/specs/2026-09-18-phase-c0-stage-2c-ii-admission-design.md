@@ -484,7 +484,7 @@ and the owner's executor.
   `../plans/2026-09-18-phase-c0-stage-2c-ii-plan-a1-decider.md` revision 3;
   implemented by codex in `3dadb11b`..`459de718`; 36 tests, 17 mutations all
   caught.
-- **Plan A2 — the conductor:** section 7 over A1's decider — assembling the
+- **Plan A2 — the conductor (done):** plan `../plans/2026-09-18-phase-c0-stage-2c-ii-plan-a2-conductor.md` revision 3; implemented by codex in `42a03c4e`..`dbed3b57`; 64 `c0_adm` tests, N1–N20 caught or type-enforced (finding `2026-09-18-stage-2c-ii-plan-a2-accepted.md`). Section 7 over A1's decider — assembling the
   snapshot from 2c-i's state (including direct eligibility), `begin`/`send_on`
   with the token, retirement ordering through the protocol ledger, the pre-IPC
   refusal disposition and withdrawal, invalidation on a layout change as a wake,
