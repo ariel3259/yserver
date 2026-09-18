@@ -77,3 +77,29 @@ This branch's hardware gate must run upstream's ignored hardware tests too —
 `render_acceptance` and the library's non-`c0_2ci` `_vulkan`/`_drm` tests — not
 only `c0_2ci`. A regression against an upstream test is exactly what a
 `c0_2ci`-only gate cannot see.
+
+## Validation of the fix (2026-09-18, `6f9a8989`)
+
+Run from tty2 as the seat's active session, Hyprland logged out, GPU idle
+beforehand (0 %, 10 MiB, no compute clients):
+
+| Suite | Result |
+| --- | --- |
+| `cargo test -p yserver --test render_acceptance -- --ignored` | **163 passed, 0 failed** — both regressions pass |
+| `cargo test -p yserver --lib c0_2ci -- --ignored --test-threads=1` | **21 passed, 0 failed** — the gamma no-master test now passes on a bare VT; the three part-3 tests still pass |
+| `cargo test -p yserver --lib -- --ignored --skip c0_2ci` | **73 passed, 0 failed** — every other library hardware test, upstream's scanout tests among them |
+
+257 hardware tests, 0 failures. `for_tests_with_vk_live_scene` is byte-for-byte
+upstream's `2ea40635` body.
+
+The R12 check left open by part 3 was also run: with another process holding
+`card1`'s master, `c0_2ci_sink_gamma_gate_four_states_master_drm` **fails**
+with the fixture's message instead of passing. That process was then confirmed
+gone and master free before the session ended.
+
+## The branch's hardware gate, from now on
+
+On this branch, "the hardware gate" means all three suites above, not only
+`c0_2ci`. A regression against an upstream test is exactly what a
+`c0_2ci`-only gate cannot see, and the two tests `f475b04c` broke stayed broken
+for six days because of that.
