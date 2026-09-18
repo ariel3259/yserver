@@ -18,6 +18,12 @@ real-path acceptance half and 4.3's generation-replacement half left open and
 recorded; see
 `docs/superpowers/findings/2026-09-17-stage-2c-i-debt-census-session-2.md`.**
 
+**Part 3 executed (2026-09-18): P3-1 and P3-4 proven on real kernel evidence,
+and 9.2's last paragraph answered by running the no-master gamma test's body
+with master (its Legacy arm then succeeds). P3-2 and P3-3 not proven — the F8
+stop of section 9.5. Not the section-16.3 delivery check (9.4). See
+`docs/superpowers/findings/2026-09-18-part-3-flip-accepted.md`.**
+
 ## 1. Why this stage exists
 
 Stage 2c-i was accepted on 2026-09-14 (`e00e5971`) with a recorded trade, not
