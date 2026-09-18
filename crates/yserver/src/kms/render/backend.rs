@@ -2631,6 +2631,34 @@ impl KmsBackend {
         true
     }
 
+    /// Retire the managed direct predecessor before a retirement admission
+    /// wake. The event remains in `completed` until the core drains it after
+    /// the handler returns. The retired frame keeps both pins while it is
+    /// current; only the previous current frame is released here.
+    pub(crate) fn managed_enqueue_retired_direct_completion(&mut self) -> (Vec<u64>, Vec<u64>) {
+        let mut completions = Vec::new();
+        if let Some(mut pending) = self.scanout_m2.pending.take() {
+            pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
+            pending.event.emit_idle = false;
+            completions.push(pending.event.present_id);
+            self.scanout_m2.completed.push(pending.event.clone());
+            if let Some(previous) = self.scanout_m2.current.replace(pending) {
+                self.release_direct_frame(previous);
+            }
+            self.scanout_m2.sync_ownership();
+        }
+        let skips = self
+            .scanout_m2
+            .deferred_successor_skips
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>();
+        self.scanout_m2
+            .completed
+            .append(&mut self.scanout_m2.deferred_successor_skips);
+        (completions, skips)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn managed_publish_deferred_successor_skips_if_no_predecessor(&mut self) {
         if self.scanout_m2.pending.is_none() {
@@ -19668,6 +19696,60 @@ impl KmsBackend {
                         service,
                     );
                 }
+            }
+            crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
+                let admission_active = self.admission_is_active(device_key);
+                let Some(service) = &mut self.resource_service else {
+                    if admission_active {
+                        log::error!(
+                            "owner completion retirement has no resource service for {device_key}"
+                        );
+                        if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
+                            gate.force_close();
+                        }
+                    }
+                    return;
+                };
+                if let Err(error) = self.commit_consumer.consume(
+                    crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources },
+                    service,
+                ) {
+                    if !admission_active {
+                        return;
+                    }
+                    log::error!(
+                        "owner completion retirement disposition failed for {device_key}: {error:?}"
+                    );
+                    if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
+                        gate.force_close();
+                    }
+                    return;
+                }
+                if !admission_active {
+                    return;
+                }
+
+                #[cfg(test)]
+                if let Some(conductor) = self.admission_conductors.get_mut(&device_key) {
+                    conductor.trace.push(
+                        crate::kms::render::admission::AdmissionTraceStep::Consumed(commit),
+                    );
+                }
+                #[cfg(test)]
+                {
+                    let (completions, skips) = self.managed_enqueue_retired_direct_completion();
+                    if let Some(conductor) = self.admission_conductors.get_mut(&device_key) {
+                        conductor.trace.push(
+                            crate::kms::render::admission::AdmissionTraceStep::Enqueued {
+                                completions,
+                                skips,
+                            },
+                        );
+                    }
+                }
+                #[cfg(not(test))]
+                self.managed_enqueue_retired_direct_completion();
+                let _ = self.admission_wake(device_key, true);
             }
             crate::kms::owner::device::OwnerEvent::SequenceArmFailed { key, .. } => {
                 if let Some(handle) =
@@ -49799,6 +49881,41 @@ mod tests {
         ));
     }
 
+    fn admission_stage_direct_predecessor(
+        backend: &mut super::KmsBackend,
+        present_id: u32,
+    ) -> (
+        crate::kms::owner::identity::CommitId,
+        crate::kms::render::resources::CommitResources,
+    ) {
+        let (source_id, candidate, event) = admission_direct_candidate(backend, present_id);
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(source_id, candidate, event)
+                .expect("predecessor preparation")
+        );
+        backend.managed_tag_queued_direct_successor(u64::MAX);
+        let commit =
+            crate::kms::owner::identity::CommitId::for_tests(12_000 + u64::from(present_id));
+        let resources = backend
+            .managed_dispatch_direct_successor(commit)
+            .expect("predecessor dispatch")
+            .expect("predecessor resources");
+        assert!(backend.managed_confirm_direct_dispatch(u64::MAX));
+        (commit, resources)
+    }
+
+    fn admission_completion_retired_event(
+        commit: crate::kms::owner::identity::CommitId,
+        resources: crate::kms::render::resources::CommitResources,
+    ) -> crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources> {
+        crate::kms::owner::device::OwnerEvent::CompletionRetired {
+            commit,
+            resources: crate::kms::owner::ledger::Submitted::new(Vec::new(), vec![resources])
+                .accepted(),
+        }
+    }
+
     fn admission_direct_candidate(
         backend: &mut super::KmsBackend,
         suffix: u32,
@@ -50833,6 +50950,188 @@ mod tests {
                 .device_owner_for_tests(0)
                 .slot()
                 .occupant()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_retirement_enqueues_then_admits_before_publication() {
+        use crate::kms::render::admission::AdmissionTraceStep;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let old_fallback_id = seed_window(&mut backend, 0xA800, None, 0, 0);
+        let (old_source_id, _, old_source_pin, old_fallback_pin) =
+            install_direct_frame_for_target_test(&mut backend, 0xA801, old_fallback_id, true);
+        let (commit_a, resources_a) = admission_stage_direct_predecessor(&mut backend, 1);
+        let (retired_source_pin, retired_fallback_pin) = {
+            let pending = backend.scanout_m2.pending.as_ref().expect("A is in flight");
+            (pending.source_pin, pending.fallback_target_pin)
+        };
+        let (source_b, candidate_b, event_b) = admission_direct_candidate(&mut backend, 2);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_b, candidate_b, event_b)
+                .expect("B offer")
+        );
+        let (source_c, candidate_c, event_c) = admission_direct_candidate(&mut backend, 3);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_c, candidate_c, event_c)
+                .expect("C offer")
+        );
+
+        backend.route_owner_event(
+            device,
+            admission_completion_retired_event(commit_a, resources_a),
+            std::time::Instant::now(),
+        );
+
+        let commit_c = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("C is live before publication")
+            .commit_id();
+        assert_eq!(
+            backend.admission_trace_for_tests(device),
+            vec![
+                AdmissionTraceStep::Consumed(commit_a),
+                AdmissionTraceStep::Enqueued {
+                    completions: vec![1],
+                    skips: vec![2],
+                },
+                AdmissionTraceStep::Decided,
+                AdmissionTraceStep::Dispatched(commit_c),
+            ]
+        );
+        assert_eq!(backend.scanout_m2.completed.len(), 2);
+        assert_eq!(backend.scanout_m2.completed[0].present_id, 1);
+        assert_eq!(backend.scanout_m2.completed[1].present_id, 2);
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .unwrap()
+                .event
+                .present_id,
+            3
+        );
+        let current = backend
+            .scanout_m2
+            .current
+            .as_ref()
+            .expect("the retired frame is now on screen");
+        assert_eq!(current.source_pin, retired_source_pin);
+        assert_eq!(current.fallback_target_pin, retired_fallback_pin);
+        assert!(
+            backend
+                .present_source_pins
+                .contains_key(&retired_source_pin)
+        );
+        assert!(
+            backend
+                .present_source_pins
+                .contains_key(&retired_fallback_pin)
+        );
+        assert!(!backend.present_source_pins.contains_key(&old_source_pin));
+        assert!(!backend.present_source_pins.contains_key(&old_fallback_pin));
+        assert_eq!(
+            backend
+                .store
+                .get(old_source_id)
+                .map(|drawable| drawable.refcount),
+            Some(1)
+        );
+        assert_eq!(
+            backend
+                .store
+                .get(old_fallback_id)
+                .map(|drawable| drawable.refcount),
+            Some(1)
+        );
+
+        let drained = <super::KmsBackend as Backend>::drain_completed_present_events(&mut backend);
+        assert_eq!(
+            drained
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(backend.scanout_m2.completed.is_empty());
+    }
+
+    #[test]
+    fn c0_adm_conductor_retirement_wake_refusal_publishes_the_skip() {
+        let mut backend = super::KmsBackend::for_tests();
+        admission_install_executor(
+            &mut backend,
+            crate::kms::owner::test_fixtures::reaped_executor_for_tests(),
+        );
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let (commit_a, resources_a) = admission_stage_direct_predecessor(&mut backend, 11);
+        let (source_b, candidate_b, event_b) = admission_direct_candidate(&mut backend, 12);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_b, candidate_b, event_b)
+                .expect("B offer")
+        );
+
+        backend.route_owner_event(
+            device,
+            admission_completion_retired_event(commit_a, resources_a),
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(backend.scanout_m2.completed.len(), 2);
+        assert_eq!(backend.scanout_m2.completed[0].present_id, 11);
+        assert_eq!(backend.scanout_m2.completed[1].present_id, 12);
+        assert!(backend.scanout_m2.deferred_successor_skips.is_empty());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+    }
+
+    #[test]
+    fn c0_adm_conductor_retirement_wake_invalidation_publishes_the_skip() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        install_admission_resource_service(&mut backend);
+        let (source, _, eligible) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let (commit_a, resources_a) = admission_stage_direct_predecessor(&mut backend, 21);
+        let (source_b, candidate_b, event_b) = admission_direct_candidate(&mut backend, 22);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_b, candidate_b, event_b)
+                .expect("B offer")
+        );
+        eligible.set(false);
+
+        backend.route_owner_event(
+            device,
+            admission_completion_retired_event(commit_a, resources_a),
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(backend.scanout_m2.completed.len(), 2);
+        assert_eq!(backend.scanout_m2.completed[0].present_id, 21);
+        assert_eq!(backend.scanout_m2.completed[1].present_id, 22);
+        assert!(backend.scanout_m2.deferred_successor_skips.is_empty());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
                 .is_none()
         );
     }

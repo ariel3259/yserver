@@ -25,6 +25,9 @@ use crate::{
     platform::drm::DrmDeviceKey,
 };
 
+#[cfg(test)]
+use crate::kms::owner::identity::CommitId;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AdmissionOutcome {
     Inert,
@@ -36,6 +39,18 @@ pub(crate) enum AdmissionOutcome {
     TransportClosed,
     PreparationRefused,
     Unsupported(Tier),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdmissionTraceStep {
+    Consumed(CommitId),
+    Enqueued {
+        completions: Vec<u64>,
+        skips: Vec<u64>,
+    },
+    Decided,
+    Dispatched(CommitId),
 }
 
 #[cfg(test)]
@@ -71,6 +86,8 @@ pub(crate) struct AdmissionConductor {
     pub(crate) prepare_hook: Option<AdmissionPreparationHook>,
     #[cfg(test)]
     pub(crate) force_lock_mismatch: bool,
+    #[cfg(test)]
+    pub(crate) trace: Vec<AdmissionTraceStep>,
 }
 
 #[allow(dead_code)]
@@ -86,13 +103,25 @@ impl AdmissionConductor {
             prepare_hook: None,
             #[cfg(test)]
             force_lock_mismatch: false,
+            #[cfg(test)]
+            trace: Vec::new(),
         }
     }
 }
 
 #[allow(dead_code)]
 impl KmsBackend {
-    fn admission_is_active(&self, device: DrmDeviceKey) -> bool {
+    #[cfg(test)]
+    pub(crate) fn admission_trace_for_tests(
+        &self,
+        device: DrmDeviceKey,
+    ) -> Vec<AdmissionTraceStep> {
+        self.admission_conductors
+            .get(&device)
+            .map_or_else(Vec::new, |conductor| conductor.trace.clone())
+    }
+
+    pub(crate) fn admission_is_active(&self, device: DrmDeviceKey) -> bool {
         self.admission_conductors.contains_key(&device)
             && self.platform.transport_gate(&device).is_some_and(|gate| {
                 gate.state() == crate::kms::render::resources::TransportState::Owner
@@ -374,6 +403,10 @@ impl KmsBackend {
                     None => AdmissionOutcome::NothingAdmissible,
                     Some(decision) => {
                         #[cfg(test)]
+                        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                            conductor.trace.push(AdmissionTraceStep::Decided);
+                        }
+                        #[cfg(test)]
                         self.admission_force_lock_mismatch_if_requested(device, &decision);
 
                         match self
@@ -465,7 +498,9 @@ impl KmsBackend {
             self.admission_abort(device, token);
             return AdmissionOutcome::BeginRefused;
         }
-        let _commit = commit.expect("successful begin has a commit id");
+        let commit = commit.expect("successful begin has a commit id");
+        #[cfg(not(test))]
+        let _ = commit;
         let send_result = {
             let device_entry = self
                 .platform
@@ -477,7 +512,16 @@ impl KmsBackend {
             owner.send_on(device_entry.executor.as_mut().expect("admission executor"))
         };
         match send_result {
-            Ok(_events) => self.admission_confirm(device, token, decision.admitted),
+            Ok(_events) => {
+                let outcome = self.admission_confirm(device, token, decision.admitted);
+                #[cfg(test)]
+                if matches!(outcome, AdmissionOutcome::Dispatched(_))
+                    && let Some(conductor) = self.admission_conductors.get_mut(&device)
+                {
+                    conductor.trace.push(AdmissionTraceStep::Dispatched(commit));
+                }
+                outcome
+            }
             Err(error @ DispatchError::Refused { .. }) => {
                 self.admission_dispose_refusal(device, token, decision.admitted, error)
             }
@@ -574,7 +618,16 @@ impl KmsBackend {
             owner.send_on(device_entry.executor.as_mut().expect("admission executor"))
         };
         match send_result {
-            Ok(_events) => self.admission_confirm(device, token, decision.admitted),
+            Ok(_events) => {
+                let outcome = self.admission_confirm(device, token, decision.admitted);
+                #[cfg(test)]
+                if matches!(outcome, AdmissionOutcome::Dispatched(_))
+                    && let Some(conductor) = self.admission_conductors.get_mut(&device)
+                {
+                    conductor.trace.push(AdmissionTraceStep::Dispatched(commit));
+                }
+                outcome
+            }
             Err(error @ DispatchError::Refused { .. }) => {
                 self.admission_dispose_refusal(device, token, decision.admitted, error)
             }
@@ -611,7 +664,12 @@ impl KmsBackend {
             Admitted::Direct { successor } => {
                 let confirmed_direct =
                     self.managed_confirm_direct_dispatch(successor.source_generation);
-                debug_assert!(confirmed_direct);
+                if !confirmed_direct {
+                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                        gate.force_close();
+                    }
+                    return AdmissionOutcome::TransportClosed;
+                }
             }
             Admitted::Topology { .. } | Admitted::Unflip { .. } => {
                 unreachable!("unsupported admissions are aborted before confirm")
