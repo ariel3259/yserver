@@ -6187,6 +6187,76 @@ impl KmsBackend {
         })?;
         let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
         base.platform.attach_test_vk_context(Arc::clone(&vk));
+        let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
+        let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
+        for (i, layout) in base.platform.outputs.iter().enumerate() {
+            let kms_device = base
+                .platform
+                .device_for_key(layout.key.device_key)
+                .expect("live-scene fixture output has a KMS owner");
+            let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
+                Arc::clone(&vk),
+                Rc::clone(&kms_device.device),
+                layout.scanout_route,
+                u32::from(layout.width),
+                u32::from(layout.height),
+                3,
+                &layout.output.scanout_modifiers,
+            )
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "render for_tests_with_vk_live_scene: ScanoutBoPool[{i}] {}x{}: {e}",
+                    layout.width, layout.height
+                ))
+            })?;
+            let n = pool.bos.len();
+            scanout_pools.push(Some(crate::kms::vk::scanout::OutputScanout::Shared(pool)));
+            bo_generations.push(vec![
+                crate::kms::render::platform::BoGenerationEntry::default(
+                );
+                n
+            ]);
+        }
+        base.platform.ops_command_pool = Some(ops_pool);
+        base.platform.fence_pool = Some(fence_pool);
+        base.platform.scanout_pools = scanout_pools;
+        base.platform.bo_generations = bo_generations;
+        base.engine =
+            crate::kms::render::engine::RenderEngine::new(&base.platform).map_err(|e| {
+                io::Error::other(format!(
+                    "render for_tests_with_vk_live_scene: RenderEngine: {e:?}"
+                ))
+            })?;
+        base.scene =
+            crate::kms::render::scene::SceneCompositor::new(&base.platform).map_err(|e| {
+                io::Error::other(format!(
+                    "render for_tests_with_vk_live_scene: SceneCompositor: {e:?}"
+                ))
+            })?;
+        base.init_root_storage();
+        Ok(base)
+    }
+
+    /// Vk-backed test fixture with a live scene compositor and test scanout
+    /// pools whose KMS device is a real primary DRM node. This is for tests
+    /// that exercise real `PRIME_FD_TO_HANDLE`/`ADDFB2`/`RMFB` ioctls.
+    #[doc(hidden)]
+    pub fn for_tests_with_vk_live_scene_real_drm() -> Result<Self, io::Error> {
+        use std::sync::Arc;
+
+        let mut base = Self::for_tests_seed();
+        let vk = crate::kms::vk::device::VkContext::new().map_err(|e| {
+            io::Error::other(format!(
+                "render for_tests_with_vk_live_scene: VkContext: {e:?}"
+            ))
+        })?;
+        let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
+            io::Error::other(format!(
+                "render for_tests_with_vk_live_scene: OpsCommandPool: {e:?}"
+            ))
+        })?;
+        let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
+        base.platform.attach_test_vk_context(Arc::clone(&vk));
 
         // F4-B2: `Device::for_tests()` is a Unix-socket stand-in and cannot
         // service `PRIME_FD_TO_HANDLE`/`ADDFB2`/`RMFB` -- every scanout-pool
@@ -6305,7 +6375,7 @@ impl KmsBackend {
         use ::drm::{ClientCapability, Device as DrmDevice};
 
         let exclusive = acquire_live_kms_fixture_guard();
-        let mut backend = Self::for_tests_with_vk_live_scene()?;
+        let mut backend = Self::for_tests_with_vk_live_scene_real_drm()?;
         let reported_primary = backend
             .platform
             .vk
@@ -41874,7 +41944,7 @@ mod tests {
         };
 
         let mut state = ServerState::new();
-        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene_real_drm() {
             Ok(b) => b,
             Err(e) => {
                 panic!("environmental skip: no live Vulkan ICD available ({e}); not claiming pass")
@@ -42182,7 +42252,7 @@ mod tests {
         };
 
         let mut state = ServerState::new();
-        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene_real_drm() {
             Ok(b) => b,
             Err(e) => {
                 panic!("environmental skip: no live Vulkan ICD available ({e}); not claiming pass")
