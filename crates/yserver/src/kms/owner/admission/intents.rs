@@ -348,6 +348,14 @@ impl Admission {
         self.composed.iter().map(|(&crtc, &intent)| (crtc, intent))
     }
 
+    pub(super) fn maintenance_intents(
+        &self,
+    ) -> impl Iterator<Item = (MaintenanceKey, MaintenanceIntent)> + '_ {
+        self.maintenance_slots
+            .iter()
+            .map(|(&key, &intent)| (key, intent))
+    }
+
     pub fn direct(&self) -> Option<&QueuedDirect> {
         self.direct.as_ref()
     }

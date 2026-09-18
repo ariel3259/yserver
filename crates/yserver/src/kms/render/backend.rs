@@ -49665,6 +49665,7 @@ mod tests {
         >,
         direct_eligible: std::rc::Rc<std::cell::Cell<bool>>,
         describe_page_flip: std::rc::Rc<std::cell::Cell<bool>>,
+        describe_calls: std::rc::Rc<std::cell::Cell<usize>>,
         composed_resource_calls: std::rc::Rc<std::cell::Cell<usize>>,
         composed_resource_dropped: std::rc::Rc<std::cell::Cell<bool>>,
     }
@@ -49687,6 +49688,7 @@ mod tests {
                 std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
             let describe_page_flip = std::rc::Rc::new(std::cell::Cell::new(false));
+            let describe_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
             (
@@ -49694,6 +49696,7 @@ mod tests {
                     readiness: std::rc::Rc::clone(&readiness),
                     direct_eligible: std::rc::Rc::clone(&direct_eligible),
                     describe_page_flip,
+                    describe_calls,
                     composed_resource_calls,
                     composed_resource_dropped,
                 }),
@@ -49716,12 +49719,14 @@ mod tests {
             std::rc::Rc<std::cell::Cell<bool>>,
             std::rc::Rc<std::cell::Cell<bool>>,
             std::rc::Rc<std::cell::Cell<usize>>,
+            std::rc::Rc<std::cell::Cell<usize>>,
             std::rc::Rc<std::cell::Cell<bool>>,
         ) {
             let readiness =
                 std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
             let describe_page_flip = std::rc::Rc::new(std::cell::Cell::new(false));
+            let describe_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
             (
@@ -49729,12 +49734,14 @@ mod tests {
                     readiness: std::rc::Rc::clone(&readiness),
                     direct_eligible: std::rc::Rc::clone(&direct_eligible),
                     describe_page_flip: std::rc::Rc::clone(&describe_page_flip),
+                    describe_calls: std::rc::Rc::clone(&describe_calls),
                     composed_resource_calls: std::rc::Rc::clone(&composed_resource_calls),
                     composed_resource_dropped: std::rc::Rc::clone(&composed_resource_dropped),
                 }),
                 readiness,
                 direct_eligible,
                 describe_page_flip,
+                describe_calls,
                 composed_resource_calls,
                 composed_resource_dropped,
             )
@@ -49772,6 +49779,7 @@ mod tests {
             &mut self,
             _admitted: &crate::kms::owner::admission::Admitted,
         ) -> crate::kms::owner::build::CommitDescription {
+            self.describe_calls.set(self.describe_calls.get() + 1);
             if self.describe_page_flip.get() {
                 crate::kms::owner::test_fixtures::single_active_crtc_with_present(1)
             } else {
@@ -50389,6 +50397,98 @@ mod tests {
     }
 
     #[test]
+    fn c0_adm_conductor_maintenance_carrying_tier6_is_unsupported() {
+        use crate::kms::owner::admission::{
+            CarriedMaintenance, IntentKey, MaintenanceClass, MaintenanceKey, Readiness,
+        };
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (
+            source,
+            _readiness,
+            _direct_eligible,
+            describe_page_flip,
+            describe_calls,
+            composed_resource_calls,
+            _composed_resource_dropped,
+        ) = AdmissionSourceFixture::new_with_controls();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("conductor")
+            .admission
+            .set_maintenance(gamma, 7, false)
+            .expect("gamma offer");
+
+        let mut snapshot = backend
+            .admission_snapshot(device, false)
+            .expect("owner snapshot");
+        snapshot.report(
+            IntentKey::Maintenance {
+                key: gamma,
+                generation: 7,
+            },
+            Readiness::Ready,
+        );
+        let decision = backend.admission_conductors[&device]
+            .admission
+            .decide(&snapshot)
+            .expect("tier-6 composed decision");
+        assert_eq!(decision.tier, crate::kms::owner::admission::Tier::Primary);
+        let mut carrying_decision = decision.clone();
+        carrying_decision.carried = vec![CarriedMaintenance {
+            key: gamma,
+            generation: 7,
+            ticket: backend.admission_conductors[&device]
+                .admission
+                .maintenance(gamma)
+                .expect("gamma intent")
+                .ticket,
+        }];
+
+        let token = backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("conductor")
+            .admission
+            .lock(decision.clone(), &snapshot)
+            .expect("lock");
+        assert_eq!(
+            backend.admission_abort_if_unsupported_for_tests(device, token, &carrying_decision),
+            crate::kms::render::admission::AdmissionOutcome::Unsupported(
+                crate::kms::owner::admission::Tier::Primary,
+            )
+        );
+        assert!(!backend.admission_conductors[&device].admission.is_locked());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .maintenance(gamma)
+                .is_some()
+        );
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .slot()
+                .occupant()
+                .is_none()
+        );
+        assert!(!describe_page_flip.get());
+        assert_eq!(describe_calls.get(), 0);
+        assert_eq!(composed_resource_calls.get(), 0);
+    }
+
+    #[test]
     fn c0_adm_conductor_pre_ipc_refusal_consumes_no_admission_state() {
         use crate::kms::owner::record::RefusalCause;
 
@@ -50681,7 +50781,8 @@ mod tests {
             .expect("spawn stub executor"),
         );
         install_admission_owner_gate(&mut backend, device);
-        let (source, _, _, describe_page_flip, _, _) = AdmissionSourceFixture::new_with_controls();
+        let (source, _, _, describe_page_flip, _, _, _) =
+            AdmissionSourceFixture::new_with_controls();
         backend.install_admission_conductor_for_tests(device, source);
         let idled_before = backend.scanout_m2.idled.len();
         let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 60);
@@ -50871,8 +50972,15 @@ mod tests {
         let mut backend = admission_backend_with_stub_executor();
         let device = backend.platform.primary_device().unwrap().key;
         install_admission_owner_gate(&mut backend, device);
-        let (source, _, _, describe_page_flip, composed_resource_calls, composed_resource_dropped) =
-            AdmissionSourceFixture::new_with_controls();
+        let (
+            source,
+            _,
+            _,
+            describe_page_flip,
+            _,
+            composed_resource_calls,
+            composed_resource_dropped,
+        ) = AdmissionSourceFixture::new_with_controls();
         backend.install_admission_conductor_for_tests(device, source);
         backend
             .admission_offer_composed(device, 1, 1)

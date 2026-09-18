@@ -25,7 +25,7 @@ mod intents;
 mod snapshot;
 mod token;
 
-pub use decide::{AdmissionDecision, Admitted, Tier};
+pub use decide::{AdmissionDecision, Admitted, CarriedMaintenance, Tier};
 pub use intents::{
     Admission, AdmissionTicket, ComposedIntent, DirectSuccessor, MaintenanceClass,
     MaintenanceIntent, MaintenanceKey, PrimaryOrdinal, QueuedDirect, Reentry, ReentryKind,

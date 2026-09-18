@@ -10,8 +10,8 @@ use crate::{
     kms::{
         owner::{
             admission::{
-                Admission, AdmissionError, AdmissionToken, Admitted, Confirmed, CrtcId,
-                DirectSuccessor, IntentKey, Readiness, ReadinessSnapshot, Tier, WaitReason,
+                Admission, AdmissionDecision, AdmissionError, AdmissionToken, Admitted, Confirmed,
+                CrtcId, DirectSuccessor, IntentKey, Readiness, ReadinessSnapshot, Tier, WaitReason,
             },
             build::CommitDescription,
             device::{DispatchError, OwnerEvent},
@@ -58,6 +58,21 @@ pub(crate) enum AdmissionTraceStep {
 pub(crate) enum AdmissionPreparationHook {
     CloseAdmission,
     OccupyOrdinaryRetirement,
+}
+
+fn decision_requires_unsupported(decision: &AdmissionDecision) -> bool {
+    !decision.carried.is_empty()
+        || decision.combined_primary.is_some()
+        || matches!(
+            decision.admitted,
+            Admitted::Maintenance { .. }
+                | Admitted::Bundle { .. }
+                | Admitted::CursorRecovery { .. }
+        )
+        || matches!(
+            decision.tier,
+            Tier::DirectSuccessor | Tier::AgedMaintenance | Tier::Bundle | Tier::Maintenance
+        )
 }
 
 /// What 2c-ii cannot observe because producers are converted in 2c-iii.
@@ -468,18 +483,29 @@ impl KmsBackend {
                             .admission
                             .lock(decision.clone(), &snapshot)
                         {
-                            Ok(token) => match decision.admitted.clone() {
-                                Admitted::Topology { .. } | Admitted::Unflip { .. } => {
-                                    self.admission_abort(device, token);
-                                    AdmissionOutcome::Unsupported(decision.tier)
+                            Ok(token) => {
+                                if decision_requires_unsupported(&decision) {
+                                    self.admission_abort_unsupported(device, token, &decision)
+                                } else {
+                                    match decision.admitted.clone() {
+                                        Admitted::Topology { .. } | Admitted::Unflip { .. } => {
+                                            self.admission_abort(device, token);
+                                            AdmissionOutcome::Unsupported(decision.tier)
+                                        }
+                                        Admitted::Composed { .. } => self
+                                            .admission_dispatch_composed(device, token, decision),
+                                        Admitted::Direct { .. } => {
+                                            self.admission_dispatch_direct(device, token, decision)
+                                        }
+                                        Admitted::Maintenance { .. }
+                                        | Admitted::Bundle { .. }
+                                        | Admitted::CursorRecovery { .. } => {
+                                            self.admission_abort(device, token);
+                                            AdmissionOutcome::Unsupported(decision.tier)
+                                        }
+                                    }
                                 }
-                                Admitted::Composed { .. } => {
-                                    self.admission_dispatch_composed(device, token, decision)
-                                }
-                                Admitted::Direct { .. } => {
-                                    self.admission_dispatch_direct(device, token, decision)
-                                }
-                            },
+                            }
                             Err(_error) => {
                                 self.platform
                                     .transport_gate_mut(&device)
@@ -497,6 +523,26 @@ impl KmsBackend {
             self.managed_publish_deferred_successor_skips_if_no_predecessor();
         }
         outcome
+    }
+
+    fn admission_abort_unsupported(
+        &mut self,
+        device: DrmDeviceKey,
+        token: AdmissionToken,
+        decision: &AdmissionDecision,
+    ) -> AdmissionOutcome {
+        self.admission_abort(device, token);
+        AdmissionOutcome::Unsupported(decision.tier)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_abort_if_unsupported_for_tests(
+        &mut self,
+        device: DrmDeviceKey,
+        token: AdmissionToken,
+        decision: &AdmissionDecision,
+    ) -> AdmissionOutcome {
+        self.admission_abort_unsupported(device, token, decision)
     }
 
     fn admission_dispatch_composed(
@@ -723,8 +769,12 @@ impl KmsBackend {
                     return AdmissionOutcome::TransportClosed;
                 }
             }
-            Admitted::Topology { .. } | Admitted::Unflip { .. } => {
-                unreachable!("unsupported admissions are aborted before confirm")
+            Admitted::Topology { .. }
+            | Admitted::Unflip { .. }
+            | Admitted::Maintenance { .. }
+            | Admitted::Bundle { .. }
+            | Admitted::CursorRecovery { .. } => {
+                return AdmissionOutcome::Unsupported(confirmed.decision.tier);
             }
         }
         AdmissionOutcome::Dispatched(confirmed)
