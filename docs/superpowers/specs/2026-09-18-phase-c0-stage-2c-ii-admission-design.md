@@ -471,19 +471,34 @@ The stage 2c design warns that **an empty maintenance queue is not evidence**, s
 those cases run with real test cursor and gamma payloads. The starvation bounds
 are asserted by the tests: exceeding one fails them.
 
-### 10.3. Two plans
+### 10.3. Three plans
 
-- **Plan A — primary:** slots and bounds, `PrimaryOrdinal`, readiness including
-  direct eligibility and its invalidation, tiers 1, 2 and 6 (including the
-  retirement successor's preference), per-CRTC round-robin, the
-  lock/confirm/abort token, and the conductor with retirement ordering.
+Plan A was split in two on 2026-09-18 (user's decision, by the plan-size rule):
+the decider needs no helper process, while the conductor works over `KmsBackend`
+and the owner's executor.
+
+- **Plan A1 — the decider (done):** slots and bounds, `PrimaryOrdinal`, the
+  readiness snapshot, tiers 1, 2 and 6 (including the retirement successor's
+  preference), the per-CRTC round-robin and the lock/confirm/abort token, in
+  `kms/owner/admission/`. Plan
+  `../plans/2026-09-18-phase-c0-stage-2c-ii-plan-a1-decider.md` revision 3;
+  implemented by codex in `3dadb11b`..`459de718`; 36 tests, 17 mutations all
+  caught.
+- **Plan A2 — the conductor:** section 7 over A1's decider — assembling the
+  snapshot from 2c-i's state (including direct eligibility), `begin`/`send_on`
+  with the token, retirement ordering through the protocol ledger, the pre-IPC
+  refusal disposition and withdrawal, invalidation on a layout change as a wake,
+  and successor displacement through 2c-i's never-submitted path.
 - **Plan B — maintenance:** tickets and ageing, tiers 3, 4, 5 and 7, symmetric
   absorption, the homogeneous bundle under the round-robin rule, the admission
   receipt and post-rejection handling (section 11.1), and the bounds measured
-  under a continuous stream.
+  under a continuous stream. Preceded by a codex round on sections 7 (receipt)
+  and 11.1.
 
-Each plan is reviewed by codex before implementation, and validated **task by
-task with each task's full gate** (fmt, clippy, tests), not as one prototype.
+Each plan is reviewed by codex before implementation and implemented by codex:
+the plan gives interfaces, invariants, named tests and the mutations they must
+catch, and the coordinator verifies each task's full gate (fmt, clippy, tests)
+and runs the mutations against the implementation.
 
 ### 10.4. Gate
 
