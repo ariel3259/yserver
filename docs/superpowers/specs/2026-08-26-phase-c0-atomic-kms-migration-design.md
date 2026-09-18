@@ -1588,20 +1588,28 @@ admissions, and owner dispatch latency. Finite topology/unflip/recovery barriers
 may interrupt this bound and are measured separately, but cannot reset surviving
 tickets.
 
-*(Amended 2026-09-18, stage 2c-ii design §11.1.)* A ticket is consumed when its
-admission crosses the send boundary. If the kernel then rejects the commit, the
-prior current state stays authoritative and each cursor or gamma generation that
-commit carried re-enters admission as desired state **with its original ticket,
-aged**, so the bound above still holds; `CompletionUnknown` re-enters the same
-way without counting as a rejection. If a newer generation of the same
-`(CRTC, class)` arrived meanwhile, it already holds a newer ticket; the slot keeps
-the newer payload with the **older** ticket, aged, and a fresh rejection count.
-A second kernel rejection of the **same** generation drops it: the desired state
-of that `(CRTC, class)` returns to its current state, so it blocks no primary. A
-dropped cursor raises the software-cursor recovery barrier of tier 2; a dropped
-gamma leaves the prior LUT authoritative and is recorded as a gamma-transport
-failure for that CRTC. The stage 2c-ii design (section 7) assigns the receipt
-that carries this state across the commit.
+*(Amended 2026-09-18, stage 2c-ii design §11.1; refined after that design's
+review round 3.)* A ticket is consumed when its admission crosses the send
+boundary.
+
+If the kernel then rejects the commit, the prior current state stays
+authoritative. Each cursor or gamma generation that commit carried re-enters
+admission as desired state **with its original ticket, aged**. Rejections are
+counted **per `(CRTC, class)` identity**: a newer generation that arrived
+meanwhile keeps the newer payload, takes the **older** ticket and **inherits the
+count**, and only a completed commit resets the count. The identity's **second
+consecutive rejection** drops its pending generation. The desired state then
+returns to the current one, so it blocks no primary. A dropped cursor raises the
+software-cursor recovery barrier of tier 2; a dropped gamma leaves the prior LUT
+authoritative and is recorded as a gamma-transport failure for that CRTC.
+
+`CompletionUnknown` is not counted as a rejection. Its carried payloads go to
+section 10's recovery as dormant desired state.
+
+Because a rejected identity keeps its ticket for one retry, the bound above
+becomes **`2(N - 1)`** older-ticket maintenance admissions instead of `N - 1`.
+The stage 2c-ii design (section 7) assigns the payloads to a conductor-owned
+maintenance store and the per-commit state to a receipt.
 
 Likewise, a continuously ready primary CRTC may not take two successive device
 slots while another CRTC has a ready primary intent. C.1 uses the inherited per-CRTC
@@ -2865,7 +2873,8 @@ applicable, hardware evidence is incomplete.
     identity and satisfies primary round-robin; a primary that cannot do so
     yields to the aged identity. Each of `N` incompatible aged
     `(CRTC,class)` identities is admitted after at most the already-submitted
-    commit plus `N - 1` older tickets. Latest-wins preserves the ticket, and
+    commit plus `N - 1` older tickets (`2(N - 1)` once a kernel rejection's
+    single retry is counted, per the §9.2.1 amendment of 2026-09-18). Latest-wins preserves the ticket, and
     cursor cannot starve gamma or another CRTC. In a qualified homogeneous
     group, two or more ready primary CRTCs enter tier 5 as one transaction before
     tier 6 can choose a singular round-robin replacement; no timer waits for a
@@ -3845,7 +3854,8 @@ redefine their terms or state transitions. C.0 is complete when:
   starving cursor, gamma, unflip, or another CRTC's ready primary work; global monotonic
   maintenance tickets are assigned at readiness, preserve age through
   latest-wins, age after losing one admission, and meet the normative `N - 1`
-  bound;
+  bound (`2(N - 1)` with the one retry after a kernel rejection, §9.2.1
+  amendment of 2026-09-18);
 - every synchronous admission, including retirement-promoted direct
   successors, absorbs only compatible changed persistent maintenance state,
   omits unchanged cursor planes and never absorbs coordinate intent; maintenance-

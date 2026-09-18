@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-ii — bounded intents and admission
 
-**Status:** design, revision 3 (2026-09-18). Its five design sections (units,
+**Status:** design, revision 4 (2026-09-18). Its five design sections (units,
 readiness, the decision, the conductor, verification — here sections 3–7 and 10)
 were approved one by one with the user in brainstorming, and the wlroots
 comparison (section 9) was requested there. Revision 2 incorporates codex round 1
@@ -10,7 +10,8 @@ major, all four verified against the tree and accepted): fairness per CRTC
 ready CRTC (B-3), barriers counted apart from the bound and ticket-lifecycle
 mutations (M-1). The one question C.0 did not answer is decided in section 11.1 and written into C.0 §9.2.1.
 Revision 3 incorporates codex round 2 (`../findings/2026-09-18-stage-2c-ii-design-review-round2.md`: 3 blocking, 1 major, all verified and accepted): tier 5 under the per-CRTC rule (B-1), direct eligibility and its invalidation (B-2), the admission receipt and post-drop progress (B-3), `PrimaryOrdinal` (M-1).
-Two implementation plans follow (section 10.3).
+Revision 4 incorporates codex round 3 (`../findings/2026-09-18-stage-2c-ii-design-review-round3.md`: 1 blocking, 1 major, 1 minor, all verified and accepted). B-1: rejections are counted per identity and the starvation bound becomes `1 + 2(N - 1)`, the user's refinement of section 11.1. M-1: a conductor-owned maintenance store holds the payloads. m-1: the conductor builds the receipt from `CommitId` and `Confirmed`.
+Implementation plans follow (section 10.3).
 
 **Authority**, most general first. This document elaborates the 2c-ii block; it
 does not replace or relax any of them.
@@ -251,8 +252,11 @@ timer waiting for a bundle.**
 **Bounds as invariants (C.0 §9.2.1):**
 
 - With `N` incompatible aged maintenance identities, each is admitted after at
-  most the one commit already submitted when it aged, `N - 1` older-ticket
-  maintenance admissions, and owner dispatch latency.
+  most the one commit already submitted when it aged, **`2(N - 1)`** older-ticket
+  maintenance admissions, and owner dispatch latency. The factor two comes from
+  section 11.1: an older identity the kernel rejects keeps its ticket and may be
+  admitted once more before its second consecutive rejection drops it. C.0's
+  original `N - 1` assumed no retry; the amendment changes it (round-3 B-1).
 - **Finite topology/unflip/recovery barriers may interrupt that bound.** They are
   counted separately and are not a violation; what they may never do is reset or
   reorder a surviving ticket.
@@ -340,25 +344,40 @@ cannot see a mismatch.
 2c-i's ledger. Its admission is already confirmed: the slot really was
 occupied.
 
-**The admission receipt.** `confirm(token)` returns an `AdmissionReceipt`: the
-`CommitId` plus, for each maintenance generation the commit carried, its
-`(CRTC, class, generation, original ticket, rejection count)`. The **conductor**
-owns it, keyed by `CommitId`, from confirmation until the owner reports that
-commit's terminal outcome. There is at most one, because there is at most one
-live transaction per device. What the terminal outcome does to it:
+**The maintenance store.** The decider holds only descriptors (section 2), so
+the payloads themselves — a cursor image, a gamma LUT, and whatever resources a
+stage-4 producer attaches to them — live in a **maintenance store owned by the
+conductor**, keyed by `(CRTC, class)`. Each key has up to three generations:
+**desired** (what the decider's slot names), **submitted** (moved into a live
+commit, held there until that commit's terminal outcome) and **current** (what
+the hardware shows). A payload has exactly one of these homes at a time. The
+decider's maintenance descriptor and the store's desired entry change together,
+the way the direct descriptor and the managed frame do (plan A2's two-sided
+transactions).
+
+**The admission receipt.** The **conductor** builds it from the owner's
+`CommitId` and A1's `Confirmed` when it confirms — the decider knows no commit
+ids, so `confirm` itself does not return it (round-3 m-1). For each maintenance
+generation the commit carried it records `(CRTC, class, generation, original
+ticket)`. The conductor owns it, keyed by `CommitId`, and intercepts that
+commit's `Terminal` event before forwarding the event to the resource consumer.
+There is at most one receipt, because there is at most one live transaction per
+device. What the terminal outcome does:
 
 | Owner outcome for the commit | Maintenance it carried |
 | --- | --- |
-| `Completed` | Becomes the current state of its `(CRTC, class)`; the receipt closes. |
-| `FailedBeforeSubmit(IoctlRejected { .. })` — the kernel rejected it | Prior current state stays authoritative. Each generation re-enters its desired slot **with its original ticket, aged**, rejection count + 1 (section 11.1). |
-| `CompletionUnknown(..)` | C.0 §10's recovery path decides what is current. Each generation re-enters as for a rejection, **without** incrementing the rejection count: a rejection is proven, an unknown is not, and C.0 §10 bounds repeated unknowns through quarantine and transport closure. |
+| `Completed` | Each carried generation moves from **submitted** to **current** in the store (the previous current payload is released); the receipt closes; the identity's rejection count (section 11.1) resets to zero. |
+| `FailedBeforeSubmit(IoctlRejected { .. })` — the kernel rejected it | The prior current stays authoritative. Each carried payload moves from **submitted** back to **desired** and re-enters admission **with its original ticket, aged**; the identity's rejection count goes up by one, and a second consecutive rejection drops it (section 11.1). |
+| `CompletionUnknown(..)` | C.0 §10 stops admission and runs recovery. Each carried payload is handed to that recovery as **dormant desired state**: it is not re-admitted while admission is stopped, and it is remapped or dropped with the topology, as C.0 §10 does for the rest of the desired state. The rejection count is unchanged, because an unknown outcome is not a proven rejection. |
 
 **Collision with a newer generation.** If a newer update to the same
-`(CRTC, class)` arrived while the commit was submitted, it already holds a new
-ticket (section 3). When the old generation re-enters, the slot keeps **the
-newer payload and the older of the two tickets**, aged, and the rejection count
-restarts at zero because it is a different generation. So a rejection never
-pushes that `(CRTC, class)` behind work it was ahead of.
+`(CRTC, class)` arrived while the commit was submitted, it is the desired
+payload and holds a new ticket (section 3). When the old generation comes back
+rejected, the old payload is released, and the desired slot keeps **the newer
+payload with the older of the two tickets**, aged. It also **inherits the
+identity's rejection count**: the count belongs to the `(CRTC, class)`, not to a
+generation (round-3 B-1). So a stream of newer generations cannot keep
+restarting a count that would never reach its limit.
 
 **Successor replacement.** When the decider returns a displaced generation, the
 conductor runs it through 2c-i's never-submitted path — idle exactly once,
@@ -462,8 +481,10 @@ confirmed to have compiled.
 | Tier 5 obeys the per-CRTC rule: after `A` alone, with `A` and `B` ready, `B` is served before an `A+B` bundle (round-2 B-1) | Skip the round-robin check in tier 5 |
 | A queued direct successor whose ancestor gains a border is invalidated and never committed, including when retirement promotes it (stage 2c v1.5.0 table; round-2 B-2) | Drop the layout/eligibility generation from the snapshot or from `lock` |
 | "Oldest ready primary" is decided by `PrimaryOrdinal` across composed and direct, and the ordinal survives replacement and `Waiting` (round-2 M-1) | Reassign the ordinal on replacement |
-| The receipt: kernel rejection re-enters with the original ticket, aged; `CompletionUnknown` re-enters without counting; collision keeps the older ticket (section 7, 11.1) | Issue a new ticket on re-entry; count an unknown as a rejection |
-| A second rejection drops the generation, and the CRTC's primary work then progresses within the bound; a cursor drop raises software-cursor recovery (section 11.1) | Keep the dropped generation pending; re-admit it a third time |
+| The receipt: kernel rejection re-enters with the original ticket, aged; `CompletionUnknown` hands the payload to recovery as dormant desired state without counting; collision keeps the older ticket and inherits the identity's count (section 7, 11.1) | Issue a new ticket on re-entry; count an unknown as a rejection; reset the count on collision |
+| `Completed` closes the receipt and promotes exactly the carried generation to current in the maintenance store (section 7, round-3 M-1) | Promote the desired generation instead of the carried one; leave the receipt open |
+| A second consecutive rejection of an identity drops its pending generation, and the CRTC's primary work then progresses within the bound; a cursor drop raises software-cursor recovery (section 11.1) | Keep the dropped generation pending; re-admit it a third time |
+| Two competing identities under continuous collision both progress within `1 + 2(N - 1)` (section 5, 11.1; round-3 B-1) | Count rejections per generation instead of per identity |
 | Fairness under a **continuous direct-successor stream** (stage 2c §7) | Drop ageing on loss |
 | Aged incompatible maintenance, symmetric absorption, **unchanged-cursor omission** (stage 2c §4) | Absorb an unchanged cursor |
 
@@ -540,13 +561,25 @@ generations the rejected commit carried. A new ticket could push them back
 indefinitely, and re-entering forever could loop on a payload the kernel always
 rejects.
 
-**Decision (user, 2026-09-18), written into C.0 §9.2.1:** each such generation
-re-enters admission as desired state **with its original ticket, aged**, so the
-starvation bound still holds. A **second** kernel rejection of the same
-generation marks it incompatible and drops it. The receipt that carries this
-state across the commit, and the collision rule with a newer generation, are in
-section 7. Round 2 (B-3) found that revision 2 named no owner for that state and
-left the post-drop state open; revision 3 closes both.
+**Decision (user, 2026-09-18), written into C.0 §9.2.1; refined by the user
+after round 3:** a generation the kernel rejects re-enters admission as desired
+state **with its original ticket, aged**. Rejections are counted **per
+`(CRTC, class)` identity, not per generation**. A newer generation inherits the
+count, and only a `Completed` resets it. The identity's **second consecutive
+rejection** drops its pending generation.
+
+Why per identity (round-3 B-1). With a per-generation count, and a newer
+generation keeping the older ticket with a fresh count, a stream of updates to
+one cursor could be rejected once each, forever. It would win the maintenance
+tier on its old ticket every time and starve every younger identity. Counting
+per identity caps each identity at two admissions on one ticket, so the bound in
+section 5 becomes `1 + 2(N - 1)` older-ticket admissions, and it holds under
+continuous collision.
+
+Where the state lives: the payloads are in section 7's maintenance store and
+the per-commit record is in section 7's receipt. Round 2 (B-3) found that
+revision 2 named no owner for that state; round 3 (M-1) found that revision 3
+still named no owner for the payloads. Revision 4 closes both.
 
 **After the drop — bounded progress.** Dropping sets the desired state of that
 `(CRTC, class)` back to its current state: nothing is pending for it, so it
@@ -560,11 +593,23 @@ incompatibility that holds the tiers forever. Then:
   as a gamma-transport failure. Surfacing it to the protocol is stage 4's,
   which owns the gamma producer.
 
-A newer generation for that `(CRTC, class)` starts clean: new ticket, rejection
-count zero.
+After a drop the slot is empty, so the next generation for that `(CRTC, class)`
+arrives as a new intent: new ticket, at the back of the queue. The rejection
+count stays at the identity until a `Completed` resets it. A third rejection in a
+row therefore drops again at once (a first rejection after a drop counts as the
+second consecutive one), and an identity the kernel keeps refusing cannot take
+more than one admission per ticket from the others.
 
-This belongs to plan B (tickets). Its exit criteria, in section 10.2: the
-receipt survives until the terminal outcome; re-entry keeps the original ticket
-and ages; a collision keeps the older ticket and the newer payload; a second
-rejection drops the generation **and** the affected CRTC's primary work is then
-admitted within the bound, with a cursor drop raising the recovery barrier.
+This belongs to plan B (tickets). Its exit criteria are in section 10.2:
+
+- the receipt survives until the terminal outcome, and `Completed` promotes
+  exactly the carried generation to current;
+- re-entry keeps the original ticket and ages;
+- a collision keeps the older ticket and the newer payload, and inherits the
+  identity's rejection count;
+- a second consecutive rejection of the identity drops its pending generation
+  **and** the affected CRTC's primary work is then admitted within the bound, with
+  a cursor drop raising the recovery barrier;
+- **two competing identities under continuous collision** — one rejected every
+  time, with a new generation arriving during each submission — both progress
+  within `1 + 2(N - 1)`.
