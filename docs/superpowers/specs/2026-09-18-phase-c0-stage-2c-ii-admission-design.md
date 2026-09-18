@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-ii — bounded intents and admission
 
-**Status:** design, revision 2 (2026-09-18). Its five design sections (units,
+**Status:** design, revision 3 (2026-09-18). Its five design sections (units,
 readiness, the decision, the conductor, verification — here sections 3–7 and 10)
 were approved one by one with the user in brainstorming, and the wlroots
 comparison (section 9) was requested there. Revision 2 incorporates codex round 1
@@ -9,6 +9,7 @@ major, all four verified against the tree and accepted): fairness per CRTC
 (B-1), the confirmation boundary moved to the send (B-2), tier 5 takes every
 ready CRTC (B-3), barriers counted apart from the bound and ticket-lifecycle
 mutations (M-1). The one question C.0 did not answer is decided in section 11.1 and written into C.0 §9.2.1.
+Revision 3 incorporates codex round 2 (`../findings/2026-09-18-stage-2c-ii-design-review-round2.md`: 3 blocking, 1 major, all verified and accepted): tier 5 under the per-CRTC rule (B-1), direct eligibility and its invalidation (B-2), the admission receipt and post-drop progress (B-3), `PrimaryOrdinal` (M-1).
 Two implementation plans follow (section 10.3).
 
 **Authority**, most general first. This document elaborates the 2c-ii block; it
@@ -109,7 +110,7 @@ at the first output.
 | Slot | Content | Replacement |
 | --- | --- | --- |
 | Composed desired | Monotonic scene/damage generation and its readiness | Newest wins; never a queue of rendered frames |
-| Direct successor | Source allocation generation and its readiness | Latest-wins; returns the displaced generation so the conductor runs it through 2c-i's never-submitted path |
+| Direct successor | Source allocation generation, **layout/eligibility generation** and topology generation, and its readiness | Latest-wins; returns the displaced generation so the conductor runs it through 2c-i's never-submitted path |
 | Unflip/recovery barrier | A request to restore the desktop | **Never** replaced; displaces incompatible unsent direct work (C.0 §9.1) |
 
 **Per CRTC, maintenance:** one desired cursor and one desired gamma, each with a
@@ -125,6 +126,16 @@ a surviving ticket (C.0 §9.2.1).
 `Successor` role; composed buffers by the existing pools; deferred `Skip`s by
 2c-i's protocol ledger. The decider knows only *which generation* occupies each
 slot.
+
+**Primary age (C.0 §9.2.1 "oldest ready primary").** Composed scene generations
+and direct allocation generations are different namespaces and cannot be
+compared, so each primary slot also carries a device-monotonic `PrimaryOrdinal`,
+assigned when the slot goes from empty to occupied. Like a maintenance ticket it
+**survives latest-wins replacement and periods of `Waiting`** (a primary that
+loses readiness to capacity pressure keeps its age), and is released when the
+slot's generation is admitted, withdrawn or terminalized. Ordinals are unique per
+device, so "oldest" is a total order across shapes and CRTCs with no further
+tie-break.
 
 **Bounds, each checkable:** per unit at most one composed, one successor and one
 barrier; per CRTC at most one cursor and one gamma; per device at most one live
@@ -144,7 +155,7 @@ reason serves telemetry and tests, never the decision.
 | Intent | Ready when |
 | --- | --- |
 | Composed | A reusable buffer exists in the pool — not retained by current, submitted or delayed-release ownership — and the producer's waits have finished (2c-i §6) |
-| Direct successor | Its source is ready (its pre-submit waits) **and** the ordinary-retirement position is free for the current state it will displace (2c-i §6); if that position is occupied it stays latest-wins but is not ready |
+| Direct successor | Its source is ready (its pre-submit waits), the ordinary-retirement position is free for the current state it will displace (2c-i §6), **and it is direct-eligible now**: its layout/eligibility generation is the current one and the current resolved paint chain passes `scanout_direct_eligible` (no border clip). If the position is occupied it stays latest-wins but is not ready; if eligibility is lost it is not ready and is invalidated (below) |
 | Unflip barrier | The **exit**-retirement position is available and the composed-return path — retained composed framebuffers, shadow materialization, waits — is established for every affected output (2c-i §6); it does not need the ordinary position |
 | Cursor / gamma | The payload is **compatible** with the current snapshot: its generations are still valid. A stale or incompatible payload cannot be absorbed (C.0 §9.2.1) |
 | Topology barrier | A lifecycle/topology request is waiting |
@@ -152,8 +163,17 @@ reason serves telemetry and tests, never the decision.
 **Wakes, and no timers.** Admission runs only when something concrete happens:
 a new intent; a source wait finishing; **release evidence** (a 2c-i role freed,
 a buffer returned to its pool); a retirement (`OwnerEvent::CompletionRetired`);
-a barrier set or cleared. There is **no retry on capacity pressure** (2c-i §6):
+a barrier set or cleared; **a geometry, layout or border change** that affects a
+queued direct successor; a commit's terminal outcome (section 7's receipt). There is **no retry on capacity pressure** (2c-i §6):
 when nothing is ready, nothing is scheduled, and the next real wake re-evaluates.
+
+**A queued direct successor that loses eligibility is invalidated**, not kept
+waiting (stage 2c, v1.5.0 table: "a geometry/layout change invalidates an
+earlier decision", including retirement-promoted successors). The conductor
+terminalizes it through 2c-i's never-submitted path — idle exactly once, the
+`Skip` deferred behind the predecessor — and the unit's composed desired state
+serves the output. A successor queued as eligible whose ancestor then gains a
+border must never reach a commit, by tier 3 or any other tier.
 
 **Compatibility is an input.** Whether a maintenance generation can be absorbed
 into a given primary request is reported by the snapshot; the decider does not
@@ -173,8 +193,8 @@ tiers in order and returns the first that applies:
 | 2 | Unflip/recovery | Ready, and needed to restore a visible/correct desktop |
 | 3 | Direct successor | Absorbs **every** aged maintenance identity that would otherwise win, **and** the round-robin rule permits every CRTC it covers |
 | 4 | Aged maintenance | Oldest ticket; stable `(CRTC, class)` tie-break |
-| 5 | Homogeneous bundle | At least two CRTCs of the qualified group ready, no barrier, all changed aged maintenance absorbed or serviced first; the bundle includes **every** ready CRTC of the group |
-| 6 | Primary | Oldest ready, round-robin per CRTC; the retirement successor is preferred when no different CRTC is owed the turn |
+| 5 | Homogeneous bundle | At least two CRTCs of the qualified group ready, no barrier, all changed aged maintenance absorbed or serviced first; the bundle includes **every** ready CRTC of the group, and the round-robin rule permits every CRTC in it |
+| 6 | Primary | Oldest ready by `PrimaryOrdinal` (section 3), round-robin per CRTC; the retirement successor is preferred when no different CRTC is owed the turn |
 | 7 | Non-aged maintenance | Oldest ticket |
 
 **The decision carries**, so that it can be confirmed and tested unambiguously:
@@ -204,9 +224,13 @@ arrival, keeping its original ticket. Barriers age the maintenance they overtake
 **Round-robin turn — per CRTC (C.0 §9.2.1).** Each CRTC records the sequence
 number of the last admission that carried a primary for it. A primary admission
 that covers several CRTCs (a grouped direct unit, a tier-5 bundle) marks
-**every** CRTC it includes as served. A candidate is eligible for tiers 3 and 6
-only if **none** of the CRTCs it covers would take a second successive slot while
-another CRTC has a ready primary and is owed service. So neither a composed
+**every** CRTC it includes as served. A candidate is eligible for tiers 3, 5
+and 6 only if **none** of the CRTCs it covers would take a second successive slot
+while another CRTC has a ready primary and is owed service. Tier 5 is no
+exception: after `A` is admitted alone, with `A` and `B` both ready, an `A+B`
+bundle would give `A` two successive slots, so tier 6 serves `B` first and the
+bundle becomes eligible after that. C.0 states the rule without an exception for
+bundles, and this design does not infer one (round-2 B-1). So neither a composed
 intent on a CRTC just served by a grouped commit, nor a grouped commit right
 after one of its CRTCs was served alone, can jump the queue.
 
@@ -254,7 +278,8 @@ The confirmation boundary is therefore **the send boundary, not `begin`**:
 
 1. `decide` is pure and changes nothing.
 2. `lock(decision) -> AdmissionToken` checks that every generation the decision
-   names is still current and marks one admission as pending. It consumes no
+   names — including a direct successor's layout/eligibility and topology
+   generations — is still current, and marks one admission as pending. It consumes no
    fairness state. While a token exists the decider refuses another `lock`. This
    is where a generation mismatch is detected — **before** anything is handed to
    the owner.
@@ -314,6 +339,26 @@ cannot see a mismatch.
 **After dispatch**, the commit follows the owner's normal lifecycle (C.0 §10) and
 2c-i's ledger. Its admission is already confirmed: the slot really was
 occupied.
+
+**The admission receipt.** `confirm(token)` returns an `AdmissionReceipt`: the
+`CommitId` plus, for each maintenance generation the commit carried, its
+`(CRTC, class, generation, original ticket, rejection count)`. The **conductor**
+owns it, keyed by `CommitId`, from confirmation until the owner reports that
+commit's terminal outcome. There is at most one, because there is at most one
+live transaction per device. What the terminal outcome does to it:
+
+| Owner outcome for the commit | Maintenance it carried |
+| --- | --- |
+| `Completed` | Becomes the current state of its `(CRTC, class)`; the receipt closes. |
+| `FailedBeforeSubmit(IoctlRejected { .. })` — the kernel rejected it | Prior current state stays authoritative. Each generation re-enters its desired slot **with its original ticket, aged**, rejection count + 1 (section 11.1). |
+| `CompletionUnknown(..)` | C.0 §10's recovery path decides what is current. Each generation re-enters as for a rejection, **without** incrementing the rejection count: a rejection is proven, an unknown is not, and C.0 §10 bounds repeated unknowns through quarantine and transport closure. |
+
+**Collision with a newer generation.** If a newer update to the same
+`(CRTC, class)` arrived while the commit was submitted, it already holds a new
+ticket (section 3). When the old generation re-enters, the slot keeps **the
+newer payload and the older of the two tickets**, aged, and the rejection count
+restarts at zero because it is a different generation. So a rejection never
+pushes that `(CRTC, class)` behind work it was ahead of.
 
 **Successor replacement.** When the decider returns a displaced generation, the
 conductor runs it through 2c-i's never-submitted path — idle exactly once,
@@ -414,6 +459,11 @@ confirmed to have compiled.
 | A ticket survives payload replacement (C.0 §9.2.1) | Reset the ticket on replacement |
 | An update arriving while its identity is submitted gets a **new** ticket (C.0 §9.2.1) | Reuse the consumed ticket |
 | A barrier interrupts the bound without resetting or reordering surviving tickets, and is counted apart (C.0 §9.2.1) | Reset relative age at a barrier; count barrier admissions against the maintenance bound |
+| Tier 5 obeys the per-CRTC rule: after `A` alone, with `A` and `B` ready, `B` is served before an `A+B` bundle (round-2 B-1) | Skip the round-robin check in tier 5 |
+| A queued direct successor whose ancestor gains a border is invalidated and never committed, including when retirement promotes it (stage 2c v1.5.0 table; round-2 B-2) | Drop the layout/eligibility generation from the snapshot or from `lock` |
+| "Oldest ready primary" is decided by `PrimaryOrdinal` across composed and direct, and the ordinal survives replacement and `Waiting` (round-2 M-1) | Reassign the ordinal on replacement |
+| The receipt: kernel rejection re-enters with the original ticket, aged; `CompletionUnknown` re-enters without counting; collision keeps the older ticket (section 7, 11.1) | Issue a new ticket on re-entry; count an unknown as a rejection |
+| A second rejection drops the generation, and the CRTC's primary work then progresses within the bound; a cursor drop raises software-cursor recovery (section 11.1) | Keep the dropped generation pending; re-admit it a third time |
 | Fairness under a **continuous direct-successor stream** (stage 2c §7) | Drop ageing on loss |
 | Aged incompatible maintenance, symmetric absorption, **unchanged-cursor omission** (stage 2c §4) | Absorb an unchanged cursor |
 
@@ -423,12 +473,14 @@ are asserted by the tests: exceeding one fails them.
 
 ### 10.3. Two plans
 
-- **Plan A — primary:** slots and bounds, readiness, tiers 1, 2 and 6 (including
-  the retirement successor's preference), round-robin, two-phase confirmation,
-  and the conductor with retirement ordering.
+- **Plan A — primary:** slots and bounds, `PrimaryOrdinal`, readiness including
+  direct eligibility and its invalidation, tiers 1, 2 and 6 (including the
+  retirement successor's preference), per-CRTC round-robin, the
+  lock/confirm/abort token, and the conductor with retirement ordering.
 - **Plan B — maintenance:** tickets and ageing, tiers 3, 4, 5 and 7, symmetric
-  absorption, the homogeneous bundle, and the bounds measured under a continuous
-  stream.
+  absorption, the homogeneous bundle under the round-robin rule, the admission
+  receipt and post-rejection handling (section 11.1), and the bounds measured
+  under a continuous stream.
 
 Each plan is reviewed by codex before implementation, and validated **task by
 task with each task's full gate** (fmt, clippy, tests), not as one prototype.
@@ -476,11 +528,28 @@ rejects.
 **Decision (user, 2026-09-18), written into C.0 §9.2.1:** each such generation
 re-enters admission as desired state **with its original ticket, aged**, so the
 starvation bound still holds. A **second** kernel rejection of the same
-generation marks it incompatible: it is dropped instead of re-admitted, and its
-CRTC is serviced under the incompatible-maintenance rules. A newer generation
-arriving meanwhile replaces it latest-wins and keeps the ticket.
+generation marks it incompatible and drops it. The receipt that carries this
+state across the commit, and the collision rule with a newer generation, are in
+section 7. Round 2 (B-3) found that revision 2 named no owner for that state and
+left the post-drop state open; revision 3 closes both.
 
-This belongs to plan B (tickets). Its exit criterion: a rejected commit's
-maintenance is re-admitted with its original ticket and aged (mutation: issue a
-new ticket), and a second rejection of the same generation drops it (mutation:
-re-admit it a third time).
+**After the drop — bounded progress.** Dropping sets the desired state of that
+`(CRTC, class)` back to its current state: nothing is pending for it, so it
+blocks no primary and no bundle, and it cannot become an unserviceable
+incompatibility that holds the tiers forever. Then:
+
+- **cursor** — the requested image cannot be shown on the plane, so the CRTC
+  gets the **software-cursor recovery** barrier C.0 §9.2.1 already defines
+  (tier 2), which restores a correct visible cursor;
+- **gamma** — the prior LUT stays authoritative; the drop is recorded per CRTC
+  as a gamma-transport failure. Surfacing it to the protocol is stage 4's,
+  which owns the gamma producer.
+
+A newer generation for that `(CRTC, class)` starts clean: new ticket, rejection
+count zero.
+
+This belongs to plan B (tickets). Its exit criteria, in section 10.2: the
+receipt survives until the terminal outcome; re-entry keeps the original ticket
+and ages; a collision keeps the older ticket and the newer payload; a second
+rejection drops the generation **and** the affected CRTC's primary work is then
+admitted within the bound, with a cursor drop raising the recovery barrier.
