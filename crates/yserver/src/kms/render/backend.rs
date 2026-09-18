@@ -1351,6 +1351,11 @@ impl PartialEq<PresentPinEntry> for crate::kms::render::store::DrawableId {
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
 /// that fill in across Stages 2b–2e. Paint / RENDER / scene ops
 /// log gaps until those substages land.
+pub(crate) struct PreparedDirectDispatch {
+    pub(crate) resources: crate::kms::render::resources::CommitResources,
+    pub(crate) retirement: Option<crate::kms::render::resources::RoleReservation>,
+}
+
 pub struct KmsBackend {
     /// Shared protocol-bookkeeping state. Identical to v1's
     /// `KmsBackend.core` — same struct, same construction path.
@@ -19771,6 +19776,150 @@ impl KmsBackend {
         Ok(true)
     }
 
+    /// Managed direct successor dispatch preparation seam (8.4), stopping
+    /// before the owner allocates a commit id. Retirement is reserved before
+    /// the queued successor is moved so every failure can restore the exact
+    /// pre-dispatch state without dropping an attached resource.
+    pub(crate) fn managed_prepare_direct_dispatch(
+        &mut self,
+    ) -> Result<Option<PreparedDirectDispatch>, crate::kms::render::resources::ResourceError> {
+        use crate::kms::render::resources::{CommitResources, DirectRole};
+
+        if self.scanout_m2.queued_successor_role.is_none() {
+            return Ok(None);
+        }
+        let displacing = !self.commit_consumer.current_resources.is_empty();
+        if displacing
+            && !self
+                .commit_consumer
+                .capacity
+                .is_vacant(DirectRole::OrdinaryRetirement)
+        {
+            self.commit_consumer.direct_admission_scheduled = true;
+            return Ok(None);
+        }
+
+        // Reserve the retirement position while the successor is still in its
+        // queued role. The old order attached first and could drop it when
+        // this reservation failed.
+        let retirement = if displacing {
+            Some(
+                self.commit_consumer
+                    .capacity
+                    .reserve(DirectRole::OrdinaryRetirement)?,
+            )
+        } else {
+            None
+        };
+
+        let mut successor = self
+            .scanout_m2
+            .queued_successor_role
+            .take()
+            .expect("checked Some above");
+        if let Err(error) = self
+            .commit_consumer
+            .capacity
+            .move_role(&mut successor, DirectRole::Submitted)
+        {
+            self.scanout_m2.queued_successor_role = Some(successor);
+            if let Some(retirement) = retirement {
+                self.discharge_bare_reservation(retirement);
+            }
+            return Err(error);
+        }
+
+        let pending = CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new());
+        let resources = match self.commit_consumer.capacity.attach(successor, pending) {
+            Ok(resources) => resources,
+            Err((error, mut successor, _resources)) => {
+                // `attach` can only fail if the reservation table was already
+                // inconsistent. Restore the queued role on this path too.
+                if let Err(restore_error) = self
+                    .commit_consumer
+                    .capacity
+                    .move_role(&mut successor, DirectRole::Successor)
+                {
+                    self.commit_consumer.capacity.close_admission();
+                    successor.discharged = true;
+                    if let Some(retirement) = retirement {
+                        self.discharge_bare_reservation(retirement);
+                    }
+                    return Err(restore_error);
+                }
+                self.scanout_m2.queued_successor_role = Some(successor);
+                if let Some(retirement) = retirement {
+                    self.discharge_bare_reservation(retirement);
+                }
+                return Err(error);
+            }
+        };
+
+        Ok(Some(PreparedDirectDispatch {
+            resources,
+            retirement,
+        }))
+    }
+
+    /// Finish the part of the direct dispatch seam that depends on the owner
+    /// allocated commit id. The conductor splits these operations around
+    /// `DeviceCommitOwner::begin_with_ledger`.
+    pub(crate) fn managed_bind_direct_dispatch(
+        &mut self,
+        prepared: PreparedDirectDispatch,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> crate::kms::render::resources::CommitResources {
+        let PreparedDirectDispatch {
+            resources,
+            retirement,
+        } = prepared;
+        if let Some(retirement) = retirement {
+            self.commit_consumer
+                .prereserve_retirement(commit, retirement);
+        }
+        resources.with_commit_id(commit)
+    }
+
+    /// Undo a prepared direct dispatch after `begin` refused. The attached
+    /// Submitted role is finished, then a fresh reserved Successor token is
+    /// installed for the still-queued frame; the pre-reserved retirement is
+    /// discharged explicitly.
+    #[allow(dead_code)]
+    pub(crate) fn managed_undo_direct_dispatch(
+        &mut self,
+        mut prepared: PreparedDirectDispatch,
+    ) -> Result<(), crate::kms::render::resources::ResourceError> {
+        use crate::kms::render::resources::DirectRole;
+
+        let submitted = prepared
+            .resources
+            .direct_role
+            .take()
+            .expect("prepared dispatch owns the Submitted role");
+        if let Err((error, mut submitted)) = self.commit_consumer.capacity.finish_role(submitted) {
+            submitted.discharged = true;
+            if let Some(retirement) = prepared.retirement.take() {
+                self.discharge_bare_reservation(retirement);
+            }
+            return Err(error);
+        }
+
+        let successor = match self.commit_consumer.capacity.reserve(DirectRole::Successor) {
+            Ok(successor) => successor,
+            Err(error) => {
+                if let Some(retirement) = prepared.retirement.take() {
+                    self.discharge_bare_reservation(retirement);
+                }
+                return Err(error);
+            }
+        };
+        self.scanout_m2.queued_successor_role = Some(successor);
+        if let Some(retirement) = prepared.retirement {
+            self.discharge_bare_reservation(retirement);
+        }
+        Ok(())
+    }
+
     /// Managed direct successor dispatch seam (8.4).
     ///
     /// Promotes the queued successor's `Successor` charge to `Submitted`,
@@ -19795,62 +19944,10 @@ impl KmsBackend {
         Option<crate::kms::render::resources::CommitResources>,
         crate::kms::render::resources::ResourceError,
     > {
-        if self.scanout_m2.queued_successor_role.is_none() {
+        let Some(prepared) = self.managed_prepare_direct_dispatch()? else {
             return Ok(None);
-        }
-        let displacing = !self.commit_consumer.current_resources.is_empty();
-        if displacing
-            && !self
-                .commit_consumer
-                .capacity
-                .is_vacant(crate::kms::render::resources::DirectRole::OrdinaryRetirement)
-        {
-            // 8.4: keep the latest Successor queued and register a service
-            // wake rather than dispatching over an occupied retirement slot.
-            self.commit_consumer.direct_admission_scheduled = true;
-            return Ok(None);
-        }
-
-        let mut slot = self
-            .scanout_m2
-            .queued_successor_role
-            .take()
-            .expect("checked Some above");
-        if let Err(err) = self.commit_consumer.capacity.move_role(
-            &mut slot,
-            crate::kms::render::resources::DirectRole::Submitted,
-        ) {
-            self.scanout_m2.queued_successor_role = Some(slot);
-            return Err(err);
-        }
-
-        let pending = crate::kms::render::resources::CommitResources::new(
-            Vec::new(),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-        )
-        .with_commit_id(commit);
-        let attached = match self.commit_consumer.capacity.attach(slot, pending) {
-            Ok(res) => res,
-            Err((err, slot, _res)) => {
-                self.scanout_m2.queued_successor_role = Some(slot);
-                return Err(err);
-            }
         };
-
-        if displacing {
-            let retire_slot = self
-                .commit_consumer
-                .capacity
-                .reserve(crate::kms::render::resources::DirectRole::OrdinaryRetirement)?;
-            self.commit_consumer
-                .prereserve_retirement(commit, retire_slot);
-        }
-
-        Ok(Some(attached))
+        Ok(Some(self.managed_bind_direct_dispatch(prepared, commit)))
     }
 
     /// Managed direct unflip / exit-resource accounting seam (8.5).
@@ -48921,6 +49018,165 @@ mod tests {
                 .expect("failed prepare must not discharge the existing successor")
                 .serial(),
             serial_b
+        );
+    }
+
+    fn backend_with_current_and_successor_for_admission_seam() -> super::KmsBackend {
+        use crate::kms::{
+            owner::identity::{CommitId, IncarnationId},
+            render::resources::ResourceService,
+        };
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device_key = backend.platform.primary_device().unwrap().key;
+        let mut service = ResourceService::new(device_key, IncarnationId::from_raw(1));
+
+        let (id_a, candidate_a, event_a) =
+            managed_prepare_ready_candidate(&mut backend, 0x7301, 0x7302, 40, 1);
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(id_a, candidate_a, event_a)
+                .unwrap()
+        );
+        let resources_a = backend
+            .managed_dispatch_direct_successor(CommitId::for_tests(9301))
+            .unwrap()
+            .expect("dispatch current frame");
+        backend
+            .commit_consumer
+            .consume(
+                crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                    commit: CommitId::for_tests(9301),
+                    resources: crate::kms::owner::ledger::Submitted::new(
+                        Vec::new(),
+                        vec![resources_a],
+                    )
+                    .accepted(),
+                },
+                &mut service,
+            )
+            .unwrap();
+
+        let (id_b, candidate_b, event_b) =
+            managed_prepare_ready_candidate(&mut backend, 0x7303, 0x7304, 40, 2);
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(id_b, candidate_b, event_b)
+                .unwrap()
+        );
+        backend
+    }
+
+    #[test]
+    fn c0_adm_conductor_seam_undo_restores_the_successor_charge() {
+        use crate::kms::render::resources::DirectRole;
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let occupied = backend.commit_consumer.capacity.occupied();
+        let successor_role = backend
+            .scanout_m2
+            .queued_successor_role
+            .as_ref()
+            .expect("the fixture has a queued successor")
+            .role();
+        assert_eq!(successor_role, DirectRole::Successor);
+
+        let prepared = backend
+            .managed_prepare_direct_dispatch()
+            .expect("prepare")
+            .expect("successor should be dispatchable");
+        backend
+            .managed_undo_direct_dispatch(prepared)
+            .expect("undo");
+
+        assert_eq!(backend.commit_consumer.capacity.occupied(), occupied);
+        assert_eq!(
+            backend
+                .scanout_m2
+                .queued_successor_role
+                .as_ref()
+                .expect("undo restores the successor charge")
+                .role(),
+            DirectRole::Successor
+        );
+        assert!(
+            backend
+                .commit_consumer
+                .capacity
+                .is_vacant(DirectRole::OrdinaryRetirement)
+        );
+        assert!(!backend.commit_consumer.capacity.is_admission_closed());
+    }
+
+    #[test]
+    fn c0_adm_conductor_seam_prepare_then_bind_matches_the_old_seam() {
+        use crate::kms::{owner::identity::CommitId, render::resources::DirectRole};
+
+        let commit = CommitId::for_tests(9302);
+        let mut old_seam = backend_with_current_and_successor_for_admission_seam();
+        let old_resources = old_seam
+            .managed_dispatch_direct_successor(commit)
+            .unwrap()
+            .expect("the old composition dispatches");
+
+        let mut split_seam = backend_with_current_and_successor_for_admission_seam();
+        let prepared = split_seam
+            .managed_prepare_direct_dispatch()
+            .expect("prepare")
+            .expect("the split seam dispatches");
+        let split_resources = split_seam.managed_bind_direct_dispatch(prepared, commit);
+
+        assert_eq!(
+            old_resources.direct_role.as_ref().unwrap().role(),
+            DirectRole::Submitted
+        );
+        assert_eq!(
+            split_resources.direct_role.as_ref().unwrap().role(),
+            DirectRole::Submitted
+        );
+        assert_eq!(
+            old_seam.commit_consumer.capacity.occupied(),
+            split_seam.commit_consumer.capacity.occupied()
+        );
+        assert_eq!(
+            old_seam
+                .scanout_m2
+                .queued_successor_role
+                .as_ref()
+                .map(|role| role.role()),
+            split_seam
+                .scanout_m2
+                .queued_successor_role
+                .as_ref()
+                .map(|role| role.role())
+        );
+        assert_eq!(
+            old_seam
+                .commit_consumer
+                .current_resources
+                .iter()
+                .map(|resources| resources.direct_role.as_ref().unwrap().role())
+                .collect::<Vec<_>>(),
+            split_seam
+                .commit_consumer
+                .current_resources
+                .iter()
+                .map(|resources| resources.direct_role.as_ref().unwrap().role())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            old_seam
+                .commit_consumer
+                .reserved_retirements
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            split_seam
+                .commit_consumer
+                .reserved_retirements
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
         );
     }
 

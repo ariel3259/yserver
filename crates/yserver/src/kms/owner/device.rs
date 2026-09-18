@@ -1325,18 +1325,43 @@ impl<R> DeviceCommitOwner<R> {
         ledger: Submitted<R>,
         context: CompletionContext,
     ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        self.begin_with_context_and_ledger(desc, |_| ledger, context)
+            .map_err(|(error, _ledger)| error)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn begin_with_context_and_ledger<F>(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: F,
+        context: CompletionContext,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), (DispatchError<R>, F)>
+    where
+        F: FnOnce(CommitId) -> Submitted<R>,
+    {
         if self.legacy_drain_permit.is_some() {
-            return Err(DispatchError::LegacyTransportActive);
+            return Err((DispatchError::LegacyTransportActive, ledger));
         }
-        let (commit, event_token, correlation) = self.next_correlation()?;
-        let (request, closure) = build_atomic_request_with_modeset(
+        let (commit, event_token, correlation) = match self.next_correlation() {
+            Ok(correlation) => correlation,
+            Err(error) => return Err((error, ledger)),
+        };
+        let (request, closure) = match build_atomic_request_with_modeset(
             desc,
             correlation,
             context.host_class,
             context.allow_modeset,
-        )?;
-        self.validate_completion_context(&closure, &context)?;
-        let proof = self.slot.reserve(commit)?;
+        ) {
+            Ok(request) => request,
+            Err(error) => return Err((error.into(), ledger)),
+        };
+        if let Err(error) = self.validate_completion_context(&closure, &context) {
+            return Err((error, ledger));
+        }
+        let proof = match self.slot.reserve(commit) {
+            Ok(proof) => proof,
+            Err(error) => return Err((error.into(), ledger)),
+        };
         let mut record = CommitRecord::new(
             commit,
             event_token,
@@ -1346,7 +1371,7 @@ impl<R> DeviceCommitOwner<R> {
             self.topology_generation,
             closure,
             correlation,
-            ledger,
+            ledger(commit),
             context,
         );
         record.attach_request(HostCallRequest::Atomic(request), proof);
@@ -1438,6 +1463,46 @@ impl<R> DeviceCommitOwner<R> {
             lifecycle_observed_max: None,
         };
         self.begin_with_context(desc, ledger, context)
+    }
+
+    /// `begin`, with the ledger built by `ledger(commit)` only after every
+    /// refusal point (transport, identity, build, completion context, slot).
+    /// On refusal the builder comes back uncalled, with the error.
+    #[allow(clippy::type_complexity)]
+    pub fn begin_with_ledger<F>(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: F,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), (DispatchError<R>, F)>
+    where
+        F: FnOnce(CommitId) -> Submitted<R>,
+    {
+        if desc.page_flip_event || !desc.present_consumers.is_empty() {
+            return Err((DispatchError::InvalidCompletionContext, ledger));
+        }
+        let closure = match AtomicCrtcClosure::compute(
+            &desc.objects,
+            &desc.crtc_state,
+            &desc.property_ids,
+            desc.page_flip_event,
+            &desc.present_consumers,
+        ) {
+            Ok(closure) => closure,
+            Err(error) => return Err((BuildError::from(error).into(), ledger)),
+        };
+        let mut mode_periods = BTreeMap::new();
+        for &crtc in closure.expected_completion() {
+            mode_periods.insert(crtc, None);
+        }
+        let context = CompletionContext {
+            class: CompletionClass::FastUpdate,
+            host_class: HostCallClass::SeatActiveNonblock,
+            allow_modeset: false,
+            clocks: BTreeMap::new(),
+            mode_periods,
+            lifecycle_observed_max: None,
+        };
+        self.begin_with_context_and_ledger(desc, ledger, context)
     }
 
     /// Cancel a live record before dispatch.
@@ -2657,6 +2722,172 @@ mod tests {
             events.is_empty(),
             "begin emits nothing; send_on emits Dispatched"
         );
+    }
+
+    #[test]
+    fn c0_adm_conductor_begin_with_ledger_returns_the_builder_uncalled_on_refusal() {
+        use std::{cell::Cell, rc::Rc};
+
+        struct DropProbe(Rc<Cell<u32>>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        fn assert_refusal<F>(
+            mut owner: DeviceCommitOwner<TestResource>,
+            desc: CommitDescription,
+            builder: F,
+            expected: impl FnOnce(&DispatchError<TestResource>) -> bool,
+            drops: &Rc<Cell<u32>>,
+            ran: &Rc<Cell<bool>>,
+        ) where
+            F: FnOnce(CommitId) -> Submitted<TestResource>,
+        {
+            let (error, builder) = owner
+                .begin_with_ledger(&desc, builder)
+                .expect_err("the refusal must return the builder");
+            assert!(expected(&error), "unexpected refusal: {error:?}");
+            assert!(!ran.get(), "the ledger builder ran on refusal");
+            assert_eq!(drops.get(), 0, "the builder's owned value was dropped");
+            drop(builder);
+            assert_eq!(drops.get(), 1, "the returned builder did not own its value");
+        }
+
+        // 1. Legacy transport refuses before identity allocation.
+        {
+            let drops = Rc::new(Cell::new(0));
+            let ran = Rc::new(Cell::new(false));
+            let probe = DropProbe(Rc::clone(&drops));
+            let builder_ran = Rc::clone(&ran);
+            let builder = move |_commit| {
+                builder_ran.set(true);
+                drop(probe);
+                ledger()
+            };
+            assert_refusal(
+                legacy_owner_for_tests(),
+                single_active_crtc(),
+                builder,
+                |error| matches!(error, DispatchError::LegacyTransportActive),
+                &drops,
+                &ran,
+            );
+        }
+
+        // 2. Identity exhaustion refuses before the request is built.
+        {
+            let drops = Rc::new(Cell::new(0));
+            let ran = Rc::new(Cell::new(false));
+            let probe = DropProbe(Rc::clone(&drops));
+            let builder_ran = Rc::clone(&ran);
+            let builder = move |_commit| {
+                builder_ran.set(true);
+                drop(probe);
+                ledger()
+            };
+            let mut owner = owner_for_tests();
+            owner.next_seq = u64::MAX;
+            assert_refusal(
+                owner,
+                single_active_crtc(),
+                builder,
+                |error| matches!(error, DispatchError::IdentityExhausted),
+                &drops,
+                &ran,
+            );
+        }
+
+        // 3. Atomic request construction refuses before completion validation.
+        {
+            let drops = Rc::new(Cell::new(0));
+            let ran = Rc::new(Cell::new(false));
+            let probe = DropProbe(Rc::clone(&drops));
+            let builder_ran = Rc::clone(&ran);
+            let builder = move |_commit| {
+                builder_ran.set(true);
+                drop(probe);
+                ledger()
+            };
+            let mut bad = single_active_crtc();
+            bad.objects[0].props = (0..1025).map(|property| (property, 0)).collect();
+            assert_refusal(
+                owner_for_tests(),
+                bad,
+                builder,
+                |error| matches!(error, DispatchError::Build(_)),
+                &drops,
+                &ran,
+            );
+        }
+
+        // 4. The begin-level completion context check refuses after building.
+        {
+            let drops = Rc::new(Cell::new(0));
+            let ran = Rc::new(Cell::new(false));
+            let probe = DropProbe(Rc::clone(&drops));
+            let builder_ran = Rc::clone(&ran);
+            let builder = move |_commit| {
+                builder_ran.set(true);
+                drop(probe);
+                ledger()
+            };
+            let mut page_event = single_active_crtc();
+            page_event.page_flip_event = true;
+            assert_refusal(
+                owner_for_tests(),
+                page_event,
+                builder,
+                |error| matches!(error, DispatchError::InvalidCompletionContext),
+                &drops,
+                &ran,
+            );
+        }
+
+        // 5. An occupied slot is the last refusal point.
+        {
+            let mut owner = owner_for_tests();
+            owner
+                .begin(&single_active_crtc(), ledger())
+                .expect("occupy slot");
+            let drops = Rc::new(Cell::new(0));
+            let ran = Rc::new(Cell::new(false));
+            let probe = DropProbe(Rc::clone(&drops));
+            let builder_ran = Rc::clone(&ran);
+            let builder = move |_commit| {
+                builder_ran.set(true);
+                drop(probe);
+                ledger()
+            };
+            assert_refusal(
+                owner,
+                single_active_crtc(),
+                builder,
+                |error| matches!(error, DispatchError::Slot(_)),
+                &drops,
+                &ran,
+            );
+        }
+
+        // A valid request invokes the builder exactly once, after reserving its
+        // commit identity, and passes that identity to it.
+        let mut owner = owner_for_tests();
+        let calls = Rc::new(Cell::new(0));
+        let seen_commit = Rc::new(Cell::new(None));
+        let builder_calls = Rc::clone(&calls);
+        let builder_commit = Rc::clone(&seen_commit);
+        let (commit, _) = match owner.begin_with_ledger(&single_active_crtc(), move |allocated| {
+            builder_calls.set(builder_calls.get() + 1);
+            builder_commit.set(Some(allocated));
+            ledger()
+        }) {
+            Ok(result) => result,
+            Err((error, _builder)) => panic!("a valid request should begin: {error:?}"),
+        };
+        assert_eq!(calls.get(), 1);
+        assert_eq!(seen_commit.get(), Some(commit));
     }
 
     #[test]
