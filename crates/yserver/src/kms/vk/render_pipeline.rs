@@ -107,6 +107,57 @@ pub const REPEAT_MODE_MASK: i32 = 0xff;
 /// `alpha_mask` is 0 (e.g. depth-24 RGB visuals).
 pub const REPEAT_FORCE_OPAQUE_BIT: i32 = 1 << 8;
 
+/// Colour write mask for a RENDER composite whose destination has no
+/// client-meaningful alpha channel — the **destination** half of the
+/// `REPEAT_FORCE_OPAQUE_BIT` rule.
+///
+/// On X11 a depth-24 drawable is opaque by definition: its picture
+/// format (`PICT_x8r8g8b8` / `PICT_r8g8b8`) declares `alpha_mask = 0`,
+/// so there is no alpha to store. Xorg gets this for free because
+/// pixman's representation has no alpha bits to write — storing an
+/// `a8r8g8b8` pixel into an `x8r8g8b8` image drops the alpha channel
+/// outright (`pixman-access.c:254-261`, `convert_channel` returns 0
+/// masked to 0 bits) and every fetch substitutes `0xff`
+/// (`pixman-access.c:270-276`, `def_value = ~0`). Xorg's own RENDER
+/// layer states the same invariant: `ReduceCompositeOp` treats
+/// `PICT_FORMAT_A(pDst->format) == 0` as "the destination alpha is
+/// always 1" (`render/picture.c:1456-1457`, `:1487-1488`).
+///
+/// We store depth-24 as `B8G8R8A8_UNORM`, which *does* have a real
+/// alpha byte, so the equivalence has to be enforced. The read side
+/// already is — [`PictOp::blend_factors`] substitutes `ONE`/`ZERO`
+/// for the `DST_ALPHA` factors when `dst_has_alpha` is false, and
+/// `DstReadback::view` binds an `a = ONE` swizzle for the shader-side
+/// blend. The **write** side was not: the fixed-function blend still
+/// evaluated the alpha channel and stored the result, so e.g.
+/// `PictOpOver` with a half-transparent source left `α = 127` in a
+/// depth-24 backing (measured on a mate-terminal frame) and
+/// `PictOpSrc` / `PictOpClear` left `α = 0`. A depth-32 compositing
+/// client then blends a hole X11 says cannot exist.
+///
+/// Masking α out of the colour write is the same mechanism
+/// `logic_fill_pipeline.rs:234-245` already uses for core fills under
+/// the `opaque_alpha` flag ("the L1 server-α invariant"): the blend
+/// equation is untouched, only the store is narrowed, so the
+/// destination keeps the opaque byte its storage was initialised
+/// with. This deliberately does NOT pin the fragment's α output —
+/// that was L1 task A.11, and it broke because the same α is the
+/// `SRC_ALPHA` blend factor (see `render.frag.glsl:306-315`).
+///
+/// `R8_UNORM` destinations are A8 pictures — alpha-only by
+/// definition, so they always write all (one) channel.
+#[must_use]
+pub fn dst_color_write_mask(
+    color_format: vk::Format,
+    dst_has_alpha: bool,
+) -> vk::ColorComponentFlags {
+    if color_format != vk::Format::R8_UNORM && !dst_has_alpha {
+        vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
+    } else {
+        vk::ColorComponentFlags::RGBA
+    }
+}
+
 impl RenderPushConsts {
     pub fn as_bytes(&self) -> &[u8] {
         // SAFETY: `repr(C)`, plain f32 fields, no padding.
@@ -841,10 +892,14 @@ fn build_pipeline(
     // and write the final premultiplied colour directly — disable
     // fixed-function blending. Standard ops use the per-op factor
     // table.
+    // Destination-side force-opaque: a depth-24 / xRGB destination
+    // has no client-meaningful α, so the composite must not store one.
+    // See `dst_color_write_mask`.
+    let write_mask = dst_color_write_mask(color_format, dst_has_alpha);
     let color_blend_attachments = if needs_dst_readback {
         [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(false)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)]
+            .color_write_mask(write_mask)]
     } else {
         let (src_factor, dst_factor) =
             op.blend_factors(color_format, dst_has_alpha, component_alpha);
@@ -856,7 +911,7 @@ fn build_pipeline(
             .src_alpha_blend_factor(src_factor)
             .dst_alpha_blend_factor(dst_factor)
             .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)]
+            .color_write_mask(write_mask)]
     };
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
@@ -912,4 +967,86 @@ fn create_shader_module(
     }
     let info = vk::ShaderModuleCreateInfo::default().code(&code);
     Ok(unsafe { device.create_shader_module(&info, None)? })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PictOp, dst_color_write_mask};
+    use ash::vk;
+
+    fn rgb() -> vk::ColorComponentFlags {
+        vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
+    }
+
+    /// The destination half of the X11 "a depth-24 drawable has no
+    /// alpha channel" rule.
+    ///
+    /// Oracle is Xorg, not our own encoder: pixman's `x8r8g8b8` has
+    /// zero alpha bits, so a store into it drops the channel outright
+    /// (`pixman-access.c:254-261` — `convert_channel` with
+    /// `n_to_bits == 0`), and RENDER's `ReduceCompositeOp` says the
+    /// destination alpha "is always 1" whenever
+    /// `PICT_FORMAT_A(pDst->format) == 0` (`render/picture.c:1487`).
+    /// Our BGRA8 storage has a real alpha byte, so the equivalent is
+    /// to never write it — otherwise `PictOpSrc` from a half-
+    /// transparent source leaves `α = 127` in a depth-24 backing
+    /// (the measured mate-terminal frame failure).
+    #[test]
+    fn a_no_alpha_destination_masks_alpha_out_of_the_colour_write() {
+        assert_eq!(
+            dst_color_write_mask(vk::Format::B8G8R8A8_UNORM, false),
+            rgb(),
+            "depth-24 / xRGB destination must not store an alpha byte",
+        );
+        assert_eq!(
+            dst_color_write_mask(vk::Format::B8G8R8A8_UNORM, true),
+            vk::ColorComponentFlags::RGBA,
+            "ARGB32 destination keeps its client-meaningful alpha",
+        );
+        assert_eq!(
+            dst_color_write_mask(vk::Format::R8_UNORM, true),
+            vk::ColorComponentFlags::RGBA,
+            "an A8 picture is alpha-only; its single channel is always written",
+        );
+        // Defensive: an R8 attachment can never be "no alpha" (see
+        // `dst_has_alpha_for_pict_format`), but if it somehow were,
+        // masking its only channel would drop the whole draw.
+        assert_eq!(
+            dst_color_write_mask(vk::Format::R8_UNORM, false),
+            vk::ColorComponentFlags::RGBA,
+            "R8 must never have its only channel masked out",
+        );
+    }
+
+    /// The *read* half of the same rule was already correct and must
+    /// stay that way — pinned here so the write-mask change above is
+    /// not mistaken for the whole invariant. A no-alpha destination
+    /// substitutes `ONE` / `ZERO` for the `DST_ALPHA` factor pair,
+    /// which is pixman's `def_value = ~0` alpha fetch
+    /// (`pixman-access.c:270-276`) expressed as blend state.
+    #[test]
+    fn a_no_alpha_destination_reads_dst_alpha_as_one() {
+        let bgra = vk::Format::B8G8R8A8_UNORM;
+        // In = (Ad, 0): with Ad == 1 the src factor is ONE.
+        assert_eq!(
+            PictOp::In.blend_factors(bgra, false, false),
+            (vk::BlendFactor::ONE, vk::BlendFactor::ZERO),
+            "PictOpIn over an opaque-by-definition dst is PictOpSrc",
+        );
+        // OverReverse = (1 - Ad, 1): with Ad == 1 the src factor is ZERO.
+        assert_eq!(
+            PictOp::OverReverse.blend_factors(bgra, false, false),
+            (vk::BlendFactor::ZERO, vk::BlendFactor::ONE),
+            "PictOpOverReverse over an opaque-by-definition dst is PictOpDst",
+        );
+        // Same ops against a real ARGB32 dst keep the DST_ALPHA reads.
+        assert_eq!(
+            PictOp::In.blend_factors(bgra, true, false),
+            (vk::BlendFactor::DST_ALPHA, vk::BlendFactor::ZERO),
+        );
+        assert_eq!(
+            PictOp::OverReverse.blend_factors(bgra, true, false),
+            (vk::BlendFactor::ONE_MINUS_DST_ALPHA, vk::BlendFactor::ONE),
+        );
+    }
 }

@@ -2787,18 +2787,24 @@ fn adjacent_trapezoids_share_horizontal_boundary_cleanly() {
     }
 }
 
-/// Regression for the xeyes-resize bug (2026-05-16): the user
-/// resizes the xeyes window larger; the new bigger eyes paint
-/// correctly but the OLD small-eye-white pixels at the original
-/// (smaller) positions remain visible in the upper-left of the
-/// window. Indicates the storage isn't being cleared on resize, or
-/// the clear doesn't cover the full new extent.
+/// From the xeyes-resize bug (2026-05-16): the user resizes the
+/// xeyes window larger; the new bigger eyes paint correctly but the
+/// OLD small-eye-white pixels at the original (smaller) positions
+/// remain visible in the upper-left. That is a window WITH a
+/// background, which X11 says to tile on a size change — pinned by
+/// `a_resize_still_retiles_a_window_that_has_a_background`.
 ///
-/// Test: create a 16×16 window, paint a red rect inside it,
-/// configure to 64×64, then get_image the new (bigger) storage at
-/// position (5, 5) — where the old red would still live if the
-/// resize-fill didn't run. Expect the safe-default depth-32 colour
-/// (transparent black), not red.
+/// This window has NO background, so #143 changed what it asserts:
+/// X11 leaves such a window's existing contents alone ("if no
+/// background is defined, the existing screen contents are not
+/// altered"; `mi/miexpose.c:438-440` returns before painting), so the
+/// red the client painted must SURVIVE the grow and only the region
+/// the grow added is initialised.
+///
+/// What it still pins is the storage-orphan regression the fixture was
+/// written for: the old storage's `destroy_now` must not remove
+/// `by_xid[xid]` after the new allocation re-installed it, or the
+/// `get_image` below comes back `None`.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn subwindow_resize_clears_old_paint() {
@@ -2861,9 +2867,8 @@ fn subwindow_resize_clears_old_paint() {
     .expect("configure_subwindow resize");
 
     // Read back the resized storage at (5, 5) — inside the OLD
-    // 16×16 region. Pre-3f.14 / pre-fix: still red (leftover old
-    // paint). 3f.14 expectation: depth-32 safe default
-    // (transparent black, BGRA = [0, 0, 0, 0]).
+    // 16×16 region, which #143 keeps, and at (30, 30), which the
+    // grow added and the storage init covers.
     //
     // get_image waits on its internal fence, which lets the
     // OLD storage's pending_retire entry actually retire via
@@ -2885,17 +2890,19 @@ fn subwindow_resize_clears_old_paint() {
     // (5, 5) is well-inside the old 16×16 footprint.
     assert_eq!(
         pixel(5, 5),
-        [0x00, 0x00, 0x00, 0x00],
-        "post-resize storage at (5,5) must be cleared to safe-default \
-         transparent black (got {:?}); old red would mean the resize-fill \
-         didn't cover this position",
+        [0x00, 0x00, 0xFF, 0xFF],
+        "post-resize storage at (5,5) must still hold the red the client \
+         painted (got {:?}): this window has no background, so nothing is \
+         allowed to alter its existing contents, and nothing will ask it to \
+         repaint them either",
         pixel(5, 5),
     );
     // (30, 30) is outside the old footprint, well inside the new.
     assert_eq!(
         pixel(30, 30),
         [0x00, 0x00, 0x00, 0x00],
-        "post-resize storage at (30,30) must also be cleared (got {:?})",
+        "the region the grow ADDED is initialised, never pool garbage \
+         (got {:?})",
         pixel(30, 30),
     );
 }
@@ -4548,6 +4555,138 @@ fn render_composite_depth24_src_samples_opaque_alpha() {
                 "dst ({x},{y}) α must be 0xFF (force-opaque); got {px:?}. \
                  Pre-fix this would be 0x00 — the depth-24 src padding byte.",
             );
+        }
+    }
+}
+
+/// Destination half of the same rule — sibling to
+/// `render_composite_depth24_src_samples_opaque_alpha` above, which
+/// covers the SOURCE side.
+///
+/// Bug: on X11 a depth-24 drawable has no alpha channel and is opaque
+/// by definition. Xorg gets that for free — pixman's `x8r8g8b8` has
+/// zero alpha bits, so a store drops the channel
+/// (`pixman-access.c:254-261`) and every fetch substitutes `0xff`
+/// (`:270-276`); RENDER states it outright, treating
+/// `PICT_FORMAT_A(pDst->format) == 0` as "the destination alpha is
+/// always 1" (`render/picture.c:1456-1457`, `:1487-1488`). We store
+/// depth-24 as `B8G8R8A8_UNORM`, which has a real alpha byte, and the
+/// composite pipeline wrote it: a `PictOpSrc` from a half-transparent
+/// source left `α = 127` in the backing. A depth-32 compositing
+/// client then blends a hole X11 says cannot exist.
+///
+/// Oracle values are the measured mate-terminal frame backing: body
+/// BGRA `(27, 21, 0)` with `α = 127` where it must be 255, and
+/// regions the client never painted reading `(0, 0, 0, 0)` instead of
+/// opaque black.
+///
+/// Storage-level, not a round trip through our own encoder:
+/// `get_image` on a depth-24 drawable is a verbatim memcpy of the
+/// BGRA8 storage (`pack_from_storage`'s `32 | 24` arm), so `px[3]`
+/// IS the stored alpha byte.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn render_composite_depth24_dst_keeps_opaque_alpha() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Step 1: depth-24 destination, 4×4, straight out of
+    // `create_pixmap` — NO paint of any kind yet.
+    let dst_pix = b.create_pixmap(None, 24, 4, 4).expect("create dst d24");
+    let dst_xid = dst_pix.as_raw();
+
+    let fresh = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("get_image fresh dst")
+        .expect("Some(fresh dst bytes)");
+    assert_eq!(fresh.len(), 4 * 4 * 4, "4×4 BGRA8 readback");
+    for (i, px) in fresh.chunks_exact(4).enumerate() {
+        assert_eq!(
+            px[3], 0xFF,
+            "fresh depth-24 pixmap pixel {i} must be OPAQUE before any paint; got {px:?}. \
+             A depth-24 drawable has no alpha channel — 0x00 here is a hole X11 says \
+             cannot exist.",
+        );
+    }
+
+    // Step 2: depth-32 source carrying the measured mate-terminal
+    // body pixel — X11 wire 0xAARRGGBB = 0x7F_00_15_1B, i.e. BGRA
+    // storage [0x1B, 0x15, 0x00, 0x7F]: RGB (0, 21, 27), α = 127.
+    let src_pix = b.create_pixmap(None, 32, 4, 4).expect("create src d32");
+    let src_xid = src_pix.as_raw();
+    b.fill_rectangle(None, src_xid, 0x7F_00_15_1B, 0, 0, 4, 4)
+        .expect("fill_rectangle src d32 with α=127");
+
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(src_pix), 0, 0, &[])
+        .expect("render_create_picture src")
+        .expect("Some(src PictureHandle)");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture dst")
+        .expect("Some(dst PictureHandle)");
+
+    // Step 3: Composite OP_SRC over the TOP-LEFT 2×2 only. `dst = src`
+    // is the simplest predicate for the write side, and the partial
+    // cover leaves the right/bottom of the destination as the
+    // "region the client never painted" case.
+    b.render_composite(
+        None,
+        1, // Src
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2,
+        2,
+    )
+    .expect("render_composite");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("get_image dst")
+        .expect("Some(dst bytes)");
+    assert_eq!(out.len(), 4 * 4 * 4, "4×4 BGRA8 readback");
+
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let off = (y * 4 + x) * 4;
+            let px = &out[off..off + 4];
+            let covered = x < 2 && y < 2;
+            assert_eq!(
+                px[3], 0xFF,
+                "dst ({x},{y}) α must be 0xFF; got {px:?}. Covered={covered}. \
+                 Pre-fix the covered pixels read 0x7F (=127, the measured \
+                 mate-terminal failure) because the composite stored the \
+                 source's alpha into a drawable that has no alpha channel.",
+            );
+            if covered {
+                // OP_SRC copies the premultiplied source through.
+                // ±1 for the UNORM8 → float → UNORM8 round trip.
+                for (ch, want) in [(0usize, 27u8), (1, 21), (2, 0)] {
+                    assert!(
+                        px[ch].abs_diff(want) <= 1,
+                        "dst ({x},{y}) channel {ch} want ≈{want}, got {px:?}",
+                    );
+                }
+            } else {
+                assert_eq!(
+                    &px[0..3],
+                    &[0u8, 0, 0],
+                    "dst ({x},{y}) is outside the composite rect and must still be \
+                     the create_pixmap init colour; got {px:?}",
+                );
+            }
         }
     }
 }
@@ -10166,6 +10305,146 @@ fn border_content_clip_confines_copy_area_destination() {
     brd_assert_ring(&mut b, xid, BRD_RED, Some(BRD_GREEN), "copy_area dst");
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn redirected_titlebar_copy_preserves_border() {
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    const W: u32 = 0x1470;
+    const SRC: u32 = 0x1471;
+    const GC: u32 = 0x1472;
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        32,
+        20,
+        30,
+        BRD_CW,
+        BRD_CH,
+        BRD_BW,
+        yserver_core::resources::ARGB_VISUAL.0,
+        8 | 0x2000,
+        &[BRD_RED, yserver_core::resources::ARGB_COLORMAP.0],
+    );
+    wz_map(&mut f, W);
+    let mut body = root.to_le_bytes().to_vec();
+    body.extend_from_slice(&[1, 0, 0, 0]);
+    f.req(144, 2, &body);
+    let mut body = SRC.to_le_bytes().to_vec();
+    body.extend_from_slice(&W.to_le_bytes());
+    body.extend_from_slice(&BRD_CW.to_le_bytes());
+    body.extend_from_slice(&BRD_CH.to_le_bytes());
+    f.req(53, 32, &body);
+    or_create_gc(&mut f, GC, SRC, BRD_GREEN);
+    or_fill(&mut f, SRC, GC, 0, 0, BRD_CW, BRD_CH);
+    let mut body = SRC.to_le_bytes().to_vec();
+    body.extend_from_slice(&W.to_le_bytes());
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&[0; 8]);
+    body.extend_from_slice(&BRD_CW.to_le_bytes());
+    body.extend_from_slice(&3u16.to_le_bytes());
+    f.req(62, 0, &body);
+    let host = f
+        .state
+        .resources
+        .window(yserver_protocol::x11::ResourceId(W))
+        .unwrap()
+        .host_xid
+        .unwrap()
+        .as_raw();
+    brd_assert_ring(&mut f.backend, host, BRD_RED, None, "titlebar copy");
+    let (sw, _, pixels) = f.backing(W);
+    let offset = ((u32::from(BRD_BW) * sw + u32::from(BRD_BW)) * 4) as usize;
+    assert_eq!(&pixels[offset..offset + 4], &brd_bgra(BRD_GREEN));
+
+    // Reading the window also starts at its content origin, not its ring.
+    let mut body = W.to_le_bytes().to_vec();
+    body.extend_from_slice(&SRC.to_le_bytes());
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&[0; 8]);
+    body.extend_from_slice(&BRD_CW.to_le_bytes());
+    body.extend_from_slice(&3u16.to_le_bytes());
+    f.req(62, 0, &body);
+    let src = f
+        .state
+        .resources
+        .pixmap(yserver_protocol::x11::ResourceId(SRC))
+        .unwrap()
+        .host_xid
+        .unwrap()
+        .as_raw();
+    let copied = f
+        .backend
+        .get_image_pixels_for_tests(src, 2, 0, 0, BRD_CW, 3, !0)
+        .unwrap()
+        .unwrap();
+    for pixel in copied.chunks_exact(4) {
+        assert_eq!(pixel, &brd_bgra(BRD_GREEN));
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn redirected_menu_border_change_resizes_backing() {
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    const W: u32 = 0x1460;
+    const GC: u32 = 0x1461;
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        32,
+        20,
+        30,
+        100,
+        30,
+        0,
+        yserver_core::resources::ARGB_VISUAL.0,
+        8 | 0x2000,
+        &[BRD_RED, yserver_core::resources::ARGB_COLORMAP.0],
+    );
+    wz_map(&mut f, W);
+    let mut body = root.to_le_bytes().to_vec();
+    body.extend_from_slice(&[1, 0, 0, 0]);
+    f.req(144, 2, &body);
+    or_create_gc(&mut f, GC, W, BRD_GREEN);
+    or_fill(&mut f, W, GC, 0, 0, 100, 30);
+    for (mask, values, extent, content) in [
+        (0x10, vec![2], (104, 34), (2..102, 2..32)),
+        // Same outer extent, different content origin.
+        (0x1c, vec![98, 28, 3], (104, 34), (3..101, 3..31)),
+        (0x10, vec![1], (100, 30), (1..99, 1..29)),
+        (0x10, vec![0], (98, 28), (0..98, 0..28)),
+    ] {
+        let mut body = GC.to_le_bytes().to_vec();
+        body.extend_from_slice(&3u32.to_le_bytes()); // function | plane-mask
+        body.extend_from_slice(&5u32.to_le_bytes()); // GXnoop
+        body.extend_from_slice(&0u32.to_le_bytes());
+        f.req(56, 0, &body);
+        or_fill(&mut f, W, GC, 0, 0, 1, 1);
+        wz_configure(&mut f, W, mask, &values);
+        let (sw, sh, pixels) = f.backing(W);
+        assert_eq!((sw, sh), extent, "named backing includes the new border");
+        for y in 0..sh {
+            for x in 0..sw {
+                let expected = if content.0.contains(&x) && content.1.contains(&y) {
+                    BRD_GREEN
+                } else {
+                    BRD_RED
+                };
+                let offset = ((y * sw + x) * 4) as usize;
+                assert_eq!(
+                    &pixels[offset..offset + 4],
+                    &brd_bgra(expected),
+                    "config {values:?}: pixel ({x},{y})"
+                );
+            }
+        }
+    }
+}
+
 /// `CopyArea` SOURCE: a copy OUT of a bordered window may not carry
 /// ring pixels with it. The ring is painted a colour that appears
 /// nowhere else, through the privileged route, so its presence in the
@@ -14360,5 +14639,326 @@ fn a_child_at_a_nonzero_offset_in_a_bordered_parent_keeps_its_full_extent() {
         )],
         pplace,
         "parent outer rect",
+    );
+}
+
+// ───── #143 — a resize must not silently destroy a window's content ──
+//
+// Issue #143's reporter: "already open windows get broken rendering"
+// when a compositor starts. Measured on HW (awesome + picom, 2026-09-16)
+// as an A/B on nothing but the launch order: windows spawned BEFORE
+// picom lost their content, the same windows spawned after it kept it.
+//
+// The redirect seed is not what loses it — `overlay_backing_inferiors`
+// copies whatever the window's leaf holds, and these tests show it
+// arriving intact. What loses it is the WM retile that happens while
+// the window is still unredirected: `configure_subwindow` reallocated
+// the leaf and discarded the pixels, and on a SHRINK the client was
+// never told, so an idle client never repainted and the window stayed
+// broken through the redirect and forever after. Both halves are fixed
+// now: a background-None window keeps its pixels, and every resize
+// reports the whole window exposed as Xorg's `miResizeWindow` does
+// (`mi/miwindow.c:466-472`).
+
+/// A shrink keeps a background-None window's pixels AND still tells the
+/// client what was exposed. Xorg does both, in that order: the paint
+/// returns without touching a pixel when the window has no background
+/// (`mi/miexpose.c:438-440`) but `miWindowExposures` sends the
+/// exposures regardless (`mi/miexpose.c:387-389`).
+///
+/// This test asserted ZERO Exposes until the shrink-Expose fix — that
+/// was our behaviour, not Xorg's, and it is what left #143's xterm
+/// black. The pixel half is unchanged.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_shrink_exposes_and_keeps_the_content_of_a_background_none_window() {
+    use std::io::Read;
+    const W: u32 = 0x1430;
+    const GC: u32 = 0x1431;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    // CWEventMask only: background None, the shape X11 says must be
+    // left alone on a size change (wezterm's, and 37 of KWin's).
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        24,
+        0,
+        0,
+        200,
+        100,
+        0,
+        visual,
+        0x0000_0800,
+        &[0x0000_8000],
+    );
+    wz_map(&mut f, W);
+    or_create_gc(&mut f, GC, W, 0x0000_FF00);
+    or_fill(&mut f, W, GC, 0, 0, 200, 100);
+    f._peer
+        .set_nonblocking(true)
+        .expect("nonblocking socketpair");
+    let mut sink = [0u8; 65536];
+    while f._peer.read(&mut sink).map(|n| n > 0).unwrap_or(false) {}
+
+    // The WM retiles when the next window opens.
+    wz_configure(&mut f, W, 0x0C, &[100, 100]);
+
+    let mut buf = [0u8; 65536];
+    let n = f._peer.read(&mut buf).unwrap_or(0);
+    let exposes: Vec<(u16, u16, u16, u16)> = (0..n / 32)
+        .map(|k| &buf[k * 32..k * 32 + 32])
+        .filter(|e| e[0] & 0x7f == 12 && u32::from_le_bytes([e[4], e[5], e[6], e[7]]) == W)
+        .map(|e| {
+            (
+                u16::from_le_bytes([e[8], e[9]]),
+                u16::from_le_bytes([e[10], e[11]]),
+                u16::from_le_bytes([e[12], e[13]]),
+                u16::from_le_bytes([e[14], e[15]]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        exposes,
+        vec![(0, 0, 100, 100)],
+        "a shrink must report the whole new window exposed, exactly once — \
+         the client cannot recover a discarded window otherwise (#143)",
+    );
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (100, 100), "storage follows the new geometry");
+    let mut distinct = std::collections::BTreeMap::<[u8; 4], usize>::new();
+    for p in px.chunks_exact(4) {
+        *distinct.entry([p[0], p[1], p[2], p[3]]).or_default() += 1;
+    }
+    assert_eq!(
+        distinct.keys().copied().collect::<Vec<_>>(),
+        vec![[0x00, 0xFF, 0x00, 0xFF]],
+        "every retained pixel must still be the client's green (BGRA); X11 \
+         leaves a background-None window's contents alone across a resize, \
+         so a background fill here would be a wipe Xorg never does: \
+         {distinct:?}",
+    );
+}
+
+/// A grow keeps the pixels it retains. What lands in the strip the grow
+/// added is a separate question (the wezterm ctrl-+ report) and this
+/// test deliberately does not pin it — only that the client's own
+/// content below it survived.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_grow_keeps_the_old_content_of_a_background_none_window() {
+    const W: u32 = 0x1440;
+    const GC: u32 = 0x1441;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(&mut f, W, root, 24, 0, 0, 100, 100, 0, visual, 0, &[]);
+    wz_map(&mut f, W);
+    or_create_gc(&mut f, GC, W, 0x0000_FF00);
+    or_fill(&mut f, W, GC, 0, 0, 100, 100);
+    wz_configure(&mut f, W, 0x0C, &[100, 160]);
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (100, 160));
+    let at = |x: usize, y: usize| {
+        let o = (y * sw as usize + x) * 4;
+        [px[o], px[o + 1], px[o + 2], px[o + 3]]
+    };
+    assert_eq!(
+        at(50, 50),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "inside the old footprint the client's own pixels survive a grow",
+    );
+}
+
+/// The other half of the ForgetGravity rule, and the reason #143's fix
+/// is gated on the background: a window that HAS one is discarded and
+/// re-tiled, exactly as X11 specifies and as the xeyes-resize
+/// regression needs.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_resize_still_retiles_a_window_that_has_a_background() {
+    const W: u32 = 0x1448;
+    const GC: u32 = 0x1449;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    // CWBackPixel = blue.
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        24,
+        0,
+        0,
+        100,
+        100,
+        0,
+        visual,
+        0x0000_0002,
+        &[0x0000_00FF],
+    );
+    wz_map(&mut f, W);
+    or_create_gc(&mut f, GC, W, 0x0000_FF00);
+    or_fill(&mut f, W, GC, 0, 0, 100, 100);
+    wz_configure(&mut f, W, 0x0C, &[60, 60]);
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (60, 60));
+    let mut distinct = std::collections::BTreeMap::<[u8; 4], usize>::new();
+    for p in px.chunks_exact(4) {
+        *distinct.entry([p[0], p[1], p[2], p[3]]).or_default() += 1;
+    }
+    assert_eq!(
+        distinct.keys().copied().collect::<Vec<_>>(),
+        vec![[0xFF, 0x00, 0x00, 0xFF]],
+        "a window with a background comes back tiled with it, not holding \
+         the client's old pixels: {distinct:?}",
+    );
+}
+
+/// The reporter's scenario end to end, through the protocol: a window
+/// paints, the WM retiles it, and only THEN does a compositor call
+/// `CompositeRedirectSubwindows(root, Manual)`. The redirect backing has
+/// to come up holding what was on screen — which is what Xorg's
+/// `compNewPixmap` guarantees by copying the parent with
+/// `IncludeInferiors` (`composite/compalloc.c:562-571`), and what our
+/// `seed_backing_from_parent` + `overlay_backing_inferiors` pair
+/// reproduces. It can only carry what the leaf still holds, so this is
+/// the test that fails if the retile wipes it.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn an_already_open_window_keeps_its_content_when_a_compositor_starts() {
+    const FRAME: u32 = 0x1450;
+    const CLIENT: u32 = 0x1451;
+    const GC: u32 = 0x1452;
+    for retile_first in [false, true] {
+        let Some(mut f) = ProtoFixture::new() else {
+            eprintln!("skipping: no Vk");
+            return;
+        };
+        let root = yserver_core::resources::ROOT_WINDOW.0;
+        let visual = yserver_core::resources::ROOT_VISUAL.0;
+        // A reparenting WM's frame under root, with the client inside:
+        // `RedirectSubwindows(root)` redirects the FRAME, and the
+        // client's pixels have to reach the frame's backing from a
+        // level down.
+        or_create_window(&mut f, FRAME, root, 24, 10, 20, 200, 100, 2, visual, 0, &[]);
+        or_create_window(&mut f, CLIENT, FRAME, 24, 0, 0, 200, 100, 0, visual, 0, &[]);
+        wz_map(&mut f, CLIENT);
+        wz_map(&mut f, FRAME);
+        or_create_gc(&mut f, GC, CLIENT, 0x0000_FF00);
+        or_fill(&mut f, CLIENT, GC, 0, 0, 200, 100);
+
+        let retile = |f: &mut ProtoFixture| {
+            wz_configure(f, FRAME, 0x0C, &[100, 100]);
+            wz_configure(f, CLIENT, 0x0C, &[100, 100]);
+        };
+        let start_compositor = |f: &mut ProtoFixture| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&root.to_le_bytes());
+            body.extend_from_slice(&[1u8, 0, 0, 0]); // CompositeRedirectManual
+            f.req(144, 2, &body);
+        };
+        if retile_first {
+            retile(&mut f);
+            start_compositor(&mut f);
+        } else {
+            start_compositor(&mut f);
+            retile(&mut f);
+        }
+
+        // The compositor reads the frame's backing. Content sits `bw`
+        // inside it (`compSetPixmap(pWin, pPixmap, bw)`,
+        // `composite/compalloc.c:620`), so sample well inside.
+        let (sw, sh, px) = f.backing(FRAME);
+        assert_eq!((sw, sh), (104, 104), "bordered backing extent");
+        let at = |x: usize, y: usize| {
+            let o = (y * sw as usize + x) * 4;
+            [px[o], px[o + 1], px[o + 2], px[o + 3]]
+        };
+        for (x, y) in [(10usize, 10usize), (50, 50), (90, 90)] {
+            assert_eq!(
+                at(x, y),
+                [0x00, 0xFF, 0x00, 0xFF],
+                "retile_first={retile_first}: the compositor must be handed \
+                 the pixels the client painted, at ({x},{y})",
+            );
+        }
+    }
+}
+
+/// The migrated content must land at the border inset, never at the
+/// storage origin: a bordered window's storage starts at its OUTER
+/// origin with the content `bw` inside (`compAllocPixmap`,
+/// `composite/compalloc.c:610`), so a copy that forgot the inset would
+/// both shift the image and eat the ring. Guards the #143 resize path
+/// specifically — the ring is the only thing that can tell the two
+/// apart once the content is uniform.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_shrink_keeps_the_content_at_the_border_inset() {
+    const W: u32 = 0x1460;
+    const GC: u32 = 0x1461;
+    const BW: usize = 3;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    // CWBorderPixel (0x08) = red; background stays None.
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        24,
+        0,
+        0,
+        100,
+        100,
+        BW as u16,
+        visual,
+        0x0000_0008,
+        &[0x00FF_0000],
+    );
+    wz_map(&mut f, W);
+    or_create_gc(&mut f, GC, W, 0x0000_FF00);
+    or_fill(&mut f, W, GC, 0, 0, 100, 100);
+    wz_configure(&mut f, W, 0x0C, &[60, 60]);
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (66, 66), "bordered storage extent");
+    let at = |x: usize, y: usize| {
+        let o = (y * sw as usize + x) * 4;
+        [px[o], px[o + 1], px[o + 2], px[o + 3]]
+    };
+    assert_eq!(
+        at(0, 0),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "the ring keeps the border pixel; content at (0,0) would mean the \
+         migrate copy dropped the inset",
+    );
+    assert_eq!(
+        at(BW, BW),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "the content starts at (bw, bw)",
+    );
+    assert_eq!(
+        at(sw as usize - BW - 1, sh as usize - BW - 1),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "and runs to the far content corner",
     );
 }

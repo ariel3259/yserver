@@ -37,8 +37,9 @@ use crate::{
     core_loop::{
         client_io::{self, WriteOutcome},
         damage_fanout::{
-            accumulate_damage_clip_by_children_to_state, accumulate_damage_full_to_state,
-            accumulate_damage_to_state, report_existing_damage_to_state,
+            accumulate_damage_border_to_state, accumulate_damage_clip_by_children_to_state,
+            accumulate_damage_full_to_state, accumulate_damage_to_state,
+            report_existing_damage_to_state,
         },
         fanout::{
             client_target_id, emit_expose_subtree_to_state,
@@ -68,6 +69,13 @@ const XI2_MAJOR_OPCODE: u8 = 137;
 /// `XI_BadDevice = 0`, so the wire `BadDevice` code is `XI2_FIRST_ERROR + 0`.
 const XI2_FIRST_ERROR: u8 = 157;
 const XFIXES_MAJOR_OPCODE: u8 = 140;
+/// Core request major opcodes for the three resource-release requests
+/// that must report an unresolvable XID. Values match this file's own
+/// dispatch arms and `yserver_protocol::x11::request_lengths`
+/// (`54 => FreePixmap`, `60 => FreeGC`, `95 => FreeCursor`).
+const FREE_PIXMAP_OPCODE: u8 = 54;
+const FREE_GC_OPCODE: u8 = 60;
+const FREE_CURSOR_OPCODE: u8 = 95;
 const XI2_SERVER_MAJOR_VERSION: u16 = 2;
 const XI2_SERVER_MINOR_VERSION: u16 = 4;
 /// Highest request numbers in the corresponding Xorg dispatch tables.
@@ -1007,6 +1015,18 @@ fn activate_redirect_backing_for(
                 .is_some_and(|w| w.map_state == MapState::Viewable)
             {
                 let _dropped = accumulate_damage_full_to_state(state, window);
+                // #143 — and the RING, which `accumulate_damage_full_to_state`
+                // cannot express: its rect is `(0, 0, width, height)`, i.e.
+                // `winSize`, which excludes the border by construction. The
+                // backing we just allocated is the BORDERED extent and
+                // `allocate_redirected_backing` paints the ring into it, so
+                // the compositor has to be told about those pixels too.
+                // Xorg gets this for free — `compSetPixmapVisitWindow` queues
+                // `compRepaintBorder` whenever `bw != 0`
+                // (`composite/compwindow.c:137-139`), and that repaint is an
+                // ordinary GC op the DAMAGE wrapper sees. Identity at
+                // `bw == 0`.
+                let _dropped = accumulate_damage_border_to_state(state, window);
             }
         }
         Err(err) => {
@@ -1231,6 +1251,7 @@ fn rotate_redirected_backing_on_resize(
     new_width: u16,
     new_height: u16,
     force_reallocate: bool,
+    old_border_width: u16,
 ) {
     let snapshot = state.resources.window(window).and_then(|w| {
         w.redirected_backing.as_ref().map(|b| {
@@ -1257,6 +1278,7 @@ fn rotate_redirected_backing_on_resize(
     let (new_width, new_height) = bordered_backing_extent(new_width, new_height, border_width);
 
     if !force_reallocate
+        && old_border_width == border_width
         && backend.redirected_backing_can_fit(old_backing, new_width, new_height, depth)
     {
         if let Some(w) = state.resources.window_mut(window)
@@ -1427,21 +1449,48 @@ fn rotate_redirected_backing_on_resize(
     // hits 0). NameWindowPixmap aliases keep it alive through this
     // path; the v2 backend's lifecycle for the no-alias case is
     // tightened separately.
-    let copy_w = old_width.min(new_width);
-    let copy_h = old_height.min(new_height);
+    //
+    // #143: the copy carries CONTENT only. Since #133 the ring lives
+    // INSIDE the storage at `(0,0)..(bw,bw)` and the allocate above has
+    // already painted NEW's ring at the NEW extent; copying the full
+    // `min(old, new)` box from OLD's origin would paint over it — and on
+    // a SHRINK that box is the whole new backing, so NEW's right/bottom
+    // ring columns would get OLD's *interior* pixels. Xorg reaches the
+    // same end state from the other side: `compCopyWindow` copies first
+    // and `compSetPixmap` queues `compRepaintBorder` afterwards
+    // (../xserver/composite/compwindow.c:137-139), so the ring is always
+    // the freshly painted one. Each backing uses its allocation-time
+    // border inset; a border-width change moves the content between them.
+    let old_inset = old_border_width.saturating_mul(2);
+    let new_inset = border_width.saturating_mul(2);
+    let copy_w = old_width
+        .saturating_sub(old_inset)
+        .min(new_width.saturating_sub(new_inset));
+    let copy_h = old_height
+        .saturating_sub(old_inset)
+        .min(new_height.saturating_sub(new_inset));
+    let old_content_origin = i16::try_from(old_border_width).unwrap_or(i16::MAX);
+    let content_origin = i16::try_from(border_width).unwrap_or(i16::MAX);
+    // Storage preservation has no client GC, just like Present's copy.
+    let copy_gc = crate::backend::DrawState::default();
     if copy_w > 0
         && copy_h > 0
-        && let Err(err) = backend.copy_area(
-            origin,
-            old_backing.as_raw(),
-            new_backing.as_raw(),
-            0,
-            0,
-            0,
-            0,
-            copy_w,
-            copy_h,
-        )
+        && let Err(err) = backend
+            .apply_clip_state(origin, &copy_gc.clip)
+            .and_then(|()| backend.apply_draw_state(origin, &copy_gc))
+            .and_then(|()| {
+                backend.copy_area(
+                    origin,
+                    old_backing.as_raw(),
+                    new_backing.as_raw(),
+                    old_content_origin,
+                    old_content_origin,
+                    content_origin,
+                    content_origin,
+                    copy_w,
+                    copy_h,
+                )
+            })
     {
         log::warn!(
             "rotate_redirected_backing_on_resize(0x{:x}): \
@@ -1484,6 +1533,45 @@ fn rotate_redirected_backing_on_resize(
             );
         }
     }
+
+    // #143 — report protocol DAMAGE over the ring the reallocate above
+    // just repainted, at the NEW geometry.
+    //
+    // This is the realloc path only, and that is exactly Xorg's gate:
+    // `compReallocPixmap` allocates a new pixmap only when the BORDERED
+    // extent differs (`pix_w != pOld->drawable.width || pix_h !=
+    // pOld->drawable.height`, `../xserver/composite/compalloc.c:698`,
+    // with `pix_w = w + (bw << 1)`), and only that branch calls
+    // `compSetPixmap(pWin, pNew, bw)` (`:700`). `compSetPixmapVisitWindow`
+    // then queues `compRepaintBorder` whenever `bw != 0`
+    // (`../xserver/composite/compwindow.c:137-139`), which subtracts
+    // `winSize` from `borderClip` and `PaintWindow(..., PW_BORDER)`s the
+    // difference (`:113-117`). That paint is an ordinary `PolyFillRect`
+    // on the window's pixmap (`../xserver/mi/miexpose.c:558`), so
+    // `damagePolyFillRect` (`../xserver/miext/damage/damage.c:1194`)
+    // reports it. The same-extent branch (`compalloc.c:702-705`) keeps
+    // `pOld`, never calls `compSetPixmap` and therefore reports nothing —
+    // which is our `redirected_backing_can_fit` early-return above,
+    // deliberately an EXACT extent match (`kms/render/backend.rs:20563`).
+    //
+    // Ordering matches Xorg's too: `compCopyWindow` carries the bits
+    // across first and the border repaint is a WorkProc that runs after,
+    // so the ring is always the freshly painted one.
+    //
+    // We only damage the NEW ring. The region the OLD ring vacated on a
+    // shrink lies outside the window's new outer extent, i.e. in the
+    // PARENT's area, and Xorg reports it against the parent, never
+    // against the shrinking window: `miComputeClips` puts the vacated
+    // area into `pParent->valdata->after.exposed`
+    // (`../xserver/mi/mivaltree.c:453-460`) and
+    // `miHandleValidateExposures` hands it to `miWindowExposures`
+    // (`../xserver/mi/miwindow.c:226`), which paints the PARENT's
+    // background over it (`../xserver/mi/miexpose.c:387`) — a GC op on
+    // the parent's drawable, so the damage lands on the parent.
+    //
+    // No-op for an unbordered window, for the root and for a
+    // non-viewable one (the gate lives in `accumulate_damage_to_state`).
+    let _dropped = accumulate_damage_border_to_state(state, window);
 }
 
 fn effective_redirect_mode_for_window(
@@ -7129,10 +7217,16 @@ fn handle_composite_request(
                     .keys()
                     .any(|(rwid, sub)| *sub && *rwid == w.parent);
                 let self_redirected = state.composite_redirects.contains_key(&(window, false));
+                let (pixmap_width, pixmap_height) = w
+                    .redirected_backing
+                    .as_ref()
+                    .map_or((w.width, w.height), |backing| {
+                        (backing.width, backing.height)
+                    });
                 (
                     w.host_xid,
-                    w.width,
-                    w.height,
+                    pixmap_width,
+                    pixmap_height,
                     w.depth,
                     parent_redirected || self_redirected,
                     w.map_state,
@@ -13229,12 +13323,11 @@ fn handle_dri3_request(
 
 /// Build the FBConfig list returned by `GetFBConfigs`. We synthesise
 /// from each X visual (depth-24 RGB and depth-32 ARGB), double buffered,
-/// both with depth=24 stencil=8 (the universal
-/// default for OpenGL apps). 2 configs × 28 properties (+5 bind-to-
-/// texture pairs when TFP is supported) is enough for Mesa to pick a
-/// match for any common glXChooseFBConfig call without paying for the
-/// full ~30-cell sweep the design mentions. All configs advertise
-/// GLX_PBUFFER_BIT so Chromium/ANGLE can allocate its offscreen surface.
+/// plus one visual-less, single-buffered pixmap configuration for
+/// QtWebEngine's native DMA-BUF import.  All share depth=24 stencil=8 (the
+/// universal default for OpenGL apps).  The two visual-backed configurations
+/// advertise GLX_PBUFFER_BIT so Chromium/ANGLE can allocate its offscreen
+/// surface.
 /// Resolve the attribute list for a `GetDrawableAttributes` reply,
 /// mirroring Xorg's `DoGetDrawableAttributes` (glxcmds.c:1863-1914).
 /// With no GLX record (a naked X window queried directly, the GLX 1.2
@@ -13385,7 +13478,7 @@ fn glx_extension_string(tfp_supported: bool) -> String {
 
 fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     use yserver_protocol::x11::glx as g;
-    let mut out = Vec::with_capacity(2);
+    let mut out = Vec::with_capacity(3);
     let depth = 24;
     let stencil = 8;
     for &(visual_id, fbconfig_id, alpha_size, total_buffer_size) in &[
@@ -13472,6 +13565,27 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
         }
         out.push(config);
     }
+    // QtWebEngine's GLXHelper chooses a single-buffered RGBA pixmap config
+    // before importing a native DMA-BUF through DRI3 (#152).  Do not attach it
+    // to either real visual: #96 showed that Mesa can then pair the
+    // single-buffered config with a double-buffered window of the same visual,
+    // making it allocate a fake front buffer.  A visual-less, pixmap-only
+    // config is sufficient for GLXPixmap and cannot be selected for windows
+    // or pbuffers.  Keep the property count uniform: GetFBConfigs encodes one
+    // count for the whole reply.
+    let mut native_pixmap = out[0].clone();
+    for (attribute, value) in &mut native_pixmap {
+        match *attribute {
+            g::GLX_VISUAL_ID => *value = 0,
+            g::GLX_FBCONFIG_ID => *value = 0x104,
+            g::GLX_X_VISUAL_TYPE => *value = g::GLX_NONE,
+            g::GLX_DRAWABLE_TYPE => *value = g::GLX_PIXMAP_BIT,
+            g::GLX_X_RENDERABLE => *value = 0,
+            g::GLX_DOUBLEBUFFER => *value = 0,
+            _ => {}
+        }
+    }
+    out.push(native_pixmap);
     out
 }
 
@@ -21176,6 +21290,28 @@ fn handle_change_window_attributes(
             let _ =
                 backend.change_subwindow_attributes(origin, host_xid.as_raw(), value_mask, &values);
         }
+        // #143 — report protocol DAMAGE for the ring the forward above
+        // just repainted. Xorg does exactly this, in
+        // `ChangeWindowAttributes` itself and on the same condition
+        // (`(vmaskCopy & (CWBorderPixel | CWBorderPixmap)) && pWin->viewable
+        // && HasBorder(pWin)`, `dix/window.c:1581-1589`): it subtracts
+        // `winSize` from `borderClip` and `PaintWindow(..., PW_BORDER)`s the
+        // difference, which lands as a `PolyFillRect` on the window's
+        // (composite backing) pixmap and so goes through `damagePolyFillRect`
+        // (`miext/damage/damage.c:1194`). Xorg does NOT compare old-vs-new
+        // border source, and neither does our backend forward
+        // (`backend.rs:20110` repaints on any `value_mask & 0x0c`), so the
+        // damage has to fire on exactly the same trigger or the reported
+        // region and the painted region drift apart.
+        //
+        // Without this, awesome's focus recolour repainted our backing
+        // correctly but told no compositor: picom, on `EXT_buffer_age`
+        // partial repaint, kept one ring colour per back buffer and
+        // alternated between them at frame rate (#143's border flicker).
+        //
+        // No-op for unbordered windows, for the root and for a
+        // non-viewable window.
+        let _dropped = accumulate_damage_border_to_state(state, target_window);
     }
 
     if let Some(cid) = cursor_id {
@@ -21576,7 +21712,8 @@ fn handle_configure_window(
         }
         let resized =
             old_size.is_some_and(|(ow, oh)| geometry.width != ow || geometry.height != oh);
-        if resized {
+        let old_border_width = before_geom.map_or(geometry.border_width, |g| g.4);
+        if resized || old_border_width != geometry.border_width {
             rotate_redirected_backing_on_resize(
                 state,
                 backend,
@@ -21585,6 +21722,7 @@ fn handle_configure_window(
                 geometry.width,
                 geometry.height,
                 false,
+                old_border_width,
             );
         }
         // NOTE (Issue 2 — 2026-07-01): a pure move MUST NOT rotate the
@@ -21672,10 +21810,41 @@ fn handle_configure_window(
                 request.value_mask,
             );
         }
-        let grew = old_size.is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
-        if grew {
+        // A resize exposes the window in EITHER direction. Xorg draws no
+        // grow/shrink distinction: `miResizeWindow` copies the whole NEW
+        // clip list into the exposed region — "the entire window is
+        // trashed unless bitGravity recovers portions of it",
+        // `RegionCopy(&pWin->valdata->after.exposed, &pWin->clipList)`
+        // (`mi/miwindow.c:466-472`) — and only the bits a non-Forget
+        // `bitGravity` actually moved are subtracted from it afterwards
+        // (`mi/miwindow.c:596-599`). Under the default ForgetGravity
+        // `oldWinClip` stays NULL (`mi/miwindow.c:403-406`), nothing is
+        // subtracted, and the full window is reported for a shrink just
+        // as for a grow. The background state does not gate the event
+        // either: `miWindowExposures` paints first and sends second, and
+        // the `case None: return;` early-out lives in the PAINT
+        // (`mi/miexpose.c:387-389` and `:438-440`), so a background-None
+        // window keeps its pixels AND still receives the Expose.
+        //
+        // We used to emit this for a grow only, and that is #143's
+        // "already open windows get broken rendering": awesome retiles an
+        // xterm smaller, `configure_subwindow` re-tiles the leaf from the
+        // window's background (black on a dark terminal), and with no
+        // Expose nothing ever asks xterm to repaint. The prompt line came
+        // back because xterm redraws it anyway; the static rows of the
+        // shell banner stayed black for good.
+        //
+        // The region is the whole window for every gravity, not only
+        // ForgetGravity. Xorg would report just the newly-added strip
+        // under e.g. NorthWestGravity, because it really moved the old
+        // bits; this server has no bit-gravity path at all (the attribute
+        // reaches the render backend by no route — see `LeafContent` and
+        // `configure_subwindow`), so the pixels are gone whatever the
+        // attribute says and a narrower Expose would leave the window
+        // black. That narrowing is a separate, tracked divergence.
+        if resized {
             // Per X11 spec, Expose fires only for visible regions. A
-            // grow-configure on an unmapped (or Unviewable) window has no
+            // resize-configure on an unmapped (or Unviewable) window has no
             // visible region, so suppress the Expose until the window
             // becomes Viewable (MapWindow's own viewable-gated Expose path
             // covers that case). Without this gate, marco-style
@@ -26744,6 +26913,19 @@ fn handle_copy_area(
     let src = state.resources.host_drawable_target(request.src);
     let dst = state.resources.host_drawable_target(request.dst);
     if let (Some(src), Some(dst)) = (src.as_ref(), dst.as_ref()) {
+        // Keep window identity so the backend applies its content offset
+        // and clip before resolving a redirect backing. Named pixmaps still
+        // address the entire backing, including its border.
+        let src_host = state
+            .resources
+            .window(request.src)
+            .and_then(|w| w.host_xid)
+            .map_or_else(|| src.host_xid(), |h| h.as_raw());
+        let dst_host = state
+            .resources
+            .window(request.dst)
+            .and_then(|w| w.host_xid)
+            .map_or_else(|| dst.host_xid(), |h| h.as_raw());
         if src.depth() != dst.depth() {
             return emit_x11_error(
                 state,
@@ -26792,12 +26974,8 @@ fn handle_copy_area(
         // `subwindow-mode=ClipByChildren` default by subtracting every
         // mapped child window's geometry from the destination rect.
         //
-        // We do this at the dispatch layer because
-        // `state.resources.host_drawable_target(req.dst)` eagerly
-        // substitutes a redirected window's backing pixmap for its
-        // host_xid, so the backend can no longer tell the original
-        // destination was a window. Splitting here keeps the existing
-        // backend trait shape and applies to v1 and v2 uniformly.
+        // Split in window-local coordinates before the backend translates
+        // each piece to backing space.
         // ClipState::Pixmap (mask-pixmap clip) is out of scope for this
         // fix and passes through untouched.
         let copy_sub_rects = if request.width == 0 || request.height == 0 {
@@ -26821,14 +26999,7 @@ fn handle_copy_area(
                 .src_y
                 .saturating_add(sub.y.saturating_sub(request.dst_y));
             backend.copy_area(
-                origin,
-                src.host_xid(),
-                dst.host_xid(),
-                sub_src_x,
-                sub_src_y,
-                sub.x,
-                sub.y,
-                sub.width,
+                origin, src_host, dst_host, sub_src_x, sub_src_y, sub.x, sub.y, sub.width,
                 sub.height,
             )?;
         }
@@ -26847,7 +27018,7 @@ fn handle_copy_area(
         // — independent of the graphics-exposures setting.
         if !missing.is_empty() && state.resources.window(request.dst).is_some() {
             for (mx, my, mw, mh) in &missing {
-                backend.paint_window_background_rect(origin, dst.host_xid(), *mx, *my, *mw, *mh)?;
+                backend.paint_window_background_rect(origin, dst_host, *mx, *my, *mw, *mh)?;
                 let _dropped = accumulate_damage_to_state(state, request.dst, *mx, *my, *mw, *mh);
             }
         }
@@ -27276,16 +27447,47 @@ fn handle_set_clip_rectangles(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcFreeGC` (`../xserver/dix/dispatch.c:1677`) resolves the id
+/// with `dixLookupGC` -> `dixLookupResourceByType(X11_RESTYPE_GC)`, which
+/// on a miss returns that resource type's `errorValue` — `BadGC`
+/// (`../xserver/dix/resource.c:454`) — after setting `client->errorValue`
+/// to the id exactly as sent. Silently succeeding is the same defect
+/// class as #143 on FreePixmap: for a *checked void* request the error
+/// packet is the only thing that can carry a higher sequence number back
+/// to XCB, so swallowing it leaves every preceding checked request of
+/// that client uncompleted.
 fn handle_free_gc(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(gc) = x11::free_resource_id(body) {
-        state.resources.free_gc(gc);
+    let Some(gc) = x11::free_resource_id(body) else {
+        debug!(
+            "client {} #{} FreeGC (parse failed)",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    };
+    if state.resources.gc(gc).is_none() {
+        debug!(
+            "client {} #{} FreeGC gc=0x{:x} unknown -> BadGC",
+            client_id.0, sequence.0, gc.0
+        );
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_GC,
+            gc.0,
+            FREE_GC_OPCODE,
+        );
     }
-    debug!("client {} #{} FreeGC", client_id.0, sequence.0);
+    state.resources.free_gc(gc);
+    debug!(
+        "client {} #{} FreeGC gc=0x{:x} freed",
+        client_id.0, sequence.0, gc.0
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -27314,6 +27516,11 @@ fn handle_change_save_set(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcFreeCursor` (`../xserver/dix/dispatch.c:3100`) looks the id
+/// up with `dixLookupResourceByType(X11_RESTYPE_CURSOR)` and on a miss
+/// sets `client->errorValue = stuff->id` and returns the type's
+/// `errorValue`, `BadCursor` (`../xserver/dix/resource.c:466`). Same
+/// checked-void-request reasoning as `handle_free_gc` above.
 fn handle_free_cursor(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -27322,12 +27529,35 @@ fn handle_free_cursor(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(cursor) = x11::free_resource_id(body)
-        && let Some(host_xid) = state.resources.free_cursor(cursor)
-    {
+    let Some(cursor) = x11::free_resource_id(body) else {
+        debug!(
+            "client {} #{} FreeCursor (parse failed)",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    };
+    if !state.resources.cursor_exists(cursor) {
+        debug!(
+            "client {} #{} FreeCursor cursor=0x{:x} unknown -> BadCursor",
+            client_id.0, sequence.0, cursor.0
+        );
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_CURSOR,
+            cursor.0,
+            FREE_CURSOR_OPCODE,
+        );
+    }
+    let host_xid = state.resources.free_cursor(cursor);
+    if let Some(host_xid) = host_xid {
         let _ = backend.free_cursor(origin, host_xid);
     }
-    debug!("client {} #{} FreeCursor", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} FreeCursor cursor=0x{:x} freed host_xid={host_xid:?}",
+        client_id.0, sequence.0, cursor.0
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -27422,6 +27652,20 @@ fn handle_create_pixmap(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcFreePixmap` (`../xserver/dix/dispatch.c:1529`) resolves the
+/// id with `dixLookupResourceByType(X11_RESTYPE_PIXMAP)`; on a miss it
+/// sets `client->errorValue = stuff->id` and returns that resource
+/// type's `errorValue`, i.e. `BadPixmap` (`../xserver/dix/resource.c:448`)
+/// — `None` (0) included, since 0 is simply an XID that is not a pixmap.
+///
+/// #143: picom sends a deliberate `FreePixmap(drawable=None)` as a sync
+/// barrier before every sleep (`x_prepare_for_sleep`, picom `src/x.c:1194`)
+/// and *expects* `BadPixmap` back. XCB can only mark a checked **void**
+/// request complete once it reads a packet carrying a higher sequence
+/// number, and for a void request that packet is the error. Returning
+/// silent success left picom's nine checked `ChangeWindowAttributes`
+/// uncompleted, so `wm_handle_set_event_mask_reply` never fired and the
+/// second half of its window import stalled ~10s (Xorg: ~120ms).
 fn handle_free_pixmap(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -27430,27 +27674,50 @@ fn handle_free_pixmap(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(pixmap) = x11::free_resource_id(body) {
-        let removed = state.resources.free_pixmap(pixmap);
-        let still_referenced = removed
-            .as_ref()
-            .and_then(|p| p.host_xid)
-            // The BORDER reference is as load-bearing as the background one:
-            // `XCreatePixmap` → `XSetWindowBorderPixmap` → `XFreePixmap` is
-            // ordinary client code, and X11 keeps the storage alive because
-            // the window still names it (Xorg refcounts
-            // `pWin->border.pixmap`). Omitting it freed the host handle
-            // underneath a ring that was still sampling it (#133). All four
-            // release sites now share one rule.
-            .is_some_and(|xid| state.resources.host_xid_still_referenced(xid));
-        if let Some(removed_pixmap) = removed
-            && let Some(xid) = removed_pixmap.host_xid
-            && !still_referenced
-        {
-            backend.free_pixmap(origin, xid.as_raw())?;
-        }
+    let Some(pixmap) = x11::free_resource_id(body) else {
+        debug!(
+            "client {} #{} FreePixmap (parse failed)",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    };
+    let Some(removed) = state.resources.free_pixmap(pixmap) else {
+        debug!(
+            "client {} #{} FreePixmap pixmap=0x{:x} unknown -> BadPixmap",
+            client_id.0, sequence.0, pixmap.0
+        );
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_PIXMAP,
+            pixmap.0,
+            FREE_PIXMAP_OPCODE,
+        );
+    };
+    let still_referenced = removed
+        .host_xid
+        // The BORDER reference is as load-bearing as the background one:
+        // `XCreatePixmap` → `XSetWindowBorderPixmap` → `XFreePixmap` is
+        // ordinary client code, and X11 keeps the storage alive because
+        // the window still names it (Xorg refcounts
+        // `pWin->border.pixmap`). Omitting it freed the host handle
+        // underneath a ring that was still sampling it (#133). All four
+        // release sites now share one rule.
+        .is_some_and(|xid| state.resources.host_xid_still_referenced(xid));
+    if let Some(xid) = removed.host_xid
+        && !still_referenced
+    {
+        backend.free_pixmap(origin, xid.as_raw())?;
     }
-    debug!("client {} #{} FreePixmap", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} FreePixmap pixmap=0x{:x} freed host_xid={:?} retained={}",
+        client_id.0,
+        sequence.0,
+        pixmap.0,
+        removed.host_xid.map(crate::backend::PixmapHandle::as_raw),
+        still_referenced
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -30956,11 +31223,12 @@ mod tests {
         );
     }
 
-    // #96: every synthesised GLX FBConfig must advertise GLX_PBUFFER_BIT plus
+    // #96: each visual-backed GLX FBConfig must advertise GLX_PBUFFER_BIT plus
     // the three GLX_MAX_PBUFFER_* caps, or Chromium/ANGLE can't allocate its
     // offscreen pbuffer surface and falls back to software (no WebGL/Maps 3D).
-    // Property counts must stay uniform across configs (GetFBConfigs encodes a
-    // single num_properties for all of them).
+    // The #152 native-pixmap config is deliberately pixmap-only.  Property
+    // counts must stay uniform across configs (GetFBConfigs encodes a single
+    // num_properties for all of them).
     #[test]
     fn glx_fb_configs_advertise_pbuffer() {
         use yserver_protocol::x11::glx as g;
@@ -30972,6 +31240,11 @@ mod tests {
                 assert_eq!(config.len(), prop_count, "non-uniform property count");
                 let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
                 let drawable = get(g::GLX_DRAWABLE_TYPE).expect("DRAWABLE_TYPE present");
+                if drawable == g::GLX_PIXMAP_BIT {
+                    assert_eq!(get(g::GLX_VISUAL_ID), Some(0));
+                    assert_eq!(get(g::GLX_X_RENDERABLE), Some(0));
+                    continue;
+                }
                 assert_ne!(
                     drawable & g::GLX_PBUFFER_BIT,
                     0,
@@ -30994,17 +31267,65 @@ mod tests {
         assert!(visuals.iter().all(|visual| visual.double_buffer));
 
         let configs = synthesise_glx_fb_configs(false);
-        assert_eq!(configs.len(), 2);
+        assert_eq!(configs.len(), 3);
         let mut visual_ids = HashSet::new();
         for config in configs {
             let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
             let visual_id = get(g::GLX_VISUAL_ID).expect("VISUAL_ID present");
-            assert!(
-                visual_ids.insert(visual_id),
-                "duplicate visual 0x{visual_id:x}"
-            );
-            assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(1));
+            if visual_id == 0 {
+                assert_eq!(get(g::GLX_DRAWABLE_TYPE), Some(g::GLX_PIXMAP_BIT));
+                assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(0));
+            } else {
+                assert!(
+                    visual_ids.insert(visual_id),
+                    "duplicate visual 0x{visual_id:x}"
+                );
+                assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(1));
+            }
         }
+        assert_eq!(visual_ids.len(), 2);
+    }
+
+    // QtWebEngine's GLXHelper chooses a native-pixmap config with this exact
+    // attribute set before it imports a DMA-BUF through DRI3.  In particular,
+    // it requires GLX_DOUBLEBUFFER=false.  It must not reuse either real X
+    // visual: doing so recreates #96, where Mesa paired a single-buffered
+    // context with a double-buffered window and allocated a fake front buffer.
+    #[test]
+    fn qtwebengine_can_choose_an_isolated_single_buffered_pixmap_config() {
+        use yserver_protocol::x11::glx as g;
+
+        let configs = synthesise_glx_fb_configs(true);
+        let config = configs
+            .iter()
+            .find(|config| {
+                let get = |attr: u32| {
+                    config
+                        .iter()
+                        .find(|(key, _)| *key == attr)
+                        .map(|(_, value)| *value)
+                };
+                get(g::GLX_RED_SIZE).is_some_and(|value| value >= 8)
+                    && get(g::GLX_GREEN_SIZE).is_some_and(|value| value >= 8)
+                    && get(g::GLX_BLUE_SIZE).is_some_and(|value| value >= 8)
+                    && get(g::GLX_ALPHA_SIZE).is_some_and(|value| value >= 8)
+                    && get(g::GLX_BUFFER_SIZE).is_some_and(|value| value >= 32)
+                    && get(g::GLX_BIND_TO_TEXTURE_RGBA_EXT) == Some(1)
+                    && get(g::GLX_DRAWABLE_TYPE).is_some_and(|value| value & g::GLX_PIXMAP_BIT != 0)
+                    && get(g::GLX_BIND_TO_TEXTURE_TARGETS_EXT)
+                        .is_some_and(|value| value & g::GLX_TEXTURE_2D_BIT_EXT != 0)
+                    && get(g::GLX_DOUBLEBUFFER) == Some(0)
+            })
+            .expect("a QtWebEngine native-pixmap FBConfig");
+        let get = |attr: u32| {
+            config
+                .iter()
+                .find(|(key, _)| *key == attr)
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(get(g::GLX_VISUAL_ID), Some(0));
+        assert_eq!(get(g::GLX_DRAWABLE_TYPE), Some(g::GLX_PIXMAP_BIT));
+        assert_eq!(get(g::GLX_X_RENDERABLE), Some(0));
     }
 
     // #96: pbuffer GetGeometry must report the fbconfig's true depth so Mesa's
@@ -31433,6 +31754,187 @@ mod tests {
             count_configure_notifies(&out),
             1,
             "a real restack must emit exactly one ConfigureNotify"
+        );
+    }
+
+    // ── #143 — a resize must report the window exposed, either way ──
+    //
+    // Xorg's `miResizeWindow` copies the NEW clip list wholesale into
+    // `after.exposed` — "the entire window is trashed unless bitGravity
+    // recovers portions of it" (`mi/miwindow.c:466-472`) — and only a
+    // non-Forget `bitGravity` subtracts the bits it actually moved
+    // (`:596-599`). There is no grow/shrink branch: under the default
+    // ForgetGravity the full window is reported in both directions.
+    // Nor does the background gate the EVENT — `miWindowExposures`
+    // paints, then sends (`mi/miexpose.c:387-389`), and the
+    // background-None early-out is inside the paint (`:438-440`).
+    //
+    // We emitted this for a grow only. On HW that is the #143 xterm:
+    // awesome retiles it smaller, the leaf is re-tiled from the
+    // window's black background, and with no Expose nothing asks xterm
+    // to repaint its static banner rows — they stay black while the
+    // prompt line, which xterm redraws unprompted, comes back.
+
+    /// One viewable, Expose-selecting child of root at `w`x`h`, plus
+    /// client 1's already-drained peer socket. `background_pixel` picks
+    /// the two shapes that matter here: `Some` is the xterm case (the
+    /// resize re-tiles the leaf and destroys the content), `None` is the
+    /// background-None case (the content survives).
+    fn one_viewable_expose_child(
+        w: u16,
+        h: u16,
+        background_pixel: Option<u32>,
+    ) -> (ServerState, UnixStream) {
+        const XID: u32 = 0x400;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(XID),
+                parent: ROOT_WINDOW,
+                width: w,
+                height: h,
+                background_pixel,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state
+                .resources
+                .window(ResourceId(XID))
+                .map(|win| win.background_none),
+            Some(background_pixel.is_none()),
+            "harness sanity: the background shape under test",
+        );
+        state
+            .resources
+            .window_mut(ResourceId(XID))
+            .expect("child installed")
+            .map_state = crate::resources::MapState::Viewable;
+        state
+            .clients
+            .get_mut(&1)
+            .expect("test client")
+            .event_masks
+            .insert(ResourceId(XID), 0x0000_8000); // ExposureMask
+        let _ = read_all_available(&mut peer);
+        (state, peer)
+    }
+
+    /// Every Expose in `bytes` for `window`, as `(x, y, width, height)`.
+    fn expose_rects(bytes: &[u8], window: u32) -> Vec<(u16, u16, u16, u16)> {
+        bytes
+            .chunks(32)
+            .filter(|e| {
+                e.len() == 32
+                    && e[0] & 0x7f == 12
+                    && u32::from_le_bytes([e[4], e[5], e[6], e[7]]) == window
+            })
+            .map(|e| {
+                (
+                    u16::from_le_bytes([e[8], e[9]]),
+                    u16::from_le_bytes([e[10], e[11]]),
+                    u16::from_le_bytes([e[12], e[13]]),
+                    u16::from_le_bytes([e[14], e[15]]),
+                )
+            })
+            .collect()
+    }
+
+    /// Resize `window` to `w`x`h` (CWWidth|CWHeight) and return whatever
+    /// reached the client.
+    fn resize_and_read(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        window: u32,
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        let body = cw_restack_body(window, 0x000C, &[w, h]);
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_configure_window");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn configure_window_shrink_exposes_the_whole_window() {
+        // The #143 case. `configure_subwindow` re-tiles the leaf from
+        // the window's background on a shrink, so without this Expose
+        // the discarded pixels are unrecoverable.
+        let (mut state, mut peer) = one_viewable_expose_child(200, 100, Some(0x0000_0000));
+        let out = resize_and_read(&mut state, &mut peer, 0x400, 100, 60);
+        assert_eq!(
+            expose_rects(&out, 0x400),
+            vec![(0, 0, 100, 60)],
+            "a shrink must report the whole NEW window exposed, exactly once \
+             (`mi/miwindow.c:466-472`); emitting none leaves an idle client \
+             showing the background fill forever (#143)",
+        );
+    }
+
+    #[test]
+    fn configure_window_grow_exposes_the_whole_window() {
+        // Over-suppression guard: the grow path predates the shrink one
+        // and must keep its single full-window Expose.
+        let (mut state, mut peer) = one_viewable_expose_child(100, 60, Some(0x0000_0000));
+        let out = resize_and_read(&mut state, &mut peer, 0x400, 200, 100);
+        assert_eq!(
+            expose_rects(&out, 0x400),
+            vec![(0, 0, 200, 100)],
+            "a grow must still report exactly one full-window Expose",
+        );
+    }
+
+    #[test]
+    fn configure_window_shrink_exposes_a_background_none_window_too() {
+        // A background-None window keeps its pixels across the resize
+        // (`mi/miexpose.c:438-440` returns before painting) but STILL
+        // gets the Expose: `miWindowExposures` calls `PaintWindow` and
+        // `miSendExposures` in sequence and only the paint is skipped
+        // (`mi/miexpose.c:387-389`). Nothing on this path may start
+        // reading the background state to suppress the event.
+        let (mut state, mut peer) = one_viewable_expose_child(200, 100, None);
+        let out = resize_and_read(&mut state, &mut peer, 0x400, 100, 60);
+        assert_eq!(
+            expose_rects(&out, 0x400),
+            vec![(0, 0, 100, 60)],
+            "a background-None window is not painted but is still told what \
+             was exposed",
+        );
+    }
+
+    #[test]
+    fn configure_window_pure_move_emits_no_expose() {
+        // Under-suppression guard: `after.exposed` is seeded from the
+        // clip list only when the size changes; a pure move of an
+        // unobscured window exposes nothing of the window itself.
+        let (mut state, mut peer) = one_viewable_expose_child(200, 100, Some(0x0000_0000));
+        let body = cw_restack_body(0x400, 0x0003, &[37, 41]); // CWX|CWY
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_configure_window");
+        let out = read_all_available(&mut peer);
+        assert_eq!(
+            expose_rects(&out, 0x400),
+            Vec::new(),
+            "a move is not a resize and must not expose the window",
         );
     }
 
@@ -35559,6 +36061,248 @@ mod tests {
         let buf = &bytes[..32];
         assert_eq!(buf[1], x11::error::BAD_GC);
         assert_eq!(buf[10], 70);
+    }
+
+    /// Decode a 32-byte X11 error at the wire offsets fixed by the core
+    /// protocol encoding (`Errors`): 0 = 0, 1 = code, 2..4 = sequence,
+    /// 4..8 = bad resource id / value, 8..10 = minor opcode, 10 = major
+    /// opcode. Asserted as raw bytes on purpose — running the reply back
+    /// through our own decoder would pass even if encoder and decoder
+    /// were wrong together.
+    fn assert_x11_error_bytes(
+        bytes: &[u8],
+        code: u8,
+        bad_value: u32,
+        minor: u16,
+        major: u8,
+        sequence: u16,
+        what: &str,
+    ) {
+        assert_eq!(
+            bytes.len(),
+            32,
+            "{what}: expected exactly one 32-byte error, got {:02x?}",
+            bytes
+        );
+        assert_eq!(bytes[0], 0, "{what}: byte 0 marks a packet as an error");
+        assert_eq!(bytes[1], code, "{what}: error code");
+        assert_eq!(
+            u16::from_le_bytes([bytes[2], bytes[3]]),
+            sequence,
+            "{what}: sequence number"
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            bad_value,
+            "{what}: bad resource id must be the XID exactly as sent"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            minor,
+            "{what}: minor opcode"
+        );
+        assert_eq!(bytes[10], major, "{what}: major opcode");
+    }
+
+    /// Drive one four-byte resource-release request (FreePixmap / FreeGC /
+    /// FreeCursor: `xResourceReq`, 2 units total) through the real
+    /// dispatch table and return whatever the client was sent.
+    fn run_free_resource_request(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        opcode: u8,
+        xid: u32,
+        sequence: u16,
+    ) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
+        let body = xid.to_le_bytes().to_vec();
+        process_request(
+            state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        read_all_available(peer)
+    }
+
+    /// #143. picom's `x_prepare_for_sleep` (picom `src/x.c:1194`) fires a
+    /// deliberately invalid `FreePixmap(drawable=None)` as a sync barrier
+    /// and *expects* `BadPixmap`: XCB only completes a checked **void**
+    /// request once it reads a packet with a higher sequence number, and
+    /// for a void request that packet is the error. Xorg answers every one
+    /// of these (measured: 419 requests -> 419 `BadPixmap`); we answered
+    /// none of 538, so picom's checked `ChangeWindowAttributes` batch never
+    /// completed and its window import stalled ~10s instead of ~120ms.
+    #[test]
+    fn free_pixmap_none_returns_bad_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 54, 0, 0x0067);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_PIXMAP,
+            0,
+            0,
+            54,
+            0x0067,
+            "FreePixmap(None)",
+        );
+    }
+
+    #[test]
+    fn free_pixmap_unknown_xid_returns_bad_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 54, 0x00de_ad00, 7);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_PIXMAP,
+            0x00de_ad00,
+            0,
+            54,
+            7,
+            "FreePixmap(unknown)",
+        );
+    }
+
+    /// The error path must not swallow the ordinary one: a pixmap the
+    /// server knows is freed silently, as Xorg's `Success` return does.
+    #[test]
+    fn free_pixmap_known_xid_reports_no_error() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(0x3100),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+            },
+        );
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 54, 0x3100, 8);
+
+        assert!(
+            bytes.is_empty(),
+            "FreePixmap(known) must be silent, got {bytes:02x?}"
+        );
+        assert!(state.resources.pixmap(ResourceId(0x3100)).is_none());
+    }
+
+    /// Xorg `ProcFreeGC` -> `dixLookupGC` -> `X11_RESTYPE_GC.errorValue`
+    /// = `BadGC` (`../xserver/dix/resource.c:454`).
+    #[test]
+    fn free_gc_none_returns_bad_gc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 60, 0, 0x0068);
+
+        assert_x11_error_bytes(&bytes, x11::error::BAD_GC, 0, 0, 60, 0x0068, "FreeGC(None)");
+    }
+
+    #[test]
+    fn free_gc_unknown_xid_returns_bad_gc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 60, 0x00be_ef00, 9);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_GC,
+            0x00be_ef00,
+            0,
+            60,
+            9,
+            "FreeGC(unknown)",
+        );
+    }
+
+    #[test]
+    fn free_gc_known_xid_reports_no_error() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .resources
+            .seed_gc_for_test(ClientId(1), ResourceId(0x2100));
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 60, 0x2100, 10);
+
+        assert!(
+            bytes.is_empty(),
+            "FreeGC(known) must be silent, got {bytes:02x?}"
+        );
+        assert!(state.resources.gc(ResourceId(0x2100)).is_none());
+    }
+
+    /// Xorg `ProcFreeCursor` -> `X11_RESTYPE_CURSOR.errorValue` =
+    /// `BadCursor` (`../xserver/dix/resource.c:466`).
+    #[test]
+    fn free_cursor_none_returns_bad_cursor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 95, 0, 0x0069);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_CURSOR,
+            0,
+            0,
+            95,
+            0x0069,
+            "FreeCursor(None)",
+        );
+    }
+
+    #[test]
+    fn free_cursor_unknown_xid_returns_bad_cursor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 95, 0x00c0_ff00, 11);
+
+        assert_x11_error_bytes(
+            &bytes,
+            x11::error::BAD_CURSOR,
+            0x00c0_ff00,
+            0,
+            95,
+            11,
+            "FreeCursor(unknown)",
+        );
+    }
+
+    #[test]
+    fn free_cursor_known_xid_reports_no_error() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(0x4100));
+
+        let bytes = run_free_resource_request(&mut state, &mut peer, 95, 0x4100, 12);
+
+        assert!(
+            bytes.is_empty(),
+            "FreeCursor(known) must be silent, got {bytes:02x?}"
+        );
+        assert!(!state.resources.cursor_exists(ResourceId(0x4100)));
     }
 
     #[test]
@@ -49080,6 +49824,78 @@ mod tests {
     }
 
     #[test]
+    fn name_window_pixmap_uses_redirected_backing_geometry() {
+        use crate::{
+            backend::{PixmapHandle, WindowHandle},
+            resources::RedirectedBacking,
+            server::{CompositeRedirectMode, RedirectRecord},
+        };
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const WINDOW: ResourceId = ResourceId(0x10004a);
+        const PIXMAP: ResourceId = ResourceId(0x300225);
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new().with_composite_support();
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 32,
+                window: WINDOW,
+                parent: ROOT_WINDOW,
+                width: 646,
+                height: 501,
+                border_width: 2,
+                class: 1,
+                visual: crate::resources::ARGB_VISUAL,
+                ..Default::default()
+            },
+        );
+        assert!(state.resources.map_window(WINDOW));
+        let window = state
+            .resources
+            .window_mut(WINDOW)
+            .expect("window installed");
+        window.host_xid = Some(WindowHandle::from_raw_for_test(0x40008a));
+        window.redirected_backing = Some(RedirectedBacking {
+            host_pixmap: PixmapHandle::from_raw_for_test(0x4000d),
+            width: 650,
+            height: 505,
+            depth: 32,
+        });
+        state.composite_redirects.insert(
+            (WINDOW, false),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(1),
+            },
+        );
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&PIXMAP.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::NAME_WINDOW_PIXMAP,
+            &body,
+        );
+
+        let pixmap = state.resources.pixmap(PIXMAP).expect("named pixmap exists");
+        assert_eq!((pixmap.width, pixmap.height), (650, 505));
+        let aliases = &state
+            .resources
+            .window(WINDOW)
+            .expect("window remains installed")
+            .composite_named_pixmaps;
+        assert_eq!(aliases.len(), 1);
+        assert_eq!((aliases[0].width, aliases[0].height), (650, 505));
+    }
+
+    #[test]
     fn get_overlay_window_wires_cow_host_xid() {
         // Pre-condition: COW resource record does NOT exist (post-Task-2.1
         // the pre-seed is gone; COW materialises only on GetOverlayWindow).
@@ -50085,6 +50901,7 @@ mod tests {
             100,
             75,
             false,
+            0,
         );
 
         let calls = backend.calls();
@@ -50199,6 +51016,7 @@ mod tests {
             NEW_W,
             NEW_H,
             false,
+            0,
         );
 
         // NEW handle is whatever the RecordingBackend's allocate
@@ -50239,6 +51057,225 @@ mod tests {
              missing the compCopyWindow analog that carries pre-resize \
              contents into the freshly-allocated backing. Calls: {calls:?}",
         );
+    }
+
+    // #143 (rendering half) — a SHRINK must rotate exactly like a grow.
+    //
+    // Measured under awesome+picom: switching tiling layout shrank a
+    // mate-terminal frame (`bw = 2`) from 1278x704 to 1276x704 and the
+    // render module logged NOTHING — `redirected_backing_can_fit` was a
+    // high-water-mark test, so the 1282x708 backing was kept and only its
+    // metadata was rewritten. The backing's ring stayed laid out for the
+    // OLD 1278-px content (2-px ring at columns 1280..1281) and nothing
+    // re-seeded it, leaving an alpha-0 band where content should be.
+    //
+    // Xorg reallocates on inequality in EITHER direction:
+    // `compReallocPixmap` (../xserver/composite/compalloc.c:698), whose
+    // replacement is always freshly seeded from the parent
+    // (`compNewPixmap`, compalloc.c:539-605).
+    //
+    // The backend predicate is where the fix lives (its own unit test is
+    // `redirected_backing_reuse_requires_the_exact_storage_extent`);
+    // what this test pins is the core half — that the realloc path
+    // allocates at the NEW bordered extent and carries only the CONTENT
+    // overlap, leaving the freshly painted ring of NEW alone.
+    #[test]
+    fn rotate_redirected_backing_on_shrink_allocates_the_new_bordered_extent() {
+        use crate::backend::recording::RecordedCall;
+
+        const BW: u16 = 2;
+        // Content 1278x704 → backing 1282x708 (the pre-switch state).
+        const OLD_BACKING_W: u16 = 1282;
+        const OLD_BACKING_H: u16 = 708;
+        // Shrink to content 1276x704 → backing 1280x708.
+        const NEW_CONTENT_W: u16 = 1276;
+        const NEW_CONTENT_H: u16 = 704;
+
+        let (mut state, mut backend, old_backing) =
+            redirected_window_fixture(OLD_BACKING_W, OLD_BACKING_H, BW);
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(ROTATE_WINDOW_XID),
+            NEW_CONTENT_W,
+            NEW_CONTENT_H,
+            false,
+            BW,
+        );
+
+        let new_backing = state
+            .resources
+            .window(ResourceId(ROTATE_WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .expect("redirected_backing repointed after the shrink rotate");
+        assert_ne!(
+            new_backing.host_pixmap.as_raw(),
+            old_backing,
+            "a shrink must rotate onto a FRESH backing, not keep the oversized one",
+        );
+        assert_eq!(
+            (new_backing.width, new_backing.height),
+            (1280, 708),
+            "the new backing is the new BORDERED extent (1276 + 2*2, 704 + 2*2)",
+        );
+
+        let calls = backend.calls();
+        assert!(
+            calls.contains(&RecordedCall::AllocateRedirectedBacking {
+                host_window: ROTATE_HOST_XID,
+                width: 1280,
+                height: 708,
+                depth: 32,
+            }),
+            "the shrink must allocate storage at the new bordered extent \
+             1280x708, not keep 1282x708. Calls: {calls:?}",
+        );
+
+        // Content-only copy: both backings hold content at `(bw, bw)`,
+        // and the overlap is min(1278, 1276) x min(704, 704).
+        let new_raw = new_backing.host_pixmap.as_raw();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::CopyArea {
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x: 2,
+                    src_y: 2,
+                    dst_x: 2,
+                    dst_y: 2,
+                    width: 1276,
+                    height: 704,
+                } if *src_host_xid == old_backing && *dst_host_xid == new_raw
+            )),
+            "the rotate copy must carry the CONTENT overlap inset by the \
+             border width — a full-extent copy would repaint NEW's \
+             right/bottom ring columns with OLD's interior pixels. \
+             Calls: {calls:?}",
+        );
+    }
+
+    // The over-correction guard for the test above: a bordered GROW must
+    // keep rotating the way it always did, and its copy is inset the same
+    // way (the ring of NEW is painted by `allocate_redirected_backing`;
+    // Xorg repaints it too, via the `compRepaintBorder` work proc queued
+    // from `compSetPixmap`, ../xserver/composite/compwindow.c:137-139).
+    #[test]
+    fn rotate_redirected_backing_on_bordered_grow_still_rotates_and_copies_content() {
+        use crate::backend::recording::RecordedCall;
+
+        const BW: u16 = 2;
+        // Content 1276x704 → backing 1280x708, growing to content
+        // 1278x704 → backing 1282x708.
+        const OLD_BACKING_W: u16 = 1280;
+        const OLD_BACKING_H: u16 = 708;
+        const NEW_CONTENT_W: u16 = 1278;
+        const NEW_CONTENT_H: u16 = 704;
+
+        let (mut state, mut backend, old_backing) =
+            redirected_window_fixture(OLD_BACKING_W, OLD_BACKING_H, BW);
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(ROTATE_WINDOW_XID),
+            NEW_CONTENT_W,
+            NEW_CONTENT_H,
+            false,
+            BW,
+        );
+
+        let new_backing = state
+            .resources
+            .window(ResourceId(ROTATE_WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .expect("redirected_backing repointed after the grow rotate");
+        assert_eq!((new_backing.width, new_backing.height), (1282, 708));
+
+        let calls = backend.calls();
+        assert!(
+            calls.contains(&RecordedCall::AllocateRedirectedBacking {
+                host_window: ROTATE_HOST_XID,
+                width: 1282,
+                height: 708,
+                depth: 32,
+            }),
+            "the grow must allocate at the new bordered extent. Calls: {calls:?}",
+        );
+        let new_raw = new_backing.host_pixmap.as_raw();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::CopyArea {
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x: 2,
+                    src_y: 2,
+                    dst_x: 2,
+                    dst_y: 2,
+                    width: 1276,
+                    height: 704,
+                } if *src_host_xid == old_backing && *dst_host_xid == new_raw
+            )),
+            "the grow copy carries the same content overlap, inset by the \
+             border width. Calls: {calls:?}",
+        );
+    }
+
+    const ROTATE_WINDOW_XID: u32 = 0x0010_0001;
+    const ROTATE_HOST_XID: u32 = 0x0040_0001;
+
+    /// A root child already redirected, with a backing whose recorded
+    /// extent is `(backing_w, backing_h)` — i.e. the post-activation
+    /// state, before the resize under test. Returns the OLD backing's
+    /// raw xid alongside the fixture.
+    fn redirected_window_fixture(
+        backing_w: u16,
+        backing_h: u16,
+        border_width: u16,
+    ) -> (ServerState, RecordingBackend, u32) {
+        const OLD_BACKING: u32 = 0x0050_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(ROTATE_WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: backing_w.saturating_sub(border_width.saturating_mul(2)),
+                height: backing_h.saturating_sub(border_width.saturating_mul(2)),
+                border_width,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(ROTATE_WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+                ROTATE_HOST_XID,
+            ));
+            w.border_width = border_width;
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                width: backing_w,
+                height: backing_h,
+                depth: 32,
+            });
+        }
+        (state, backend, OLD_BACKING)
     }
 
     // Storage-alive invariant for the rotate copy. Observed in HW
@@ -50309,6 +51346,7 @@ mod tests {
             NEW_W,
             NEW_H,
             true,
+            0,
         );
 
         let calls = backend.calls();
@@ -50415,6 +51453,7 @@ mod tests {
             W,
             H,
             true,
+            0,
         );
 
         let calls = backend.calls();
@@ -57027,6 +58066,7 @@ mod tests {
             100,
             75,
             false,
+            0,
         );
 
         let calls = backend.calls();
@@ -60243,12 +61283,10 @@ mod tests {
                 "copy strip ({dx},{dy} {w}x{h}) overlaps the child rect (11,41 975x600); \
                  ClipByChildren must exclude mapped children",
             );
-            // All strips must target the frame's backing pixmap (the
-            // host xid eagerly substituted by host_drawable_target).
+            // Preserve window identity for backend border translation.
             assert_eq!(
-                *dst_host, FRAME_BACKING_HOST,
-                "ClipByChildren splitting must NOT change the backend's \
-                 dst host_xid; it stays the redirected backing pixmap",
+                *dst_host, FRAME_HOST,
+                "ClipByChildren strips stay in window-local coordinates",
             );
         }
     }
@@ -63868,6 +64906,396 @@ mod tests {
             border_forwards(&calls),
             vec![(host_xid, CWA_BORDER_PIXMAP, vec![0x9999_0001])],
         );
+    }
+
+    /// #143 — THE regression gate for the awesome border flicker.
+    ///
+    /// awesome recolours a focused/unfocused frame with a CWA carrying
+    /// only `CWBorderPixel`. We repainted the ring into the redirect
+    /// backing but reported no protocol DAMAGE for it, so picom — which
+    /// partial-repaints from `EXT_buffer_age` — kept one ring colour per
+    /// back buffer and alternated between them at frame rate. Xorg
+    /// reports it from `ChangeWindowAttributes` itself: `borderClip −
+    /// winSize` → `PaintWindow(..., PW_BORDER)` (`dix/window.c:1581-1589`)
+    /// → `PolyFillRect` on the window pixmap (`mi/miexpose.c:448-471`,
+    /// `:558`) → `damagePolyFillRect` (`miext/damage/damage.c:1194`).
+    ///
+    /// Geometry is the captured one: 1276×704 at `border_width = 2`.
+    #[test]
+    fn change_window_attributes_border_pixel_damages_the_ring() {
+        use crate::server::DamageObject;
+        use yserver_protocol::x11::xfixes::RegionRect;
+        const DAMAGE_XID: u32 = 0x0080_9143;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0001);
+        seed_window(&mut state, win, ROOT_WINDOW, 1276, 704);
+        if let Some(w) = state.resources.window_mut(win) {
+            w.border_width = 2;
+        }
+        assert!(state.resources.map_window(win), "window must map");
+        // Raw level: `area` on the wire then carries the real rect
+        // instead of the NonEmpty full-extent substitute, so the test
+        // can prove the negative origin survives the i16 encoding.
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(1),
+                drawable: win,
+                level: 0,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        let body = border_cwa_body(win.0, CWA_BORDER_PIXEL, &[0x0000_ff00]);
+        run_border_request(&mut state, 2, 0, &body);
+
+        let rects = state
+            .damage_objects
+            .get(&DAMAGE_XID)
+            .expect("damage object")
+            .rects
+            .clone();
+        assert_eq!(
+            rects,
+            vec![
+                RegionRect {
+                    x: -2,
+                    y: -2,
+                    width: 1280,
+                    height: 2
+                },
+                RegionRect {
+                    x: -2,
+                    y: 0,
+                    width: 2,
+                    height: 704
+                },
+                RegionRect {
+                    x: 1276,
+                    y: 0,
+                    width: 2,
+                    height: 704
+                },
+                RegionRect {
+                    x: -2,
+                    y: 704,
+                    width: 1280,
+                    height: 2
+                },
+            ],
+            "a border-source change must damage the whole ring, including the \
+             negative-origin top and left strips",
+        );
+
+        // And it must reach the client as real DamageNotify events,
+        // with the negative origin intact on the wire (`area.x` is
+        // INT16 at byte 16).
+        let bytes = read_all_available(&mut peer);
+        let notifies: Vec<&[u8]> = bytes
+            .chunks_exact(32)
+            .filter(|c| c[0] == crate::nested::DAMAGE_FIRST_EVENT)
+            .collect();
+        assert_eq!(
+            notifies.len(),
+            4,
+            "one DamageNotify per ring strip at ReportLevel Raw",
+        );
+        let areas: Vec<(i16, i16, u16, u16)> = notifies
+            .iter()
+            .map(|c| {
+                (
+                    i16::from_le_bytes([c[16], c[17]]),
+                    i16::from_le_bytes([c[18], c[19]]),
+                    u16::from_le_bytes([c[20], c[21]]),
+                    u16::from_le_bytes([c[22], c[23]]),
+                )
+            })
+            .collect();
+        assert!(
+            areas.contains(&(-2, -2, 1280, 2)),
+            "the top strip must arrive at a NEGATIVE origin, got {areas:?}",
+        );
+        assert!(
+            areas.contains(&(-2, 0, 2, 704)),
+            "the left strip must arrive at a NEGATIVE x, got {areas:?}",
+        );
+    }
+
+    /// The ring damage follows Xorg's two gates and no others: nothing
+    /// for an unbordered window (`HasBorder(pWin)`, `dix/window.c:1586`)
+    /// and nothing for a non-viewable one (`pWin->viewable`, same line).
+    #[test]
+    fn change_window_attributes_border_pixel_damages_nothing_unbordered_or_unmapped() {
+        use crate::server::DamageObject;
+        const DAMAGE_XID: u32 = 0x0080_9144;
+        for (bw, map) in [(0u16, true), (2, false)] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let win = ResourceId(0x0080_0001);
+            seed_window(&mut state, win, ROOT_WINDOW, 64, 64);
+            if let Some(w) = state.resources.window_mut(win) {
+                w.border_width = bw;
+            }
+            if map {
+                assert!(state.resources.map_window(win), "window must map");
+            }
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: win,
+                    level: 0,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+
+            let body = border_cwa_body(win.0, CWA_BORDER_PIXEL, &[0x0000_ff00]);
+            run_border_request(&mut state, 2, 0, &body);
+            assert_no_error(&read_all_available(&mut peer), "CWA border-pixel");
+
+            assert!(
+                state.damage_objects[&DAMAGE_XID].rects.is_empty(),
+                "bw={bw} mapped={map}: no ring to report",
+            );
+        }
+    }
+
+    /// #143, the resize half. `5d7270c1` reported the ring on a
+    /// border-source change and on backing activation; a RESIZE
+    /// repaints it too — `rotate_redirected_backing_on_resize`
+    /// reallocates and `allocate_redirected_backing` paints the new
+    /// ring — and reported nothing, so a partial-repaint compositor
+    /// (picom on `EXT_buffer_age`) kept a ring at the OLD extent in one
+    /// back buffer and the new one in the other. The bottom and right
+    /// strips are the ones that move when a window is resized about a
+    /// fixed origin, which is exactly the observed fingerprint: those
+    /// two edges flickered at awesome's ~1 Hz clock tick and settled
+    /// gone.
+    ///
+    /// Xorg reports it: `compReallocPixmap` reallocates whenever the
+    /// bordered extent differs (`composite/compalloc.c:698`) and that
+    /// branch alone calls `compSetPixmap` (`:700`), whose visitor
+    /// queues `compRepaintBorder` for `bw != 0`
+    /// (`composite/compwindow.c:137-139`) — a `PolyFillRect` on the
+    /// window pixmap (`mi/miexpose.c:558`) that `damagePolyFillRect`
+    /// (`miext/damage/damage.c:1194`) reports.
+    ///
+    /// bw = 2 and the captured 1276x704, shrunk and grown.
+    #[test]
+    fn configure_window_resize_damages_the_ring_at_the_new_geometry() {
+        use crate::{
+            resources::RedirectedBacking,
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
+        };
+        use yserver_protocol::x11::xfixes::RegionRect;
+        const DAMAGE_XID: u32 = 0x0080_9145;
+        const BW: u16 = 2;
+        // (old_w, old_h, new_w, new_h, label)
+        for (old_w, old_h, new_w, new_h, label) in [
+            (1276u16, 704u16, 636u16, 348u16, "shrink"),
+            (636, 348, 1276, 704, "grow"),
+        ] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let win = ResourceId(0x0080_0001);
+            seed_window(&mut state, win, ROOT_WINDOW, old_w, old_h);
+            if let Some(w) = state.resources.window_mut(win) {
+                w.border_width = BW;
+                w.redirected_backing = Some(RedirectedBacking {
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(0x0050_0001),
+                    width: old_w + 2 * BW,
+                    height: old_h + 2 * BW,
+                    depth: 24,
+                });
+            }
+            assert!(state.resources.map_window(win), "window must map");
+            state.composite_redirects.insert(
+                (win, false),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            );
+            // ReportLevel Raw, so `rects` keeps the real strips instead
+            // of the NonEmpty full-extent substitute.
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: win,
+                    level: 0,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+
+            // ConfigureWindow, CWWidth | CWHeight.
+            let mut body = Vec::with_capacity(16);
+            body.extend_from_slice(&win.0.to_le_bytes());
+            body.extend_from_slice(&0x000cu16.to_le_bytes());
+            body.extend_from_slice(&[0u8; 2]);
+            body.extend_from_slice(&u32::from(new_w).to_le_bytes());
+            body.extend_from_slice(&u32::from(new_h).to_le_bytes());
+            run_border_request(&mut state, 12, 0, &body);
+
+            let rects = state.damage_objects[&DAMAGE_XID].rects.clone();
+            let bw = i16::try_from(BW).unwrap();
+            let ring = [
+                RegionRect {
+                    x: -bw,
+                    y: -bw,
+                    width: new_w + 2 * BW,
+                    height: BW,
+                },
+                RegionRect {
+                    x: -bw,
+                    y: 0,
+                    width: BW,
+                    height: new_h,
+                },
+                RegionRect {
+                    x: i16::try_from(new_w).unwrap(),
+                    y: 0,
+                    width: BW,
+                    height: new_h,
+                },
+                RegionRect {
+                    x: -bw,
+                    y: i16::try_from(new_h).unwrap(),
+                    width: new_w + 2 * BW,
+                    height: BW,
+                },
+            ];
+            assert_eq!(
+                rects.get(..4),
+                Some(&ring[..]),
+                "{label}: a resize must damage the whole ring at the NEW \
+                 geometry, before the full-extent configure damage, and the \
+                 top/left strips carry NEGATIVE origins; got {rects:?}",
+            );
+            // The bottom and right strips are the ones whose position
+            // MOVED — the #143 fingerprint. Spell them out so a
+            // regression that reports the ring at the OLD extent fails
+            // here and not only on the ordering assert above.
+            assert!(
+                rects.contains(&ring[2]) && rects.contains(&ring[3]),
+                "{label}: the right and bottom strips must sit at the NEW \
+                 extent ({new_w}x{new_h}), not the old one ({old_w}x{old_h})",
+            );
+            assert!(
+                rects.contains(&RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: new_w,
+                    height: new_h,
+                }),
+                "{label}: the pre-existing full-extent configure damage must \
+                 still fire alongside the ring",
+            );
+
+            // And it reaches the client, negative origins intact on the
+            // wire (`area.x`/`area.y` are INT16 at bytes 16..20).
+            let bytes = read_all_available(&mut peer);
+            let areas: Vec<(i16, i16, u16, u16)> = bytes
+                .chunks_exact(32)
+                .filter(|c| c[0] == crate::nested::DAMAGE_FIRST_EVENT)
+                .map(|c| {
+                    (
+                        i16::from_le_bytes([c[16], c[17]]),
+                        i16::from_le_bytes([c[18], c[19]]),
+                        u16::from_le_bytes([c[20], c[21]]),
+                        u16::from_le_bytes([c[22], c[23]]),
+                    )
+                })
+                .collect();
+            for r in &ring {
+                assert!(
+                    areas.contains(&(r.x, r.y, r.width, r.height)),
+                    "{label}: ring strip {r:?} must arrive as a DamageNotify, got {areas:?}",
+                );
+            }
+        }
+    }
+
+    /// The resize ring damage follows the same two Xorg gates as the
+    /// border-source one — nothing at `bw == 0` (`HasBorder(pWin)`) and
+    /// nothing for a non-viewable window (`pWin->viewable`,
+    /// `dix/window.c:1586`) — so an unbordered resize keeps reporting
+    /// exactly the one full-extent rect it always did.
+    #[test]
+    fn configure_window_resize_damages_no_ring_unbordered_or_unmapped() {
+        use crate::{
+            resources::RedirectedBacking,
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
+        };
+        use yserver_protocol::x11::xfixes::RegionRect;
+        const DAMAGE_XID: u32 = 0x0080_9146;
+        for (bw, map) in [(0u16, true), (2, false)] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let win = ResourceId(0x0080_0001);
+            seed_window(&mut state, win, ROOT_WINDOW, 128, 64);
+            if let Some(w) = state.resources.window_mut(win) {
+                w.border_width = bw;
+                w.redirected_backing = Some(RedirectedBacking {
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(0x0050_0001),
+                    width: 128 + 2 * bw,
+                    height: 64 + 2 * bw,
+                    depth: 24,
+                });
+            }
+            if map {
+                assert!(state.resources.map_window(win), "window must map");
+            }
+            state.composite_redirects.insert(
+                (win, false),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            );
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: win,
+                    level: 0,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+
+            let mut body = Vec::with_capacity(16);
+            body.extend_from_slice(&win.0.to_le_bytes());
+            body.extend_from_slice(&0x000cu16.to_le_bytes());
+            body.extend_from_slice(&[0u8; 2]);
+            body.extend_from_slice(&64u32.to_le_bytes());
+            body.extend_from_slice(&32u32.to_le_bytes());
+            run_border_request(&mut state, 12, 0, &body);
+            assert_no_error(&read_all_available(&mut peer), "ConfigureWindow resize");
+
+            let expected: Vec<RegionRect> = if map {
+                vec![RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 32,
+                }]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                state.damage_objects[&DAMAGE_XID].rects, expected,
+                "bw={bw} mapped={map}: no ring to report on a resize",
+            );
+        }
     }
 
     /// A tile with no host storage degrades to the pixel bit with a

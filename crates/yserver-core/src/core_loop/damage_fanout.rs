@@ -67,6 +67,83 @@ pub fn accumulate_damage_full_to_state(
     accumulate_damage_to_state(state, drawable, 0, 0, r.width, r.height)
 }
 
+/// The border annulus of `window`, in the window's OWN coordinate
+/// space — the region Xorg calls `borderClip − winSize`
+/// (`dix/window.c:1585-1587`, `composite/compwindow.c:114`). The ring
+/// lies OUTSIDE the content origin, so it spans `(-bw, -bw)` to
+/// `(width + bw, height + bw)` and its top/left strips carry NEGATIVE
+/// rect origins. That is the same convention as the SHAPE bounding
+/// default (`nested::default_shape_rect`) and as Xorg's own damage
+/// report: `damageDamageBox` translates by the window's INNER origin
+/// (`miext/damage/damage.c:1194` → `damageRegionAppend`), so the
+/// border pixels arrive at negative window coordinates on the wire.
+///
+/// Returned as the actual region difference (four strips: top, bottom,
+/// left, right) rather than one bounding rect, so a compositor
+/// repainting exactly what we report does not also repaint the
+/// content it already has.
+///
+/// Empty for the root, for an unknown xid and at `bw == 0` — the
+/// latter being Xorg's `HasBorder(pWin)` early-out.
+pub fn border_annulus_rects(state: &ServerState, window: ResourceId) -> Vec<xfixes::RegionRect> {
+    if window == crate::resources::ROOT_WINDOW {
+        return Vec::new();
+    }
+    let Some(w) = state.resources.window(window) else {
+        return Vec::new();
+    };
+    if w.border_width == 0 {
+        return Vec::new();
+    }
+    let bw = i32::from(w.border_width);
+    let origin = i16::try_from(-bw).unwrap_or(i16::MIN);
+    let outer = xfixes::RegionRect {
+        x: origin,
+        y: origin,
+        width: u16::try_from(i32::from(w.width) + 2 * bw).unwrap_or(u16::MAX),
+        height: u16::try_from(i32::from(w.height) + 2 * bw).unwrap_or(u16::MAX),
+    };
+    let inner = xfixes::RegionRect {
+        x: 0,
+        y: 0,
+        width: w.width,
+        height: w.height,
+    };
+    crate::nested::subtract_regions(&[outer], &[inner])
+}
+
+/// Report protocol DAMAGE over `window`'s border ring (#143).
+///
+/// Xorg reaches this for free: a border repaint is an ordinary
+/// `PolyFillRect` GC op on `GetWindowPixmap(pWin)`
+/// (`mi/miexpose.c:448-471`, `:558`), which the DAMAGE wrapper
+/// intercepts at `damagePolyFillRect` (`miext/damage/damage.c:1194`).
+/// yserver paints its ring inside the render backend
+/// (`paint_window_border`), which wakes our own compositor loop but
+/// never enters the DAMAGE fanout — so a compositor doing partial
+/// repaint from `EXT_buffer_age` (picom) keeps a different stale ring
+/// in each back buffer and alternates between them at frame rate.
+/// That is the awesome focused/unfocused border flicker.
+///
+/// Non-viewable windows drop out inside
+/// [`accumulate_damage_to_state`], matching Xorg's `pWin->viewable`
+/// gate at `dix/window.c:1581`.
+pub fn accumulate_damage_border_to_state(
+    state: &mut ServerState,
+    window: ResourceId,
+) -> Vec<ClientId> {
+    let mut dropped: Vec<ClientId> = Vec::new();
+    for rect in border_annulus_rects(state, window) {
+        for c in accumulate_damage_to_state(state, window, rect.x, rect.y, rect.width, rect.height)
+        {
+            if !dropped.contains(&c) {
+                dropped.push(c);
+            }
+        }
+    }
+    dropped
+}
+
 /// Mapped `InputOutput` children of `drawable`, as rects in the
 /// drawable's local coords (a child's x/y are already relative to its
 /// parent). These are the regions `ClipByChildren` subtracts from a
@@ -945,6 +1022,181 @@ mod tests {
         buf.chunks_exact(32)
             .filter(|c| c[0] == DAMAGE_FIRST_EVENT)
             .count()
+    }
+
+    /// #143 — the border annulus is Xorg's `borderClip − winSize`
+    /// (`dix/window.c:1585-1587`): four strips around the content,
+    /// with the top and left ones at NEGATIVE window-local origins.
+    /// Geometry is the awesome window from the capture: 1276×704 with
+    /// `border_width = 2`.
+    #[test]
+    fn the_border_annulus_is_the_region_difference_at_negative_origins() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0030_0000);
+        let w = add_window(&mut state, 1, 0x0030_0001, ROOT_WINDOW, 100, 50, 1276, 704);
+        state
+            .resources
+            .window_mut(w)
+            .expect("seeded window")
+            .border_width = 2;
+
+        assert_eq!(
+            border_annulus_rects(&state, w),
+            vec![
+                xfixes::RegionRect {
+                    x: -2,
+                    y: -2,
+                    width: 1280,
+                    height: 2
+                },
+                xfixes::RegionRect {
+                    x: -2,
+                    y: 0,
+                    width: 2,
+                    height: 704
+                },
+                xfixes::RegionRect {
+                    x: 1276,
+                    y: 0,
+                    width: 2,
+                    height: 704
+                },
+                xfixes::RegionRect {
+                    x: -2,
+                    y: 704,
+                    width: 1280,
+                    height: 2
+                },
+            ],
+            "the ring must be the four strips of `borderClip − winSize`, \
+             not one bounding rect over the content",
+        );
+        // The strips tile the annulus exactly: 2 * (1280 * 2) + 2 * (2 * 704).
+        let area: u32 = border_annulus_rects(&state, w)
+            .iter()
+            .map(|r| u32::from(r.width) * u32::from(r.height))
+            .sum();
+        assert_eq!(area, 1280 * 708 - 1276 * 704, "outer extent minus winSize");
+    }
+
+    /// `HasBorder(pWin)` (`dix/window.c:1586`) is Xorg's early-out and
+    /// ours: no border width, no ring, no damage. The root is excluded
+    /// too — its ring is not a thing any compositor composites.
+    #[test]
+    fn the_border_annulus_is_empty_without_a_border_and_on_the_root() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0030_0000);
+        let w = add_window(&mut state, 1, 0x0030_0001, ROOT_WINDOW, 0, 0, 64, 64);
+        assert!(
+            border_annulus_rects(&state, w).is_empty(),
+            "bw == 0 must produce no ring",
+        );
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .border_width = 2;
+        assert!(
+            border_annulus_rects(&state, ROOT_WINDOW).is_empty(),
+            "the root never reports a border ring",
+        );
+    }
+
+    /// #143 — the negative origins have to survive `accumulate_at_level`'s
+    /// i32 → i16/u16 saturating cast and land in the damage object as
+    /// negative rects. Xorg reports them the same way: `damageDamageBox`
+    /// translates by the window's INNER origin
+    /// (`miext/damage/damage.c:1194` → `damageRegionAppend`), so border
+    /// pixels are at negative window coordinates there too.
+    #[test]
+    fn border_damage_reaches_the_damage_object_at_negative_origins() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0030_0000);
+        let w = add_window(&mut state, 1, 0x0030_0001, ROOT_WINDOW, 100, 50, 1276, 704);
+        state
+            .resources
+            .window_mut(w)
+            .expect("seeded window")
+            .border_width = 2;
+        // Raw level so `area` carries the real rect rather than the
+        // NonEmpty full-extent substitute.
+        add_damage_on_with_level(
+            &mut state,
+            1,
+            0xd143_0001,
+            w,
+            x11damage::report_level::RAW_RECTANGLES,
+        );
+
+        let _dropped = accumulate_damage_border_to_state(&mut state, w);
+
+        let dmg = state
+            .damage_objects
+            .get(&0xd143_0001)
+            .expect("damage object");
+        assert_eq!(
+            dmg.rects,
+            border_annulus_rects(&state, w),
+            "every ring strip must be accumulated verbatim, negatives included",
+        );
+        assert!(
+            dmg.rects.iter().any(|r| r.x < 0 || r.y < 0),
+            "the ring's top/left strips are at negative origins by construction",
+        );
+        assert!(dmg.pending_notify_fired, "a notify must have been queued");
+    }
+
+    /// The ancestor walk translates a negative-origin ring rect by the
+    /// child's own (x, y) — which is exactly right, because a child's
+    /// x/y are its INNER origin in the parent and the ring hangs `bw`
+    /// outside it. A child at (100, 50) with `bw = 2` must therefore
+    /// damage its parent starting at (98, 48).
+    #[test]
+    fn the_ring_translates_to_the_outer_origin_in_the_parent() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0030_0000);
+        let parent = add_window(&mut state, 1, 0x0030_0001, ROOT_WINDOW, 0, 0, 2000, 1000);
+        let child = add_window(&mut state, 1, 0x0030_0002, parent, 100, 50, 1276, 704);
+        state
+            .resources
+            .window_mut(child)
+            .expect("child")
+            .border_width = 2;
+        add_damage_on_with_level(
+            &mut state,
+            1,
+            0xd143_0002,
+            parent,
+            x11damage::report_level::RAW_RECTANGLES,
+        );
+
+        let _dropped = accumulate_damage_border_to_state(&mut state, child);
+
+        let rects = &state
+            .damage_objects
+            .get(&0xd143_0002)
+            .expect("parent damage object")
+            .rects;
+        assert!(
+            rects.contains(&xfixes::RegionRect {
+                x: 98,
+                y: 48,
+                width: 1280,
+                height: 2
+            }),
+            "the top strip must land at the child's OUTER origin in the \
+             parent, got {rects:?}",
+        );
+        assert!(
+            rects.contains(&xfixes::RegionRect {
+                x: 98,
+                y: 754,
+                width: 1280,
+                height: 2
+            }),
+            "the bottom strip must land one border width past the content, \
+             got {rects:?}",
+        );
     }
 
     /// Issue #97 (i3 + fastcompmgr): switching workspace left the

@@ -310,10 +310,14 @@ void main() {
     // pixel overwrite the destination as opaque black — observed
     // as black borders around desktop icons on first MATE/fuji
     // smoke. The ALPHA_MODE spec-constant is kept declared so the
-    // pipeline cache key + plumbing stay intact; the actual fix
-    // for the depth-24 α-stays-opaque contract on RENDER paths
-    // needs either dual-source blending or a second α-write pass,
-    // tracked as follow-up.
+    // pipeline cache key + plumbing stay intact. The depth-24
+    // α-stays-opaque contract is instead enforced OUTSIDE the
+    // fragment stage, where it does not disturb the blend factor:
+    // `render_pipeline::dst_color_write_mask` drops α from the
+    // colour write mask for a no-alpha destination, so the composite
+    // never stores an α byte and the storage keeps the opaque value
+    // it was initialised with (`default_window_init_color`). Same
+    // mechanism `logic_fill_pipeline.rs` uses for core fills.
     // Output 1 is consumed by the pipeline's SRC1_* blend factors
     // when COMPONENT_ALPHA = 1 (MODE=0). For an R8 (a8 picture)
     // attachment the blend reads `.r` of output 1, so we replicate

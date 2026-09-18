@@ -33,6 +33,112 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-17 on-screen reads follow the directly-flipped buffer:** while a
+  CRTC scans out a client buffer directly, the compositor's pool BOs are not
+  painted at all (`retire_direct_output` calls `invalidate_all_scanout_damage`
+  on the way back for exactly that reason), but every scanout READ still went
+  to the pool. A measured session: the Ctrl-Alt-Enter dumps matched the COW
+  storage 100.00% and the live direct source only 7.68%, with the direct
+  source holding what was actually on screen; direct scanout had been up ~65s
+  with zero composed-unflip events. `select_scanout_bo_for_rect` is now
+  `select_scanout_read_route`, which asks `direct_scanout_frame_for_output`
+  first and reads the flipped source drawable via
+  `engine.get_image(Src::server_internal(source_id), …)` — the same read
+  `do_dump_drawables` uses for its `present-src` targets. This is protocol-
+  visible: root `GetImage`, root-source `CopyArea(IncludeInferiors)` and the
+  root screenshot pixmap all go through `read_root_scanout_assembled`.
+  Per-output, because a direct flip and the composed unflip both retire
+  per-CRTC: `direct_frame_slot_on_output` picks pending/current/composed from
+  `pending.awaiting_outputs` + `unflip_awaiting_outputs`. The rect maps into
+  the source by subtracting `candidate.x_off/y_off` — the identity today,
+  since M2 eligibility pins a direct source to the whole root at the root
+  origin, but derived rather than assumed. An unresolvable direct source is an
+  ERROR, never a fall-through to the pool: the dump writes
+  `yserver-scanout-<run>-out<i>-UNREADABLE.txt` and the protocol path keeps
+  the existing zero-fill/skip degradation, now with a warn naming the rect.
+  Dump filenames gained the buffer they came from —
+  `yserver-scanout-<run>-out<i>-{composed-pool<p>-bo<b>|direct-src-0x<xid>}.ppm`
+  — so a stale artifact can never be mistaken for the screen again; every
+  in-tree consumer (`tools/vng-shot.sh`, `tools/e16-hover-repro.sh`,
+  `tools/ppm-regions.py`) globs `yserver-scanout-*.ppm` and is unaffected.
+  NOT touched: the unflip policy itself. Note for test work —
+  `for_tests_with_vk_live_scene` cannot allocate a scanout BO pool on
+  lavapipe, so every lib test built on it (including the pre-existing
+  `root_get_image_reads_scanout_pixels_not_root_storage`) skips vacuously
+  there; the new pixel test uses `for_tests_with_vk` instead, where the
+  composed route has no pool and can only zero-fill, which is what makes the
+  direct assertion bite.
+
+- **2026-09-16 #143 follow-up, awesome borders on bee:** the drawable dump
+  exposed two separate failures. The frame backing already contained title-bar
+  pixels in its top/left border: core `CopyArea` substituted the redirect
+  pixmap before dispatch, bypassing KMS's window content offset and clip.
+  `CopyArea` now preserves window identity for both source and destination;
+  named pixmaps still address the whole backing, including the border.
+
+  The menu's content backing was correct at 100x30, but awesome added a 2-pixel
+  border after mapping and the backing stayed 100x30 instead of 104x34.
+  Configure now rotates redirected storage on border-width changes as well
+  as resizes, copying content from the old inset to the new one. This also
+  handles a combined resize/border change whose outer extent is unchanged.
+  The internal preservation copy resets the last client's drawing state;
+  a preceding GXnoop/zero-plane-mask draw otherwise lost edge pixels.
+
+  Both failures reproduced through protocol requests against the real KMS
+  backend before the fixes. All 163 Vulkan render acceptance tests and 1357
+  core unit tests pass, including pixel checks for border growth, shrink,
+  removal, unchanged outer extent, and CopyArea in both directions.
+  Live awesome/picom visual confirmation is still pending.
+
+- **2026-09-16 #143 "already open windows get broken rendering" is the RESIZE,
+  not the redirect:** the reporter's symptom, and jos's HW A/B on nothing but
+  launch order (awesome + picom: terminals spawned before picom lost their
+  content, the same terminals spawned after it kept it), attribute to
+  `configure_subwindow`'s leaf realloc — not to the redirect seed.
+
+  Measured, through `ProtoFixture` on lavapipe, replaying the sequence as
+  protocol requests:
+
+  - the redirect seed is CLEAN. Paint a window, then
+    `RedirectSubwindows(root, Manual)`, and the backing comes up holding the
+    pixels — for a root child, for a reparented client inside a WM frame, at
+    depth 24 and 32, with and without a border. `seed_backing_from_parent` +
+    `overlay_backing_inferiors` reproduce `compNewPixmap`'s
+    `CopyArea(parent, …, IncludeInferiors)`
+    (`composite/compalloc.c:562-571`) faithfully enough for every shape
+    tried. Four separate attempts to make it drop content all came back
+    green.
+  - the unredirected resize WIPES. `sync_window_leaf_storage_to_geometry`
+    reallocated at the new extent and background-filled, discarding what the
+    client had painted. So by the time picom starts, the leaf the seed copies
+    is already blank, and an idle client never repaints it.
+  - and on a SHRINK we emit **no Expose at all** (measured off the client
+    socket: 0 events for 200x100 → 100x100, a full-window Expose for the
+    grow). Xorg exposes "the entire window ... unless bitGravity recovers
+    portions of it" (`mi/miwindow.c:466-472`). So we took the worst of both
+    gravities: we discarded the pixels like `ForgetGravity` and stayed silent
+    like `NorthWestGravity`. Nothing could ever bring the content back.
+
+  Fix: a resize of a window with NO background now migrates its content
+  across the realloc (`LeafContent::Migrate`, the machinery the border-width
+  path already used), which is X11's own rule for the default gravity — "the
+  window is tiled with its background. If no background is defined, the
+  existing screen contents are not altered", which Xorg implements by
+  returning from the paint untouched (`switch (pWin->backgroundState) { case
+  None: return; }`, `mi/miexpose.c:438-440`). A window WITH a background is
+  still discarded and re-tiled: that is the same rule's other half, and it is
+  what the xeyes-resize regression needs. Closes the background-None half of
+  [[project_resize_black_window_storage]].
+
+  **Still open**, both pre-existing and both now pinned by a test that says so
+  when they change: (a) a non-`ForgetGravity` `bit_gravity` should retain the
+  pixels of a window that HAS a background too — the attribute is tracked in
+  `resources.rs` but never reaches the render backend, neither at CreateWindow
+  nor through `change_subwindow_attributes`; (b) the missing shrink Expose,
+  which is the only recovery path left for those windows. Whether the HW
+  xterm that lost its fish banner is fixed depends on which of the two it
+  needs — xterm's background and bit gravity were not measured.
+
 - **2026-09-16 C.0 specification section 16.3 revision 4 — first review of the
   evidence regime.** Revision 3 (2026-09-10, `39c9b75e`), which replaced the
   eight-hour soak with runtime qualification, had entered without a review or a
@@ -451,6 +557,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   sleeps exist on any host-call core path, and the full local and portable build
   gates pass on Linux glibc, Linux musl, and FreeBSD. No owner or call-site
   conversion exists yet; that is Stage 2b.
+
 - **2026-09-09 COMPOSITE overlay claim ownership:** the overlay claim is now a
   per-client thing owned by core, as it is in Xorg. `ServerState.cow_claims`
   holds one entry per `GetOverlayWindow` recording the owning `ClientId`, and

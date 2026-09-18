@@ -443,6 +443,10 @@ impl TextPipeline {
             // factor `fg.a * cov.rgb`.
             component_alpha,
         );
+        // Same destination-side force-opaque rule the general
+        // composite path uses: a depth-24 / xRGB destination has no
+        // client-meaningful α, so a glyph draw must not store one.
+        // See `render_pipeline::dst_color_write_mask`.
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
             .src_color_blend_factor(src_factor)
@@ -451,7 +455,10 @@ impl TextPipeline {
             .src_alpha_blend_factor(src_factor)
             .dst_alpha_blend_factor(dst_factor)
             .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            .color_write_mask(crate::kms::vk::render_pipeline::dst_color_write_mask(
+                color_format,
+                dst_has_alpha,
+            ))];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
         let dynamic_state_array = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];

@@ -1313,11 +1313,18 @@ pub trait Backend {
         Ok(())
     }
 
-    /// Returns whether the existing redirected backing storage can
-    /// satisfy a resize to `(width, height, depth)` without
-    /// reallocating the underlying pixmap. Backends that track a
-    /// larger storage extent than the current logical alias size can
-    /// use this to fast-path shrink/re-grow cycles.
+    /// Returns whether the existing redirected backing storage already
+    /// IS `(width, height, depth)`, so a resize can keep it without
+    /// reallocating the underlying pixmap. `width`/`height` are the
+    /// bordered extent.
+    ///
+    /// #143: this is an equality, not a high-water mark — a backing
+    /// that is merely big enough must still be replaced, because the
+    /// border ring and the parent seed live inside the storage and are
+    /// laid out for the extent it was allocated at. Xorg keys the same
+    /// decision off `pix_w != pOld->drawable.width ||
+    /// pix_h != pOld->drawable.height`
+    /// (../xserver/composite/compalloc.c:698).
     #[must_use]
     fn redirected_backing_can_fit(
         &self,
