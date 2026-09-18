@@ -91,11 +91,12 @@ After Task 5 the coordinator applies each mutation to your code and runs the tes
 cargo +nightly fmt
 cargo clippy --all-targets -- -D warnings
 for i in 1 2 3 4 5; do cargo test -p yserver --lib c0_adm; done
+cargo test --release -p yserver --lib c0_adm
 cargo test -p yserver --lib c0_2ci
 cargo test -p yserver --lib
 ```
 
-Report all five `c0_adm` runs. Task 5 additionally runs clippy with `--features tcp-transport` and `--features xdmcp`, and `cargo check --workspace --target` for `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl` and `x86_64-unknown-freebsd`.
+Report all five `c0_adm` runs. The release run was added after Task 3's first attempt: a side effect placed inside `debug_assert!` passed every debug test and broke in release. **No side effect may live inside a `debug_assert!`**. Task 5 additionally runs clippy with `--features tcp-transport` and `--features xdmcp`, and `cargo check --workspace --target` for `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl` and `x86_64-unknown-freebsd`.
 
 ---
 
