@@ -8,7 +8,7 @@ comparison (section 9) was requested there. Revision 2 incorporates codex round 
 major, all four verified against the tree and accepted): fairness per CRTC
 (B-1), the confirmation boundary moved to the send (B-2), tier 5 takes every
 ready CRTC (B-3), barriers counted apart from the bound and ticket-lifecycle
-mutations (M-1). One question C.0 does not answer is open in section 11.1.
+mutations (M-1). The one question C.0 did not answer is decided in section 11.1 and written into C.0 §9.2.1.
 Two implementation plans follow (section 10.3).
 
 **Authority**, most general first. This document elaborates the 2c-ii block; it
@@ -464,16 +464,23 @@ the decisions above.
 - How the `HomogeneousCompletionGroup` membership reaches the snapshot; qualifying
   the group on hardware remains stage 3 and C.0 §16.3.
 
-### 11.1. Open design question — must be settled before plan B
+### 11.1. Absorbed maintenance after a post-dispatch kernel rejection — decided
 
-**What happens to absorbed maintenance when a dispatched commit is rejected
-by the kernel?** Section 6 confirms at the send boundary, so the tickets are
-spent. C.0 §9.2 says a failure leaves the prior current state authoritative, but
-nowhere says whether a cursor or gamma generation carried by the rejected commit
-re-enters admission with its original ticket (aged), gets a new one, or is
-dropped as incompatible. The choice affects the starvation bound: a new ticket
-could push it back indefinitely, while re-entering with the old ticket could
-loop on a payload the kernel will always reject. This is a gap in C.0, not
-plumbing; it is recorded here per the authority rule and answered in C.0 (or by
-the user) before plan B, which owns tickets. Plan A (primary only) does not
-depend on it.
+Fixing round-1 B-2 exposed a gap in C.0: section 6 confirms at the send boundary,
+so the tickets are spent, and C.0 §9.2 only says a failure leaves the prior
+current state authoritative. It did not say what happens to the cursor or gamma
+generations the rejected commit carried. A new ticket could push them back
+indefinitely, and re-entering forever could loop on a payload the kernel always
+rejects.
+
+**Decision (user, 2026-09-18), written into C.0 §9.2.1:** each such generation
+re-enters admission as desired state **with its original ticket, aged**, so the
+starvation bound still holds. A **second** kernel rejection of the same
+generation marks it incompatible: it is dropped instead of re-admitted, and its
+CRTC is serviced under the incompatible-maintenance rules. A newer generation
+arriving meanwhile replaces it latest-wins and keeps the ticket.
+
+This belongs to plan B (tickets). Its exit criterion: a rejected commit's
+maintenance is re-admitted with its original ticket and aged (mutation: issue a
+new ticket), and a second rejection of the same generation drops it (mutation:
+re-admit it a third time).

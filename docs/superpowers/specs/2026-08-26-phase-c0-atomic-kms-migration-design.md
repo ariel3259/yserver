@@ -1588,6 +1588,15 @@ admissions, and owner dispatch latency. Finite topology/unflip/recovery barriers
 may interrupt this bound and are measured separately, but cannot reset surviving
 tickets.
 
+*(Amended 2026-09-18, stage 2c-ii design §11.1.)* A ticket is consumed when its
+admission crosses the send boundary. If the kernel then rejects the commit, the
+prior current state stays authoritative and each cursor or gamma generation that
+commit carried re-enters admission as desired state **with its original ticket,
+aged**, so the bound above still holds. A second kernel rejection of the **same**
+generation marks it incompatible: it is dropped rather than re-admitted, and its
+CRTC is serviced under the incompatible-maintenance rules of this section. A
+newer generation arriving meanwhile replaces it latest-wins and keeps the ticket.
+
 Likewise, a continuously ready primary CRTC may not take two successive device
 slots while another CRTC has a ready primary intent. C.1 uses the inherited per-CRTC
 latest-wins slot but yields device admission under these rules. The bounded
