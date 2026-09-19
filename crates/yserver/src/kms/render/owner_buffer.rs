@@ -127,6 +127,78 @@ impl<P> OwnerBuffer<P> {
         }
     }
 
+    pub(crate) fn pending_ack(&self) -> Option<&P> {
+        match self {
+            Self::Rendering { pending_ack, .. }
+            | Self::Desired { pending_ack, .. }
+            | Self::Displaced { pending_ack, .. }
+            | Self::Submitted { pending_ack, .. }
+            | Self::Accepted { pending_ack, .. }
+            | Self::Current { pending_ack, .. }
+            | Self::Releasing { pending_ack, .. } => Some(pending_ack),
+            Self::Quarantined { .. } => None,
+        }
+    }
+
+    pub(crate) fn pending_ack_mut(&mut self) -> Option<&mut P> {
+        match self {
+            Self::Rendering { pending_ack, .. }
+            | Self::Desired { pending_ack, .. }
+            | Self::Displaced { pending_ack, .. }
+            | Self::Submitted { pending_ack, .. }
+            | Self::Accepted { pending_ack, .. }
+            | Self::Current { pending_ack, .. }
+            | Self::Releasing { pending_ack, .. } => Some(pending_ack),
+            Self::Quarantined { .. } => None,
+        }
+    }
+
+    pub(crate) fn allocation_lease(&self) -> Option<&AllocationLease> {
+        match self {
+            Self::Desired {
+                allocation_lease, ..
+            }
+            | Self::Displaced {
+                allocation_lease: Some(allocation_lease),
+                ..
+            } => Some(allocation_lease),
+            Self::Rendering { .. }
+            | Self::Displaced {
+                allocation_lease: None,
+                ..
+            }
+            | Self::Submitted { .. }
+            | Self::Accepted { .. }
+            | Self::Current { .. }
+            | Self::Releasing { .. }
+            | Self::Quarantined { .. } => None,
+        }
+    }
+
+    /// Take the descriptor-pool slot while this state still owns it.
+    pub(crate) fn take_descriptor_slot(&mut self) -> Option<usize> {
+        match self {
+            Self::Rendering {
+                descriptor_slot, ..
+            } => Some(*descriptor_slot),
+            Self::Desired {
+                descriptor_slot, ..
+            }
+            | Self::Displaced {
+                descriptor_slot, ..
+            } => descriptor_slot.take(),
+            Self::Submitted { .. }
+            | Self::Accepted { .. }
+            | Self::Current { .. }
+            | Self::Releasing { .. }
+            | Self::Quarantined { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_prepared(&self) -> bool {
+        matches!(self, Self::Rendering { .. } | Self::Desired { .. })
+    }
+
     pub(crate) fn commit_id(&self) -> Option<CommitId> {
         match self {
             Self::Submitted { commit_id, .. }

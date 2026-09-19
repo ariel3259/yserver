@@ -134,31 +134,10 @@ pub enum BoPhase {
     /// `Free` once all GPU readers (e.g. damage-diff sources)
     /// complete.
     Retiring,
-    /// Owner route: the compose GPU submission exists and its render
-    /// completion is registered with the platform drain. There is no KMS
-    /// in-fence on this route.
-    OwnerRendering,
-    /// Owner route: render completion was drained and the generation is
-    /// available to the admission conductor.
-    OwnerDesired,
-    /// Owner route: admission moved the desired generation into the commit's
-    /// submitted ledger. The owner now owns the KMS completion evidence.
-    OwnerSubmitted,
-    /// Owner route: the owner accepted the commit, but has not yet retired
-    /// its completion evidence.
-    OwnerAccepted,
-    /// Owner route: the owner retired the commit and this generation is the
-    /// display's current owner buffer.
-    OwnerCurrent,
-    /// Owner route: a newer owner generation is current, so this buffer is
-    /// waiting for all release obligations before reuse.
-    OwnerReleasing,
-    /// Owner route: a newer generation displaced this one before admission.
-    /// It returns to `Free` only after its compose GPU batch retires.
-    OwnerDisplaced,
-    /// Owner route: completion evidence was contradictory or unavailable.
-    /// This buffer is never reused by the C.0 owner path.
-    OwnerQuarantined,
+    /// Owner route membership. The scene's [`OwnerBuffer`] is authoritative
+    /// for the logical lifecycle state; this phase only prevents legacy
+    /// acquisition from treating an owner-held buffer as free.
+    Owner,
 }
 
 /// Reuse state for a binary semaphore whose submitted payload is exported as
@@ -401,117 +380,21 @@ impl BoState {
         self.phase = BoPhase::Recording;
     }
 
-    /// `Recording → OwnerRendering`: the owner route has submitted the
-    /// compose and registered its render-completion payload. No KMS fence is
-    /// retained in this state.
-    pub fn transition_to_owner_rendering(&mut self) {
-        debug_assert_eq!(self.phase, BoPhase::Recording);
-        self.phase = BoPhase::OwnerRendering;
-    }
-
-    /// `OwnerRendering → OwnerDesired`: the platform drain observed the
-    /// render completion, so the generation may be offered to admission.
-    pub fn transition_to_owner_desired(&mut self) {
-        if self.phase != BoPhase::OwnerRendering {
-            return;
-        }
-        self.phase = BoPhase::OwnerDesired;
-    }
-
-    /// `OwnerDesired → OwnerSubmitted`: the admission ledger took ownership
-    /// of the prepared generation. Owner commits carry no producer fence in
-    /// the ioctl; this phase is only the buffer-side lifecycle marker.
-    pub fn transition_to_owner_submitted(&mut self) -> bool {
-        if self.phase != BoPhase::OwnerDesired {
+    /// `Recording → Owner`: the owner route has submitted the compose and
+    /// registered its render-completion payload. The scene's `OwnerBuffer`
+    /// carries the logical state after this membership transition.
+    pub fn transition_to_owner(&mut self) -> bool {
+        if self.phase != BoPhase::Recording {
             return false;
         }
-        self.phase = BoPhase::OwnerSubmitted;
+        self.phase = BoPhase::Owner;
         true
     }
 
-    /// `OwnerSubmitted → OwnerAccepted` after the owner reports acceptance.
-    pub fn transition_to_owner_accepted(&mut self) -> bool {
-        if self.phase != BoPhase::OwnerSubmitted {
-            return false;
-        }
-        self.phase = BoPhase::OwnerAccepted;
-        true
-    }
-
-    /// `OwnerAccepted → OwnerCurrent` after the owner retires the commit.
-    pub fn transition_to_owner_current(&mut self) -> bool {
-        if self.phase != BoPhase::OwnerAccepted {
-            return false;
-        }
-        self.phase = BoPhase::OwnerCurrent;
-        true
-    }
-
-    /// `OwnerCurrent → OwnerReleasing` when a later owner generation retires.
-    pub fn transition_to_owner_releasing(&mut self) -> bool {
-        if self.phase != BoPhase::OwnerCurrent {
-            return false;
-        }
-        self.phase = BoPhase::OwnerReleasing;
-        true
-    }
-
-    /// Roll back a failed compound current/releasing transition.
-    pub fn transition_to_owner_current_after_release_abort(&mut self) -> bool {
-        if self.phase != BoPhase::OwnerReleasing {
-            return false;
-        }
-        self.phase = BoPhase::OwnerCurrent;
-        true
-    }
-
-    /// `OwnerReleasing → Free` once the owner and resource-service gates are
-    /// both satisfied.
-    pub fn transition_to_free_after_owner_release(&mut self) -> bool {
-        if self.phase != BoPhase::OwnerReleasing {
-            return false;
-        }
-        self.phase = BoPhase::Free;
-        true
-    }
-
-    /// `OwnerSubmitted|OwnerAccepted → OwnerQuarantined` after completion
-    /// evidence is unknown. A quarantined BO is never reused in C.0.
-    pub fn transition_to_owner_quarantined(&mut self) -> bool {
-        if !matches!(self.phase, BoPhase::OwnerSubmitted | BoPhase::OwnerAccepted) {
-            return false;
-        }
-        self.phase = BoPhase::OwnerQuarantined;
-        true
-    }
-
-    /// `OwnerSubmitted → OwnerDesired` after a pre-IPC send refusal. The
-    /// ledger's returned new state is restored by the caller exactly once.
-    pub fn transition_to_owner_desired_after_refusal(&mut self) -> bool {
-        if self.phase != BoPhase::OwnerSubmitted {
-            return false;
-        }
-        self.phase = BoPhase::OwnerDesired;
-        true
-    }
-
-    /// `OwnerRendering|OwnerDesired → OwnerDisplaced`: latest-wins
-    /// replacement before an owner commit. This buffer never acquired a KMS
-    /// state and therefore has no KMS release gate.
-    pub fn transition_to_owner_displaced(&mut self) -> bool {
-        if !matches!(
-            self.phase,
-            BoPhase::OwnerRendering | BoPhase::OwnerDesired | BoPhase::OwnerSubmitted
-        ) {
-            return false;
-        }
-        self.phase = BoPhase::OwnerDisplaced;
-        true
-    }
-
-    /// `OwnerDisplaced → Free` after the compose GPU batch has retired.
-    pub fn transition_to_free_after_owner_displacement(&mut self) -> bool {
-        if self.phase != BoPhase::OwnerDisplaced {
+    /// `Owner → Free` after the scene's owner state machine has accepted a
+    /// `Displaced` or `Releasing` buffer's release.
+    pub fn transition_to_free_after_owner(&mut self) -> bool {
+        if self.phase != BoPhase::Owner {
             return false;
         }
         self.phase = BoPhase::Free;
