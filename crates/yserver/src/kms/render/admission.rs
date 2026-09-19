@@ -1061,6 +1061,7 @@ impl KmsBackend {
                             spec.location,
                             spec.generation,
                             spec.member,
+                            commit,
                             scanout_pools,
                         ) {
                             Ok(resources) => resources,

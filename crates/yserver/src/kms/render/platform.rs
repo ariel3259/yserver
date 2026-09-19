@@ -3442,8 +3442,7 @@ impl PlatformBackend {
         if bo.state.phase != BoPhase::OwnerDisplaced {
             return false;
         }
-        bo.state.transition_to_free_after_owner_displacement();
-        true
+        bo.state.transition_to_free_after_owner_displacement()
     }
 
     pub(crate) fn displace_owner_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
@@ -3464,6 +3463,21 @@ impl PlatformBackend {
         bo.state.transition_to_owner_displaced()
     }
 
+    pub(crate) fn reject_owner_submitted_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        if bo.state.phase != BoPhase::OwnerSubmitted {
+            return false;
+        }
+        bo.state.transition_to_owner_displaced()
+    }
+
     pub(crate) fn complete_owner_rendering_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
         let Some(bo) = self
             .scanout_pools
@@ -3478,6 +3492,94 @@ impl PlatformBackend {
         }
         bo.state.transition_to_owner_desired();
         true
+    }
+
+    pub(crate) fn accept_owner_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_accepted()
+    }
+
+    pub(crate) fn current_owner_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_current()
+    }
+
+    pub(crate) fn release_owner_current_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_releasing()
+    }
+
+    pub(crate) fn restore_owner_current_bo_after_release_abort(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_current_after_release_abort()
+    }
+
+    pub(crate) fn release_owner_releasing_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_free_after_owner_release()
+    }
+
+    pub(crate) fn quarantine_owner_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_quarantined()
+    }
+
+    pub(crate) fn owner_bo_phase(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> Option<crate::kms::vk::scanout::BoPhase> {
+        self.scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .and_then(|scanout| scanout.display_pool().bos.get(bo_idx))
+            .map(|bo| bo.state.phase)
     }
 
     pub(crate) fn allows_legacy(

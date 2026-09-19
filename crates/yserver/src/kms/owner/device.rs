@@ -2179,6 +2179,16 @@ impl<R> DeviceCommitOwner<R> {
         record.take_request();
         record.mark_dispatched();
     }
+
+    #[doc(hidden)]
+    pub fn complete_for_tests(&mut self) -> Vec<OwnerEvent<R>> {
+        let Some(record) = self.live.as_mut() else {
+            return Vec::new();
+        };
+        record.mark_accepted();
+        record.mark_hardware_complete();
+        self.try_complete()
+    }
     #[doc(hidden)]
     pub fn mark_probe_dispatched_for_tests(&mut self) {
         let (key, probe_id, _) = self.pending_probe.take().expect("pending probe");

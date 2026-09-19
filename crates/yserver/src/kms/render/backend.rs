@@ -48727,6 +48727,19 @@ mod tests {
         > {
             self.platform.devices[index].owner.as_ref().expect("owner")
         }
+
+        pub(crate) fn complete_owner_for_tests(
+            &mut self,
+            index: usize,
+        ) -> Vec<
+            crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
+        > {
+            self.platform.devices[index]
+                .owner
+                .as_mut()
+                .expect("owner")
+                .complete_for_tests()
+        }
     }
     #[cfg(test)]
     pub(crate) fn wait_device_executor_readable_for_tests(
@@ -50885,6 +50898,19 @@ mod tests {
         crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal }
     }
 
+    fn owner_bo_phase_for_tests(
+        backend: &super::KmsBackend,
+        bo_idx: usize,
+    ) -> crate::kms::vk::scanout::BoPhase {
+        backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live-scene pool")
+            .display_pool()
+            .bos[bo_idx]
+            .state
+            .phase
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_transaction_installed_inside_the_closure_vulkan() {
@@ -51019,6 +51045,10 @@ mod tests {
             _registry,
         } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        let (bo_idx, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("submitted generation");
         backend.route_owner_event_batch(
             device,
             vec![owner_terminal_event_for_tests(
@@ -51039,6 +51069,11 @@ mod tests {
                 .is_some_and(|(_, staged)| !staged),
             "a pre-accept rejection closes without staging"
         );
+        assert_eq!(
+            owner_bo_phase_for_tests(&backend, bo_idx),
+            crate::kms::vk::scanout::BoPhase::OwnerDisplaced,
+            "an ioctl rejection takes the submitted buffer to Displaced"
+        );
     }
 
     #[test]
@@ -51049,6 +51084,10 @@ mod tests {
             _registry,
         } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        let (bo_idx, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("submitted generation");
         backend.route_owner_event_batch(
             device,
             vec![owner_terminal_event_for_tests(
@@ -51067,6 +51106,11 @@ mod tests {
                 .is_some_and(|(owed, staged)| owed && !staged),
             "unknown completion invalidates the output and owes a repaint"
         );
+        assert_eq!(
+            owner_bo_phase_for_tests(&backend, bo_idx),
+            crate::kms::vk::scanout::BoPhase::OwnerQuarantined,
+            "unknown completion quarantines the submitted buffer"
+        );
     }
 
     #[test]
@@ -51078,6 +51122,11 @@ mod tests {
                 _registry,
             } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
             let (device, _commit) = owner_damage_commit_for_tests(&mut backend);
+            let (bo_idx, _, _) = backend
+                .scene
+                .owner_prepared_for_tests(0)
+                .expect("submitted generation");
+            let phase_before = owner_bo_phase_for_tests(&backend, bo_idx);
             backend.route_owner_event_batch(
                 device,
                 vec![crate::kms::owner::device::OwnerEvent::MechanismFailed {
@@ -51093,6 +51142,11 @@ mod tests {
                     .is_some_and(|(owed, _)| owed),
                 "incarnation poison invalidation owes a repaint"
             );
+            assert_eq!(
+                owner_bo_phase_for_tests(&backend, bo_idx),
+                phase_before,
+                "incarnation poison invalidates damage only"
+            );
         }
         {
             let OwnerLiveFixture {
@@ -51100,6 +51154,11 @@ mod tests {
                 _registry,
             } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
             let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+            let (bo_idx, _, _) = backend
+                .scene
+                .owner_prepared_for_tests(0)
+                .expect("submitted generation");
+            let phase_before = owner_bo_phase_for_tests(&backend, bo_idx);
             backend.route_owner_event_batch(
                 device,
                 vec![crate::kms::owner::device::OwnerEvent::Quarantined { commit }],
@@ -51113,6 +51172,11 @@ mod tests {
                     .is_some_and(|(owed, _)| owed),
                 "recovery quarantine invalidation owes a repaint"
             );
+            assert_eq!(
+                owner_bo_phase_for_tests(&backend, bo_idx),
+                phase_before,
+                "recovery invalidates damage only"
+            );
         }
     }
 
@@ -51124,6 +51188,11 @@ mod tests {
             _registry,
         } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        let (bo_idx, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("submitted generation");
+        let phase_before = owner_bo_phase_for_tests(&backend, bo_idx);
         backend.bump_crtc_config_topology_epoch("Task 6 test topology change");
         assert_eq!(
             backend.scene.owner_damage_transaction_count_for_tests(),
@@ -51141,6 +51210,204 @@ mod tests {
                 .damage_state_for_tests(0)
                 .is_some_and(|(owed, _)| owed),
             "a stale milestone cannot ack after topology invalidation"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&backend, bo_idx),
+            phase_before,
+            "topology invalidates damage only"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_buffer_reuse_waits_for_every_gate_vulkan() {
+        use crate::kms::render::resources::ObligationKind;
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (first_bo, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("first prepared generation");
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first owner commit")
+            .commit_id();
+
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted {
+                commit: first_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::OwnerAccepted,
+            "Accepted advances Submitted to Accepted"
+        );
+
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                commit: first_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        backend.scene.wake_for_damage();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            owner_bo_phase_for_tests(&backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::OwnerAccepted,
+            "the release pass cannot free the buffer before CompletionRetired"
+        );
+
+        let first_completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, first_completion, std::time::Instant::now());
+        assert_eq!(
+            owner_bo_phase_for_tests(&backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::OwnerCurrent,
+            "CompletionRetired advances Accepted to Current"
+        );
+
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("first owner executor"),
+        );
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("replacement owner executor"),
+        );
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("second prepared generation");
+        assert_ne!(first_bo, second_bo);
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("second owner commit")
+            .commit_id();
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+
+        let first_key = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live-scene pool")
+            .display_pool()
+            .bos[first_bo]
+            .managed_key()
+            .expect("first buffer is managed");
+        let gpu_obligation = backend
+            .resource_service_mut()
+            .expect("owner fixture resource service")
+            .register(first_key, ObligationKind::Gpu)
+            .expect("hold another live GPU use behind gate 3");
+
+        let second_completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, second_completion, std::time::Instant::now());
+        // The compose batch itself cannot be the withheld GPU obligation at
+        // Releasing time: Task 5 retires it at render-completion drain, before
+        // dispatch. This registered obligation represents any other live GPU
+        // use of the buffer that the resource service tracks.
+        backend.scene.wake_for_damage();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            owner_bo_phase_for_tests(&backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::OwnerReleasing,
+            "the displacing CompletionRetired enters Releasing"
+        );
+        assert_ne!(
+            owner_bo_phase_for_tests(&backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Free,
+            "a live resource-service obligation blocks reuse"
+        );
+
+        backend
+            .resource_service_mut()
+            .expect("owner fixture resource service")
+            .apply_validated_proof_for_tests(first_key, gpu_obligation)
+            .expect("retire the tracked GPU use");
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let first_phase = owner_bo_phase_for_tests(&backend, first_bo);
+        let reacquired = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .is_some_and(|(bo, generation, _)| bo == first_bo && generation > 2);
+        assert!(
+            first_phase == crate::kms::vk::scanout::BoPhase::Free || reacquired,
+            "the buffer becomes reusable only after the service reports readiness: {first_phase:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_pre_ipc_refusal_returns_the_buffer_to_desired_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (bo_idx, generation, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("prepared generation");
+        backend.platform.wait_idle_bounded();
+
+        let executor = backend.platform.devices[0]
+            .executor
+            .as_mut()
+            .expect("owner executor");
+        crate::kms::executor::test_support::kill_and_reap(executor);
+        backend.drain_scanout_render_completions_for_tests();
+
+        let (_, restored_generation, waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("pre-IPC refusal restores the prepared generation");
+        assert_eq!(restored_generation, generation);
+        assert!(!waiting, "the refused generation is desired again");
+        let phase = owner_bo_phase_for_tests(&backend, bo_idx);
+        assert_eq!(
+            phase,
+            crate::kms::vk::scanout::BoPhase::OwnerDesired,
+            "the pre-IPC refusal returns its buffer to Desired"
         );
     }
 

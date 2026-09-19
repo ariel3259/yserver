@@ -485,6 +485,10 @@ struct OutputSceneState {
     /// scene tick must retain these acknowledgements until the owner commit
     /// resolves; they are not candidates for latest-wins displacement.
     owner_submitted: VecDeque<PreparedComposed>,
+    /// Owner generations whose commits have retired. At most one entry per
+    /// output is OwnerCurrent; older entries remain OwnerReleasing until the
+    /// resource service proves that every release gate is clear.
+    owner_current: VecDeque<PreparedComposed>,
     owner_displaced: VecDeque<PreparedComposed>,
     /// Fence-gated descriptor-pool slot releases. At
     /// `handle_page_flip_complete` we want to pop the matching
@@ -977,6 +981,10 @@ struct PreparedComposed {
     output_key: OutputKey,
     managed_key: AllocationKey,
     managed: Option<crate::kms::render::resources::AllocationLease>,
+    /// Commit identity once admission has moved this generation out of
+    /// `OwnerDesired`. Cleared by pre-IPC restoration and once completion
+    /// retirement moves the generation to `owner_current`.
+    commit_id: Option<crate::kms::owner::identity::CommitId>,
     /// `None` after admission has released the descriptor slot. The scanout
     /// BO remains owned by the owner ledger, so a later scene tick must not
     /// try to displace or release that slot a second time.
@@ -1440,6 +1448,7 @@ impl SceneCompositor {
             pending_acks: VecDeque::with_capacity(4),
             owner_prepared: None,
             owner_submitted: VecDeque::with_capacity(4),
+            owner_current: VecDeque::with_capacity(4),
             owner_displaced: VecDeque::with_capacity(4),
             failed_submit_bos: VecDeque::with_capacity(4),
             damage_history: BufferAgeRing::new(bo_depth + 1),
@@ -1627,6 +1636,7 @@ impl SceneCompositor {
         location: PreparedComposedLocation,
         generation: u64,
         member: crate::kms::render::resources::GroupMember,
+        commit: crate::kms::owner::identity::CommitId,
         scanout_pools: &mut [Option<OutputScanout>],
     ) -> Result<Vec<crate::kms::render::resources::CommitResources>, ResourceError> {
         let Some(inner) = self.inner.as_mut() else {
@@ -1670,6 +1680,7 @@ impl SceneCompositor {
         }
 
         prepared.ack.stage = InFlightStage::OwnerSubmitted;
+        prepared.commit_id = Some(commit);
 
         Ok(vec![crate::kms::render::resources::CommitResources::new(
             vec![managed],
@@ -1702,7 +1713,6 @@ impl SceneCompositor {
                 || resources.present.is_some()
                 || !resources.kms_obligations.is_empty()
                 || resources.direct_role.is_some()
-                || resources.commit_id.is_some()
             {
                 return false;
             }
@@ -1717,7 +1727,11 @@ impl SceneCompositor {
                             .owner_prepared
                             .as_ref()
                             .filter(|prepared| {
-                                prepared.managed_key == key && prepared.managed.is_none()
+                                prepared.managed_key == key
+                                    && prepared.managed.is_none()
+                                    && resources
+                                        .commit_id
+                                        .is_none_or(|commit| prepared.commit_id == Some(commit))
                             })
                             .map(|prepared| (output_idx, prepared))
                     })
@@ -1759,6 +1773,7 @@ impl SceneCompositor {
                 return false;
             }
             prepared.ack.stage = InFlightStage::OwnerDesired;
+            prepared.commit_id = None;
             prepared.managed = Some(managed);
         }
         true
@@ -1840,14 +1855,29 @@ impl SceneCompositor {
         use crate::kms::owner::{device::OwnerEvent, record::TerminalState};
 
         match event {
-            OwnerEvent::Accepted { commit } => self.owner_damage_accept(*commit, platform),
+            OwnerEvent::Accepted { commit } => {
+                self.owner_damage_accept(*commit, platform);
+                self.accept_owner_buffer(*commit, platform);
+            }
             OwnerEvent::HardwareComplete { commit } => {
                 self.owner_damage_hardware_complete(*commit, store, platform)
             }
+            OwnerEvent::CompletionRetired { commit, .. } => {
+                self.retire_owner_buffer(*commit, platform)
+            }
             OwnerEvent::Terminal { commit, terminal } => match terminal {
-                TerminalState::FailedBeforeSubmit(_) => self.owner_damage_close(*commit, platform),
+                TerminalState::FailedBeforeSubmit(cause) => {
+                    self.owner_damage_close(*commit, platform);
+                    if matches!(
+                        cause,
+                        crate::kms::owner::record::FailureCause::IoctlRejected { .. }
+                    ) {
+                        self.reject_owner_buffer(*commit, platform);
+                    }
+                }
                 TerminalState::CompletionUnknown(_) => {
-                    self.invalidate_owner_damage_transaction(*commit, platform)
+                    self.quarantine_owner_buffer(*commit, platform);
+                    self.invalidate_owner_damage_transaction(*commit, platform);
                 }
                 TerminalState::Completed => {}
             },
@@ -1918,7 +1948,9 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let Some(transaction) = inner.owner_damage_transactions.remove(&commit) else {
+        let transaction = inner.owner_damage_transactions.remove(&commit);
+        clear_owner_commit_id(inner, commit);
+        let Some(transaction) = transaction else {
             return;
         };
         for member in transaction.members {
@@ -1931,6 +1963,223 @@ impl SceneCompositor {
                 state.damage.invalidate();
             }
         }
+    }
+
+    fn accept_owner_buffer(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        platform: &mut PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        for (output_idx, state) in inner.outputs.iter().enumerate() {
+            let Some(prepared) = state
+                .owner_prepared
+                .as_ref()
+                .filter(|prepared| prepared.commit_id == Some(commit))
+                .or_else(|| {
+                    state
+                        .owner_submitted
+                        .iter()
+                        .find(|prepared| prepared.commit_id == Some(commit))
+                })
+            else {
+                continue;
+            };
+            if platform.accept_owner_bo(output_idx, prepared.ack.bo_idx) {
+                return;
+            }
+            log::error!(
+                "render scene: owner commit {commit:?} buffer {} was not OwnerSubmitted",
+                prepared.ack.bo_idx
+            );
+            return;
+        }
+    }
+
+    fn reject_owner_buffer(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        platform: &mut PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some((output_idx, mut prepared, from_submitted, submitted_idx)) = inner
+            .outputs
+            .iter_mut()
+            .enumerate()
+            .find_map(|(output_idx, state)| {
+                if state
+                    .owner_prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.commit_id == Some(commit))
+                {
+                    return state
+                        .owner_prepared
+                        .take()
+                        .map(|prepared| (output_idx, prepared, false, None));
+                }
+                let submitted_idx = state
+                    .owner_submitted
+                    .iter()
+                    .position(|prepared| prepared.commit_id == Some(commit))?;
+                let prepared = state.owner_submitted.remove(submitted_idx)?;
+                Some((output_idx, prepared, true, Some(submitted_idx)))
+            })
+        else {
+            return;
+        };
+        if !platform.reject_owner_submitted_bo(output_idx, prepared.ack.bo_idx) {
+            // The only accepted rejection phase is OwnerSubmitted. Keep the
+            // generation identified if a stale or contradictory event tries
+            // to close anything else.
+            if from_submitted {
+                if let Some(index) = submitted_idx {
+                    inner.outputs[output_idx]
+                        .owner_submitted
+                        .insert(index, prepared);
+                } else {
+                    inner.outputs[output_idx].owner_prepared = Some(prepared);
+                }
+            } else {
+                inner.outputs[output_idx].owner_prepared = Some(prepared);
+            }
+            return;
+        }
+        prepared.commit_id = None;
+        inner.outputs[output_idx]
+            .owner_displaced
+            .push_back(prepared);
+    }
+
+    fn quarantine_owner_buffer(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        platform: &mut PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some((output_idx, mut prepared)) =
+            inner
+                .outputs
+                .iter_mut()
+                .enumerate()
+                .find_map(|(output_idx, state)| {
+                    if state
+                        .owner_prepared
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.commit_id == Some(commit))
+                    {
+                        return state
+                            .owner_prepared
+                            .take()
+                            .map(|prepared| (output_idx, prepared));
+                    }
+                    let submitted_idx = state
+                        .owner_submitted
+                        .iter()
+                        .position(|prepared| prepared.commit_id == Some(commit))?;
+                    Some((output_idx, state.owner_submitted.remove(submitted_idx)?))
+                })
+        else {
+            return;
+        };
+        if !platform.quarantine_owner_bo(output_idx, prepared.ack.bo_idx) {
+            log::error!(
+                "render scene: owner commit {commit:?} buffer {} was not quarantineable",
+                prepared.ack.bo_idx
+            );
+            prepared.commit_id = Some(commit);
+            inner.outputs[output_idx]
+                .owner_submitted
+                .push_back(prepared);
+            return;
+        }
+        prepared.commit_id = None;
+        // There is intentionally no quarantine queue. Dropping the scene
+        // record cannot make the BO reusable: its physical phase is the
+        // terminal OwnerQuarantined state and pool acquisition only accepts
+        // Free BOs.
+    }
+
+    fn retire_owner_buffer(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        platform: &mut PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some((output_idx, mut prepared, from_prepared, submitted_idx)) = inner
+            .outputs
+            .iter_mut()
+            .enumerate()
+            .find_map(|(output_idx, state)| {
+                if state
+                    .owner_prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.commit_id == Some(commit))
+                {
+                    return state
+                        .owner_prepared
+                        .take()
+                        .map(|prepared| (output_idx, prepared, true, None));
+                }
+                let submitted_idx = state
+                    .owner_submitted
+                    .iter()
+                    .position(|prepared| prepared.commit_id == Some(commit))?;
+                let prepared = state.owner_submitted.remove(submitted_idx)?;
+                Some((output_idx, prepared, false, Some(submitted_idx)))
+            })
+        else {
+            return;
+        };
+
+        let output_key = prepared.output_key.clone();
+        let old_current_idx = inner.outputs[output_idx]
+            .owner_current
+            .iter()
+            .position(|old| {
+                old.output_key == output_key
+                    && platform.owner_bo_phase(output_idx, old.ack.bo_idx)
+                        == Some(BoPhase::OwnerCurrent)
+            });
+        if let Some(old_idx) = old_current_idx
+            && !platform.release_owner_current_bo(
+                output_idx,
+                inner.outputs[output_idx].owner_current[old_idx].ack.bo_idx,
+            )
+        {
+            restore_owner_prepared_after_resolution_failure(
+                &mut inner.outputs[output_idx],
+                prepared,
+                from_prepared,
+                submitted_idx,
+            );
+            return;
+        }
+
+        if !platform.current_owner_bo(output_idx, prepared.ack.bo_idx) {
+            if let Some(old_idx) = old_current_idx {
+                let old_bo_idx = inner.outputs[output_idx].owner_current[old_idx].ack.bo_idx;
+                let _ =
+                    platform.restore_owner_current_bo_after_release_abort(output_idx, old_bo_idx);
+            }
+            restore_owner_prepared_after_resolution_failure(
+                &mut inner.outputs[output_idx],
+                prepared,
+                from_prepared,
+                submitted_idx,
+            );
+            return;
+        }
+
+        prepared.commit_id = None;
+        inner.outputs[output_idx].owner_current.push_back(prepared);
     }
 
     fn owner_damage_close(
@@ -3872,6 +4121,42 @@ fn apply_cursor_transition_on_retire(
     }
 }
 
+fn clear_owner_commit_id(
+    inner: &mut SceneCompositorInner,
+    commit: crate::kms::owner::identity::CommitId,
+) {
+    for state in &mut inner.outputs {
+        if state
+            .owner_prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.commit_id == Some(commit))
+            && let Some(prepared) = state.owner_prepared.as_mut()
+        {
+            prepared.commit_id = None;
+        }
+        for prepared in &mut state.owner_submitted {
+            if prepared.commit_id == Some(commit) {
+                prepared.commit_id = None;
+            }
+        }
+    }
+}
+
+fn restore_owner_prepared_after_resolution_failure(
+    state: &mut OutputSceneState,
+    prepared: PreparedComposed,
+    from_prepared: bool,
+    submitted_idx: Option<usize>,
+) {
+    if from_prepared {
+        state.owner_prepared = Some(prepared);
+    } else if let Some(index) = submitted_idx {
+        state.owner_submitted.insert(index, prepared);
+    } else {
+        state.owner_submitted.push_front(prepared);
+    }
+}
+
 fn retire_failed_submit_bos(
     state: &mut OutputSceneState,
     output_idx: usize,
@@ -3966,6 +4251,37 @@ fn retire_owner_displaced(
         }
     }
     state.owner_displaced = remaining;
+}
+
+fn retire_owner_current(
+    state: &mut OutputSceneState,
+    output_idx: usize,
+    platform: &mut PlatformBackend,
+    resource_service: Option<&ResourceService>,
+) {
+    let Some(service) = resource_service else {
+        return;
+    };
+    let mut remaining = VecDeque::with_capacity(state.owner_current.len());
+    while let Some(prepared) = state.owner_current.pop_front() {
+        let releasing = platform.owner_bo_phase(output_idx, prepared.ack.bo_idx)
+            == Some(BoPhase::OwnerReleasing);
+        let ready = releasing
+            && prepared.ack.managed_batch.is_none()
+            && service.is_releasable(&prepared.managed_key);
+        if ready {
+            if platform.release_owner_releasing_bo(output_idx, prepared.ack.bo_idx) {
+                if let Some(pool_slot) = prepared.pool_slot {
+                    state.pool_ring.release(pool_slot);
+                }
+            } else {
+                remaining.push_back(prepared);
+            }
+        } else {
+            remaining.push_back(prepared);
+        }
+    }
+    state.owner_current = remaining;
 }
 
 /// Drain the deferred descriptor-pool slot releases queued by
@@ -5172,6 +5488,7 @@ fn tick_one_output(
             vk.as_ref(),
             resource_service.as_deref(),
         );
+        retire_owner_current(s, output_idx, platform, resource_service.as_deref());
         retire_owner_displaced(s, output_idx, platform, resource_service.as_deref());
         // B.2-context fix (vkdebug VUID-vkResetDescriptorPool-00313):
         // drain any deferred descriptor-pool slot releases whose
@@ -6007,7 +6324,12 @@ fn tick_one_output(
                     ))));
                 };
                 if let Some(previous) = state.owner_prepared.take() {
-                    if previous.ack.stage == InFlightStage::OwnerSubmitted {
+                    let owner_commit_in_flight = previous.commit_id.is_some()
+                        || matches!(
+                            platform.owner_bo_phase(output_idx, previous.ack.bo_idx),
+                            Some(BoPhase::OwnerSubmitted | BoPhase::OwnerAccepted)
+                        );
+                    if owner_commit_in_flight {
                         // This generation is already owned by the in-flight
                         // owner commit. Keep its PendingAck beside the newer
                         // prepared generation; it is never latest-wins
@@ -6031,6 +6353,7 @@ fn tick_one_output(
                     output_key,
                     managed_key,
                     managed: None,
+                    commit_id: None,
                     pool_slot: Some(slot),
                     ack,
                 });

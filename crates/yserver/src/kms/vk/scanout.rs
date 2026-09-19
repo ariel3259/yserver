@@ -144,9 +144,21 @@ pub enum BoPhase {
     /// Owner route: admission moved the desired generation into the commit's
     /// submitted ledger. The owner now owns the KMS completion evidence.
     OwnerSubmitted,
+    /// Owner route: the owner accepted the commit, but has not yet retired
+    /// its completion evidence.
+    OwnerAccepted,
+    /// Owner route: the owner retired the commit and this generation is the
+    /// display's current owner buffer.
+    OwnerCurrent,
+    /// Owner route: a newer owner generation is current, so this buffer is
+    /// waiting for all release obligations before reuse.
+    OwnerReleasing,
     /// Owner route: a newer generation displaced this one before admission.
     /// It returns to `Free` only after its compose GPU batch retires.
     OwnerDisplaced,
+    /// Owner route: completion evidence was contradictory or unavailable.
+    /// This buffer is never reused by the C.0 owner path.
+    OwnerQuarantined,
 }
 
 /// Reuse state for a binary semaphore whose submitted payload is exported as
@@ -417,6 +429,62 @@ impl BoState {
         true
     }
 
+    /// `OwnerSubmitted → OwnerAccepted` after the owner reports acceptance.
+    pub fn transition_to_owner_accepted(&mut self) -> bool {
+        if self.phase != BoPhase::OwnerSubmitted {
+            return false;
+        }
+        self.phase = BoPhase::OwnerAccepted;
+        true
+    }
+
+    /// `OwnerAccepted → OwnerCurrent` after the owner retires the commit.
+    pub fn transition_to_owner_current(&mut self) -> bool {
+        if self.phase != BoPhase::OwnerAccepted {
+            return false;
+        }
+        self.phase = BoPhase::OwnerCurrent;
+        true
+    }
+
+    /// `OwnerCurrent → OwnerReleasing` when a later owner generation retires.
+    pub fn transition_to_owner_releasing(&mut self) -> bool {
+        if self.phase != BoPhase::OwnerCurrent {
+            return false;
+        }
+        self.phase = BoPhase::OwnerReleasing;
+        true
+    }
+
+    /// Roll back a failed compound current/releasing transition.
+    pub fn transition_to_owner_current_after_release_abort(&mut self) -> bool {
+        if self.phase != BoPhase::OwnerReleasing {
+            return false;
+        }
+        self.phase = BoPhase::OwnerCurrent;
+        true
+    }
+
+    /// `OwnerReleasing → Free` once the owner and resource-service gates are
+    /// both satisfied.
+    pub fn transition_to_free_after_owner_release(&mut self) -> bool {
+        if self.phase != BoPhase::OwnerReleasing {
+            return false;
+        }
+        self.phase = BoPhase::Free;
+        true
+    }
+
+    /// `OwnerSubmitted|OwnerAccepted → OwnerQuarantined` after completion
+    /// evidence is unknown. A quarantined BO is never reused in C.0.
+    pub fn transition_to_owner_quarantined(&mut self) -> bool {
+        if !matches!(self.phase, BoPhase::OwnerSubmitted | BoPhase::OwnerAccepted) {
+            return false;
+        }
+        self.phase = BoPhase::OwnerQuarantined;
+        true
+    }
+
     /// `OwnerSubmitted → OwnerDesired` after a pre-IPC send refusal. The
     /// ledger's returned new state is restored by the caller exactly once.
     pub fn transition_to_owner_desired_after_refusal(&mut self) -> bool {
@@ -442,9 +510,12 @@ impl BoState {
     }
 
     /// `OwnerDisplaced → Free` after the compose GPU batch has retired.
-    pub fn transition_to_free_after_owner_displacement(&mut self) {
-        debug_assert_eq!(self.phase, BoPhase::OwnerDisplaced);
+    pub fn transition_to_free_after_owner_displacement(&mut self) -> bool {
+        if self.phase != BoPhase::OwnerDisplaced {
+            return false;
+        }
         self.phase = BoPhase::Free;
+        true
     }
 
     /// `Recording → Submitted`: `vkQueueSubmit2` issued. Caller
