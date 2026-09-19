@@ -345,6 +345,16 @@ three independent gates (round-2 M-1), none of which is the damage milestone:
 3. the compose **GPU fence** of that buffer has signalled (the gate
    `handle_page_flip_complete` applies today).
 
+*Correction (plan Ci review round 2, M-1).* Gates 1 and 2 are not independent
+in this code. `Completed` requires `HardwareComplete` (`owner/record.rs`), so
+`HardwareComplete` always precedes `CompletionRetired`, and the consumer
+discharges the `KmsRelease` obligation inside its `CompletionRetired` handler
+(`resources/commit.rs:227`–`262`). "Retired, obligation outstanding" cannot
+occur on the owner's order. The scene-level evidence therefore withholds what
+can be withheld (`CompletionRetired` after `HardwareComplete`; the GPU batch
+after `CompletionRetired`), and gate 2's guard is proven where it lives, in the
+resource service, by the 2c-i debt census.
+
 **4.3. Bundles (tier 5, DMG-4).** One transaction over every included output:
 staged at the single `Accepted`, applied at the single `HardwareComplete`,
 naming exactly the outputs of `ExpectedCompletionCrtcs`. No output is staged
@@ -565,7 +575,7 @@ not by the first textual match.
 | A displaced composed generation acks nothing (4.1) | Ack the displaced generation's snapshots |
 | Damage after capture survives the ack (stage 2c §5) | Ack from the live store instead of the captured snapshots |
 | Pool release follows the ledger, not the ack (4.2) | Release the pool slot at `HardwareComplete` |
-| Pool release waits for **every** gate of section 4.2, each withheld alone (round-1 M-2, round-2 M-1) | Three mutations, each dropping exactly one gate: release without `CompletionRetired`; release with the `KmsRelease` obligation still outstanding; release before the GPU fence signals |
+| Pool release waits for **every** gate of section 4.2, each withheld where the owner's order allows it (round-1 M-2, round-2 M-1; corrected by the plan Ci review) | Release at `HardwareComplete` with `CompletionRetired` withheld; release at `CompletionRetired` before the GPU fence signals; the `KmsRelease` guard's mutation at the resource-service level (debt census) |
 | A composed commit carries no Present; composited Presents complete once, from the GPU batch (3.3; round-2 B-1) | Attach a composited Present to the composed description; complete it at `HardwareComplete` as well |
 | The damage transaction exists before any of its milestones is routed (4.2; round-2 B-2) | Install the transaction at `confirm`, after the returned events are routed |
 | Direct Present: one authority, the owner-bound frame; `present_consumers` holds CRTCs only; exactly one publication (3.3; round-1 M-1, round-3 B-1) | Also publish from an owner-event consumer (a second CompleteNotify); put a Present serial in `present_consumers`; publish the retirement completion without the bound `Presented` sample |
