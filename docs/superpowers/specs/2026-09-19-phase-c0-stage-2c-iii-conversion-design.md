@@ -1,11 +1,17 @@
 # Phase C.0 stage 2c-iii — primary conversion and damage
 
-**Status:** design, revision 1 (2026-09-19). Its three design sections (plans
+**Status:** design, revision 2 (2026-09-19). Its three design sections (plans
 C1, C2 and C3 — here sections 4, 5 and 6) were approved one by one with the user
 in brainstorming, together with three decisions recorded in section 2: the
 evidence level, the split into three plans with the composed plan first, and
-the prepare/submit selection boundary. Not yet reviewed; implementation plans
-follow the codex review of this document (section 8.3).
+the prepare/submit selection boundary.
+Revision 2 incorporates codex round 1
+(`../findings/2026-09-19-stage-2c-iii-design-review-round1.md`: 2 blocking,
+3 major, all verified against the tree and accepted): the damage transaction
+survives `Dispatched` (B-1), the registration caller is a hard requirement with
+no deferral (B-2), Present carriage from producer to owner (M-1, new section
+3.3), each pool-release gate tested on its own (M-2), and DMG-5 on the unflip
+return (M-3). Implementation plans follow (section 8.3).
 
 **Authority**, most general first. This document elaborates the 2c-iii block; it
 does not replace or relax any of them.
@@ -126,8 +132,14 @@ converted route must register the commit's old/new dependencies when it
 dispatches**, so that each displaced buffer's release is discharged by that
 commit's real completion evidence (C.0 §10.2), never by the page event. This is
 the production caller whose absence stopped P3-2/P3-3 (debt spec §9.5), and
-section 6.4 carries them. If a reason turns up in planning why the route cannot
-register there, it is an F8 stop recorded here, not a silent omission.
+section 6.4 carries them. **This is not deferrable (round-1 B-2).** "Production
+caller" means a call in non-test code on the converted `Owner` submit path of a
+real producer — the path section 2.3's fork selects, driven by the fixtures
+because production stays `Legacy` (R8) — not a test helper. Its absence on that
+path blocks the acceptance of C1 (composed), C2 (direct), C3 (unflip) and of
+2c-iii; it cannot be handed to stages 3/4. If planning finds a reason the route
+cannot register, that is an F8 stop that halts the stage and goes back to the
+user, not a deferral.
 
 **Reachability, verified at `13fa30bd` (user's request, before any plan):**
 
@@ -171,7 +183,27 @@ Both are owner changes inside C.0's existing contracts (they add no state and
 no outcome); section 4.0 states what must hold, and C1 implements them first,
 because composed is the first converted producer.
 
-**3.3. Owner events reach the consumers.** 2c-ii's `route_owner_event_batch` is
+**3.3. Present carriage from producer to owner (round-1 M-1).** A converted
+commit that completes Present requests carries them into the owner, or the
+client's FIFO stays parked while every damage and resource test passes. Today
+the conductor sets neither `page_flip_event` nor `present_consumers` on any
+`CommitDescription` (`kms/owner/build.rs:27`), because `begin_with_ledger`
+refuses both. Invariants, for the composed (C1) and direct (C2) producers:
+
+- the prepared intent keeps the identity of every Present request the frame
+  completes — serial, FIFO position, target — and the description built for
+  the admitted generation carries it as `present_consumers` with
+  `page_flip_event` and the `CompletionContext`, through section 4.0's entry;
+- Present terminalization stays independent of damage and resource release
+  (C.0 §10.4, stage 2c §3): `Presented` delivers the protocol completion;
+  an accepted Present lacking validated presentation terminalizes as `Skip`
+  with the last validated clock sample, never a fabricated timestamp; no idle
+  or release is emitted before the ledger proves it;
+- a Present whose generation is displaced before admission takes the
+  never-submitted path (idle once, `Skip` behind the predecessor), and is not
+  carried by the displacing generation's commit.
+
+**3.4. Owner events reach the consumers.** 2c-ii's `route_owner_event_batch` is
 the only path owner events take (plan B2). 2c-iii adds consumers behind it: the
 damage transactions (section 4.2) and the direct frame state (section 5).
 Milestones are delivered by `CommitId`; a consumer that sees an unknown
@@ -228,7 +260,8 @@ staged before `Accepted`.
 
 | Owner outcome | Damage action |
 | --- | --- |
-| `Dispatched`, `FailedBeforeSubmit`, a pre-IPC refusal | None. The transaction closes; the next tick recomputes an identical repaint |
+| `Dispatched` (`Submitting`) | None, and the transaction is **retained**: `Dispatched` is not terminal and precedes `Accepted` (C.0 §10.2) |
+| `FailedBeforeSubmit`, a pre-IPC refusal (`NeverDispatched`) | None. The transaction closes without staging; the next tick recomputes an identical repaint |
 | `Accepted` | Stage each painted buffer once (`commit_submitted`) — today this runs at submission, `scene.rs:4841`, and that is the line that moves |
 | `HardwareComplete` | Apply (`retire_success`), ack the per-output captured drawable snapshots, subtract the captured structure/failed-repaint damage, push damage history, set `prev_presented` — what `handle_page_flip_complete` (`scene.rs:2129`) does today for the legacy route |
 | `Presented` | None |
@@ -263,7 +296,10 @@ every row of the table in 4.2; new paint between capture and `HardwareComplete`
 survives; two outputs with permuted completions, bundled and separately
 scheduled; a displaced generation acks nothing; invalidation without fresh paint
 still repaints; skipped-output dormancy; off-output damage not acked; old-state
-registration of section 3.2; the four invariants of section 4.0, including a
+registration of section 3.2; the Present carriage of section 3.3 on the real
+composed producer, with `HardwareComplete`/`Presented` in both orders, a missing
+`Presented`, and no idle or release before the ledger proves it; the four
+invariants of section 4.0, including a
 registration failure that leaves the owner and the decider untouched.
 
 ## 5. Plan C2 — direct producer
@@ -317,7 +353,9 @@ generation (C.0 §12).
 `Owner`): the successor that gains a border while queued, promoted or not;
 retirement promotion ordered predecessor → `Skip` → admission → publication;
 lease adoption; displacement with a deferred `Skip`; composed invalidation on
-direct entry; eligibility identical between the two routes for the same inputs.
+direct entry; eligibility identical between the two routes for the same inputs;
+section 3.3's Present carriage on the real direct producer, under the same event
+orders and missing-`Presented` case as C1.
 
 ## 6. Plan C3 — unflip, multi-device, route selection, hardware
 
@@ -330,7 +368,9 @@ request replaces the complete plane set in one transaction, as
 per-CRTC replacement with `ENOSPC`. On an `Owner` device the reasons that reach
 `request_direct_unflip` (`backend.rs:2219`) — cursor, overlay and topology
 invalidation, a failed successor send — enter `admission_request_unflip`.
-Returning to composed invalidates the affected composed buffers (DMG-5). The
+Returning to composed invalidates every affected composed buffer, and each is
+repainted in full before it is scanned out again (DMG-5); a C3 fixture proves
+it per output (round-1 M-3). The
 unflip must not drop or flash the cursor and preserves the current gamma
 (C.0 §12). `Topology` and `CursorRecovery` stay `Unsupported`: stages 3 and 4.
 
@@ -364,8 +404,10 @@ carries **P3-2** (a displaced buffer's `KmsRelease` is discharged by the real
 completion) and **P3-3** (a retained buffer registers none). Before the plan
 anchors them, the plan's author re-runs the reachability check on the
 implemented C1/C2 code: a non-test caller of `register_kms` must exist on the
-path the test drives. If it does not, they stay the debt spec's §9.5 F8 for
-stages 3/4, and this document says so.
+path the test drives. By section 3.2 that caller is already a condition of
+C1's and C2's acceptance, so its absence here means an acceptance was wrong:
+the stage stops and the defect is reopened, it is not deferred (round-1 B-2).
+P3-2/P3-3 close the debt spec's §9.5 F8.
 
 ## 7. Out of scope, and the doors that must stay open
 
@@ -400,10 +442,13 @@ not by the first textual match.
 | Apply at `HardwareComplete`, never at `Accepted` or `Presented` (DMG-2) | Apply at `Presented` |
 | Unknown and invalidation events invalidate (DMG-3) | Restore on `CompletionUnknown` |
 | A bundle is one transaction; no double staging (DMG-4) | Stage one bundle output at a separate milestone |
-| Direct entry and unflip return invalidate composed buffers (DMG-5) | Drop the invalidation on direct entry |
+| Direct entry invalidates composed buffers (DMG-5) | Drop the invalidation on direct entry |
+| The unflip return invalidates and repaints every affected composed buffer (DMG-5; round-1 M-3) | Drop the invalidation on the unflip return; invalidate only one affected output |
 | A displaced composed generation acks nothing (4.1) | Ack the displaced generation's snapshots |
 | Damage after capture survives the ack (stage 2c §5) | Ack from the live store instead of the captured snapshots |
 | Pool release follows the ledger, not the ack (4.2) | Release the pool slot at `HardwareComplete` |
+| Pool release waits for **every** gate, each tested alone (4.2; round-1 M-2) | Release at `CompletionRetired` alone; release at `PriorBufferReleased` before the GPU fence signals; drop the GPU fence gate |
+| Present requests reach the owner and terminalize independently (3.3; round-1 M-1) | Drop `present_consumers` from the built description; fabricate a `Flip` timestamp for a missing `Presented`; idle before the ledger proves release |
 | Old-state dependencies registered at dispatch (3.2) | Build the ledger without registering |
 | A failed registration leaves the owner as before `begin` (4.0) | Keep the slot reserved on a ledger error |
 | A failed registration consumes no admission state (4.0; 2c-ii §6) | `confirm` instead of `abort` after a ledger error |
