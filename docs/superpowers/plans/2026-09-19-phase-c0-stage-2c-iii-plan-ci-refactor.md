@@ -2,6 +2,10 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ci_`, `c0_adm`, `c0_2ci` without `--ignored`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master; no deletes outside the worktree. **You write the implementation**; this plan gives the interfaces, the invariants and the checks. Execute tasks in order, one per run. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 4 (2026-09-19)** — incorporates codex round 2 (`../findings/2026-09-19-stage-2c-iii-plan-ci-refactor-review-round2.md`: 1 blocking, 1 major, both verified and accepted; round 1: B-2, M-1 and M-2 APPLIED, B-1 TRADED into this round's B-1).
+- **B-1:** the spec's §8.3 defined this plan as behaviour-preserving, so Task 4 had no authority for any policy change. **Spec §8.3 is amended first** (`a1adc3b1`, user's decision): the refactor may collapse dispatch-failure policies that production cannot reach, provided every reachable row keeps today's behaviour, the unreachable ones are identified by recorded measurement, and the acceptance numbers, the mutation parity and the hardware gate are unchanged.
+- **M-1:** the reachable-only matrix cannot witness a mutation of the collapsed fallback, so Task 4 adds a policy-level test on the real policy function and owns both mutations itself.
+
 **Revision 3 (2026-09-19)** — Task 4 replaced, on measured evidence (user's decision after Task 3).
 Task 3 measured the reachability of decision 4's policy table through production entries: **only 3 of its 11 rows are reachable** — primary `Ledger`/restore-succeeded, primary `Refused`, and direct `Ledger`/undo-succeeded together with direct `Refused`. The other eight are F8 (recorded in Task 3's commit `bd429355` and in the matrix test): a `Cleanup` error needs `slot.release` to fail on the commit just reserved, and the direct missing/extra-resource rows cannot be produced by a real preparation. Making those cells "consistent", as revision 2's Task 4 proposed, would change behaviour no test driven through production can observe. Instead Task 4 now **collapses them**: one fail-closed path, and the table keeps only the rows that describe observable behaviour.
 
@@ -123,7 +127,11 @@ Revision 3's decision, from Task 3's measurement: eight of the eleven rows canno
 - No unreachable condition keeps a policy of its own, and the mechanism has no cell that no caller can produce.
 - Decision 4's table in this plan is rewritten to the new policy in the same change, with a line naming the rows that were collapsed and why.
 
-**Named test:** `c0_conv_cir_dispatch_failure_policy_matrix`, updated: one case per reachable row asserting outcome, gate state and where every resource ended up, plus a note in the test naming the collapsed conditions and why they are unreachable. Mutations that must fail it: give a reachable row the fail-closed policy; and give the fail-closed path a reachable row's policy (gate left open, `BeginRefused`).
+**Named tests:**
+- `c0_conv_cir_dispatch_failure_policy_matrix`, updated: one case per reachable row, driven through the real dispatches, asserting outcome, gate state and where every resource ended up, plus a note naming the collapsed conditions and why they are unreachable. Mutation that must fail it: give a reachable row the fail-closed policy.
+- `c0_conv_cir_dispatch_failure_fallback_is_fail_closed` (round-2 M-1): a policy-level test calling the **real** policy function with a representative collapsed condition per dispatch, asserting closed gate and `TransportClosed`. The test states in one line that it proves the mapping only — not reachability, not end-to-end restoration. Mutation that must fail it: give the fail-closed path a reachable row's policy (gate left open, `BeginRefused`).
+
+Both mutations are part of this task's own evidence, not only of the plan's acceptance step.
 
 - [ ] Steps: update the test and the plan's table; collapse the policy; checks; stop dirty and report.
 
