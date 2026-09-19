@@ -33,6 +33,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-19 Phase C.0 stage 2c-iii, plan Ci accepted (fixture level):** the
+  shared managed composed route now has an `Owner` half behind the transport fork
+  — render-completion readiness, a real `CommitDescription`, per-member old-state
+  registration (`register_kms`'s first non-test caller), the `CommitId`-keyed
+  damage transaction and the owner buffer lifecycle; `Legacy`, which production
+  still uses, is unchanged. Tasks `914f2818`..`f153c3a5`; upstream #162 merged as
+  `c2ff6965`; `c0_conv_ci_` 38/38 on the GPU; hardware gate 285/285. One Legacy
+  dormancy bug found and left for a user decision. Details, mutations and F8
+  stops in the
+  [acceptance finding](superpowers/findings/2026-09-19-stage-2c-iii-plan-ci-accepted.md).
 - **2026-09-17 on-screen reads follow the directly-flipped buffer:** while a
   CRTC scans out a client buffer directly, the compositor's pool BOs are not
   painted at all (`retire_direct_output` calls `invalidate_all_scanout_damage`
