@@ -161,6 +161,39 @@ impl CommitResourceConsumer {
         std::mem::take(&mut self.current_resources)
     }
 
+    /// Remove only the current entries covered by a commit. A resource entry
+    /// is the unit of ownership, so seeing only part of one entry covered is
+    /// an invalid shape rather than permission to split the entry.
+    pub(crate) fn take_current_for_members(
+        &mut self,
+        members: &[GroupMember],
+    ) -> Result<Vec<CommitResources>, ResourceError> {
+        if !GroupMember::validate_unique(members) {
+            return Err(ResourceError::InvalidProof);
+        }
+
+        let covered = |member: &GroupMember| members.contains(member);
+        if self.current_resources.iter().any(|resources| {
+            let intersects = resources.crtcs.iter().any(covered);
+            intersects && resources.crtcs.iter().any(|member| !covered(member))
+        }) {
+            return Err(ResourceError::InvalidProof);
+        }
+
+        let current = std::mem::take(&mut self.current_resources);
+        let mut selected = Vec::new();
+        let mut retained = Vec::with_capacity(current.len());
+        for resources in current {
+            if resources.crtcs.iter().any(covered) {
+                selected.push(resources);
+            } else {
+                retained.push(resources);
+            }
+        }
+        self.current_resources = retained;
+        Ok(selected)
+    }
+
     pub(crate) fn take_released_presents(&mut self) -> Vec<PresentRelease> {
         std::mem::take(&mut self.released_presents)
     }
@@ -291,7 +324,7 @@ impl CommitResourceConsumer {
                     }
                 }
                 self.releasing_resources.extend(old);
-                self.current_resources = new;
+                self.current_resources.extend(new);
                 Ok(())
             }
             crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
@@ -308,7 +341,7 @@ impl CommitResourceConsumer {
                         let _ = service.cancel(key, obligation_id);
                     }
                 }
-                self.current_resources = resources;
+                self.current_resources.extend(resources);
                 Ok(())
             }
             crate::kms::owner::device::OwnerEvent::ResourcesReleased {

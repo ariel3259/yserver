@@ -49354,10 +49354,15 @@ mod tests {
                 .managed_prepare_direct_candidate(id_a, candidate_a, event_a)
                 .unwrap()
         );
-        let resources_a = backend
+        let mut resources_a = backend
             .managed_dispatch_direct_successor(CommitId::for_tests(9301))
             .unwrap()
             .expect("dispatch current frame");
+        resources_a.crtcs = vec![crate::kms::render::resources::GroupMember::new(
+            test_crtc_key(device_key, 1),
+            1,
+            1,
+        )];
         backend
             .commit_consumer
             .consume(
@@ -49848,6 +49853,8 @@ mod tests {
         described_carried: std::rc::Rc<std::cell::Cell<usize>>,
         composed_resource_calls: std::rc::Rc<std::cell::Cell<usize>>,
         composed_resource_dropped: std::rc::Rc<std::cell::Cell<bool>>,
+        restored_composed_resources:
+            std::rc::Rc<std::cell::RefCell<Vec<crate::kms::render::resources::CommitResources>>>,
         maintenance_compatibility: MaintenanceCompatibility,
         homogeneous_group: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<u32>>>,
         cursor_recovery_ready: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<u32>>>,
@@ -49875,6 +49882,7 @@ mod tests {
             let described_carried = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let restored_composed_resources = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let maintenance_compatibility =
                 std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             let homogeneous_group =
@@ -49890,6 +49898,7 @@ mod tests {
                     described_carried,
                     composed_resource_calls,
                     composed_resource_dropped,
+                    restored_composed_resources: std::rc::Rc::clone(&restored_composed_resources),
                     maintenance_compatibility,
                     homogeneous_group,
                     cursor_recovery_ready,
@@ -49925,6 +49934,7 @@ mod tests {
             let described_carried = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let restored_composed_resources = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let maintenance_compatibility =
                 std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             let homogeneous_group =
@@ -49940,6 +49950,7 @@ mod tests {
                     described_carried: std::rc::Rc::clone(&described_carried),
                     composed_resource_calls: std::rc::Rc::clone(&composed_resource_calls),
                     composed_resource_dropped: std::rc::Rc::clone(&composed_resource_dropped),
+                    restored_composed_resources: std::rc::Rc::clone(&restored_composed_resources),
                     maintenance_compatibility,
                     homogeneous_group,
                     cursor_recovery_ready,
@@ -49977,6 +49988,7 @@ mod tests {
             let described_carried = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let restored_composed_resources = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let maintenance_compatibility =
                 std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             let homogeneous_group =
@@ -49992,6 +50004,7 @@ mod tests {
                     described_carried,
                     composed_resource_calls,
                     composed_resource_dropped,
+                    restored_composed_resources: std::rc::Rc::clone(&restored_composed_resources),
                     maintenance_compatibility: std::rc::Rc::clone(&maintenance_compatibility),
                     homogeneous_group: std::rc::Rc::clone(&homogeneous_group),
                     cursor_recovery_ready: std::rc::Rc::clone(&cursor_recovery_ready),
@@ -50078,18 +50091,26 @@ mod tests {
 
         fn composed_resources(
             &mut self,
-            _crtc: crate::kms::owner::admission::CrtcId,
+            crtc: crate::kms::owner::admission::CrtcId,
             _generation: u64,
         ) -> Vec<crate::kms::render::resources::CommitResources> {
             self.composed_resource_calls
                 .set(self.composed_resource_calls.get() + 1);
+            let member = crate::kms::render::resources::GroupMember::new(
+                CrtcKey::new(
+                    DrmDeviceKey { major: 0, minor: 0 },
+                    ::drm::control::from_u32(crtc).expect("fixture CRTC"),
+                ),
+                1,
+                1,
+            );
             vec![
                 crate::kms::render::resources::CommitResources::new(
                     Vec::new(),
                     None,
                     None,
                     None,
-                    Vec::new(),
+                    vec![member],
                     Vec::new(),
                 )
                 .with_direct_role(
@@ -50100,6 +50121,15 @@ mod tests {
                     ),
                 ),
             ]
+        }
+
+        fn restore_composed_resources(
+            &mut self,
+            resources: Vec<crate::kms::render::resources::CommitResources>,
+        ) {
+            self.restored_composed_resources
+                .borrow_mut()
+                .extend(resources);
         }
 
         fn direct_eligible(&self, _source_generation: u64) -> bool {
@@ -52178,10 +52208,13 @@ mod tests {
 
         let mut backend = backend_with_current_and_successor_for_admission_seam();
         let device = backend.platform.primary_device().unwrap().key;
-        admission_install_executor(
-            &mut backend,
+        let executor =
             crate::kms::executor::test_support::spawn_stub_helper(StubBehaviour::NeverReply)
-                .expect("spawn stub executor"),
+                .expect("spawn stub executor");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
         );
         install_admission_owner_gate(&mut backend, device);
         let (source, _, _, _, _, _, _, composed_resource_dropped) =
@@ -53407,6 +53440,417 @@ mod tests {
                     step,
                     crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
                 ))
+        );
+    }
+
+    struct Task2ResourceSource {
+        composed: Option<Vec<crate::kms::render::resources::CommitResources>>,
+        restored: Rc<RefCell<Vec<crate::kms::render::resources::CommitResources>>>,
+    }
+
+    impl Task2ResourceSource {
+        fn new(composed: Vec<crate::kms::render::resources::CommitResources>) -> Box<Self> {
+            Self::with_restore(composed).0
+        }
+
+        fn with_restore(
+            composed: Vec<crate::kms::render::resources::CommitResources>,
+        ) -> (
+            Box<Self>,
+            Rc<RefCell<Vec<crate::kms::render::resources::CommitResources>>>,
+        ) {
+            let restored = Rc::new(RefCell::new(Vec::new()));
+            (
+                Box::new(Self {
+                    composed: Some(composed),
+                    restored: Rc::clone(&restored),
+                }),
+                restored,
+            )
+        }
+    }
+
+    impl crate::kms::render::admission::AdmissionSource for Task2ResourceSource {
+        fn producer_readiness(
+            &self,
+            _key: crate::kms::owner::admission::IntentKey,
+        ) -> crate::kms::owner::admission::Readiness {
+            crate::kms::owner::admission::Readiness::Ready
+        }
+
+        fn describe(
+            &mut self,
+            _decision: &crate::kms::owner::admission::AdmissionDecision,
+        ) -> crate::kms::owner::build::CommitDescription {
+            crate::kms::owner::test_fixtures::single_active_crtc()
+        }
+
+        fn maintenance_readiness(
+            &self,
+            _key: crate::kms::owner::admission::MaintenanceKey,
+            _generation: u64,
+        ) -> crate::kms::owner::admission::Readiness {
+            crate::kms::owner::admission::Readiness::Ready
+        }
+
+        fn compatible(
+            &self,
+            _key: crate::kms::owner::admission::MaintenanceKey,
+            _generation: u64,
+            _primary: crate::kms::owner::admission::IntentKey,
+        ) -> bool {
+            true
+        }
+
+        fn homogeneous_group(&self) -> std::collections::BTreeSet<u32> {
+            std::collections::BTreeSet::new()
+        }
+
+        fn cursor_recovery_ready(&self, _crtc: u32) -> bool {
+            false
+        }
+
+        fn composed_resources(
+            &mut self,
+            _crtc: crate::kms::owner::admission::CrtcId,
+            _generation: u64,
+        ) -> Vec<crate::kms::render::resources::CommitResources> {
+            self.composed.take().unwrap_or_default()
+        }
+
+        fn restore_composed_resources(
+            &mut self,
+            resources: Vec<crate::kms::render::resources::CommitResources>,
+        ) {
+            self.restored.borrow_mut().extend(resources);
+        }
+
+        fn direct_eligible(&self, _source_generation: u64) -> bool {
+            true
+        }
+    }
+
+    struct Task2SuccessQuery;
+
+    impl crate::kms::owner::fences::FenceQuery for Task2SuccessQuery {
+        fn status(
+            &mut self,
+            _fd: std::os::fd::BorrowedFd<'_>,
+        ) -> io::Result<crate::platform::sync_file::FenceStatus> {
+            Ok(crate::platform::sync_file::FenceStatus::Success)
+        }
+    }
+
+    struct Task2NoopPoll;
+
+    impl crate::kms::owner::fences::FencePollSet for Task2NoopPoll {
+        fn register(&mut self, _fd: std::os::fd::BorrowedFd<'_>, _token: u64) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn unregister(&mut self, _fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn task2_member(device: DrmDeviceKey, crtc: u32) -> CrateGroupMember {
+        CrateGroupMember::new(test_crtc_key(device, crtc), 1, 1)
+    }
+
+    type CrateGroupMember = crate::kms::render::resources::GroupMember;
+
+    fn task2_resource(
+        backend: &mut KmsBackend,
+        member: CrateGroupMember,
+    ) -> crate::kms::render::resources::CommitResources {
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let allocation = backend
+            .resource_service
+            .as_mut()
+            .expect("Task 2 fixture resource service")
+            .adopt(crate::kms::render::resources::AllocationPayload::Spy(
+                crate::kms::render::resources::tests::SpyAllocation { drops },
+            ))
+            .expect("Task 2 fixture allocation");
+        crate::kms::render::resources::CommitResources::new(
+            vec![allocation],
+            None,
+            None,
+            None,
+            vec![member],
+            Vec::new(),
+        )
+    }
+
+    fn task2_complete_commit(
+        backend: &mut KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+    ) {
+        backend.record_host_call_events(vec![(
+            device,
+            crate::kms::owner::test_fixtures::accepted(commit, 1, 1),
+        )]);
+        let events = backend
+            .platform
+            .owner_for(device)
+            .expect("Task 2 fixture owner")
+            .observe_fences(
+                &mut Task2SuccessQuery,
+                &mut Task2NoopPoll,
+                std::time::Instant::now(),
+            );
+        backend.route_owner_event_batch(device, events, std::time::Instant::now());
+    }
+
+    fn task2_install_composed(
+        backend: &mut KmsBackend,
+        device: DrmDeviceKey,
+        current: Vec<crate::kms::render::resources::CommitResources>,
+        next: Vec<crate::kms::render::resources::CommitResources>,
+    ) {
+        backend.commit_consumer.current_resources = current;
+        install_admission_owner_gate(backend, device);
+        backend.install_admission_conductor_for_tests(device, Task2ResourceSource::new(next));
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("Task 2 composed offer");
+    }
+
+    #[test]
+    fn c0_conv_ci_dispatch_registers_displaced_obligations() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        let member = task2_member(device, 1);
+        let old = task2_resource(&mut backend, member);
+        let next = task2_resource(&mut backend, member);
+        let old_key = old.allocations[0].key();
+        task2_install_composed(&mut backend, device, vec![old], vec![next]);
+
+        let outcome = backend.admission_wake(device, false);
+        assert!(matches!(
+            outcome,
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("live Task 2 commit")
+            .commit_id();
+        assert!(
+            backend
+                .resource_service
+                .as_ref()
+                .expect("resource service")
+                .has_pending_obligations(&old_key),
+            "dispatch must register the displaced allocation"
+        );
+
+        task2_complete_commit(&mut backend, device, commit);
+
+        assert_eq!(backend.commit_consumer.releasing_resources.len(), 1);
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert!(
+            !backend
+                .resource_service
+                .as_ref()
+                .expect("resource service")
+                .has_pending_obligations(&old_key),
+            "the routed completion must discharge the registration"
+        );
+    }
+
+    #[test]
+    fn c0_conv_ci_registration_failure_aborts_the_token() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        let member = task2_member(device, 1);
+        let old = task2_resource(&mut backend, member);
+        let old_key = old.allocations[0].key();
+        let next = task2_resource(&mut backend, member);
+        backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .freeze(old_key)
+            .expect("freeze old allocation");
+        backend.commit_consumer.current_resources = vec![old];
+        install_admission_owner_gate(&mut backend, device);
+        let (source, restored) = Task2ResourceSource::with_restore(vec![next]);
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("Task 2 composed offer");
+        let before = format!("{:?}", backend.admission_conductors[&device].admission);
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::BeginRefused
+        ));
+        assert_eq!(
+            format!("{:?}", backend.admission_conductors[&device].admission),
+            before,
+            "a registration error must abort without changing admission state"
+        );
+        assert!(backend.device_owner_for_tests(0).slot().is_idle());
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert!(backend.commit_consumer.rejected_resources.is_empty());
+        assert_eq!(restored.borrow().len(), 1);
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .composed(1)
+                .is_some(),
+            "the failed registration remains queued for a later real wake"
+        );
+    }
+
+    #[test]
+    fn c0_conv_ci_other_crtc_current_survives_retirement() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        let member_a = task2_member(device, 1);
+        let member_b = task2_member(device, 2);
+        let old_a = task2_resource(&mut backend, member_a);
+        let old_b = task2_resource(&mut backend, member_b);
+        let next_a = task2_resource(&mut backend, member_a);
+        let old_b_key = old_b.allocations[0].key();
+        task2_install_composed(&mut backend, device, vec![old_a, old_b], vec![next_a]);
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("live Task 2 retirement commit")
+            .commit_id();
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(
+            backend.commit_consumer.current_resources[0].crtcs,
+            vec![member_b]
+        );
+
+        task2_complete_commit(&mut backend, device, commit);
+
+        assert_eq!(backend.commit_consumer.releasing_resources.len(), 1);
+        assert_eq!(backend.commit_consumer.current_resources.len(), 2);
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|res| { res.crtcs == vec![member_b] && res.kms_obligations.is_empty() })
+        );
+        assert!(
+            !backend
+                .resource_service
+                .as_ref()
+                .expect("resource service")
+                .has_pending_obligations(&old_b_key),
+            "the uncovered CRTC never acquired the retiring commit's obligation"
+        );
+    }
+
+    #[test]
+    fn c0_conv_ci_other_crtc_current_survives_rejection() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        let member_a = task2_member(device, 1);
+        let member_b = task2_member(device, 2);
+        let old_a = task2_resource(&mut backend, member_a);
+        let old_b = task2_resource(&mut backend, member_b);
+        let next_a = task2_resource(&mut backend, member_a);
+        task2_install_composed(&mut backend, device, vec![old_a, old_b], vec![next_a]);
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(
+            crate::kms::executor::test_support::StubBehaviour::RejectWith(libc::EINVAL),
+        )
+        .expect("rejecting Task 2 executor");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        install_admission_owner_gate(&mut backend, device);
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("live Task 2 rejection commit")
+            .commit_id();
+        backend.record_host_call_events(vec![(
+            device,
+            crate::kms::owner::test_fixtures::rejected(commit, libc::EINVAL),
+        )]);
+
+        assert_eq!(backend.commit_consumer.current_resources.len(), 2);
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|res| { res.crtcs == vec![member_b] && res.kms_obligations.is_empty() })
+        );
+        assert!(!backend.commit_consumer.rejected_resources.is_empty());
+    }
+
+    #[test]
+    fn c0_conv_ci_other_crtc_current_survives_direct_dispatch() {
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+        )
+        .expect("direct Task 2 executor");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        let member_a = task2_member(device, 1);
+        let member_b = task2_member(device, 2);
+        backend.commit_consumer.current_resources[0].crtcs = vec![member_a];
+        let old_b = task2_resource(&mut backend, member_b);
+        backend.commit_consumer.current_resources.push(old_b);
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 901);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .unwrap()
+        );
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("live direct Task 2 commit")
+            .commit_id();
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(
+            backend.commit_consumer.current_resources[0].crtcs,
+            vec![member_b]
+        );
+
+        task2_complete_commit(&mut backend, device, commit);
+
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|res| { res.crtcs == vec![member_b] && res.kms_obligations.is_empty() })
         );
     }
 }
