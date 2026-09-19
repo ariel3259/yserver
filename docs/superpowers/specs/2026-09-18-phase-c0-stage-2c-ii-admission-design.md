@@ -384,10 +384,9 @@ conductor runs it through 2c-i's never-submitted path — idle exactly once,
 release pins, defer the `Skip` behind the predecessor (C.0 §9.1). The decider
 touches no resource.
 
-**Activation.** The conductor acts only with the device's transport in
-**`Owner`**, reachable today only in fixtures carrying the writer-coverage
-evidence of the 2c-i debt spec §4.4. In production the transport stays `Legacy`
-and the conductor is inert (R8; stage 2c §6).
+**Activation.** The conductor **admits new work** only with the device's transport in **`Owner`**, reachable today only in fixtures carrying the writer-coverage evidence of the 2c-i debt spec §4.4. In production the transport stays `Legacy` and the conductor is inert (R8; stage 2c §6).
+
+*(Amended 2026-09-19, plan B2 review round 3.)* A commit already dispatched when the transport leaves `Owner` — for example when a bound violation closes it — still has its outcome **drained**: resource disposition, receipt disposition and the retirement enqueue, until its receipt closes. Closing admission never strands a receipt or a submitted payload. Drainage admits nothing.
 
 **Inputs in 2c-ii.** Producers are converted in 2c-iii, so intents are fed by
 tests. Cursor and gamma use test payloads; no live maintenance payload is ever
