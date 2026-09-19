@@ -4,6 +4,14 @@
 
 **Coverage: COMPLETE FOR DECLARED SCOPE**
 
+**Target:** plan B2 revision 1. **Reviewer:** `codex exec --sandbox read-only`, single pass.
+**Instrument:** `docs/superpowers/review/` @ `69c6d6e2`; model `gpt-5.6-sol`; reasoning effort `xhigh`; `codex-cli 0.154.0`.
+**Recorded usage:** 55,873 tokens (exit 0). 12/12 excerpts.
+
+**Author verification (2026-09-19):** all three CONFIRMED.
+- B-1: `try_complete` returns `CompletionRetired` then `Terminal(Completed)` (`device.rs` ~969). The Rejected arm returns `ResourcesReleased`, then `retire_live`'s `Terminal` and `ResourcesReleased`/`ResourcesStillCurrent` (~2464, ~2327). A2's retirement arm wakes admission inside the arm. Fixed by design decision 8, batch handling.
+- M-1, M-2: as stated. Fixed with confirm-path and one-home evidence, the post-drop dispatch, and the two-identity scenario (Q17–Q20).
+
 This is a design-review result only; it does not claim compilation, passing tests, or implementation approval.
 
 ## Incorporation audit

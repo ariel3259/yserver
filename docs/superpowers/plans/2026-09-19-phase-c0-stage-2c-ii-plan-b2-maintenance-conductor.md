@@ -2,7 +2,12 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), `--sandbox workspace-write`, run with `< /dev/null`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time. Tick steps (`- [ ]` → `- [x]`) only with the evidence each one names. Before writing code, read `AGENTS.md` and, as plain markdown, the Superpowers skills `executing-plans/SKILL.md` and `test-driven-development/SKILL.md` under `~/.claude/plugins/cache/claude-plugins-official/superpowers/*/skills/`. **The implementer never commits**: this worktree's git directory is read-only inside the sandbox. Stop with the tree dirty after each task; the coordinating session verifies and commits. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, stop and report it (F8).
 
-**Revision 1 (2026-09-19).**
+**Revision 2 (2026-09-19)** — incorporates codex round 1 (`../findings/2026-09-19-stage-2c-ii-plan-b2-review-round1.md`: 1 blocking, 2 major, all verified against `device.rs` and accepted).
+- **B-1:** owner events are handled **per batch**. Admission wakes are suppressed while the batch is routed, and admission wakes once after it. A completion emits `CompletionRetired` before `Terminal(Completed)`, so waking inside the retirement arm admitted a new commit while the old receipt was still open. A rejection (`ResourcesReleased`, `Terminal`, `ResourcesStillCurrent`) never woke admission at all.
+- **M-1:** the one-home evidence moves to the confirm path, and `Unknown` gets a one-home mutation.
+- **M-2:** a drop is followed through to the next primary dispatch, and a conductor-level two-identity continuous-collision scenario is added.
+
+Mutations Q17–Q20 were added.
 
 **Goal:** Give the conductor what 2c-ii's maintenance needs. That covers the routing of host-call outcomes, the maintenance store, dispatch of the decisions B1 now produces, the admission receipt and the terminal outcomes, the consequences of a drop, and closing the transport on a bound violation. With it, 2c-ii's admission is complete at fixture level.
 
@@ -26,6 +31,11 @@
    - Kernel rejection: submitted goes back to desired, with the collision rule, and `reenter(Rejected)`. If that returns `Dropped`, a cursor raises `request_cursor_recovery` and a gamma records a per-CRTC failure for stage 4.
    - `CompletionUnknown`: the payload is parked dormant and is **not** re-offered in 2c-ii. Re-offering it is C.0 §10 recovery's job.
 6. **`bound_violation()` is checked after every `confirm`**; `Some` closes the device's transport, like a lock mismatch.
+8. **Owner events are handled per batch** (round-1 B-1). A batch is every `OwnerEvent` one owner call returns: one `apply_host_call_event`, or one `service_owner_completions` for a device.
+   - Each event is routed in order, with admission wakes suppressed.
+   - After the whole batch, the conductor wakes admission **once**, if its conductor is active, the owner's slot is free, and the batch contained a terminal outcome or a retirement. It is a retirement wake if the batch contained a `CompletionRetired`.
+   - That is the only point where A2's retirement hook and this plan's receipt handling wake admission. A2's hook stops calling `admission_wake` itself. Its enqueue-then-admit order holds, because the enqueue happens inside the batch and the wake after it.
+   - A kernel rejection is not a pre-IPC refusal, so waking after its batch is allowed. The rejected maintenance re-entered through `reenter`, and the per-identity count bounds it.
 7. **Cursor recovery, topology and unflip admissions stay `Unsupported`.** The software cursor is stage 4's; topology and unflip dispatch are outside 2c-ii.
 
 ## Limits stated
@@ -50,13 +60,14 @@
 | Criterion | Tests | Mutation that must fail them |
 | --- | --- | --- |
 | Host-call outcomes reach the conductor for an active device only | `c0_adm_conductor_kernel_rejection_returns_the_primary_ledger`, `c0_adm_conductor_host_call_events_unchanged_without_a_conductor` | Q1: skip the routing; Q2: route for every device |
-| The store keeps one home per payload | `c0_adm_conductor_offer_maintenance_fills_the_store_and_the_decider` | Q3: leave the payload in desired after confirm |
+| Owner events are handled per batch: one wake, after the receipt closes and the ledger is restored (round-1 B-1) | `c0_adm_conductor_completion_batch_wakes_once_after_the_receipt_closes`, `c0_adm_conductor_rejection_batch_wakes_once_after_the_ledger_is_restored` | Q17: wake inside the retirement arm again; Q18: no wake after a rejection batch |
+| The store keeps one home per payload, through confirm, collision and unknown (round-1 M-1) | `c0_adm_conductor_offer_maintenance_fills_the_store_and_the_decider`, `c0_adm_conductor_confirm_moves_the_payload_to_submitted`, `c0_adm_conductor_unknown_parks_the_payload` | Q3: leave the payload in desired after confirm; Q19: park the unknown payload dormant but leave it in submitted |
 | Snapshot reports maintenance readiness, compatibility, group and recovery readiness from the source | `c0_adm_conductor_snapshot_reports_maintenance_inputs` | Q4: report maintenance ready without asking the source |
 | Decisions carrying maintenance dispatch, with the source describing the whole decision | `c0_adm_conductor_tier6_carrying_gamma_dispatches`, `c0_adm_conductor_tier3_carrying_cursor_dispatches`, `c0_adm_conductor_maintenance_only_dispatches_with_an_empty_ledger`, `c0_adm_conductor_bundle_dispatches_every_member` | Q5: A2's old `Unsupported` guard left in place; Q6: `describe` given only `admitted` |
 | Cursor recovery, topology, unflip stay `Unsupported` | `c0_adm_conductor_cursor_recovery_is_unsupported` | Q7: dispatch a cursor recovery |
 | A maintenance-only retirement leaves the primary's current state | `c0_adm_conductor_maintenance_only_retirement_keeps_the_primary_current` | Q8: forward its `CompletionRetired` to `consume` |
 | `Completed` promotes exactly the carried generation and closes the receipt | `c0_adm_conductor_completed_promotes_the_carried_generation` | Q9: promote the desired generation instead; Q10: leave the receipt open |
-| A kernel rejection re-enters with the original ticket; the collision rule; a second rejection drops, with its consequence | `c0_adm_conductor_rejection_reenters_the_carried_payload`, `c0_adm_conductor_rejection_collision_keeps_the_newer_payload`, `c0_adm_conductor_second_rejection_drops_a_cursor_into_recovery`, `c0_adm_conductor_second_rejection_records_a_gamma_failure` | Q11: re-enter with a new ticket; Q12: keep the older payload on collision; Q13: no recovery barrier on a dropped cursor |
+| A kernel rejection re-enters with the original ticket; the collision rule; a second rejection drops, with its consequence, and the CRTC's primary work then progresses; two identities progress under continuous collision (round-1 M-2) | `c0_adm_conductor_rejection_reenters_the_carried_payload`, `c0_adm_conductor_rejection_collision_keeps_the_newer_payload`, `c0_adm_conductor_second_rejection_drops_a_cursor_into_recovery`, `c0_adm_conductor_second_rejection_records_a_gamma_failure`, `c0_adm_conductor_two_identities_progress_under_continuous_collision` | Q11: re-enter with a new ticket; Q12: keep the older payload on collision; Q13: no recovery barrier on a dropped cursor; Q20: reset the inherited rejection count when the collision keeps the newer payload |
 | `CompletionUnknown` parks the payload dormant, uncounted | `c0_adm_conductor_unknown_parks_the_payload` | Q14: re-offer it; Q15: count it as a rejection |
 | A bound violation closes the transport | `c0_adm_conductor_bound_violation_closes_the_transport` | Q16: ignore `bound_violation()` |
 
@@ -66,12 +77,14 @@
 
 **Files:** `backend.rs` (`record_host_call_events`, and `route_owner_event` if needed), tests.
 
-**Invariant:** for each `(device, HostCallEvent)` that `record_host_call_events` applies to a device's owner, if that device's conductor is active, every `OwnerEvent` returned by `apply_host_call_event` is passed to `route_owner_event(device, event, now)`, in order. For any other device the events are only logged, as today. `route_owner_event` must already handle the event kinds that arrive: resource events go to `commit_consumer.consume`; `Terminal` is recorded; `Quarantined` and the rest fall to the default arm. Check that each kind is handled correctly rather than assuming it, and report what you found.
+**Invariant:** for each `(device, HostCallEvent)` that `record_host_call_events` applies to a device's owner, if that device's conductor is active, the `OwnerEvent`s that `apply_host_call_event` returns are handled **as one batch** (design decision 8): routed in order through `route_owner_event` with admission wakes suppressed, then one wake. The same batch handling replaces the per-event loops over `service_owner_completions`, in the tick path and in `on_owner_completion_ready`, for an active conductor. A2's retirement hook stops waking admission itself. For any device without an active conductor, host-call events are only logged and completion events are routed as today. `route_owner_event` must already handle the event kinds that arrive: resource events go to `commit_consumer.consume`, and the rest fall to their existing arms. Check that each kind is handled correctly rather than assuming it, and report what you found.
 
 **Named tests:**
 
 - `c0_adm_conductor_kernel_rejection_returns_the_primary_ledger` — active conductor. A composed admission dispatched over a non-empty current (A's `Current` resources), then the executor delivers a kernel rejection for that commit (a stub behaviour or a crafted `HostCallEvent` — say which). Afterwards `current_resources` holds A again, the new resources are in `rejected_resources`, and nothing was dropped.
 - `c0_adm_conductor_host_call_events_unchanged_without_a_conductor` — the same event on a device with no conductor: `commit_consumer` is untouched, which is today's behaviour.
+- `c0_adm_conductor_completion_batch_wakes_once_after_the_receipt_closes` — a completion batch (`CompletionRetired` then `Terminal(Completed)`), with another ready intent queued. The next commit is dispatched only after both events are in (the operation trace shows it), and two receipts never exist at once. A2's `c0_adm_conductor_retirement_enqueues_then_admits_before_publication` still passes, and its trace keeps its meaning.
+- `c0_adm_conductor_rejection_batch_wakes_once_after_the_ledger_is_restored` — a rejection batch (`ResourcesReleased`, `Terminal`, `ResourcesStillCurrent`), with another ready intent queued. That intent is dispatched after the batch, over the restored `current_resources`.
 
 - [ ] Steps: tests; red state; implement; gate; stop dirty and report.
 
@@ -128,7 +141,7 @@ impl KmsBackend {
 4. Right after `confirm`, if `admission.bound_violation()` is `Some`, close the device's transport (the lock-mismatch close) and return `TransportClosed`.
 5. At most one receipt exists per device (one live commit).
 
-**Named tests:** `c0_adm_conductor_tier6_carrying_gamma_dispatches`, `c0_adm_conductor_tier3_carrying_cursor_dispatches` (a retirement wake), `c0_adm_conductor_maintenance_only_dispatches_with_an_empty_ledger`, `c0_adm_conductor_bundle_dispatches_every_member`, `c0_adm_conductor_cursor_recovery_is_unsupported`, `c0_adm_conductor_bound_violation_closes_the_transport`. That last one reaches a violation through a sequence the decider allows, or through a hook that changes **only** the decider's counters, not the conductor's check. Name which; if you use a hook, say why no legal sequence exists.
+**Named tests:** `c0_adm_conductor_confirm_moves_the_payload_to_submitted` (after a confirmed dispatch carrying a gamma, the store's desired entry for it is absent and its submitted entry holds exactly that generation; with a newer gamma offered before the dispatch, the carried generation is in submitted and the newer one in desired), `c0_adm_conductor_tier6_carrying_gamma_dispatches`, `c0_adm_conductor_tier3_carrying_cursor_dispatches` (a retirement wake), `c0_adm_conductor_maintenance_only_dispatches_with_an_empty_ledger`, `c0_adm_conductor_bundle_dispatches_every_member`, `c0_adm_conductor_cursor_recovery_is_unsupported`, `c0_adm_conductor_bound_violation_closes_the_transport`. That last one reaches a violation through a sequence the decider allows, or through a hook that changes **only** the decider's counters, not the conductor's check. Name which; if you use a hook, say why no legal sequence exists.
 
 A2's and B1's existing tests that asserted `Unsupported` for maintenance-carrying decisions (`c0_adm_conductor_maintenance_carrying_tier6_is_unsupported`, `..._tier3_is_unsupported`) now assert dispatch. Rewrite them under the new names above, and list them.
 
@@ -150,7 +163,7 @@ A2's and B1's existing tests that asserted `Unsupported` for maintenance-carryin
 2. For a maintenance-only commit's `CompletionRetired`, do **not** call `commit_consumer.consume`. Everything else about the retirement hook (A2 Task 4) is unchanged.
 3. A `Terminal` for a commit with no receipt changes nothing in the store.
 
-**Named tests:** `c0_adm_conductor_completed_promotes_the_carried_generation`, `c0_adm_conductor_maintenance_only_retirement_keeps_the_primary_current`, `c0_adm_conductor_rejection_reenters_the_carried_payload`, `c0_adm_conductor_rejection_collision_keeps_the_newer_payload`, `c0_adm_conductor_second_rejection_drops_a_cursor_into_recovery` (then a wake: `Unsupported(Tier::Unflip)` for the recovery), `c0_adm_conductor_second_rejection_records_a_gamma_failure`, `c0_adm_conductor_unknown_parks_the_payload`. The rejection and unknown outcomes arrive through Task 1's routing, from a stub or crafted host-call event, not by calling the handler directly.
+**Named tests:** `c0_adm_conductor_completed_promotes_the_carried_generation`, `c0_adm_conductor_maintenance_only_retirement_keeps_the_primary_current`, `c0_adm_conductor_rejection_reenters_the_carried_payload`, `c0_adm_conductor_rejection_collision_keeps_the_newer_payload`, `c0_adm_conductor_second_rejection_drops_a_cursor_into_recovery` (then a wake: `Unsupported(Tier::Unflip)` for the recovery), `c0_adm_conductor_second_rejection_records_a_gamma_failure`, `c0_adm_conductor_unknown_parks_the_payload`. The rejection and unknown outcomes arrive through Task 1's routing, from a stub or crafted host-call event, not by calling the handler directly. Also: the gamma-failure test continues past the drop, and a wake then dispatches the ready primary on that CRTC. `c0_adm_conductor_unknown_parks_the_payload` also checks the payload is **absent from submitted**, and that a newer desired generation, if present, stays in desired. And `c0_adm_conductor_two_identities_progress_under_continuous_collision`: a cursor the kernel rejects at every commit, a newer cursor generation offered during each rejected submission, and a gamma on another CRTC. The gamma is dispatched within `1 + 2(N − 1)` admissions and the cursor is dropped at its second consecutive rejection. All of it is driven through dispatch and host-call batches, not by calling the decider directly.
 
 - [ ] Steps as above; Task 4 also runs `cargo check --workspace --target` for the three targets.
 
@@ -179,5 +192,5 @@ Task 4 adds `cargo check --workspace --target <t>` for `x86_64-unknown-linux-gnu
 
 1. Reads the diff against the invariants; checks each named test sets up its scenario and goes through the path it is named after.
 2. Reruns the gate outside the sandbox.
-3. After Task 4: applies Q1–Q16 to your code; a survivor goes back as a finding.
+3. After Task 4: applies Q1–Q20 to your code; a survivor goes back as a finding.
 4. Commits each task with `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)` and `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
