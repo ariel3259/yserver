@@ -29915,6 +29915,7 @@ mod tests {
             .push(crate::kms::render::platform::KmsDevice {
                 key,
                 device,
+                active_property_cache: Default::default(),
                 cursor: crate::kms::render::platform::KmsCursorState::new(),
                 executor: None,
                 owner: Some(crate::kms::owner::device::DeviceCommitOwner::new(

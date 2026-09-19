@@ -2040,6 +2040,8 @@ fn mode_via_connector_handle<T: Copy>(
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
+    /// Cached per-CRTC `ACTIVE` property ids used by composed owner commits.
+    pub(crate) active_property_cache: crate::kms::render::composed_commit::ActivePropertyCache,
     pub(crate) cursor: KmsCursorState,
     /// Optional because test fixtures do not spawn helper processes. Always `Some` in production.
     pub(crate) executor: Option<crate::kms::executor::KmsIoExecutor>,
@@ -2689,6 +2691,7 @@ impl PlatformBackend {
                 KmsDevice {
                     key: device.key,
                     device: device.device,
+                    active_property_cache: Default::default(),
                     cursor,
                     executor: Some(device.executor),
                     owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
@@ -3150,6 +3153,7 @@ impl PlatformBackend {
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
+                active_property_cache: Default::default(),
                 cursor: KmsCursorState::new(),
                 executor: None,
                 owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
@@ -4579,6 +4583,7 @@ impl PlatformBackend {
         self.devices.push(KmsDevice {
             key,
             device: std::rc::Rc::new(device),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
@@ -4601,6 +4606,7 @@ impl PlatformBackend {
         self.devices.push(KmsDevice {
             key,
             device: std::rc::Rc::new(device),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: Some(owner),
@@ -8600,6 +8606,7 @@ mod tests {
         KmsDevice {
             key,
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: None,
@@ -9193,6 +9200,7 @@ mod tests {
         platform.devices.push(KmsDevice {
             key: second_key,
             device: Rc::new(drm::Device::for_tests().expect("second test DRM device")),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: None,
@@ -9215,6 +9223,7 @@ mod tests {
                 minor: 1,
             },
             device: second_device,
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: None,
@@ -9805,6 +9814,7 @@ mod tests {
         platform.devices.push(KmsDevice {
             key: nvidia_key,
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new_with_nvidia_policy(true),
             executor: None,
             owner: None,
