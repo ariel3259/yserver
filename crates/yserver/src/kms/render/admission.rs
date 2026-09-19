@@ -4,14 +4,18 @@
 //! real producer conversion is stage 2c-iii; this module owns the boundary
 //! between that source, A1's pure decider, and the managed 2c-i seams.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::{
     kms::{
         owner::{
             admission::{
                 Admission, AdmissionDecision, AdmissionError, AdmissionToken, Admitted, Confirmed,
-                CrtcId, DirectSuccessor, IntentKey, Readiness, ReadinessSnapshot, Tier, WaitReason,
+                CrtcId, DirectSuccessor, IntentKey, MaintenanceKey, Readiness, ReadinessSnapshot,
+                Tier, WaitReason,
             },
             build::CommitDescription,
             device::{DispatchError, OwnerEvent},
@@ -75,6 +79,21 @@ fn decision_requires_unsupported(decision: &AdmissionDecision) -> bool {
         )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MaintenancePayload {
+    pub(crate) generation: u64,
+    pub(crate) data: Arc<[u8]>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub(crate) struct MaintenanceStore {
+    pub(crate) desired: BTreeMap<MaintenanceKey, MaintenancePayload>,
+    pub(crate) submitted: BTreeMap<MaintenanceKey, MaintenancePayload>,
+    pub(crate) current: BTreeMap<MaintenanceKey, MaintenancePayload>,
+    pub(crate) dormant: BTreeMap<MaintenanceKey, MaintenancePayload>,
+}
+
 /// What 2c-ii cannot observe because producers are converted in 2c-iii.
 #[allow(dead_code)]
 pub(crate) trait AdmissionSource {
@@ -82,7 +101,15 @@ pub(crate) trait AdmissionSource {
     /// finished producer waits; for a direct one, its pre-submit source waits.
     fn producer_readiness(&self, key: IntentKey) -> Readiness;
     /// The atomic description of an admitted primary.
-    fn describe(&mut self, admitted: &Admitted) -> CommitDescription;
+    fn describe(&mut self, decision: &AdmissionDecision) -> CommitDescription;
+    /// Readiness of a desired maintenance payload supplied by the source.
+    fn maintenance_readiness(&self, key: MaintenanceKey, generation: u64) -> Readiness;
+    /// Whether a maintenance payload can be carried by the primary intent.
+    fn compatible(&self, key: MaintenanceKey, generation: u64, primary: IntentKey) -> bool;
+    /// CRTCs whose primary requests may be combined into one commit.
+    fn homogeneous_group(&self) -> BTreeSet<CrtcId>;
+    /// Whether software-cursor recovery can be admitted for this CRTC.
+    fn cursor_recovery_ready(&self, crtc: CrtcId) -> bool;
     /// A composed admission's new-state resources, moved into the ledger.
     fn composed_resources(&mut self, crtc: CrtcId, generation: u64) -> Vec<CommitResources>;
     /// Whether the queued direct successor passes current direct eligibility.
@@ -97,6 +124,7 @@ pub(crate) struct AdmissionConductor {
     pub(crate) layout_generation: u64,
     pub(crate) next_direct_source_generation: u64,
     pub(crate) composed: BTreeMap<CrtcId, u64>,
+    pub(crate) maintenance: MaintenanceStore,
     pub(crate) recovery_stopped: bool,
     #[cfg(test)]
     pub(crate) prepare_hook: Option<AdmissionPreparationHook>,
@@ -115,6 +143,7 @@ impl AdmissionConductor {
             layout_generation: 0,
             next_direct_source_generation: 1,
             composed: BTreeMap::new(),
+            maintenance: MaintenanceStore::default(),
             recovery_stopped: false,
             #[cfg(test)]
             prepare_hook: None,
@@ -171,6 +200,38 @@ impl KmsBackend {
             .expect("active admission conductor");
         conductor.admission.set_composed(crtc, generation)?;
         conductor.composed.insert(crtc, generation);
+        Ok(())
+    }
+
+    /// Store the latest maintenance payload and queue its descriptor as one
+    /// transaction. An unchanged generation is an omission: it clears the
+    /// decider slot and leaves no desired payload in the conductor store.
+    pub(crate) fn admission_offer_maintenance(
+        &mut self,
+        device: DrmDeviceKey,
+        key: MaintenanceKey,
+        payload: MaintenancePayload,
+    ) -> Result<(), AdmissionError> {
+        if !self.admission_is_active(device) {
+            return Ok(());
+        }
+
+        let behind_commit = self
+            .platform
+            .owner_ref(device)
+            .is_some_and(|owner| owner.slot().occupant().is_some());
+        let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+            return Ok(());
+        };
+        conductor
+            .admission
+            .set_maintenance(key, payload.generation, behind_commit)?;
+
+        if conductor.admission.maintenance(key).is_some() {
+            conductor.maintenance.desired.insert(key, payload);
+        } else {
+            conductor.maintenance.desired.remove(&key);
+        }
         Ok(())
     }
 
@@ -381,6 +442,20 @@ impl KmsBackend {
                 ReadinessSnapshot::new(conductor.layout_generation, topology_generation);
             snapshot.retirement_wake = retirement_wake;
 
+            let primary_intents = conductor
+                .composed
+                .iter()
+                .map(|(&crtc, &generation)| IntentKey::Composed { crtc, generation })
+                .chain(
+                    conductor
+                        .admission
+                        .direct()
+                        .map(|direct| IntentKey::Direct {
+                            source_generation: direct.successor.source_generation,
+                        }),
+                )
+                .collect::<Vec<_>>();
+
             for (&crtc, &generation) in &conductor.composed {
                 snapshot.report(
                     IntentKey::Composed { crtc, generation },
@@ -409,6 +484,36 @@ impl KmsBackend {
                     }
                 };
                 snapshot.report(key, readiness);
+            }
+
+            for (&key, payload) in &conductor.maintenance.desired {
+                let maintenance = IntentKey::Maintenance {
+                    key,
+                    generation: payload.generation,
+                };
+                snapshot.report(
+                    maintenance,
+                    conductor
+                        .source
+                        .maintenance_readiness(key, payload.generation),
+                );
+                for &primary in &primary_intents {
+                    if conductor
+                        .source
+                        .compatible(key, payload.generation, primary)
+                    {
+                        snapshot.report_compatible(maintenance, primary);
+                    }
+                }
+            }
+            snapshot.homogeneous_group = conductor.source.homogeneous_group();
+            for &crtc in conductor.admission.cursor_recovery() {
+                let readiness = if conductor.source.cursor_recovery_ready(crtc) {
+                    Readiness::Ready
+                } else {
+                    Readiness::Waiting(WaitReason::SourceWaits)
+                };
+                snapshot.report(IntentKey::CursorRecovery { crtc }, readiness);
             }
 
             if conductor.admission.unflip().is_some() {
@@ -571,7 +676,7 @@ impl KmsBackend {
             .get_mut(&device)
             .expect("active admission conductor")
             .source
-            .describe(&decision.admitted);
+            .describe(&decision);
 
         let mut begin_refused = false;
         let commit = {
@@ -669,7 +774,7 @@ impl KmsBackend {
             .get_mut(&device)
             .expect("active admission conductor")
             .source
-            .describe(&decision.admitted);
+            .describe(&decision);
 
         let mut begin_refused = false;
         let commit = {

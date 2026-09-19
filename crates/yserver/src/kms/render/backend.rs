@@ -49788,6 +49788,19 @@ mod tests {
         );
     }
 
+    type MaintenanceCompatibility = std::rc::Rc<
+        std::cell::RefCell<
+            std::collections::BTreeMap<
+                (
+                    crate::kms::owner::admission::MaintenanceKey,
+                    u64,
+                    crate::kms::owner::admission::IntentKey,
+                ),
+                bool,
+            >,
+        >,
+    >;
+
     #[derive(Clone)]
     struct AdmissionSourceFixture {
         readiness: std::rc::Rc<
@@ -49803,6 +49816,9 @@ mod tests {
         describe_calls: std::rc::Rc<std::cell::Cell<usize>>,
         composed_resource_calls: std::rc::Rc<std::cell::Cell<usize>>,
         composed_resource_dropped: std::rc::Rc<std::cell::Cell<bool>>,
+        maintenance_compatibility: MaintenanceCompatibility,
+        homogeneous_group: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<u32>>>,
+        cursor_recovery_ready: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<u32>>>,
     }
 
     impl AdmissionSourceFixture {
@@ -49826,6 +49842,12 @@ mod tests {
             let describe_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let maintenance_compatibility =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let homogeneous_group =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
+            let cursor_recovery_ready =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
             (
                 Box::new(Self {
                     readiness: std::rc::Rc::clone(&readiness),
@@ -49834,6 +49856,9 @@ mod tests {
                     describe_calls,
                     composed_resource_calls,
                     composed_resource_dropped,
+                    maintenance_compatibility,
+                    homogeneous_group,
+                    cursor_recovery_ready,
                 }),
                 readiness,
                 direct_eligible,
@@ -49864,6 +49889,12 @@ mod tests {
             let describe_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let maintenance_compatibility =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let homogeneous_group =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
+            let cursor_recovery_ready =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
             (
                 Box::new(Self {
                     readiness: std::rc::Rc::clone(&readiness),
@@ -49872,6 +49903,9 @@ mod tests {
                     describe_calls: std::rc::Rc::clone(&describe_calls),
                     composed_resource_calls: std::rc::Rc::clone(&composed_resource_calls),
                     composed_resource_dropped: std::rc::Rc::clone(&composed_resource_dropped),
+                    maintenance_compatibility,
+                    homogeneous_group,
+                    cursor_recovery_ready,
                 }),
                 readiness,
                 direct_eligible,
@@ -49879,6 +49913,53 @@ mod tests {
                 describe_calls,
                 composed_resource_calls,
                 composed_resource_dropped,
+            )
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn new_with_snapshot_controls() -> (
+            Box<dyn crate::kms::render::admission::AdmissionSource>,
+            std::rc::Rc<
+                std::cell::RefCell<
+                    std::collections::BTreeMap<
+                        crate::kms::owner::admission::IntentKey,
+                        crate::kms::owner::admission::Readiness,
+                    >,
+                >,
+            >,
+            MaintenanceCompatibility,
+            std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<u32>>>,
+            std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<u32>>>,
+        ) {
+            let readiness =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
+            let describe_page_flip = std::rc::Rc::new(std::cell::Cell::new(false));
+            let describe_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let maintenance_compatibility =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let homogeneous_group =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
+            let cursor_recovery_ready =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
+            (
+                Box::new(Self {
+                    readiness: std::rc::Rc::clone(&readiness),
+                    direct_eligible,
+                    describe_page_flip,
+                    describe_calls,
+                    composed_resource_calls,
+                    composed_resource_dropped,
+                    maintenance_compatibility: std::rc::Rc::clone(&maintenance_compatibility),
+                    homogeneous_group: std::rc::Rc::clone(&homogeneous_group),
+                    cursor_recovery_ready: std::rc::Rc::clone(&cursor_recovery_ready),
+                }),
+                readiness,
+                maintenance_compatibility,
+                homogeneous_group,
+                cursor_recovery_ready,
             )
         }
 
@@ -49912,7 +49993,7 @@ mod tests {
 
         fn describe(
             &mut self,
-            _admitted: &crate::kms::owner::admission::Admitted,
+            _decision: &crate::kms::owner::admission::AdmissionDecision,
         ) -> crate::kms::owner::build::CommitDescription {
             self.describe_calls.set(self.describe_calls.get() + 1);
             if self.describe_page_flip.get() {
@@ -49920,6 +50001,38 @@ mod tests {
             } else {
                 crate::kms::owner::test_fixtures::single_active_crtc()
             }
+        }
+
+        fn maintenance_readiness(
+            &self,
+            key: crate::kms::owner::admission::MaintenanceKey,
+            generation: u64,
+        ) -> crate::kms::owner::admission::Readiness {
+            self.producer_readiness(crate::kms::owner::admission::IntentKey::Maintenance {
+                key,
+                generation,
+            })
+        }
+
+        fn compatible(
+            &self,
+            key: crate::kms::owner::admission::MaintenanceKey,
+            generation: u64,
+            primary: crate::kms::owner::admission::IntentKey,
+        ) -> bool {
+            self.maintenance_compatibility
+                .borrow()
+                .get(&(key, generation, primary))
+                .copied()
+                .unwrap_or(true)
+        }
+
+        fn homogeneous_group(&self) -> std::collections::BTreeSet<u32> {
+            self.homogeneous_group.borrow().clone()
+        }
+
+        fn cursor_recovery_ready(&self, crtc: u32) -> bool {
+            self.cursor_recovery_ready.borrow().contains(&crtc)
         }
 
         fn composed_resources(
@@ -50244,6 +50357,211 @@ mod tests {
                 .admission_snapshot(device, false)
                 .unwrap()
                 .readiness(key),
+            Some(Readiness::Ready)
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_offer_maintenance_fills_the_store_and_the_decider() {
+        use crate::kms::{
+            owner::admission::{AdmissionError, MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        let payload = MaintenancePayload {
+            generation: 7,
+            data: Arc::<[u8]>::from(vec![1, 2, 3]),
+        };
+
+        backend
+            .admission_offer_maintenance(device, gamma, payload.clone())
+            .expect("gamma offer");
+        let conductor = &backend.admission_conductors[&device];
+        assert_eq!(conductor.maintenance.desired.get(&gamma), Some(&payload));
+        assert!(conductor.maintenance.submitted.is_empty());
+        assert!(conductor.maintenance.current.is_empty());
+        assert!(conductor.maintenance.dormant.is_empty());
+        assert_eq!(
+            conductor.admission.maintenance(gamma).unwrap().generation,
+            7
+        );
+        assert!(conductor.admission.maintenance(gamma).unwrap().aged);
+
+        let stale = MaintenancePayload {
+            generation: 6,
+            data: Arc::<[u8]>::from(vec![9, 9]),
+        };
+        assert_eq!(
+            backend.admission_offer_maintenance(device, gamma, stale),
+            Err(AdmissionError::StaleGeneration {
+                queued: 7,
+                offered: 6,
+            })
+        );
+        let conductor = &backend.admission_conductors[&device];
+        assert_eq!(conductor.maintenance.desired.get(&gamma), Some(&payload));
+        assert_eq!(
+            conductor.admission.maintenance(gamma).unwrap().generation,
+            7
+        );
+
+        let current = MaintenanceKey {
+            crtc: 2,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .unwrap()
+            .admission
+            .note_completed(current, 8);
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .unwrap()
+            .maintenance
+            .current
+            .insert(
+                current,
+                MaintenancePayload {
+                    generation: 8,
+                    data: Arc::<[u8]>::from(vec![8]),
+                },
+            );
+        let queued = MaintenancePayload {
+            generation: 7,
+            data: Arc::<[u8]>::from(vec![7]),
+        };
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .unwrap()
+            .admission
+            .set_maintenance(current, queued.generation, false)
+            .expect("older queued maintenance");
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .unwrap()
+            .maintenance
+            .desired
+            .insert(current, queued);
+        backend
+            .admission_offer_maintenance(
+                device,
+                current,
+                MaintenancePayload {
+                    generation: 8,
+                    data: Arc::<[u8]>::from(vec![8, 8]),
+                },
+            )
+            .expect("unchanged maintenance omission");
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .maintenance(current)
+                .is_none()
+        );
+        assert!(
+            !backend.admission_conductors[&device]
+                .maintenance
+                .desired
+                .contains_key(&current)
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_snapshot_reports_maintenance_inputs() {
+        use crate::kms::{
+            owner::admission::{
+                IntentKey, MaintenanceClass, MaintenanceKey, Readiness, WaitReason,
+            },
+            render::admission::MaintenancePayload,
+        };
+        use std::{collections::BTreeSet, sync::Arc};
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, readiness, compatibility, homogeneous_group, recovery_ready) =
+            AdmissionSourceFixture::new_with_snapshot_controls();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let primary = IntentKey::Composed {
+            crtc: 1,
+            generation: 9,
+        };
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_composed(device, 1, 9)
+            .expect("composed offer");
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 7,
+                    data: Arc::<[u8]>::from(vec![7]),
+                },
+            )
+            .expect("gamma offer");
+        readiness.borrow_mut().insert(
+            IntentKey::Maintenance {
+                key: gamma,
+                generation: 7,
+            },
+            Readiness::Waiting(WaitReason::SourceWaits),
+        );
+        compatibility
+            .borrow_mut()
+            .insert((gamma, 7, primary), false);
+        homogeneous_group.borrow_mut().extend([1, 2]);
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .unwrap()
+            .admission
+            .request_cursor_recovery(2);
+        recovery_ready.borrow_mut().insert(2);
+
+        let snapshot = backend.admission_snapshot(device, false).expect("snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Maintenance {
+                key: gamma,
+                generation: 7,
+            }),
+            Some(Readiness::Waiting(WaitReason::SourceWaits))
+        );
+        assert!(!snapshot.is_compatible(
+            IntentKey::Maintenance {
+                key: gamma,
+                generation: 7,
+            },
+            primary,
+        ));
+        assert_eq!(snapshot.homogeneous_group, BTreeSet::from([1, 2]));
+        assert_eq!(
+            snapshot.readiness(IntentKey::CursorRecovery { crtc: 2 }),
             Some(Readiness::Ready)
         );
     }
