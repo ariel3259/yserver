@@ -19281,18 +19281,45 @@ fn dri3_import_supported_for_topology(
 }
 
 impl KmsBackend {
+    /// Owner-event drainage is part of the conductor path only when the
+    /// device has a conductor and either admission is active or a commit is
+    /// already in flight.  The latter keeps lifecycle drainage working after
+    /// the transport closes; without a conductor, production retains the
+    /// historical behavior of discarding non-clock DRM owner events.
+    fn should_route_owner_events(&self, device: DrmDeviceKey) -> bool {
+        self.admission_conductors.contains_key(&device)
+            && (self.admission_is_active(device)
+                || self
+                    .platform
+                    .owner_ref(device)
+                    .is_some_and(|owner| owner.live_record().is_some()))
+    }
+
     fn record_host_call_events(
         &mut self,
         events: Vec<(DrmDeviceKey, crate::kms::executor::HostCallEvent)>,
     ) {
+        let now = std::time::Instant::now();
         for (key, event) in events {
             log::debug!("kms executor host call event on {key}: {event:?}");
             self.host_call_events_for_tests
                 .lock()
                 .unwrap()
                 .push(crate::kms::executor::HostCallObservation::of(&event));
-            if let Some(owner) = self.platform.owner_for(key) {
-                for owner_event in owner.apply_host_call_event(event) {
+            let route_owner_events = self.should_route_owner_events(key);
+            let owner_events = self
+                .platform
+                .owner_for(key)
+                .map(|owner| owner.apply_host_call_event(event));
+            if route_owner_events {
+                if let Some(owner_events) = owner_events {
+                    for owner_event in &owner_events {
+                        log::debug!("kms owner event on {key}: {owner_event:?}");
+                    }
+                    self.route_owner_event_batch(key, owner_events, now);
+                }
+            } else if let Some(owner_events) = owner_events {
+                for owner_event in &owner_events {
                     log::debug!("kms owner event on {key}: {owner_event:?}");
                 }
             }
@@ -19557,8 +19584,104 @@ impl KmsBackend {
         Ok(())
     }
 
+    fn route_owner_event(
+        &mut self,
+        device_key: DrmDeviceKey,
+        event: crate::kms::owner::device::OwnerEvent<
+            crate::kms::render::resources::CommitResources,
+        >,
+        now: std::time::Instant,
+    ) {
+        self.route_owner_event_inner(device_key, event, now);
+    }
+
     #[doc(hidden)]
-    pub fn route_owner_event(
+    pub fn route_owner_event_batch(
+        &mut self,
+        device_key: DrmDeviceKey,
+        events: Vec<
+            crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
+        >,
+        now: std::time::Instant,
+    ) {
+        let has_retirement = events.iter().any(|event| {
+            matches!(
+                event,
+                crate::kms::owner::device::OwnerEvent::CompletionRetired { .. }
+            )
+        });
+        let rejected_commits = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::kms::owner::device::OwnerEvent::Terminal {
+                    commit,
+                    terminal:
+                        crate::kms::owner::record::TerminalState::FailedBeforeSubmit(
+                            crate::kms::owner::record::FailureCause::IoctlRejected { .. },
+                        ),
+                } => Some(*commit),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let rejected_still_current = events.iter().any(|event| {
+            let crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent { commit, .. } = event
+            else {
+                return false;
+            };
+            rejected_commits.contains(commit)
+                || self.platform.owner_ref(device_key).is_some_and(|owner| {
+                    owner.tombstones().iter().rev().any(|tombstone| {
+                        tombstone.commit == *commit
+                            && matches!(
+                                tombstone.terminal,
+                                crate::kms::owner::record::TerminalState::FailedBeforeSubmit(
+                                    crate::kms::owner::record::FailureCause::IoctlRejected { .. }
+                                )
+                            )
+                    })
+                })
+        });
+        let wake_eligible = has_retirement
+            || events.iter().any(|event| {
+                matches!(
+                    event,
+                    crate::kms::owner::device::OwnerEvent::Terminal {
+                        terminal: crate::kms::owner::record::TerminalState::Completed,
+                        ..
+                    }
+                )
+            })
+            || events.iter().any(|event| {
+                matches!(
+                    event,
+                    crate::kms::owner::device::OwnerEvent::Terminal {
+                        terminal: crate::kms::owner::record::TerminalState::FailedBeforeSubmit(
+                            crate::kms::owner::record::FailureCause::IoctlRejected { .. },
+                        ),
+                        ..
+                    }
+                )
+            })
+            || rejected_still_current;
+
+        for event in events {
+            self.route_owner_event(device_key, event, now);
+        }
+
+        let recovery_stopped = self
+            .admission_conductors
+            .get(&device_key)
+            .is_some_and(|conductor| conductor.recovery_stopped);
+        let slot_free = self
+            .platform
+            .owner_ref(device_key)
+            .is_some_and(|owner| owner.slot().occupant().is_none());
+        if wake_eligible && self.admission_is_active(device_key) && !recovery_stopped && slot_free {
+            let _ = self.admission_wake(device_key, has_retirement);
+        }
+    }
+
+    fn route_owner_event_inner(
         &mut self,
         device_key: DrmDeviceKey,
         event: crate::kms::owner::device::OwnerEvent<
@@ -19699,6 +19822,7 @@ impl KmsBackend {
             }
             crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
                 let admission_active = self.admission_is_active(device_key);
+                let conductor_installed = self.admission_conductors.contains_key(&device_key);
                 let Some(service) = &mut self.resource_service else {
                     if admission_active {
                         log::error!(
@@ -19725,7 +19849,7 @@ impl KmsBackend {
                     }
                     return;
                 }
-                if !admission_active {
+                if !conductor_installed {
                     return;
                 }
 
@@ -19749,7 +19873,6 @@ impl KmsBackend {
                 }
                 #[cfg(not(test))]
                 self.managed_enqueue_retired_direct_completion();
-                let _ = self.admission_wake(device_key, true);
             }
             crate::kms::owner::device::OwnerEvent::SequenceArmFailed { key, .. } => {
                 if let Some(handle) =
@@ -20530,8 +20653,14 @@ impl Backend for KmsBackend {
             // state) but STILL run the sequence handler so the armed-target
             // map clears — leaving a stuck entry across suspend is exactly
             // the permanent-stall failure mode this guards against.
-            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
-                for seq in sequences {
+            if let Ok(drained) = self.platform.drain_page_flip_events(drm_fd) {
+                let now = std::time::Instant::now();
+                for (device_key, owner_events) in drained.owner_event_batches {
+                    if self.should_route_owner_events(device_key) {
+                        self.route_owner_event_batch(device_key, owner_events, now);
+                    }
+                }
+                for seq in drained.sequences {
                     self.on_crtc_sequence_event(
                         seq.device_key,
                         seq.user_data,
@@ -20543,14 +20672,20 @@ impl Backend for KmsBackend {
             log::debug!("render on_page_flip_ready: skipped (seat not Active)");
             return;
         }
-        let (flipped, sequences) = match self.platform.drain_page_flip_events(drm_fd) {
-            Ok(pair) => pair,
+        let drained = match self.platform.drain_page_flip_events(drm_fd) {
+            Ok(drained) => drained,
             Err(e) => {
                 log::warn!("render: drain_page_flip_events failed: {e}");
                 return;
             }
         };
-        for (output_idx, clock) in flipped {
+        let now = std::time::Instant::now();
+        for (device_key, owner_events) in drained.owner_event_batches {
+            if self.should_route_owner_events(device_key) {
+                self.route_owner_event_batch(device_key, owner_events, now);
+            }
+        }
+        for (output_idx, clock) in drained.flipped {
             let direct_retired = self.retire_direct_output(output_idx, clock);
             let scene_retired = !direct_retired
                 && self.scene.handle_page_flip_complete(
@@ -20579,7 +20714,7 @@ impl Backend for KmsBackend {
         // each CRTC sequence the kernel delivered. The run loop reads the
         // updated `(msc, ust)` via `present_get_ust_msc` and fires parked
         // NotifyMSC, then re-arms if any remain.
-        for seq in sequences {
+        for seq in drained.sequences {
             self.on_crtc_sequence_event(seq.device_key, seq.user_data, seq.time_ns, seq.sequence);
         }
         // Sweep retired engine submits + retired drawables now
@@ -20647,8 +20782,8 @@ impl Backend for KmsBackend {
             let _ = service.service_completions(now);
         }
         let owner_events = self.platform.service_owner_completions(now);
-        for (device_key, event) in owner_events {
-            self.route_owner_event(device_key, event, now);
+        for (device_key, events) in owner_events {
+            self.route_owner_event_batch(device_key, events, now);
         }
     }
 
@@ -20658,8 +20793,8 @@ impl Backend for KmsBackend {
             let _ = service.service_completions(now);
         }
         let owner_events = self.platform.service_owner_completions(now);
-        for (device_key, event) in owner_events {
-            self.route_owner_event(device_key, event, now);
+        for (device_key, events) in owner_events {
+            self.route_owner_event_batch(device_key, events, now);
         }
     }
 
@@ -51216,9 +51351,9 @@ mod tests {
                 .expect("C offer")
         );
 
-        backend.route_owner_event(
+        backend.route_owner_event_batch(
             device,
-            admission_completion_retired_event(commit_a, resources_a),
+            vec![admission_completion_retired_event(commit_a, resources_a)],
             std::time::Instant::now(),
         );
 
@@ -51317,9 +51452,9 @@ mod tests {
                 .expect("B offer")
         );
 
-        backend.route_owner_event(
+        backend.route_owner_event_batch(
             device,
-            admission_completion_retired_event(commit_a, resources_a),
+            vec![admission_completion_retired_event(commit_a, resources_a)],
             std::time::Instant::now(),
         );
 
@@ -51348,9 +51483,9 @@ mod tests {
         );
         eligible.set(false);
 
-        backend.route_owner_event(
+        backend.route_owner_event_batch(
             device,
-            admission_completion_retired_event(commit_a, resources_a),
+            vec![admission_completion_retired_event(commit_a, resources_a)],
             std::time::Instant::now(),
         );
 
@@ -51474,9 +51609,9 @@ mod tests {
         assert!(backend.scanout_m2.pending.is_some());
         assert!(backend.scanout_m2.completed.is_empty());
 
-        backend.route_owner_event(
+        backend.route_owner_event_batch(
             device,
-            admission_completion_retired_event(commit_a, resources_a),
+            vec![admission_completion_retired_event(commit_a, resources_a)],
             std::time::Instant::now(),
         );
 
@@ -51497,5 +51632,560 @@ mod tests {
                 .is_none()
         );
         assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    fn c0_adm_conductor_kernel_rejection_returns_the_primary_ledger() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour, owner::test_fixtures,
+            render::resources::DirectRole,
+        };
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(StubBehaviour::NeverReply)
+                .expect("spawn stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _, _, _, _, composed_resource_dropped) =
+            AdmissionSourceFixture::new_with_controls();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+
+        let commit = match backend.admission_wake(device, false) {
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_confirmed) => backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("live owner record")
+                .commit_id(),
+            outcome => panic!("composed admission did not dispatch: {outcome:?}"),
+        };
+        assert!(backend.commit_consumer.current_resources.is_empty());
+
+        // This is the real host-call ingress: the fixture crafts the executor
+        // rejection, while record_host_call_events invokes the owner's
+        // apply_host_call_event and routes its complete returned batch.
+        backend.record_host_call_events(vec![(
+            device,
+            test_fixtures::rejected(commit, libc::EINVAL),
+        )]);
+
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(
+            backend.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("current role")
+                .role(),
+            DirectRole::Current
+        );
+        assert_eq!(backend.commit_consumer.rejected_resources.len(), 1);
+        assert_eq!(
+            backend.commit_consumer.rejected_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("rejected role")
+                .role(),
+            DirectRole::Successor
+        );
+        assert!(
+            !composed_resource_dropped.get(),
+            "post-dispatch rejection must return the new resources by value"
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_host_call_events_unchanged_without_a_conductor() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::{ledger::Submitted, test_fixtures},
+        };
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(StubBehaviour::NeverReply)
+                .expect("spawn stub executor"),
+        );
+
+        let old = backend.commit_consumer.take_current();
+        let commit = {
+            let device_entry = backend
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == device)
+                .expect("test device");
+            let owner = device_entry.owner.as_mut().expect("test owner");
+            let (commit, _) = owner
+                .begin(
+                    &test_fixtures::single_active_crtc(),
+                    Submitted::new(old, Vec::new()),
+                )
+                .expect("begin test commit");
+            owner
+                .send_on(device_entry.executor.as_mut().expect("test executor"))
+                .expect("send test commit");
+            commit
+        };
+
+        let before = (
+            backend.commit_consumer.current_resources.len(),
+            backend.commit_consumer.rejected_resources.len(),
+        );
+        backend.record_host_call_events(vec![(
+            device,
+            test_fixtures::rejected(commit, libc::EINVAL),
+        )]);
+        let after = (
+            backend.commit_consumer.current_resources.len(),
+            backend.commit_consumer.rejected_resources.len(),
+        );
+
+        assert_eq!(before, (0, 0));
+        assert_eq!(after, before, "no-conductor host events remain dropped");
+    }
+
+    #[test]
+    fn c0_adm_conductor_drm_events_unchanged_without_a_conductor() {
+        use std::{
+            os::fd::{AsFd, AsRawFd},
+            rc::Rc,
+        };
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("spawn stub executor"),
+        );
+
+        let old = backend.commit_consumer.take_current();
+        let clock_key = crate::kms::owner::clock::ClockKey {
+            hardware_crtc: 1,
+            epoch: crate::kms::owner::identity::ClockEpochId::first(),
+        };
+        let commit = {
+            let device_entry = backend
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == device)
+                .expect("test device");
+            let owner = device_entry.owner.as_mut().expect("test owner");
+            owner
+                .install_clock(
+                    clock_key,
+                    crate::kms::owner::lifecycle::LifecycleEpochId::first(),
+                    1,
+                )
+                .expect("install test clock");
+            owner
+                .clock_mut(clock_key)
+                .expect("test clock")
+                .install_reference(100);
+            let (commit, _) = owner
+                .begin_with_context(
+                    &crate::kms::owner::test_fixtures::single_active_crtc_with_present(1),
+                    crate::kms::owner::ledger::Submitted::new(old, Vec::new()),
+                    crate::kms::owner::test_fixtures::fast_context_for_crtcs(&[(1, clock_key)]),
+                )
+                .expect("begin page-flip commit");
+            owner.mark_dispatched_for_tests();
+            commit
+        };
+
+        backend.record_host_call_events(vec![(
+            device,
+            crate::kms::owner::test_fixtures::accepted(commit, 1, 1),
+        )]);
+        let consumer_before = format!("{:?}", backend.commit_consumer);
+        assert!(backend.admission_conductors.is_empty());
+
+        let (reader, mut writer) =
+            crate::drm::event_stream::test_support::nonblocking_pipe().expect("DRM event pipe");
+        backend.platform.devices[0].device =
+            Rc::new(crate::drm::Device::from_file_for_tests(reader));
+        let page_event = crate::kms::owner::test_fixtures::page_event_bytes(
+            1,
+            101,
+            10,
+            5_000,
+            backend
+                .platform
+                .owner_ref(device)
+                .expect("owner")
+                .live_record()
+                .expect("live commit")
+                .event_token()
+                .as_user_data(),
+        );
+        std::io::Write::write_all(&mut writer, &page_event).expect("write DRM page-flip");
+        let mut state = yserver_core::server::ServerState::new();
+        backend.on_page_flip_ready(
+            &mut state,
+            backend.platform.devices[0].device.as_fd().as_raw_fd(),
+        );
+
+        assert_eq!(
+            format!("{:?}", backend.commit_consumer),
+            consumer_before,
+            "non-clock DRM owner events remain discarded without a conductor"
+        );
+        assert!(backend.admission_conductors.is_empty());
+    }
+
+    #[test]
+    fn c0_adm_conductor_completion_batch_wakes_once_after_the_receipt_closes() {
+        use crate::kms::render::admission::AdmissionTraceStep;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let (commit_a, resources_a) = admission_stage_direct_predecessor(&mut backend, 71);
+        let (source_b, candidate_b, event_b) = admission_direct_candidate(&mut backend, 72);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_b, candidate_b, event_b)
+                .expect("queued successor")
+        );
+
+        let terminal = crate::kms::owner::device::OwnerEvent::Terminal {
+            commit: commit_a,
+            terminal: crate::kms::owner::record::TerminalState::Completed,
+        };
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                admission_completion_retired_event(commit_a, resources_a),
+                terminal,
+            ],
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(
+            backend.admission_trace_for_tests(device),
+            vec![
+                AdmissionTraceStep::Consumed(commit_a),
+                AdmissionTraceStep::Enqueued {
+                    completions: vec![71],
+                    skips: vec![],
+                },
+                AdmissionTraceStep::Decided,
+                AdmissionTraceStep::Dispatched(
+                    backend
+                        .device_owner_for_tests(0)
+                        .live_record()
+                        .expect("successor dispatched")
+                        .commit_id(),
+                ),
+            ]
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+    }
+
+    #[test]
+    fn c0_adm_conductor_rejection_batch_wakes_once_after_the_ledger_is_restored() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(StubBehaviour::RejectWith(
+                libc::EINVAL,
+            ))
+            .expect("spawn stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("first composed offer");
+        let rejected_commit = match backend.admission_wake(device, false) {
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_confirmed) => backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("live owner record")
+                .commit_id(),
+            outcome => panic!("first admission did not dispatch: {outcome:?}"),
+        };
+
+        let (source_b, candidate_b, event_b) = admission_direct_candidate(&mut backend, 73);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_b, candidate_b, event_b)
+                .expect("queued successor")
+        );
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+
+        assert!(!backend.commit_consumer.rejected_resources.is_empty());
+        let next_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("the queued intent dispatched after the rejection batch")
+            .commit_id();
+        assert_ne!(next_commit, rejected_commit);
+        assert!(
+            backend
+                .commit_consumer
+                .rejected_resources
+                .iter()
+                .any(|resource| resource.commit_id == Some(rejected_commit))
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_drm_completion_batch_wakes_once() {
+        use std::{
+            io,
+            os::{
+                fd::BorrowedFd,
+                unix::io::{AsFd, AsRawFd},
+            },
+            rc::Rc,
+        };
+
+        struct SuccessQuery;
+        impl crate::kms::owner::fences::FenceQuery for SuccessQuery {
+            fn status(
+                &mut self,
+                _fd: BorrowedFd<'_>,
+            ) -> io::Result<crate::platform::sync_file::FenceStatus> {
+                Ok(crate::platform::sync_file::FenceStatus::Success)
+            }
+        }
+        struct NoopPoll;
+        impl crate::kms::owner::fences::FencePollSet for NoopPoll {
+            fn register(&mut self, _fd: BorrowedFd<'_>, _token: u64) -> io::Result<()> {
+                Ok(())
+            }
+            fn unregister(&mut self, _fd: BorrowedFd<'_>) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("spawn stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("queued successor");
+
+        let old = backend.commit_consumer.take_current();
+        let clock_key = crate::kms::owner::clock::ClockKey {
+            hardware_crtc: 1,
+            epoch: crate::kms::owner::identity::ClockEpochId::first(),
+        };
+        let (commit_a, _fence_reader, fence_writer) = {
+            let device_entry = backend
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == device)
+                .expect("test device");
+            let owner = device_entry.owner.as_mut().expect("test owner");
+            owner
+                .install_clock(
+                    clock_key,
+                    crate::kms::owner::lifecycle::LifecycleEpochId::first(),
+                    1,
+                )
+                .expect("install test clock");
+            owner
+                .clock_mut(clock_key)
+                .expect("test clock")
+                .install_reference(100);
+            let (fence_reader, fence_writer) = nix::unistd::pipe().expect("fence pipe");
+            let (commit, _) = owner
+                .begin_with_context(
+                    &crate::kms::owner::test_fixtures::single_active_crtc_with_present(1),
+                    crate::kms::owner::ledger::Submitted::new(old, Vec::new()),
+                    crate::kms::owner::test_fixtures::fast_context_for_crtcs(&[(1, clock_key)]),
+                )
+                .expect("begin page-flip commit");
+            owner.mark_dispatched_for_tests();
+            (commit, fence_reader, fence_writer)
+        };
+
+        backend.record_host_call_events(vec![(
+            device,
+            crate::kms::owner::test_fixtures::accepted(commit_a, 1, 1),
+        )]);
+        let hardware_events = backend
+            .platform
+            .owner_for(device)
+            .expect("owner")
+            .observe_fences(&mut SuccessQuery, &mut NoopPoll, std::time::Instant::now());
+        backend.route_owner_event_batch(device, hardware_events, std::time::Instant::now());
+
+        let (reader, mut writer) =
+            crate::drm::event_stream::test_support::nonblocking_pipe().expect("DRM event pipe");
+        backend.platform.devices[0].device =
+            Rc::new(crate::drm::Device::from_file_for_tests(reader));
+        let page_event = crate::kms::owner::test_fixtures::page_event_bytes(
+            1,
+            101,
+            10,
+            5_000,
+            backend
+                .platform
+                .owner_ref(device)
+                .expect("owner")
+                .live_record()
+                .expect("live commit")
+                .event_token()
+                .as_user_data(),
+        );
+        std::io::Write::write_all(&mut writer, &page_event).expect("write DRM page-flip");
+        let mut state = yserver_core::server::ServerState::new();
+        backend.on_page_flip_ready(
+            &mut state,
+            backend.platform.devices[0].device.as_fd().as_raw_fd(),
+        );
+
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        assert!(
+            backend
+                .admission_trace_for_tests(device)
+                .windows(2)
+                .any(|window| matches!(
+                    window,
+                    [
+                        crate::kms::render::admission::AdmissionTraceStep::Consumed(_),
+                        crate::kms::render::admission::AdmissionTraceStep::Enqueued { .. }
+                    ]
+                ))
+        );
+        assert!(
+            backend
+                .admission_trace_for_tests(device)
+                .iter()
+                .any(|step| matches!(
+                    step,
+                    crate::kms::render::admission::AdmissionTraceStep::Dispatched(commit)
+                        if *commit != commit_a
+                ))
+        );
+        drop(fence_writer);
+    }
+
+    #[test]
+    fn c0_adm_conductor_transport_close_still_drains_the_live_commit() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(StubBehaviour::NeverReply)
+                .expect("spawn stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+        let commit = match backend.admission_wake(device, false) {
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_confirmed) => backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("live owner record")
+                .commit_id(),
+            outcome => panic!("admission did not dispatch: {outcome:?}"),
+        };
+        let trace_before_close = backend.admission_trace_for_tests(device);
+        backend
+            .platform
+            .transport_gate_mut(&device)
+            .expect("owner gate")
+            .close()
+            .expect("close transport gate");
+
+        backend.record_host_call_events(vec![(
+            device,
+            crate::kms::owner::test_fixtures::rejected(commit, libc::EINVAL),
+        )]);
+
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(backend.commit_consumer.rejected_resources.len(), 1);
+        assert_eq!(
+            backend.admission_trace_for_tests(device),
+            trace_before_close,
+            "closed transport must drain the ledger without new admission"
+        );
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .slot()
+                .occupant()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_never_dispatched_does_not_wake() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::owner::test_fixtures::reaped_executor_for_tests(),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::SendRefused(
+                crate::kms::owner::record::RefusalCause::Reaped
+            )
+        ));
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert_eq!(
+            backend.admission_conductors[&device].admission.sequence(),
+            0
+        );
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .composed(1)
+                .is_some()
+        );
+        assert!(
+            backend
+                .admission_trace_for_tests(device)
+                .iter()
+                .all(|step| !matches!(
+                    step,
+                    crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                ))
+        );
     }
 }

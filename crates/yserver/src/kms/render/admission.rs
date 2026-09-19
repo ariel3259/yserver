@@ -97,6 +97,7 @@ pub(crate) struct AdmissionConductor {
     pub(crate) layout_generation: u64,
     pub(crate) next_direct_source_generation: u64,
     pub(crate) composed: BTreeMap<CrtcId, u64>,
+    pub(crate) recovery_stopped: bool,
     #[cfg(test)]
     pub(crate) prepare_hook: Option<AdmissionPreparationHook>,
     #[cfg(test)]
@@ -114,6 +115,7 @@ impl AdmissionConductor {
             layout_generation: 0,
             next_direct_source_generation: 1,
             composed: BTreeMap::new(),
+            recovery_stopped: false,
             #[cfg(test)]
             prepare_hook: None,
             #[cfg(test)]
@@ -449,7 +451,11 @@ impl KmsBackend {
         device: DrmDeviceKey,
         retirement_wake: bool,
     ) -> AdmissionOutcome {
-        let outcome = if !self.admission_is_active(device) {
+        let recovery_stopped = self
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| conductor.recovery_stopped);
+        let outcome = if !self.admission_is_active(device) || recovery_stopped {
             AdmissionOutcome::Inert
         } else if self
             .platform
