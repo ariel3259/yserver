@@ -2,6 +2,9 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ci_`, `c0_adm`, `c0_2ci` without `--ignored`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master; no deletes outside the worktree. **You write the implementation**; this plan gives the interfaces, the invariants and the checks. Execute tasks in order, one per run. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 3 (2026-09-19)** — Task 4 replaced, on measured evidence (user's decision after Task 3).
+Task 3 measured the reachability of decision 4's policy table through production entries: **only 3 of its 11 rows are reachable** — primary `Ledger`/restore-succeeded, primary `Refused`, and direct `Ledger`/undo-succeeded together with direct `Refused`. The other eight are F8 (recorded in Task 3's commit `bd429355` and in the matrix test): a `Cleanup` error needs `slot.release` to fail on the commit just reserved, and the direct missing/extra-resource rows cannot be produced by a real preparation. Making those cells "consistent", as revision 2's Task 4 proposed, would change behaviour no test driven through production can observe. Instead Task 4 now **collapses them**: one fail-closed path, and the table keeps only the rows that describe observable behaviour.
+
 **Revision 2 (2026-09-19)** — incorporates codex round 1 (`../findings/2026-09-19-stage-2c-iii-plan-ci-refactor-review-round1.md`: 2 blocking, 2 major, all verified against the tree and accepted).
 - **B-1:** the dispatch failure arms are not uniform today; decision 4 now carries the exact current policy matrix, Tasks 1–3 preserve it, and the three inconsistencies it exposes are fixed separately, as an explicit behaviour change, in Task 4.
 - **B-2:** `Quarantined` is a minimal poison marker, not a payload holder: today `CompletionUnknown` drops the scene record.
@@ -108,17 +111,21 @@ Baseline before Task 1 (commit `5fe87a75`): `c0_conv_ci_` 38/38 with `--include-
 
 ---
 
-### Task 4: Make the dispatch failure policy consistent (behaviour change)
+### Task 4: Collapse the unreachable failure rows into one fail-closed path (behaviour change)
 
-**Files:** `admission.rs`; the matrix test.
+**Files:** `admission.rs`; the matrix test; decision 4's table in this plan.
 
-This is the one task that changes behaviour, and only in Ci's own code (user rule: bugs in what we built, we fix). A `Cleanup` error means the owner could not release its own reservation, and a missing resource means the conductor lost track of what it was dispatching; in both, admission on that device can no longer be trusted.
+Revision 3's decision, from Task 3's measurement: eight of the eleven rows cannot be reached through production entries, and three of them claim distinct policies for situations that cannot occur. A table that describes unobservable behaviour is where the next reader's wrong assumption comes from.
 
-**Invariants:** every `Cleanup` row, in both dispatches, closes the gate and returns `TransportClosed`; every row where a resource the dispatch should hold is missing closes the gate and returns `TransportClosed`; `Ledger` and `Refused` rows with a successful restore are unchanged. Update decision 4's table in this plan to the new policy in the same change.
+**Invariants:**
+- The policy keeps exactly the reachable rows, each with today's behaviour unchanged: primary `Ledger` with a successful restore → `BeginRefused`, gate open; primary `Refused` → `BeginRefused`, gate open; direct `Ledger` with a successful undo → `BeginRefused`, gate open; direct `Refused` with its resource present → `BeginRefused`, gate open.
+- Every other failure — any `Cleanup`, any restore that fails, any resource missing or unexpected, on either dispatch — takes **one** fail-closed path: close the gate, abort the token, return `TransportClosed`, and log which condition it was. A `Cleanup` error means the owner could not release the reservation it just made, and a missing resource means the conductor lost track of what it was dispatching; neither leaves admission on that device trustworthy.
+- No unreachable condition keeps a policy of its own, and the mechanism has no cell that no caller can produce.
+- Decision 4's table in this plan is rewritten to the new policy in the same change, with a line naming the rows that were collapsed and why.
 
-**Named test:** `c0_conv_cir_dispatch_failure_policy_matrix`, updated to the new table; each changed cell has its own assertion. Mutation that must fail it: restore each changed cell to its old behaviour, one at a time.
+**Named test:** `c0_conv_cir_dispatch_failure_policy_matrix`, updated: one case per reachable row asserting outcome, gate state and where every resource ended up, plus a note in the test naming the collapsed conditions and why they are unreachable. Mutations that must fail it: give a reachable row the fail-closed policy; and give the fail-closed path a reachable row's policy (gate left open, `BeginRefused`).
 
-- [ ] Steps: update the test to the new table (red on the changed cells); change the policy; checks; stop dirty and report.
+- [ ] Steps: update the test and the plan's table; collapse the policy; checks; stop dirty and report.
 
 ---
 
