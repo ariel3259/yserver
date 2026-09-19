@@ -52596,33 +52596,46 @@ mod tests {
         );
         std::io::Write::write_all(&mut writer, &page_event).expect("write DRM page-flip");
         let mut state = yserver_core::server::ServerState::new();
+        let trace_before_drm = backend.admission_trace_for_tests(device);
+        assert!(
+            trace_before_drm.iter().all(|step| !matches!(
+                step,
+                crate::kms::render::admission::AdmissionTraceStep::Dispatched(commit)
+                    if *commit != commit_a
+            )),
+            "the queued successor must not dispatch before the DRM drain"
+        );
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("original commit remains live before DRM drain")
+                .commit_id(),
+            commit_a
+        );
         backend.on_page_flip_ready(
             &mut state,
             backend.platform.devices[0].device.as_fd().as_raw_fd(),
         );
 
-        assert!(backend.device_owner_for_tests(0).live_record().is_some());
-        assert!(
-            backend
-                .admission_trace_for_tests(device)
-                .windows(2)
-                .any(|window| matches!(
-                    window,
-                    [
-                        crate::kms::render::admission::AdmissionTraceStep::Consumed(_),
-                        crate::kms::render::admission::AdmissionTraceStep::Enqueued { .. }
-                    ]
-                ))
-        );
-        assert!(
-            backend
-                .admission_trace_for_tests(device)
-                .iter()
-                .any(|step| matches!(
-                    step,
-                    crate::kms::render::admission::AdmissionTraceStep::Dispatched(commit)
-                        if *commit != commit_a
-                ))
+        let next_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("successor dispatched by the DRM drain wake")
+            .commit_id();
+        assert_ne!(next_commit, commit_a);
+        assert_eq!(
+            backend.admission_trace_for_tests(device),
+            vec![
+                crate::kms::render::admission::AdmissionTraceStep::Consumed(commit_a),
+                crate::kms::render::admission::AdmissionTraceStep::Enqueued {
+                    completions: Vec::new(),
+                    skips: vec![1],
+                },
+                crate::kms::render::admission::AdmissionTraceStep::Decided,
+                crate::kms::render::admission::AdmissionTraceStep::Dispatched(next_commit),
+            ],
+            "the DRM drain must retire the original commit and cause exactly one wake"
         );
         drop(fence_writer);
     }
@@ -52753,6 +52766,14 @@ mod tests {
             outcome => panic!("maintenance admission did not dispatch: {outcome:?}"),
         };
 
+        let newer = MaintenancePayload {
+            generation: 8,
+            data: Arc::<[u8]>::from(vec![8]),
+        };
+        backend
+            .admission_offer_maintenance(device, gamma, newer.clone())
+            .expect("newer gamma offered while generation 7 is in flight");
+
         backend.route_owner_event_batch(
             device,
             vec![crate::kms::owner::device::OwnerEvent::Terminal {
@@ -52772,6 +52793,12 @@ mod tests {
                 .map(|payload| payload.generation),
             Some(7)
         );
+        assert_eq!(
+            conductor.maintenance.current.get(&gamma).unwrap().data,
+            Arc::<[u8]>::from(vec![7])
+        );
+        assert_eq!(conductor.maintenance.desired.get(&gamma), Some(&newer));
+        assert_eq!(conductor.maintenance.submitted.get(&gamma), None);
         assert!(conductor.receipts.is_empty());
         assert_eq!(conductor.admission.rejection_count(gamma), 0);
     }
