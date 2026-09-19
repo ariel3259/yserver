@@ -483,29 +483,7 @@ impl KmsBackend {
                             .admission
                             .lock(decision.clone(), &snapshot)
                         {
-                            Ok(token) => {
-                                if decision_requires_unsupported(&decision) {
-                                    self.admission_abort_unsupported(device, token, &decision)
-                                } else {
-                                    match decision.admitted.clone() {
-                                        Admitted::Topology { .. } | Admitted::Unflip { .. } => {
-                                            self.admission_abort(device, token);
-                                            AdmissionOutcome::Unsupported(decision.tier)
-                                        }
-                                        Admitted::Composed { .. } => self
-                                            .admission_dispatch_composed(device, token, decision),
-                                        Admitted::Direct { .. } => {
-                                            self.admission_dispatch_direct(device, token, decision)
-                                        }
-                                        Admitted::Maintenance { .. }
-                                        | Admitted::Bundle { .. }
-                                        | Admitted::CursorRecovery { .. } => {
-                                            self.admission_abort(device, token);
-                                            AdmissionOutcome::Unsupported(decision.tier)
-                                        }
-                                    }
-                                }
-                            }
+                            Ok(token) => self.admission_dispatch_decision(device, token, decision),
                             Err(_error) => {
                                 self.platform
                                     .transport_gate_mut(&device)
@@ -525,6 +503,34 @@ impl KmsBackend {
         outcome
     }
 
+    fn admission_dispatch_decision(
+        &mut self,
+        device: DrmDeviceKey,
+        token: AdmissionToken,
+        decision: AdmissionDecision,
+    ) -> AdmissionOutcome {
+        if decision_requires_unsupported(&decision) {
+            self.admission_abort_unsupported(device, token, &decision)
+        } else {
+            match decision.admitted.clone() {
+                Admitted::Topology { .. } | Admitted::Unflip { .. } => {
+                    self.admission_abort(device, token);
+                    AdmissionOutcome::Unsupported(decision.tier)
+                }
+                Admitted::Composed { .. } => {
+                    self.admission_dispatch_composed(device, token, decision)
+                }
+                Admitted::Direct { .. } => self.admission_dispatch_direct(device, token, decision),
+                Admitted::Maintenance { .. }
+                | Admitted::Bundle { .. }
+                | Admitted::CursorRecovery { .. } => {
+                    self.admission_abort(device, token);
+                    AdmissionOutcome::Unsupported(decision.tier)
+                }
+            }
+        }
+    }
+
     fn admission_abort_unsupported(
         &mut self,
         device: DrmDeviceKey,
@@ -536,13 +542,13 @@ impl KmsBackend {
     }
 
     #[cfg(test)]
-    pub(crate) fn admission_abort_if_unsupported_for_tests(
+    pub(crate) fn admission_dispatch_decision_for_tests(
         &mut self,
         device: DrmDeviceKey,
         token: AdmissionToken,
         decision: &AdmissionDecision,
     ) -> AdmissionOutcome {
-        self.admission_abort_unsupported(device, token, decision)
+        self.admission_dispatch_decision(device, token, decision.clone())
     }
 
     fn admission_dispatch_composed(

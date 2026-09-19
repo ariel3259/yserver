@@ -50399,7 +50399,7 @@ mod tests {
     #[test]
     fn c0_adm_conductor_maintenance_carrying_tier6_is_unsupported() {
         use crate::kms::owner::admission::{
-            CarriedMaintenance, IntentKey, MaintenanceClass, MaintenanceKey, Readiness,
+            IntentKey, MaintenanceClass, MaintenanceKey, Readiness,
         };
 
         let mut backend = admission_backend_with_stub_executor();
@@ -50440,21 +50440,39 @@ mod tests {
             },
             Readiness::Ready,
         );
+        snapshot.report_compatible(
+            IntentKey::Maintenance {
+                key: gamma,
+                generation: 7,
+            },
+            IntentKey::Composed {
+                crtc: 1,
+                generation: 1,
+            },
+        );
         let decision = backend.admission_conductors[&device]
             .admission
             .decide(&snapshot)
             .expect("tier-6 composed decision");
         assert_eq!(decision.tier, crate::kms::owner::admission::Tier::Primary);
-        let mut carrying_decision = decision.clone();
-        carrying_decision.carried = vec![CarriedMaintenance {
-            key: gamma,
-            generation: 7,
-            ticket: backend.admission_conductors[&device]
+        assert!(matches!(
+            &decision.admitted,
+            crate::kms::owner::admission::Admitted::Composed {
+                crtc: 1,
+                generation: 1,
+            }
+        ));
+        assert_eq!(decision.carried.len(), 1);
+        assert_eq!(decision.carried[0].key, gamma);
+        assert_eq!(decision.carried[0].generation, 7);
+        assert_eq!(
+            decision.carried[0].ticket,
+            backend.admission_conductors[&device]
                 .admission
                 .maintenance(gamma)
                 .expect("gamma intent")
-                .ticket,
-        }];
+                .ticket
+        );
 
         let token = backend
             .admission_conductors
@@ -50464,7 +50482,7 @@ mod tests {
             .lock(decision.clone(), &snapshot)
             .expect("lock");
         assert_eq!(
-            backend.admission_abort_if_unsupported_for_tests(device, token, &carrying_decision),
+            backend.admission_dispatch_decision_for_tests(device, token, &decision),
             crate::kms::render::admission::AdmissionOutcome::Unsupported(
                 crate::kms::owner::admission::Tier::Primary,
             )
@@ -50560,7 +50578,7 @@ mod tests {
             .lock(decision.clone(), &snapshot)
             .expect("lock");
         assert_eq!(
-            backend.admission_abort_if_unsupported_for_tests(device, token, &decision),
+            backend.admission_dispatch_decision_for_tests(device, token, &decision),
             crate::kms::render::admission::AdmissionOutcome::Unsupported(Tier::DirectSuccessor)
         );
         assert!(!backend.admission_conductors[&device].admission.is_locked());
