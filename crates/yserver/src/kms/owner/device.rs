@@ -1372,55 +1372,29 @@ impl<R> DeviceCommitOwner<R> {
     where
         F: FnOnce(CommitId) -> Submitted<R>,
     {
-        if self.legacy_drain_permit.is_some() {
-            return Err((DispatchError::LegacyTransportActive, ledger));
-        }
-        let (commit, event_token, correlation) = match self.next_correlation() {
-            Ok(correlation) => correlation,
-            Err(error) => return Err((error, ledger)),
-        };
-        let (request, closure) = match build_atomic_request_with_modeset(
+        self.begin_with_context_core(
             desc,
-            correlation,
-            context.host_class,
-            context.allow_modeset,
-        ) {
-            Ok(request) => request,
-            Err(error) => return Err((error.into(), ledger)),
-        };
-        if let Err(error) = self.validate_completion_context(&closure, &context) {
-            return Err((error, ledger));
-        }
-        let proof = match self.slot.reserve(commit) {
-            Ok(proof) => proof,
-            Err(error) => return Err((error.into(), ledger)),
-        };
-        let mut record = CommitRecord::new(
-            commit,
-            event_token,
-            self.identities.incarnation(),
-            self.lifecycle_epoch,
-            self.transition,
-            self.topology_generation,
-            closure,
-            correlation,
-            ledger(commit),
+            ledger,
+            |ledger, commit| Ok::<_, std::convert::Infallible>(ledger(commit)),
             context,
-        );
-        record.attach_request(HostCallRequest::Atomic(request), proof);
-        self.live = Some(record);
-        Ok((commit, Vec::new()))
+        )
+        .map_err(|error| match error {
+            FallibleBeginError::Refused { error, ledger } => (error, ledger),
+            FallibleBeginError::Ledger(error) => match error {},
+            FallibleBeginError::Cleanup { error, .. } => match error {},
+        })
     }
 
     #[allow(clippy::type_complexity)]
-    fn begin_with_context_and_fallible_ledger<F, E>(
+    fn begin_with_context_core<F, E, B>(
         &mut self,
         desc: &CommitDescription,
         ledger: F,
+        build_ledger: B,
         context: CompletionContext,
     ) -> Result<(CommitId, Vec<OwnerEvent<R>>), FallibleBeginError<R, E, F>>
     where
-        F: FnOnce(CommitId) -> Result<Submitted<R>, E>,
+        B: FnOnce(F, CommitId) -> Result<Submitted<R>, E>,
     {
         if self.legacy_drain_permit.is_some() {
             return Err(FallibleBeginError::Refused {
@@ -1458,7 +1432,7 @@ impl<R> DeviceCommitOwner<R> {
                 });
             }
         };
-        let ledger = match ledger(commit) {
+        let ledger = match build_ledger(ledger, commit) {
             Ok(ledger) => ledger,
             Err(error) => {
                 return match self.slot.release(commit) {
@@ -1482,6 +1456,19 @@ impl<R> DeviceCommitOwner<R> {
         record.attach_request(HostCallRequest::Atomic(request), proof);
         self.live = Some(record);
         Ok((commit, Vec::new()))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn begin_with_context_and_fallible_ledger<F, E>(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: F,
+        context: CompletionContext,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), FallibleBeginError<R, E, F>>
+    where
+        F: FnOnce(CommitId) -> Result<Submitted<R>, E>,
+    {
+        self.begin_with_context_core(desc, ledger, |ledger, commit| ledger(commit), context)
     }
 
     pub fn begin_install_restore(
@@ -1539,11 +1526,9 @@ impl<R> DeviceCommitOwner<R> {
     /// Install the record and reserve the slot. No IPC happens here.
     /// Building precedes reserving, so a description that cannot produce a
     /// valid request never consumes the slot.
-    pub fn begin(
-        &mut self,
+    fn fast_update_context(
         desc: &CommitDescription,
-        ledger: Submitted<R>,
-    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+    ) -> Result<CompletionContext, DispatchError<R>> {
         if desc.page_flip_event || !desc.present_consumers.is_empty() {
             return Err(DispatchError::InvalidCompletionContext);
         }
@@ -1559,14 +1544,22 @@ impl<R> DeviceCommitOwner<R> {
         for &crtc in closure.expected_completion() {
             mode_periods.insert(crtc, None);
         }
-        let context = CompletionContext {
+        Ok(CompletionContext {
             class: CompletionClass::FastUpdate,
             host_class: HostCallClass::SeatActiveNonblock,
             allow_modeset: false,
             clocks: BTreeMap::new(),
             mode_periods,
             lifecycle_observed_max: None,
-        };
+        })
+    }
+
+    pub fn begin(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: Submitted<R>,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        let context = Self::fast_update_context(desc)?;
         self.begin_with_context(desc, ledger, context)
     }
 
@@ -1582,30 +1575,9 @@ impl<R> DeviceCommitOwner<R> {
     where
         F: FnOnce(CommitId) -> Submitted<R>,
     {
-        if desc.page_flip_event || !desc.present_consumers.is_empty() {
-            return Err((DispatchError::InvalidCompletionContext, ledger));
-        }
-        let closure = match AtomicCrtcClosure::compute(
-            &desc.objects,
-            &desc.crtc_state,
-            &desc.property_ids,
-            desc.page_flip_event,
-            &desc.present_consumers,
-        ) {
-            Ok(closure) => closure,
-            Err(error) => return Err((BuildError::from(error).into(), ledger)),
-        };
-        let mut mode_periods = BTreeMap::new();
-        for &crtc in closure.expected_completion() {
-            mode_periods.insert(crtc, None);
-        }
-        let context = CompletionContext {
-            class: CompletionClass::FastUpdate,
-            host_class: HostCallClass::SeatActiveNonblock,
-            allow_modeset: false,
-            clocks: BTreeMap::new(),
-            mode_periods,
-            lifecycle_observed_max: None,
+        let context = match Self::fast_update_context(desc) {
+            Ok(context) => context,
+            Err(error) => return Err((error, ledger)),
         };
         self.begin_with_context_and_ledger(desc, ledger, context)
     }
@@ -1626,38 +1598,11 @@ impl<R> DeviceCommitOwner<R> {
     where
         F: FnOnce(CommitId) -> Result<Submitted<R>, E>,
     {
-        if desc.page_flip_event || !desc.present_consumers.is_empty() {
-            return Err(FallibleBeginError::Refused {
-                error: DispatchError::InvalidCompletionContext,
-                ledger,
-            });
-        }
-        let closure = match AtomicCrtcClosure::compute(
-            &desc.objects,
-            &desc.crtc_state,
-            &desc.property_ids,
-            desc.page_flip_event,
-            &desc.present_consumers,
-        ) {
-            Ok(closure) => closure,
+        let context = match Self::fast_update_context(desc) {
+            Ok(context) => context,
             Err(error) => {
-                return Err(FallibleBeginError::Refused {
-                    error: BuildError::from(error).into(),
-                    ledger,
-                });
+                return Err(FallibleBeginError::Refused { error, ledger });
             }
-        };
-        let mut mode_periods = BTreeMap::new();
-        for &crtc in closure.expected_completion() {
-            mode_periods.insert(crtc, None);
-        }
-        let context = CompletionContext {
-            class: CompletionClass::FastUpdate,
-            host_class: HostCallClass::SeatActiveNonblock,
-            allow_modeset: false,
-            clocks: BTreeMap::new(),
-            mode_periods,
-            lifecycle_observed_max: None,
         };
         self.begin_with_context_and_fallible_ledger(desc, ledger, context)
     }

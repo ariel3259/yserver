@@ -56044,6 +56044,210 @@ mod tests {
     }
 
     #[test]
+    fn c0_conv_cir_dispatch_failure_policy_matrix() {
+        use crate::kms::render::resources::{DirectRole, TransportState};
+
+        // primary / Ledger / restore succeeds: the source-backed composed
+        // route takes the new resources, registration fails on the frozen old
+        // allocation, and the source receives the new resources back.
+        {
+            let mut backend = admission_backend_with_stub_executor();
+            let device = backend.platform.primary_device().unwrap().key;
+            let member = task2_member(device, 1);
+            let old = task2_resource(&mut backend, member);
+            let old_key = old.allocations[0].key();
+            let next = task2_resource(&mut backend, member);
+            backend
+                .resource_service
+                .as_mut()
+                .expect("resource service")
+                .freeze(old_key)
+                .expect("freeze old allocation");
+            backend.commit_consumer.current_resources = vec![old];
+            install_admission_owner_gate(&mut backend, device);
+            let (source, restored) = Task2ResourceSource::with_restore(vec![next]);
+            backend.install_admission_conductor_for_tests(device, source);
+            backend
+                .admission_offer_composed(device, 1, 1)
+                .expect("composed offer");
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert!(backend.device_owner_for_tests(0).slot().is_idle());
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+            assert_eq!(restored.borrow().len(), 1);
+            assert!(
+                backend.admission_conductors[&device]
+                    .admission
+                    .composed(1)
+                    .is_some()
+            );
+        }
+
+        // primary / Refused: the source description rejects before its ledger
+        // closure runs, so no composed resource is moved at all.
+        {
+            let mut backend = admission_backend_with_stub_executor();
+            let device = backend.platform.primary_device().unwrap().key;
+            install_admission_owner_gate(&mut backend, device);
+            let (
+                source,
+                _,
+                _,
+                describe_page_flip,
+                _,
+                _,
+                composed_resource_calls,
+                composed_resource_dropped,
+            ) = AdmissionSourceFixture::new_with_controls();
+            backend.install_admission_conductor_for_tests(device, source);
+            backend
+                .admission_offer_composed(device, 1, 1)
+                .expect("composed offer");
+            describe_page_flip.set(true);
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert_eq!(composed_resource_calls.get(), 0);
+            assert!(!composed_resource_dropped.get());
+            assert!(backend.device_owner_for_tests(0).slot().is_idle());
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert!(backend.commit_consumer.current_resources.is_empty());
+        }
+
+        // direct / Ledger / undo succeeds: the prepared successor is moved to
+        // Submitted, the deliberately malformed current member list makes
+        // ledger registration refuse, and the shared failure path restores
+        // the successor role.
+        {
+            let mut backend = backend_with_current_and_successor_for_admission_seam();
+            let device = backend.platform.primary_device().unwrap().key;
+            let member = backend.commit_consumer.current_resources[0].crtcs[0];
+            let current_role = backend.commit_consumer.current_resources[0]
+                .direct_role
+                .take()
+                .expect("direct current role");
+            let mut replacement = task2_resource(&mut backend, member);
+            let old_key = replacement.allocations[0].key();
+            replacement.direct_role = Some(current_role);
+            backend.commit_consumer.current_resources[0] = replacement;
+            backend
+                .resource_service
+                .as_mut()
+                .expect("resource service")
+                .freeze(old_key)
+                .expect("freeze old allocation");
+            admission_install_executor(
+                &mut backend,
+                crate::kms::executor::test_support::spawn_stub_helper(
+                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                )
+                .expect("direct executor"),
+            );
+            install_admission_owner_gate(&mut backend, device);
+            let (source, _, _) = AdmissionSourceFixture::new();
+            backend.install_admission_conductor_for_tests(device, source);
+            let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 910);
+            assert!(
+                backend
+                    .admission_offer_direct(device, source_id, candidate, event)
+                    .expect("direct offer")
+            );
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert!(backend.device_owner_for_tests(0).slot().is_idle());
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+            assert_eq!(backend.commit_consumer.releasing_resources.len(), 0);
+            assert_eq!(
+                backend
+                    .scanout_m2
+                    .queued_successor_role
+                    .as_ref()
+                    .expect("undo restores successor")
+                    .role(),
+                DirectRole::Successor
+            );
+        }
+
+        // direct / Refused / resource present: the owner refuses a Present
+        // description before calling the ledger closure. The prepared
+        // successor is returned through the managed undo seam.
+        {
+            let mut backend = backend_with_current_and_successor_for_admission_seam();
+            let device = backend.platform.primary_device().unwrap().key;
+            admission_install_executor(
+                &mut backend,
+                crate::kms::executor::test_support::spawn_stub_helper(
+                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                )
+                .expect("direct executor"),
+            );
+            install_admission_owner_gate(&mut backend, device);
+            let (source, _, _, describe_page_flip, _, _, _, _) =
+                AdmissionSourceFixture::new_with_controls();
+            backend.install_admission_conductor_for_tests(device, source);
+            let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 911);
+            assert!(
+                backend
+                    .admission_offer_direct(device, source_id, candidate, event)
+                    .expect("direct offer")
+            );
+            describe_page_flip.set(true);
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert!(backend.device_owner_for_tests(0).slot().is_idle());
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+            assert_eq!(
+                backend
+                    .scanout_m2
+                    .queued_successor_role
+                    .as_ref()
+                    .expect("undo restores successor")
+                    .role(),
+                DirectRole::Successor
+            );
+        }
+
+        // F8: primary Ledger/restore-fails, both primary Cleanup rows, direct
+        // Ledger with no returned resource, undo failure, or extra resources,
+        // both direct Cleanup rows, and direct Refused with a missing resource
+        // cannot be reached through the production dispatch closures. The
+        // primary restore is synchronous and receives only the state it just
+        // moved; the owner slot release is exclusively owned by begin; and
+        // direct preparation always supplies exactly one resource. No
+        // test-only hook is introduced to manufacture those states.
+    }
+
+    #[test]
     fn c0_conv_ci_other_crtc_current_survives_retirement() {
         let mut backend = admission_backend_with_stub_executor();
         let device = backend.platform.primary_device().unwrap().key;
