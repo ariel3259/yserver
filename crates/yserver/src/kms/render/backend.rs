@@ -19290,6 +19290,10 @@ impl KmsBackend {
         self.admission_conductors.contains_key(&device)
             && (self.admission_is_active(device)
                 || self
+                    .admission_conductors
+                    .get(&device)
+                    .is_some_and(|conductor| !conductor.receipts.is_empty())
+                || self
                     .platform
                     .owner_ref(device)
                     .is_some_and(|owner| owner.live_record().is_some()))
@@ -49814,6 +49818,7 @@ mod tests {
         direct_eligible: std::rc::Rc<std::cell::Cell<bool>>,
         describe_page_flip: std::rc::Rc<std::cell::Cell<bool>>,
         describe_calls: std::rc::Rc<std::cell::Cell<usize>>,
+        described_carried: std::rc::Rc<std::cell::Cell<usize>>,
         composed_resource_calls: std::rc::Rc<std::cell::Cell<usize>>,
         composed_resource_dropped: std::rc::Rc<std::cell::Cell<bool>>,
         maintenance_compatibility: MaintenanceCompatibility,
@@ -49840,6 +49845,7 @@ mod tests {
             let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
             let describe_page_flip = std::rc::Rc::new(std::cell::Cell::new(false));
             let describe_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let described_carried = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
             let maintenance_compatibility =
@@ -49854,6 +49860,7 @@ mod tests {
                     direct_eligible: std::rc::Rc::clone(&direct_eligible),
                     describe_page_flip,
                     describe_calls,
+                    described_carried,
                     composed_resource_calls,
                     composed_resource_dropped,
                     maintenance_compatibility,
@@ -49880,6 +49887,7 @@ mod tests {
             std::rc::Rc<std::cell::Cell<bool>>,
             std::rc::Rc<std::cell::Cell<usize>>,
             std::rc::Rc<std::cell::Cell<usize>>,
+            std::rc::Rc<std::cell::Cell<usize>>,
             std::rc::Rc<std::cell::Cell<bool>>,
         ) {
             let readiness =
@@ -49887,6 +49895,7 @@ mod tests {
             let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
             let describe_page_flip = std::rc::Rc::new(std::cell::Cell::new(false));
             let describe_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let described_carried = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
             let maintenance_compatibility =
@@ -49901,6 +49910,7 @@ mod tests {
                     direct_eligible: std::rc::Rc::clone(&direct_eligible),
                     describe_page_flip: std::rc::Rc::clone(&describe_page_flip),
                     describe_calls: std::rc::Rc::clone(&describe_calls),
+                    described_carried: std::rc::Rc::clone(&described_carried),
                     composed_resource_calls: std::rc::Rc::clone(&composed_resource_calls),
                     composed_resource_dropped: std::rc::Rc::clone(&composed_resource_dropped),
                     maintenance_compatibility,
@@ -49911,6 +49921,7 @@ mod tests {
                 direct_eligible,
                 describe_page_flip,
                 describe_calls,
+                described_carried,
                 composed_resource_calls,
                 composed_resource_dropped,
             )
@@ -49936,6 +49947,7 @@ mod tests {
             let direct_eligible = std::rc::Rc::new(std::cell::Cell::new(true));
             let describe_page_flip = std::rc::Rc::new(std::cell::Cell::new(false));
             let describe_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let described_carried = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let composed_resource_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
             let maintenance_compatibility =
@@ -49950,6 +49962,7 @@ mod tests {
                     direct_eligible,
                     describe_page_flip,
                     describe_calls,
+                    described_carried,
                     composed_resource_calls,
                     composed_resource_dropped,
                     maintenance_compatibility: std::rc::Rc::clone(&maintenance_compatibility),
@@ -49993,9 +50006,10 @@ mod tests {
 
         fn describe(
             &mut self,
-            _decision: &crate::kms::owner::admission::AdmissionDecision,
+            decision: &crate::kms::owner::admission::AdmissionDecision,
         ) -> crate::kms::owner::build::CommitDescription {
             self.describe_calls.set(self.describe_calls.get() + 1);
+            self.described_carried.set(decision.carried.len());
             if self.describe_page_flip.get() {
                 crate::kms::owner::test_fixtures::single_active_crtc_with_present(1)
             } else {
@@ -50850,10 +50864,8 @@ mod tests {
     }
 
     #[test]
-    fn c0_adm_conductor_maintenance_carrying_tier6_is_unsupported() {
-        use crate::kms::owner::admission::{
-            IntentKey, MaintenanceClass, MaintenanceKey, Readiness,
-        };
+    fn c0_adm_conductor_tier6_carrying_gamma_dispatches() {
+        use crate::kms::owner::admission::{MaintenanceClass, MaintenanceKey};
 
         let mut backend = admission_backend_with_stub_executor();
         let device = backend.platform.primary_device().unwrap().key;
@@ -50864,6 +50876,7 @@ mod tests {
             _direct_eligible,
             describe_page_flip,
             describe_calls,
+            described_carried,
             composed_resource_calls,
             _composed_resource_dropped,
         ) = AdmissionSourceFixture::new_with_controls();
@@ -50876,94 +50889,51 @@ mod tests {
             class: MaintenanceClass::Gamma,
         };
         backend
-            .admission_conductors
-            .get_mut(&device)
-            .expect("conductor")
-            .admission
-            .set_maintenance(gamma, 7, false)
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                crate::kms::render::admission::MaintenancePayload {
+                    generation: 7,
+                    data: std::sync::Arc::<[u8]>::from(vec![7]),
+                },
+            )
             .expect("gamma offer");
 
-        let mut snapshot = backend
-            .admission_snapshot(device, false)
-            .expect("owner snapshot");
-        snapshot.report(
-            IntentKey::Maintenance {
-                key: gamma,
-                generation: 7,
-            },
-            Readiness::Ready,
-        );
-        snapshot.report_compatible(
-            IntentKey::Maintenance {
-                key: gamma,
-                generation: 7,
-            },
-            IntentKey::Composed {
-                crtc: 1,
-                generation: 1,
-            },
-        );
-        let decision = backend.admission_conductors[&device]
-            .admission
-            .decide(&snapshot)
-            .expect("tier-6 composed decision");
-        assert_eq!(decision.tier, crate::kms::owner::admission::Tier::Primary);
         assert!(matches!(
-            &decision.admitted,
-            crate::kms::owner::admission::Admitted::Composed {
-                crtc: 1,
-                generation: 1,
-            }
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
         ));
-        assert_eq!(decision.carried.len(), 1);
-        assert_eq!(decision.carried[0].key, gamma);
-        assert_eq!(decision.carried[0].generation, 7);
-        assert_eq!(
-            decision.carried[0].ticket,
-            backend.admission_conductors[&device]
-                .admission
-                .maintenance(gamma)
-                .expect("gamma intent")
-                .ticket
-        );
-
-        let token = backend
-            .admission_conductors
-            .get_mut(&device)
-            .expect("conductor")
-            .admission
-            .lock(decision.clone(), &snapshot)
-            .expect("lock");
-        assert_eq!(
-            backend.admission_dispatch_decision_for_tests(device, token, &decision),
-            crate::kms::render::admission::AdmissionOutcome::Unsupported(
-                crate::kms::owner::admission::Tier::Primary,
-            )
-        );
         assert!(!backend.admission_conductors[&device].admission.is_locked());
-        assert!(
-            backend.admission_conductors[&device]
-                .admission
-                .maintenance(gamma)
-                .is_some()
-        );
         assert!(
             backend
                 .device_owner_for_tests(0)
                 .slot()
                 .occupant()
-                .is_none()
+                .is_some()
         );
         assert!(!describe_page_flip.get());
-        assert_eq!(describe_calls.get(), 0);
-        assert_eq!(composed_resource_calls.get(), 0);
+        assert_eq!(describe_calls.get(), 1);
+        assert_eq!(described_carried.get(), 1);
+        assert_eq!(composed_resource_calls.get(), 1);
+        assert_eq!(
+            backend.admission_conductors[&device]
+                .maintenance
+                .submitted
+                .get(&gamma)
+                .map(|payload| payload.generation),
+            Some(7)
+        );
+        assert!(
+            !backend.admission_conductors[&device]
+                .maintenance
+                .desired
+                .contains_key(&gamma)
+        );
     }
 
     #[test]
-    fn c0_adm_conductor_maintenance_carrying_tier3_is_unsupported() {
-        use crate::kms::owner::admission::{
-            IntentKey, MaintenanceClass, MaintenanceKey, Readiness, Tier,
-        };
+    fn c0_adm_conductor_tier3_carrying_cursor_dispatches() {
+        use crate::kms::owner::admission::{MaintenanceClass, MaintenanceKey};
 
         let mut backend = admission_backend_with_stub_executor();
         let device = backend.platform.primary_device().unwrap().key;
@@ -50982,85 +50952,304 @@ mod tests {
             class: MaintenanceClass::Cursor,
         };
         backend
-            .admission_conductors
-            .get_mut(&device)
-            .expect("conductor")
-            .admission
-            .set_maintenance(cursor, 7, true)
+            .admission_offer_maintenance(
+                device,
+                cursor,
+                crate::kms::render::admission::MaintenancePayload {
+                    generation: 7,
+                    data: std::sync::Arc::<[u8]>::from(vec![7]),
+                },
+            )
             .expect("cursor offer");
-        let source_generation = backend.admission_conductors[&device]
-            .admission
-            .direct()
-            .expect("queued successor")
-            .successor
-            .source_generation;
-
-        let mut snapshot = backend
-            .admission_snapshot(device, true)
-            .expect("owner snapshot");
-        snapshot.report(
-            IntentKey::Maintenance {
-                key: cursor,
-                generation: 7,
-            },
-            Readiness::Ready,
-        );
-        snapshot.report_compatible(
-            IntentKey::Maintenance {
-                key: cursor,
-                generation: 7,
-            },
-            IntentKey::Direct { source_generation },
-        );
-        let decision = backend.admission_conductors[&device]
-            .admission
-            .decide(&snapshot)
-            .expect("tier-3 decision");
-        assert_eq!(decision.tier, Tier::DirectSuccessor);
-        assert_eq!(decision.carried.len(), 1);
         assert!(matches!(
-            decision.admitted,
-            crate::kms::owner::admission::Admitted::Direct { .. }
+            backend.admission_wake(device, true),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
         ));
-
-        let token = backend
-            .admission_conductors
-            .get_mut(&device)
-            .expect("conductor")
-            .admission
-            .lock(decision.clone(), &snapshot)
-            .expect("lock");
-        assert_eq!(
-            backend.admission_dispatch_decision_for_tests(device, token, &decision),
-            crate::kms::render::admission::AdmissionOutcome::Unsupported(Tier::DirectSuccessor)
-        );
         assert!(!backend.admission_conductors[&device].admission.is_locked());
-        assert!(
-            backend.admission_conductors[&device]
-                .admission
-                .direct()
-                .is_some()
-        );
         assert_eq!(
             backend
                 .scanout_m2
-                .queued_successor
+                .pending
                 .as_ref()
                 .map(|frame| frame.event.present_id),
             Some(61)
         );
-        assert!(
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(
             backend.admission_conductors[&device]
-                .admission
-                .maintenance(cursor)
-                .is_some()
+                .maintenance
+                .submitted
+                .get(&cursor)
+                .map(|payload| payload.generation),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_confirm_moves_the_payload_to_submitted() {
+        use crate::kms::{
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("composed offer");
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 7,
+                    data: Arc::<[u8]>::from(vec![7]),
+                },
+            )
+            .expect("first gamma offer");
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        assert_eq!(
+            backend.admission_conductors[&device]
+                .maintenance
+                .submitted
+                .get(&gamma)
+                .map(|payload| payload.generation),
+            Some(7)
+        );
+        assert!(
+            !backend.admission_conductors[&device]
+                .maintenance
+                .desired
+                .contains_key(&gamma)
+        );
+
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 8,
+                    data: Arc::<[u8]>::from(vec![8]),
+                },
+            )
+            .expect("newer gamma while the first commit is live");
+        let conductor = &backend.admission_conductors[&device];
+        assert_eq!(
+            conductor.maintenance.submitted[&gamma].generation, 7,
+            "the carried generation remains submitted"
+        );
+        assert_eq!(conductor.maintenance.desired[&gamma].generation, 8);
+    }
+
+    #[test]
+    fn c0_adm_conductor_maintenance_only_dispatches_with_an_empty_ledger() {
+        use crate::kms::{
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 9,
+                    data: Arc::<[u8]>::from(vec![9]),
+                },
+            )
+            .expect("maintenance offer");
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        assert!(backend.commit_consumer.current_resources.is_empty());
+        assert!(backend.commit_consumer.rejected_resources.is_empty());
+        let ledger = format!(
+            "{:?}",
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("maintenance-only live record")
+                .ledger()
+        );
+        assert!(ledger.contains("old: []"), "ledger was not empty: {ledger}");
+        assert!(ledger.contains("new: []"), "ledger was not empty: {ledger}");
+    }
+
+    #[test]
+    fn c0_adm_conductor_bundle_dispatches_every_member() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _readiness, _compatibility, homogeneous_group, _recovery_ready) =
+            AdmissionSourceFixture::new_with_snapshot_controls();
+        homogeneous_group.borrow_mut().extend([1, 2]);
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("first bundle member");
+        backend
+            .admission_offer_composed(device, 2, 1)
+            .expect("second bundle member");
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let ledger = format!(
+            "{:?}",
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("bundle live record")
+                .ledger()
+        );
+        assert_eq!(
+            ledger.matches("CommitResources {").count(),
+            2,
+            "bundle ledger did not contain one resource set per member: {ledger}"
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_cursor_recovery_is_unsupported() {
+        use crate::kms::owner::admission::Tier;
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _readiness, _compatibility, _group, recovery_ready) =
+            AdmissionSourceFixture::new_with_snapshot_controls();
+        recovery_ready.borrow_mut().insert(1);
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("conductor")
+            .admission
+            .request_cursor_recovery(1);
+
+        assert_eq!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Unsupported(Tier::Unflip)
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    fn c0_adm_conductor_bound_violation_closes_the_transport() {
+        use crate::kms::{
+            owner::admission::{IntentKey, MaintenanceClass, MaintenanceKey, Readiness},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        // The fixture legally creates an aged bound by offering both
+        // maintenance identities behind a live primary. Task 3 has no
+        // terminal receipt handling yet, so the test hook changes only the
+        // decider's waited counter to reach the already-created violation.
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::RejectWith(libc::EINVAL),
+            )
+            .expect("rejecting stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, readiness, _compatibility, _group, _recovery_ready) =
+            AdmissionSourceFixture::new_with_snapshot_controls();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend
+            .admission_offer_composed(device, 1, 1)
+            .expect("primary offer");
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        let cursor = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Cursor,
+        };
+        for (key, generation) in [(gamma, 2), (cursor, 3)] {
+            backend
+                .admission_offer_maintenance(
+                    device,
+                    key,
+                    MaintenancePayload {
+                        generation,
+                        data: Arc::<[u8]>::from(vec![generation as u8]),
+                    },
+                )
+                .expect("maintenance offer behind primary");
+            AdmissionSourceFixture::set_readiness(
+                &readiness,
+                IntentKey::Maintenance { key, generation },
+                Readiness::Waiting(crate::kms::owner::admission::WaitReason::SourceWaits),
+            );
+        }
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            IntentKey::Maintenance {
+                key: gamma,
+                generation: 2,
+            },
+            Readiness::Ready,
         );
         assert!(
             backend
-                .device_owner_for_tests(0)
-                .slot()
-                .occupant()
-                .is_none()
+                .admission_conductors
+                .get_mut(&device)
+                .expect("conductor")
+                .admission
+                .set_bound_waited_for_tests(cursor)
+        );
+
+        assert_eq!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::TransportClosed
+        );
+        assert_eq!(
+            backend.platform.transport_gate(&device).unwrap().state(),
+            crate::kms::render::resources::TransportState::Closed
+        );
+        assert_eq!(
+            backend.admission_conductors[&device].receipts.len(),
+            1,
+            "the confirmed commit retains its receipt for lifecycle drainage"
         );
     }
 
@@ -51357,7 +51546,7 @@ mod tests {
             .expect("spawn stub executor"),
         );
         install_admission_owner_gate(&mut backend, device);
-        let (source, _, _, describe_page_flip, _, _, _) =
+        let (source, _, _, describe_page_flip, _, _, _, _) =
             AdmissionSourceFixture::new_with_controls();
         backend.install_admission_conductor_for_tests(device, source);
         let idled_before = backend.scanout_m2.idled.len();
@@ -51553,6 +51742,7 @@ mod tests {
             _,
             _,
             describe_page_flip,
+            _,
             _,
             composed_resource_calls,
             composed_resource_dropped,
@@ -51967,7 +52157,7 @@ mod tests {
                 .expect("spawn stub executor"),
         );
         install_admission_owner_gate(&mut backend, device);
-        let (source, _, _, _, _, _, composed_resource_dropped) =
+        let (source, _, _, _, _, _, _, composed_resource_dropped) =
             AdmissionSourceFixture::new_with_controls();
         backend.install_admission_conductor_for_tests(device, source);
         backend
