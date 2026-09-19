@@ -129,6 +129,48 @@ the production caller whose absence stopped P3-2/P3-3 (debt spec §9.5), and
 section 6.4 carries them. If a reason turns up in planning why the route cannot
 register there, it is an F8 stop recorded here, not a silent omission.
 
+**Reachability, verified at `13fa30bd` (user's request, before any plan):**
+
+- *Registration — no production caller.* Every `KmsRelease` registration
+  outside `register_kms` is test-only: the three in `store.rs` (`:2878`,
+  `:2979`, `:4004`) sit inside `#[cfg(test)] mod tests` (`store.rs:1965`), and
+  `register_commit_dependencies` is called only from `resources/tests.rs` and
+  `guard_tests.rs`.
+- *Discharge — already reachable.* `CommitConsumer::consume`
+  (`resources/commit.rs:221`) discharges a commit's `kms_obligations` through
+  `discharge_commit_kms_obligations` (`:523`) on `HardwareComplete` and
+  `CompletionRetired`, and `consume` has production callers in the owner-event
+  routing (`backend.rs:19821` and the following arms) and in
+  `admission_consume_events` (`admission.rs:1215`). Today it discharges
+  nothing, only because the ledger arrives with empty `kms_obligations`.
+- *The fit.* `register_commit_dependencies` returns exactly the
+  `Submitted<CommitResources>` the conductor's ledger closure builds, and
+  `KmsBackend::resource_service` is a field disjoint from `platform` and
+  `commit_consumer`, so the closure can borrow it.
+
+**Two owner-API gaps the plan must close first** (both in
+`owner/device.rs`):
+
+1. `begin_with_ledger`'s closure is `FnOnce(CommitId) -> Submitted<R>`
+   (`device.rs:1472`), infallible, while registration can fail (it returns the
+   old and new resources on error, after cancelling what it registered). The
+   `CommitId` exists only inside `begin`, so registration cannot move before it.
+   Needed: a fallible ledger closure whose error makes `begin` release the slot
+   and the reservation, with the resources handed back — and the conductor then
+   `abort`s its token, consuming no fairness state (2c-ii §6).
+2. `begin_with_ledger` refuses any description with `page_flip_event` or
+   `present_consumers` (`device.rs:1480`), and the one public entry that accepts
+   a `CompletionContext`, `begin_with_context` (`device.rs:1322`), takes the
+   ledger **by value**, before the `CommitId` exists. The CommitId-aware
+   closure form, `begin_with_context_and_ledger`, is private. A real
+   Present-carrying commit therefore has no public entry that can register its
+   dependencies. Needed: a public, fallible, CommitId-aware ledger entry that
+   also takes the completion context.
+
+Both are owner changes inside C.0's existing contracts (they add no state and
+no outcome); C1's plan owns them, because composed is the first converted
+producer.
+
 **3.3. Owner events reach the consumers.** 2c-ii's `route_owner_event_batch` is
 the only path owner events take (plan B2). 2c-iii adds consumers behind it: the
 damage transactions (section 4.2) and the direct frame state (section 5).
