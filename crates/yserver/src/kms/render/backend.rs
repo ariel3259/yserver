@@ -3263,6 +3263,12 @@ impl KmsBackend {
     /// off-core so its eventual uncertain result can still poison its resource
     /// domain inside the executor.
     fn bump_crtc_config_topology_epoch(&mut self, reason: &str) {
+        // Owner damage transactions are keyed by stable output identity, not
+        // the soon-to-be-rebuilt output index. Invalidate them while the old
+        // topology is still authoritative; the owner buffer lifecycle remains
+        // untouched until its own outcome/resource gates resolve.
+        self.scene
+            .invalidate_all_owner_damage_transactions(&mut self.platform);
         self.crtc_config_topology_epoch = self.crtc_config_topology_epoch.wrapping_add(1);
 
         let mut tokens: Vec<_> = self.pending_crtc_config_probes.keys().copied().collect();
@@ -19668,8 +19674,8 @@ impl KmsBackend {
             crate::kms::render::resources::CommitResources,
         >,
         now: std::time::Instant,
-    ) {
-        self.route_owner_event_inner(device_key, event, now);
+    ) -> bool {
+        self.route_owner_event_inner(device_key, event, now)
     }
 
     #[doc(hidden)]
@@ -19680,7 +19686,7 @@ impl KmsBackend {
             crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
         >,
         now: std::time::Instant,
-    ) {
+    ) -> bool {
         let has_retirement = events.iter().any(|event| {
             matches!(
                 event,
@@ -19741,8 +19747,9 @@ impl KmsBackend {
             })
             || rejected_still_current;
 
+        let mut consumed = true;
         for event in events {
-            self.route_owner_event(device_key, event, now);
+            consumed &= self.route_owner_event(device_key, event, now);
         }
 
         let recovery_stopped = self
@@ -19756,6 +19763,7 @@ impl KmsBackend {
         if wake_eligible && self.admission_is_active(device_key) && !recovery_stopped && slot_free {
             let _ = self.admission_wake(device_key, has_retirement);
         }
+        consumed
     }
 
     fn route_owner_event_inner(
@@ -19765,8 +19773,10 @@ impl KmsBackend {
             crate::kms::render::resources::CommitResources,
         >,
         _now: std::time::Instant,
-    ) {
+    ) -> bool {
         use yserver_core::backend::{PresentClockSample, PresentClockSource};
+        self.scene
+            .route_owner_event(device_key, &event, &mut self.store, &mut self.platform);
         match event {
             crate::kms::owner::device::OwnerEvent::LegacyPageFlip {
                 crtc_id,
@@ -19777,11 +19787,11 @@ impl KmsBackend {
                 let Some(handle) =
                     ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
                 else {
-                    return;
+                    return true;
                 };
                 let crtc_key = CrtcKey::new(device_key, handle);
                 let Some(output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
-                    return;
+                    return true;
                 };
                 let dur = std::time::Duration::new(u64::from(tv_sec), tv_usec * 1_000);
                 let ust = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
@@ -19824,6 +19834,7 @@ impl KmsBackend {
                         self.handle_cursor_move_outcome(outcome);
                     }
                 }
+                true
             }
             crate::kms::owner::device::OwnerEvent::LegacyClockSample {
                 key: clock_key,
@@ -19844,6 +19855,7 @@ impl KmsBackend {
                     self.platform
                         .record_completion_clock(crtc_key, clock_sample);
                 }
+                true
             }
             crate::kms::owner::device::OwnerEvent::ClockSample {
                 key,
@@ -19872,6 +19884,7 @@ impl KmsBackend {
                     self.platform
                         .record_completion_clock(crtc_key, clock_sample);
                 }
+                true
             }
             crate::kms::owner::device::OwnerEvent::Presented { commit, samples } => {
                 for (crtc_id, sample) in &samples {
@@ -19890,27 +19903,47 @@ impl KmsBackend {
                             .record_completion_clock(crtc_key, clock_sample);
                     }
                 }
-                if let Some(service) = &mut self.resource_service {
-                    let _ = self.commit_consumer.consume(
+                let Some(service) = &mut self.resource_service else {
+                    return false;
+                };
+                self.commit_consumer
+                    .consume(
                         crate::kms::owner::device::OwnerEvent::Presented { commit, samples },
                         service,
-                    );
-                }
+                    )
+                    .is_ok()
             }
             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => {
-                if self
+                let never_dispatched = matches!(
+                    terminal,
+                    crate::kms::owner::record::TerminalState::FailedBeforeSubmit(
+                        crate::kms::owner::record::FailureCause::NeverDispatched(_)
+                    )
+                );
+                let admission_handled = if never_dispatched {
+                    true
+                } else if self
                     .admission_handle_terminal(device_key, commit, terminal)
                     .is_err()
-                    && let Some(gate) = self.platform.transport_gate_mut(&device_key)
                 {
-                    gate.force_close();
-                }
-                if let Some(service) = &mut self.resource_service {
-                    let _ = self.commit_consumer.consume(
-                        crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal },
-                        service,
-                    );
-                }
+                    if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
+                        gate.force_close();
+                    }
+                    false
+                } else {
+                    true
+                };
+                let Some(service) = &mut self.resource_service else {
+                    return false;
+                };
+                admission_handled
+                    && self
+                        .commit_consumer
+                        .consume(
+                            crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal },
+                            service,
+                        )
+                        .is_ok()
             }
             crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
                 let admission_active = self.admission_is_active(device_key);
@@ -19930,7 +19963,7 @@ impl KmsBackend {
                                 gate.force_close();
                             }
                         }
-                        return;
+                        return false;
                     };
                     if let Err(error) = self.commit_consumer.consume(
                         crate::kms::owner::device::OwnerEvent::CompletionRetired {
@@ -19940,7 +19973,7 @@ impl KmsBackend {
                         service,
                     ) {
                         if !admission_active {
-                            return;
+                            return false;
                         }
                         log::error!(
                             "owner completion retirement disposition failed for {device_key}: {error:?}"
@@ -19948,11 +19981,11 @@ impl KmsBackend {
                         if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
                             gate.force_close();
                         }
-                        return;
+                        return false;
                     }
                 }
                 if !conductor_installed {
-                    return;
+                    return true;
                 }
 
                 #[cfg(test)]
@@ -19977,6 +20010,7 @@ impl KmsBackend {
                 }
                 #[cfg(not(test))]
                 self.managed_enqueue_retired_direct_completion();
+                true
             }
             crate::kms::owner::device::OwnerEvent::SequenceArmFailed { key, .. } => {
                 if let Some(handle) =
@@ -19986,6 +20020,7 @@ impl KmsBackend {
                     self.armed_vblank_targets.remove(&crtc_key);
                     self.absolute_vblank_targets.remove(&crtc_key);
                 }
+                true
             }
             crate::kms::owner::device::OwnerEvent::MechanismFailed { reason } => {
                 if let Some(owner) = self.platform.owner_for(device_key) {
@@ -19995,11 +20030,13 @@ impl KmsBackend {
                 if reason == crate::kms::owner::completion::MechanismFailure::FencePollError {
                     self.platform.owner_completion_detached = true;
                 }
+                true
             }
             event => {
-                if let Some(service) = &mut self.resource_service {
-                    let _ = self.commit_consumer.consume(event, service);
-                }
+                let Some(service) = &mut self.resource_service else {
+                    return false;
+                };
+                self.commit_consumer.consume(event, service).is_ok()
             }
         }
     }
@@ -50663,6 +50700,7 @@ mod tests {
             mut backend,
             _registry,
         } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
         let (first_bo, first_generation, first_waiting) = backend
@@ -50712,6 +50750,34 @@ mod tests {
 
         backend.platform.wait_idle_bounded();
         backend.drain_scanout_render_completions_for_tests();
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("the second generation is admitted after its render completion")
+            .commit_id();
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: second_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: second_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+        let (displaced_snapshots_after, displaced_snapshots_pending_after) = backend
+            .scene
+            .owner_displaced_snapshots_for_tests(0, &backend.store);
+        assert!(
+            displaced_snapshots_after > 0,
+            "the displaced generation retains its captured snapshot record"
+        );
+        assert!(
+            !displaced_snapshots_pending_after,
+            "the second generation's capture, not the displaced generation, acks the snapshot"
+        );
         backend.before_block();
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
@@ -50794,6 +50860,326 @@ mod tests {
             }
         ));
         assert!(backend.platform.transport_gate(&device).is_none());
+    }
+
+    fn owner_damage_commit_for_tests(
+        backend: &mut super::KmsBackend,
+    ) -> (DrmDeviceKey, crate::kms::owner::identity::CommitId) {
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("the owner route admits the prepared generation")
+            .commit_id();
+        (device, commit)
+    }
+
+    fn owner_terminal_event_for_tests(
+        commit: crate::kms::owner::identity::CommitId,
+        terminal: crate::kms::owner::record::TerminalState,
+    ) -> crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources> {
+        crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_transaction_installed_inside_the_closure_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        assert_eq!(
+            backend.scene.owner_damage_transaction_count_for_tests(),
+            1,
+            "the transaction is installed before send/Dispatched routing"
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Dispatched { commit }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            backend.scene.owner_damage_transaction_count_for_tests(),
+            1,
+            "Dispatched retains the transaction"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_stage_at_accepted_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "dispatch does not stage damage"
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted { commit }],
+            std::time::Instant::now(),
+        );
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| staged),
+            "Accepted stages the captured repaint exactly once"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_apply_at_hardware_complete_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        let snapshots = backend.scene.owner_damage_snapshot_count_for_tests(commit);
+        assert!(
+            snapshots > 0,
+            "the transaction carries the captured snapshots"
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
+            ],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            backend.scene.owner_damage_transaction_count_for_tests(),
+            0,
+            "HardwareComplete consumes the transaction"
+        );
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "HardwareComplete retires the staged damage"
+        );
+        let history_after_hardware = backend.scene.damage_history_len_for_tests(0);
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Presented {
+                commit,
+                samples: std::collections::BTreeMap::new(),
+            }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            backend.scene.damage_history_len_for_tests(0),
+            history_after_hardware,
+            "Presented does not apply the damage a second time"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_dispatched_retains_the_transaction_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Dispatched { commit }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 1);
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "Dispatched does not stage"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_rejection_closes_without_staging_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        backend.route_owner_event_batch(
+            device,
+            vec![owner_terminal_event_for_tests(
+                commit,
+                crate::kms::owner::record::TerminalState::FailedBeforeSubmit(
+                    crate::kms::owner::record::FailureCause::IoctlRejected {
+                        errno: libc::EINVAL,
+                    },
+                ),
+            )],
+            std::time::Instant::now(),
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "a pre-accept rejection closes without staging"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_unknown_invalidates_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        backend.route_owner_event_batch(
+            device,
+            vec![owner_terminal_event_for_tests(
+                commit,
+                crate::kms::owner::record::TerminalState::CompletionUnknown(
+                    crate::kms::owner::record::UnknownCause::ContradictoryEvidence,
+                ),
+            )],
+            std::time::Instant::now(),
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(owed, staged)| owed && !staged),
+            "unknown completion invalidates the output and owes a repaint"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_invalidation_sources_invalidate_vulkan() {
+        {
+            let OwnerLiveFixture {
+                mut backend,
+                _registry,
+            } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+            let (device, _commit) = owner_damage_commit_for_tests(&mut backend);
+            backend.route_owner_event_batch(
+                device,
+                vec![crate::kms::owner::device::OwnerEvent::MechanismFailed {
+                    reason: crate::kms::owner::completion::MechanismFailure::FencePollError,
+                }],
+                std::time::Instant::now(),
+            );
+            assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+            assert!(
+                backend
+                    .scene
+                    .damage_state_for_tests(0)
+                    .is_some_and(|(owed, _)| owed),
+                "incarnation poison invalidation owes a repaint"
+            );
+        }
+        {
+            let OwnerLiveFixture {
+                mut backend,
+                _registry,
+            } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+            let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+            backend.route_owner_event_batch(
+                device,
+                vec![crate::kms::owner::device::OwnerEvent::Quarantined { commit }],
+                std::time::Instant::now(),
+            );
+            assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+            assert!(
+                backend
+                    .scene
+                    .damage_state_for_tests(0)
+                    .is_some_and(|(owed, _)| owed),
+                "recovery quarantine invalidation owes a repaint"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_stale_milestone_after_topology_change_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        backend.bump_crtc_config_topology_epoch("Task 6 test topology change");
+        assert_eq!(
+            backend.scene.owner_damage_transaction_count_for_tests(),
+            0,
+            "topology invalidates before output indices can be rebuilt"
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+            std::time::Instant::now(),
+        );
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(owed, _)| owed),
+            "a stale milestone cannot ack after topology invalidation"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_new_paint_survives_the_ack_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, commit) = owner_damage_commit_for_tests(&mut backend);
+        let drawable = backend
+            .scene
+            .owner_damage_snapshot_ids_for_tests(commit)
+            .into_iter()
+            .next()
+            .expect("the live frame captured a drawable snapshot");
+        backend.store.damage(
+            drawable,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 2, y: 2 },
+                extent: ash::vk::Extent2D {
+                    width: 3,
+                    height: 3,
+                },
+            },
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
+            ],
+            std::time::Instant::now(),
+        );
+        assert!(
+            backend.store.has_pending_presentation_damage(),
+            "damage painted after capture survives the captured-snapshot ack"
+        );
     }
 
     fn install_admission_resource_service(backend: &mut super::KmsBackend) {

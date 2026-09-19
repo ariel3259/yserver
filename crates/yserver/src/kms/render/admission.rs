@@ -1056,7 +1056,7 @@ impl KmsBackend {
                 let specs = resource_specs;
                 match owner.begin_with_fallible_ledger(&desc, move |commit| {
                     let mut new = Vec::with_capacity(specs.len());
-                    for spec in specs {
+                    for spec in specs.iter().copied() {
                         let mut resources = match scene.take_owner_composed_resources(
                             spec.location,
                             spec.generation,
@@ -1076,7 +1076,19 @@ impl KmsBackend {
                         Ok(old) => old,
                         Err(error) => return Err((error, Vec::new(), new)),
                     };
-                    register_commit_dependencies(commit, old, new, service)
+                    let submitted = match register_commit_dependencies(commit, old, new, service) {
+                        Ok(submitted) => submitted,
+                        Err(error) => return Err(error),
+                    };
+                    let transaction_specs = specs
+                        .iter()
+                        .map(|spec| (spec.location, spec.generation, spec.member))
+                        .collect::<Vec<_>>();
+                    if !scene.install_owner_damage_transaction(commit, &transaction_specs) {
+                        let (old, new) = submitted.into_parts();
+                        return Err((ResourceError::InvalidState, old, new));
+                    }
+                    Ok(submitted)
                 }) {
                     Ok((commit, _events)) => Ok(commit),
                     Err(FallibleBeginError::Ledger((_error, old, new))) => {
@@ -1716,7 +1728,12 @@ impl KmsBackend {
             _ => None,
         });
         self.admission_abort(device, token);
-        let consumed = self.admission_consume_events(events).is_ok();
+        // The owner has already terminalized this pre-IPC refusal. Route its
+        // terminal/resource batch through the same backend seam as every other
+        // owner milestone; the NeverDispatched arm intentionally does not wake
+        // admission before the composed lease is restored below.
+        let consumed = self.resource_service.is_some()
+            && self.route_owner_event_batch(device, events, std::time::Instant::now());
         let restored = if consumed && restores_composed {
             refused_commit.is_some_and(|commit| {
                 let resources = self.commit_consumer.take_rejected_for_commit(commit);
@@ -1751,20 +1768,6 @@ impl KmsBackend {
                 .force_close();
             AdmissionOutcome::TransportClosed
         }
-    }
-
-    fn admission_consume_events(
-        &mut self,
-        events: Vec<OwnerEvent<CommitResources>>,
-    ) -> Result<(), ResourceError> {
-        let Some(service) = self.resource_service.as_mut() else {
-            return Err(ResourceError::InvalidState);
-        };
-        let consumer = &mut self.commit_consumer;
-        for event in events {
-            consumer.consume(event, service)?;
-        }
-        Ok(())
     }
 
     #[cfg(test)]

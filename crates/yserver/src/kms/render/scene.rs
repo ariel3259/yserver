@@ -199,6 +199,11 @@ struct PendingAck {
     /// retirement. Damage that arrived between submit and
     /// retirement is NOT in this snapshot — it survives.
     submitted_output_damage: RegionSet,
+    /// Owner-route staging is delayed until the owner reports Accepted.
+    /// Keep the recorder's exact coverage beside the captured ack until then.
+    stage_complete: bool,
+    stage_repaint: Region,
+    stage_painted: Region,
     /// Step 2 — the participants this frame emitted. Becomes
     /// `prev_presented` if and only if the frame retires successfully.
     submitted_participants: Vec<ScenePresence>,
@@ -979,6 +984,62 @@ struct PreparedComposed {
     ack: PendingAck,
 }
 
+/// Damage-side contents of one owner commit member. The scanout allocation,
+/// GPU ticket and descriptor slot remain with `PreparedComposed`; this value is
+/// the exact snapshot/retirement payload that crosses the owner milestones.
+#[derive(Clone)]
+struct OwnerDamageMember {
+    output_key: OutputKey,
+    crtc: u32,
+    bo_idx: usize,
+    generation: u64,
+    stage_complete: bool,
+    stage_repaint: Region,
+    stage_painted: Region,
+    accepted: bool,
+    drawable_snapshots: Vec<DamageSnapshot>,
+    submitted_output_damage: RegionSet,
+    submitted_participants: Vec<ScenePresence>,
+    submitted_scene_structure_damage: RegionSet,
+    submitted_failed_repaint: RegionSet,
+    cursor_transition: Option<CursorTransition>,
+    cursor_prev_pos_after_retire: Option<Option<(i32, i32)>>,
+    cursor_mode_after_retire: OutputCursorMode,
+    last_present_cursor_rect_after_retire: Option<vk::Rect2D>,
+    last_present_cursor_version_after_retire: Option<u64>,
+}
+
+struct OwnerDamageTransaction {
+    members: Vec<OwnerDamageMember>,
+}
+
+impl PendingAck {
+    fn take_owner_damage_member(&mut self, output_key: OutputKey, crtc: u32) -> OwnerDamageMember {
+        OwnerDamageMember {
+            output_key,
+            crtc,
+            bo_idx: self.bo_idx,
+            generation: self.generation,
+            stage_complete: self.stage_complete,
+            stage_repaint: std::mem::take(&mut self.stage_repaint),
+            stage_painted: std::mem::take(&mut self.stage_painted),
+            accepted: false,
+            drawable_snapshots: std::mem::take(&mut self.drawable_snapshots),
+            submitted_output_damage: std::mem::take(&mut self.submitted_output_damage),
+            submitted_participants: std::mem::take(&mut self.submitted_participants),
+            submitted_scene_structure_damage: std::mem::take(
+                &mut self.submitted_scene_structure_damage,
+            ),
+            submitted_failed_repaint: std::mem::take(&mut self.submitted_failed_repaint),
+            cursor_transition: self.cursor_transition.take(),
+            cursor_prev_pos_after_retire: self.cursor_prev_pos_after_retire.take(),
+            cursor_mode_after_retire: self.cursor_mode_after_retire,
+            last_present_cursor_rect_after_retire: self.last_present_cursor_rect_after_retire,
+            last_present_cursor_version_after_retire: self.last_present_cursor_version_after_retire,
+        }
+    }
+}
+
 struct SceneCompositorInner {
     vk: Arc<crate::kms::vk::device::VkContext>,
     pipeline: CompositorPipeline,
@@ -1002,6 +1063,8 @@ struct SceneCompositorInner {
     /// visible pointer feedback.
     cursor: Option<CursorEntry>,
     owner_offers: VecDeque<ComposedOffer>,
+    owner_damage_transactions:
+        HashMap<crate::kms::owner::identity::CommitId, OwnerDamageTransaction>,
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -1340,6 +1403,7 @@ impl SceneCompositor {
                 damage_audit_next_event_id: 0,
                 cursor: None,
                 owner_offers: VecDeque::new(),
+                owner_damage_transactions: HashMap::new(),
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
@@ -1700,6 +1764,336 @@ impl SceneCompositor {
         true
     }
 
+    /// Install the damage half of an owner commit after its ledger has been
+    /// registered successfully. This is called inside the CommitId-aware
+    /// ledger closure, before `send_on`; a failed closure therefore never
+    /// reaches this method.
+    pub(crate) fn install_owner_damage_transaction(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        specs: &[(
+            PreparedComposedLocation,
+            u64,
+            crate::kms::render::resources::GroupMember,
+        )],
+    ) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        if specs.is_empty() || inner.owner_damage_transactions.contains_key(&commit) {
+            return false;
+        }
+
+        let mut output_indices = HashSet::with_capacity(specs.len());
+        for (location, generation, member) in specs {
+            if !output_indices.insert(location.output_idx) {
+                return false;
+            }
+            let Some(state) = inner.outputs.get(location.output_idx) else {
+                return false;
+            };
+            let Some(prepared) = state.owner_prepared.as_ref() else {
+                return false;
+            };
+            if prepared.ack.bo_idx != location.bo_idx
+                || prepared.ack.generation != *generation
+                || prepared.ack.stage != InFlightStage::OwnerSubmitted
+                || prepared.managed.is_some()
+                || prepared.output_key.device_key != member.crtc.device_key
+            {
+                return false;
+            }
+        }
+
+        let members = specs
+            .iter()
+            .map(|(location, _generation, member)| {
+                let state = inner.outputs.get_mut(location.output_idx)?;
+                let prepared = state.owner_prepared.as_mut()?;
+                Some(prepared.ack.take_owner_damage_member(
+                    prepared.output_key.clone(),
+                    u32::from(member.crtc.crtc),
+                ))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(members) = members else {
+            return false;
+        };
+        inner
+            .owner_damage_transactions
+            .insert(commit, OwnerDamageTransaction { members });
+        true
+    }
+
+    /// Route owner milestones into the scene's damage transaction. The
+    /// backend is the only caller; tests also deliver events through the
+    /// backend's `route_owner_event_batch` entry.
+    pub(crate) fn route_owner_event(
+        &mut self,
+        device: crate::platform::drm::DrmDeviceKey,
+        event: &crate::kms::owner::device::OwnerEvent<
+            crate::kms::render::resources::CommitResources,
+        >,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) {
+        use crate::kms::owner::{device::OwnerEvent, record::TerminalState};
+
+        match event {
+            OwnerEvent::Accepted { commit } => self.owner_damage_accept(*commit, platform),
+            OwnerEvent::HardwareComplete { commit } => {
+                self.owner_damage_hardware_complete(*commit, store, platform)
+            }
+            OwnerEvent::Terminal { commit, terminal } => match terminal {
+                TerminalState::FailedBeforeSubmit(_) => self.owner_damage_close(*commit, platform),
+                TerminalState::CompletionUnknown(_) => {
+                    self.invalidate_owner_damage_transaction(*commit, platform)
+                }
+                TerminalState::Completed => {}
+            },
+            OwnerEvent::Quarantined { commit } => {
+                self.invalidate_owner_damage_transaction(*commit, platform)
+            }
+            OwnerEvent::MechanismFailed { .. } => {
+                self.invalidate_owner_damage_transactions_for_device(device, platform)
+            }
+            _ => {}
+        }
+    }
+
+    /// Invalidate all open damage transactions before topology/output indices
+    /// can be rebuilt. Buffer ownership is intentionally untouched here.
+    pub(crate) fn invalidate_all_owner_damage_transactions(
+        &mut self,
+        platform: &mut PlatformBackend,
+    ) {
+        let commits = self
+            .inner
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .owner_damage_transactions
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for commit in commits {
+            self.invalidate_owner_damage_transaction(commit, platform);
+        }
+    }
+
+    fn invalidate_owner_damage_transactions_for_device(
+        &mut self,
+        device: crate::platform::drm::DrmDeviceKey,
+        platform: &mut PlatformBackend,
+    ) {
+        let commits = self
+            .inner
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .owner_damage_transactions
+                    .iter()
+                    .filter(|(_, transaction)| {
+                        transaction
+                            .members
+                            .iter()
+                            .any(|member| member.output_key.device_key == device)
+                    })
+                    .map(|(commit, _)| *commit)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for commit in commits {
+            self.invalidate_owner_damage_transaction(commit, platform);
+        }
+    }
+
+    fn invalidate_owner_damage_transaction(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        platform: &mut PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some(transaction) = inner.owner_damage_transactions.remove(&commit) else {
+            return;
+        };
+        for member in transaction.members {
+            if let Some(output_idx) = platform
+                .outputs
+                .iter()
+                .position(|output| output.key == member.output_key)
+                && let Some(state) = inner.outputs.get_mut(output_idx)
+            {
+                state.damage.invalidate();
+            }
+        }
+    }
+
+    fn owner_damage_close(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        platform: &mut PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some(transaction) = inner.owner_damage_transactions.remove(&commit) else {
+            return;
+        };
+        for member in transaction.members {
+            if let Some(output_idx) = platform
+                .outputs
+                .iter()
+                .position(|output| output.key == member.output_key)
+                && let Some(state) = inner.outputs.get_mut(output_idx)
+                && state.damage.has_staged_frame()
+            {
+                state.damage.retire_failure();
+            }
+        }
+    }
+
+    fn owner_damage_accept(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        platform: &mut PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let actions = {
+            let Some(transaction) = inner.owner_damage_transactions.get_mut(&commit) else {
+                return;
+            };
+            let mut actions = Vec::with_capacity(transaction.members.len());
+            for member in &mut transaction.members {
+                if member.accepted {
+                    continue;
+                }
+                member.accepted = true;
+                actions.push((
+                    member.output_key.clone(),
+                    member.bo_idx,
+                    member.stage_complete,
+                    member.stage_repaint.clone(),
+                    member.stage_painted.clone(),
+                ));
+            }
+            actions
+        };
+        for (output_key, bo_idx, complete, repaint, painted) in actions {
+            let Some(output_idx) = platform
+                .outputs
+                .iter()
+                .position(|output| output.key == output_key)
+            else {
+                continue;
+            };
+            let Some(state) = inner.outputs.get_mut(output_idx) else {
+                continue;
+            };
+            if state.damage.has_staged_frame() {
+                state.damage.invalidate();
+            } else {
+                stage_submitted_frame(&mut state.damage, complete, bo_idx, &repaint, &painted);
+            }
+        }
+    }
+
+    fn owner_damage_hardware_complete(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some(transaction) = inner.owner_damage_transactions.remove(&commit) else {
+            return;
+        };
+        for member in transaction.members {
+            let Some(output_idx) = platform
+                .outputs
+                .iter()
+                .position(|output| output.key == member.output_key)
+            else {
+                continue;
+            };
+            let submitted = inner.outputs.get(output_idx).is_some_and(|state| {
+                state.owner_prepared.as_ref().is_some_and(|prepared| {
+                    prepared.output_key == member.output_key
+                        && prepared.ack.bo_idx == member.bo_idx
+                        && prepared.ack.generation == member.generation
+                        && prepared.ack.stage == InFlightStage::OwnerSubmitted
+                }) || state.owner_submitted.iter().any(|prepared| {
+                    prepared.output_key == member.output_key
+                        && prepared.ack.bo_idx == member.bo_idx
+                        && prepared.ack.generation == member.generation
+                        && prepared.ack.stage == InFlightStage::OwnerSubmitted
+                })
+            });
+            if !submitted {
+                if let Some(state) = inner.outputs.get_mut(output_idx) {
+                    state.damage.invalidate();
+                }
+                continue;
+            }
+            retire_owner_damage_member(inner, output_idx, member, store, platform);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_damage_transaction_count_for_tests(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.owner_damage_transactions.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_damage_snapshot_count_for_tests(
+        &self,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> usize {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.owner_damage_transactions.get(&commit))
+            .map_or(0, |transaction| {
+                transaction
+                    .members
+                    .iter()
+                    .map(|member| member.drawable_snapshots.len())
+                    .sum()
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_damage_snapshot_ids_for_tests(
+        &self,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> Vec<super::store::DrawableId> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.owner_damage_transactions.get(&commit))
+            .into_iter()
+            .flat_map(|transaction| transaction.members.iter())
+            .flat_map(|member| member.drawable_snapshots.iter())
+            .map(|snapshot| snapshot.id)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn damage_history_len_for_tests(&self, output_idx: usize) -> usize {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map_or(0, |state| state.damage_history.entries.len())
+    }
+
     #[cfg(test)]
     pub(crate) fn owner_prepared_for_tests(&self, output_idx: usize) -> Option<(usize, u64, bool)> {
         let prepared = self
@@ -1736,10 +2130,22 @@ impl SceneCompositor {
             .get(output_idx)?
             .owner_submitted
             .front()?;
+        let transaction_snapshot_count = self
+            .inner
+            .as_ref()?
+            .owner_damage_transactions
+            .values()
+            .flat_map(|transaction| transaction.members.iter())
+            .filter(|member| {
+                member.output_key == prepared.output_key
+                    && member.generation == prepared.ack.generation
+            })
+            .map(|member| member.drawable_snapshots.len())
+            .sum::<usize>();
         Some((
             prepared.ack.bo_idx,
             prepared.ack.generation,
-            prepared.ack.drawable_snapshots.len(),
+            prepared.ack.drawable_snapshots.len() + transaction_snapshot_count,
         ))
     }
 
@@ -2778,6 +3184,92 @@ impl SceneCompositor {
             return false;
         };
         handle_scanout_render_completion_inner(inner, completion, platform, resource_service)
+    }
+}
+
+/// Apply one owner transaction member at `HardwareComplete`. This is the
+/// owner analogue of the post-match bookkeeping in
+/// `handle_page_flip_complete`; it deliberately does not move a BO phase or
+/// release a descriptor slot (those are Task 7's gates).
+fn retire_owner_damage_member(
+    inner: &mut SceneCompositorInner,
+    output_idx: usize,
+    member: OwnerDamageMember,
+    store: &mut DrawableStore,
+    platform: &mut PlatformBackend,
+) {
+    if !member.accepted {
+        if let Some(state) = inner.outputs.get_mut(output_idx) {
+            state.damage.invalidate();
+        }
+        return;
+    }
+
+    let OwnerDamageMember {
+        generation,
+        drawable_snapshots,
+        submitted_output_damage,
+        submitted_participants,
+        submitted_scene_structure_damage,
+        submitted_failed_repaint,
+        cursor_transition,
+        cursor_prev_pos_after_retire,
+        cursor_mode_after_retire,
+        last_present_cursor_rect_after_retire,
+        last_present_cursor_version_after_retire,
+        ..
+    } = member;
+
+    let Some(state) = inner.outputs.get_mut(output_idx) else {
+        return;
+    };
+    for snapshot in drawable_snapshots {
+        store.ack_presentation_damage(snapshot);
+    }
+    state
+        .scene_structure_damage
+        .subtract(&submitted_scene_structure_damage);
+    state
+        .pending_repaint_after_failed_submit
+        .subtract(&submitted_failed_repaint);
+    state
+        .damage_history
+        .push(generation, submitted_output_damage);
+    state.damage.retire_success();
+    state.prev_presented = submitted_participants;
+
+    let cursor_result =
+        apply_cursor_transition_on_retire(inner, output_idx, platform, cursor_transition);
+    let Some(state) = inner.outputs.get_mut(output_idx) else {
+        return;
+    };
+    let resolution = resolve_retired_cursor_state(cursor_result, cursor_mode_after_retire);
+    state.force_show_retry_version = update_force_show_retry_version(
+        state.force_show_retry_version,
+        cursor_transition,
+        cursor_result,
+        cursor_mode_after_retire,
+    );
+    state.last_frame_cursor_mode = resolution.actual_mode;
+    if resolution.commit_desired_metadata {
+        if let Some(new_prev) = cursor_prev_pos_after_retire {
+            state.cursor_prev_pos = new_prev;
+        }
+        state.last_present_cursor_rect = last_present_cursor_rect_after_retire;
+        state.last_present_cursor_version = last_present_cursor_version_after_retire;
+    } else {
+        state.cursor_prev_pos = None;
+        if resolution.clear_presented_metadata {
+            state.last_present_cursor_rect = None;
+            state.last_present_cursor_version = None;
+        }
+    }
+    if resolution.force_repaint {
+        force_cursor_retry_repaint(state);
+    }
+    let actually_sw_composed = matches!(cursor_mode_after_retire, OutputCursorMode::Sw { .. });
+    if actually_sw_composed && platform.cursor_plane_note_composed_retirement(output_idx) {
+        force_cursor_retry_repaint(state);
     }
 }
 
@@ -5491,6 +5983,9 @@ fn tick_one_output(
                 drawable_snapshots: built.snapshots,
                 ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,
+                stage_complete: compose_complete,
+                stage_repaint: requested.clone(),
+                stage_painted: plan.painted.clone(),
                 submitted_participants: built.participants,
                 submitted_scene_structure_damage: scene_structure_snap,
                 submitted_failed_repaint: failed_repaint_snap,
@@ -9757,6 +10252,9 @@ mod tests {
                 drawable_snapshots: Vec::new(),
                 ticket: Some(FenceTicket::for_tests_stub()),
                 submitted_output_damage: RegionSet::new(),
+                stage_complete: true,
+                stage_repaint: Region::new(),
+                stage_painted: Region::new(),
                 submitted_participants: Vec::new(),
                 submitted_scene_structure_damage: RegionSet::new(),
                 submitted_failed_repaint: RegionSet::new(),
