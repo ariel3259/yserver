@@ -384,10 +384,9 @@ conductor runs it through 2c-i's never-submitted path — idle exactly once,
 release pins, defer the `Skip` behind the predecessor (C.0 §9.1). The decider
 touches no resource.
 
-**Activation.** The conductor acts only with the device's transport in
-**`Owner`**, reachable today only in fixtures carrying the writer-coverage
-evidence of the 2c-i debt spec §4.4. In production the transport stays `Legacy`
-and the conductor is inert (R8; stage 2c §6).
+**Activation.** The conductor **admits new work** only with the device's transport in **`Owner`**, reachable today only in fixtures carrying the writer-coverage evidence of the 2c-i debt spec §4.4. In production the transport stays `Legacy` and the conductor is inert (R8; stage 2c §6).
+
+*(Amended 2026-09-19, plan B2 review round 3.)* A commit already dispatched when the transport leaves `Owner` — for example when a bound violation closes it — still has its outcome **drained**: resource disposition, receipt disposition and the retirement enqueue, until its receipt closes. Closing admission never strands a receipt or a submitted payload. Drainage admits nothing.
 
 **Inputs in 2c-ii.** Producers are converted in 2c-iii, so intents are fed by
 tests. Cursor and gamma use test payloads; no live maintenance payload is ever
@@ -510,7 +509,7 @@ and the owner's executor.
   with the token, retirement ordering through the protocol ledger, the pre-IPC
   refusal disposition and withdrawal, invalidation on a layout change as a wake,
   and successor displacement through 2c-i's never-submitted path.
-- **Plan B — maintenance**, split like A on 2026-09-18 (user's decision) into **B1**, the decider (`../plans/2026-09-18-phase-c0-stage-2c-ii-plan-b1-maintenance-decider.md`; **done**, `7f37f5e2`..`3d3f8174` plus the P20 fix, 106 `c0_adm` tests, 29 of 30 mutations run and all caught — finding `2026-09-19-stage-2c-ii-plan-b1-accepted.md`), and **B2**, the conductor's maintenance store, receipt and terminal routing. Its scope: tickets and ageing, tiers 3, 4, 5 and 7, symmetric
+- **Plan B — maintenance**, split like A on 2026-09-18 (user's decision) into **B1**, the decider (`../plans/2026-09-18-phase-c0-stage-2c-ii-plan-b1-maintenance-decider.md`; **done**, `7f37f5e2`..`3d3f8174` plus the P20 fix, 106 `c0_adm` tests, 29 of 30 mutations run and all caught — finding `2026-09-19-stage-2c-ii-plan-b1-accepted.md`), and **B2**, the conductor's maintenance store, receipt and terminal routing (`../plans/2026-09-19-phase-c0-stage-2c-ii-plan-b2-maintenance-conductor.md`; **done**, `600458b8`..`00e32c10`, 129 `c0_adm` tests, finding `2026-09-19-stage-2c-ii-plan-b2-accepted.md`). **With B2, every 2c-ii plan is implemented at fixture level.** The hardware gate of section 10.4 passed on 2026-09-19 (258/258; see the B2 acceptance finding). Its scope: tickets and ageing, tiers 3, 4, 5 and 7, symmetric
   absorption, the homogeneous bundle under the round-robin rule, the admission
   receipt and post-rejection handling (section 11.1), and the bounds measured
   under a continuous stream. Preceded by a codex round on sections 7 (receipt)

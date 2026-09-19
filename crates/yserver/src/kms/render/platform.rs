@@ -667,7 +667,15 @@ pub(crate) struct SequenceCompletion {
     pub(crate) sequence: u64,
 }
 
-pub(crate) type DrainedPageFlipEvents = (Vec<(usize, PresentClockSample)>, Vec<SequenceCompletion>);
+#[derive(Debug)]
+pub(crate) struct DrainedPageFlipEvents {
+    pub(crate) flipped: Vec<(usize, PresentClockSample)>,
+    pub(crate) sequences: Vec<SequenceCompletion>,
+    pub(crate) owner_event_batches: Vec<(
+        crate::platform::drm::DrmDeviceKey,
+        Vec<crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>>,
+    )>,
+}
 
 /// Process-local identity of one KMS CRTC.
 ///
@@ -4314,9 +4322,9 @@ impl PlatformBackend {
         now: std::time::Instant,
     ) -> Vec<(
         crate::platform::drm::DrmDeviceKey,
-        crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
+        Vec<crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>>,
     )> {
-        let mut events = Vec::new();
+        let mut batches = Vec::new();
         let Self {
             devices,
             owner_completion_poller,
@@ -4329,24 +4337,15 @@ impl PlatformBackend {
             let Some(owner) = device.owner.as_mut() else {
                 continue;
             };
+            let mut events = Vec::new();
 
             // 1. Host call events if executor is present
             if let Some(executor) = device.executor.as_mut() {
                 if let Some(tick_ev) = executor.tick(now) {
-                    events.extend(
-                        owner
-                            .apply_host_call_event_at(tick_ev, now)
-                            .into_iter()
-                            .map(|e| (key, e)),
-                    );
+                    events.extend(owner.apply_host_call_event_at(tick_ev, now));
                 }
                 while let Some(reply_ev) = executor.poll_reply() {
-                    events.extend(
-                        owner
-                            .apply_host_call_event_at(reply_ev, now)
-                            .into_iter()
-                            .map(|e| (key, e)),
-                    );
+                    events.extend(owner.apply_host_call_event_at(reply_ev, now));
                 }
             }
 
@@ -4357,25 +4356,28 @@ impl PlatformBackend {
                     &mut *owner_completion_poller,
                     now,
                 );
-                events.extend(fence_events.into_iter().map(|e| (key, e)));
+                events.extend(fence_events);
             }
 
             // 3. Deadlines
             let deadline_events = owner.tick_completion(now);
-            events.extend(deadline_events.into_iter().map(|e| (key, e)));
+            events.extend(deadline_events);
 
             // 4. Try complete if ready
             let complete_events = owner.try_complete();
-            events.extend(complete_events.into_iter().map(|e| (key, e)));
+            events.extend(complete_events);
 
             // 5. Eligible sequence sends
             if let Some(executor) = device.executor.as_mut()
                 && let Ok(seq_events) = owner.send_next_sequence_on(executor)
             {
-                events.extend(seq_events.into_iter().map(|e| (key, e)));
+                events.extend(seq_events);
+            }
+            if !events.is_empty() {
+                batches.push((key, events));
             }
         }
-        events
+        batches
     }
 
     #[doc(hidden)]
@@ -4855,6 +4857,14 @@ impl PlatformBackend {
         let (events, drain_res) = self.drain_owner_events(drm_fd, now);
         let mut completions = Vec::new();
         let sequenced = Vec::new();
+        let mut owner_event_batches: Vec<(
+            crate::platform::drm::DrmDeviceKey,
+            Vec<
+                crate::kms::owner::device::OwnerEvent<
+                    crate::kms::render::resources::CommitResources,
+                >,
+            >,
+        )> = Vec::new();
 
         for (device_key, event) in events {
             match event {
@@ -4964,14 +4974,27 @@ impl PlatformBackend {
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    if let Some((_, batch)) = owner_event_batches
+                        .iter_mut()
+                        .find(|(key, _)| *key == device_key)
+                    {
+                        batch.push(event);
+                    } else {
+                        owner_event_batches.push((device_key, vec![event]));
+                    }
+                }
             }
         }
 
-        if completions.is_empty() {
+        if completions.is_empty() && owner_event_batches.is_empty() {
             drain_res?;
         }
-        Ok((completions, sequenced))
+        Ok(DrainedPageFlipEvents {
+            flipped: completions,
+            sequences: sequenced,
+            owner_event_batches,
+        })
     }
 
     /// Latest kernel `(msc, ust_micros)` for one device-qualified CRTC, or

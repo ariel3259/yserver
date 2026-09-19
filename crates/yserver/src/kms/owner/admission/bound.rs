@@ -19,6 +19,16 @@ impl Admission {
         })
     }
 
+    #[cfg(test)]
+    pub fn set_bound_waited_for_tests(&mut self, key: MaintenanceKey) -> bool {
+        let Some(bound) = self.maintenance_bounds.get_mut(&key) else {
+            return false;
+        };
+        let allowance = (bound.older_aged.len() as u64).saturating_mul(2);
+        bound.waited = allowance.saturating_add(1);
+        true
+    }
+
     pub(super) fn age_maintenance(&mut self, key: MaintenanceKey) {
         let Some(intent) = self.maintenance_slots.get_mut(&key) else {
             return;

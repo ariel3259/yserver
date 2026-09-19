@@ -4,18 +4,24 @@
 //! real producer conversion is stage 2c-iii; this module owns the boundary
 //! between that source, A1's pure decider, and the managed 2c-i seams.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::{
     kms::{
         owner::{
             admission::{
-                Admission, AdmissionDecision, AdmissionError, AdmissionToken, Admitted, Confirmed,
-                CrtcId, DirectSuccessor, IntentKey, Readiness, ReadinessSnapshot, Tier, WaitReason,
+                Admission, AdmissionDecision, AdmissionError, AdmissionToken, Admitted,
+                CarriedMaintenance, Confirmed, CrtcId, DirectSuccessor, IntentKey,
+                MaintenanceClass, MaintenanceKey, Readiness, ReadinessSnapshot, Reentry,
+                ReentryKind, Tier, WaitReason,
             },
             build::CommitDescription,
             device::{DispatchError, OwnerEvent},
-            record::RefusalCause,
+            identity::CommitId,
+            record::{FailureCause, RefusalCause, TerminalState},
         },
         render::{
             backend::{KmsBackend, PreparedDirectDispatch},
@@ -24,9 +30,6 @@ use crate::{
     },
     platform::drm::DrmDeviceKey,
 };
-
-#[cfg(test)]
-use crate::kms::owner::identity::CommitId;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AdmissionOutcome {
@@ -61,18 +64,40 @@ pub(crate) enum AdmissionPreparationHook {
 }
 
 fn decision_requires_unsupported(decision: &AdmissionDecision) -> bool {
-    !decision.carried.is_empty()
-        || decision.combined_primary.is_some()
-        || matches!(
-            decision.admitted,
-            Admitted::Maintenance { .. }
-                | Admitted::Bundle { .. }
-                | Admitted::CursorRecovery { .. }
-        )
-        || matches!(
-            decision.tier,
-            Tier::AgedMaintenance | Tier::Bundle | Tier::Maintenance
-        )
+    matches!(
+        decision.admitted,
+        Admitted::Topology { .. } | Admitted::Unflip { .. } | Admitted::CursorRecovery { .. }
+    )
+}
+
+fn decision_primary(decision: &AdmissionDecision) -> Option<&Admitted> {
+    match &decision.admitted {
+        Admitted::Maintenance { .. } => decision.combined_primary.as_ref(),
+        admitted => Some(admitted),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MaintenancePayload {
+    pub(crate) generation: u64,
+    pub(crate) data: Arc<[u8]>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub(crate) struct MaintenanceStore {
+    pub(crate) desired: BTreeMap<MaintenanceKey, MaintenancePayload>,
+    pub(crate) submitted: BTreeMap<MaintenanceKey, MaintenancePayload>,
+    pub(crate) current: BTreeMap<MaintenanceKey, MaintenancePayload>,
+    pub(crate) dormant: BTreeMap<MaintenanceKey, MaintenancePayload>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionReceipt {
+    pub(crate) commit: CommitId,
+    pub(crate) carried: Vec<CarriedMaintenance>,
+    pub(crate) maintenance_only: bool,
 }
 
 /// What 2c-ii cannot observe because producers are converted in 2c-iii.
@@ -82,7 +107,15 @@ pub(crate) trait AdmissionSource {
     /// finished producer waits; for a direct one, its pre-submit source waits.
     fn producer_readiness(&self, key: IntentKey) -> Readiness;
     /// The atomic description of an admitted primary.
-    fn describe(&mut self, admitted: &Admitted) -> CommitDescription;
+    fn describe(&mut self, decision: &AdmissionDecision) -> CommitDescription;
+    /// Readiness of a desired maintenance payload supplied by the source.
+    fn maintenance_readiness(&self, key: MaintenanceKey, generation: u64) -> Readiness;
+    /// Whether a maintenance payload can be carried by the primary intent.
+    fn compatible(&self, key: MaintenanceKey, generation: u64, primary: IntentKey) -> bool;
+    /// CRTCs whose primary requests may be combined into one commit.
+    fn homogeneous_group(&self) -> BTreeSet<CrtcId>;
+    /// Whether software-cursor recovery can be admitted for this CRTC.
+    fn cursor_recovery_ready(&self, crtc: CrtcId) -> bool;
     /// A composed admission's new-state resources, moved into the ledger.
     fn composed_resources(&mut self, crtc: CrtcId, generation: u64) -> Vec<CommitResources>;
     /// Whether the queued direct successor passes current direct eligibility.
@@ -97,6 +130,10 @@ pub(crate) struct AdmissionConductor {
     pub(crate) layout_generation: u64,
     pub(crate) next_direct_source_generation: u64,
     pub(crate) composed: BTreeMap<CrtcId, u64>,
+    pub(crate) maintenance: MaintenanceStore,
+    pub(crate) receipts: BTreeMap<CommitId, AdmissionReceipt>,
+    pub(crate) recovery_stopped: bool,
+    pub(crate) gamma_failures: BTreeSet<CrtcId>,
     #[cfg(test)]
     pub(crate) prepare_hook: Option<AdmissionPreparationHook>,
     #[cfg(test)]
@@ -114,6 +151,10 @@ impl AdmissionConductor {
             layout_generation: 0,
             next_direct_source_generation: 1,
             composed: BTreeMap::new(),
+            maintenance: MaintenanceStore::default(),
+            receipts: BTreeMap::new(),
+            recovery_stopped: false,
+            gamma_failures: BTreeSet::new(),
             #[cfg(test)]
             prepare_hook: None,
             #[cfg(test)]
@@ -169,6 +210,38 @@ impl KmsBackend {
             .expect("active admission conductor");
         conductor.admission.set_composed(crtc, generation)?;
         conductor.composed.insert(crtc, generation);
+        Ok(())
+    }
+
+    /// Store the latest maintenance payload and queue its descriptor as one
+    /// transaction. An unchanged generation is an omission: it clears the
+    /// decider slot and leaves no desired payload in the conductor store.
+    pub(crate) fn admission_offer_maintenance(
+        &mut self,
+        device: DrmDeviceKey,
+        key: MaintenanceKey,
+        payload: MaintenancePayload,
+    ) -> Result<(), AdmissionError> {
+        if !self.admission_is_active(device) {
+            return Ok(());
+        }
+
+        let behind_commit = self
+            .platform
+            .owner_ref(device)
+            .is_some_and(|owner| owner.slot().occupant().is_some());
+        let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+            return Ok(());
+        };
+        conductor
+            .admission
+            .set_maintenance(key, payload.generation, behind_commit)?;
+
+        if conductor.admission.maintenance(key).is_some() {
+            conductor.maintenance.desired.insert(key, payload);
+        } else {
+            conductor.maintenance.desired.remove(&key);
+        }
         Ok(())
     }
 
@@ -379,6 +452,20 @@ impl KmsBackend {
                 ReadinessSnapshot::new(conductor.layout_generation, topology_generation);
             snapshot.retirement_wake = retirement_wake;
 
+            let primary_intents = conductor
+                .composed
+                .iter()
+                .map(|(&crtc, &generation)| IntentKey::Composed { crtc, generation })
+                .chain(
+                    conductor
+                        .admission
+                        .direct()
+                        .map(|direct| IntentKey::Direct {
+                            source_generation: direct.successor.source_generation,
+                        }),
+                )
+                .collect::<Vec<_>>();
+
             for (&crtc, &generation) in &conductor.composed {
                 snapshot.report(
                     IntentKey::Composed { crtc, generation },
@@ -407,6 +494,36 @@ impl KmsBackend {
                     }
                 };
                 snapshot.report(key, readiness);
+            }
+
+            for (&key, payload) in &conductor.maintenance.desired {
+                let maintenance = IntentKey::Maintenance {
+                    key,
+                    generation: payload.generation,
+                };
+                snapshot.report(
+                    maintenance,
+                    conductor
+                        .source
+                        .maintenance_readiness(key, payload.generation),
+                );
+                for &primary in &primary_intents {
+                    if conductor
+                        .source
+                        .compatible(key, payload.generation, primary)
+                    {
+                        snapshot.report_compatible(maintenance, primary);
+                    }
+                }
+            }
+            snapshot.homogeneous_group = conductor.source.homogeneous_group();
+            for &crtc in conductor.admission.cursor_recovery() {
+                let readiness = if conductor.source.cursor_recovery_ready(crtc) {
+                    Readiness::Ready
+                } else {
+                    Readiness::Waiting(WaitReason::SourceWaits)
+                };
+                snapshot.report(IntentKey::CursorRecovery { crtc }, readiness);
             }
 
             if conductor.admission.unflip().is_some() {
@@ -449,7 +566,11 @@ impl KmsBackend {
         device: DrmDeviceKey,
         retirement_wake: bool,
     ) -> AdmissionOutcome {
-        let outcome = if !self.admission_is_active(device) {
+        let recovery_stopped = self
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| conductor.recovery_stopped);
+        let outcome = if !self.admission_is_active(device) || recovery_stopped {
             AdmissionOutcome::Inert
         } else if self
             .platform
@@ -511,23 +632,16 @@ impl KmsBackend {
     ) -> AdmissionOutcome {
         if decision_requires_unsupported(&decision) {
             self.admission_abort_unsupported(device, token, &decision)
+        } else if matches!(decision_primary(&decision), Some(Admitted::Direct { .. })) {
+            self.admission_dispatch_direct(device, token, decision)
+        } else if matches!(
+            decision_primary(&decision),
+            Some(Admitted::Composed { .. } | Admitted::Bundle { .. }) | None
+        ) {
+            self.admission_dispatch_primary(device, token, decision)
         } else {
-            match decision.admitted.clone() {
-                Admitted::Topology { .. } | Admitted::Unflip { .. } => {
-                    self.admission_abort(device, token);
-                    AdmissionOutcome::Unsupported(decision.tier)
-                }
-                Admitted::Composed { .. } => {
-                    self.admission_dispatch_composed(device, token, decision)
-                }
-                Admitted::Direct { .. } => self.admission_dispatch_direct(device, token, decision),
-                Admitted::Maintenance { .. }
-                | Admitted::Bundle { .. }
-                | Admitted::CursorRecovery { .. } => {
-                    self.admission_abort(device, token);
-                    AdmissionOutcome::Unsupported(decision.tier)
-                }
-            }
+            self.admission_abort(device, token);
+            AdmissionOutcome::Unsupported(decision.tier)
         }
     }
 
@@ -551,73 +665,108 @@ impl KmsBackend {
         self.admission_dispatch_decision(device, token, decision.clone())
     }
 
-    fn admission_dispatch_composed(
+    fn admission_dispatch_primary(
         &mut self,
         device: DrmDeviceKey,
         token: AdmissionToken,
         decision: crate::kms::owner::admission::AdmissionDecision,
     ) -> AdmissionOutcome {
-        let Admitted::Composed { crtc, generation } = decision.admitted.clone() else {
-            unreachable!("composed dispatch received a non-composed decision")
+        let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+            return AdmissionOutcome::TransportClosed;
         };
-        let desc = self
-            .admission_conductors
-            .get_mut(&device)
-            .expect("active admission conductor")
-            .source
-            .describe(&decision.admitted);
+        let desc = conductor.source.describe(&decision);
 
-        let mut begin_refused = false;
+        let primary = decision_primary(&decision).cloned();
+        if let Some(Admitted::Bundle { members }) = &primary
+            && !members
+                .iter()
+                .all(|member| matches!(member, Admitted::Composed { .. }))
+        {
+            self.admission_abort(device, token);
+            return AdmissionOutcome::Unsupported(decision.tier);
+        }
         let commit = {
-            let source = &mut self
-                .admission_conductors
-                .get_mut(&device)
-                .expect("active admission conductor")
-                .source;
             let consumer = &mut self.commit_consumer;
             let result = {
-                let device_entry = self
+                let Some(device_entry) = self
                     .platform
                     .devices
                     .iter_mut()
                     .find(|entry| entry.key == device)
-                    .expect("admission device");
-                let owner = device_entry.owner.as_mut().expect("admission owner");
+                else {
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::BeginRefused;
+                };
+                let Some(owner) = device_entry.owner.as_mut() else {
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::BeginRefused;
+                };
+                let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::TransportClosed;
+                };
+                let source = &mut conductor.source;
                 owner.begin_with_ledger(&desc, |_commit| {
-                    let old = consumer.take_current();
-                    let new = source.composed_resources(crtc, generation);
+                    let old = if primary.is_some() {
+                        consumer.take_current()
+                    } else {
+                        Vec::new()
+                    };
+                    let new = match primary.as_ref() {
+                        Some(Admitted::Composed { crtc, generation }) => {
+                            source.composed_resources(*crtc, *generation)
+                        }
+                        Some(Admitted::Bundle { members }) => members
+                            .iter()
+                            .filter_map(|member| match member {
+                                Admitted::Composed { crtc, generation } => {
+                                    Some(source.composed_resources(*crtc, *generation))
+                                }
+                                _ => None,
+                            })
+                            .flatten()
+                            .collect(),
+                        None => Vec::new(),
+                        Some(_) => Vec::new(),
+                    };
                     crate::kms::owner::ledger::Submitted::new(old, new)
                 })
             };
             match result {
                 Ok((commit, _events)) => Some(commit),
-                Err((_error, _builder)) => {
-                    begin_refused = true;
-                    None
-                }
+                Err((_error, _builder)) => None,
             }
         };
 
-        if begin_refused {
+        let Some(commit) = commit else {
             self.admission_abort(device, token);
             return AdmissionOutcome::BeginRefused;
-        }
-        let commit = commit.expect("successful begin has a commit id");
+        };
         #[cfg(not(test))]
         let _ = commit;
         let send_result = {
-            let device_entry = self
+            let Some(device_entry) = self
                 .platform
                 .devices
                 .iter_mut()
                 .find(|entry| entry.key == device)
-                .expect("admission device");
-            let owner = device_entry.owner.as_mut().expect("admission owner");
-            owner.send_on(device_entry.executor.as_mut().expect("admission executor"))
+            else {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            };
+            let Some(owner) = device_entry.owner.as_mut() else {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            };
+            let Some(executor) = device_entry.executor.as_mut() else {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            };
+            owner.send_on(executor)
         };
         match send_result {
             Ok(_events) => {
-                let outcome = self.admission_confirm(device, token, decision.admitted);
+                let outcome = self.admission_confirm(device, token, commit, decision);
                 #[cfg(test)]
                 if matches!(outcome, AdmissionOutcome::Dispatched(_))
                     && let Some(conductor) = self.admission_conductors.get_mut(&device)
@@ -627,7 +776,10 @@ impl KmsBackend {
                 outcome
             }
             Err(error @ DispatchError::Refused { .. }) => {
-                self.admission_dispose_refusal(device, token, decision.admitted, error)
+                let admitted = decision_primary(&decision)
+                    .cloned()
+                    .unwrap_or_else(|| decision.admitted.clone());
+                self.admission_dispose_refusal(device, token, admitted, error)
             }
             Err(_error) => {
                 self.admission_abort(device, token);
@@ -663,9 +815,8 @@ impl KmsBackend {
             .get_mut(&device)
             .expect("active admission conductor")
             .source
-            .describe(&decision.admitted);
+            .describe(&decision);
 
-        let mut begin_refused = false;
         let commit = {
             let consumer = &mut self.commit_consumer;
             let result = {
@@ -689,24 +840,25 @@ impl KmsBackend {
             };
             match result {
                 Ok((commit, _events)) => Some(commit),
-                Err((_error, _builder)) => {
-                    begin_refused = true;
-                    None
-                }
+                Err((_error, _builder)) => None,
             }
         };
 
-        if begin_refused {
+        let Some(commit) = commit else {
             let prepared = PreparedDirectDispatch {
-                resources: resources.take().expect("refused builder was uncalled"),
-                retirement: retirement.take(),
+                resources: match resources.take() {
+                    Some(resources) => resources,
+                    None => {
+                        self.admission_abort(device, token);
+                        return AdmissionOutcome::TransportClosed;
+                    }
+                },
+                retirement,
             };
             let _ = self.managed_undo_direct_dispatch(prepared);
             self.admission_abort(device, token);
             return AdmissionOutcome::BeginRefused;
-        }
-
-        let commit = commit.expect("successful begin has a commit id");
+        };
         if let Some(retirement) = retirement.take() {
             self.commit_consumer
                 .prereserve_retirement(commit, retirement);
@@ -723,7 +875,7 @@ impl KmsBackend {
         };
         match send_result {
             Ok(_events) => {
-                let outcome = self.admission_confirm(device, token, decision.admitted);
+                let outcome = self.admission_confirm(device, token, commit, decision);
                 #[cfg(test)]
                 if matches!(outcome, AdmissionOutcome::Dispatched(_))
                     && let Some(conductor) = self.admission_conductors.get_mut(&device)
@@ -733,7 +885,10 @@ impl KmsBackend {
                 outcome
             }
             Err(error @ DispatchError::Refused { .. }) => {
-                self.admission_dispose_refusal(device, token, decision.admitted, error)
+                let admitted = decision_primary(&decision)
+                    .cloned()
+                    .unwrap_or_else(|| decision.admitted.clone());
+                self.admission_dispose_refusal(device, token, admitted, error)
             }
             Err(_error) => {
                 self.admission_abort(device, token);
@@ -746,44 +901,270 @@ impl KmsBackend {
         &mut self,
         device: DrmDeviceKey,
         token: AdmissionToken,
-        admitted: Admitted,
+        commit: CommitId,
+        decision: AdmissionDecision,
     ) -> AdmissionOutcome {
-        let confirmed = self
+        let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+            if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                gate.force_close();
+            }
+            return AdmissionOutcome::TransportClosed;
+        };
+        let confirmed = match conductor.admission.confirm(token) {
+            Ok(confirmed) => confirmed,
+            Err(_error) => {
+                if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                    gate.force_close();
+                }
+                return AdmissionOutcome::TransportClosed;
+            }
+        };
+        let bound_violation = self
             .admission_conductors
-            .get_mut(&device)
-            .expect("active admission conductor")
-            .admission
-            .confirm(token)
-            .expect("the admission token is consumed exactly once");
-        match admitted {
-            Admitted::Composed { crtc, generation } => {
-                let conductor = self
-                    .admission_conductors
-                    .get_mut(&device)
-                    .expect("active admission conductor");
-                if conductor.composed.get(&crtc) == Some(&generation) {
-                    conductor.composed.remove(&crtc);
+            .get(&device)
+            .is_some_and(|conductor| conductor.admission.bound_violation().is_some());
+        if bound_violation && let Some(gate) = self.platform.transport_gate_mut(&device) {
+            gate.force_close();
+        }
+
+        let maintenance_only = matches!(decision.admitted, Admitted::Maintenance { .. })
+            && decision.combined_primary.is_none();
+        if !self.admission_record_receipt(device, commit, &decision, maintenance_only) {
+            if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                gate.force_close();
+            }
+            return AdmissionOutcome::TransportClosed;
+        }
+
+        match decision_primary(&decision) {
+            Some(Admitted::Composed { crtc, generation }) => {
+                if let Some(conductor) = self.admission_conductors.get_mut(&device)
+                    && conductor.composed.get(crtc) == Some(generation)
+                {
+                    conductor.composed.remove(crtc);
                 }
             }
-            Admitted::Direct { successor } => {
-                let confirmed_direct =
-                    self.managed_confirm_direct_dispatch(successor.source_generation);
-                if !confirmed_direct {
+            Some(Admitted::Bundle { members }) => {
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    for member in members {
+                        if let Admitted::Composed { crtc, generation } = member
+                            && conductor.composed.get(crtc) == Some(generation)
+                        {
+                            conductor.composed.remove(crtc);
+                        }
+                    }
+                }
+            }
+            Some(Admitted::Direct { successor }) => {
+                if !self.managed_confirm_direct_dispatch(successor.source_generation) {
                     if let Some(gate) = self.platform.transport_gate_mut(&device) {
                         gate.force_close();
                     }
                     return AdmissionOutcome::TransportClosed;
                 }
             }
-            Admitted::Topology { .. }
-            | Admitted::Unflip { .. }
-            | Admitted::Maintenance { .. }
-            | Admitted::Bundle { .. }
-            | Admitted::CursorRecovery { .. } => {
+            None | Some(Admitted::Maintenance { .. }) => {}
+            Some(Admitted::Topology { .. })
+            | Some(Admitted::Unflip { .. })
+            | Some(Admitted::CursorRecovery { .. }) => {
                 return AdmissionOutcome::Unsupported(confirmed.decision.tier);
             }
         }
+        if bound_violation {
+            return AdmissionOutcome::TransportClosed;
+        }
         AdmissionOutcome::Dispatched(confirmed)
+    }
+
+    fn admission_record_receipt(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        decision: &AdmissionDecision,
+        maintenance_only: bool,
+    ) -> bool {
+        let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+            return false;
+        };
+        if decision.carried.is_empty() && !maintenance_only {
+            return true;
+        }
+        if !conductor.receipts.is_empty()
+            || decision.carried.iter().any(|carried| {
+                conductor.maintenance.submitted.contains_key(&carried.key)
+                    || conductor
+                        .maintenance
+                        .desired
+                        .get(&carried.key)
+                        .is_none_or(|payload| payload.generation != carried.generation)
+            })
+        {
+            return false;
+        }
+
+        let mut payloads = Vec::with_capacity(decision.carried.len());
+        for carried in &decision.carried {
+            let Some(payload) = conductor.maintenance.desired.remove(&carried.key) else {
+                return false;
+            };
+            payloads.push((carried.key, payload));
+        }
+        for (key, payload) in payloads {
+            conductor.maintenance.submitted.insert(key, payload);
+        }
+        conductor.receipts.insert(
+            commit,
+            AdmissionReceipt {
+                commit,
+                carried: decision.carried.clone(),
+                maintenance_only,
+            },
+        );
+        true
+    }
+
+    /// Apply a terminal owner outcome to the maintenance payloads carried by
+    /// this commit. `Ok(false)` means that this commit is not a maintenance
+    /// receipt and the ordinary resource path must handle the event.
+    pub(crate) fn admission_handle_terminal(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        terminal: TerminalState,
+    ) -> Result<bool, ()> {
+        let Some(receipt) = self
+            .admission_conductors
+            .get(&device)
+            .and_then(|conductor| conductor.receipts.get(&commit))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+
+        let Some(conductor) = self.admission_conductors.get(&device) else {
+            return Err(());
+        };
+        let mut keys = BTreeSet::new();
+        if receipt
+            .carried
+            .iter()
+            .any(|carried| !keys.insert(carried.key))
+        {
+            return Err(());
+        }
+        match terminal {
+            TerminalState::Completed => {
+                if receipt.carried.iter().any(|carried| {
+                    conductor
+                        .maintenance
+                        .submitted
+                        .get(&carried.key)
+                        .is_none_or(|payload| payload.generation != carried.generation)
+                }) {
+                    return Err(());
+                }
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { .. }) => {
+                if receipt.carried.iter().any(|carried| {
+                    conductor
+                        .maintenance
+                        .submitted
+                        .get(&carried.key)
+                        .is_none_or(|payload| payload.generation != carried.generation)
+                        || conductor
+                            .maintenance
+                            .desired
+                            .get(&carried.key)
+                            .is_some_and(|payload| payload.generation <= carried.generation)
+                }) {
+                    return Err(());
+                }
+            }
+            TerminalState::CompletionUnknown(_) => {
+                if receipt.carried.iter().any(|carried| {
+                    conductor
+                        .maintenance
+                        .submitted
+                        .get(&carried.key)
+                        .is_none_or(|payload| payload.generation != carried.generation)
+                        || conductor.maintenance.dormant.contains_key(&carried.key)
+                }) {
+                    return Err(());
+                }
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(_)) => {
+                return Err(());
+            }
+        }
+
+        let conductor = self.admission_conductors.get_mut(&device).ok_or(())?;
+        match terminal {
+            TerminalState::Completed => {
+                for carried in &receipt.carried {
+                    let payload = conductor
+                        .maintenance
+                        .submitted
+                        .remove(&carried.key)
+                        .ok_or(())?;
+                    conductor.maintenance.current.insert(carried.key, payload);
+                    conductor
+                        .admission
+                        .note_completed(carried.key, carried.generation);
+                }
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { .. }) => {
+                for carried in &receipt.carried {
+                    let payload = conductor
+                        .maintenance
+                        .submitted
+                        .remove(&carried.key)
+                        .ok_or(())?;
+                    if conductor
+                        .maintenance
+                        .desired
+                        .get(&carried.key)
+                        .is_none_or(|desired| desired.generation <= carried.generation)
+                    {
+                        conductor.maintenance.desired.insert(carried.key, payload);
+                    }
+                    if conductor.admission.reenter(
+                        carried.key,
+                        carried.generation,
+                        carried.ticket,
+                        ReentryKind::Rejected,
+                    ) == Reentry::Dropped
+                    {
+                        conductor.maintenance.desired.remove(&carried.key);
+                        match carried.key.class {
+                            MaintenanceClass::Cursor => {
+                                conductor
+                                    .admission
+                                    .request_cursor_recovery(carried.key.crtc);
+                            }
+                            MaintenanceClass::Gamma => {
+                                conductor.gamma_failures.insert(carried.key.crtc);
+                            }
+                        }
+                    }
+                }
+            }
+            TerminalState::CompletionUnknown(_) => {
+                for carried in &receipt.carried {
+                    let payload = conductor
+                        .maintenance
+                        .submitted
+                        .remove(&carried.key)
+                        .ok_or(())?;
+                    conductor.maintenance.dormant.insert(carried.key, payload);
+                }
+                conductor.recovery_stopped = true;
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(_)) => {
+                return Err(());
+            }
+        }
+        conductor.receipts.remove(&commit);
+        Ok(true)
     }
 
     fn admission_abort(&mut self, device: DrmDeviceKey, token: AdmissionToken) {
