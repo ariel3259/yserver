@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-iii — primary conversion and damage
 
-**Status:** design, revision 2 (2026-09-19). Its three design sections (plans
+**Status:** design, revision 3 (2026-09-19). Its three design sections (plans
 C1, C2 and C3 — here sections 4, 5 and 6) were approved one by one with the user
 in brainstorming, together with three decisions recorded in section 2: the
 evidence level, the split into three plans with the composed plan first, and
@@ -11,7 +11,16 @@ Revision 2 incorporates codex round 1
 survives `Dispatched` (B-1), the registration caller is a hard requirement with
 no deferral (B-2), Present carriage from producer to owner (M-1, new section
 3.3), each pool-release gate tested on its own (M-2), and DMG-5 on the unflip
-return (M-3). Implementation plans follow (section 8.3).
+return (M-3).
+Revision 3 incorporates codex round 2
+(`../findings/2026-09-19-stage-2c-iii-design-review-round2.md`: 2 blocking,
+1 major, all verified and accepted): composed commits are non-Present
+primaries and composited Presents keep their GPU-completion authority, so
+section 3.3's carriage is direct-only and the Present-carrying owner entry moves
+to C2 (B-1); the damage transaction is installed inside the ledger closure,
+before any event can be routed (B-2); the pool-release gates are named in code
+terms and each is dropped alone by one mutation (M-1). Implementation plans
+follow (section 8.3).
 
 **Authority**, most general first. This document elaborates the 2c-iii block; it
 does not replace or relax any of them.
@@ -180,28 +189,48 @@ user, not a deferral.
    also takes the completion context.
 
 Both are owner changes inside C.0's existing contracts (they add no state and
-no outcome); section 4.0 states what must hold, and C1 implements them first,
-because composed is the first converted producer.
+no outcome). Gap 1 is C1's (section 4.0), because composed is the first
+converted producer. Gap 2 is C2's (section 5.0): composed commits carry no
+Present (section 3.3), so the direct producer is the first caller that needs a
+Present-carrying entry (round-2 B-1).
 
-**3.3. Present carriage from producer to owner (round-1 M-1).** A converted
-commit that completes Present requests carries them into the owner, or the
-client's FIFO stays parked while every damage and resource test passes. Today
-the conductor sets neither `page_flip_event` nor `present_consumers` on any
-`CommitDescription` (`kms/owner/build.rs:27`), because `begin_with_ledger`
-refuses both. Invariants, for the composed (C1) and direct (C2) producers:
+**3.3. Present carriage from producer to owner (round-1 M-1, round-2 B-1).**
+Each Present request has exactly one terminalization authority, and the
+conversion does not move it.
 
-- the prepared intent keeps the identity of every Present request the frame
-  completes — serial, FIFO position, target — and the description built for
-  the admitted generation carries it as `present_consumers` with
-  `page_flip_event` and the `CompletionContext`, through section 4.0's entry;
-- Present terminalization stays independent of damage and resource release
-  (C.0 §10.4, stage 2c §3): `Presented` delivers the protocol completion;
-  an accepted Present lacking validated presentation terminalizes as `Skip`
-  with the last validated clock sample, never a fabricated timestamp; no idle
-  or release is emitted before the ledger proves it;
-- a Present whose generation is displaced before admission takes the
-  never-submitted path (idle once, `Skip` behind the predecessor), and is not
-  carried by the displacing generation's commit.
+- **Composited Presents keep their GPU-completion authority; composed commits
+  are non-Present primaries.** Today a Present that is copied into a drawable
+  and composited completes when its render work completes, not at a KMS flip:
+  its `CompletedPresentEvent`s are held in `OpenFrame.pending_present_completions`
+  and, after a successful submission, move into a `PendingPresentBatch` behind
+  the exported fence (`kms/render/engine.rs:2777`–`2821`, Phase B.3). The scene
+  sees only a Boolean per output (`pending_presentation_for_output`,
+  `scene.rs:2013`), with no request identity. So a composed `CommitDescription`
+  carries **no** `present_consumers` and no `page_flip_event`, needs only
+  `Accepted` and `HardwareComplete`, and **cannot manufacture Present
+  completion** (C.0 §10.2). Displacing a composed generation changes nothing
+  for those Presents: they were already completed or queued by the GPU batch.
+  Moving composited Presents onto the KMS commit would be a protocol change
+  (C.0 §12 preserves Phase A+B's outcomes), not a 2c-iii conversion.
+- **Direct commits carry their Present into the owner** (C2). A direct commit
+  that completes Present requests carries them, or the client's FIFO stays
+  parked while every damage and resource test passes. Today the conductor sets
+  neither `page_flip_event` nor `present_consumers` on any `CommitDescription`
+  (`kms/owner/build.rs:27`), because `begin_with_ledger` refuses both.
+  Invariants for the direct producer:
+
+  - the prepared direct frame keeps the identity of every Present request it
+    completes — serial, FIFO position, target — and the description built for the
+    admitted generation carries it as `present_consumers` with `page_flip_event`
+    and the `CompletionContext`, through section 5.0's entry;
+  - Present terminalization stays independent of damage and resource release
+    (C.0 §10.4, stage 2c §3): `Presented` delivers the protocol completion;
+    an accepted Present lacking validated presentation terminalizes as `Skip`
+    with the last validated clock sample, never a fabricated timestamp; no idle
+    or release is emitted before the ledger proves it;
+  - a Present whose generation is displaced before admission takes the
+    never-submitted path (idle once, `Skip` behind the predecessor), and is not
+    carried by the displacing generation's commit.
 
 **3.4. Owner events reach the consumers.** 2c-ii's `route_owner_event_batch` is
 the only path owner events take (plan B2). 2c-iii adds consumers behind it: the
@@ -211,9 +240,9 @@ Milestones are delivered by `CommitId`; a consumer that sees an unknown
 
 ## 4. Plan C1 — owner entry, composed producer, damage transaction, bundles
 
-**4.0. The owner entry for a registered ledger** (section 3.2's two gaps). C1's
-first tasks, before any producer is converted, because the composed producer is
-the first real caller. Stated as invariants; the shape of the API is the plan's:
+**4.0. The owner entry for a registered ledger** (section 3.2's first gap).
+C1's first tasks, before any producer is converted, because the composed
+producer is the first real caller. Stated as invariants; the shape of the API is the plan's:
 
 - **A failed registration leaves nothing behind.** When the ledger closure
   fails, `begin` returns an error and the owner is as it was before the call:
@@ -223,11 +252,6 @@ the first real caller. Stated as invariants; the shape of the API is the plan's:
   `abort`s its token, so no ticket is spent, no turn advances and no loser ages
   (2c-ii §6). This is a `begin` refusal, not a pre-IPC `send_on` refusal: no
   record reaches `NeverDispatched`.
-- **A Present-carrying commit can register.** A description with
-  `page_flip_event` or `present_consumers` is begun through a public entry that
-  takes its `CompletionContext` **and** a CommitId-aware, fallible ledger
-  closure. That entry applies every check `begin_with_context` applies today;
-  it is not a way around them.
 - **The obligations name the record's own commit.** Each registered
   `KmsRelease` is keyed by the `CommitId` of the record that carries it, so the
   discharge in `consume` matches it (`record_kms_discharged` and
@@ -252,11 +276,17 @@ next peek includes them. Composed readiness is 2c-ii §4's: a reusable buffer no
 retained by current, submitted or delayed-release ownership, and finished
 producer waits (the render-completion stage, `InFlightStage`).
 
-**4.2. The damage transaction** (C.0 §12.1, stage 2c §5). Created when the
-conductor confirms the admission, identified by the `CommitId` together with
-the exact set of `(output, buffer index, generation)` it includes, and carrying
-each output's captured `PendingAck` contents. Retained before dispatch; nothing
-staged before `Accepted`.
+**4.2. The damage transaction** (C.0 §12.1, stage 2c §5). Identified by the
+`CommitId` together with the exact set of `(output, buffer index, generation)`
+it includes, and carrying each output's captured `PendingAck` contents.
+**Installed inside the CommitId-aware ledger closure of section 4.0** — the
+first point where the `CommitId` exists, and before any IPC (round-2 B-2). The
+owner events that `begin` and `send_on` return are routed only after it is
+installed, and admission is confirmed after the send, as 2c-ii §6 requires. If
+the closure fails, nothing is installed; if `send_on` refuses before IPC, the
+`NeverDispatched` row below closes it. So no milestone of the commit can reach a
+consumer before its transaction exists, and section 3.4's rule for an unknown
+`CommitId` never discards one. Nothing is staged before `Accepted`.
 
 | Owner outcome | Damage action |
 | --- | --- |
@@ -268,9 +298,17 @@ staged before `Accepted`.
 | `CompletionUnknown`; incarnation poison, recovery, topology, VT release, device loss | Invalidate |
 | A post-accept failure with the prior state proven current | Restore. If no `TerminalState` expresses this case today, the plan records it as an F8 stop against C.0 §12.1's row rather than inventing one |
 
-The composed **pool slot's release is separated from the ack**: it follows
-2c-i's ledger (`CompletionRetired`, `PriorBufferReleased`, and the GPU fence gate
-that exists today), not the damage milestone.
+The composed **pool slot's release is separated from the ack** and waits for
+three independent gates (round-2 M-1), none of which is the damage milestone:
+
+1. **`CompletionRetired`** has handed the displaced buffer from the commit to
+   the consumer's retiring state (`CommitConsumer::consume`);
+2. **`PriorBufferReleased`** holds, which in this code is not an owner event:
+   it is the resource service reporting the buffer's allocation free, its
+   `KmsRelease` obligation discharged by the displacing commit's completion
+   (section 3.2; C.0 §10.2 item 6);
+3. the compose **GPU fence** of that buffer has signalled (the gate
+   `handle_page_flip_complete` applies today).
 
 **4.3. Bundles (tier 5, DMG-4).** One transaction over every included output:
 staged at the single `Accepted`, applied at the single `HardwareComplete`,
@@ -296,13 +334,20 @@ every row of the table in 4.2; new paint between capture and `HardwareComplete`
 survives; two outputs with permuted completions, bundled and separately
 scheduled; a displaced generation acks nothing; invalidation without fresh paint
 still repaints; skipped-output dormancy; off-output damage not acked; old-state
-registration of section 3.2; the Present carriage of section 3.3 on the real
-composed producer, with `HardwareComplete`/`Presented` in both orders, a missing
-`Presented`, and no idle or release before the ledger proves it; the four
-invariants of section 4.0, including a
+registration of section 3.2; a composed commit carries no Present and a
+composited Present still completes exactly once, from its GPU batch (section
+3.3); a milestone returned by `begin`/`send_on` finds its transaction installed
+(section 4.2); the invariants of section 4.0, including a
 registration failure that leaves the owner and the decider untouched.
 
 ## 5. Plan C2 — direct producer
+
+**5.0. The Present-carrying owner entry** (section 3.2's second gap; moved
+from C1 by round-2 B-1). C2's first task. A description with `page_flip_event`
+or `present_consumers` is begun through a public entry that takes its
+`CompletionContext` **and** section 4.0's CommitId-aware, fallible ledger
+closure, with section 4.0's failure invariants. That entry applies every check
+`begin_with_context` applies today; it is not a way around them.
 
 **5.1. The real eligibility predicate.** Today the inputs of direct eligibility
 — VT, clock epoch, cursor, the resolved paint chain's `has_border_clip()` — are
@@ -354,8 +399,9 @@ generation (C.0 §12).
 retirement promotion ordered predecessor → `Skip` → admission → publication;
 lease adoption; displacement with a deferred `Skip`; composed invalidation on
 direct entry; eligibility identical between the two routes for the same inputs;
-section 3.3's Present carriage on the real direct producer, under the same event
-orders and missing-`Presented` case as C1.
+section 3.3's Present carriage on the real direct producer, with
+`HardwareComplete`/`Presented` in both orders, a missing `Presented`, and no idle
+or release before the ledger proves it; section 5.0's entry and its checks.
 
 ## 6. Plan C3 — unflip, multi-device, route selection, hardware
 
@@ -447,14 +493,16 @@ not by the first textual match.
 | A displaced composed generation acks nothing (4.1) | Ack the displaced generation's snapshots |
 | Damage after capture survives the ack (stage 2c §5) | Ack from the live store instead of the captured snapshots |
 | Pool release follows the ledger, not the ack (4.2) | Release the pool slot at `HardwareComplete` |
-| Pool release waits for **every** gate, each tested alone (4.2; round-1 M-2) | Release at `CompletionRetired` alone; release at `PriorBufferReleased` before the GPU fence signals; drop the GPU fence gate |
-| Present requests reach the owner and terminalize independently (3.3; round-1 M-1) | Drop `present_consumers` from the built description; fabricate a `Flip` timestamp for a missing `Presented`; idle before the ledger proves release |
+| Pool release waits for **every** gate of section 4.2, each withheld alone (round-1 M-2, round-2 M-1) | Three mutations, each dropping exactly one gate: release without `CompletionRetired`; release with the `KmsRelease` obligation still outstanding; release before the GPU fence signals |
+| A composed commit carries no Present; composited Presents complete once, from the GPU batch (3.3; round-2 B-1) | Attach a composited Present to the composed description; complete it at `HardwareComplete` as well |
+| The damage transaction exists before any of its milestones is routed (4.2; round-2 B-2) | Install the transaction at `confirm`, after the returned events are routed |
+| Direct Present requests reach the owner and terminalize independently (3.3; round-1 M-1) | Drop `present_consumers` from the built description; fabricate a `Flip` timestamp for a missing `Presented`; idle before the ledger proves release |
 | Old-state dependencies registered at dispatch (3.2) | Build the ledger without registering |
 | A failed registration leaves the owner as before `begin` (4.0) | Keep the slot reserved on a ledger error |
 | A failed registration consumes no admission state (4.0; 2c-ii §6) | `confirm` instead of `abort` after a ledger error |
-| A Present-carrying commit registers through the context entry, with its checks (4.0) | Skip the completion-context validation in the new entry |
+| A Present-carrying commit registers through the context entry, with its checks (5.0) | Skip the completion-context validation in the new entry |
 | Registered obligations carry the record's own `CommitId` (4.0) | Register under a different `CommitId` than the record's |
-| `begin_with_ledger` still refuses Present-carrying descriptions (4.0) | Drop the `page_flip_event`/`present_consumers` refusal |
+| `begin_with_ledger` still refuses Present-carrying descriptions (4.0, 5.0) | Drop the `page_flip_event`/`present_consumers` refusal |
 | One eligibility predicate for both routes (5.1) | Let the owner route skip the border-clip input |
 | A border gained while queued is never committed, promoted or not (5.2) | Skip the layout hook at one enumerated site |
 | Retirement promotion goes through the conductor, in order (5.3) | Commit the successor from the event handler |
