@@ -4,7 +4,12 @@
 >
 > **Your sandbox has no `/dev/dri` and no Vulkan.** From Task 4 on, most named tests are `#[ignore = "needs live Vulkan ICD"]` `_vulkan` tests. Write them, make them compile and pass clippy, and run the deterministic ones. You **cannot** run the `_vulkan` ones: they report an environmental skip. Say so in your report; do not claim them. The coordinator runs them outside the sandbox, with the user's go-ahead.
 
-**Revision 1 (2026-09-19)** — not yet reviewed.
+**Revision 2 (2026-09-19)** — incorporates codex round 1 (`../findings/2026-09-19-stage-2c-iii-plan-ci-review-round1.md`: 1 blocking, 4 major, all verified against the tree and accepted).
+- **B-1:** decision 7 and Task 7 contradicted each other for a generation displaced before admission, and the owner route had no buffer-phase mapping once the legacy flip is gone. Decision 10 is now the one authoritative owner buffer lifecycle. A never-admitted buffer returns to `Free` behind its GPU work alone, with no KMS gate and no fabricated event.
+- **M-1:** per-member old state is now tested on rejection, `ResourcesStillCurrent` and direct dispatch too (R27–R28).
+- **M-2:** `Owner` eligibility is tested for unmanaged pools and for mixed-output devices (R29–R30).
+- **M-3:** the apply mutation is `Presented`, as spec §8.2 names it (R15), and every reachable invalidation source is tested (R31).
+- **M-4:** transaction members carry `OutputKey` and generation, not an index; a topology change invalidates before reindexing (R32).
 
 **Goal:** Convert the shared managed composed route to the owner. That means the owner entry that lets a dispatch register its old-state dependencies, the conductor registering them per member, a real composed `CommitDescription`, the prepare/submit fork in the scene, the real composed admission source, the damage transaction driven by owner milestones, buffer reuse behind its three gates, and tier-5 bundles with real members.
 
@@ -14,7 +19,7 @@
 
 ## Design decisions this plan fixes
 
-Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–9 are this plan's.
+Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–12 are this plan's.
 
 1. **Real-tick evidence under Vulkan.** Every criterion involving the composed producer, the damage transaction or buffer reuse is proven with the real scene tick in a `_vulkan` fixture. Tasks 1–3 have no tick and stay deterministic.
 2. **Only the shared managed route is converted.** A device with an output on the copied route, or on an unmanaged scanout pool, cannot enter `Owner` (Task 4). The copied route is Ciii's.
@@ -22,9 +27,25 @@ Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–9
 4. **Old state per member.** A commit's old state is exactly the current resources of the members it covers; every other member's current state stays current, through dispatch, retirement, rejection and unknown.
 5. **Composed commits are non-Present primaries** (spec §3.3). Their description has `page_flip_event = false` and no `present_consumers`, and they need only `Accepted` and `HardwareComplete`. Composited Presents keep completing from their GPU batch (`engine.rs`, `PendingPresentBatch`). Nothing in this plan touches that path.
 6. **What "the pool slot" means.** The scene has two pools. The **scanout buffer** (a `ScanoutBo` in the output's pool) is what spec §4.2's three gates govern: `CompletionRetired`, the `KmsRelease` discharge, and the GPU batch of its compose. The **descriptor-pool slot** (`pool_slots`, `pool_ring`) keeps its existing compose-fence gate, released after `HardwareComplete` instead of the page event. It was never a KMS resource.
-7. **Displacement without a queue.** Under `Owner` the tick may compose a newer generation for an output whose previous generation is still desired (offered, not admitted) when a free buffer exists. That is latest-wins, as spec §4.1 and 2c-ii §3 require. The displaced generation's buffer returns to the pool only after its own render work completes. The tick still never composes over a *submitted* generation's buffer.
+7. **Displacement without a queue.** Under `Owner` the tick may compose a newer generation for an output whose previous generation is still rendering or desired (not admitted) when a free buffer exists. That is latest-wins, as spec §4.1 and 2c-ii §3 require. The displaced buffer follows decision 10's never-admitted path. The tick never composes into a buffer that is not `Free`.
 8. **One production description builder**, in a new file `crates/yserver/src/kms/render/composed_commit.rs`. It builds the minimal persistent list from the `Output`s' plane, CRTC and property ids. `ACTIVE`'s property id is discovered once per CRTC and cached; `Output` does not carry it today.
-9. **Test names start with `c0_conv_ci_`**, so one filter selects the whole plan. Vulkan tests end in `_vulkan` and carry `#[ignore = "needs live Vulkan ICD"]`.
+10. **The owner buffer lifecycle — the one authoritative table** (round-1 B-1). Under `Owner`, a composed scanout buffer is in exactly one of these logical states. How they map onto `BoPhase` (`vk/scanout.rs:114`) is yours: reuse phases whose meaning fits, add phases where none does, and say which. Legacy `Submitted`/`Pending` carry the `IN_FENCE_FD`/`OUT_FENCE_FD` of the legacy flip, and neither fence exists on this route. The `Legacy` machine is untouched.
+
+    | State | Entered by | Left by | Fences and gates |
+    | --- | --- | --- | --- |
+    | Free | start; the exits below | the tick records into it → Rendering | none |
+    | Rendering | the tick's GPU submission; its render completion is registered with the drain | drain → Desired; displaced → Displaced | the render-completion fd belongs to the drain, which closes it |
+    | Desired | the render completion drained; the generation is offered | dispatch (inside Task 2's closure) → Submitted; displaced → Displaced; a pre-IPC refusal keeps it Desired (2c-ii §6) | none |
+    | Displaced | a newer generation for the output while Rendering or Desired | its compose's GPU batch has retired → Free | **no KMS gate, no `CommitId`, no fabricated event**: it was never in a commit |
+    | Submitted | the ledger closure moved it into the commit's new state | `Accepted` → Accepted; `FailedBeforeSubmit` (kernel rejection) → Displaced, the generation is withdrawn and the output owes a repaint; `CompletionUnknown` → Quarantined | the owner holds the out-fence as canonical evidence; the buffer holds no fence |
+    | Accepted | `Accepted` | `CompletionRetired` of its commit → Current; `CompletionUnknown` → Quarantined | — |
+    | Current | its commit's `CompletionRetired` | the displacing commit's `CompletionRetired` → Releasing | — |
+    | Releasing | the displacing commit's `CompletionRetired` | the resource service reports its allocation ready (its `KmsRelease` discharged **and** its compose's GPU batch retired) → Free | spec §4.2's three gates |
+    | Quarantined | `CompletionUnknown` | not in Ci: recovery is stage 3; the buffer is never reused | — |
+
+    Rows 5–8 are the KMS path. The three gates govern only Releasing. A buffer that never reached Submitted is freed by its GPU work alone.
+11. **Transaction members carry identity, not position** (round-1 M-4). Each transaction member is `(OutputKey, CRTC id, buffer index, generation)`, the way `register_scanout_render_completion` already keys by `OutputKey`. A milestone is applied to a member only if that output still exists with the same generation. A topology change invalidates every open transaction **before** any output is reindexed.
+12. **Test names start with `c0_conv_ci_`**, so one filter selects the whole plan. Vulkan tests end in `_vulkan` and carry `#[ignore = "needs live Vulkan ICD"]`.
 
 ## Limits stated
 
@@ -51,17 +72,18 @@ Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–9
 | `begin_with_ledger` keeps its Present refusal (§4.0) | `c0_conv_ci_owner_fallible_entry_refuses_present` | R3: drop the `page_flip_event`/`present_consumers` refusal from the new entry |
 | Dispatch registers old-state dependencies (§3.2) | `c0_conv_ci_dispatch_registers_displaced_obligations` | R4: build the ledger with `Submitted::new` instead of registering |
 | A registration failure consumes no admission state (§4.0; 2c-ii §6) | `c0_conv_ci_registration_failure_aborts_the_token` | R5: `confirm` instead of `abort` after a ledger error |
-| Old state is per member (§4.6) | `c0_conv_ci_other_crtc_current_survives_retirement` | R6: take the whole current state as old again |
+| Old state is per member (§4.6) | `c0_conv_ci_other_crtc_current_survives_retirement`, `c0_conv_ci_other_crtc_current_survives_rejection`, `c0_conv_ci_other_crtc_current_survives_direct_dispatch` | R6: take the whole current state as old again at dispatch; R27: replace the whole current vector in the `ResourcesStillCurrent`/rejection arm; R28: keep the whole-state `take_current` in the direct dispatch |
 | The description is the minimal list, non-Present (§3.3, decision 8) | `c0_conv_ci_description_single_output`, `c0_conv_ci_description_bundle` | R7: set `page_flip_event` on a composed description |
-| `Owner` is refused for copied or unmanaged outputs (decision 2) | `c0_conv_ci_owner_refused_for_copied_route` | R8: allow `Owner` with a copied output |
+| `Owner` is refused for copied or unmanaged outputs, on any output of the device (decision 2) | `c0_conv_ci_owner_refused_for_copied_route`, `c0_conv_ci_owner_refused_for_unmanaged_pool`, `c0_conv_ci_owner_refused_for_one_bad_output_of_many` | R8: allow `Owner` with a copied output; R29: allow it with an unmanaged pool; R30: check only the first (or initiating) output |
 | `Legacy` is unchanged; `Owner` never flips from the tick (§2.3, §6.3) | `c0_conv_ci_legacy_tick_flips_as_before_vulkan`, `c0_conv_ci_owner_tick_offers_instead_of_flipping_vulkan` | R9: force the legacy branch under `Owner`; R10: offer under `Legacy` |
 | No producer fence crosses the ioctl; readiness waits for render completion (decision 3) | `c0_conv_ci_ready_only_after_render_completion_vulkan` | R11: report `Ready` before the render completion drains |
 | A displaced generation stages and acks nothing (§4.1) | `c0_conv_ci_displaced_generation_acks_nothing_vulkan` | R12: ack the displaced generation's snapshots |
 | The transaction is installed before any milestone is routed (§4.2) | `c0_conv_ci_transaction_installed_inside_the_closure_vulkan` | R13: install it at `confirm` |
 | Staging at `Accepted`, not at dispatch (DMG-1) | `c0_conv_ci_stage_at_accepted_vulkan` | R14: stage at the offer/dispatch |
-| Apply at `HardwareComplete` only (DMG-2) | `c0_conv_ci_apply_at_hardware_complete_vulkan` | R15: apply at `Accepted` |
+| Apply at `HardwareComplete` only, never again at `Presented` (DMG-2) | `c0_conv_ci_apply_at_hardware_complete_vulkan` | R15: also apply at `Presented` (spec §8.2's mutation) |
 | `Dispatched` retains; `FailedBeforeSubmit` and `NeverDispatched` close without staging (§4.2) | `c0_conv_ci_dispatched_retains_the_transaction_vulkan`, `c0_conv_ci_rejection_closes_without_staging_vulkan` | R16: close the transaction at `Dispatched` |
-| Unknown and invalidation events invalidate (DMG-3) | `c0_conv_ci_unknown_invalidates_vulkan` | R17: restore on `CompletionUnknown` |
+| Unknown and every invalidation source invalidate, and the output owes a repaint (DMG-3) | `c0_conv_ci_unknown_invalidates_vulkan`, `c0_conv_ci_invalidation_sources_invalidate_vulkan` | R17: restore on `CompletionUnknown`; R31: drop the invalidation for one source (each reachable source mutated separately) |
+| Members are keyed by output identity; a stale milestone after a topology change touches nothing (decision 11) | `c0_conv_ci_stale_milestone_after_topology_change_vulkan` | R32: key members by output index |
 | Damage after capture survives the ack (stage 2c §5) | `c0_conv_ci_new_paint_survives_the_ack_vulkan` | R18: ack from the live store instead of the captured snapshots |
 | Buffer reuse waits for each of three gates (§4.2) | `c0_conv_ci_buffer_reuse_waits_for_every_gate_vulkan` | R19: without `CompletionRetired`; R20: with the `KmsRelease` obligation outstanding; R21: before the GPU batch retires |
 | A bundle is one transaction (DMG-4) | `c0_conv_ci_bundle_is_one_transaction_vulkan` | R22: stage one bundle output at a separate milestone |
@@ -103,6 +125,8 @@ Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–9
 - `c0_conv_ci_dispatch_registers_displaced_obligations` — a composed admission over a current allocation of the same CRTC: after dispatch the displaced allocation carries a `KmsRelease` obligation keyed by the commit. After a `HardwareComplete` + `CompletionRetired` routed through `route_owner_event_batch` it is discharged and the allocation moves to releasing.
 - `c0_conv_ci_registration_failure_aborts_the_token` — force a registration error (for example, an old allocation already frozen or detached in the service; say which you used): the owner is idle, the decider is exactly as before `lock` (same pending tickets, same turn), the resources are back, and nothing is dispatched until another wake.
 - `c0_conv_ci_other_crtc_current_survives_retirement` — two CRTCs, each with a current allocation; a commit for CRTC A retires; B's allocation is still current and has no obligation, and A's is releasing.
+- `c0_conv_ci_other_crtc_current_survives_rejection` — the same set-up, with the commit for A rejected by the kernel (a stub `RejectWith`, routed through `route_owner_event_batch`). A's old state is current again, and B's never left current and has no obligation.
+- `c0_conv_ci_other_crtc_current_survives_direct_dispatch` — a direct dispatch through `admission_dispatch_direct` covering a subset of the device's CRTCs, over a current state that includes another member. That member stays current and obligation-free through dispatch and retirement. If the 2c-ii direct fixture can only cover every CRTC, report which shape you used; F8 if no subset is reachable.
 
 - [ ] Steps: tests; red; implement; gate; stop dirty and report.
 
@@ -129,7 +153,7 @@ Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–9
 
 **Files:** `crates/yserver/src/kms/render/scene.rs` (the composed present path from the flip site near line 4683 through `submit_shared_scanout_frame`, and the managed variant near line 8013), `crates/yserver/src/kms/render/admission.rs` (`admission_offer_composed`, the wake after a render completion), `crates/yserver/src/kms/render/platform.rs` (the render-completion drain), the `Owner` establishment path (the transport gate install); tests.
 
-**Invariants.**
+**Invariants.** Task 4 introduces decision 10's states Free → Rendering → Desired and Displaced, and decision 11's member identity for the prepared generation.
 - **The fork.** The shared managed present path splits at the flip. Everything before it is one code path for both routes: repaint, render, `PendingAck` construction and the managed GPU batch. Then:
   - with no active conductor for the output's device, today's `submit_flip_with_fences`, staging and `pending_acks` push, unchanged;
   - with one: no flip and no staging. The buffer is registered with the render-completion drain (decision 3), and the frame becomes the output's **prepared composed generation**: buffer index, generation, captured `PendingAck`, managed batch. When its render completion drains, it is offered (`admission_offer_composed`) and the conductor is woken.
@@ -141,7 +165,8 @@ Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–9
 - `c0_conv_ci_owner_tick_offers_instead_of_flipping_vulkan` — with an active conductor, the same tick issues no legacy flip and stages nothing, and after the render completion drains the conductor holds a desired composed generation for that CRTC.
 - `c0_conv_ci_ready_only_after_render_completion_vulkan` — before the drain, the snapshot reports that generation `Waiting`.
 - `c0_conv_ci_displaced_generation_acks_nothing_vulkan` — two ticks before any admission: the first generation is displaced. After the second is admitted and completes, the first's snapshots were acked only because the second frame's capture included them, and its buffer is free.
-- `c0_conv_ci_owner_refused_for_copied_route` (deterministic if reachable without Vulkan; otherwise `_vulkan`) — `Owner` refused, and the device still `Legacy`.
+- `c0_conv_ci_owner_refused_for_copied_route`, `c0_conv_ci_owner_refused_for_unmanaged_pool`, `c0_conv_ci_owner_refused_for_one_bad_output_of_many` (deterministic if reachable without Vulkan; otherwise `_vulkan`) — `Owner` refused and the device still `Legacy`. The last one has several outputs on one device, with only a non-first output bad.
+- The tests drive the production drain entry (`drain_scanout_render_completions` and its consumer), never `admission_offer_composed` directly. If the live fixture cannot deliver a render completion to that drain, F8.
 
 - [ ] Steps: tests; red; implement; gate; stop dirty and report.
 
@@ -173,17 +198,17 @@ Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–9
 
 **Invariants (spec §4.2, DMG-1..3).**
 - The transaction is installed **inside** Task 2's ledger closure, keyed by the `CommitId` it receives, before any IPC. The events `begin` and the send return are routed after it exists. A closure error installs nothing.
-- It carries, for each included output, the captured `PendingAck` contents (buffer index, generation, drawable snapshots, submitted structure and failed-repaint damage, participants, cursor transition fields).
+- It carries, for each included output, a member keyed as decision 11 says, with the captured `PendingAck` contents (drawable snapshots, submitted structure and failed-repaint damage, participants, cursor transition fields).
 - The milestone table:
   - `Dispatched` retains the transaction.
   - `FailedBeforeSubmit` (any cause, including `NeverDispatched`) closes it without staging.
   - `Accepted` stages each output once (`commit_submitted`, gated on the compose having been complete, as `stage_submitted_frame` does).
   - `HardwareComplete` applies (`retire_success`) and does everything `handle_page_flip_complete` does after its ack match (`scene.rs:2129`): ack the captured snapshots, subtract the captured structure and failed-repaint damage, push the damage history, set `prev_presented`, apply the cursor-transition fields.
   - `Presented` does nothing.
-  - `CompletionUnknown`, and an invalidation of the incarnation, topology or VT, invalidate.
+  - `CompletionUnknown`, and every invalidation source the spec names (incarnation poison, recovery, topology, VT release, device loss), invalidate, and the output owes a repaint (`owes_repaint`). For each source, find the event or hook that signals it on an `Owner` device today. A source with no signal yet is reported (F8, naming it); it is never skipped silently.
 - **The restore row.** Find whether any `TerminalState` today is a failure after `Accepted` with the prior state proven current. If one is, restore on it. If none is, report it (F8) and do not invent one; the coordinator records the spec's F8 stop.
 
-**Named tests** (`_vulkan`; milestones delivered through `route_owner_event_batch`): `c0_conv_ci_transaction_installed_inside_the_closure_vulkan` (a `Dispatched` returned by the send is routed and finds the transaction), `c0_conv_ci_stage_at_accepted_vulkan`, `c0_conv_ci_apply_at_hardware_complete_vulkan`, `c0_conv_ci_dispatched_retains_the_transaction_vulkan`, `c0_conv_ci_rejection_closes_without_staging_vulkan` (a stub `RejectWith` behaviour), `c0_conv_ci_unknown_invalidates_vulkan`, `c0_conv_ci_new_paint_survives_the_ack_vulkan` (paint lands between the capture and `HardwareComplete`; it survives and drives the next tick).
+**Named tests** (`_vulkan`; milestones delivered through `route_owner_event_batch`): `c0_conv_ci_transaction_installed_inside_the_closure_vulkan` (a `Dispatched` returned by the send is routed and finds the transaction), `c0_conv_ci_stage_at_accepted_vulkan`, `c0_conv_ci_apply_at_hardware_complete_vulkan` (a `Presented` after it changes no damage, history or cursor state), `c0_conv_ci_dispatched_retains_the_transaction_vulkan`, `c0_conv_ci_rejection_closes_without_staging_vulkan` (a stub `RejectWith` behaviour), `c0_conv_ci_unknown_invalidates_vulkan`, `c0_conv_ci_invalidation_sources_invalidate_vulkan` (one case per reachable source, each asserting the invalidation and `owes_repaint`), `c0_conv_ci_stale_milestone_after_topology_change_vulkan` (a topology change between dispatch and `HardwareComplete`: no output is acked, and the transaction is invalidated first), `c0_conv_ci_new_paint_survives_the_ack_vulkan` (paint lands between the capture and `HardwareComplete`; it survives and drives the next tick).
 
 - [ ] Steps: tests; red; implement; gate; stop dirty and report.
 
@@ -193,16 +218,17 @@ Items 1–4 come from the spec (§4.6, user-approved on 2026-09-19); items 5–9
 
 **Files:** `scene.rs`, `platform.rs` (the buffer phase machine, `on_page_flip_complete`'s owner-route counterpart), `resources/`; tests.
 
-**Invariants (spec §4.2, decision 6).**
-- Under `Owner`, a composed scanout buffer becomes free for the tick only when all three of these hold:
+**Invariants (spec §4.2, decisions 6 and 10).**
+- Task 7 implements decision 10's KMS rows: Submitted → Accepted → Current → Releasing → Free, the rejection and unknown exits, and the Displaced → Free path. A Releasing buffer becomes Free only when all three of these hold:
   1. `CompletionRetired` has moved it to releasing;
   2. its `KmsRelease` obligation is discharged;
   3. its compose's GPU batch has retired.
-  Gates 2 and 3 are the resource service reporting its allocation ready. The phase transitions that `on_page_flip_complete` performs for the legacy route are driven by those milestones instead. The page event plays no part.
+  Gates 2 and 3 are the resource service reporting its allocation ready. The page event plays no part.
+- A Displaced buffer becomes Free when its compose's GPU batch retires, with no KMS gate and no event fabricated for it.
 - The descriptor-pool slot is released at `HardwareComplete` behind its existing compose-fence gate (`pending_pool_releases` when the fence is not yet signalled).
 - `Legacy` phase handling is unchanged.
 
-**Named test:** `c0_conv_ci_buffer_reuse_waits_for_every_gate_vulkan` — three sub-cases, each withholding exactly one gate while the other two hold. The buffer is not reusable in any of them, and becomes reusable once the withheld gate arrives.
+**Named tests:** `c0_conv_ci_buffer_reuse_waits_for_every_gate_vulkan` — three sub-cases, each withholding exactly one gate while the other two hold. The buffer is not reusable in any of them, and becomes reusable once the withheld gate arrives. `c0_conv_ci_displaced_generation_acks_nothing_vulkan` (Task 4) is extended: the displaced buffer becomes Free after its GPU work, while no `CompletionRetired` or `KmsRelease` exists for it. `c0_conv_ci_rejection_closes_without_staging_vulkan` (Task 6) is extended: the rejected buffer takes the Displaced path, and the output owes a repaint.
 
 - [ ] Steps: tests; red; implement; gate; stop dirty and report.
 
@@ -251,5 +277,5 @@ Task 8 adds `cargo check --workspace --target <t>` for `x86_64-unknown-linux-gnu
 
 1. Reads the diff against the invariants, and checks each named test sets up its scenario and goes through the path it is named after.
 2. Reruns the gate outside the sandbox, and — **after asking the user** for the GPU — runs `cargo test -p yserver --lib c0_conv_ci_ -- --ignored --test-threads=1` in debug and release.
-3. After Task 8: applies R1–R26 by line, confirming each compiled and removed the behaviour, running the Vulkan ones with the user's go-ahead. A survivor goes back as a finding. Then the full hardware gate (spec §8.4) with the user's go-ahead, and a `docs/status.md` entry plus an acceptance finding.
+3. After Task 8: applies R1–R32 by line, confirming each compiled and removed the behaviour, running the Vulkan ones with the user's go-ahead. A survivor goes back as a finding. Then the full hardware gate (spec §8.4) with the user's go-ahead, and a `docs/status.md` entry plus an acceptance finding.
 4. Commits each task with `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)` and `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
