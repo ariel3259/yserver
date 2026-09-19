@@ -161,8 +161,63 @@ impl CommitResourceConsumer {
         std::mem::take(&mut self.current_resources)
     }
 
+    /// Remove only the current entries covered by a commit. A resource entry
+    /// is the unit of ownership, so seeing only part of one entry covered is
+    /// an invalid shape rather than permission to split the entry.
+    pub(crate) fn take_current_for_members(
+        &mut self,
+        members: &[GroupMember],
+    ) -> Result<Vec<CommitResources>, ResourceError> {
+        if !GroupMember::validate_unique(members) {
+            return Err(ResourceError::InvalidProof);
+        }
+
+        let covered = |member: &GroupMember| members.contains(member);
+        if self.current_resources.iter().any(|resources| {
+            let intersects = resources.crtcs.iter().any(covered);
+            intersects && resources.crtcs.iter().any(|member| !covered(member))
+        }) {
+            return Err(ResourceError::InvalidProof);
+        }
+
+        let current = std::mem::take(&mut self.current_resources);
+        let mut selected = Vec::new();
+        let mut retained = Vec::with_capacity(current.len());
+        for resources in current {
+            if resources.crtcs.iter().any(covered) {
+                selected.push(resources);
+            } else {
+                retained.push(resources);
+            }
+        }
+        self.current_resources = retained;
+        Ok(selected)
+    }
+
     pub(crate) fn take_released_presents(&mut self) -> Vec<PresentRelease> {
         std::mem::take(&mut self.released_presents)
+    }
+
+    /// Remove the new-state resources returned by a pre-IPC owner refusal.
+    /// The owner tags every released entry with the record's commit id, so a
+    /// composed caller can hand exactly that state back to its prepared
+    /// generation without touching another rejected commit.
+    pub(crate) fn take_rejected_for_commit(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> Vec<CommitResources> {
+        let rejected = std::mem::take(&mut self.rejected_resources);
+        let mut matching = Vec::new();
+        let mut retained = Vec::with_capacity(rejected.len());
+        for resources in rejected {
+            if resources.commit_id == Some(commit) {
+                matching.push(resources);
+            } else {
+                retained.push(resources);
+            }
+        }
+        self.rejected_resources = retained;
+        matching
     }
 
     pub(crate) fn present_disposition(&self, key: &PresentKey) -> Option<PresentDisposition> {
@@ -291,7 +346,7 @@ impl CommitResourceConsumer {
                     }
                 }
                 self.releasing_resources.extend(old);
-                self.current_resources = new;
+                self.current_resources.extend(new);
                 Ok(())
             }
             crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
@@ -308,7 +363,7 @@ impl CommitResourceConsumer {
                         let _ = service.cancel(key, obligation_id);
                     }
                 }
-                self.current_resources = resources;
+                self.current_resources.extend(resources);
                 Ok(())
             }
             crate::kms::owner::device::OwnerEvent::ResourcesReleased {

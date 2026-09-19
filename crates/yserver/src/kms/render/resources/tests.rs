@@ -3067,6 +3067,7 @@ pub(crate) fn run_sink_gamma_gate_four_states(
     backend.platform.devices = vec![crate::kms::render::platform::KmsDevice {
         key: device_key,
         device: Rc::clone(&device),
+        active_property_cache: Default::default(),
         cursor: crate::kms::render::platform::KmsCursorState::new(),
         executor: None,
         owner: None,

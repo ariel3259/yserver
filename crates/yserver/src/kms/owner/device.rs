@@ -30,7 +30,7 @@ use crate::kms::executor::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    io,
+    fmt, io,
     os::fd::{AsFd, AsRawFd},
     time::Instant,
 };
@@ -163,6 +163,39 @@ pub enum DispatchError<R> {
         events: Vec<OwnerEvent<R>>,
     },
 }
+
+/// The result of the fallible owner entry's pre-admission work.
+///
+/// A refusal happens before the ledger closure is called, so the closure is
+/// returned to its caller just like `begin_with_ledger` returns its builder.
+/// Once the slot has been reserved, the closure's error is returned by value;
+/// it may own resources that must not be dropped by the owner.
+pub enum FallibleBeginError<R, E, F> {
+    Refused {
+        error: DispatchError<R>,
+        ledger: F,
+    },
+    Ledger(E),
+    /// The closure failed and the owner could not release the reservation it
+    /// had just made. This is defensive only: no other operation can mutate
+    /// the slot during the closure, but the error remains fail-closed and
+    /// retains the caller's resources.
+    Cleanup {
+        error: E,
+        cleanup: SlotError,
+    },
+}
+
+impl<R, E, F> fmt::Debug for FallibleBeginError<R, E, F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused { .. } => formatter.write_str("FallibleBeginError::Refused"),
+            Self::Ledger(_) => formatter.write_str("FallibleBeginError::Ledger"),
+            Self::Cleanup { .. } => formatter.write_str("FallibleBeginError::Cleanup"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DeviceCommitOwner<R> {
     slot: DeviceSlot,
@@ -1379,6 +1412,78 @@ impl<R> DeviceCommitOwner<R> {
         Ok((commit, Vec::new()))
     }
 
+    #[allow(clippy::type_complexity)]
+    fn begin_with_context_and_fallible_ledger<F, E>(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: F,
+        context: CompletionContext,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), FallibleBeginError<R, E, F>>
+    where
+        F: FnOnce(CommitId) -> Result<Submitted<R>, E>,
+    {
+        if self.legacy_drain_permit.is_some() {
+            return Err(FallibleBeginError::Refused {
+                error: DispatchError::LegacyTransportActive,
+                ledger,
+            });
+        }
+        let (commit, event_token, correlation) = match self.next_correlation() {
+            Ok(correlation) => correlation,
+            Err(error) => return Err(FallibleBeginError::Refused { error, ledger }),
+        };
+        let (request, closure) = match build_atomic_request_with_modeset(
+            desc,
+            correlation,
+            context.host_class,
+            context.allow_modeset,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return Err(FallibleBeginError::Refused {
+                    error: error.into(),
+                    ledger,
+                });
+            }
+        };
+        if let Err(error) = self.validate_completion_context(&closure, &context) {
+            return Err(FallibleBeginError::Refused { error, ledger });
+        }
+        let proof = match self.slot.reserve(commit) {
+            Ok(proof) => proof,
+            Err(error) => {
+                return Err(FallibleBeginError::Refused {
+                    error: error.into(),
+                    ledger,
+                });
+            }
+        };
+        let ledger = match ledger(commit) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                return match self.slot.release(commit) {
+                    Ok(()) => Err(FallibleBeginError::Ledger(error)),
+                    Err(cleanup) => Err(FallibleBeginError::Cleanup { error, cleanup }),
+                };
+            }
+        };
+        let mut record = CommitRecord::new(
+            commit,
+            event_token,
+            self.identities.incarnation(),
+            self.lifecycle_epoch,
+            self.transition,
+            self.topology_generation,
+            closure,
+            correlation,
+            ledger,
+            context,
+        );
+        record.attach_request(HostCallRequest::Atomic(request), proof);
+        self.live = Some(record);
+        Ok((commit, Vec::new()))
+    }
+
     pub fn begin_install_restore(
         &mut self,
         desc: &CommitDescription,
@@ -1503,6 +1608,58 @@ impl<R> DeviceCommitOwner<R> {
             lifecycle_observed_max: None,
         };
         self.begin_with_context_and_ledger(desc, ledger, context)
+    }
+
+    /// Like [`Self::begin_with_ledger`], but lets the ledger builder fail
+    /// after all owner refusal points and slot reservation have succeeded.
+    ///
+    /// The closure receives the exact `CommitId` stored in the new record. A
+    /// closure error leaves no live record and releases the slot before its
+    /// error is returned. Commit and event identities are monotonic and are
+    /// consumed even when the closure fails.
+    #[allow(clippy::type_complexity)]
+    pub fn begin_with_fallible_ledger<F, E>(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: F,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), FallibleBeginError<R, E, F>>
+    where
+        F: FnOnce(CommitId) -> Result<Submitted<R>, E>,
+    {
+        if desc.page_flip_event || !desc.present_consumers.is_empty() {
+            return Err(FallibleBeginError::Refused {
+                error: DispatchError::InvalidCompletionContext,
+                ledger,
+            });
+        }
+        let closure = match AtomicCrtcClosure::compute(
+            &desc.objects,
+            &desc.crtc_state,
+            &desc.property_ids,
+            desc.page_flip_event,
+            &desc.present_consumers,
+        ) {
+            Ok(closure) => closure,
+            Err(error) => {
+                return Err(FallibleBeginError::Refused {
+                    error: BuildError::from(error).into(),
+                    ledger,
+                });
+            }
+        };
+        let mut mode_periods = BTreeMap::new();
+        for &crtc in closure.expected_completion() {
+            mode_periods.insert(crtc, None);
+        }
+        let context = CompletionContext {
+            class: CompletionClass::FastUpdate,
+            host_class: HostCallClass::SeatActiveNonblock,
+            allow_modeset: false,
+            clocks: BTreeMap::new(),
+            mode_periods,
+            lifecycle_observed_max: None,
+        };
+        self.begin_with_context_and_fallible_ledger(desc, ledger, context)
     }
 
     /// Cancel a live record before dispatch.
@@ -2021,6 +2178,16 @@ impl<R> DeviceCommitOwner<R> {
         let record = self.live.as_mut().expect("record");
         record.take_request();
         record.mark_dispatched();
+    }
+
+    #[doc(hidden)]
+    pub fn complete_for_tests(&mut self) -> Vec<OwnerEvent<R>> {
+        let Some(record) = self.live.as_mut() else {
+            return Vec::new();
+        };
+        record.mark_accepted();
+        record.mark_hardware_complete();
+        self.try_complete()
     }
     #[doc(hidden)]
     pub fn mark_probe_dispatched_for_tests(&mut self) {
@@ -2722,6 +2889,87 @@ mod tests {
             events.is_empty(),
             "begin emits nothing; send_on emits Dispatched"
         );
+    }
+
+    #[test]
+    fn c0_conv_ci_owner_failed_ledger_leaves_nothing() {
+        #[derive(Debug, PartialEq)]
+        struct LedgerError {
+            resources: Vec<TestResource>,
+        }
+
+        let mut owner = owner_for_tests();
+        let error = owner
+            .begin_with_fallible_ledger(&single_active_crtc(), |_commit| {
+                Err(LedgerError {
+                    resources: vec![TestResource::NewFramebuffer(99)],
+                })
+            })
+            .expect_err("the ledger closure must fail this begin");
+
+        match error {
+            FallibleBeginError::Ledger(LedgerError { resources }) => {
+                assert_eq!(resources, vec![TestResource::NewFramebuffer(99)]);
+            }
+            FallibleBeginError::Refused { error, .. } => {
+                panic!("the request was refused before the ledger closure: {error:?}")
+            }
+            FallibleBeginError::Cleanup { .. } => {
+                panic!("the owner failed to release its just-made reservation")
+            }
+        }
+        assert!(owner.slot().is_idle());
+        assert!(owner.live_record().is_none());
+
+        let (commit, _) = owner
+            .begin(&single_active_crtc(), ledger())
+            .expect("a failed ledger closure must leave the owner reusable");
+        assert_eq!(commit.get(), 2, "the failed attempt consumed its CommitId");
+    }
+
+    #[test]
+    fn c0_conv_ci_owner_ledger_sees_the_record_commit() {
+        use std::{cell::Cell, rc::Rc};
+
+        let mut owner = owner_for_tests();
+        let seen = Rc::new(Cell::new(None));
+        let seen_by_closure = Rc::clone(&seen);
+        let (returned, _) = owner
+            .begin_with_fallible_ledger(&single_active_crtc(), move |commit| {
+                seen_by_closure.set(Some(commit));
+                Ok::<_, ()>(ledger())
+            })
+            .expect("the fallible ledger closure should succeed");
+
+        assert_eq!(seen.get(), Some(returned));
+        assert_eq!(owner.live_record().expect("record").commit_id(), returned);
+    }
+
+    #[test]
+    fn c0_conv_ci_owner_fallible_entry_refuses_present() {
+        use std::cell::Cell;
+
+        fn assert_refused(desc: CommitDescription) {
+            let mut owner = owner_for_tests();
+            let called = Cell::new(false);
+            let result = owner.begin_with_fallible_ledger(&desc, |_commit| {
+                called.set(true);
+                Ok::<_, ()>(ledger())
+            });
+
+            assert!(result.is_err());
+            assert!(!called.get(), "the closure ran for a Present description");
+            assert!(owner.slot().is_idle());
+            assert!(owner.live_record().is_none());
+        }
+
+        let mut page_flip = single_active_crtc();
+        page_flip.page_flip_event = true;
+        assert_refused(page_flip);
+
+        let mut present_consumers = single_active_crtc();
+        present_consumers.present_consumers.push(1234);
+        assert_refused(present_consumers);
     }
 
     #[test]

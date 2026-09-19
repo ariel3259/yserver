@@ -19,13 +19,17 @@ use crate::{
                 ReentryKind, Tier, WaitReason,
             },
             build::CommitDescription,
-            device::{DispatchError, OwnerEvent},
+            device::{DispatchError, FallibleBeginError, OwnerEvent},
             identity::CommitId,
             record::{FailureCause, RefusalCause, TerminalState},
         },
         render::{
-            backend::{KmsBackend, PreparedDirectDispatch},
-            resources::{CommitResources, ResourceError},
+            backend::{KmsBackend, PreparedDirectDispatch, effective_refresh_matches},
+            platform::CrtcKey,
+            resources::{
+                CommitResources, GroupMember, ResourceError, register_commit_dependencies,
+            },
+            scene::PreparedComposedLocation,
         },
     },
     platform::drm::DrmDeviceKey,
@@ -77,6 +81,27 @@ fn decision_primary(decision: &AdmissionDecision) -> Option<&Admitted> {
     }
 }
 
+fn composed_intents(decision: &AdmissionDecision) -> Vec<(CrtcId, u64)> {
+    match decision_primary(decision) {
+        Some(Admitted::Composed { crtc, generation }) => vec![(*crtc, *generation)],
+        Some(Admitted::Bundle { members }) => members
+            .iter()
+            .filter_map(|member| match member {
+                Admitted::Composed { crtc, generation } => Some((*crtc, *generation)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComposedResourceSpec {
+    location: PreparedComposedLocation,
+    generation: u64,
+    member: GroupMember,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaintenancePayload {
     pub(crate) generation: u64,
@@ -118,6 +143,9 @@ pub(crate) trait AdmissionSource {
     fn cursor_recovery_ready(&self, crtc: CrtcId) -> bool;
     /// A composed admission's new-state resources, moved into the ledger.
     fn composed_resources(&mut self, crtc: CrtcId, generation: u64) -> Vec<CommitResources>;
+    /// Return resources to the composed intent when owner admission cannot
+    /// construct a ledger. The source owns the returned intent-side storage.
+    fn restore_composed_resources(&mut self, resources: Vec<CommitResources>);
     /// Whether the queued direct successor passes current direct eligibility.
     /// 2c-iii replaces this with the real predicate.
     fn direct_eligible(&self, source_generation: u64) -> bool;
@@ -127,6 +155,10 @@ pub(crate) trait AdmissionSource {
 pub(crate) struct AdmissionConductor {
     pub(crate) admission: Admission,
     pub(crate) source: Box<dyn AdmissionSource>,
+    /// The converted composed half is served by `KmsBackend` and `SceneCompositor`.
+    /// The injected source remains authoritative for direct and maintenance
+    /// answers until their later conversion tasks.
+    pub(crate) backend_composed: bool,
     pub(crate) layout_generation: u64,
     pub(crate) next_direct_source_generation: u64,
     pub(crate) composed: BTreeMap<CrtcId, u64>,
@@ -148,6 +180,34 @@ impl AdmissionConductor {
         Self {
             admission: Admission::new(),
             source,
+            // Task 5: composed readiness, description, resources and
+            // topology come from the live backend/scene path by default.
+            backend_composed: true,
+            layout_generation: 0,
+            next_direct_source_generation: 1,
+            composed: BTreeMap::new(),
+            maintenance: MaintenanceStore::default(),
+            receipts: BTreeMap::new(),
+            recovery_stopped: false,
+            gamma_failures: BTreeSet::new(),
+            #[cfg(test)]
+            prepare_hook: None,
+            #[cfg(test)]
+            force_lock_mismatch: false,
+            #[cfg(test)]
+            trace: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_composed_backend(
+        source: Box<dyn AdmissionSource>,
+        backend_composed: bool,
+    ) -> Self {
+        Self {
+            admission: Admission::new(),
+            source,
+            backend_composed,
             layout_generation: 0,
             next_direct_source_generation: 1,
             composed: BTreeMap::new(),
@@ -184,15 +244,39 @@ impl KmsBackend {
             })
     }
 
-    /// Install the fixture-only conductor. Production has no caller until
-    /// stage 2c-iii converts the producers.
-    pub(crate) fn install_admission_conductor_for_tests(
+    pub(crate) fn install_admission_conductor(
         &mut self,
         device: DrmDeviceKey,
         source: Box<dyn AdmissionSource>,
     ) {
         self.admission_conductors
             .insert(device, AdmissionConductor::new(source));
+    }
+
+    /// Install the fixture-only conductor. Production has no caller until
+    /// stage 2c-iii converts the producers.
+    #[cfg(test)]
+    pub(crate) fn install_admission_conductor_for_tests(
+        &mut self,
+        device: DrmDeviceKey,
+        source: Box<dyn AdmissionSource>,
+    ) {
+        self.admission_conductors.insert(
+            device,
+            AdmissionConductor::new_with_composed_backend(source, false),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_admission_conductor_with_backend_composed_for_tests(
+        &mut self,
+        device: DrmDeviceKey,
+        source: Box<dyn AdmissionSource>,
+    ) {
+        self.admission_conductors.insert(
+            device,
+            AdmissionConductor::new_with_composed_backend(source, true),
+        );
     }
 
     pub(crate) fn admission_offer_composed(
@@ -211,6 +295,190 @@ impl KmsBackend {
         conductor.admission.set_composed(crtc, generation)?;
         conductor.composed.insert(crtc, generation);
         Ok(())
+    }
+
+    fn composed_output_index(&self, device: DrmDeviceKey, crtc: CrtcId) -> Option<usize> {
+        let crtc = ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc)?;
+        self.platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device && output.output.crtc == crtc)
+    }
+
+    fn composed_prepared_planes(
+        &mut self,
+        device: DrmDeviceKey,
+        intents: &[(CrtcId, u64)],
+    ) -> Option<Vec<crate::kms::render::composed_commit::ComposedPlane<'_>>> {
+        if intents.is_empty() {
+            return None;
+        }
+        let mut planes = Vec::with_capacity(intents.len());
+        for &(crtc, generation) in intents {
+            let output_idx = self.composed_output_index(device, crtc)?;
+            let location = self.scene.owner_prepared_location(output_idx, generation)?;
+            let bo_fb_handle = self
+                .platform
+                .scanout_pools
+                .get(location.output_idx)
+                .and_then(Option::as_ref)
+                .and_then(|scanout| scanout.display_pool().bos.get(location.bo_idx))
+                .and_then(|bo| bo.fb_handle);
+            let framebuffer = {
+                let service = self.resource_service.as_mut()?;
+                self.scene
+                    .owner_prepared_framebuffer(location, generation, bo_fb_handle, service)
+                    .ok()??
+            };
+            planes.push(crate::kms::render::composed_commit::ComposedPlane {
+                output: &self.platform.outputs[output_idx].output,
+                framebuffer,
+            });
+        }
+        Some(planes)
+    }
+
+    fn composed_property_ids(
+        &mut self,
+        device: DrmDeviceKey,
+        intents: &[(CrtcId, u64)],
+    ) -> Result<crate::kms::owner::closure::PropertyIds, String> {
+        if intents.is_empty() {
+            return Err("prepared composed generation is unavailable".to_string());
+        }
+
+        // Keep the mutable property cache borrow separate from the output and
+        // scene borrows used to construct the builder's borrowed members.
+        let devices = &mut self.platform.devices;
+        let outputs = &self.platform.outputs;
+        let scanout_pools = &self.platform.scanout_pools;
+        let scene = &self.scene;
+        let kms_device = devices
+            .iter_mut()
+            .find(|entry| entry.key == device)
+            .ok_or_else(|| "composed device disappeared".to_string())?;
+
+        let mut planes = Vec::with_capacity(intents.len());
+        for &(crtc, generation) in intents {
+            let output_idx = outputs
+                .iter()
+                .position(|output| {
+                    output.key.device_key == device && u32::from(output.output.crtc) == crtc
+                })
+                .ok_or_else(|| "composed output disappeared".to_string())?;
+            let location = scene
+                .owner_prepared_location(output_idx, generation)
+                .ok_or_else(|| "prepared composed generation is unavailable".to_string())?;
+            let bo_fb_handle = scanout_pools
+                .get(location.output_idx)
+                .and_then(Option::as_ref)
+                .and_then(|scanout| scanout.display_pool().bos.get(location.bo_idx))
+                .and_then(|bo| bo.fb_handle);
+            let framebuffer = self
+                .resource_service
+                .as_mut()
+                .ok_or_else(|| "prepared composed resource service is unavailable".to_string())?;
+            let framebuffer = scene
+                .owner_prepared_framebuffer(location, generation, bo_fb_handle, framebuffer)
+                .map_err(|error| format!("prepared composed framebuffer read failed: {error}"))?
+                .ok_or_else(|| "prepared composed framebuffer is unavailable".to_string())?;
+            planes.push(crate::kms::render::composed_commit::ComposedPlane {
+                output: &outputs[output_idx].output,
+                framebuffer,
+            });
+        }
+        crate::kms::render::composed_commit::discover_composed_property_ids(
+            &kms_device.device,
+            &planes,
+            &mut kms_device.active_property_cache,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn composed_readiness(
+        &mut self,
+        device: DrmDeviceKey,
+        crtc: CrtcId,
+        generation: u64,
+    ) -> Readiness {
+        let Some(output_idx) = self.composed_output_index(device, crtc) else {
+            return Readiness::Waiting(WaitReason::SourceWaits);
+        };
+        if !self.scene.owner_composed_ready(output_idx, generation) {
+            return Readiness::Waiting(WaitReason::SourceWaits);
+        }
+        if self
+            .composed_property_ids(device, &[(crtc, generation)])
+            .is_ok()
+        {
+            Readiness::Ready
+        } else {
+            // Property discovery is a readiness prerequisite. A missing or
+            // inconsistent property never reaches owner begin/IPC.
+            Readiness::Waiting(WaitReason::SourceWaits)
+        }
+    }
+
+    fn composed_description(
+        &mut self,
+        device: DrmDeviceKey,
+        decision: &AdmissionDecision,
+    ) -> Result<crate::kms::owner::build::CommitDescription, String> {
+        let intents = composed_intents(decision);
+        let property_ids = self.composed_property_ids(device, &intents)?;
+        let planes = self
+            .composed_prepared_planes(device, &intents)
+            .ok_or_else(|| "prepared composed generation is unavailable".to_string())?;
+        Ok(crate::kms::render::composed_commit::composed_description(
+            &planes,
+            property_ids,
+        ))
+    }
+
+    fn composed_resource_specs(
+        &self,
+        device: DrmDeviceKey,
+        intents: &[(CrtcId, u64)],
+    ) -> Option<Vec<ComposedResourceSpec>> {
+        let topology_generation = self
+            .platform
+            .owner_ref(device)
+            .map_or(0, |owner| owner.topology_generation());
+        intents
+            .iter()
+            .map(|&(crtc, generation)| {
+                let output_idx = self.composed_output_index(device, crtc)?;
+                let location = self.scene.owner_prepared_location(output_idx, generation)?;
+                let member = GroupMember::new(
+                    CrtcKey::for_output(&self.platform.outputs[output_idx]),
+                    topology_generation,
+                    1,
+                );
+                Some(ComposedResourceSpec {
+                    location,
+                    generation,
+                    member,
+                })
+            })
+            .collect()
+    }
+
+    fn composed_homogeneous_group(&self, device: DrmDeviceKey) -> BTreeSet<CrtcId> {
+        let outputs = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .collect::<Vec<_>>();
+        let Some(first) = outputs.first() else {
+            return BTreeSet::new();
+        };
+        let first_picked = first.output.picked.clone();
+        outputs
+            .into_iter()
+            .filter(|output| effective_refresh_matches(&first_picked, &output.output.picked))
+            .map(|output| u32::from(output.output.crtc))
+            .collect()
     }
 
     /// Store the latest maintenance payload and queue its descriptor as one
@@ -442,6 +710,39 @@ impl KmsBackend {
                     .retained_composed_framebuffer(output_idx)
                     .is_some()
             });
+        let backend_composed = self
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| conductor.backend_composed);
+        let composed_intents = self
+            .admission_conductors
+            .get(&device)
+            .map(|conductor| {
+                conductor
+                    .composed
+                    .iter()
+                    .map(|(&crtc, &generation)| (crtc, generation))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let backend_composed_readiness = if backend_composed {
+            composed_intents
+                .iter()
+                .map(|&(crtc, generation)| {
+                    (
+                        (crtc, generation),
+                        self.composed_readiness(device, crtc, generation),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        let backend_homogeneous_group = if backend_composed {
+            self.composed_homogeneous_group(device)
+        } else {
+            BTreeSet::new()
+        };
         let mut invalidate = None;
         let snapshot = {
             let conductor = self
@@ -469,9 +770,16 @@ impl KmsBackend {
             for (&crtc, &generation) in &conductor.composed {
                 snapshot.report(
                     IntentKey::Composed { crtc, generation },
-                    conductor
-                        .source
-                        .producer_readiness(IntentKey::Composed { crtc, generation }),
+                    if backend_composed {
+                        backend_composed_readiness
+                            .get(&(crtc, generation))
+                            .copied()
+                            .unwrap_or(Readiness::Waiting(WaitReason::SourceWaits))
+                    } else {
+                        conductor
+                            .source
+                            .producer_readiness(IntentKey::Composed { crtc, generation })
+                    },
                 );
             }
 
@@ -516,7 +824,11 @@ impl KmsBackend {
                     }
                 }
             }
-            snapshot.homogeneous_group = conductor.source.homogeneous_group();
+            snapshot.homogeneous_group = if backend_composed {
+                backend_homogeneous_group.clone()
+            } else {
+                conductor.source.homogeneous_group()
+            };
             for &crtc in conductor.admission.cursor_recovery() {
                 let readiness = if conductor.source.cursor_recovery_ready(crtc) {
                     Readiness::Ready
@@ -671,11 +983,6 @@ impl KmsBackend {
         token: AdmissionToken,
         decision: crate::kms::owner::admission::AdmissionDecision,
     ) -> AdmissionOutcome {
-        let Some(conductor) = self.admission_conductors.get_mut(&device) else {
-            return AdmissionOutcome::TransportClosed;
-        };
-        let desc = conductor.source.describe(&decision);
-
         let primary = decision_primary(&decision).cloned();
         if let Some(Admitted::Bundle { members }) = &primary
             && !members
@@ -685,33 +992,122 @@ impl KmsBackend {
             self.admission_abort(device, token);
             return AdmissionOutcome::Unsupported(decision.tier);
         }
-        let commit = {
+        let backend_composed = self
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| conductor.backend_composed);
+        let intents = composed_intents(&decision);
+        let use_backend_composed = backend_composed && !intents.is_empty();
+        let resource_specs = if use_backend_composed {
+            let Some(specs) = self.composed_resource_specs(device, &intents) else {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::PreparationRefused;
+            };
+            specs
+        } else {
+            Vec::new()
+        };
+        let desc = if use_backend_composed {
+            match self.composed_description(device, &decision) {
+                Ok(desc) => desc,
+                Err(_error) => {
+                    // Property discovery and framebuffer lookup are
+                    // readiness prerequisites. A generation that becomes
+                    // unavailable between snapshot and dispatch is refused
+                    // without consuming its prepared lease.
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::PreparationRefused;
+                }
+            }
+        } else {
+            let Some(conductor) = self.admission_conductors.get_mut(&device) else {
+                return AdmissionOutcome::TransportClosed;
+            };
+            conductor.source.describe(&decision)
+        };
+        enum PrimaryBeginError {
+            Ledger(Vec<CommitResources>, Vec<CommitResources>),
+            Cleanup(Vec<CommitResources>, Vec<CommitResources>),
+            Refused,
+        }
+
+        let result: Result<CommitId, PrimaryBeginError> = {
             let consumer = &mut self.commit_consumer;
-            let result = {
-                let Some(device_entry) = self
-                    .platform
-                    .devices
-                    .iter_mut()
-                    .find(|entry| entry.key == device)
-                else {
-                    self.admission_abort(device, token);
-                    return AdmissionOutcome::BeginRefused;
-                };
-                let Some(owner) = device_entry.owner.as_mut() else {
-                    self.admission_abort(device, token);
-                    return AdmissionOutcome::BeginRefused;
-                };
+            let Some(service) = self.resource_service.as_mut() else {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            };
+            let Some(device_entry) = self
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == device)
+            else {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            };
+            let Some(owner) = device_entry.owner.as_mut() else {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            };
+            let scene = &mut self.scene;
+            let scanout_pools = &mut self.platform.scanout_pools;
+            if use_backend_composed {
+                let specs = resource_specs;
+                match owner.begin_with_fallible_ledger(&desc, move |commit| {
+                    let mut new = Vec::with_capacity(specs.len());
+                    for spec in specs.iter().copied() {
+                        let mut resources = match scene.take_owner_composed_resources(
+                            spec.location,
+                            spec.generation,
+                            spec.member,
+                            commit,
+                            scanout_pools,
+                        ) {
+                            Ok(resources) => resources,
+                            Err(error) => return Err((error, Vec::new(), new)),
+                        };
+                        new.append(&mut resources);
+                    }
+                    let members = new
+                        .iter()
+                        .flat_map(|resources| resources.crtcs.iter().copied())
+                        .collect::<Vec<_>>();
+                    let old = match consumer.take_current_for_members(&members) {
+                        Ok(old) => old,
+                        Err(error) => return Err((error, Vec::new(), new)),
+                    };
+                    let submitted = match register_commit_dependencies(commit, old, new, service) {
+                        Ok(submitted) => submitted,
+                        Err(error) => return Err(error),
+                    };
+                    let transaction_specs = specs
+                        .iter()
+                        .map(|spec| (spec.location, spec.generation, spec.member))
+                        .collect::<Vec<_>>();
+                    if !scene.install_owner_damage_transaction(commit, &transaction_specs) {
+                        let (old, new) = submitted.into_parts();
+                        return Err((ResourceError::InvalidState, old, new));
+                    }
+                    Ok(submitted)
+                }) {
+                    Ok((commit, _events)) => Ok(commit),
+                    Err(FallibleBeginError::Ledger((_error, old, new))) => {
+                        Err(PrimaryBeginError::Ledger(old, new))
+                    }
+                    Err(FallibleBeginError::Cleanup {
+                        error: (_error, old, new),
+                        ..
+                    }) => Err(PrimaryBeginError::Cleanup(old, new)),
+                    Err(FallibleBeginError::Refused { .. }) => Err(PrimaryBeginError::Refused),
+                }
+            } else {
                 let Some(conductor) = self.admission_conductors.get_mut(&device) else {
                     self.admission_abort(device, token);
                     return AdmissionOutcome::TransportClosed;
                 };
                 let source = &mut conductor.source;
-                owner.begin_with_ledger(&desc, |_commit| {
-                    let old = if primary.is_some() {
-                        consumer.take_current()
-                    } else {
-                        Vec::new()
-                    };
+                match owner.begin_with_fallible_ledger(&desc, |commit| {
                     let new = match primary.as_ref() {
                         Some(Admitted::Composed { crtc, generation }) => {
                             source.composed_resources(*crtc, *generation)
@@ -729,18 +1125,59 @@ impl KmsBackend {
                         None => Vec::new(),
                         Some(_) => Vec::new(),
                     };
-                    crate::kms::owner::ledger::Submitted::new(old, new)
-                })
-            };
-            match result {
-                Ok((commit, _events)) => Some(commit),
-                Err((_error, _builder)) => None,
+                    let members = new
+                        .iter()
+                        .flat_map(|resources| resources.crtcs.iter().copied())
+                        .collect::<Vec<_>>();
+                    let old = match consumer.take_current_for_members(&members) {
+                        Ok(old) => old,
+                        Err(error) => return Err((error, Vec::new(), new)),
+                    };
+                    register_commit_dependencies(commit, old, new, service)
+                }) {
+                    Ok((commit, _events)) => Ok(commit),
+                    Err(FallibleBeginError::Ledger((_error, old, new))) => {
+                        Err(PrimaryBeginError::Ledger(old, new))
+                    }
+                    Err(FallibleBeginError::Cleanup {
+                        error: (_error, old, new),
+                        ..
+                    }) => Err(PrimaryBeginError::Cleanup(old, new)),
+                    Err(FallibleBeginError::Refused { .. }) => Err(PrimaryBeginError::Refused),
+                }
             }
         };
 
-        let Some(commit) = commit else {
-            self.admission_abort(device, token);
-            return AdmissionOutcome::BeginRefused;
+        let commit = match result {
+            Ok(commit) => commit,
+            Err(PrimaryBeginError::Ledger(old, new)) => {
+                self.commit_consumer.current_resources.extend(old);
+                if !self.restore_primary_composed_resources(device, use_backend_composed, new) {
+                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                        gate.force_close();
+                    }
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::TransportClosed;
+                }
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            }
+            Err(PrimaryBeginError::Cleanup(old, new)) => {
+                self.commit_consumer.current_resources.extend(old);
+                if !self.restore_primary_composed_resources(device, use_backend_composed, new) {
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::TransportClosed;
+                }
+                if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                    gate.force_close();
+                }
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            }
+            Err(PrimaryBeginError::Refused) => {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            }
         };
         #[cfg(not(test))]
         let _ = commit;
@@ -788,6 +1225,23 @@ impl KmsBackend {
         }
     }
 
+    fn restore_primary_composed_resources(
+        &mut self,
+        device: DrmDeviceKey,
+        backend_composed: bool,
+        resources: Vec<CommitResources>,
+    ) -> bool {
+        if backend_composed {
+            self.scene
+                .restore_owner_composed_resources(resources, &mut self.platform.scanout_pools)
+        } else if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor.source.restore_composed_resources(resources);
+            true
+        } else {
+            false
+        }
+    }
+
     fn admission_dispatch_direct(
         &mut self,
         device: DrmDeviceKey,
@@ -817,47 +1271,122 @@ impl KmsBackend {
             .source
             .describe(&decision);
 
-        let commit = {
+        let direct_crtcs = match decision_primary(&decision) {
+            Some(Admitted::Direct { successor }) => Some(successor.crtcs.clone()),
+            _ => None,
+        };
+        let result = {
             let consumer = &mut self.commit_consumer;
-            let result = {
-                let device_entry = self
-                    .platform
-                    .devices
-                    .iter_mut()
-                    .find(|entry| entry.key == device)
-                    .expect("admission device");
-                let owner = device_entry.owner.as_mut().expect("admission owner");
-                owner.begin_with_ledger(&desc, |commit| {
-                    let old = consumer.take_current();
-                    let new = vec![
-                        resources
-                            .take()
-                            .expect("direct builder called once")
-                            .with_commit_id(commit),
-                    ];
-                    crate::kms::owner::ledger::Submitted::new(old, new)
-                })
+            let Some(service) = self.resource_service.as_mut() else {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
             };
-            match result {
-                Ok((commit, _events)) => Some(commit),
-                Err((_error, _builder)) => None,
-            }
+            let device_entry = self
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == device)
+                .expect("admission device");
+            let owner = device_entry.owner.as_mut().expect("admission owner");
+            owner.begin_with_fallible_ledger(&desc, |commit| {
+                let mut new_resource = resources
+                    .take()
+                    .ok_or_else(|| (ResourceError::InvalidState, Vec::new(), Vec::new()))?;
+                if new_resource.crtcs.is_empty()
+                    && let Some(direct_crtcs) = direct_crtcs.as_ref()
+                {
+                    new_resource.crtcs = consumer
+                        .current_resources
+                        .iter()
+                        .flat_map(|resources| resources.crtcs.iter().copied())
+                        .filter(|member| direct_crtcs.contains(&u32::from(member.crtc.crtc)))
+                        .collect();
+                }
+                let new = vec![new_resource.with_commit_id(commit)];
+                let members = new
+                    .iter()
+                    .flat_map(|resources| resources.crtcs.iter().copied())
+                    .collect::<Vec<GroupMember>>();
+                let old = match consumer.take_current_for_members(&members) {
+                    Ok(old) => old,
+                    Err(error) => return Err((error, Vec::new(), new)),
+                };
+                register_commit_dependencies(commit, old, new, service)
+            })
         };
 
-        let Some(commit) = commit else {
-            let prepared = PreparedDirectDispatch {
-                resources: match resources.take() {
-                    Some(resources) => resources,
-                    None => {
-                        self.admission_abort(device, token);
-                        return AdmissionOutcome::TransportClosed;
+        let commit = match result {
+            Ok((commit, _events)) => commit,
+            Err(FallibleBeginError::Ledger((_error, old, mut new))) => {
+                self.commit_consumer.current_resources.extend(old);
+                let Some(resources) = new.pop() else {
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::TransportClosed;
+                };
+                if !new.is_empty()
+                    || self
+                        .managed_undo_direct_dispatch(PreparedDirectDispatch {
+                            resources,
+                            retirement,
+                        })
+                        .is_err()
+                {
+                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                        gate.force_close();
                     }
-                },
-                retirement,
-            };
-            let _ = self.managed_undo_direct_dispatch(prepared);
-            self.admission_abort(device, token);
-            return AdmissionOutcome::BeginRefused;
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::TransportClosed;
+                }
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            }
+            Err(FallibleBeginError::Cleanup {
+                error: (_error, old, mut new),
+                ..
+            }) => {
+                self.commit_consumer.current_resources.extend(old);
+                let Some(resources) = new.pop() else {
+                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                        gate.force_close();
+                    }
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::TransportClosed;
+                };
+                if !new.is_empty()
+                    || self
+                        .managed_undo_direct_dispatch(PreparedDirectDispatch {
+                            resources,
+                            retirement,
+                        })
+                        .is_err()
+                {
+                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                        gate.force_close();
+                    }
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::TransportClosed;
+                }
+                if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                    gate.force_close();
+                }
+                self.admission_abort(device, token);
+                return AdmissionOutcome::TransportClosed;
+            }
+            Err(FallibleBeginError::Refused { .. }) => {
+                let prepared = PreparedDirectDispatch {
+                    resources: match resources.take() {
+                        Some(resources) => resources,
+                        None => {
+                            self.admission_abort(device, token);
+                            return AdmissionOutcome::TransportClosed;
+                        }
+                    },
+                    retirement,
+                };
+                let _ = self.managed_undo_direct_dispatch(prepared);
+                self.admission_abort(device, token);
+                return AdmissionOutcome::BeginRefused;
+            }
         };
         if let Some(retirement) = retirement.take() {
             self.commit_consumer
@@ -1186,8 +1715,38 @@ impl KmsBackend {
         let DispatchError::Refused { cause, events } = error else {
             unreachable!("only pre-IPC refusals use refusal disposition")
         };
+        let backend_composed = self
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| conductor.backend_composed);
+        let restores_composed = backend_composed
+            && matches!(
+                admitted,
+                Admitted::Composed { .. } | Admitted::Bundle { .. }
+            );
+        let refused_commit = events.iter().find_map(|event| match event {
+            OwnerEvent::ResourcesReleased { commit, .. } => Some(*commit),
+            _ => None,
+        });
         self.admission_abort(device, token);
-        let consumed = self.admission_consume_events(events).is_ok();
+        // The owner has already terminalized this pre-IPC refusal. Route its
+        // terminal/resource batch through the same backend seam as every other
+        // owner milestone; the NeverDispatched arm intentionally does not wake
+        // admission before the composed lease is restored below.
+        let consumed = self.resource_service.is_some()
+            && self.route_owner_event_batch(device, events, std::time::Instant::now());
+        let restored = if consumed && restores_composed {
+            refused_commit.is_some_and(|commit| {
+                let resources = self.commit_consumer.take_rejected_for_commit(commit);
+                !resources.is_empty()
+                    && self.scene.restore_owner_composed_resources(
+                        resources,
+                        &mut self.platform.scanout_pools,
+                    )
+            })
+        } else {
+            true
+        };
         if let Admitted::Direct { successor } = admitted {
             let withdrawn = self
                 .admission_conductors
@@ -1201,7 +1760,7 @@ impl KmsBackend {
                 debug_assert!(terminalized, "refused direct descriptor names its frame");
             }
         }
-        if consumed {
+        if consumed && restored {
             AdmissionOutcome::SendRefused(cause)
         } else {
             self.platform
@@ -1210,20 +1769,6 @@ impl KmsBackend {
                 .force_close();
             AdmissionOutcome::TransportClosed
         }
-    }
-
-    fn admission_consume_events(
-        &mut self,
-        events: Vec<OwnerEvent<CommitResources>>,
-    ) -> Result<(), ResourceError> {
-        let Some(service) = self.resource_service.as_mut() else {
-            return Err(ResourceError::InvalidState);
-        };
-        let consumer = &mut self.commit_consumer;
-        for event in events {
-            consumer.consume(event, service)?;
-        }
-        Ok(())
     }
 
     #[cfg(test)]

@@ -71,6 +71,60 @@ use crate::{
 
 pub(crate) use crate::kms::scanout_route::RenderDeviceId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerEligibilityError {
+    NoOutputs,
+    MissingScanoutPool { output_idx: usize },
+    CopiedScanoutRoute { output_idx: usize },
+    UnmanagedScanoutPool { output_idx: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerOutputKind {
+    SharedManaged,
+    Copied,
+    Unmanaged,
+    Missing,
+}
+
+fn validate_owner_output_kinds(kinds: &[OwnerOutputKind]) -> Result<(), OwnerEligibilityError> {
+    if kinds.is_empty() {
+        return Err(OwnerEligibilityError::NoOutputs);
+    }
+    for (output_idx, kind) in kinds.iter().copied().enumerate() {
+        match kind {
+            OwnerOutputKind::SharedManaged => {}
+            OwnerOutputKind::Copied => {
+                return Err(OwnerEligibilityError::CopiedScanoutRoute { output_idx });
+            }
+            OwnerOutputKind::Unmanaged => {
+                return Err(OwnerEligibilityError::UnmanagedScanoutPool { output_idx });
+            }
+            OwnerOutputKind::Missing => {
+                return Err(OwnerEligibilityError::MissingScanoutPool { output_idx });
+            }
+        }
+    }
+    Ok(())
+}
+
+impl std::fmt::Display for OwnerEligibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoOutputs => f.write_str("Owner requires at least one scanout output"),
+            Self::MissingScanoutPool { output_idx } => {
+                write!(f, "Owner output {output_idx} has no scanout pool")
+            }
+            Self::CopiedScanoutRoute { output_idx } => {
+                write!(f, "Owner output {output_idx} uses the copied scanout route")
+            }
+            Self::UnmanagedScanoutPool { output_idx } => {
+                write!(f, "Owner output {output_idx} has an unmanaged scanout pool")
+            }
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────
 // FenceTicket — CPU-side I6a lifetime ticket.
 //
@@ -2040,6 +2094,8 @@ fn mode_via_connector_handle<T: Copy>(
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
+    /// Cached per-CRTC `ACTIVE` property ids used by composed owner commits.
+    pub(crate) active_property_cache: crate::kms::render::composed_commit::ActivePropertyCache,
     pub(crate) cursor: KmsCursorState,
     /// Optional because test fixtures do not spawn helper processes. Always `Some` in production.
     pub(crate) executor: Option<crate::kms::executor::KmsIoExecutor>,
@@ -2689,6 +2745,7 @@ impl PlatformBackend {
                 KmsDevice {
                     key: device.key,
                     device: device.device,
+                    active_property_cache: Default::default(),
                     cursor,
                     executor: Some(device.executor),
                     owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
@@ -3150,6 +3207,7 @@ impl PlatformBackend {
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
+                active_property_cache: Default::default(),
                 cursor: KmsCursorState::new(),
                 executor: None,
                 owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
@@ -3270,6 +3328,294 @@ impl PlatformBackend {
         gate: crate::kms::render::resources::TransportGate,
     ) {
         self.transport_gates.insert(gate.device(), gate);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_test_output_without_scanout_pool(&mut self, connector_name: &str) {
+        let device_key = self
+            .devices
+            .first()
+            .expect("test platform has a device")
+            .key;
+        let mut seed = Self::for_tests();
+        let mut output = seed.outputs.remove(0);
+        let raw_crtc = u32::from(output.output.crtc)
+            .saturating_add(u32::try_from(self.outputs.len()).unwrap_or(u32::MAX));
+        output.key = OutputKey::new(device_key, connector_name);
+        output.scanout_route.kms_device_key = device_key;
+        output.output.connector_name = connector_name.to_owned();
+        output.output.connector = ::drm::control::from_u32(raw_crtc).expect("test CRTC");
+        output.output.encoder = ::drm::control::from_u32(raw_crtc).expect("test encoder");
+        output.output.crtc = ::drm::control::from_u32(raw_crtc).expect("test CRTC");
+        output.output.plane = ::drm::control::from_u32(raw_crtc).expect("test plane");
+        self.outputs.push(output);
+        self.scanout_pools.push(None);
+        self.bo_generations.push(Vec::new());
+        self.first_pageflip_logged.push(false);
+    }
+
+    /// Append a fixture output through the same platform-owned pool and
+    /// per-output bookkeeping used by the live scene constructor. This is
+    /// deliberately allocation-only: the Task 8 owner fixture must exercise
+    /// a multi-CRTC owner bundle without modesetting the user's display.
+    #[cfg(test)]
+    pub(crate) fn append_test_output_with_scanout_pool(
+        &mut self,
+        vk: std::sync::Arc<crate::kms::vk::device::VkContext>,
+        connector_name: &str,
+    ) -> io::Result<()> {
+        self.append_test_output_without_scanout_pool(connector_name);
+        let output_idx = self.outputs.len().saturating_sub(1);
+        let layout = &self.outputs[output_idx];
+        let kms_device = self
+            .device_for_key(layout.key.device_key)
+            .ok_or_else(|| io::Error::other("test output has no KMS device"))?;
+        let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
+            vk,
+            Rc::clone(&kms_device.device),
+            layout.scanout_route,
+            u32::from(layout.width),
+            u32::from(layout.height),
+            SCANOUT_POOL_DEPTH,
+            &layout.output.scanout_modifiers,
+        )
+        .map_err(|error| io::Error::other(format!("test output scanout pool: {error}")))?;
+        self.scanout_pools[output_idx] = Some(OutputScanout::Shared(pool));
+        self.bo_generations[output_idx] = self.scanout_pools[output_idx]
+            .as_ref()
+            .map_or_else(Vec::new, |pool| {
+                vec![BoGenerationEntry::default(); pool.display_pool().bos.len()]
+            });
+        Ok(())
+    }
+
+    /// Install a transport gate after checking the complete device route.
+    ///
+    /// Legacy gates are used by the older fixture and recovery paths and do
+    /// not need scanout ownership.  An Owner gate is different: the scene's
+    /// owner fork can only be safe when every output on this device has a
+    /// shared, already-adopted pool.  Keep the refusal at the establishment
+    /// boundary so a caller can observe it and the device remains implicitly
+    /// Legacy (no gate is installed).
+    pub(crate) fn try_install_transport_gate(
+        &mut self,
+        gate: crate::kms::render::resources::TransportGate,
+    ) -> Result<(), OwnerEligibilityError> {
+        if gate.state() == crate::kms::render::resources::TransportState::Owner {
+            self.check_owner_eligibility(gate.device())?;
+        }
+        self.install_transport_gate(gate);
+        Ok(())
+    }
+
+    fn check_owner_eligibility(
+        &self,
+        device: crate::platform::drm::DrmDeviceKey,
+    ) -> Result<(), OwnerEligibilityError> {
+        let mut kinds = Vec::new();
+        for (output_idx, _output) in self
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| output.key.device_key == device)
+        {
+            let Some(scanout) = self.scanout_pools.get(output_idx).and_then(Option::as_ref) else {
+                kinds.push(OwnerOutputKind::Missing);
+                continue;
+            };
+            if !matches!(scanout, OutputScanout::Shared(_)) {
+                kinds.push(OwnerOutputKind::Copied);
+                continue;
+            }
+            let pool = scanout.display_pool();
+            if pool.bos.is_empty() || pool.bos.iter().any(|bo| bo.managed_key().is_none()) {
+                kinds.push(OwnerOutputKind::Unmanaged);
+                continue;
+            }
+            kinds.push(OwnerOutputKind::SharedManaged);
+        }
+        validate_owner_output_kinds(&kinds)
+    }
+
+    /// The scene's single route predicate.  Eligibility is checked again at
+    /// the use site so a topology/pool change cannot silently fall back to a
+    /// legacy KMS ioctl while the transport gate still says Owner.
+    pub(crate) fn output_uses_owner_route(&self, output_idx: usize) -> bool {
+        let Some(output) = self.outputs.get(output_idx) else {
+            return false;
+        };
+        self.transport_gate(&output.key.device_key)
+            .is_some_and(|gate| {
+                gate.state() == crate::kms::render::resources::TransportState::Owner
+                    && self
+                        .scanout_pools
+                        .get(output_idx)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|scanout| {
+                            matches!(scanout, OutputScanout::Shared(_))
+                                && !scanout.display_pool().bos.is_empty()
+                                && scanout
+                                    .display_pool()
+                                    .bos
+                                    .iter()
+                                    .all(|bo| bo.managed_key().is_some())
+                        })
+            })
+    }
+
+    /// Return an owner-route buffer to the pool after its displacement batch
+    /// is proven complete by `ResourceService`. There is deliberately no KMS
+    /// retirement or fake page event in this path.
+    pub(crate) fn release_owner_displaced_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        if bo.state.phase != BoPhase::OwnerDisplaced {
+            return false;
+        }
+        bo.state.transition_to_free_after_owner_displacement()
+    }
+
+    pub(crate) fn displace_owner_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        if !matches!(
+            bo.state.phase,
+            BoPhase::OwnerRendering | BoPhase::OwnerDesired
+        ) {
+            return false;
+        }
+        bo.state.transition_to_owner_displaced()
+    }
+
+    pub(crate) fn reject_owner_submitted_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        if bo.state.phase != BoPhase::OwnerSubmitted {
+            return false;
+        }
+        bo.state.transition_to_owner_displaced()
+    }
+
+    pub(crate) fn complete_owner_rendering_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        if bo.state.phase != BoPhase::OwnerRendering {
+            return false;
+        }
+        bo.state.transition_to_owner_desired();
+        true
+    }
+
+    pub(crate) fn accept_owner_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_accepted()
+    }
+
+    pub(crate) fn current_owner_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_current()
+    }
+
+    pub(crate) fn release_owner_current_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_releasing()
+    }
+
+    pub(crate) fn restore_owner_current_bo_after_release_abort(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_current_after_release_abort()
+    }
+
+    pub(crate) fn release_owner_releasing_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_free_after_owner_release()
+    }
+
+    pub(crate) fn quarantine_owner_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+        else {
+            return false;
+        };
+        bo.state.transition_to_owner_quarantined()
+    }
+
+    pub(crate) fn owner_bo_phase(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> Option<crate::kms::vk::scanout::BoPhase> {
+        self.scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .and_then(|scanout| scanout.display_pool().bos.get(bo_idx))
+            .map(|bo| bo.state.phase)
     }
 
     pub(crate) fn allows_legacy(
@@ -4579,6 +4925,7 @@ impl PlatformBackend {
         self.devices.push(KmsDevice {
             key,
             device: std::rc::Rc::new(device),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
@@ -4601,6 +4948,7 @@ impl PlatformBackend {
         self.devices.push(KmsDevice {
             key,
             device: std::rc::Rc::new(device),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: Some(owner),
@@ -6119,8 +6467,9 @@ impl PlatformBackend {
                 display,
                 renderer,
                 output,
+                bo_idx,
                 topology_generation: topology_gen,
-                last_present_generation: entry.last_present_generation.unwrap_or(0),
+                last_present_generation: entry.last_present_generation,
                 content_invalidated: entry.content_invalidated,
             });
         }
@@ -8600,6 +8949,7 @@ mod tests {
         KmsDevice {
             key,
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: None,
@@ -9193,6 +9543,7 @@ mod tests {
         platform.devices.push(KmsDevice {
             key: second_key,
             device: Rc::new(drm::Device::for_tests().expect("second test DRM device")),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: None,
@@ -9215,6 +9566,7 @@ mod tests {
                 minor: 1,
             },
             device: second_device,
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new(),
             executor: None,
             owner: None,
@@ -9805,6 +10157,7 @@ mod tests {
         platform.devices.push(KmsDevice {
             key: nvidia_key,
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            active_property_cache: Default::default(),
             cursor: KmsCursorState::new_with_nvidia_policy(true),
             executor: None,
             owner: None,
@@ -10041,6 +10394,30 @@ mod tests {
     fn for_tests_scanout_acquire_returns_none() {
         let mut p = PlatformBackend::for_tests();
         assert!(p.acquire_scanout_bo(0).is_none());
+    }
+
+    #[test]
+    fn owner_output_kind_validator_rejects_copied_route() {
+        let error = validate_owner_output_kinds(&[OwnerOutputKind::Copied])
+            .expect_err("copied route must not enter Owner");
+        assert!(matches!(
+            error,
+            OwnerEligibilityError::CopiedScanoutRoute { output_idx: 0 }
+        ));
+    }
+
+    #[test]
+    fn owner_output_kind_validator_rejects_one_bad_output_of_many() {
+        let error = validate_owner_output_kinds(&[
+            OwnerOutputKind::SharedManaged,
+            OwnerOutputKind::Copied,
+            OwnerOutputKind::SharedManaged,
+        ])
+        .expect_err("one bad output must keep the whole device Legacy");
+        assert!(matches!(
+            error,
+            OwnerEligibilityError::CopiedScanoutRoute { output_idx: 1 }
+        ));
     }
 
     /// Pending-move slot is None on a fresh backend and stays None

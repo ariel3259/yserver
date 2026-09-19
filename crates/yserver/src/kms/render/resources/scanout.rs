@@ -566,7 +566,8 @@ pub(crate) struct ManagedScanoutToken {
     pub display: AllocationLease,
     pub renderer: Option<AllocationLease>,
     pub output: CrtcKey,
+    pub bo_idx: usize,
     pub topology_generation: u64,
-    pub last_present_generation: u64,
+    pub last_present_generation: Option<u64>,
     pub content_invalidated: bool,
 }

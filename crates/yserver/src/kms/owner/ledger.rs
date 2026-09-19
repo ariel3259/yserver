@@ -67,6 +67,10 @@ impl<R> Submitted<R> {
         Quarantined { held }
     }
 
+    pub fn new_resources(&self) -> &[R] {
+        &self.new
+    }
+
     pub fn into_parts(self) -> (Vec<R>, Vec<R>) {
         (self.old, self.new)
     }
