@@ -14,13 +14,14 @@ use crate::{
         owner::{
             admission::{
                 Admission, AdmissionDecision, AdmissionError, AdmissionToken, Admitted,
-                CarriedMaintenance, Confirmed, CrtcId, DirectSuccessor, IntentKey, MaintenanceKey,
-                Readiness, ReadinessSnapshot, Tier, WaitReason,
+                CarriedMaintenance, Confirmed, CrtcId, DirectSuccessor, IntentKey,
+                MaintenanceClass, MaintenanceKey, Readiness, ReadinessSnapshot, Reentry,
+                ReentryKind, Tier, WaitReason,
             },
             build::CommitDescription,
             device::{DispatchError, OwnerEvent},
             identity::CommitId,
-            record::RefusalCause,
+            record::{FailureCause, RefusalCause, TerminalState},
         },
         render::{
             backend::{KmsBackend, PreparedDirectDispatch},
@@ -132,6 +133,7 @@ pub(crate) struct AdmissionConductor {
     pub(crate) maintenance: MaintenanceStore,
     pub(crate) receipts: BTreeMap<CommitId, AdmissionReceipt>,
     pub(crate) recovery_stopped: bool,
+    pub(crate) gamma_failures: BTreeSet<CrtcId>,
     #[cfg(test)]
     pub(crate) prepare_hook: Option<AdmissionPreparationHook>,
     #[cfg(test)]
@@ -152,6 +154,7 @@ impl AdmissionConductor {
             maintenance: MaintenanceStore::default(),
             receipts: BTreeMap::new(),
             recovery_stopped: false,
+            gamma_failures: BTreeSet::new(),
             #[cfg(test)]
             prepare_hook: None,
             #[cfg(test)]
@@ -1018,6 +1021,150 @@ impl KmsBackend {
             },
         );
         true
+    }
+
+    /// Apply a terminal owner outcome to the maintenance payloads carried by
+    /// this commit. `Ok(false)` means that this commit is not a maintenance
+    /// receipt and the ordinary resource path must handle the event.
+    pub(crate) fn admission_handle_terminal(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        terminal: TerminalState,
+    ) -> Result<bool, ()> {
+        let Some(receipt) = self
+            .admission_conductors
+            .get(&device)
+            .and_then(|conductor| conductor.receipts.get(&commit))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+
+        let Some(conductor) = self.admission_conductors.get(&device) else {
+            return Err(());
+        };
+        let mut keys = BTreeSet::new();
+        if receipt
+            .carried
+            .iter()
+            .any(|carried| !keys.insert(carried.key))
+        {
+            return Err(());
+        }
+        match terminal {
+            TerminalState::Completed => {
+                if receipt.carried.iter().any(|carried| {
+                    conductor
+                        .maintenance
+                        .submitted
+                        .get(&carried.key)
+                        .is_none_or(|payload| payload.generation != carried.generation)
+                }) {
+                    return Err(());
+                }
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { .. }) => {
+                if receipt.carried.iter().any(|carried| {
+                    conductor
+                        .maintenance
+                        .submitted
+                        .get(&carried.key)
+                        .is_none_or(|payload| payload.generation != carried.generation)
+                        || conductor
+                            .maintenance
+                            .desired
+                            .get(&carried.key)
+                            .is_some_and(|payload| payload.generation <= carried.generation)
+                }) {
+                    return Err(());
+                }
+            }
+            TerminalState::CompletionUnknown(_) => {
+                if receipt.carried.iter().any(|carried| {
+                    conductor
+                        .maintenance
+                        .submitted
+                        .get(&carried.key)
+                        .is_none_or(|payload| payload.generation != carried.generation)
+                        || conductor.maintenance.dormant.contains_key(&carried.key)
+                }) {
+                    return Err(());
+                }
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(_)) => {
+                return Err(());
+            }
+        }
+
+        let conductor = self.admission_conductors.get_mut(&device).ok_or(())?;
+        match terminal {
+            TerminalState::Completed => {
+                for carried in &receipt.carried {
+                    let payload = conductor
+                        .maintenance
+                        .submitted
+                        .remove(&carried.key)
+                        .ok_or(())?;
+                    conductor.maintenance.current.insert(carried.key, payload);
+                    conductor
+                        .admission
+                        .note_completed(carried.key, carried.generation);
+                }
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { .. }) => {
+                for carried in &receipt.carried {
+                    let payload = conductor
+                        .maintenance
+                        .submitted
+                        .remove(&carried.key)
+                        .ok_or(())?;
+                    if conductor
+                        .maintenance
+                        .desired
+                        .get(&carried.key)
+                        .is_none_or(|desired| desired.generation <= carried.generation)
+                    {
+                        conductor.maintenance.desired.insert(carried.key, payload);
+                    }
+                    if conductor.admission.reenter(
+                        carried.key,
+                        carried.generation,
+                        carried.ticket,
+                        ReentryKind::Rejected,
+                    ) == Reentry::Dropped
+                    {
+                        conductor.maintenance.desired.remove(&carried.key);
+                        match carried.key.class {
+                            MaintenanceClass::Cursor => {
+                                conductor
+                                    .admission
+                                    .request_cursor_recovery(carried.key.crtc);
+                            }
+                            MaintenanceClass::Gamma => {
+                                conductor.gamma_failures.insert(carried.key.crtc);
+                            }
+                        }
+                    }
+                }
+            }
+            TerminalState::CompletionUnknown(_) => {
+                for carried in &receipt.carried {
+                    let payload = conductor
+                        .maintenance
+                        .submitted
+                        .remove(&carried.key)
+                        .ok_or(())?;
+                    conductor.maintenance.dormant.insert(carried.key, payload);
+                }
+                conductor.recovery_stopped = true;
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(_)) => {
+                return Err(());
+            }
+        }
+        conductor.receipts.remove(&commit);
+        Ok(true)
     }
 
     fn admission_abort(&mut self, device: DrmDeviceKey, token: AdmissionToken) {

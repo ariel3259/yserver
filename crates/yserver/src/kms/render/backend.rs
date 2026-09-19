@@ -19824,41 +19824,68 @@ impl KmsBackend {
                     );
                 }
             }
+            crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => {
+                if self
+                    .admission_handle_terminal(device_key, commit, terminal)
+                    .is_err()
+                    && let Some(gate) = self.platform.transport_gate_mut(&device_key)
+                {
+                    gate.force_close();
+                }
+                if let Some(service) = &mut self.resource_service {
+                    let _ = self.commit_consumer.consume(
+                        crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal },
+                        service,
+                    );
+                }
+            }
             crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
                 let admission_active = self.admission_is_active(device_key);
                 let conductor_installed = self.admission_conductors.contains_key(&device_key);
-                let Some(service) = &mut self.resource_service else {
-                    if admission_active {
+                let maintenance_only = self
+                    .admission_conductors
+                    .get(&device_key)
+                    .and_then(|conductor| conductor.receipts.get(&commit))
+                    .is_some_and(|receipt| receipt.maintenance_only);
+                if !maintenance_only {
+                    let Some(service) = &mut self.resource_service else {
+                        if admission_active {
+                            log::error!(
+                                "owner completion retirement has no resource service for {device_key}"
+                            );
+                            if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
+                                gate.force_close();
+                            }
+                        }
+                        return;
+                    };
+                    if let Err(error) = self.commit_consumer.consume(
+                        crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                            commit,
+                            resources,
+                        },
+                        service,
+                    ) {
+                        if !admission_active {
+                            return;
+                        }
                         log::error!(
-                            "owner completion retirement has no resource service for {device_key}"
+                            "owner completion retirement disposition failed for {device_key}: {error:?}"
                         );
                         if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
                             gate.force_close();
                         }
-                    }
-                    return;
-                };
-                if let Err(error) = self.commit_consumer.consume(
-                    crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources },
-                    service,
-                ) {
-                    if !admission_active {
                         return;
                     }
-                    log::error!(
-                        "owner completion retirement disposition failed for {device_key}: {error:?}"
-                    );
-                    if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
-                        gate.force_close();
-                    }
-                    return;
                 }
                 if !conductor_installed {
                     return;
                 }
 
                 #[cfg(test)]
-                if let Some(conductor) = self.admission_conductors.get_mut(&device_key) {
+                if !maintenance_only
+                    && let Some(conductor) = self.admission_conductors.get_mut(&device_key)
+                {
                     conductor.trace.push(
                         crate::kms::render::admission::AdmissionTraceStep::Consumed(commit),
                     );
@@ -52602,7 +52629,12 @@ mod tests {
 
     #[test]
     fn c0_adm_conductor_transport_close_still_drains_the_live_commit() {
-        use crate::kms::executor::test_support::StubBehaviour;
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
 
         let mut backend = backend_with_current_and_successor_for_admission_seam();
         let device = backend.platform.primary_device().unwrap().key;
@@ -52617,6 +52649,20 @@ mod tests {
         backend
             .admission_offer_composed(device, 1, 1)
             .expect("composed offer");
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 7,
+                    data: Arc::<[u8]>::from(vec![7]),
+                },
+            )
+            .expect("gamma offer");
         let commit = match backend.admission_wake(device, false) {
             crate::kms::render::admission::AdmissionOutcome::Dispatched(_confirmed) => backend
                 .device_owner_for_tests(0)
@@ -52640,6 +52686,23 @@ mod tests {
 
         assert_eq!(backend.commit_consumer.current_resources.len(), 1);
         assert_eq!(backend.commit_consumer.rejected_resources.len(), 1);
+        assert!(backend.admission_conductors[&device].receipts.is_empty());
+        assert_eq!(
+            backend.admission_conductors[&device]
+                .maintenance
+                .submitted
+                .get(&gamma),
+            None,
+            "closed transport must still drain the receipt"
+        );
+        assert_eq!(
+            backend.admission_conductors[&device]
+                .maintenance
+                .desired
+                .get(&gamma)
+                .map(|payload| payload.generation),
+            Some(7)
+        );
         assert_eq!(
             backend.admission_trace_for_tests(device),
             trace_before_close,
@@ -52651,6 +52714,629 @@ mod tests {
                 .slot()
                 .occupant()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_completed_promotes_the_carried_generation() {
+        use crate::kms::{
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 7,
+                    data: Arc::<[u8]>::from(vec![7]),
+                },
+            )
+            .expect("gamma offer");
+        let commit = match backend.admission_wake(device, false) {
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_) => backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("maintenance commit")
+                .commit_id(),
+            outcome => panic!("maintenance admission did not dispatch: {outcome:?}"),
+        };
+
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Terminal {
+                commit,
+                terminal: crate::kms::owner::record::TerminalState::Completed,
+            }],
+            std::time::Instant::now(),
+        );
+
+        let conductor = &backend.admission_conductors[&device];
+        assert_eq!(conductor.maintenance.submitted.get(&gamma), None);
+        assert_eq!(
+            conductor
+                .maintenance
+                .current
+                .get(&gamma)
+                .map(|payload| payload.generation),
+            Some(7)
+        );
+        assert!(conductor.receipts.is_empty());
+        assert_eq!(conductor.admission.rejection_count(gamma), 0);
+    }
+
+    #[test]
+    fn c0_adm_conductor_maintenance_only_retirement_keeps_the_primary_current() {
+        use crate::kms::{
+            owner::{
+                admission::{MaintenanceClass, MaintenanceKey},
+                ledger::Submitted,
+            },
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("spawn stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 9,
+                    data: Arc::<[u8]>::from(vec![9]),
+                },
+            )
+            .expect("gamma offer");
+        let commit = match backend.admission_wake(device, false) {
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_) => backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("maintenance commit")
+                .commit_id(),
+            outcome => panic!("maintenance admission did not dispatch: {outcome:?}"),
+        };
+        let current_before = backend.commit_consumer.current_resources.len();
+        let current_role = backend.commit_consumer.current_resources[0]
+            .direct_role
+            .as_ref()
+            .expect("current direct role")
+            .role();
+
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                    commit,
+                    resources: Submitted::new(Vec::new(), Vec::new()).accepted(),
+                },
+                crate::kms::owner::device::OwnerEvent::Terminal {
+                    commit,
+                    terminal: crate::kms::owner::record::TerminalState::Completed,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(
+            backend.commit_consumer.current_resources.len(),
+            current_before
+        );
+        assert_eq!(
+            backend.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("primary current direct role")
+                .role(),
+            current_role
+        );
+        assert!(backend.admission_conductors[&device].receipts.is_empty());
+    }
+
+    #[test]
+    fn c0_adm_conductor_rejection_reenters_the_carried_payload() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                StubBehaviour::RejectWithRepeatedly(libc::EINVAL),
+            )
+            .expect("spawn rejecting stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 7,
+                    data: Arc::<[u8]>::from(vec![7]),
+                },
+            )
+            .expect("gamma offer");
+        let original_ticket = backend.admission_conductors[&device]
+            .admission
+            .maintenance(gamma)
+            .expect("queued gamma")
+            .ticket;
+        let first_commit = match backend.admission_wake(device, false) {
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_) => backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("first commit")
+                .commit_id(),
+            outcome => panic!("gamma admission did not dispatch: {outcome:?}"),
+        };
+
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+
+        let conductor = &backend.admission_conductors[&device];
+        assert_eq!(conductor.maintenance.submitted[&gamma].generation, 7);
+        assert_eq!(conductor.maintenance.dormant.get(&gamma), None);
+        assert_eq!(conductor.receipts.len(), 1);
+        assert_eq!(
+            conductor.receipts.values().next().unwrap().carried[0].ticket,
+            original_ticket
+        );
+        assert_eq!(conductor.admission.rejection_count(gamma), 1);
+        assert_ne!(
+            conductor.receipts.values().next().unwrap().commit,
+            first_commit
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_rejection_collision_keeps_the_newer_payload() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                StubBehaviour::RejectWithRepeatedly(libc::EINVAL),
+            )
+            .expect("spawn rejecting stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 7,
+                    data: Arc::<[u8]>::from(vec![7]),
+                },
+            )
+            .expect("first gamma offer");
+        let old_ticket = backend.admission_conductors[&device]
+            .admission
+            .maintenance(gamma)
+            .expect("first gamma")
+            .ticket;
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let _first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first commit")
+            .commit_id();
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 8,
+                    data: Arc::<[u8]>::from(vec![8]),
+                },
+            )
+            .expect("newer gamma offer");
+
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+
+        let conductor = &backend.admission_conductors[&device];
+        assert_eq!(conductor.maintenance.submitted[&gamma].generation, 8);
+        assert_eq!(conductor.maintenance.submitted[&gamma].data.as_ref(), &[8]);
+        assert_eq!(
+            conductor.receipts.values().next().unwrap().carried[0].ticket,
+            old_ticket
+        );
+        assert_eq!(conductor.admission.rejection_count(gamma), 1);
+    }
+
+    #[test]
+    fn c0_adm_conductor_second_rejection_drops_a_cursor_into_recovery() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                StubBehaviour::RejectWithRepeatedly(libc::EINVAL),
+            )
+            .expect("spawn rejecting stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _, _, recovery_ready) =
+            AdmissionSourceFixture::new_with_snapshot_controls();
+        recovery_ready.borrow_mut().insert(1);
+        backend.install_admission_conductor_for_tests(device, source);
+        let cursor = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Cursor,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                cursor,
+                MaintenancePayload {
+                    generation: 1,
+                    data: Arc::<[u8]>::from(vec![1]),
+                },
+            )
+            .expect("cursor offer");
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first cursor commit")
+            .commit_id();
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("re-entered cursor commit")
+            .commit_id();
+        assert_ne!(second_commit, first_commit);
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+
+        let conductor = &backend.admission_conductors[&device];
+        assert!(!conductor.maintenance.desired.contains_key(&cursor));
+        assert!(!conductor.maintenance.submitted.contains_key(&cursor));
+        assert_eq!(conductor.admission.rejection_count(cursor), 2);
+        assert!(conductor.admission.cursor_recovery().contains(&1));
+        assert!(conductor.receipts.is_empty());
+        assert_eq!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Unsupported(
+                crate::kms::owner::admission::Tier::Unflip
+            )
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_second_rejection_records_a_gamma_failure() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                StubBehaviour::RejectWithRepeatedly(libc::EINVAL),
+            )
+            .expect("spawn rejecting stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, readiness, _, _, _, _, _, _) = AdmissionSourceFixture::new_with_controls();
+        backend.install_admission_conductor_for_tests(device, source);
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 1,
+                    data: Arc::<[u8]>::from(vec![1]),
+                },
+            )
+            .expect("gamma offer");
+        backend
+            .admission_offer_composed(device, 1, 4)
+            .expect("primary offer behind gamma");
+        let primary = crate::kms::owner::admission::IntentKey::Composed {
+            crtc: 1,
+            generation: 4,
+        };
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            primary,
+            crate::kms::owner::admission::Readiness::Waiting(
+                crate::kms::owner::admission::WaitReason::SourceWaits,
+            ),
+        );
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let _first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first gamma commit")
+            .commit_id();
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+        AdmissionSourceFixture::set_readiness(
+            &readiness,
+            primary,
+            crate::kms::owner::admission::Readiness::Ready,
+        );
+        let _second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("second gamma commit")
+            .commit_id();
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+
+        let conductor = &backend.admission_conductors[&device];
+        assert!(conductor.gamma_failures.contains(&1));
+        assert!(!conductor.maintenance.desired.contains_key(&gamma));
+        assert!(!conductor.maintenance.submitted.contains_key(&gamma));
+        assert!(conductor.admission.composed(1).is_none());
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        assert!(
+            backend
+                .admission_trace_for_tests(device)
+                .iter()
+                .filter(|step| matches!(
+                    step,
+                    crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                ))
+                .count()
+                >= 3
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_unknown_parks_the_payload() {
+        use crate::kms::{
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 7,
+                    data: Arc::<[u8]>::from(vec![7]),
+                },
+            )
+            .expect("first gamma offer");
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("gamma commit")
+            .commit_id();
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 8,
+                    data: Arc::<[u8]>::from(vec![8]),
+                },
+            )
+            .expect("newer gamma offer");
+        let before_trace = backend.admission_trace_for_tests(device);
+
+        backend.record_host_call_events(vec![(
+            device,
+            crate::kms::owner::test_fixtures::unknown(
+                first_commit,
+                crate::kms::executor::UnknownReason::HelperExited,
+            ),
+        )]);
+
+        let conductor = &backend.admission_conductors[&device];
+        assert_eq!(conductor.maintenance.submitted.get(&gamma), None);
+        assert_eq!(conductor.maintenance.dormant[&gamma].generation, 7);
+        assert_eq!(conductor.maintenance.desired[&gamma].generation, 8);
+        assert_eq!(conductor.admission.rejection_count(gamma), 0);
+        assert!(conductor.recovery_stopped);
+        assert!(conductor.receipts.is_empty());
+        assert_eq!(backend.admission_trace_for_tests(device), before_trace);
+        assert_eq!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Inert
+        );
+    }
+
+    #[test]
+    fn c0_adm_conductor_two_identities_progress_under_continuous_collision() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::admission::{MaintenanceClass, MaintenanceKey},
+            render::admission::MaintenancePayload,
+        };
+        use std::sync::Arc;
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                StubBehaviour::RejectWithRepeatedly(libc::EINVAL),
+            )
+            .expect("spawn rejecting stub executor"),
+        );
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let gamma = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Gamma,
+        };
+        let cursor = MaintenanceKey {
+            crtc: 2,
+            class: MaintenanceClass::Cursor,
+        };
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 1,
+                    data: Arc::<[u8]>::from(vec![1]),
+                },
+            )
+            .expect("gamma offer");
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let _first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first gamma commit")
+            .commit_id();
+        backend
+            .admission_offer_maintenance(
+                device,
+                cursor,
+                MaintenancePayload {
+                    generation: 1,
+                    data: Arc::<[u8]>::from(vec![11]),
+                },
+            )
+            .expect("cursor offer");
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 2,
+                    data: Arc::<[u8]>::from(vec![2]),
+                },
+            )
+            .expect("first colliding gamma offer");
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+
+        let _second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("second gamma commit")
+            .commit_id();
+        backend
+            .admission_offer_maintenance(
+                device,
+                gamma,
+                MaintenancePayload {
+                    generation: 3,
+                    data: Arc::<[u8]>::from(vec![3]),
+                },
+            )
+            .expect("second colliding gamma offer");
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        backend.before_block();
+
+        let conductor = &backend.admission_conductors[&device];
+        assert!(conductor.gamma_failures.contains(&1));
+        assert!(!conductor.maintenance.desired.contains_key(&gamma));
+        assert!(!conductor.maintenance.submitted.contains_key(&gamma));
+        assert_eq!(conductor.admission.rejection_count(gamma), 2);
+        assert_eq!(conductor.maintenance.submitted[&cursor].generation, 1);
+        let trace = backend.admission_trace_for_tests(device);
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|step| matches!(
+                    step,
+                    crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                ))
+                .count(),
+            3,
+            "the cursor must be admitted by the third slot"
         );
     }
 
