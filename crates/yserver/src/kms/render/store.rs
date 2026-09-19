@@ -1820,6 +1820,19 @@ impl DrawableStore {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn snapshot_region_is_pending_for_tests(&self, snap: &DamageSnapshot) -> bool {
+        let Some(drawable) = self.entries.get(&snap.id) else {
+            return false;
+        };
+        !snap.region.is_empty()
+            && snap
+                .region
+                .rects()
+                .iter()
+                .all(|rect| drawable.presentation_damage.rects().contains(rect))
+    }
+
     /// Stage 4a — set or clear a window's COMPOSITE redirect
     /// routing. `Some(backing_id)` routes future paint resolution
     /// against `window_id`'s xid (or any descendant whose nearest

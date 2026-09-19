@@ -134,6 +134,16 @@ pub enum BoPhase {
     /// `Free` once all GPU readers (e.g. damage-diff sources)
     /// complete.
     Retiring,
+    /// Owner route: the compose GPU submission exists and its render
+    /// completion is registered with the platform drain. There is no KMS
+    /// in-fence on this route.
+    OwnerRendering,
+    /// Owner route: render completion was drained and the generation is
+    /// available to the admission conductor.
+    OwnerDesired,
+    /// Owner route: a newer generation displaced this one before admission.
+    /// It returns to `Free` only after its compose GPU batch retires.
+    OwnerDisplaced,
 }
 
 /// Reuse state for a binary semaphore whose submitted payload is exported as
@@ -374,6 +384,38 @@ impl BoState {
     pub fn transition_to_recording(&mut self) {
         debug_assert_eq!(self.phase, BoPhase::Free);
         self.phase = BoPhase::Recording;
+    }
+
+    /// `Recording → OwnerRendering`: the owner route has submitted the
+    /// compose and registered its render-completion payload. No KMS fence is
+    /// retained in this state.
+    pub fn transition_to_owner_rendering(&mut self) {
+        debug_assert_eq!(self.phase, BoPhase::Recording);
+        self.phase = BoPhase::OwnerRendering;
+    }
+
+    /// `OwnerRendering → OwnerDesired`: the platform drain observed the
+    /// render completion, so the generation may be offered to admission.
+    pub fn transition_to_owner_desired(&mut self) {
+        debug_assert_eq!(self.phase, BoPhase::OwnerRendering);
+        self.phase = BoPhase::OwnerDesired;
+    }
+
+    /// `OwnerRendering|OwnerDesired → OwnerDisplaced`: latest-wins
+    /// replacement before an owner commit. This buffer never acquired a KMS
+    /// state and therefore has no KMS release gate.
+    pub fn transition_to_owner_displaced(&mut self) {
+        debug_assert!(matches!(
+            self.phase,
+            BoPhase::OwnerRendering | BoPhase::OwnerDesired
+        ));
+        self.phase = BoPhase::OwnerDisplaced;
+    }
+
+    /// `OwnerDisplaced → Free` after the compose GPU batch has retired.
+    pub fn transition_to_free_after_owner_displacement(&mut self) {
+        debug_assert_eq!(self.phase, BoPhase::OwnerDisplaced);
+        self.phase = BoPhase::Free;
     }
 
     /// `Recording → Submitted`: `vkQueueSubmit2` issued. Caller

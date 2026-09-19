@@ -73,7 +73,7 @@ use ash::vk;
 use yserver_protocol::x11::xfixes;
 
 use super::{
-    platform::{FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
+    platform::{CrtcKey, FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
     region::Region,
     resources::{AllocationKey, CoreRetirementBatch, ResourceError, ResourceService},
     scanout_damage::ScanoutDamage,
@@ -85,6 +85,7 @@ use super::{
     telemetry::Telemetry,
 };
 use crate::kms::{
+    backend::OutputKey,
     core::KmsCore,
     render::composite_pool_ring::CompositePoolRing,
     vk::{
@@ -107,12 +108,18 @@ use crate::kms::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InFlightStage {
     WaitingForRenderCompletion { job_id: u64 },
+    OwnerRenderWaiting { job_id: u64 },
+    OwnerDesired,
     KmsFlipPending,
 }
 
 impl InFlightStage {
     fn matches_render_completion(self, job_id: u64) -> bool {
         self == Self::WaitingForRenderCompletion { job_id }
+    }
+
+    fn matches_owner_render_completion(self, job_id: u64) -> bool {
+        self == Self::OwnerRenderWaiting { job_id }
     }
 
     fn is_kms_flip_pending(self) -> bool {
@@ -463,6 +470,11 @@ struct OutputSceneState {
     /// `pool_slots[i]`. Released to the ring on flip retirement.
     pool_slots: VecDeque<usize>,
     pending_acks: VecDeque<PendingAck>,
+    /// Owner-route composed generations are not page-flip acks. The active
+    /// generation remains here until its render completion is drained and
+    /// offered; a newer generation moves it to `owner_displaced`.
+    owner_prepared: Option<PreparedComposed>,
+    owner_displaced: VecDeque<PreparedComposed>,
     /// Fence-gated descriptor-pool slot releases. At
     /// `handle_page_flip_complete` we want to pop the matching
     /// `pool_slots` entry and free it, but the compose CB's Vulkan
@@ -938,6 +950,19 @@ pub(crate) struct SceneCompositor {
     test_flip_in_flight_override: Option<bool>,
 }
 
+pub(crate) struct ComposedOffer {
+    pub(crate) device: crate::platform::drm::DrmDeviceKey,
+    pub(crate) crtc: u32,
+    pub(crate) generation: u64,
+}
+
+struct PreparedComposed {
+    output_key: OutputKey,
+    managed_key: AllocationKey,
+    pool_slot: usize,
+    ack: PendingAck,
+}
+
 struct SceneCompositorInner {
     vk: Arc<crate::kms::vk::device::VkContext>,
     pipeline: CompositorPipeline,
@@ -960,6 +985,7 @@ struct SceneCompositorInner {
     /// is just a default-arrow fallback so hardware smoke has
     /// visible pointer feedback.
     cursor: Option<CursorEntry>,
+    owner_offers: VecDeque<ComposedOffer>,
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -1297,6 +1323,7 @@ impl SceneCompositor {
                 damage_audit_ledger: VecDeque::new(),
                 damage_audit_next_event_id: 0,
                 cursor: None,
+                owner_offers: VecDeque::new(),
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
@@ -1331,6 +1358,8 @@ impl SceneCompositor {
             pool_slots: VecDeque::with_capacity(4),
             pending_pool_releases: VecDeque::with_capacity(4),
             pending_acks: VecDeque::with_capacity(4),
+            owner_prepared: None,
+            owner_displaced: VecDeque::with_capacity(4),
             failed_submit_bos: VecDeque::with_capacity(4),
             damage_history: BufferAgeRing::new(bo_depth + 1),
             current_generation: 0,
@@ -1428,6 +1457,97 @@ impl SceneCompositor {
     /// this to skip Vk-only assertions.
     pub(crate) fn is_live(&self) -> bool {
         self.inner.is_some()
+    }
+
+    pub(crate) fn take_owner_composed_offers(&mut self) -> Vec<ComposedOffer> {
+        self.inner
+            .as_mut()
+            .map(|inner| inner.owner_offers.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_prepared_for_tests(&self, output_idx: usize) -> Option<(usize, u64, bool)> {
+        let prepared = self
+            .inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)?
+            .owner_prepared
+            .as_ref()?;
+        Some((
+            prepared.ack.bo_idx,
+            prepared.ack.generation,
+            matches!(prepared.ack.stage, InFlightStage::OwnerRenderWaiting { .. }),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_displaced_len_for_tests(&self, output_idx: usize) -> usize {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map_or(0, |state| state.owner_displaced.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn damage_state_for_tests(&self, output_idx: usize) -> Option<(bool, bool)> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map(|state| (state.damage.owes_repaint(), state.damage.has_staged_frame()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repaint_for_tests(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+        loadable: bool,
+        rect: vk::Rect2D,
+    ) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .is_some_and(|state| {
+                state
+                    .damage
+                    .repaint_for(bo_idx, loadable)
+                    .contains_rect(rect)
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_displaced_snapshots_for_tests(
+        &self,
+        output_idx: usize,
+        store: &DrawableStore,
+    ) -> (usize, bool) {
+        let Some(state) = self
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+        else {
+            return (0, false);
+        };
+        let Some(prepared) = state.owner_displaced.front() else {
+            return (0, false);
+        };
+        let snapshots = &prepared.ack.drawable_snapshots;
+        (
+            snapshots.len(),
+            snapshots
+                .iter()
+                .any(|snapshot| store.snapshot_region_is_pending_for_tests(snapshot)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_ack_count_for_tests(&self, output_idx: usize) -> usize {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map_or(0, |state| state.pending_acks.len())
     }
 
     fn full_output_audit_area(&self) -> Vec<vk::Rect2D> {
@@ -1803,6 +1923,49 @@ impl SceneCompositor {
         platform.clear_scanout_render_completions();
         let vk = inner.vk.clone();
         for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
+            if let Some(prepared) = o.owner_prepared.take() {
+                if platform.displace_owner_bo(output_idx, prepared.ack.bo_idx) {
+                    o.owner_displaced.push_back(prepared);
+                } else {
+                    log::error!(
+                        "render scene drain: Owner prepared buffer {} was not displaceable",
+                        prepared.ack.bo_idx
+                    );
+                    platform.renderer_failed = true;
+                }
+            }
+            while let Some(mut prepared) = o.owner_displaced.pop_front() {
+                let wait_ok = prepared.ack.ticket.as_ref().is_none_or(|ticket| {
+                    match ticket.wait(&vk) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::error!(
+                                "render scene drain: Owner displaced compose wait failed: {error:?}"
+                            );
+                            platform.renderer_failed = true;
+                            false
+                        }
+                    }
+                });
+                if wait_ok {
+                    if let Some(batch) = prepared.ack.managed_batch.take()
+                        && let Some(service) = resource_service.as_deref_mut()
+                    {
+                        service.register_batch(batch);
+                    }
+                    if platform.release_owner_displaced_bo(output_idx, prepared.ack.bo_idx) {
+                        o.pool_ring.release(prepared.pool_slot);
+                    } else {
+                        log::error!(
+                            "render scene drain: Owner displaced buffer {} was not releasable",
+                            prepared.ack.bo_idx
+                        );
+                        platform.renderer_failed = true;
+                    }
+                } else {
+                    o.owner_displaced.push_back(prepared);
+                }
+            }
             // B.2-context fix (codex audit followup): wait for any
             // in-flight compose fences before resetting their
             // descriptor-pool slots. `disable_output` runs
@@ -1956,6 +2119,7 @@ impl SceneCompositor {
         telemetry: &mut Telemetry,
         cow_host_xid: Option<u32>,
         mut resource_service: Option<&mut ResourceService>,
+        drain_render_completions: bool,
     ) -> Result<Vec<usize>, SceneError> {
         // Destructure so `inner` (mutable) and `root_overlay` (shared)
         // are borrowed as disjoint fields: `tick_one_output` needs
@@ -2106,15 +2270,22 @@ impl SceneCompositor {
         // Such a job has no pollable fd, so drain only after every composed
         // output installed its PendingAck; exact job/BO matching is then live
         // before the immediate B submission runs.
-        for completion in platform.drain_scanout_render_completions() {
-            if platform.renderer_failed {
-                break;
-            }
-            if !handle_scanout_render_completion_inner(inner, completion, platform) {
-                telemetry.record_missed_pageflip();
-            }
-            if platform.renderer_failed {
-                break;
+        if drain_render_completions {
+            for completion in platform.drain_scanout_render_completions() {
+                if platform.renderer_failed {
+                    break;
+                }
+                if !handle_scanout_render_completion_inner(
+                    inner,
+                    completion,
+                    platform,
+                    resource_service.as_deref_mut(),
+                ) {
+                    telemetry.record_missed_pageflip();
+                }
+                if platform.renderer_failed {
+                    break;
+                }
             }
         }
         Ok(composed)
@@ -2342,11 +2513,12 @@ impl SceneCompositor {
         &mut self,
         completion: ReadyScanoutRenderCompletion,
         platform: &mut PlatformBackend,
+        resource_service: Option<&mut ResourceService>,
     ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
-        handle_scanout_render_completion_inner(inner, completion, platform)
+        handle_scanout_render_completion_inner(inner, completion, platform, resource_service)
     }
 }
 
@@ -2354,6 +2526,7 @@ fn handle_scanout_render_completion_inner(
     inner: &mut SceneCompositorInner,
     completion: ReadyScanoutRenderCompletion,
     platform: &mut PlatformBackend,
+    resource_service: Option<&mut ResourceService>,
 ) -> bool {
     if platform.renderer_failed {
         return false;
@@ -2375,6 +2548,84 @@ fn handle_scanout_render_completion_inner(
         );
         return false;
     };
+    let owner_prepared_matches = inner
+        .outputs
+        .get(output_idx)
+        .and_then(|state| state.owner_prepared.as_ref())
+        .is_some_and(|prepared| {
+            prepared.output_key == output_key
+                && prepared.ack.bo_idx == bo_idx
+                && prepared.ack.stage.matches_owner_render_completion(job_id)
+        });
+    if owner_prepared_matches {
+        let Some(service) = resource_service else {
+            log::error!("render Owner scanout: render completion arrived without ResourceService");
+            platform.renderer_failed = true;
+            return false;
+        };
+        if !platform.complete_owner_rendering_bo(output_idx, bo_idx) {
+            log::error!(
+                "render Owner scanout: buffer {bo_idx} was not OwnerRendering at completion"
+            );
+            platform.renderer_failed = true;
+            return false;
+        }
+        let Some(prepared) = inner.outputs[output_idx].owner_prepared.as_mut() else {
+            log::error!("render Owner scanout: prepared generation disappeared at completion");
+            platform.renderer_failed = true;
+            return false;
+        };
+        let Some(batch) = prepared.ack.managed_batch.take() else {
+            log::error!(
+                "render Owner scanout: prepared generation {} had no GPU batch",
+                prepared.ack.generation
+            );
+            platform.renderer_failed = true;
+            return false;
+        };
+        service.register_batch(batch);
+        prepared.ack.stage = InFlightStage::OwnerDesired;
+        inner.owner_offers.push_back(ComposedOffer {
+            device: output_key.device_key,
+            crtc: u32::from(platform.outputs[output_idx].output.crtc),
+            generation: prepared.ack.generation,
+        });
+        // `fd` is intentionally dropped here. Owner carries no producer fd
+        // through an ioctl; the drain owns and closes the notification.
+        drop(fd);
+        return true;
+    }
+    if let Some(displaced_idx) =
+        inner.outputs[output_idx]
+            .owner_displaced
+            .iter()
+            .position(|prepared| {
+                prepared.output_key == output_key
+                    && prepared.ack.bo_idx == bo_idx
+                    && prepared.ack.stage.matches_owner_render_completion(job_id)
+            })
+    {
+        let Some(service) = resource_service else {
+            log::error!(
+                "render Owner scanout: displaced completion arrived without ResourceService"
+            );
+            platform.renderer_failed = true;
+            return false;
+        };
+        let prepared = &mut inner.outputs[output_idx].owner_displaced[displaced_idx];
+        let Some(batch) = prepared.ack.managed_batch.take() else {
+            log::error!(
+                "render Owner scanout: displaced generation {} had no GPU batch",
+                prepared.ack.generation
+            );
+            platform.renderer_failed = true;
+            return false;
+        };
+        service.register_batch(batch);
+        prepared.ack.stage = InFlightStage::OwnerDesired;
+        drop(fd);
+        return true;
+    }
     let expected = inner
         .outputs
         .get(output_idx)
@@ -2896,6 +3147,41 @@ fn retire_failed_submit_bos(
         }
     }
     state.failed_submit_bos = remaining;
+}
+
+fn retire_owner_displaced(
+    state: &mut OutputSceneState,
+    output_idx: usize,
+    platform: &mut PlatformBackend,
+    resource_service: Option<&ResourceService>,
+) {
+    let Some(service) = resource_service else {
+        return;
+    };
+    let mut remaining = VecDeque::with_capacity(state.owner_displaced.len());
+    while let Some(prepared) = state.owner_displaced.pop_front() {
+        // A batch is Some until its render completion is drained and handed
+        // to ResourceService.  Only the service's later readiness result can
+        // free a displaced owner buffer; the completion fd alone is not a
+        // substitute for the compose fence.
+        let ready =
+            prepared.ack.managed_batch.is_none() && service.is_releasable(&prepared.managed_key);
+        if ready {
+            if platform.release_owner_displaced_bo(output_idx, prepared.ack.bo_idx) {
+                state.pool_ring.release(prepared.pool_slot);
+            } else {
+                log::error!(
+                    "render scene: owner displaced buffer {} was not in OwnerDisplaced",
+                    prepared.ack.bo_idx
+                );
+                platform.renderer_failed = true;
+                remaining.push_back(prepared);
+            }
+        } else {
+            remaining.push_back(prepared);
+        }
+    }
+    state.owner_displaced = remaining;
 }
 
 /// Drain the deferred descriptor-pool slot releases queued by
@@ -4072,7 +4358,7 @@ fn tick_one_output(
     // `walk_needed`.
     structure_dirty: bool,
     pending_presentation: bool,
-    resource_service: Option<&mut ResourceService>,
+    mut resource_service: Option<&mut ResourceService>,
 ) -> Result<TickOutcome, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -4102,6 +4388,7 @@ fn tick_one_output(
             vk.as_ref(),
             resource_service.as_deref(),
         );
+        retire_owner_displaced(s, output_idx, platform, resource_service.as_deref());
         // B.2-context fix (vkdebug VUID-vkResetDescriptorPool-00313):
         // drain any deferred descriptor-pool slot releases whose
         // compose fence has now signaled. Deferred entries are
@@ -4459,6 +4746,8 @@ fn tick_one_output(
             .and_then(Option::as_ref),
         Some(OutputScanout::Shared(_))
     );
+    let output_key = platform.outputs[output_idx].key.clone();
+    let owner_route = platform.output_uses_owner_route(output_idx);
     if shared_output {
         let mut damage_region = Region::from_rects(output_damage.rects().iter().copied());
         // Clip to the output. Damage outside it cannot be presented, and letting
@@ -4473,20 +4762,68 @@ fn tick_one_output(
     }
 
     // 4. Acquire BO.
-    let token = match platform.acquire_scanout_bo(output_idx) {
-        Some(t) => t,
-        None => {
-            let s = inner.outputs.get_mut(output_idx).expect("range");
-            record_tick_skip(
-                s,
-                output_idx,
-                TickSkipReason::NoBO,
-                output_damage.rects().len(),
-            );
-            return Ok(TickOutcome::Skipped(TickSkipReason::NoBO));
-        }
-    };
-
+    let (bo_idx, token_extent, last_present_generation, content_invalidated, owner_managed_key) =
+        if owner_route {
+            let Some(service) = resource_service.as_deref_mut() else {
+                log::warn!(
+                    "render scene: Owner route has no resource service for output {output_idx}"
+                );
+                let s = inner.outputs.get_mut(output_idx).expect("range");
+                record_tick_skip(
+                    s,
+                    output_idx,
+                    TickSkipReason::NoBO,
+                    output_damage.rects().len(),
+                );
+                return Ok(TickOutcome::Skipped(TickSkipReason::NoBO));
+            };
+            let crtc = CrtcKey::for_output(&platform.outputs[output_idx]);
+            match platform.acquire_managed_scanout_bo(service, crtc) {
+                Ok(token) => (
+                    token.bo_idx,
+                    vk::Extent2D {
+                        width: u32::from(platform.outputs[output_idx].width),
+                        height: u32::from(platform.outputs[output_idx].height),
+                    },
+                    token.last_present_generation,
+                    token.content_invalidated,
+                    Some(token.display.key()),
+                ),
+                Err(error) => {
+                    log::debug!(
+                        "render scene: Owner scanout acquisition skipped for output {output_idx}: {error:?}"
+                    );
+                    let s = inner.outputs.get_mut(output_idx).expect("range");
+                    record_tick_skip(
+                        s,
+                        output_idx,
+                        TickSkipReason::NoBO,
+                        output_damage.rects().len(),
+                    );
+                    return Ok(TickOutcome::Skipped(TickSkipReason::NoBO));
+                }
+            }
+        } else {
+            match platform.acquire_scanout_bo(output_idx) {
+                Some(token) => (
+                    token.bo_idx,
+                    token.extent,
+                    token.last_present_generation,
+                    token.content_invalidated,
+                    None,
+                ),
+                None => {
+                    let s = inner.outputs.get_mut(output_idx).expect("range");
+                    record_tick_skip(
+                        s,
+                        output_idx,
+                        TickSkipReason::NoBO,
+                        output_damage.rects().len(),
+                    );
+                    return Ok(TickOutcome::Skipped(TickSkipReason::NoBO));
+                }
+            }
+        };
     // 4b. Step 3 — what this BO is missing. Pure: acquiring mutates nothing, so
     // any later skip or failure leaves the model exactly as it was and the next
     // tick recomputes the same answer.
@@ -4495,11 +4832,11 @@ fn tick_one_output(
     // `loadOp = LOAD`: the BO must have been through a present and not been
     // invalidated since. When false everything is missing, and step 4 must also
     // render Full — loading from a never-presented BO is invalid, not just stale.
-    let bo_loadable = !token.content_invalidated && token.last_present_generation.is_some();
+    let bo_loadable = !content_invalidated && last_present_generation.is_some();
     let bo_repaint = if shared_output {
         inner.outputs[output_idx]
             .damage
-            .repaint_for(token.bo_idx, bo_loadable)
+            .repaint_for(bo_idx, bo_loadable)
     } else {
         Region::new()
     };
@@ -4664,7 +5001,6 @@ fn tick_one_output(
             return Err(SceneError::Present(PresentError::Vk(error)));
         }
     };
-    let output_key = platform.outputs[output_idx].key.clone();
     let drm_device = platform
         .device_for_output(&output_key)
         .map(|device| device.device.clone())
@@ -4712,41 +5048,71 @@ fn tick_one_output(
     // Full and re-clears every frame, so only the shared path reports it.
     let mut compose_complete = true;
     let record_start = std::time::Instant::now();
-    let (render_result, previous_gpu_ns, copied_prepare_failed, managed_batch) = match pool {
+    let (render_result, previous_gpu_ns, copied_prepare_failed, mut managed_batch) = match pool {
         OutputScanout::Shared(pool) => {
-            let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            let bo = pool.bos.get_mut(bo_idx).ok_or(SceneError::NoVk)?;
             let mut managed_batch = None;
-            let result = submit_shared_scanout_frame(
-                &inner.vk,
-                &drm_device,
-                &layout.output,
-                bo,
-                &inner.pipeline,
-                descriptor_pool,
-                render_scene,
-                repaint,
-                &plan.scissors,
-                &compose_ticket,
-                &mut gpu_submitted,
-                &overlay_ops,
-                xor_pipeline,
-                xor_layout,
-                legacy_write_permitted,
-                resource_service,
-            )
-            .map(|(submitted, batch)| {
-                compose_complete = compose_submit_was_complete(submitted, render_scene.draws.len());
-                managed_batch = batch;
-                None
-            });
+            let result = if owner_route {
+                let Some(service) = resource_service.as_deref_mut() else {
+                    return Err(SceneError::Present(PresentError::Io(io::Error::other(
+                        "Owner route lost its resource service before submit",
+                    ))));
+                };
+                submit_owner_shared_scanout_frame(
+                    &inner.vk,
+                    bo,
+                    &inner.pipeline,
+                    descriptor_pool,
+                    render_scene,
+                    repaint,
+                    &plan.scissors,
+                    &compose_ticket,
+                    &mut gpu_submitted,
+                    &overlay_ops,
+                    xor_pipeline,
+                    xor_layout,
+                    service,
+                )
+                .map(|(submitted, completion, batch)| {
+                    compose_complete =
+                        compose_submit_was_complete(submitted, render_scene.draws.len());
+                    managed_batch = Some(batch);
+                    Some(completion)
+                })
+            } else {
+                submit_shared_scanout_frame(
+                    &inner.vk,
+                    &drm_device,
+                    &layout.output,
+                    bo,
+                    &inner.pipeline,
+                    descriptor_pool,
+                    render_scene,
+                    repaint,
+                    &plan.scissors,
+                    &compose_ticket,
+                    &mut gpu_submitted,
+                    &overlay_ops,
+                    xor_pipeline,
+                    xor_layout,
+                    legacy_write_permitted,
+                    resource_service.as_deref_mut(),
+                )
+                .map(|(submitted, batch)| {
+                    compose_complete =
+                        compose_submit_was_complete(submitted, render_scene.draws.len());
+                    managed_batch = batch;
+                    None
+                })
+            };
             (result, bo.last_gpu_render_ns.take(), false, managed_batch)
         }
         OutputScanout::Copied(pool) => {
-            let source = pool.sources.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            let source = pool.sources.get_mut(bo_idx).ok_or(SceneError::NoVk)?;
             let destination_state = &mut pool
                 .destinations
                 .bos
-                .get_mut(token.bo_idx)
+                .get_mut(bo_idx)
                 .ok_or(SceneError::NoVk)?
                 .state;
             let result = submit_copied_scanout_render(
@@ -4756,7 +5122,7 @@ fn tick_one_output(
                 &inner.pipeline,
                 descriptor_pool,
                 render_scene,
-                Repaint::Full(token.extent),
+                Repaint::Full(token_extent),
                 &[],
                 compose_ticket.fence(),
                 &mut gpu_submitted,
@@ -4786,8 +5152,14 @@ fn tick_one_output(
     }
     let compose_result = match render_result {
         Ok(Some(completion)) => platform
-            .register_scanout_render_completion(output_key, token.bo_idx, completion)
-            .map(|job_id| InFlightStage::WaitingForRenderCompletion { job_id })
+            .register_scanout_render_completion(output_key.clone(), bo_idx, completion)
+            .map(|job_id| {
+                if owner_route {
+                    InFlightStage::OwnerRenderWaiting { job_id }
+                } else {
+                    InFlightStage::WaitingForRenderCompletion { job_id }
+                }
+            })
             .map_err(PresentError::Io),
         Ok(None) => Ok(InFlightStage::KmsFlipPending),
         Err(error) => Err(error),
@@ -4809,9 +5181,8 @@ fn tick_one_output(
             for id in &built.sampled_ids {
                 store.touch_render_fence(*id, compose_ticket.clone());
             }
-            state.pool_slots.push_back(slot);
-            state.pending_acks.push_back(PendingAck {
-                bo_idx: token.bo_idx,
+            let ack = PendingAck {
+                bo_idx,
                 generation: frame_gen,
                 stage,
                 drawable_snapshots: built.snapshots,
@@ -4826,8 +5197,44 @@ fn tick_one_output(
                 last_present_cursor_rect_after_retire: built.new_cursor_rect,
                 last_present_cursor_version_after_retire: built.cursor_record_version,
                 managed_batch,
-            });
-            state.current_generation = frame_gen;
+            };
+            if owner_route {
+                let Some(managed_key) = owner_managed_key else {
+                    log::error!(
+                        "render scene: Owner submit succeeded without a managed allocation key"
+                    );
+                    platform.renderer_failed = true;
+                    return Err(SceneError::Present(PresentError::Io(io::Error::other(
+                        "Owner submit lost its managed allocation key",
+                    ))));
+                };
+                if let Some(previous) = state.owner_prepared.take() {
+                    if !platform.displace_owner_bo(output_idx, previous.ack.bo_idx) {
+                        log::error!(
+                            "render scene: could not displace prepared Owner buffer {}",
+                            previous.ack.bo_idx
+                        );
+                        platform.renderer_failed = true;
+                        return Err(SceneError::Present(PresentError::Io(io::Error::other(
+                            "Owner prepared buffer was not in a displaceable phase",
+                        ))));
+                    }
+                    state.owner_displaced.push_back(previous);
+                }
+                state.owner_prepared = Some(PreparedComposed {
+                    output_key,
+                    managed_key,
+                    pool_slot: slot,
+                    ack,
+                });
+                // The generation identifies the latest prepared intent. It
+                // is not damage staging or a page-flip retirement claim.
+                state.current_generation = frame_gen;
+            } else {
+                state.pool_slots.push_back(slot);
+                state.pending_acks.push_back(ack);
+                state.current_generation = frame_gen;
+            }
             // Step 3 — stage the frame that just succeeded. Deliberately here
             // and not at submit *attempt*: an attempt that failed never staged,
             // so `pending` was never taken and the next tick recomputes an
@@ -4837,11 +5244,11 @@ fn tick_one_output(
             // returns `Repaint::Full`; step 4 replaces it with what the recorder
             // actually covered. It must always be a superset of `bo_repaint` —
             // `commit_submitted` asserts exactly that.
-            if shared_output {
+            if shared_output && !owner_route {
                 stage_submitted_frame(
                     &mut state.damage,
                     compose_complete,
-                    token.bo_idx,
+                    bo_idx,
                     &requested,
                     &plan.painted,
                 );
@@ -4884,18 +5291,24 @@ fn tick_one_output(
                 // registration, or shared KMS commit failed. Keep the paired
                 // resources fenced until A is done and make buffer-age state
                 // conservative; no pageflip event will retire this frame.
-                platform.invalidate_bo(output_idx, token.bo_idx);
+                platform.invalidate_bo(output_idx, bo_idx);
+                if owner_route
+                    && let Some(batch) = managed_batch.take()
+                    && let Some(service) = resource_service
+                {
+                    service.register_batch(batch);
+                }
                 telemetry.record_missed_pageflip();
                 log::warn!(
                     "render scene: post-render scanout handoff failed for output \
                      {output_idx} (bo {}): {e}; BO invalidated",
-                    token.bo_idx,
+                    bo_idx,
                 );
             } else {
                 log::warn!(
                     "render scene: compose record/queue submit failed for output \
                      {output_idx} (bo {}): {e}",
-                    token.bo_idx,
+                    bo_idx,
                 );
             }
             // Both failure paths fold repaint forward and do NOT
@@ -4921,13 +5334,13 @@ fn tick_one_output(
             }
             if gpu_submitted {
                 state.failed_submit_bos.push_back(FailedSubmitBo {
-                    bo_idx: token.bo_idx,
+                    bo_idx,
                     pool_slot: slot,
                     ticket: compose_ticket,
                 });
             } else {
                 state.pool_ring.release(slot);
-                platform.cancel_scanout_bo_recording(output_idx, token.bo_idx);
+                platform.cancel_scanout_bo_recording(output_idx, bo_idx);
             }
             Err(SceneError::Present(e))
         }
@@ -8041,6 +8454,109 @@ fn submit_shared_scanout_frame(
     }
 }
 
+/// Owner-route half of the shared compose.  It stops after exporting the
+/// render-completion payload: there is deliberately no DRM flip or staging
+/// here.  The returned batch remains with the prepared generation until the
+/// platform drain observes the completion and registers it with the resource
+/// service.
+#[allow(clippy::too_many_arguments)]
+fn submit_owner_shared_scanout_frame(
+    vk: &Arc<crate::kms::vk::device::VkContext>,
+    bo: &mut ScanoutBo,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+    repaint: Repaint,
+    scissors: &[vk::Rect2D],
+    compose_ticket: &FenceTicket,
+    gpu_submitted: &mut bool,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
+    service: &mut ResourceService,
+) -> Result<
+    (
+        ComposeSubmit,
+        Option<std::os::fd::OwnedFd>,
+        CoreRetirementBatch,
+    ),
+    PresentError,
+> {
+    let key = bo.managed_key().ok_or_else(|| {
+        PresentError::Io(io::Error::other(
+            "Owner shared compose requires a managed scanout buffer",
+        ))
+    })?;
+    if bo.state.phase != BoPhase::Recording {
+        return Err(PresentError::WrongPhase(bo.state.phase));
+    }
+
+    let (mut batch, entries) =
+        crate::kms::render::resources::gpu::prepare_retirement_batch(service, &[key], Vec::new())
+            .map_err(|error| {
+            PresentError::Io(io::Error::other(format!(
+                "prepare Owner scanout retirement batch: {error:?}"
+            )))
+        })?;
+    let write_lease = &batch.leases()[0];
+    let render_res = service.with_scanout_write(write_lease, |allocation| {
+        let mut target = ManagedSharedComposeTarget {
+            bo,
+            shared: &mut allocation.shared,
+        };
+        record_and_submit_render(
+            vk,
+            &mut target,
+            pipeline,
+            descriptor_pool,
+            scene,
+            repaint,
+            scissors,
+            compose_ticket.fence(),
+            gpu_submitted,
+            overlay_ops,
+            xor_pipeline,
+            xor_layout,
+        )
+    });
+    let submitted = match render_res {
+        Ok(Ok(submitted)) => submitted,
+        Ok(Err(error)) => {
+            return Err(managed_submit_failure(
+                service,
+                &entries,
+                *gpu_submitted,
+                error,
+            ));
+        }
+        Err(error) => {
+            return Err(managed_submit_failure(
+                service,
+                &entries,
+                *gpu_submitted,
+                PresentError::Io(io::Error::other(format!(
+                    "with Owner scanout write: {error:?}"
+                ))),
+            ));
+        }
+    };
+
+    batch.bind_ticket(crate::kms::render::resources::GpuObligation::new(
+        entries,
+        compose_ticket.clone(),
+        Arc::clone(vk),
+    ));
+    let completion = match bo.export_signaled_fd() {
+        Ok(fd) => fd,
+        Err(error) => {
+            service.register_batch(batch);
+            return Err(PresentError::Vk(error));
+        }
+    };
+    bo.state.transition_to_owner_rendering();
+    Ok((submitted, completion, batch))
+}
+
 /// Spec 4.2 (stage 2c-i debt): the error a failed managed submission reports.
 /// Unwinding its batch is not best-effort: a failure there is part of the
 /// result, never discarded, and `abandon_unsubmitted_batch` has already
@@ -9861,6 +10377,7 @@ mod tests {
                 &mut telemetry,
                 None,
                 None,
+                true,
             )
             .expect_err("stub must reject tick");
         assert!(matches!(err, SceneError::NoVk));

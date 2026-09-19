@@ -1433,6 +1433,9 @@ pub struct KmsBackend {
     pub(crate) resource_service: Option<crate::kms::render::resources::ResourceService>,
     pub(crate) commit_consumer: crate::kms::render::resources::CommitResourceConsumer,
 
+    #[cfg(test)]
+    test_skip_render_completion_drain: bool,
+
     /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
     /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
     /// queued on this CRTC and we are waiting for it" (value `0` is the
@@ -2170,6 +2173,23 @@ fn restore_primary_output_after_rebuild(
 }
 
 impl KmsBackend {
+    fn offer_scene_composed_generations(&mut self) {
+        let offers = self.scene.take_owner_composed_offers();
+        for offer in offers {
+            if let Err(error) =
+                self.admission_offer_composed(offer.device, offer.crtc, offer.generation)
+            {
+                log::warn!(
+                    "render Owner scanout: could not offer composed generation {} for CRTC {}: {error:?}",
+                    offer.generation,
+                    offer.crtc,
+                );
+            } else {
+                let _ = self.admission_wake(offer.device, false);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn install_resource_service(
         &mut self,
@@ -5635,6 +5655,8 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             resource_service: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
+            #[cfg(test)]
+            test_skip_render_completion_drain: false,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -6909,6 +6931,8 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             resource_service: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
+            #[cfg(test)]
+            test_skip_render_completion_drain: false,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -10521,6 +10545,52 @@ impl KmsBackend {
         let _ = self.maybe_composite();
     }
 
+    fn drain_scanout_render_completions(&mut self) {
+        let completions = self.platform.drain_scanout_render_completions();
+        if !self.scanout_allowed() {
+            log::debug!(
+                "render copied scanout: discarded {} completion(s) while scanout is inactive",
+                completions.len(),
+            );
+            return;
+        }
+        for completion in completions {
+            if self.platform.renderer_failed {
+                break;
+            }
+            if !self.scene.handle_scanout_render_completion(
+                completion,
+                &mut self.platform,
+                self.resource_service.as_mut(),
+            ) {
+                self.telemetry.record_missed_pageflip();
+            }
+            if self.platform.renderer_failed {
+                break;
+            }
+        }
+        self.offer_scene_composed_generations();
+    }
+
+    /// Drive the same composition entry while leaving the platform's render
+    /// completion queue for the production drain entry. This keeps the
+    /// render-completion boundary observable in the owner-route tests without
+    /// constructing a prepared generation or invoking its handler directly.
+    #[cfg(test)]
+    pub fn tick_maybe_composite_for_tests_without_render_completion_drain(&mut self) {
+        self.test_skip_render_completion_drain = true;
+        let result = self.maybe_composite();
+        self.test_skip_render_completion_drain = false;
+        let _ = result;
+    }
+
+    /// Run the production render-completion drain entry without requiring a
+    /// synthetic `ServerState` in the owner-route tests.
+    #[cfg(test)]
+    pub fn drain_scanout_render_completions_for_tests(&mut self) {
+        self.drain_scanout_render_completions();
+    }
+
     /// Phase B.1 Task 15: engine's monotonic `frame_seq` counter.
     /// Bumped by `close_open_frame` on every successful close.
     pub fn engine_frame_seq_for_tests(&self) -> u64 {
@@ -11822,7 +11892,7 @@ impl KmsBackend {
             log::warn!("render composite_and_flip: flush_submit_group failed: {e:?}");
         }
         let cow_host_xid = self.cow_host_xid();
-        match self.scene.tick(
+        let result = match self.scene.tick(
             &self.core,
             &mut self.store,
             &mut self.platform,
@@ -11830,12 +11900,15 @@ impl KmsBackend {
             &mut self.telemetry,
             cow_host_xid,
             self.resource_service.as_mut(),
+            true,
         ) {
             Ok(_) => Ok(()),
             Err(e) => Err(io::Error::other(format!(
                 "render composite_and_flip: {e:?}"
             ))),
-        }
+        };
+        self.offer_scene_composed_generations();
+        result
     }
 
     /// Post-loop teardown — delegates to PlatformBackend, which
@@ -20646,32 +20719,7 @@ impl Backend for KmsBackend {
     }
 
     fn on_scanout_render_completion(&mut self, _state: &mut ServerState) {
-        let completions = self.platform.drain_scanout_render_completions();
-        if !self.scanout_allowed() {
-            // Draining avoids a readable aggregator spinning the core loop.
-            // The suspend/topology lifecycle subsequently waits A, cancels
-            // the ledger, and drains both pool devices before any allocation
-            // can be reset or dropped.
-            log::debug!(
-                "render copied scanout: discarded {} completion(s) while scanout is inactive",
-                completions.len(),
-            );
-            return;
-        }
-        for completion in completions {
-            if self.platform.renderer_failed {
-                break;
-            }
-            if !self
-                .scene
-                .handle_scanout_render_completion(completion, &mut self.platform)
-            {
-                self.telemetry.record_missed_pageflip();
-            }
-            if self.platform.renderer_failed {
-                break;
-            }
-        }
+        self.drain_scanout_render_completions();
     }
 
     fn on_page_flip_ready(&mut self, _state: &mut ServerState, drm_fd: std::os::fd::RawFd) {
@@ -21071,6 +21119,10 @@ impl Backend for KmsBackend {
             Ok(())
         } else {
             let cow_host_xid = self.cow_host_xid();
+            #[cfg(test)]
+            let drain_render_completions = !self.test_skip_render_completion_drain;
+            #[cfg(not(test))]
+            let drain_render_completions = true;
             match self.scene.tick(
                 &self.core,
                 &mut self.store,
@@ -21079,6 +21131,7 @@ impl Backend for KmsBackend {
                 &mut self.telemetry,
                 cow_host_xid,
                 self.resource_service.as_mut(),
+                drain_render_completions,
             ) {
                 Ok(composed_outputs) => {
                     if self.scanout_m2.reentry_blocked_until_composed
@@ -21114,6 +21167,7 @@ impl Backend for KmsBackend {
                 }
             }
         };
+        self.offer_scene_composed_generations();
         self.drain_render_telemetry();
         // Phase A Task 3.5: drain SubmitGroup flush outcomes and
         // route each to the matching telemetry counter.
@@ -49848,6 +49902,7 @@ mod tests {
                 >,
             >,
         >,
+        composed_waiting: bool,
         direct_eligible: std::rc::Rc<std::cell::Cell<bool>>,
         describe_page_flip: std::rc::Rc<std::cell::Cell<bool>>,
         describe_calls: std::rc::Rc<std::cell::Cell<usize>>,
@@ -49864,6 +49919,40 @@ mod tests {
     impl AdmissionSourceFixture {
         #[allow(clippy::new_ret_no_self, clippy::type_complexity)]
         fn new() -> (
+            Box<dyn crate::kms::render::admission::AdmissionSource>,
+            std::rc::Rc<
+                std::cell::RefCell<
+                    std::collections::BTreeMap<
+                        crate::kms::owner::admission::IntentKey,
+                        crate::kms::owner::admission::Readiness,
+                    >,
+                >,
+            >,
+            std::rc::Rc<std::cell::Cell<bool>>,
+        ) {
+            Self::new_source()
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn new_source() -> (
+            Box<dyn crate::kms::render::admission::AdmissionSource>,
+            std::rc::Rc<
+                std::cell::RefCell<
+                    std::collections::BTreeMap<
+                        crate::kms::owner::admission::IntentKey,
+                        crate::kms::owner::admission::Readiness,
+                    >,
+                >,
+            >,
+            std::rc::Rc<std::cell::Cell<bool>>,
+        ) {
+            Self::new_source_with_composed_waiting(false)
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn new_source_with_composed_waiting(
+            composed_waiting: bool,
+        ) -> (
             Box<dyn crate::kms::render::admission::AdmissionSource>,
             std::rc::Rc<
                 std::cell::RefCell<
@@ -49893,6 +49982,7 @@ mod tests {
             (
                 Box::new(Self {
                     readiness: std::rc::Rc::clone(&readiness),
+                    composed_waiting,
                     direct_eligible: std::rc::Rc::clone(&direct_eligible),
                     describe_page_flip,
                     describe_calls,
@@ -49945,6 +50035,7 @@ mod tests {
             (
                 Box::new(Self {
                     readiness: std::rc::Rc::clone(&readiness),
+                    composed_waiting: false,
                     direct_eligible: std::rc::Rc::clone(&direct_eligible),
                     describe_page_flip: std::rc::Rc::clone(&describe_page_flip),
                     describe_calls: std::rc::Rc::clone(&describe_calls),
@@ -49999,6 +50090,7 @@ mod tests {
             (
                 Box::new(Self {
                     readiness: std::rc::Rc::clone(&readiness),
+                    composed_waiting: false,
                     direct_eligible,
                     describe_page_flip,
                     describe_calls,
@@ -50038,6 +50130,16 @@ mod tests {
             &self,
             key: crate::kms::owner::admission::IntentKey,
         ) -> crate::kms::owner::admission::Readiness {
+            if self.composed_waiting
+                && matches!(
+                    key,
+                    crate::kms::owner::admission::IntentKey::Composed { .. }
+                )
+            {
+                return crate::kms::owner::admission::Readiness::Waiting(
+                    crate::kms::owner::admission::WaitReason::SourceWaits,
+                );
+            }
             self.readiness
                 .borrow()
                 .get(&key)
@@ -50146,6 +50248,362 @@ mod tests {
             .incarnation();
         let gate = crate::kms::render::resources::tests::owner_gate_for_tests(device, incarnation);
         backend.platform.install_transport_gate(gate);
+    }
+
+    struct OwnerLiveFixture {
+        backend: super::KmsBackend,
+        _registry: crate::kms::render::resources::DrmCleanupRegistry,
+    }
+
+    fn owner_live_fixture() -> Result<OwnerLiveFixture, std::io::Error> {
+        owner_live_fixture_with_extra_missing_output(false)
+    }
+
+    fn owner_live_fixture_with_extra_missing_output(
+        extra_missing_output: bool,
+    ) -> Result<OwnerLiveFixture, std::io::Error> {
+        use std::{cell::RefCell, rc::Rc};
+
+        use crate::kms::render::resources::{
+            DrmCleanupRegistry, ResourceService, tests::MockCleanupIo,
+        };
+
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+        )
+        .map_err(|error| std::io::Error::other(format!("stub executor: {error}")))?;
+        let (incarnation, lifecycle) = executor.owner_identity();
+        let device_key = backend
+            .platform
+            .primary_device()
+            .ok_or_else(|| std::io::Error::other("live-scene fixture has no primary device"))?
+            .key;
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        let device = backend
+            .platform
+            .device_for_key(device_key)
+            .ok_or_else(|| std::io::Error::other("live-scene fixture device disappeared"))?
+            .device
+            .clone();
+        let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
+        let mut registry = DrmCleanupRegistry::new_with_device_and_io(
+            Rc::clone(&device),
+            device_key,
+            incarnation,
+            Box::new(MockCleanupIo::new(cleanup_calls)),
+        );
+        let mut service = ResourceService::new(device_key, incarnation);
+        for output_idx in 0..backend.platform.scanout_pools.len() {
+            let bo_count = backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .map_or(0, |scanout| scanout.display_pool().bos.len());
+            for bo_idx in 0..bo_count {
+                backend
+                    .platform
+                    .register_managed_scanout_bo(&mut service, &mut registry, output_idx, bo_idx)
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "adopt live-scene scanout output {output_idx} bo {bo_idx}: {error:?}"
+                        ))
+                    })?;
+            }
+        }
+        backend.install_resource_service(service);
+        if extra_missing_output {
+            backend
+                .platform
+                .append_test_output_without_scanout_pool("test-bad-output");
+            return Ok(OwnerLiveFixture {
+                backend,
+                _registry: registry,
+            });
+        }
+        let gate =
+            crate::kms::render::resources::tests::owner_gate_for_tests(device_key, incarnation);
+        backend
+            .platform
+            .try_install_transport_gate(gate)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let source = AdmissionSourceFixture::new_source_with_composed_waiting(true).0;
+        backend.install_admission_conductor_for_tests(device_key, source);
+        Ok(OwnerLiveFixture {
+            backend,
+            _registry: registry,
+        })
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_legacy_tick_flips_as_before_vulkan() {
+        let mut fixture = super::KmsBackend::for_tests_with_live_kms()
+            .expect("environmental skip: no live Vulkan ICD/DRM master available");
+        let backend = &mut fixture.backend;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests();
+        assert!(
+            backend.scene.pending_ack_count_for_tests(0) > 0,
+            "the live legacy tick must retain its page-flip acknowledgement"
+        );
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| staged),
+            "the legacy observable is a staged ScanoutDamage frame"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_owner_tick_accumulates_damage_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let damage = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: 17, y: 23 },
+            extent: ash::vk::Extent2D {
+                width: 31,
+                height: 29,
+            },
+        };
+        backend.scene.mark_scene_structure_damage_rect(0, damage);
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+
+        let (pending, staged) = backend
+            .scene
+            .damage_state_for_tests(0)
+            .expect("live-scene output damage state");
+        assert!(pending, "the owner tick's damage remains pending");
+        assert!(!staged, "owner preparation does not stage damage");
+        let (bo_idx, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("Owner tick must retain a prepared generation");
+        assert!(
+            backend.scene.repaint_for_tests(0, bo_idx, true, damage),
+            "the next repaint for the acquired buffer includes the tick damage"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_owner_tick_offers_instead_of_flipping_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (_, generation, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("Owner tick must retain a prepared generation");
+        assert_eq!(backend.scene.pending_ack_count_for_tests(0), 0);
+        assert_eq!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.composed(crtc)),
+            None,
+            "Owner preparation does not offer before render completion drains"
+        );
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.composed(crtc))
+                .map(|intent| intent.generation),
+            Some(generation)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_ready_only_after_render_completion_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (_, generation, waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("Owner tick must retain a prepared generation");
+        assert!(waiting, "a submitted render is still waiting for the drain");
+        assert_eq!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.composed(crtc)),
+            None,
+            "a generation is not offered before its render completion drains"
+        );
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let (_, desired_generation, desired_waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("drained Owner generation");
+        assert_eq!(desired_generation, generation);
+        assert!(!desired_waiting, "the drained generation is OwnerDesired");
+        let offered = backend
+            .admission_conductors
+            .get(&device)
+            .and_then(|conductor| conductor.admission.composed(crtc))
+            .map(|intent| intent.generation);
+        assert_eq!(offered, Some(generation));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_displaced_generation_acks_nothing_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (first_bo, first_generation, first_waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("first Owner generation");
+        assert!(first_waiting);
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, second_generation, second_waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("second Owner generation");
+        assert_ne!(first_generation, second_generation);
+        assert_ne!(first_bo, second_bo);
+        assert!(!second_waiting || second_generation > first_generation);
+        assert_eq!(backend.scene.owner_displaced_len_for_tests(0), 1);
+        assert!(matches!(
+            backend.platform.scanout_pools[0]
+                .as_ref()
+                .expect("live-scene pool")
+                .display_pool()
+                .bos[first_bo]
+                .state
+                .phase,
+            crate::kms::vk::scanout::BoPhase::OwnerDisplaced
+        ));
+        assert_eq!(backend.scene.pending_ack_count_for_tests(0), 0);
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "displacement does not stage an owner damage transaction"
+        );
+        let (displaced_snapshots, snapshots_pending) = backend
+            .scene
+            .owner_displaced_snapshots_for_tests(0, &backend.store);
+        assert!(
+            displaced_snapshots > 0,
+            "the first frame captured drawable snapshots"
+        );
+        assert!(
+            snapshots_pending,
+            "displacement leaves the first snapshots unacknowledged"
+        );
+
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        backend.before_block();
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        // The tick's retire pass frees the displaced buffer and the same tick
+        // may immediately acquire it for the next generation (measured on the
+        // GPU: `[OwnerDisplaced, OwnerDesired, Free]` became
+        // `[OwnerRendering, OwnerDisplaced, Free]` with generation 3 in buffer
+        // 0). Either outcome proves the buffer went through `Free`; a buffer
+        // that never left `OwnerDisplaced` could be neither.
+        let first_phase = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live-scene pool")
+            .display_pool()
+            .bos[first_bo]
+            .state
+            .phase;
+        let reacquired = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .is_some_and(|(bo, generation, _)| bo == first_bo && generation > second_generation);
+        assert!(
+            first_phase == crate::kms::vk::scanout::BoPhase::Free || reacquired,
+            "the displaced buffer must return to Free after its GPU work: phase {first_phase:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_owner_refused_for_unmanaged_pool_vulkan() {
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("owner")
+            .incarnation();
+        let gate = crate::kms::render::resources::tests::owner_gate_for_tests(device, incarnation);
+        let error = backend
+            .platform
+            .try_install_transport_gate(gate)
+            .expect_err("an unadopted live pool must refuse Owner");
+        assert!(matches!(
+            error,
+            crate::kms::render::platform::OwnerEligibilityError::UnmanagedScanoutPool {
+                output_idx: 0
+            }
+        ));
+        assert!(backend.platform.transport_gate(&device).is_none());
+        assert!(
+            backend
+                .platform
+                .allows_legacy(&device, crate::kms::render::resources::WriterClass::Primary)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_owner_refused_for_one_bad_output_of_many_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture_with_extra_missing_output(true)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("owner")
+            .incarnation();
+        let gate = crate::kms::render::resources::tests::owner_gate_for_tests(device, incarnation);
+        let error = backend
+            .platform
+            .try_install_transport_gate(gate)
+            .expect_err("a bad non-first output must refuse Owner");
+        assert!(matches!(
+            error,
+            crate::kms::render::platform::OwnerEligibilityError::MissingScanoutPool {
+                output_idx: 1
+            }
+        ));
+        assert!(backend.platform.transport_gate(&device).is_none());
     }
 
     fn install_admission_resource_service(backend: &mut super::KmsBackend) {
