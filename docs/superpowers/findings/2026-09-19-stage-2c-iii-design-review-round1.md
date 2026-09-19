@@ -9,6 +9,10 @@ passed parent, with C.0, 2c-i (+ debt) and 2c-ii named in the context.
 model `gpt-5.6-sol`; reasoning effort `xhigh`; `codex-cli 0.155.1`.
 Counts are comparable only to other reviews citing this same instrument SHA.
 
+**Naming note (2026-09-19):** this record says C1, C2 and C3 for the design's
+three plans. They were renamed **Ci, Cii and Ciii** in revision 3, so they
+cannot be confused with Phases C.1 and C.2; the review text is left as written.
+
 **Author verification (2026-09-19), every finding checked against the tree:**
 
 - **B-1 — CONFIRMED.** Revision 1's §4.2 row grouped `Dispatched` with

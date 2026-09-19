@@ -1,7 +1,7 @@
 # Phase C.0 stage 2c-iii — primary conversion and damage
 
 **Status:** design, revision 3 (2026-09-19). Its three design sections (plans
-C1, C2 and C3 — here sections 4, 5 and 6) were approved one by one with the user
+Ci, Cii and Ciii — here sections 4, 5 and 6) were approved one by one with the user
 in brainstorming, together with three decisions recorded in section 2: the
 evidence level, the split into three plans with the composed plan first, and
 the prepare/submit selection boundary.
@@ -17,9 +17,12 @@ Revision 3 incorporates codex round 2
 1 major, all verified and accepted): composed commits are non-Present
 primaries and composited Presents keep their GPU-completion authority, so
 section 3.3's carriage is direct-only and the Present-carrying owner entry moves
-to C2 (B-1); the damage transaction is installed inside the ledger closure,
+to Cii (B-1); the damage transaction is installed inside the ledger closure,
 before any event can be routed (B-2); the pool-release gates are named in code
-terms and each is dropped alone by one mutation (M-1). Implementation plans
+terms and each is dropped alone by one mutation (M-1). The plans, called C1,
+C2 and C3 up to revision 3's first commit, are now **Ci, Cii and Ciii** (user,
+2026-09-19), so they cannot be read as Phases C.1 and C.2, which follow C.0.
+The round-1 and round-2 findings keep the old names. Implementation plans
 follow (section 8.3).
 
 **Authority**, most general first. This document elaborates the 2c-iii block; it
@@ -72,12 +75,12 @@ retirement and legacy exclusion checks — section 8.
 
 | Item | Home |
 | --- | --- |
-| Real `CommitDescription` builders and producer readiness | C1 (composed), C2 (direct), C3 (unflip) |
-| The real direct-eligibility predicate, extracted from `try_present_direct` | C2 |
-| Real layout-change hook sites | C2 |
-| F13b-D1: dispatched `CommitResources` carries the present-pin leases by value | C2 |
-| Ready-unflip dispatch (needs a retained composed framebuffer) | C3 |
-| Multi-device conductor state | C3 |
+| Real `CommitDescription` builders and producer readiness | Ci (composed), Cii (direct), Ciii (unflip) |
+| The real direct-eligibility predicate, extracted from `try_present_direct` | Cii |
+| Real layout-change hook sites | Cii |
+| F13b-D1: dispatched `CommitResources` carries the present-pin leases by value | Cii |
+| Ready-unflip dispatch (needs a retained composed framebuffer) | Ciii |
+| Multi-device conductor state | Ciii |
 
 ## 2. Decisions taken in brainstorming
 
@@ -88,12 +91,12 @@ and the real producers (section 6.4). It is the first evidence that the owner
 route works on a real device; the precedent is part 3 of the 2c-i debt stage.
 Activating production was rejected: it contradicts stage 2c §6 and R8.
 
-**2.2. Three plans, composed first (user, 2026-09-19).** C1 — composed producer,
-damage transaction, bundles. C2 — direct producer, eligibility, layout hooks,
-F13b-D1, retirement promotion. C3 — unflip, multi-device, route selection,
+**2.2. Three plans, composed first (user, 2026-09-19).** Ci — composed producer,
+damage transaction, bundles. Cii — direct producer, eligibility, layout hooks,
+F13b-D1, retirement promotion. Ciii — unflip, multi-device, route selection,
 hardware test. Composed goes first because it is the base traffic every other
 path returns to, and damage is the contract with the most risk. Keeping damage
-in C1, rather than a plan of its own, avoids an intermediate state in which the
+in Ci, rather than a plan of its own, avoids an intermediate state in which the
 owner route stages damage at submission.
 
 **2.3. The selection boundary: prepare / submit (user, 2026-09-19).** This
@@ -145,7 +148,7 @@ section 6.4 carries them. **This is not deferrable (round-1 B-2).** "Production
 caller" means a call in non-test code on the converted `Owner` submit path of a
 real producer — the path section 2.3's fork selects, driven by the fixtures
 because production stays `Legacy` (R8) — not a test helper. Its absence on that
-path blocks the acceptance of C1 (composed), C2 (direct), C3 (unflip) and of
+path blocks the acceptance of Ci (composed), Cii (direct), Ciii (unflip) and of
 2c-iii; it cannot be handed to stages 3/4. If planning finds a reason the route
 cannot register, that is an F8 stop that halts the stage and goes back to the
 user, not a deferral.
@@ -189,8 +192,8 @@ user, not a deferral.
    also takes the completion context.
 
 Both are owner changes inside C.0's existing contracts (they add no state and
-no outcome). Gap 1 is C1's (section 4.0), because composed is the first
-converted producer. Gap 2 is C2's (section 5.0): composed commits carry no
+no outcome). Gap 1 is Ci's (section 4.0), because composed is the first
+converted producer. Gap 2 is Cii's (section 5.0): composed commits carry no
 Present (section 3.3), so the direct producer is the first caller that needs a
 Present-carrying entry (round-2 B-1).
 
@@ -212,7 +215,7 @@ conversion does not move it.
   for those Presents: they were already completed or queued by the GPU batch.
   Moving composited Presents onto the KMS commit would be a protocol change
   (C.0 §12 preserves Phase A+B's outcomes), not a 2c-iii conversion.
-- **Direct commits carry their Present into the owner** (C2). A direct commit
+- **Direct commits carry their Present into the owner** (Cii). A direct commit
   that completes Present requests carries them, or the client's FIFO stays
   parked while every damage and resource test passes. Today the conductor sets
   neither `page_flip_event` nor `present_consumers` on any `CommitDescription`
@@ -238,10 +241,10 @@ damage transactions (section 4.2) and the direct frame state (section 5).
 Milestones are delivered by `CommitId`; a consumer that sees an unknown
 `CommitId` ignores it and records a telemetry count, never guesses an owner.
 
-## 4. Plan C1 — owner entry, composed producer, damage transaction, bundles
+## 4. Plan Ci — owner entry, composed producer, damage transaction, bundles
 
 **4.0. The owner entry for a registered ledger** (section 3.2's first gap).
-C1's first tasks, before any producer is converted, because the composed
+Ci's first tasks, before any producer is converted, because the composed
 producer is the first real caller. Stated as invariants; the shape of the API is the plan's:
 
 - **A failed registration leaves nothing behind.** When the ledger closure
@@ -315,7 +318,7 @@ staged at the single `Accepted`, applied at the single `HardwareComplete`,
 naming exactly the outputs of `ExpectedCompletionCrtcs`. No output is staged
 twice without an intervening apply or invalidate; an output not represented
 earns nothing. The conductor's bundle dispatch already exists for composed
-members (`admission.rs`, `Admitted::Bundle`); C1 gives it real members.
+members (`admission.rs`, `Admitted::Bundle`); Ci gives it real members.
 
 **4.4. Scene contracts preserved** (stage 2c §5, "Current-master scene
 contracts"). An invalidated or failed transaction owes a repaint independently
@@ -328,7 +331,7 @@ every output. The v1.5.0 row for 2c-iii (`PaintTarget` coordinates and clips,
 root `IncludeInferiors` snapshots with their own GPU lifetime) applies unchanged:
 the conversion moves the flip, not the compose.
 
-**4.5. C1 exit evidence** (fixtures with the real scene tick in `Owner`, the
+**4.5. Ci exit evidence** (fixtures with the real scene tick in `Owner`, the
 real owner and the helper; each row has a named test and a named mutation):
 every row of the table in 4.2; new paint between capture and `HardwareComplete`
 survives; two outputs with permuted completions, bundled and separately
@@ -340,10 +343,10 @@ composited Present still completes exactly once, from its GPU batch (section
 (section 4.2); the invariants of section 4.0, including a
 registration failure that leaves the owner and the decider untouched.
 
-## 5. Plan C2 — direct producer
+## 5. Plan Cii — direct producer
 
 **5.0. The Present-carrying owner entry** (section 3.2's second gap; moved
-from C1 by round-2 B-1). C2's first task. A description with `page_flip_event`
+from Ci by round-2 B-1). Cii's first task. A description with `page_flip_event`
 or `present_consumers` is begun through a public entry that takes its
 `CompletionContext` **and** section 4.0's CommitId-aware, fallible ledger
 closure, with section 4.0's failure invariants. That entry applies every check
@@ -389,12 +392,12 @@ that constructs an empty lease set must fail a named test.
 **5.5. DMG-5.** Entering direct invalidates every composed buffer of the
 affected outputs; no milestone of a direct transaction applies composed damage.
 
-**5.6. Cursor and gamma.** C2 adds no payloads: absorption exists since B1/B2 and
+**5.6. Cursor and gamma.** Cii adds no payloads: absorption exists since B1/B2 and
 real producers are stage 4's. What is proven: a direct commit never carries an
 unchanged cursor, and a primary flip event does not retire a newer cursor
 generation (C.0 §12).
 
-**5.7. C2 exit evidence** (fixtures with the real `try_present_direct` in
+**5.7. Cii exit evidence** (fixtures with the real `try_present_direct` in
 `Owner`): the successor that gains a border while queued, promoted or not;
 retirement promotion ordered predecessor → `Skip` → admission → publication;
 lease adoption; displacement with a deferred `Skip`; composed invalidation on
@@ -403,10 +406,10 @@ section 3.3's Present carriage on the real direct producer, with
 `HardwareComplete`/`Presented` in both orders, a missing `Presented`, and no idle
 or release before the ledger proves it; section 5.0's entry and its checks.
 
-## 6. Plan C3 — unflip, multi-device, route selection, hardware
+## 6. Plan Ciii — unflip, multi-device, route selection, hardware
 
 **6.1. Ready unflip (tier 2).** `decision_requires_unsupported`
-(`admission.rs:65`) aborts `Unflip` today; C3 dispatches it. Ready (2c-ii §4)
+(`admission.rs:65`) aborts `Unflip` today; Ciii dispatches it. Ready (2c-ii §4)
 when the exit-retirement position is free, every affected output has its
 retained composed framebuffer, and the direct shadow is materialized. The
 request replaces the complete plane set in one transaction, as
@@ -415,7 +418,7 @@ per-CRTC replacement with `ENOSPC`. On an `Owner` device the reasons that reach
 `request_direct_unflip` (`backend.rs:2219`) — cursor, overlay and topology
 invalidation, a failed successor send — enter `admission_request_unflip`.
 Returning to composed invalidates every affected composed buffer, and each is
-repainted in full before it is scanned out again (DMG-5); a C3 fixture proves
+repainted in full before it is scanned out again (DMG-5); a Ciii fixture proves
 it per output (round-1 M-3). The
 unflip must not drop or flash the cursor and preserves the current gamma
 (C.0 §12). `Topology` and `CursorRecovery` stay `Unsupported`: stages 3 and 4.
@@ -449,9 +452,9 @@ Because section 3.2 gives `KmsRelease` a production caller, this test also
 carries **P3-2** (a displaced buffer's `KmsRelease` is discharged by the real
 completion) and **P3-3** (a retained buffer registers none). Before the plan
 anchors them, the plan's author re-runs the reachability check on the
-implemented C1/C2 code: a non-test caller of `register_kms` must exist on the
+implemented Ci/Cii code: a non-test caller of `register_kms` must exist on the
 path the test drives. By section 3.2 that caller is already a condition of
-C1's and C2's acceptance, so its absence here means an acceptance was wrong:
+Ci's and Cii's acceptance, so its absence here means an acceptance was wrong:
 the stage stops and the defect is reopened, it is not deferred (round-1 B-2).
 P3-2/P3-3 close the debt spec's §9.5 F8.
 
@@ -513,12 +516,12 @@ not by the first textual match.
 
 ### 8.3. Plans and process
 
-Three plans, C1 → C2 → C3 (section 2.2), each reviewed by codex through
+Three plans, Ci → Cii → Ciii (section 2.2), each reviewed by codex through
 `docs/superpowers/review/review.sh` before implementation and implemented by
 codex one task per run; the coordinator verifies each task's full gate and runs
 the mutations. Each plan is written only after the previous one is accepted, so
 it cites implemented interfaces. Each plan carries a `docs/status.md` step.
-This document itself is reviewed by codex before plan C1 is written.
+This document itself is reviewed by codex before plan Ci is written.
 
 ### 8.4. Gate
 
@@ -527,20 +530,20 @@ build and with `--features tcp-transport` and `--features xdmcp`; the
 deterministic suites (the helper-spawning ones run several times — one green run
 is not evidence); `cargo check` for Linux glibc, Linux musl and FreeBSD. The
 full hardware gate (`render_acceptance`, `c0_2ci -- --ignored`, the library's
-other ignored tests) after each plan, and section 6.4's test after C3 — each
+other ignored tests) after each plan, and section 6.4's test after Ciii — each
 only after asking the user.
 
 ## 9. Questions for the plans
 
 Placement and plumbing only; none can change the decisions above.
 
-- C1: where the prepared composed frame lives between the tick and admission,
+- Ci: where the prepared composed frame lives between the tick and admission,
   and how its buffer's pool phase expresses "retained by a desired intent".
-- C1: which `TerminalState` (if any) is the post-accept failure with proven
+- Ci: which `TerminalState` (if any) is the post-accept failure with proven
   prior state (section 4.2's last row).
-- C2: the extracted predicate's signature, and whether `Legacy` callers move to
-  it in C2 or keep an adapter.
-- C3: how the retained composed framebuffer and the shadow materialization
+- Cii: the extracted predicate's signature, and whether `Legacy` callers move to
+  it in Cii or keep an adapter.
+- Ciii: how the retained composed framebuffer and the shadow materialization
   report readiness without a borrow across the wake.
-- C3: whether the hardware fixture reuses part 3's tty2 fixture
+- Ciii: whether the hardware fixture reuses part 3's tty2 fixture
   (`part3_tests.rs`) or needs its own.
