@@ -52,7 +52,22 @@ impl Admission {
             return Err(AdmissionError::TokenMismatch);
         }
 
+        if !matches!(
+            decision.admitted,
+            Admitted::Topology { .. } | Admitted::Unflip { .. } | Admitted::CursorRecovery { .. }
+        ) {
+            self.count_older_ticket_waits(&decision.carried);
+        }
         self.consume(&decision.admitted);
+        if let Some(combined_primary) = &decision.combined_primary {
+            self.consume(combined_primary);
+        }
+        for carried in &decision.carried {
+            self.consume_maintenance(carried);
+        }
+        for key in &decision.ages {
+            self.age_maintenance(*key);
+        }
         self.last_primary_crtcs = decision.primary_crtcs();
         self.locked = None;
         self.sequence = self
@@ -117,6 +132,35 @@ impl Admission {
                     self.direct = None;
                 }
             }
+            Admitted::Maintenance { .. } => {}
+            Admitted::Bundle { members } => {
+                for member in members {
+                    self.consume(member);
+                }
+            }
+            Admitted::CursorRecovery { crtc } => {
+                self.cursor_recovery.remove(crtc);
+            }
         }
+    }
+
+    fn consume_maintenance(&mut self, carried: &super::CarriedMaintenance) {
+        if self
+            .maintenance_slots
+            .get(&carried.key)
+            .is_some_and(|intent| {
+                intent.generation == carried.generation && intent.ticket == carried.ticket
+            })
+        {
+            self.maintenance_slots.remove(&carried.key);
+        }
+        self.maintenance_bounds.remove(&carried.key);
+        self.maintenance_submitted.insert(
+            carried.key,
+            super::intents::SubmittedMaintenance {
+                generation: carried.generation,
+                ticket: carried.ticket,
+            },
+        );
     }
 }
