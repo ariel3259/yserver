@@ -2151,3 +2151,647 @@ fn c0_adm_maint_waiting_candidates_never_win_tiers_2_4_7() {
     );
     assert_eq!(fresh.decide(&fresh_snapshot).unwrap().tier, Tier::Primary);
 }
+
+#[test]
+fn c0_adm_maint_tier3_absorbs_every_aged_identity() {
+    let mut admission = Admission::new();
+    let cursor_one = cursor_key(1);
+    let cursor_two = cursor_key(2);
+    admission
+        .set_direct_successor(successor(20, 0, 0, &[1, 2]))
+        .unwrap();
+    admission.set_maintenance(cursor_one, 7, true).unwrap();
+    admission.set_maintenance(cursor_two, 8, true).unwrap();
+    let ticket_one = admission.maintenance(cursor_one).unwrap().ticket;
+    let ticket_two = admission.maintenance(cursor_two).unwrap().ticket;
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.retirement_wake = true;
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    for (key, generation) in [(cursor_one, 7), (cursor_two, 8)] {
+        let maintenance = IntentKey::Maintenance { key, generation };
+        snapshot.report(maintenance, Readiness::Ready);
+        snapshot.report_compatible(
+            maintenance,
+            IntentKey::Direct {
+                source_generation: 20,
+            },
+        );
+    }
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::DirectSuccessor);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Direct {
+            successor: successor(20, 0, 0, &[1, 2]),
+        }
+    );
+    assert_eq!(
+        decision
+            .carried
+            .iter()
+            .map(|carried| (carried.key, carried.ticket))
+            .collect::<Vec<_>>(),
+        vec![(cursor_one, ticket_one), (cursor_two, ticket_two)]
+    );
+
+    let token = admission.lock(decision, &snapshot).unwrap();
+    admission.confirm(token).unwrap();
+    assert!(admission.direct().is_none());
+    assert!(admission.maintenance(cursor_one).is_none());
+    assert!(admission.maintenance(cursor_two).is_none());
+}
+
+#[test]
+fn c0_adm_maint_tier3_yields_to_unabsorbable_aged_maintenance() {
+    let mut admission = Admission::new();
+    let cursor_one = cursor_key(1);
+    let cursor_two = cursor_key(2);
+    admission
+        .set_direct_successor(successor(20, 0, 0, &[1, 2]))
+        .unwrap();
+    admission.set_maintenance(cursor_one, 7, true).unwrap();
+    admission.set_maintenance(cursor_two, 8, true).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.retirement_wake = true;
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Maintenance {
+            key: cursor_one,
+            generation: 7,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Maintenance {
+            key: cursor_two,
+            generation: 8,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report_compatible(
+        IntentKey::Maintenance {
+            key: cursor_one,
+            generation: 7,
+        },
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+    );
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::AgedMaintenance);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Maintenance {
+            key: cursor_one,
+            generation: 7,
+        }
+    );
+    assert!(
+        decision
+            .carried
+            .iter()
+            .all(|carried| carried.key == cursor_one)
+    );
+}
+
+#[test]
+fn c0_adm_maint_primary_absorbs_compatible_maintenance() {
+    let mut admission = Admission::new();
+    let key = gamma_key(1);
+    admission.set_composed(1, 10).unwrap();
+    admission.set_maintenance(key, 7, false).unwrap();
+    let ticket = admission.maintenance(key).unwrap().ticket;
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Maintenance { key, generation: 7 },
+        Readiness::Ready,
+    );
+    snapshot.report_compatible(
+        IntentKey::Maintenance { key, generation: 7 },
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+    );
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::Primary);
+    assert_eq!(decision.carried.len(), 1);
+    assert_eq!(decision.carried[0].key, key);
+    assert_eq!(decision.carried[0].ticket, ticket);
+
+    let token = admission.lock(decision, &snapshot).unwrap();
+    admission.confirm(token).unwrap();
+    assert!(admission.maintenance(key).is_none());
+}
+
+#[test]
+fn c0_adm_maint_incompatible_maintenance_is_not_absorbed() {
+    let mut admission = Admission::new();
+    let key = gamma_key(1);
+    admission.set_composed(1, 10).unwrap();
+    admission.set_maintenance(key, 7, false).unwrap();
+    let ticket = admission.maintenance(key).unwrap().ticket;
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Maintenance { key, generation: 7 },
+        Readiness::Ready,
+    );
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::Primary);
+    assert!(decision.carried.is_empty());
+    assert_eq!(admission.maintenance(key).unwrap().ticket, ticket);
+}
+
+#[test]
+fn c0_adm_maint_waiting_maintenance_is_not_absorbed() {
+    let mut admission = Admission::new();
+    let key = gamma_key(1);
+    admission.set_composed(1, 10).unwrap();
+    admission.set_maintenance(key, 7, false).unwrap();
+    let ticket = admission.maintenance(key).unwrap().ticket;
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Maintenance { key, generation: 7 },
+        Readiness::Waiting(WaitReason::SourceWaits),
+    );
+    snapshot.report_compatible(
+        IntentKey::Maintenance { key, generation: 7 },
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+    );
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::Primary);
+    assert!(decision.carried.is_empty());
+    assert_eq!(admission.maintenance(key).unwrap().ticket, ticket);
+}
+
+#[test]
+fn c0_adm_maint_bundle_takes_every_ready_group_crtc() {
+    let mut admission = Admission::new();
+    for (crtc, generation) in [(1, 10), (2, 20), (3, 30)] {
+        admission.set_composed(crtc, generation).unwrap();
+    }
+    let gamma = gamma_key(2);
+    admission.set_maintenance(gamma, 7, false).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.homogeneous_group = super::crtcs(&[1, 2, 3]);
+    for (crtc, generation) in [(1, 10), (2, 20), (3, 30)] {
+        snapshot.report(IntentKey::Composed { crtc, generation }, Readiness::Ready);
+    }
+    snapshot.report(
+        IntentKey::Maintenance {
+            key: gamma,
+            generation: 7,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report_compatible(
+        IntentKey::Maintenance {
+            key: gamma,
+            generation: 7,
+        },
+        IntentKey::Composed {
+            crtc: 2,
+            generation: 20,
+        },
+    );
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::Bundle);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Bundle {
+            members: vec![
+                Admitted::Composed {
+                    crtc: 1,
+                    generation: 10,
+                },
+                Admitted::Composed {
+                    crtc: 2,
+                    generation: 20,
+                },
+                Admitted::Composed {
+                    crtc: 3,
+                    generation: 30,
+                },
+            ],
+        }
+    );
+    assert_eq!(decision.carried.len(), 1);
+    assert_eq!(decision.carried[0].key, gamma);
+
+    let token = admission.lock(decision, &snapshot).unwrap();
+    admission.confirm(token).unwrap();
+    assert!(admission.maintenance(gamma).is_none());
+}
+
+#[test]
+fn c0_adm_maint_bundle_obeys_the_round_robin() {
+    let mut admission = Admission::new();
+    admission.set_composed(1, 10).unwrap();
+    let mut first_snapshot = ReadinessSnapshot::new(0, 0);
+    first_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    let first = admission.decide(&first_snapshot).unwrap();
+    let token = admission.lock(first, &first_snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    admission.set_composed(1, 11).unwrap();
+    admission.set_composed(2, 20).unwrap();
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.homogeneous_group = super::crtcs(&[1, 2]);
+    for (crtc, generation) in [(1, 11), (2, 20)] {
+        snapshot.report(IntentKey::Composed { crtc, generation }, Readiness::Ready);
+    }
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::Primary);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Composed {
+            crtc: 2,
+            generation: 20,
+        }
+    );
+}
+
+#[test]
+fn c0_adm_maint_one_ready_group_crtc_is_tier6() {
+    let mut admission = Admission::new();
+    for (crtc, generation) in [(1, 10), (2, 20), (3, 30)] {
+        admission.set_composed(crtc, generation).unwrap();
+    }
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.homogeneous_group = super::crtcs(&[1, 2, 3]);
+    snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    for (crtc, generation) in [(2, 20), (3, 30)] {
+        snapshot.report(
+            IntentKey::Composed { crtc, generation },
+            Readiness::Waiting(WaitReason::NoReusableBuffer),
+        );
+    }
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::Primary);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Composed {
+            crtc: 1,
+            generation: 10,
+        }
+    );
+}
+
+#[test]
+fn c0_adm_maint_tier3_never_applies_on_an_ordinary_wake() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+    admission
+        .set_direct_successor(successor(20, 0, 0, &[1]))
+        .unwrap();
+    admission.set_maintenance(key, 7, true).unwrap();
+
+    let mut aged_snapshot = ReadinessSnapshot::new(0, 0);
+    aged_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    aged_snapshot.report(
+        IntentKey::Maintenance { key, generation: 7 },
+        Readiness::Ready,
+    );
+    aged_snapshot.report_compatible(
+        IntentKey::Maintenance { key, generation: 7 },
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+    );
+    let aged_decision = admission.decide(&aged_snapshot).unwrap();
+    assert_eq!(aged_decision.tier, Tier::AgedMaintenance);
+    assert_ne!(aged_decision.tier, Tier::DirectSuccessor);
+
+    let mut waiting_snapshot = ReadinessSnapshot::new(0, 0);
+    waiting_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    waiting_snapshot.report(
+        IntentKey::Maintenance { key, generation: 7 },
+        Readiness::Waiting(WaitReason::SourceWaits),
+    );
+    waiting_snapshot.report_compatible(
+        IntentKey::Maintenance { key, generation: 7 },
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+    );
+    let ordinary_decision = admission.decide(&waiting_snapshot).unwrap();
+    assert_eq!(ordinary_decision.tier, Tier::Primary);
+    assert_eq!(
+        ordinary_decision.admitted,
+        Admitted::Direct {
+            successor: successor(20, 0, 0, &[1]),
+        }
+    );
+}
+
+#[test]
+fn c0_adm_maint_tier3_ignores_waiting_aged_identities() {
+    let mut admission = Admission::new();
+    let waiting_key = cursor_key(2);
+    admission
+        .set_direct_successor(successor(20, 0, 0, &[1]))
+        .unwrap();
+    admission.set_maintenance(waiting_key, 7, true).unwrap();
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.retirement_wake = true;
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Maintenance {
+            key: waiting_key,
+            generation: 7,
+        },
+        Readiness::Waiting(WaitReason::SourceWaits),
+    );
+
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::DirectSuccessor);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Direct {
+            successor: successor(20, 0, 0, &[1]),
+        }
+    );
+}
+
+#[test]
+fn c0_adm_maint_stale_required_maintenance_blocks_the_successor_in_every_tier() {
+    for &(retirement_wake, aged, expected_tier) in &[
+        (true, true, Tier::AgedMaintenance),
+        (false, true, Tier::AgedMaintenance),
+        (true, false, Tier::Maintenance),
+        (false, false, Tier::Maintenance),
+    ] {
+        let mut admission = Admission::new();
+        let key = cursor_key(1);
+        admission
+            .set_direct_successor(successor(20, 0, 0, &[1]))
+            .unwrap();
+        admission.set_maintenance(key, 7, aged).unwrap();
+
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.retirement_wake = retirement_wake;
+        snapshot.report(
+            IntentKey::Direct {
+                source_generation: 20,
+            },
+            Readiness::Ready,
+        );
+        snapshot.report(
+            IntentKey::Maintenance { key, generation: 7 },
+            Readiness::Ready,
+        );
+
+        let decision = admission.decide(&snapshot).unwrap();
+        assert_eq!(decision.tier, expected_tier);
+        assert_eq!(
+            decision.admitted,
+            Admitted::Maintenance { key, generation: 7 }
+        );
+
+        let mut waiting_snapshot = ReadinessSnapshot::new(0, 0);
+        waiting_snapshot.retirement_wake = retirement_wake;
+        waiting_snapshot.report(
+            IntentKey::Direct {
+                source_generation: 20,
+            },
+            Readiness::Ready,
+        );
+        waiting_snapshot.report(
+            IntentKey::Maintenance { key, generation: 7 },
+            Readiness::Waiting(WaitReason::SourceWaits),
+        );
+        assert!(admission.decide(&waiting_snapshot).is_none());
+    }
+}
+
+#[test]
+fn c0_adm_maint_seven_tiers_in_order() {
+    let mut topology = Admission::new();
+    topology.request_topology(1).unwrap();
+    topology.request_unflip(super::crtcs(&[1])).unwrap();
+    let mut topology_snapshot = ReadinessSnapshot::new(0, 0);
+    topology_snapshot.report(IntentKey::Unflip, Readiness::Ready);
+    assert_eq!(
+        topology.decide(&topology_snapshot).unwrap().tier,
+        Tier::Topology
+    );
+
+    let mut barrier = Admission::new();
+    barrier.request_cursor_recovery(1);
+    barrier
+        .set_direct_successor(successor(20, 0, 0, &[2]))
+        .unwrap();
+    let mut barrier_snapshot = ReadinessSnapshot::new(0, 0);
+    barrier_snapshot.report(IntentKey::CursorRecovery { crtc: 1 }, Readiness::Ready);
+    barrier_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    assert_eq!(
+        barrier.decide(&barrier_snapshot).unwrap().tier,
+        Tier::Unflip
+    );
+
+    let mut successor_admission = Admission::new();
+    let successor_key = cursor_key(1);
+    successor_admission
+        .set_direct_successor(successor(20, 0, 0, &[1]))
+        .unwrap();
+    successor_admission
+        .set_maintenance(successor_key, 7, true)
+        .unwrap();
+    let mut successor_snapshot = ReadinessSnapshot::new(0, 0);
+    successor_snapshot.retirement_wake = true;
+    successor_snapshot.report(
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+        Readiness::Ready,
+    );
+    successor_snapshot.report(
+        IntentKey::Maintenance {
+            key: successor_key,
+            generation: 7,
+        },
+        Readiness::Ready,
+    );
+    successor_snapshot.report_compatible(
+        IntentKey::Maintenance {
+            key: successor_key,
+            generation: 7,
+        },
+        IntentKey::Direct {
+            source_generation: 20,
+        },
+    );
+    assert_eq!(
+        successor_admission
+            .decide(&successor_snapshot)
+            .unwrap()
+            .tier,
+        Tier::DirectSuccessor
+    );
+
+    let mut aged = Admission::new();
+    let aged_key = cursor_key(3);
+    aged.set_maintenance(aged_key, 7, true).unwrap();
+    aged.set_composed(1, 10).unwrap();
+    aged.set_composed(2, 20).unwrap();
+    let mut aged_snapshot = ReadinessSnapshot::new(0, 0);
+    aged_snapshot.homogeneous_group = super::crtcs(&[1, 2]);
+    aged_snapshot.report(
+        IntentKey::Maintenance {
+            key: aged_key,
+            generation: 7,
+        },
+        Readiness::Ready,
+    );
+    for (crtc, generation) in [(1, 10), (2, 20)] {
+        aged_snapshot.report(IntentKey::Composed { crtc, generation }, Readiness::Ready);
+    }
+    assert_eq!(
+        aged.decide(&aged_snapshot).unwrap().tier,
+        Tier::AgedMaintenance
+    );
+
+    let mut bundle = Admission::new();
+    bundle.set_composed(1, 10).unwrap();
+    bundle.set_composed(2, 20).unwrap();
+    let mut bundle_snapshot = ReadinessSnapshot::new(0, 0);
+    bundle_snapshot.homogeneous_group = super::crtcs(&[1, 2]);
+    for (crtc, generation) in [(1, 10), (2, 20)] {
+        bundle_snapshot.report(IntentKey::Composed { crtc, generation }, Readiness::Ready);
+    }
+    assert_eq!(bundle.decide(&bundle_snapshot).unwrap().tier, Tier::Bundle);
+
+    let mut primary = Admission::new();
+    let primary_key = gamma_key(1);
+    primary.set_composed(1, 10).unwrap();
+    primary.set_maintenance(primary_key, 7, false).unwrap();
+    let mut primary_snapshot = ReadinessSnapshot::new(0, 0);
+    primary_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    primary_snapshot.report(
+        IntentKey::Maintenance {
+            key: primary_key,
+            generation: 7,
+        },
+        Readiness::Ready,
+    );
+    primary_snapshot.report_compatible(
+        IntentKey::Maintenance {
+            key: primary_key,
+            generation: 7,
+        },
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 10,
+        },
+    );
+    assert_eq!(
+        primary.decide(&primary_snapshot).unwrap().tier,
+        Tier::Primary
+    );
+
+    let mut maintenance = Admission::new();
+    let maintenance_key = gamma_key(1);
+    maintenance
+        .set_maintenance(maintenance_key, 7, false)
+        .unwrap();
+    let mut maintenance_snapshot = ReadinessSnapshot::new(0, 0);
+    maintenance_snapshot.report(
+        IntentKey::Maintenance {
+            key: maintenance_key,
+            generation: 7,
+        },
+        Readiness::Ready,
+    );
+    assert_eq!(
+        maintenance.decide(&maintenance_snapshot).unwrap().tier,
+        Tier::Maintenance
+    );
+}

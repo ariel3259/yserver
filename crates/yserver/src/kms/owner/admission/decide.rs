@@ -45,6 +45,17 @@ impl Admission {
         let candidates = self.primary_candidates(snapshot);
         let owed = owed_crtcs(&candidates, &self.last_primary_crtcs);
 
+        if snapshot.retirement_wake
+            && let Some(direct) = candidates.iter().find(|candidate| {
+                matches!(candidate.admitted, Admitted::Direct { .. })
+                    && round_robin_allows(candidate, &self.last_primary_crtcs, &owed)
+                    && owed.is_subset(&candidate.crtcs)
+                    && self.direct_absorbs_all_ready_aged(candidate, snapshot)
+            })
+        {
+            return Some(self.primary_decision(Tier::DirectSuccessor, direct, snapshot));
+        }
+
         if let Some(maintenance) = self
             .maintenance_intents()
             .filter(|(key, intent)| {
@@ -63,6 +74,20 @@ impl Admission {
                 snapshot,
                 &candidates,
                 &owed,
+            ));
+        }
+
+        if let Some(bundle) = self.bundle_candidate(snapshot, &candidates, &owed) {
+            let members = bundle
+                .iter()
+                .map(|candidate| candidate.admitted.clone())
+                .collect::<Vec<_>>();
+            let carried = self.carried_for_primaries(&bundle, snapshot);
+            return Some(self.decision(
+                Tier::Bundle,
+                Admitted::Bundle { members },
+                carried,
+                snapshot,
             ));
         }
 
@@ -127,6 +152,37 @@ impl Admission {
             })
     }
 
+    fn bundle_candidate<'a>(
+        &self,
+        snapshot: &ReadinessSnapshot,
+        candidates: &'a [Candidate],
+        owed: &BTreeSet<CrtcId>,
+    ) -> Option<Vec<&'a Candidate>> {
+        if self.unflip().is_some() || !self.cursor_recovery().is_empty() {
+            return None;
+        }
+
+        let members = candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(candidate.admitted, Admitted::Composed { .. })
+                    && candidate
+                        .crtcs
+                        .iter()
+                        .all(|crtc| snapshot.homogeneous_group.contains(crtc))
+            })
+            .collect::<Vec<_>>();
+        if members.len() < 2 {
+            return None;
+        }
+
+        let bundle_crtcs = members
+            .iter()
+            .flat_map(|candidate| candidate.crtcs.iter().copied())
+            .collect::<BTreeSet<_>>();
+        (bundle_crtcs.is_disjoint(&self.last_primary_crtcs) || owed.is_empty()).then_some(members)
+    }
+
     fn has_compatible_primary(
         &self,
         key: MaintenanceKey,
@@ -183,7 +239,9 @@ impl Admission {
             let intent = IntentKey::Direct {
                 source_generation: direct.successor.source_generation,
             };
-            if snapshot.is_ready(intent) {
+            if snapshot.is_ready(intent)
+                && !self.direct_has_incompatible_maintenance(&direct.successor, intent, snapshot)
+            {
                 candidates.push(Candidate {
                     ordinal: direct.ordinal,
                     crtcs: direct.successor.crtcs.clone(),
@@ -210,7 +268,47 @@ impl Admission {
         candidate: &Candidate,
         snapshot: &ReadinessSnapshot,
     ) -> AdmissionDecision {
-        self.decision(tier, candidate.admitted.clone(), Vec::new(), snapshot)
+        self.decision(
+            tier,
+            candidate.admitted.clone(),
+            self.carried_for_primary(candidate, snapshot),
+            snapshot,
+        )
+    }
+
+    fn direct_absorbs_all_ready_aged(
+        &self,
+        candidate: &Candidate,
+        snapshot: &ReadinessSnapshot,
+    ) -> bool {
+        self.maintenance_intents().all(|(key, intent)| {
+            let maintenance = IntentKey::Maintenance {
+                key,
+                generation: intent.generation,
+            };
+            !intent.aged
+                || !snapshot.is_ready(maintenance)
+                || (candidate.crtcs.contains(&key.crtc)
+                    && snapshot.is_compatible(maintenance, candidate.intent))
+        })
+    }
+
+    fn direct_has_incompatible_maintenance(
+        &self,
+        successor: &DirectSuccessor,
+        direct: IntentKey,
+        snapshot: &ReadinessSnapshot,
+    ) -> bool {
+        self.maintenance_intents().any(|(key, intent)| {
+            successor.crtcs.contains(&key.crtc)
+                && !snapshot.is_compatible(
+                    IntentKey::Maintenance {
+                        key,
+                        generation: intent.generation,
+                    },
+                    direct,
+                )
+        })
     }
 
     fn maintenance_decision(
@@ -266,15 +364,24 @@ impl Admission {
         candidate: &Candidate,
         snapshot: &ReadinessSnapshot,
     ) -> Vec<CarriedMaintenance> {
+        self.carried_for_primaries(std::slice::from_ref(&candidate), snapshot)
+    }
+
+    fn carried_for_primaries(
+        &self,
+        candidates: &[&Candidate],
+        snapshot: &ReadinessSnapshot,
+    ) -> Vec<CarriedMaintenance> {
         self.maintenance_intents()
             .filter_map(|(key, intent)| {
                 let maintenance = IntentKey::Maintenance {
                     key,
                     generation: intent.generation,
                 };
-                (candidate.crtcs.contains(&key.crtc)
-                    && snapshot.is_ready(maintenance)
-                    && snapshot.is_compatible(maintenance, candidate.intent))
+                (candidates.iter().any(|candidate| {
+                    candidate.crtcs.contains(&key.crtc)
+                        && snapshot.is_compatible(maintenance, candidate.intent)
+                }) && snapshot.is_ready(maintenance))
                 .then_some(CarriedMaintenance {
                     key,
                     generation: intent.generation,

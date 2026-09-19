@@ -71,7 +71,7 @@ fn decision_requires_unsupported(decision: &AdmissionDecision) -> bool {
         )
         || matches!(
             decision.tier,
-            Tier::DirectSuccessor | Tier::AgedMaintenance | Tier::Bundle | Tier::Maintenance
+            Tier::AgedMaintenance | Tier::Bundle | Tier::Maintenance
         )
 }
 

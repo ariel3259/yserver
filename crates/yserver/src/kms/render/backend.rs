@@ -50489,6 +50489,111 @@ mod tests {
     }
 
     #[test]
+    fn c0_adm_conductor_maintenance_carrying_tier3_is_unsupported() {
+        use crate::kms::owner::admission::{
+            IntentKey, MaintenanceClass, MaintenanceKey, Readiness, Tier,
+        };
+
+        let mut backend = admission_backend_with_stub_executor();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 61);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        let cursor = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Cursor,
+        };
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("conductor")
+            .admission
+            .set_maintenance(cursor, 7, true)
+            .expect("cursor offer");
+        let source_generation = backend.admission_conductors[&device]
+            .admission
+            .direct()
+            .expect("queued successor")
+            .successor
+            .source_generation;
+
+        let mut snapshot = backend
+            .admission_snapshot(device, true)
+            .expect("owner snapshot");
+        snapshot.report(
+            IntentKey::Maintenance {
+                key: cursor,
+                generation: 7,
+            },
+            Readiness::Ready,
+        );
+        snapshot.report_compatible(
+            IntentKey::Maintenance {
+                key: cursor,
+                generation: 7,
+            },
+            IntentKey::Direct { source_generation },
+        );
+        let decision = backend.admission_conductors[&device]
+            .admission
+            .decide(&snapshot)
+            .expect("tier-3 decision");
+        assert_eq!(decision.tier, Tier::DirectSuccessor);
+        assert_eq!(decision.carried.len(), 1);
+        assert!(matches!(
+            decision.admitted,
+            crate::kms::owner::admission::Admitted::Direct { .. }
+        ));
+
+        let token = backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("conductor")
+            .admission
+            .lock(decision.clone(), &snapshot)
+            .expect("lock");
+        assert_eq!(
+            backend.admission_abort_if_unsupported_for_tests(device, token, &decision),
+            crate::kms::render::admission::AdmissionOutcome::Unsupported(Tier::DirectSuccessor)
+        );
+        assert!(!backend.admission_conductors[&device].admission.is_locked());
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .direct()
+                .is_some()
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .map(|frame| frame.event.present_id),
+            Some(61)
+        );
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .maintenance(cursor)
+                .is_some()
+        );
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .slot()
+                .occupant()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn c0_adm_conductor_pre_ipc_refusal_consumes_no_admission_state() {
         use crate::kms::owner::record::RefusalCause;
 
