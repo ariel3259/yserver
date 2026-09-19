@@ -21,7 +21,7 @@ READING AND EXECUTION BOUNDARY:
 - Verify a claim about existing code only when it is needed to confirm or
   disprove a concrete design-risk hypothesis. Do not audit every line anchor,
   symbol, import, constructor, fixture or dependency API in the plan.
-- Beyond the plan and prior review, use at most 12 bounded excerpts, each at
+- Beyond the plan and prior review, use at most 24 bounded excerpts, each at
   most 120 lines, across spec and source. Search named paths first; do not dump
   whole large files, the repository, dependency registries or session logs.
   Do not reread material already available in context. Count excerpts in the
@@ -89,7 +89,7 @@ and a body citing the relevant plan/spec/source lines, the concrete failure
 scenario and the smallest required design correction. Merge duplicate symptoms
 of the same root cause. Do not fill a findings quota or list cosmetic edits.
 End with "## Coverage and implementation checks": summarize the four checks,
-excerpts used (N/12), verified ground, unassessed risks and checks deferred to
+excerpts used (N/24), verified ground, unassessed risks and checks deferred to
 the real compiler/tests. Unverified ground is not SOUND. Zero findings with
 incomplete coverage is not a clean review. Do not recommend another full
 review merely to reach zero findings; name the specific unresolved design
