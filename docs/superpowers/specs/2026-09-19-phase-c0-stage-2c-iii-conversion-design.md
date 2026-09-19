@@ -168,8 +168,8 @@ register there, it is an F8 stop recorded here, not a silent omission.
    also takes the completion context.
 
 Both are owner changes inside C.0's existing contracts (they add no state and
-no outcome); C1's plan owns them, because composed is the first converted
-producer.
+no outcome); section 4.0 states what must hold, and C1 implements them first,
+because composed is the first converted producer.
 
 **3.3. Owner events reach the consumers.** 2c-ii's `route_owner_event_batch` is
 the only path owner events take (plan B2). 2c-iii adds consumers behind it: the
@@ -177,7 +177,31 @@ damage transactions (section 4.2) and the direct frame state (section 5).
 Milestones are delivered by `CommitId`; a consumer that sees an unknown
 `CommitId` ignores it and records a telemetry count, never guesses an owner.
 
-## 4. Plan C1 — composed producer, damage transaction, bundles
+## 4. Plan C1 — owner entry, composed producer, damage transaction, bundles
+
+**4.0. The owner entry for a registered ledger** (section 3.2's two gaps). C1's
+first tasks, before any producer is converted, because the composed producer is
+the first real caller. Stated as invariants; the shape of the API is the plan's:
+
+- **A failed registration leaves nothing behind.** When the ledger closure
+  fails, `begin` returns an error and the owner is as it was before the call:
+  no live record, the slot and the reservation released, no event emitted for
+  that commit. Every obligation the registration had taken is cancelled, and
+  the old and new resources come back to the caller intact. The conductor then
+  `abort`s its token, so no ticket is spent, no turn advances and no loser ages
+  (2c-ii §6). This is a `begin` refusal, not a pre-IPC `send_on` refusal: no
+  record reaches `NeverDispatched`.
+- **A Present-carrying commit can register.** A description with
+  `page_flip_event` or `present_consumers` is begun through a public entry that
+  takes its `CompletionContext` **and** a CommitId-aware, fallible ledger
+  closure. That entry applies every check `begin_with_context` applies today;
+  it is not a way around them.
+- **The obligations name the record's own commit.** Each registered
+  `KmsRelease` is keyed by the `CommitId` of the record that carries it, so the
+  discharge in `consume` matches it (`record_kms_discharged` and
+  `discharge_commit_kms_obligations` compare the commit).
+- **The existing entries keep their refusals.** `begin_with_ledger` still
+  refuses a Present-carrying description; nothing widens it silently.
 
 **4.1. Producer.** The scene tick is unchanged up to the composed buffer and its
 `PendingAck` (repaint, per-output damage, `drawable_snapshots`) — the prepare
@@ -239,7 +263,8 @@ every row of the table in 4.2; new paint between capture and `HardwareComplete`
 survives; two outputs with permuted completions, bundled and separately
 scheduled; a displaced generation acks nothing; invalidation without fresh paint
 still repaints; skipped-output dormancy; off-output damage not acked; old-state
-registration of section 3.2.
+registration of section 3.2; the four invariants of section 4.0, including a
+registration failure that leaves the owner and the decider untouched.
 
 ## 5. Plan C2 — direct producer
 
@@ -380,6 +405,11 @@ not by the first textual match.
 | Damage after capture survives the ack (stage 2c §5) | Ack from the live store instead of the captured snapshots |
 | Pool release follows the ledger, not the ack (4.2) | Release the pool slot at `HardwareComplete` |
 | Old-state dependencies registered at dispatch (3.2) | Build the ledger without registering |
+| A failed registration leaves the owner as before `begin` (4.0) | Keep the slot reserved on a ledger error |
+| A failed registration consumes no admission state (4.0; 2c-ii §6) | `confirm` instead of `abort` after a ledger error |
+| A Present-carrying commit registers through the context entry, with its checks (4.0) | Skip the completion-context validation in the new entry |
+| Registered obligations carry the record's own `CommitId` (4.0) | Register under a different `CommitId` than the record's |
+| `begin_with_ledger` still refuses Present-carrying descriptions (4.0) | Drop the `page_flip_event`/`present_consumers` refusal |
 | One eligibility predicate for both routes (5.1) | Let the owner route skip the border-clip input |
 | A border gained while queued is never committed, promoted or not (5.2) | Skip the layout hook at one enumerated site |
 | Retirement promotion goes through the conductor, in order (5.3) | Commit the successor from the event handler |
