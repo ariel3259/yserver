@@ -3339,7 +3339,8 @@ impl PlatformBackend {
             .key;
         let mut seed = Self::for_tests();
         let mut output = seed.outputs.remove(0);
-        let raw_crtc = u32::from(output.output.crtc).saturating_add(1);
+        let raw_crtc = u32::from(output.output.crtc)
+            .saturating_add(u32::try_from(self.outputs.len()).unwrap_or(u32::MAX));
         output.key = OutputKey::new(device_key, connector_name);
         output.scanout_route.kms_device_key = device_key;
         output.output.connector_name = connector_name.to_owned();
@@ -3351,6 +3352,41 @@ impl PlatformBackend {
         self.scanout_pools.push(None);
         self.bo_generations.push(Vec::new());
         self.first_pageflip_logged.push(false);
+    }
+
+    /// Append a fixture output through the same platform-owned pool and
+    /// per-output bookkeeping used by the live scene constructor. This is
+    /// deliberately allocation-only: the Task 8 owner fixture must exercise
+    /// a multi-CRTC owner bundle without modesetting the user's display.
+    #[cfg(test)]
+    pub(crate) fn append_test_output_with_scanout_pool(
+        &mut self,
+        vk: std::sync::Arc<crate::kms::vk::device::VkContext>,
+        connector_name: &str,
+    ) -> io::Result<()> {
+        self.append_test_output_without_scanout_pool(connector_name);
+        let output_idx = self.outputs.len().saturating_sub(1);
+        let layout = &self.outputs[output_idx];
+        let kms_device = self
+            .device_for_key(layout.key.device_key)
+            .ok_or_else(|| io::Error::other("test output has no KMS device"))?;
+        let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
+            vk,
+            Rc::clone(&kms_device.device),
+            layout.scanout_route,
+            u32::from(layout.width),
+            u32::from(layout.height),
+            SCANOUT_POOL_DEPTH,
+            &layout.output.scanout_modifiers,
+        )
+        .map_err(|error| io::Error::other(format!("test output scanout pool: {error}")))?;
+        self.scanout_pools[output_idx] = Some(OutputScanout::Shared(pool));
+        self.bo_generations[output_idx] = self.scanout_pools[output_idx]
+            .as_ref()
+            .map_or_else(Vec::new, |pool| {
+                vec![BoGenerationEntry::default(); pool.display_pool().bos.len()]
+            });
+        Ok(())
     }
 
     /// Install a transport gate after checking the complete device route.

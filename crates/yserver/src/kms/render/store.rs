@@ -1833,6 +1833,15 @@ impl DrawableStore {
                 .all(|rect| drawable.presentation_damage.rects().contains(rect))
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_presentation_damage_for_tests(&self, id: DrawableId) -> bool {
+        self.entries.get(&id).is_some_and(|drawable| {
+            drawable.scene_participating
+                && !drawable.presentation_damage.is_empty()
+                && drawable.dormant.is_none()
+        })
+    }
+
     /// Stage 4a — set or clear a window's COMPOSITE redirect
     /// routing. `Some(backing_id)` routes future paint resolution
     /// against `window_id`'s xid (or any descendant whose nearest

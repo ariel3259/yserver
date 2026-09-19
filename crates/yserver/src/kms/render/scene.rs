@@ -937,6 +937,29 @@ impl TickOutcome {
                 | Self::Skipped(TickSkipReason::NothingPending)
         )
     }
+
+    /// Owner generations that cannot acquire a scanout buffer or descriptor
+    /// pool did run the walk, but did not present it. Keep that distinction
+    /// local to the Owner dormancy policy; Legacy continues to use
+    /// [`Self::walked`] exactly as before.
+    fn owner_dormancy_walked(self) -> bool {
+        self.walked()
+            && !matches!(
+                self,
+                Self::Skipped(TickSkipReason::NoBO) | Self::Skipped(TickSkipReason::NoPool)
+            )
+    }
+}
+
+/// Select the dormancy walk policy at the per-output route seam. The Legacy
+/// branch deliberately retains `TickOutcome::walked`; only Owner treats a
+/// post-walk resource skip as not having presented its walk.
+fn dormancy_walked_for_output(outcome: TickOutcome, owner_route: bool) -> bool {
+    if owner_route {
+        outcome.owner_dormancy_walked()
+    } else {
+        outcome.walked()
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1988,7 +2011,7 @@ impl SceneCompositor {
                 continue;
             };
             if platform.accept_owner_bo(output_idx, prepared.ack.bo_idx) {
-                return;
+                continue;
             }
             log::error!(
                 "render scene: owner commit {commit:?} buffer {} was not OwnerSubmitted",
@@ -2113,73 +2136,80 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let Some((output_idx, mut prepared, from_prepared, submitted_idx)) = inner
-            .outputs
-            .iter_mut()
-            .enumerate()
-            .find_map(|(output_idx, state)| {
-                if state
-                    .owner_prepared
-                    .as_ref()
-                    .is_some_and(|prepared| prepared.commit_id == Some(commit))
-                {
-                    return state
+        // A bundled owner commit has one CompletionRetired event carrying the
+        // bundle's resources. Resolve every scene member keyed by this commit;
+        // consuming only the first one leaves the remaining outputs attached
+        // to their prepared slots and makes a later per-output admission look
+        // permanently unavailable.
+        loop {
+            let Some((output_idx, mut prepared, from_prepared, submitted_idx)) = inner
+                .outputs
+                .iter_mut()
+                .enumerate()
+                .find_map(|(output_idx, state)| {
+                    if state
                         .owner_prepared
-                        .take()
-                        .map(|prepared| (output_idx, prepared, true, None));
-                }
-                let submitted_idx = state
-                    .owner_submitted
-                    .iter()
-                    .position(|prepared| prepared.commit_id == Some(commit))?;
-                let prepared = state.owner_submitted.remove(submitted_idx)?;
-                Some((output_idx, prepared, false, Some(submitted_idx)))
-            })
-        else {
-            return;
-        };
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.commit_id == Some(commit))
+                    {
+                        return state
+                            .owner_prepared
+                            .take()
+                            .map(|prepared| (output_idx, prepared, true, None));
+                    }
+                    let submitted_idx = state
+                        .owner_submitted
+                        .iter()
+                        .position(|prepared| prepared.commit_id == Some(commit))?;
+                    let prepared = state.owner_submitted.remove(submitted_idx)?;
+                    Some((output_idx, prepared, false, Some(submitted_idx)))
+                })
+            else {
+                return;
+            };
 
-        let output_key = prepared.output_key.clone();
-        let old_current_idx = inner.outputs[output_idx]
-            .owner_current
-            .iter()
-            .position(|old| {
-                old.output_key == output_key
-                    && platform.owner_bo_phase(output_idx, old.ack.bo_idx)
-                        == Some(BoPhase::OwnerCurrent)
-            });
-        if let Some(old_idx) = old_current_idx
-            && !platform.release_owner_current_bo(
-                output_idx,
-                inner.outputs[output_idx].owner_current[old_idx].ack.bo_idx,
-            )
-        {
-            restore_owner_prepared_after_resolution_failure(
-                &mut inner.outputs[output_idx],
-                prepared,
-                from_prepared,
-                submitted_idx,
-            );
-            return;
-        }
-
-        if !platform.current_owner_bo(output_idx, prepared.ack.bo_idx) {
-            if let Some(old_idx) = old_current_idx {
-                let old_bo_idx = inner.outputs[output_idx].owner_current[old_idx].ack.bo_idx;
-                let _ =
-                    platform.restore_owner_current_bo_after_release_abort(output_idx, old_bo_idx);
+            let output_key = prepared.output_key.clone();
+            let old_current_idx = inner.outputs[output_idx]
+                .owner_current
+                .iter()
+                .position(|old| {
+                    old.output_key == output_key
+                        && platform.owner_bo_phase(output_idx, old.ack.bo_idx)
+                            == Some(BoPhase::OwnerCurrent)
+                });
+            if let Some(old_idx) = old_current_idx
+                && !platform.release_owner_current_bo(
+                    output_idx,
+                    inner.outputs[output_idx].owner_current[old_idx].ack.bo_idx,
+                )
+            {
+                restore_owner_prepared_after_resolution_failure(
+                    &mut inner.outputs[output_idx],
+                    prepared,
+                    from_prepared,
+                    submitted_idx,
+                );
+                return;
             }
-            restore_owner_prepared_after_resolution_failure(
-                &mut inner.outputs[output_idx],
-                prepared,
-                from_prepared,
-                submitted_idx,
-            );
-            return;
-        }
 
-        prepared.commit_id = None;
-        inner.outputs[output_idx].owner_current.push_back(prepared);
+            if !platform.current_owner_bo(output_idx, prepared.ack.bo_idx) {
+                if let Some(old_idx) = old_current_idx {
+                    let old_bo_idx = inner.outputs[output_idx].owner_current[old_idx].ack.bo_idx;
+                    let _ = platform
+                        .restore_owner_current_bo_after_release_abort(output_idx, old_bo_idx);
+                }
+                restore_owner_prepared_after_resolution_failure(
+                    &mut inner.outputs[output_idx],
+                    prepared,
+                    from_prepared,
+                    submitted_idx,
+                );
+                return;
+            }
+
+            prepared.commit_id = None;
+            inner.outputs[output_idx].owner_current.push_back(prepared);
+        }
     }
 
     fn owner_damage_close(
@@ -2704,6 +2734,11 @@ impl SceneCompositor {
             .is_some_and(|inner| inner.outputs.iter().any(|o| o.damage.owes_repaint()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn scene_structure_dirty_for_tests(&self) -> bool {
+        self.scene_structure_dirty
+    }
+
     /// True while any output has an atomic pageflip awaiting retirement.
     /// Present completion pacing uses this with pending compose damage to
     /// decide whether a standalone CRTC sequence is a genuine idle fallback.
@@ -3135,7 +3170,10 @@ impl SceneCompositor {
                     } else {
                         clear_dirty &= outcome.clears_scene_structure_dirty();
                     }
-                    walked_outputs[output_idx] = outcome.walked();
+                    walked_outputs[output_idx] = dormancy_walked_for_output(
+                        outcome,
+                        platform.output_uses_owner_route(output_idx),
+                    );
                 }
                 Err(e) => {
                     clear_dirty = false;
@@ -5595,17 +5633,6 @@ fn tick_one_output(
         built.omit_software_cursor_for_hide();
     }
 
-    // Idle free-run fix (cut 2b): record the sampled sources whose pending
-    // damage this output PRESENTED, so `tick` can reconcile
-    // `offscreen_no_draw` from the union across outputs. Recorded
-    // unconditionally here (before the empty-damage / BO / pool skips below)
-    // so a window that WAS presented is never mis-flagged just because its
-    // output later skips. `presented_ids`, not `sampled_ids`: a node sampled
-    // but with all of its damage under a cover must NOT count, or the
-    // scheduler never goes dormant (see `WalkSink::presented_ids`).
-    drawn.extend(built.presented_ids.iter().copied());
-    had_pieces.extend(built.pieces_ids.iter().copied());
-
     // Stage 5 Phase D — derive the per-output cursor transition
     // and new prev_pos from `built.cursor_assignment` and the
     // last-frame mode. Both are queued on the PendingAck below
@@ -6290,6 +6317,14 @@ fn tick_one_output(
     match compose_result {
         Ok(stage) => {
             state.next_submit_retry_at = None;
+            // Idle free-run fix (cut 2b): only a successfully submitted frame
+            // counts as having presented its sampled sources. A walk that
+            // later skips at BO or descriptor-pool acquisition refreshed
+            // `last_pieces` but did not put pixels on screen; counting it here
+            // would let another output's dormancy report ack its damage by
+            // proxy and would make the retained-piece rule ineffective.
+            drawn.extend(built.presented_ids.iter().copied());
+            had_pieces.extend(built.pieces_ids.iter().copied());
             for id in &built.sampled_ids {
                 store.touch_render_fence(*id, compose_ticket.clone());
             }
@@ -11062,6 +11097,84 @@ mod tests {
         assert!(!TickOutcome::Skipped(TickSkipReason::PendingAcks).walked());
         assert!(TickOutcome::Skipped(TickSkipReason::EmptyDamage).walked());
         assert!(TickOutcome::Composed.walked());
+    }
+
+    #[test]
+    fn c0_conv_ci_legacy_dormancy_unchanged() {
+        let platform = PlatformBackend::for_tests();
+        assert!(!platform.output_uses_owner_route(0));
+        assert!(dormancy_walked_for_output(
+            TickOutcome::Skipped(TickSkipReason::NoBO),
+            false,
+        ));
+        assert!(dormancy_walked_for_output(
+            TickOutcome::Skipped(TickSkipReason::NoPool),
+            false,
+        ));
+        assert!(!dormancy_walked_for_output(
+            TickOutcome::Skipped(TickSkipReason::NoBO),
+            true,
+        ));
+        assert!(!dormancy_walked_for_output(
+            TickOutcome::Skipped(TickSkipReason::NoPool),
+            true,
+        ));
+    }
+
+    #[test]
+    #[ignore = "F8: legacy dormancy with NoBO/NoPool — pending user decision"]
+    fn c0_conv_ci_legacy_dormancy_no_bo_no_pool_f8() {
+        for reason in [TickSkipReason::NoBO, TickSkipReason::NoPool] {
+            let mut store = DrawableStore::new();
+            let id = store
+                .allocate(
+                    0xF8_0001,
+                    DrawableKind::Window,
+                    24,
+                    true,
+                    crate::kms::render::store::Storage::for_tests_null(
+                        vk::Extent2D {
+                            width: 32,
+                            height: 32,
+                        },
+                        vk::Format::B8G8R8A8_UNORM,
+                    ),
+                )
+                .expect("allocate visible drawable");
+            store.damage(
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+            );
+            let pieces = HashSet::from([id]);
+            let presented = HashSet::new();
+            let walked = dormancy_walked_for_output(TickOutcome::Skipped(reason), false);
+            assert!(
+                walked,
+                "Legacy counts the post-walk {reason:?} skip as walked"
+            );
+            let report = [OutputWalkReport {
+                walked,
+                presented: &presented,
+                last_pieces: &pieces,
+            }];
+            let (keep_armed, pieces_anywhere) = dormancy_inputs(&report);
+            store.reconcile_offscreen_no_draw(&keep_armed, &pieces_anywhere);
+            assert_eq!(
+                store.get(id).expect("drawable").dormant,
+                Some(crate::kms::render::store::DormantReason::HiddenDamage),
+                "Legacy marks a visible drawable dormant after {reason:?} even though no frame presented",
+            );
+            assert!(
+                !store.has_pending_presentation_damage(),
+                "Legacy suppresses the pending repaint after {reason:?}"
+            );
+        }
     }
 
     /// Each input of the pre-walk predicate alone forces a walk; with none set

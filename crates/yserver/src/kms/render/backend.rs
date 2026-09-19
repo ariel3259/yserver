@@ -2175,6 +2175,7 @@ fn restore_primary_output_after_rebuild(
 impl KmsBackend {
     fn offer_scene_composed_generations(&mut self) {
         let offers = self.scene.take_owner_composed_offers();
+        let mut devices = Vec::new();
         for offer in offers {
             if let Err(error) =
                 self.admission_offer_composed(offer.device, offer.crtc, offer.generation)
@@ -2184,9 +2185,17 @@ impl KmsBackend {
                     offer.generation,
                     offer.crtc,
                 );
-            } else {
-                let _ = self.admission_wake(offer.device, false);
+            } else if !devices.contains(&offer.device) {
+                devices.push(offer.device);
             }
+        }
+        // Collect every completion drained from this scene tick before
+        // waking the decider. Tier 5 then sees the complete set of ready
+        // CRTCs and dispatches one bundle/transaction for the device rather
+        // than admitting the first offer and leaving its siblings queued
+        // behind the newly occupied owner slot.
+        for device in devices {
+            let _ = self.admission_wake(device, false);
         }
     }
 
@@ -50306,10 +50315,21 @@ mod tests {
     }
 
     fn owner_live_fixture() -> Result<OwnerLiveFixture, std::io::Error> {
-        owner_live_fixture_with_extra_missing_output(false)
+        owner_live_fixture_with_output_count(1, false)
+    }
+
+    fn owner_live_fixture_with_three_outputs() -> Result<OwnerLiveFixture, std::io::Error> {
+        owner_live_fixture_with_output_count(3, false)
     }
 
     fn owner_live_fixture_with_extra_missing_output(
+        extra_missing_output: bool,
+    ) -> Result<OwnerLiveFixture, std::io::Error> {
+        owner_live_fixture_with_output_count(1, extra_missing_output)
+    }
+
+    fn owner_live_fixture_with_output_count(
+        output_count: usize,
         extra_missing_output: bool,
     ) -> Result<OwnerLiveFixture, std::io::Error> {
         use std::{cell::RefCell, rc::Rc};
@@ -50319,23 +50339,51 @@ mod tests {
         };
 
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        if output_count > 1 {
+            let vk =
+                backend.platform.vk.as_ref().cloned().ok_or_else(|| {
+                    std::io::Error::other("live-scene fixture has no Vulkan context")
+                })?;
+            for output_idx in 1..output_count {
+                backend.platform.append_test_output_with_scanout_pool(
+                    std::sync::Arc::clone(&vk),
+                    &format!("test-output-{output_idx}"),
+                )?;
+            }
+            let output_width = backend.platform.outputs[0].width;
+            for (output_idx, output) in backend.platform.outputs.iter_mut().enumerate() {
+                output.x = i32::from(output_width)
+                    .saturating_mul(i32::try_from(output_idx).unwrap_or(i32::MAX));
+            }
+            let fb_w = output_width.saturating_mul(u16::try_from(output_count).unwrap_or(u16::MAX));
+            backend.apply_virtual_screen_extent(fb_w, backend.platform.outputs[0].height)?;
+            backend
+                .scene
+                .rebuild_outputs(&backend.platform)
+                .map_err(|error| {
+                    std::io::Error::other(format!("rebuild multi-output scene: {error:?}"))
+                })?;
+        }
         // This fixture uses the synthetic KMS object ids from the existing
         // scene fixture while its scanout allocations use a real DRM fd.
         // The owner executor is a stub and never issues this description to
         // that fd, so seed the persistent property ids that the production
         // discovery cache would have obtained for a real output.
-        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
-        backend.platform.outputs[0].output.plane =
-            ::drm::control::from_u32(10).expect("fixture primary plane");
-        backend.platform.outputs[0].output.plane_fb_id_prop =
-            ::drm::control::from_u32(19).expect("fixture FB_ID property");
-        backend.platform.outputs[0].output.plane_crtc_id_prop =
-            ::drm::control::from_u32(20).expect("fixture CRTC_ID property");
-        backend.platform.devices[0]
-            .active_property_cache
-            .insert_for_tests(crtc, 21);
-        backend.platform.outputs[0].output.crtc_out_fence_ptr_prop =
-            Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
+        for (output_idx, output) in backend.platform.outputs.iter_mut().enumerate() {
+            let crtc = u32::from(output.output.crtc);
+            output.output.plane =
+                ::drm::control::from_u32(10 + u32::try_from(output_idx).unwrap_or(u32::MAX))
+                    .expect("fixture primary plane");
+            output.output.plane_fb_id_prop =
+                ::drm::control::from_u32(19).expect("fixture FB_ID property");
+            output.output.plane_crtc_id_prop =
+                ::drm::control::from_u32(20).expect("fixture CRTC_ID property");
+            output.output.crtc_out_fence_ptr_prop =
+                Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
+            backend.platform.devices[0]
+                .active_property_cache
+                .insert_for_tests(crtc, 21);
+        }
         let executor = crate::kms::executor::test_support::spawn_stub_helper(
             crate::kms::executor::test_support::StubBehaviour::NeverReply,
         )
@@ -51447,6 +51495,628 @@ mod tests {
             backend.store.has_pending_presentation_damage(),
             "damage painted after capture survives the captured-snapshot ack"
         );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_bundle_is_one_transaction_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        assert_eq!(
+            backend.platform.outputs.len(),
+            3,
+            "the tier-5 bundle fixture must have three outputs on one device"
+        );
+
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("the ready outputs must be admitted as one owner commit");
+        let commit = record.commit_id();
+        assert_eq!(record.closure().expected_completion().len(), 3);
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 1);
+
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted { commit }],
+            std::time::Instant::now(),
+        );
+        for output_idx in 0..3 {
+            assert!(
+                backend
+                    .scene
+                    .damage_state_for_tests(output_idx)
+                    .is_some_and(|(_, staged)| staged),
+                "Accepted must stage each bundle member exactly once"
+            );
+        }
+
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+        for output_idx in 0..3 {
+            assert!(
+                backend
+                    .scene
+                    .damage_state_for_tests(output_idx)
+                    .is_some_and(|(_, staged)| !staged),
+                "one HardwareComplete must apply every bundle member"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_composited_present_completes_once_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let root = backend.core.window_id;
+        let root_extent = (
+            u32::from(backend.platform.fb_w),
+            u32::from(backend.platform.fb_h),
+        );
+
+        backend
+            .render_composite_for_tests(root, [0.25, 0.5, 0.75, 1.0], root_extent.0, root_extent.1)
+            .expect("record the real composited Present write");
+        assert!(backend.attach_synthetic_present_completion_for_tests(root, 801));
+        backend
+            .engine_close_open_frame_for_timeout_for_tests()
+            .expect("submit the Present GPU batch");
+        backend
+            .engine_flush_submit_group_for_tests()
+            .expect("flush the Present GPU batch");
+
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("owner composed commit")
+            .commit_id();
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("owner composed commit")
+                .closure()
+                .present_event()
+                .is_empty(),
+            "a composited Present must not be carried by the owner commit"
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
+            ],
+            std::time::Instant::now(),
+        );
+
+        backend.engine_drain_all_for_tests();
+        let completed = backend.drain_completed_present_events_for_tests();
+        assert_eq!(completed.len(), 1, "the GPU batch emits one completion");
+        assert_eq!(completed[0].serial, 801);
+        assert!(
+            backend
+                .drain_completed_present_events_for_tests()
+                .is_empty(),
+            "owner milestones must not emit a second Present completion"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_owed_repaint_wakes_without_new_paint_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device, first_commit) = owner_damage_commit_for_tests(&mut backend);
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: first_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: first_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+        let first_completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, first_completion, std::time::Instant::now());
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("initial owner executor"),
+        );
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("replacement owner executor"),
+        );
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+        let (_, commit) = owner_damage_commit_for_tests(&mut backend);
+        assert!(!backend.store.has_pending_presentation_damage());
+        assert!(!backend.scene.scene_structure_dirty_for_tests());
+        let first_generation = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("submitted owner generation")
+            .1;
+        backend.route_owner_event_batch(
+            device,
+            vec![owner_terminal_event_for_tests(
+                commit,
+                crate::kms::owner::record::TerminalState::CompletionUnknown(
+                    crate::kms::owner::record::UnknownCause::ContradictoryEvidence,
+                ),
+            )],
+            std::time::Instant::now(),
+        );
+        assert!(
+            backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(owed, staged)| owed && !staged)
+        );
+        assert!(!backend.store.has_pending_presentation_damage());
+        assert!(!backend.scene.scene_structure_dirty_for_tests());
+
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (_, generation, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("owed repaint must drive a new owner generation without new paint");
+        assert!(generation > first_generation);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_off_output_damage_not_acked_vulkan() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let mut state = yserver_core::server::ServerState::new();
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+        let off_output_x =
+            i16::try_from(backend.platform.fb_w.saturating_sub(16)).expect("fixture width");
+        let window = create_live_window(
+            &mut state,
+            &mut backend,
+            ResourceId(0xC0_0801),
+            ROOT_WINDOW,
+            off_output_x,
+            0,
+            32,
+            32,
+        );
+        backend.sync_top_level_order(&state);
+        backend
+            .fill_rectangle(None, window.as_raw(), 0x0000_22ff, 20, 0, 12, 32)
+            .expect("paint the off-output window");
+        assert!(backend.test_peek_presentation_damage_nonempty(window.as_raw()));
+
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("off-output damage still forces the owner compose")
+            .commit_id();
+        assert!(
+            !backend
+                .scene
+                .owner_damage_snapshot_ids_for_tests(commit)
+                .contains(
+                    &backend
+                        .store
+                        .lookup(window.as_raw())
+                        .expect("window drawable")
+                )
+        );
+
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
+            ],
+            std::time::Instant::now(),
+        );
+        assert!(
+            backend.test_peek_presentation_damage_nonempty(window.as_raw()),
+            "OffOutput damage must remain pending after this output's ack"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_skipped_output_stays_armed_vulkan() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        assert_eq!(backend.platform.outputs.len(), 3);
+
+        let mut state = yserver_core::server::ServerState::new();
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+        let output_width = i16::try_from(backend.platform.outputs[0].width).expect("output width");
+        let output_zero_window = create_live_window(
+            &mut state,
+            &mut backend,
+            ResourceId(0xC0_0802),
+            ROOT_WINDOW,
+            10,
+            10,
+            32,
+            32,
+        );
+        let output_one_window = create_live_window(
+            &mut state,
+            &mut backend,
+            ResourceId(0xC0_0803),
+            ROOT_WINDOW,
+            output_width.saturating_add(10),
+            10,
+            32,
+            32,
+        );
+        backend.sync_top_level_order(&state);
+        backend
+            .fill_rectangle(None, output_zero_window.as_raw(), 0x0000_11ff, 0, 0, 32, 32)
+            .expect("paint output-zero window for the initial frame");
+        backend
+            .fill_rectangle(None, output_one_window.as_raw(), 0x0000_12ff, 0, 0, 32, 32)
+            .expect("paint output-one window for the initial frame");
+
+        // Establish a real current generation on every output, then retire
+        // that bundle through the owner route. The later generations are
+        // driven by production paint entries, not prepared-state helpers.
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let device = backend.platform.primary_device().expect("device").key;
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("initial bundle")
+            .commit_id();
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: first_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: first_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+        let first_completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, first_completion, std::time::Instant::now());
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("initial owner executor"),
+        );
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("replacement owner executor"),
+        );
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+
+        // Paint only output 0. This is separately scheduled because the
+        // other outputs have no pending presentation damage.
+        backend
+            .fill_rectangle(None, output_zero_window.as_raw(), 0x0000_22ff, 0, 0, 32, 32)
+            .expect("paint output-zero window");
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("separately scheduled output-zero commit")
+            .commit_id();
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("live second commit")
+                .closure()
+                .expected_completion(),
+            &[u32::from(backend.platform.outputs[0].output.crtc)],
+            "the second admission includes only the output that was ready"
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: second_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: second_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+
+        // A third output-zero generation completes rendering but cannot be
+        // admitted while the second commit occupies the owner slot. It is
+        // therefore Desired, and its scanout pool has no free BO left once
+        // the first generation is Current and the second is Submitted.
+        backend
+            .fill_rectangle(None, output_zero_window.as_raw(), 0x0000_33ff, 1, 1, 30, 30)
+            .expect("paint output-zero window again");
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let (_, desired_generation, waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("third output-zero generation remains prepared");
+        assert!(!waiting, "the unadmitted generation is Desired");
+
+        // Now both windows are damaged. Output 0 is forced to skip at BO
+        // acquisition because its generation is still desired, while output
+        // 1 has a free BO and walks. Reconciliation must retain output 0's
+        // last pieces; dropping them would incorrectly make this pending
+        // paint dormant.
+        backend
+            .fill_rectangle(None, output_zero_window.as_raw(), 0x0000_44ff, 2, 2, 28, 28)
+            .expect("paint output-zero window while its generation is desired");
+        backend
+            .fill_rectangle(None, output_one_window.as_raw(), 0x0000_55ff, 2, 2, 28, 28)
+            .expect("wake output one with a separate paint");
+        assert!(
+            backend.test_peek_presentation_damage_nonempty(output_zero_window.as_raw()),
+            "the output-zero paint starts pending before the skip"
+        );
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            backend
+                .scene
+                .owner_prepared_for_tests(0)
+                .map(|(_, generation, waiting)| (generation, waiting)),
+            Some((desired_generation, false)),
+            "the pending desired generation is not displaced by the skipped output"
+        );
+        assert!(
+            backend.test_peek_presentation_damage_nonempty(output_zero_window.as_raw()),
+            "a skipped output retains last_pieces and stays armed"
+        );
+        assert!(
+            backend.store.pending_presentation_damage_for_tests(
+                backend
+                    .store
+                    .lookup(output_zero_window.as_raw())
+                    .expect("output-zero drawable")
+            ),
+            "the skipped output's retained pieces prevent NoPieces dormancy"
+        );
+    }
+
+    fn owner_live_two_output_windows() -> (
+        OwnerLiveFixture,
+        yserver_core::server::ServerState,
+        yserver_core::backend::WindowHandle,
+        yserver_core::backend::WindowHandle,
+    ) {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let mut state = yserver_core::server::ServerState::new();
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+        let output_width = i16::try_from(backend.platform.outputs[0].width).expect("output width");
+        let output_zero_window = create_live_window(
+            &mut state,
+            &mut backend,
+            ResourceId(0xC0_0804),
+            ROOT_WINDOW,
+            10,
+            10,
+            32,
+            32,
+        );
+        let output_one_window = create_live_window(
+            &mut state,
+            &mut backend,
+            ResourceId(0xC0_0805),
+            ROOT_WINDOW,
+            output_width.saturating_add(10),
+            10,
+            32,
+            32,
+        );
+        backend.sync_top_level_order(&state);
+        backend
+            .fill_rectangle(None, output_zero_window.as_raw(), 0x0000_61ff, 0, 0, 32, 32)
+            .expect("paint output-zero window");
+        backend
+            .fill_rectangle(None, output_one_window.as_raw(), 0x0000_62ff, 0, 0, 32, 32)
+            .expect("paint output-one window");
+        (
+            OwnerLiveFixture { backend, _registry },
+            state,
+            output_zero_window,
+            output_one_window,
+        )
+    }
+
+    fn complete_owner_commit_and_reinstall(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+    ) {
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
+            ],
+            std::time::Instant::now(),
+        );
+        let completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, completion, std::time::Instant::now());
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("owner executor"),
+        );
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("replacement owner executor"),
+        );
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_two_outputs_permuted_completions_vulkan() {
+        let run_separate_order = |first_output: usize, second_output: usize| {
+            let (
+                OwnerLiveFixture {
+                    mut backend,
+                    _registry,
+                },
+                _state,
+                output_zero_window,
+                output_one_window,
+            ) = owner_live_two_output_windows();
+            let windows = [output_zero_window, output_one_window];
+            let device = backend.platform.primary_device().expect("device").key;
+
+            // First prove the same two outputs arrive bundled with the third
+            // ready CRTC; all milestones are then routed through the owner
+            // entry before the separate-order phase begins.
+            backend.scene.mark_scene_structure_dirty();
+            backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+            backend.platform.wait_idle_bounded();
+            backend.drain_scanout_render_completions_for_tests();
+            let initial = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("initial owner bundle")
+                .commit_id();
+            assert_eq!(
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .expect("initial owner bundle")
+                    .closure()
+                    .expected_completion()
+                    .len(),
+                3,
+                "the initial ready outputs share one transaction"
+            );
+            complete_owner_commit_and_reinstall(&mut backend, device, initial);
+
+            for (position, output_idx) in [first_output, second_output].into_iter().enumerate() {
+                backend
+                    .fill_rectangle(
+                        None,
+                        windows[output_idx].as_raw(),
+                        0x0000_70ff + u32::try_from(position).expect("position") * 0x100,
+                        1,
+                        1,
+                        30,
+                        30,
+                    )
+                    .expect("paint separately scheduled output");
+                backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+                backend.platform.wait_idle_bounded();
+                backend.drain_scanout_render_completions_for_tests();
+                let record = backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .expect("separately scheduled owner commit");
+                let commit = record.commit_id();
+                assert_eq!(
+                    record.closure().expected_completion(),
+                    &[u32::from(backend.platform.outputs[output_idx].output.crtc)],
+                    "separate admission contains only output {output_idx}"
+                );
+                complete_owner_commit_and_reinstall(&mut backend, device, commit);
+                assert_eq!(
+                    backend.scene.owner_damage_transaction_count_for_tests(),
+                    0,
+                    "output {output_idx} completion applies and closes its transaction"
+                );
+            }
+        };
+
+        // Run both permutations on fresh real-GPU fixtures so no completion
+        // order is accidentally made valid by the prior output's state.
+        run_separate_order(1, 0);
+        run_separate_order(0, 1);
     }
 
     fn install_admission_resource_service(backend: &mut super::KmsBackend) {
