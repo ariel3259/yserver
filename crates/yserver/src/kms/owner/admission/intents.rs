@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{AdmissionError, CrtcId};
+use crate::kms::owner::admission::bound::MaintenanceBound;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MaintenanceClass {
@@ -80,6 +81,7 @@ pub struct Admission {
     pub(super) maintenance_current: BTreeMap<MaintenanceKey, u64>,
     pub(super) maintenance_submitted: BTreeMap<MaintenanceKey, SubmittedMaintenance>,
     pub(super) rejection_counts: BTreeMap<MaintenanceKey, u32>,
+    pub(super) maintenance_bounds: BTreeMap<MaintenanceKey, MaintenanceBound>,
     pub(super) cursor_recovery: BTreeSet<CrtcId>,
     next_ordinal: u64,
     next_ticket: u64,
@@ -235,6 +237,9 @@ impl Admission {
                 aged: already_aged || behind_commit || submitted_ticket.is_some(),
             },
         );
+        if already_aged || behind_commit || submitted_ticket.is_some() {
+            self.age_maintenance(key);
+        }
         Ok(())
     }
 
@@ -269,6 +274,7 @@ impl Admission {
 
         if kind == ReentryKind::Rejected && rejection_count >= 2 {
             self.maintenance_slots.remove(&key);
+            self.maintenance_bounds.remove(&key);
             return Reentry::Dropped;
         }
 
@@ -296,6 +302,8 @@ impl Admission {
             }
         }
 
+        self.age_maintenance(key);
+
         Reentry::Reentered
     }
 
@@ -315,6 +323,7 @@ impl Admission {
             .is_some_and(|intent| intent.generation <= generation)
         {
             self.maintenance_slots.remove(&key);
+            self.maintenance_bounds.remove(&key);
         }
 
         self.maintenance_current

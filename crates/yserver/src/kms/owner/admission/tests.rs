@@ -2795,3 +2795,349 @@ fn c0_adm_maint_seven_tiers_in_order() {
         Tier::Maintenance
     );
 }
+
+#[test]
+fn c0_adm_maint_allowance_grows_when_an_older_identity_ages_later() {
+    let mut admission = Admission::new();
+    let older = cursor_key(1);
+    let younger = gamma_key(2);
+    admission.set_maintenance(older, 10, false).unwrap();
+    admission.set_maintenance(younger, 20, true).unwrap();
+    let older_ticket = admission.maintenance(older).unwrap().ticket;
+    let younger_ticket = admission.maintenance(younger).unwrap().ticket;
+
+    admission.request_topology(1).unwrap();
+    let mut barrier_snapshot = ReadinessSnapshot::new(0, 0);
+    barrier_snapshot.report(
+        IntentKey::Maintenance {
+            key: older,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    barrier_snapshot.report(
+        IntentKey::Maintenance {
+            key: younger,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+    let barrier = admission.decide(&barrier_snapshot).unwrap();
+    assert_eq!(barrier.tier, Tier::Topology);
+    let token = admission.lock(barrier, &barrier_snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    assert!(admission.maintenance(older).unwrap().aged);
+    assert!(admission.maintenance(younger).unwrap().aged);
+    assert_eq!(admission.maintenance(older).unwrap().ticket, older_ticket);
+    assert_eq!(
+        admission.maintenance(younger).unwrap().ticket,
+        younger_ticket
+    );
+
+    let mut maintenance_snapshot = ReadinessSnapshot::new(0, 0);
+    for (key, generation) in [(older, 10), (younger, 20)] {
+        maintenance_snapshot.report(IntentKey::Maintenance { key, generation }, Readiness::Ready);
+    }
+    let decision = admission.decide(&maintenance_snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::AgedMaintenance);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Maintenance {
+            key: older,
+            generation: 10,
+        }
+    );
+    let token = admission.lock(decision, &maintenance_snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    assert!(admission.bound_violation().is_none());
+}
+
+#[test]
+fn c0_adm_maint_confirm_counts_and_carry_clears_the_counter() {
+    let mut admission = Admission::new();
+    let older = cursor_key(1);
+    let younger = gamma_key(2);
+    admission.set_maintenance(older, 10, false).unwrap();
+    admission.set_maintenance(younger, 20, true).unwrap();
+    admission.set_composed(1, 30).unwrap();
+    let older_ticket = admission.maintenance(older).unwrap().ticket;
+
+    let mut primary_snapshot = ReadinessSnapshot::new(0, 0);
+    primary_snapshot.report(
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 30,
+        },
+        Readiness::Ready,
+    );
+    primary_snapshot.report(
+        IntentKey::Maintenance {
+            key: older,
+            generation: 10,
+        },
+        Readiness::Ready,
+    );
+    primary_snapshot.report(
+        IntentKey::Maintenance {
+            key: younger,
+            generation: 20,
+        },
+        Readiness::Waiting(WaitReason::SourceWaits),
+    );
+    primary_snapshot.report_compatible(
+        IntentKey::Maintenance {
+            key: older,
+            generation: 10,
+        },
+        IntentKey::Composed {
+            crtc: 1,
+            generation: 30,
+        },
+    );
+    let primary = admission.decide(&primary_snapshot).unwrap();
+    assert_eq!(primary.tier, Tier::Primary);
+    assert_eq!(primary.carried.len(), 1);
+    assert_eq!(primary.carried[0].ticket, older_ticket);
+    let token = admission.lock(primary, &primary_snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    assert_eq!(admission.bound_violation(), Some(younger));
+
+    let mut maintenance_snapshot = ReadinessSnapshot::new(0, 0);
+    maintenance_snapshot.report(
+        IntentKey::Maintenance {
+            key: younger,
+            generation: 20,
+        },
+        Readiness::Ready,
+    );
+    let maintenance = admission.decide(&maintenance_snapshot).unwrap();
+    assert_eq!(maintenance.tier, Tier::AgedMaintenance);
+    let token = admission.lock(maintenance, &maintenance_snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    assert!(admission.maintenance(younger).is_none());
+    assert!(admission.bound_violation().is_none());
+}
+
+#[test]
+fn c0_adm_maint_two_identities_progress_under_continuous_collision() {
+    let mut admission = Admission::new();
+    let a = cursor_key(1);
+    let b = gamma_key(2);
+    admission.set_maintenance(a, 1, true).unwrap();
+    admission.set_maintenance(b, 1, true).unwrap();
+    let a_ticket = admission.maintenance(a).unwrap().ticket;
+
+    for (generation, next_generation) in [(1, 2), (2, 3)] {
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.report(
+            IntentKey::Maintenance { key: a, generation },
+            Readiness::Ready,
+        );
+        snapshot.report(
+            IntentKey::Maintenance {
+                key: b,
+                generation: 1,
+            },
+            Readiness::Ready,
+        );
+        let decision = admission.decide(&snapshot).unwrap();
+        assert_eq!(decision.tier, Tier::AgedMaintenance);
+        assert_eq!(
+            decision.admitted,
+            Admitted::Maintenance { key: a, generation }
+        );
+        assert_eq!(decision.carried.len(), 1);
+        assert_eq!(decision.carried[0].ticket, a_ticket);
+        let token = admission.lock(decision, &snapshot).unwrap();
+        admission.confirm(token).unwrap();
+
+        assert!(admission.bound_violation().is_none());
+        admission
+            .set_maintenance(a, next_generation, false)
+            .unwrap();
+        let result = admission.reenter(a, generation, a_ticket, ReentryKind::Rejected);
+        if next_generation == 2 {
+            assert_eq!(result, Reentry::Reentered);
+            assert_eq!(admission.rejection_count(a), 1);
+        } else {
+            assert_eq!(result, Reentry::Dropped);
+            assert_eq!(admission.rejection_count(a), 2);
+            assert!(admission.maintenance(a).is_none());
+        }
+    }
+
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.report(
+        IntentKey::Maintenance {
+            key: b,
+            generation: 1,
+        },
+        Readiness::Ready,
+    );
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::AgedMaintenance);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Maintenance {
+            key: b,
+            generation: 1
+        }
+    );
+    let token = admission.lock(decision, &snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    assert_eq!(admission.sequence(), 3);
+    assert!(admission.maintenance(b).is_none());
+    assert!(admission.bound_violation().is_none());
+}
+
+#[test]
+fn c0_adm_maint_bound_violation_is_reported() {
+    let mut admission = Admission::new();
+    let older = cursor_key(1);
+    let younger = gamma_key(2);
+    admission.set_maintenance(older, 10, false).unwrap();
+    admission.set_maintenance(younger, 20, true).unwrap();
+    let older_ticket = admission.maintenance(older).unwrap().ticket;
+
+    admission.request_topology(1).unwrap();
+    let mut barrier_snapshot = ReadinessSnapshot::new(0, 0);
+    for (key, generation) in [(older, 10), (younger, 20)] {
+        barrier_snapshot.report(IntentKey::Maintenance { key, generation }, Readiness::Ready);
+    }
+    let barrier = admission.decide(&barrier_snapshot).unwrap();
+    let token = admission.lock(barrier, &barrier_snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    for attempt in 0..3 {
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.report(
+            IntentKey::Maintenance {
+                key: older,
+                generation: 10,
+            },
+            Readiness::Ready,
+        );
+        snapshot.report(
+            IntentKey::Maintenance {
+                key: younger,
+                generation: 20,
+            },
+            Readiness::Ready,
+        );
+        let decision = admission.decide(&snapshot).unwrap();
+        assert_eq!(decision.tier, Tier::AgedMaintenance);
+        assert_eq!(
+            decision.admitted,
+            Admitted::Maintenance {
+                key: older,
+                generation: 10,
+            }
+        );
+        let token = admission.lock(decision, &snapshot).unwrap();
+        admission.confirm(token).unwrap();
+
+        if attempt < 2 {
+            assert!(admission.bound_violation().is_none());
+            assert_eq!(
+                admission.reenter(older, 10, older_ticket, ReentryKind::Unknown),
+                Reentry::Reentered
+            );
+        } else {
+            assert_eq!(admission.bound_violation(), Some(younger));
+        }
+    }
+}
+
+#[test]
+fn c0_adm_maint_barriers_do_not_count_against_the_bound() {
+    let mut admission = Admission::new();
+    let key = cursor_key(1);
+    admission.set_maintenance(key, 7, true).unwrap();
+    let ticket = admission.maintenance(key).unwrap().ticket;
+
+    for generation in 1..=3 {
+        admission.request_topology(generation).unwrap();
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.report(
+            IntentKey::Maintenance { key, generation: 7 },
+            Readiness::Ready,
+        );
+        let decision = admission.decide(&snapshot).unwrap();
+        assert_eq!(decision.tier, Tier::Topology);
+        assert!(decision.carried.is_empty());
+        let token = admission.lock(decision, &snapshot).unwrap();
+        admission.confirm(token).unwrap();
+
+        assert!(admission.bound_violation().is_none());
+        let intent = admission.maintenance(key).unwrap();
+        assert!(intent.aged);
+        assert_eq!(intent.ticket, ticket);
+    }
+}
+
+#[test]
+fn c0_adm_maint_direct_stream_cannot_starve_maintenance() {
+    let mut admission = Admission::new();
+    let cursor = cursor_key(2);
+    admission.set_maintenance(cursor, 7, true).unwrap();
+
+    for source_generation in 10..13 {
+        admission
+            .set_direct_successor(successor(source_generation, 0, 0, &[1]))
+            .unwrap();
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.retirement_wake = true;
+        snapshot.report(IntentKey::Direct { source_generation }, Readiness::Ready);
+        snapshot.report(
+            IntentKey::Maintenance {
+                key: cursor,
+                generation: 7,
+            },
+            Readiness::Waiting(WaitReason::SourceWaits),
+        );
+        let decision = admission.decide(&snapshot).unwrap();
+        assert_eq!(decision.tier, Tier::DirectSuccessor);
+        let token = admission.lock(decision, &snapshot).unwrap();
+        admission.confirm(token).unwrap();
+        assert!(admission.bound_violation().is_none());
+    }
+
+    admission
+        .set_direct_successor(successor(13, 0, 0, &[1]))
+        .unwrap();
+    let mut snapshot = ReadinessSnapshot::new(0, 0);
+    snapshot.retirement_wake = true;
+    snapshot.report(
+        IntentKey::Direct {
+            source_generation: 13,
+        },
+        Readiness::Ready,
+    );
+    snapshot.report(
+        IntentKey::Maintenance {
+            key: cursor,
+            generation: 7,
+        },
+        Readiness::Ready,
+    );
+    let decision = admission.decide(&snapshot).unwrap();
+    assert_eq!(decision.tier, Tier::AgedMaintenance);
+    assert_eq!(
+        decision.admitted,
+        Admitted::Maintenance {
+            key: cursor,
+            generation: 7,
+        }
+    );
+    let token = admission.lock(decision, &snapshot).unwrap();
+    admission.confirm(token).unwrap();
+
+    assert!(admission.maintenance(cursor).is_none());
+    assert!(admission.direct().is_some());
+    assert!(admission.bound_violation().is_none());
+}

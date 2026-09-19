@@ -20,6 +20,7 @@ pub enum AdmissionError {
     TicketOverflow,
 }
 
+mod bound;
 mod decide;
 mod intents;
 mod snapshot;

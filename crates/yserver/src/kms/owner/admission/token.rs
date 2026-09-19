@@ -52,6 +52,12 @@ impl Admission {
             return Err(AdmissionError::TokenMismatch);
         }
 
+        if !matches!(
+            decision.admitted,
+            Admitted::Topology { .. } | Admitted::Unflip { .. } | Admitted::CursorRecovery { .. }
+        ) {
+            self.count_older_ticket_waits(&decision.carried);
+        }
         self.consume(&decision.admitted);
         if let Some(combined_primary) = &decision.combined_primary {
             self.consume(combined_primary);
@@ -60,9 +66,7 @@ impl Admission {
             self.consume_maintenance(carried);
         }
         for key in &decision.ages {
-            if let Some(intent) = self.maintenance_slots.get_mut(key) {
-                intent.aged = true;
-            }
+            self.age_maintenance(*key);
         }
         self.last_primary_crtcs = decision.primary_crtcs();
         self.locked = None;
@@ -150,6 +154,7 @@ impl Admission {
         {
             self.maintenance_slots.remove(&carried.key);
         }
+        self.maintenance_bounds.remove(&carried.key);
         self.maintenance_submitted.insert(
             carried.key,
             super::intents::SubmittedMaintenance {
