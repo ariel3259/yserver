@@ -12,7 +12,7 @@ verified each task outside the sandbox and committed it.
 | 2 — decision shape, tiers 2/4/7, symmetric absorption, ageing on confirm | `5259b644` | once: F-B1T2-1, tier 7 evaluated before tier 6 — to satisfy a plan test whose scenario (a tier-7 winner combining a primary) is unreachable; **plan error**, fixed in `bd9abe18` |
 | 3 — tier 3, absorption into primaries, tier 5 | `63d7a725` | once: F-B1T3-1, A2's retirement promotion switched off and its evidence rewritten, following the plan's constraint that A2 abort every tier-3 decision; **plan error**, fixed before re-dispatch |
 | 4 — the checked bound | `3d3f8174` | no |
-| mutation survivor P20 | `(this commit's parent)` | the A2 guard test bypassed the guard; fixed with one shared guard/dispatch step |
+| mutation survivor P20 | `62ac56c1` | the A2 guard test bypassed the guard; fixed with one shared guard/dispatch step |
 
 ## Mutations (coordinator, against the implemented code)
 
