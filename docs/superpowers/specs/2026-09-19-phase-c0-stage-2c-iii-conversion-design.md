@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-iii — primary conversion and damage
 
-**Status:** design, revision 3 (2026-09-19). Its three design sections (plans
+**Status:** design, revision 4 (2026-09-19). Its three design sections (plans
 Ci, Cii and Ciii — here sections 4, 5 and 6) were approved one by one with the user
 in brainstorming, together with three decisions recorded in section 2: the
 evidence level, the split into three plans with the composed plan first, and
@@ -24,6 +24,12 @@ C2 and C3 up to revision 3's first commit, are now **Ci, Cii and Ciii** (user,
 2026-09-19), so they cannot be read as Phases C.1 and C.2, which follow C.0.
 The round-1 and round-2 findings keep the old names. Implementation plans
 follow (section 8.3).
+Revision 4 incorporates codex round 3
+(`../findings/2026-09-19-stage-2c-iii-design-review-round3.md`, instrument
+`da807b70` with 24 excerpts: 1 blocking, 1 major, both verified and accepted):
+the direct frame state is the single Present authority and `present_consumers`
+holds CRTCs only (B-1); a retained-allocation hardware case and a mutation per
+P3 invariant (M-1).
 
 **Authority**, most general first. This document elaborates the 2c-iii block; it
 does not replace or relax any of them.
@@ -220,19 +226,44 @@ conversion does not move it.
   parked while every damage and resource test passes. Today the conductor sets
   neither `page_flip_event` nor `present_consumers` on any `CommitDescription`
   (`kms/owner/build.rs:27`), because `begin_with_ledger` refuses both.
-  Invariants for the direct producer:
+  Invariants for the direct producer (revised by round-3 B-1):
 
-  - the prepared direct frame keeps the identity of every Present request it
-    completes — serial, FIFO position, target — and the description built for the
-    admitted generation carries it as `present_consumers` with `page_flip_event`
-    and the `CompletionContext`, through section 5.0's entry;
+  - **two different things, never confused.** `CommitDescription::present_consumers`
+    is a set of **CRTC ids** — the members of the kernel event set whose page
+    event supplies MSC/UST for this commit (`owner/build.rs:27`; the closure
+    rejects a consumer outside the event set, `owner/closure.rs:215`). It
+    never carries a Present serial, FIFO position or notification. The
+    **protocol payload** — the `CompletedPresentEvent` with its serial, target
+    and idle/notify state — is not in the description at all;
+  - **exactly one terminalization authority per direct Present: the direct
+    frame state.** The frame carries its event from preparation
+    (`DirectPresentFrame`), and the conductor's confirmation already moves it
+    intact into the accepted slot (`managed_confirm_direct_dispatch`,
+    `backend.rs:2620`). Confirmation also binds that accepted frame to the
+    commit's `CommitId`. The owner does not complete the Present: its
+    `Presented { samples }` for that `CommitId` delivers the MSC/UST sample to
+    the bound frame, and the frame's single publication at retirement
+    (`managed_enqueue_retired_direct_completion`, `backend.rs:2638`) is the
+    **only** CompleteNotify/FIFO wake that request gets. No other consumer —
+    the damage transaction, the resource consumer, the conductor — publishes
+    or wakes for it;
+  - the description built for the admitted direct generation sets
+    `page_flip_event` and names the CRTCs of that event set in
+    `present_consumers`, with the `CompletionContext`, through section 5.0's
+    entry, so that the owner correlates and validates the page event the sample
+    comes from;
   - Present terminalization stays independent of damage and resource release
-    (C.0 §10.4, stage 2c §3): `Presented` delivers the protocol completion;
-    an accepted Present lacking validated presentation terminalizes as `Skip`
-    with the last validated clock sample, never a fabricated timestamp; no idle
-    or release is emitted before the ledger proves it;
-  - a Present whose generation is displaced before admission takes the
-    never-submitted path (idle once, `Skip` behind the predecessor), and is not
+    (C.0 §10.4, stage 2c §3): the retirement publication is `Flip` with the
+    validated `Presented` sample for that `CommitId`; an accepted Present
+    lacking validated presentation terminalizes as `Skip` with the last
+    validated clock sample, never a fabricated timestamp; no idle or release is
+    emitted before the ledger proves it;
+  - a Present whose generation is displaced before admission keeps the
+    frame-owned never-submitted path 2c-ii built (idle once, `Skip` deferred);
+    its deferred `Skip` is published only after the predecessor's own
+    retirement publication — the owner-bound frame above — or at once when no
+    predecessor is in flight
+    (`managed_publish_deferred_successor_skips_if_no_predecessor`). It is not
     carried by the displacing generation's commit.
 
 **3.4. Owner events reach the consumers.** 2c-ii's `route_owner_event_batch` is
@@ -446,11 +477,20 @@ producers:
 1. a composed frame: `Accepted` → `HardwareComplete` → damage applied;
 2. a direct frame from a Vulkan-rendered PRIME-imported buffer (as part 3's
    P3-1): out-fence `Success`, leases released at `PriorBufferReleased`;
-3. the unflip back to composed.
+3. the unflip back to composed;
+4. **a commit whose new state retains an allocation of the old state for the
+   same member** (round-3 M-1) — for example, a direct Present of the same
+   source buffer again; the plan chooses the shape, and if no such commit is
+   reachable on card1 it reports that as an F8 stop rather than substituting a
+   fixture. The retained allocation gets no `KmsRelease` obligation and is not
+   released, while any displaced allocation in the same commit is.
 
 Because section 3.2 gives `KmsRelease` a production caller, this test also
 carries **P3-2** (a displaced buffer's `KmsRelease` is discharged by the real
-completion) and **P3-3** (a retained buffer registers none). Before the plan
+completion — steps 1–3) and **P3-3** (a retained buffer registers none — step
+4). As the debt spec §9.3 requires, each has its own mutation run on the
+hardware under the same filter: dropping the displaced buffer's registration
+must fail P3-2, and registering the retained allocation must fail P3-3. Before the plan
 anchors them, the plan's author re-runs the reachability check on the
 implemented Ci/Cii code: a non-test caller of `register_kms` must exist on the
 path the test drives. By section 3.2 that caller is already a condition of
@@ -499,8 +539,11 @@ not by the first textual match.
 | Pool release waits for **every** gate of section 4.2, each withheld alone (round-1 M-2, round-2 M-1) | Three mutations, each dropping exactly one gate: release without `CompletionRetired`; release with the `KmsRelease` obligation still outstanding; release before the GPU fence signals |
 | A composed commit carries no Present; composited Presents complete once, from the GPU batch (3.3; round-2 B-1) | Attach a composited Present to the composed description; complete it at `HardwareComplete` as well |
 | The damage transaction exists before any of its milestones is routed (4.2; round-2 B-2) | Install the transaction at `confirm`, after the returned events are routed |
+| Direct Present: one authority, the owner-bound frame; `present_consumers` holds CRTCs only; exactly one publication (3.3; round-1 M-1, round-3 B-1) | Also publish from an owner-event consumer (a second CompleteNotify); put a Present serial in `present_consumers`; publish the retirement completion without the bound `Presented` sample |
 | Direct Present requests reach the owner and terminalize independently (3.3; round-1 M-1) | Drop `present_consumers` from the built description; fabricate a `Flip` timestamp for a missing `Presented`; idle before the ledger proves release |
 | Old-state dependencies registered at dispatch (3.2) | Build the ledger without registering |
+| A retained allocation registers no obligation and is not released, on real hardware (6.4 step 4; P3-3; round-3 M-1) | Register the retained allocation as if displaced |
+| A displaced allocation is released only by the real completion, on real hardware (6.4; P3-2) | Drop the displaced allocation's registration |
 | A failed registration leaves the owner as before `begin` (4.0) | Keep the slot reserved on a ledger error |
 | A failed registration consumes no admission state (4.0; 2c-ii §6) | `confirm` instead of `abort` after a ledger error |
 | A Present-carrying commit registers through the context entry, with its checks (5.0) | Skip the completion-context validation in the new entry |
