@@ -87,6 +87,7 @@ retirement and legacy exclusion checks — section 8.
 | F13b-D1: dispatched `CommitResources` carries the present-pin leases by value | Cii |
 | Ready-unflip dispatch (needs a retained composed framebuffer) | Ciii |
 | Multi-device conductor state | Ciii |
+| The copied composed route (`platform.rs:6205`), whose flip follows a copy into a destination buffer | Ciii (section 6.3; user, 2026-09-19) |
 
 ## 2. Decisions taken in brainstorming
 
@@ -361,6 +362,34 @@ outputs are captured before any ack; a device-owner wake does not by itself walk
 every output. The v1.5.0 row for 2c-iii (`PaintTarget` coordinates and clips,
 root `IncludeInferiors` snapshots with their own GPU lifetime) applies unchanged:
 the conversion moves the flip, not the compose.
+
+**4.6. Decided while planning Ci (user, 2026-09-19).**
+
+- **Evidence with the real tick, under Vulkan.** Every Ci criterion that
+  involves the composed producer, the damage transaction or buffer reuse is
+  proven with the real scene tick, in `#[ignore]`d `_vulkan` fixtures. The
+  implementer's sandbox has no `/dev/dri`, so the coordinator runs them, and
+  their mutations, after asking the user each time (the GPU is in personal
+  use). Criteria with no tick in them — the owner entry of section 4.0 and the
+  conductor's registration — stay deterministic.
+- **The copied route is Ciii's.** Ci converts the shared managed composed route
+  only. Until Ciii converts the copied route, a device with an output on the
+  copied route, or on an unmanaged scanout pool, **cannot enter `Owner`**; it
+  stays `Legacy`, so section 6.3's exclusivity holds on every `Owner` device.
+- **Producer fences do not cross the ioctl** (C.0 §10.2 item 3). The legacy
+  composed flip hands the render fence to KMS as `IN_FENCE_FD`
+  (`drm/page_flip.rs:152`); the owner route does not. A composed generation is
+  `Ready` only once its render completion has signalled, observed through the
+  platform's existing render-completion drain.
+- **Old state is per member** (verified defect of the 2c-ii conductor). The
+  conductor takes the device's **whole** current state as the commit's old
+  state (`CommitResourceConsumer::take_current`), and `CompletionRetired` moves
+  all of it to releasing and makes the new state the whole current state
+  (`resources/commit.rs:160`, `:262`–`:295`). A composed commit for one CRTC
+  would release another CRTC's on-screen buffer. 2c-ii never saw it because its
+  fixtures have one CRTC. Ci makes the old state exactly the current resources
+  of the members the commit covers; every other member's current state stays
+  current.
 
 **4.5. Ci exit evidence** (fixtures with the real scene tick in `Owner`, the
 real owner and the helper; each row has a named test and a named mutation):
