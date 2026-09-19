@@ -3461,8 +3461,7 @@ impl PlatformBackend {
         ) {
             return false;
         }
-        bo.state.transition_to_owner_displaced();
-        true
+        bo.state.transition_to_owner_displaced()
     }
 
     pub(crate) fn complete_owner_rendering_bo(&mut self, output_idx: usize, bo_idx: usize) -> bool {

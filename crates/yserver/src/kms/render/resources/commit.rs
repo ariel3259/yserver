@@ -198,6 +198,28 @@ impl CommitResourceConsumer {
         std::mem::take(&mut self.released_presents)
     }
 
+    /// Remove the new-state resources returned by a pre-IPC owner refusal.
+    /// The owner tags every released entry with the record's commit id, so a
+    /// composed caller can hand exactly that state back to its prepared
+    /// generation without touching another rejected commit.
+    pub(crate) fn take_rejected_for_commit(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> Vec<CommitResources> {
+        let rejected = std::mem::take(&mut self.rejected_resources);
+        let mut matching = Vec::new();
+        let mut retained = Vec::with_capacity(rejected.len());
+        for resources in rejected {
+            if resources.commit_id == Some(commit) {
+                matching.push(resources);
+            } else {
+                retained.push(resources);
+            }
+        }
+        self.rejected_resources = retained;
+        matching
+    }
+
     pub(crate) fn present_disposition(&self, key: &PresentKey) -> Option<PresentDisposition> {
         self.present_dispositions.get(key).copied()
     }

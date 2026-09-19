@@ -15,6 +15,9 @@ use crate::kms::{
     },
 };
 
+#[cfg(test)]
+use crate::kms::executor::protocol::AtomicPropertyList;
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct Milestones {
     pub producer_ready: bool,
@@ -173,6 +176,8 @@ pub struct CommitRecord<R> {
     completion_state: CompletionState,
     fences: Option<FenceEvidence>,
     pending_request: Option<(HostCallRequest, SubmittingProof)>,
+    #[cfg(test)]
+    request_properties: Option<AtomicPropertyList>,
     out_fence_slots: Vec<OutFenceSlot>,
     state: RecordState,
 }
@@ -209,6 +214,8 @@ impl<R> CommitRecord<R> {
             completion_state: CompletionState::default(),
             fences: None,
             pending_request: None,
+            #[cfg(test)]
+            request_properties: None,
             out_fence_slots: Vec::new(),
             state: RecordState::Submitting,
         }
@@ -245,8 +252,17 @@ impl<R> CommitRecord<R> {
     pub fn attach_request(&mut self, req: HostCallRequest, proof: SubmittingProof) {
         if let HostCallRequest::Atomic(ref atomic) = req {
             self.out_fence_slots = atomic.out_fence_slots.clone();
+            #[cfg(test)]
+            {
+                self.request_properties = Some(atomic.properties.clone());
+            }
         }
         self.pending_request = Some((req, proof));
+    }
+
+    #[cfg(test)]
+    pub fn request_properties_for_tests(&self) -> Option<&AtomicPropertyList> {
+        self.request_properties.as_ref()
     }
 
     pub(super) fn adopt_returned_fences(&mut self, mask: u32, fences: Vec<OwnedFd>) {

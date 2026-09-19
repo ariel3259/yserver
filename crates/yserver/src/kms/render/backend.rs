@@ -2122,7 +2122,7 @@ impl SequenceArmTable {
 /// to `Mode::vrefresh`'s integer. Kernel mode refresh is pixel clock divided by
 /// horizontal and vertical totals, doubled for interlace and halved for
 /// doublescan. Synthetic/test modes fall back to the advertised integer rate.
-fn effective_refresh_matches(
+pub(crate) fn effective_refresh_matches(
     a: &crate::platform::drm::Mode,
     b: &crate::platform::drm::Mode,
 ) -> bool {
@@ -50269,6 +50269,23 @@ mod tests {
         };
 
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        // This fixture uses the synthetic KMS object ids from the existing
+        // scene fixture while its scanout allocations use a real DRM fd.
+        // The owner executor is a stub and never issues this description to
+        // that fd, so seed the persistent property ids that the production
+        // discovery cache would have obtained for a real output.
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        backend.platform.outputs[0].output.plane =
+            ::drm::control::from_u32(10).expect("fixture primary plane");
+        backend.platform.outputs[0].output.plane_fb_id_prop =
+            ::drm::control::from_u32(19).expect("fixture FB_ID property");
+        backend.platform.outputs[0].output.plane_crtc_id_prop =
+            ::drm::control::from_u32(20).expect("fixture CRTC_ID property");
+        backend.platform.devices[0]
+            .active_property_cache
+            .insert_for_tests(crtc, 21);
+        backend.platform.outputs[0].output.crtc_out_fence_ptr_prop =
+            Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
         let executor = crate::kms::executor::test_support::spawn_stub_helper(
             crate::kms::executor::test_support::StubBehaviour::NeverReply,
         )
@@ -50328,8 +50345,8 @@ mod tests {
             .platform
             .try_install_transport_gate(gate)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let source = AdmissionSourceFixture::new_source_with_composed_waiting(true).0;
-        backend.install_admission_conductor_for_tests(device_key, source);
+        let source = AdmissionSourceFixture::new_source().0;
+        backend.install_admission_conductor_with_backend_composed_for_tests(device_key, source);
         Ok(OwnerLiveFixture {
             backend,
             _registry: registry,
@@ -50401,7 +50418,7 @@ mod tests {
         let crtc = u32::from(backend.platform.outputs[0].output.crtc);
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
-        let (_, generation, _) = backend
+        let (bo_idx, _generation, _) = backend
             .scene
             .owner_prepared_for_tests(0)
             .expect("Owner tick must retain a prepared generation");
@@ -50420,9 +50437,145 @@ mod tests {
             backend
                 .admission_conductors
                 .get(&device)
-                .and_then(|conductor| conductor.admission.composed(crtc))
-                .map(|intent| intent.generation),
-            Some(generation)
+                .and_then(|conductor| conductor.admission.composed(crtc)),
+            None,
+            "the same wake admits and consumes the composed offer"
+        );
+        let managed_key = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live-scene pool")
+            .display_pool()
+            .bos[bo_idx]
+            .managed_key()
+            .expect("owner prepared buffer is managed");
+        let resolved_framebuffer = {
+            let service = backend
+                .resource_service_mut()
+                .expect("owner fixture resource service");
+            let read_lease = service
+                .reserve(managed_key, crate::kms::render::resources::UseKind::Read)
+                .expect("reserve the prepared allocation for a framebuffer read");
+            let framebuffer = service
+                .with_scanout_read(&read_lease, |allocation| {
+                    allocation
+                        .file_owned()
+                        .and_then(|file_owned| file_owned.fb_handle())
+                })
+                .expect("read the prepared allocation framebuffer")
+                .expect("prepared allocation has a framebuffer");
+            drop(read_lease);
+            framebuffer
+        };
+        let plane_id = u32::from(backend.platform.outputs[0].output.plane);
+        let plane_fb_id_property = u32::from(backend.platform.outputs[0].output.plane_fb_id_prop);
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("the drained composed generation is admitted in the same wake");
+        assert_eq!(record.closure().expected_completion(), &[crtc]);
+        assert!(record.closure().present_event().is_empty());
+        let request = record
+            .request_properties_for_tests()
+            .expect("the dispatched atomic request is retained for this assertion");
+        let mut property_cursor = 0usize;
+        let dispatched_framebuffer = request.objects.iter().zip(&request.count_props).find_map(
+            |(object, property_count)| {
+                let start = property_cursor;
+                property_cursor += *property_count as usize;
+                if *object != plane_id {
+                    return None;
+                }
+                (start..property_cursor).find_map(|index| {
+                    (request.props[index] == plane_fb_id_property).then_some(request.values[index])
+                })
+            },
+        );
+        assert_eq!(
+            dispatched_framebuffer,
+            Some(u64::from(u32::from(resolved_framebuffer))),
+            "the owner description must use the managed allocation's framebuffer"
+        );
+        match record.ledger() {
+            crate::kms::owner::ledger::LedgerState::Submitted(submitted) => {
+                assert_eq!(submitted.new_resources().len(), 1);
+                assert_eq!(submitted.new_resources()[0].crtcs.len(), 1);
+                assert_eq!(
+                    submitted.new_resources()[0].crtcs[0].crtc.crtc,
+                    backend.platform.outputs[0].output.crtc
+                );
+                assert_eq!(
+                    submitted.new_resources()[0].allocations[0].key(),
+                    managed_key
+                );
+            }
+            state => panic!("composed dispatch must retain Submitted ledger state: {state:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ci_submitted_generation_survives_the_next_tick_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (first_bo, first_generation, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("first Owner generation");
+
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| {
+                    conductor
+                        .admission
+                        .composed(u32::from(backend.platform.outputs[0].output.crtc))
+                }),
+            None,
+            "the drained offer is consumed by the owner wake"
+        );
+        assert_eq!(
+            backend.platform.scanout_pools[0]
+                .as_ref()
+                .expect("live-scene pool")
+                .display_pool()
+                .bos[first_bo]
+                .state
+                .phase,
+            crate::kms::vk::scanout::BoPhase::OwnerSubmitted
+        );
+
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, second_generation, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("newer Owner generation");
+        assert_ne!(second_bo, first_bo);
+        assert!(second_generation > first_generation);
+        let (submitted_bo, submitted_generation, snapshot_count) = backend
+            .scene
+            .owner_submitted_for_tests(0)
+            .expect("submitted generation retained beside newer preparation");
+        assert_eq!(submitted_bo, first_bo);
+        assert_eq!(submitted_generation, first_generation);
+        assert!(snapshot_count > 0, "submitted PendingAck snapshots survive");
+        assert_eq!(
+            backend.platform.scanout_pools[0]
+                .as_ref()
+                .expect("live-scene pool")
+                .display_pool()
+                .bos[submitted_bo]
+                .state
+                .phase,
+            crate::kms::vk::scanout::BoPhase::OwnerSubmitted
         );
     }
 
@@ -50457,13 +50610,50 @@ mod tests {
             .owner_prepared_for_tests(0)
             .expect("drained Owner generation");
         assert_eq!(desired_generation, generation);
-        assert!(!desired_waiting, "the drained generation is OwnerDesired");
-        let offered = backend
-            .admission_conductors
-            .get(&device)
-            .and_then(|conductor| conductor.admission.composed(crtc))
-            .map(|intent| intent.generation);
-        assert_eq!(offered, Some(generation));
+        assert!(
+            !desired_waiting,
+            "the drained generation is no longer render-waiting"
+        );
+        let bo_idx = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("prepared Owner generation")
+            .0;
+        let managed_key = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live-scene pool")
+            .display_pool()
+            .bos[bo_idx]
+            .managed_key()
+            .expect("prepared Owner buffer is managed");
+        let read_lease = backend
+            .resource_service_mut()
+            .expect("owner fixture resource service")
+            .reserve(managed_key, crate::kms::render::resources::UseKind::Read)
+            .expect("an offered generation must have no live compose writer");
+        drop(read_lease);
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .map(|record| record.closure().expected_completion()),
+            Some(&[crtc][..]),
+            "the drained generation is admitted in the same wake"
+        );
+        assert_eq!(
+            backend.platform.scanout_pools[0]
+                .as_ref()
+                .expect("live-scene pool")
+                .display_pool()
+                .bos[backend
+                .scene
+                .owner_prepared_for_tests(0)
+                .expect("prepared")
+                .0]
+                .state
+                .phase,
+            crate::kms::vk::scanout::BoPhase::OwnerSubmitted
+        );
     }
 
     #[test]
@@ -50888,6 +51078,35 @@ mod tests {
                 .unwrap()
                 .readiness(key),
             Some(Readiness::Ready)
+        );
+    }
+
+    #[test]
+    fn c0_conv_ci_default_conductor_uses_backend_composed() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().unwrap().key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, readiness, _) = AdmissionSourceFixture::new();
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let key = IntentKey::Composed {
+            crtc,
+            generation: 1,
+        };
+        AdmissionSourceFixture::set_readiness(&readiness, key, Readiness::Ready);
+
+        backend.install_admission_conductor(device, source);
+        backend
+            .admission_offer_composed(device, crtc, 1)
+            .expect("composed offer");
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .expect("active snapshot")
+                .readiness(key),
+            Some(Readiness::Waiting(WaitReason::SourceWaits)),
+            "the default conductor must use the backend composed answer"
         );
     }
 

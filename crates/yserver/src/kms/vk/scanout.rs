@@ -141,6 +141,9 @@ pub enum BoPhase {
     /// Owner route: render completion was drained and the generation is
     /// available to the admission conductor.
     OwnerDesired,
+    /// Owner route: admission moved the desired generation into the commit's
+    /// submitted ledger. The owner now owns the KMS completion evidence.
+    OwnerSubmitted,
     /// Owner route: a newer generation displaced this one before admission.
     /// It returns to `Free` only after its compose GPU batch retires.
     OwnerDisplaced,
@@ -397,19 +400,45 @@ impl BoState {
     /// `OwnerRendering → OwnerDesired`: the platform drain observed the
     /// render completion, so the generation may be offered to admission.
     pub fn transition_to_owner_desired(&mut self) {
-        debug_assert_eq!(self.phase, BoPhase::OwnerRendering);
+        if self.phase != BoPhase::OwnerRendering {
+            return;
+        }
         self.phase = BoPhase::OwnerDesired;
+    }
+
+    /// `OwnerDesired → OwnerSubmitted`: the admission ledger took ownership
+    /// of the prepared generation. Owner commits carry no producer fence in
+    /// the ioctl; this phase is only the buffer-side lifecycle marker.
+    pub fn transition_to_owner_submitted(&mut self) -> bool {
+        if self.phase != BoPhase::OwnerDesired {
+            return false;
+        }
+        self.phase = BoPhase::OwnerSubmitted;
+        true
+    }
+
+    /// `OwnerSubmitted → OwnerDesired` after a pre-IPC send refusal. The
+    /// ledger's returned new state is restored by the caller exactly once.
+    pub fn transition_to_owner_desired_after_refusal(&mut self) -> bool {
+        if self.phase != BoPhase::OwnerSubmitted {
+            return false;
+        }
+        self.phase = BoPhase::OwnerDesired;
+        true
     }
 
     /// `OwnerRendering|OwnerDesired → OwnerDisplaced`: latest-wins
     /// replacement before an owner commit. This buffer never acquired a KMS
     /// state and therefore has no KMS release gate.
-    pub fn transition_to_owner_displaced(&mut self) {
-        debug_assert!(matches!(
+    pub fn transition_to_owner_displaced(&mut self) -> bool {
+        if !matches!(
             self.phase,
-            BoPhase::OwnerRendering | BoPhase::OwnerDesired
-        ));
+            BoPhase::OwnerRendering | BoPhase::OwnerDesired | BoPhase::OwnerSubmitted
+        ) {
+            return false;
+        }
         self.phase = BoPhase::OwnerDisplaced;
+        true
     }
 
     /// `OwnerDisplaced → Free` after the compose GPU batch has retired.

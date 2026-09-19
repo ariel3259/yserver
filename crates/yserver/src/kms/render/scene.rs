@@ -70,6 +70,7 @@ use std::{
 };
 
 use ash::vk;
+use drm::control::framebuffer;
 use yserver_protocol::x11::xfixes;
 
 use super::{
@@ -110,6 +111,7 @@ enum InFlightStage {
     WaitingForRenderCompletion { job_id: u64 },
     OwnerRenderWaiting { job_id: u64 },
     OwnerDesired,
+    OwnerSubmitted,
     KmsFlipPending,
 }
 
@@ -474,6 +476,10 @@ struct OutputSceneState {
     /// generation remains here until its render completion is drained and
     /// offered; a newer generation moves it to `owner_displaced`.
     owner_prepared: Option<PreparedComposed>,
+    /// Owner generations already moved into an in-flight commit. A later
+    /// scene tick must retain these acknowledgements until the owner commit
+    /// resolves; they are not candidates for latest-wins displacement.
+    owner_submitted: VecDeque<PreparedComposed>,
     owner_displaced: VecDeque<PreparedComposed>,
     /// Fence-gated descriptor-pool slot releases. At
     /// `handle_page_flip_complete` we want to pop the matching
@@ -956,10 +962,20 @@ pub(crate) struct ComposedOffer {
     pub(crate) generation: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedComposedLocation {
+    pub(crate) output_idx: usize,
+    pub(crate) bo_idx: usize,
+}
+
 struct PreparedComposed {
     output_key: OutputKey,
     managed_key: AllocationKey,
-    pool_slot: usize,
+    managed: Option<crate::kms::render::resources::AllocationLease>,
+    /// `None` after admission has released the descriptor slot. The scanout
+    /// BO remains owned by the owner ledger, so a later scene tick must not
+    /// try to displace or release that slot a second time.
+    pool_slot: Option<usize>,
     ack: PendingAck,
 }
 
@@ -1359,6 +1375,7 @@ impl SceneCompositor {
             pending_pool_releases: VecDeque::with_capacity(4),
             pending_acks: VecDeque::with_capacity(4),
             owner_prepared: None,
+            owner_submitted: VecDeque::with_capacity(4),
             owner_displaced: VecDeque::with_capacity(4),
             failed_submit_bos: VecDeque::with_capacity(4),
             damage_history: BufferAgeRing::new(bo_depth + 1),
@@ -1466,6 +1483,223 @@ impl SceneCompositor {
             .unwrap_or_default()
     }
 
+    pub(crate) fn owner_composed_ready(&self, output_idx: usize, generation: u64) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .and_then(|state| state.owner_prepared.as_ref())
+            .is_some_and(|prepared| {
+                prepared.ack.generation == generation
+                    && prepared.ack.stage == InFlightStage::OwnerDesired
+                    && prepared.managed.is_some()
+            })
+    }
+
+    pub(crate) fn owner_prepared_location(
+        &self,
+        output_idx: usize,
+        generation: u64,
+    ) -> Option<PreparedComposedLocation> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .and_then(|state| state.owner_prepared.as_ref())
+            .filter(|prepared| {
+                prepared.ack.generation == generation
+                    && prepared.ack.stage == InFlightStage::OwnerDesired
+                    && prepared.managed.is_some()
+            })
+            .map(|prepared| PreparedComposedLocation {
+                output_idx,
+                bo_idx: prepared.ack.bo_idx,
+            })
+    }
+
+    /// Resolve the framebuffer that the prepared managed allocation names.
+    ///
+    /// Managed scanout BOs leave their physical backing in the resource
+    /// service when they are adopted, so `ScanoutBo::fb_handle` is only the
+    /// legacy fallback.  The prepared generation's retain lease is the
+    /// authoritative read path here; `with_scanout_read` adds only a
+    /// temporary read use and never takes a write reservation.
+    pub(crate) fn owner_prepared_framebuffer(
+        &self,
+        location: PreparedComposedLocation,
+        generation: u64,
+        bo_fb_handle: Option<framebuffer::Handle>,
+        service: &mut ResourceService,
+    ) -> Result<Option<framebuffer::Handle>, ResourceError> {
+        let Some(state) = self
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(location.output_idx))
+        else {
+            return Err(ResourceError::InvalidState);
+        };
+        let Some(prepared) = state.owner_prepared.as_ref() else {
+            return Err(ResourceError::InvalidState);
+        };
+        if prepared.ack.generation != generation
+            || prepared.ack.stage != InFlightStage::OwnerDesired
+        {
+            return Err(ResourceError::InvalidState);
+        }
+        let Some(managed) = prepared.managed.as_ref() else {
+            return Err(ResourceError::InvalidState);
+        };
+        service.with_scanout_read(managed, |allocation| {
+            allocation
+                .file_owned()
+                .and_then(|file_owned| file_owned.fb_handle())
+                .or(bo_fb_handle)
+        })
+    }
+
+    /// Move the prepared scanout lease into the owner ledger's new state.
+    /// The phase transition and the lease move are one operation: if the
+    /// prepared buffer is not still desired, no lease is consumed.
+    pub(crate) fn take_owner_composed_resources(
+        &mut self,
+        location: PreparedComposedLocation,
+        generation: u64,
+        member: crate::kms::render::resources::GroupMember,
+        scanout_pools: &mut [Option<OutputScanout>],
+    ) -> Result<Vec<crate::kms::render::resources::CommitResources>, ResourceError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(ResourceError::InvalidState);
+        };
+        let Some(state) = inner.outputs.get_mut(location.output_idx) else {
+            return Err(ResourceError::InvalidState);
+        };
+        let Some(prepared) = state.owner_prepared.as_mut() else {
+            return Err(ResourceError::InvalidState);
+        };
+        if prepared.ack.generation != generation
+            || prepared.ack.stage != InFlightStage::OwnerDesired
+        {
+            return Err(ResourceError::InvalidState);
+        }
+        let Some(managed) = prepared.managed.take() else {
+            return Err(ResourceError::InvalidState);
+        };
+        let phase_changed = scanout_pools
+            .get_mut(location.output_idx)
+            .and_then(Option::as_mut)
+            .is_some_and(|scanout| {
+                scanout
+                    .display_pool_mut()
+                    .bos
+                    .get_mut(location.bo_idx)
+                    .is_some_and(|bo| bo.state.transition_to_owner_submitted())
+            });
+        if !phase_changed {
+            prepared.managed = Some(managed);
+            return Err(ResourceError::InvalidState);
+        }
+
+        if let Some(pool_slot) = prepared.pool_slot.take() {
+            // Admission occurs only after the render-completion drain, so the
+            // compose fence has completed before this dispatch-time release.
+            // Releasing the descriptor slot here is therefore behind the
+            // compose-fence gate required by the pool ring.
+            state.pool_ring.release(pool_slot);
+        }
+
+        prepared.ack.stage = InFlightStage::OwnerSubmitted;
+
+        Ok(vec![crate::kms::render::resources::CommitResources::new(
+            vec![managed],
+            None,
+            None,
+            None,
+            vec![member],
+            Vec::new(),
+        )])
+    }
+
+    /// Restore the new-state lease returned by a failed owner admission.
+    /// The resource is put back into the same prepared generation and the
+    /// buffer returns to `OwnerDesired`, so the decider can retry it later.
+    pub(crate) fn restore_owner_composed_resources(
+        &mut self,
+        resources: Vec<crate::kms::render::resources::CommitResources>,
+        scanout_pools: &mut [Option<OutputScanout>],
+    ) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        let mut targets = Vec::with_capacity(resources.len());
+        let mut seen_outputs = HashSet::with_capacity(resources.len());
+        for resources in &resources {
+            if resources.allocations.len() != 1
+                || resources.crtcs.len() != 1
+                || resources.source.is_some()
+                || resources.fallback.is_some()
+                || resources.present.is_some()
+                || !resources.kms_obligations.is_empty()
+                || resources.direct_role.is_some()
+                || resources.commit_id.is_some()
+            {
+                return false;
+            }
+            let key = resources.allocations[0].key();
+            let Some((output_idx, prepared)) =
+                inner
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(output_idx, state)| {
+                        state
+                            .owner_prepared
+                            .as_ref()
+                            .filter(|prepared| {
+                                prepared.managed_key == key && prepared.managed.is_none()
+                            })
+                            .map(|prepared| (output_idx, prepared))
+                    })
+            else {
+                return false;
+            };
+            if !seen_outputs.insert(output_idx) {
+                return false;
+            }
+            let Some(scanout) = scanout_pools.get(output_idx).and_then(Option::as_ref) else {
+                return false;
+            };
+            let Some(bo) = scanout.display_pool().bos.get(prepared.ack.bo_idx) else {
+                return false;
+            };
+            if bo.state.phase != BoPhase::OwnerSubmitted {
+                return false;
+            }
+            targets.push((output_idx, prepared.ack.bo_idx));
+        }
+
+        for (mut resources, (output_idx, bo_idx)) in resources.into_iter().zip(targets) {
+            let Some(managed) = resources.allocations.pop() else {
+                return false;
+            };
+            let Some(state) = inner.outputs.get_mut(output_idx) else {
+                return false;
+            };
+            let Some(prepared) = state.owner_prepared.as_mut() else {
+                return false;
+            };
+            let phase_changed = scanout_pools
+                .get_mut(output_idx)
+                .and_then(Option::as_mut)
+                .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
+                .is_some_and(|bo| bo.state.transition_to_owner_desired_after_refusal());
+            if !phase_changed {
+                prepared.managed = Some(managed);
+                return false;
+            }
+            prepared.ack.stage = InFlightStage::OwnerDesired;
+            prepared.managed = Some(managed);
+        }
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn owner_prepared_for_tests(&self, output_idx: usize) -> Option<(usize, u64, bool)> {
         let prepared = self
@@ -1488,6 +1722,25 @@ impl SceneCompositor {
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))
             .map_or(0, |state| state.owner_displaced.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_submitted_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<(usize, u64, usize)> {
+        let prepared = self
+            .inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)?
+            .owner_submitted
+            .front()?;
+        Some((
+            prepared.ack.bo_idx,
+            prepared.ack.generation,
+            prepared.ack.drawable_snapshots.len(),
+        ))
     }
 
     #[cfg(test)]
@@ -1924,7 +2177,11 @@ impl SceneCompositor {
         let vk = inner.vk.clone();
         for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
             if let Some(prepared) = o.owner_prepared.take() {
-                if platform.displace_owner_bo(output_idx, prepared.ack.bo_idx) {
+                if prepared.managed.is_none() {
+                    // Admission already moved the lease into the owner
+                    // ledger. There is no scene-owned resource or descriptor
+                    // slot left to displace here.
+                } else if platform.displace_owner_bo(output_idx, prepared.ack.bo_idx) {
                     o.owner_displaced.push_back(prepared);
                 } else {
                     log::error!(
@@ -1954,7 +2211,9 @@ impl SceneCompositor {
                         service.register_batch(batch);
                     }
                     if platform.release_owner_displaced_bo(output_idx, prepared.ack.bo_idx) {
-                        o.pool_ring.release(prepared.pool_slot);
+                        if let Some(pool_slot) = prepared.pool_slot {
+                            o.pool_ring.release(pool_slot);
+                        }
                     } else {
                         log::error!(
                             "render scene drain: Owner displaced buffer {} was not releasable",
@@ -2583,8 +2842,33 @@ fn handle_scanout_render_completion_inner(
             platform.renderer_failed = true;
             return false;
         };
+        let managed = service.reserve(
+            prepared.managed_key,
+            crate::kms::render::resources::UseKind::Retain,
+        );
         service.register_batch(batch);
+        let Ok(managed) = managed else {
+            log::error!(
+                "render Owner scanout: could not retain prepared generation {} after completion",
+                prepared.ack.generation
+            );
+            platform.renderer_failed = true;
+            return false;
+        };
+        prepared.managed = Some(managed);
         prepared.ack.stage = InFlightStage::OwnerDesired;
+        // The render-completion fd is the evidence that this compose has
+        // finished.  Let the resource service consume that evidence before
+        // the offer can reach admission: its poll/commit path drops the
+        // batch's write lease and is the authority that makes the allocation
+        // readable.  Offering first would leave readiness stuck on Busy in
+        // the same wake.
+        if let Err(error) = service.service_completions(std::time::Instant::now()) {
+            log::warn!(
+                "render Owner scanout: compose completion service failed for generation {}: {error:?}",
+                prepared.ack.generation,
+            );
+        }
         inner.owner_offers.push_back(ComposedOffer {
             device: output_key.device_key,
             crtc: u32::from(platform.outputs[output_idx].output.crtc),
@@ -2622,6 +2906,12 @@ fn handle_scanout_render_completion_inner(
             return false;
         };
         service.register_batch(batch);
+        if let Err(error) = service.service_completions(std::time::Instant::now()) {
+            log::warn!(
+                "render Owner scanout: displaced compose completion service failed for generation {}: {error:?}",
+                prepared.ack.generation,
+            );
+        }
         prepared.ack.stage = InFlightStage::OwnerDesired;
         drop(fd);
         return true;
@@ -3168,7 +3458,9 @@ fn retire_owner_displaced(
             prepared.ack.managed_batch.is_none() && service.is_releasable(&prepared.managed_key);
         if ready {
             if platform.release_owner_displaced_bo(output_idx, prepared.ack.bo_idx) {
-                state.pool_ring.release(prepared.pool_slot);
+                if let Some(pool_slot) = prepared.pool_slot {
+                    state.pool_ring.release(pool_slot);
+                }
             } else {
                 log::error!(
                     "render scene: owner displaced buffer {} was not in OwnerDisplaced",
@@ -4779,16 +5071,27 @@ fn tick_one_output(
             };
             let crtc = CrtcKey::for_output(&platform.outputs[output_idx]);
             match platform.acquire_managed_scanout_bo(service, crtc) {
-                Ok(token) => (
-                    token.bo_idx,
-                    vk::Extent2D {
-                        width: u32::from(platform.outputs[output_idx].width),
-                        height: u32::from(platform.outputs[output_idx].height),
-                    },
-                    token.last_present_generation,
-                    token.content_invalidated,
-                    Some(token.display.key()),
-                ),
+                Ok(token) => {
+                    let managed_key = token.display.key();
+                    // The acquisition lease protects the selected free buffer
+                    // only through selection. The compose creates its own GPU
+                    // obligation and write reservation below; retaining this
+                    // lease across that reservation would make the service
+                    // correctly report Busy for the same allocation. The
+                    // prepared generation receives its Retain lease when the
+                    // render completion is drained.
+                    drop(token.display);
+                    (
+                        token.bo_idx,
+                        vk::Extent2D {
+                            width: u32::from(platform.outputs[output_idx].width),
+                            height: u32::from(platform.outputs[output_idx].height),
+                        },
+                        token.last_present_generation,
+                        token.content_invalidated,
+                        Some(managed_key),
+                    )
+                }
                 Err(error) => {
                     log::debug!(
                         "render scene: Owner scanout acquisition skipped for output {output_idx}: {error:?}"
@@ -5209,22 +5512,31 @@ fn tick_one_output(
                     ))));
                 };
                 if let Some(previous) = state.owner_prepared.take() {
-                    if !platform.displace_owner_bo(output_idx, previous.ack.bo_idx) {
-                        log::error!(
-                            "render scene: could not displace prepared Owner buffer {}",
-                            previous.ack.bo_idx
-                        );
-                        platform.renderer_failed = true;
-                        return Err(SceneError::Present(PresentError::Io(io::Error::other(
-                            "Owner prepared buffer was not in a displaceable phase",
-                        ))));
+                    if previous.ack.stage == InFlightStage::OwnerSubmitted {
+                        // This generation is already owned by the in-flight
+                        // owner commit. Keep its PendingAck beside the newer
+                        // prepared generation; it is never latest-wins
+                        // displaced by a scene tick.
+                        state.owner_submitted.push_back(previous);
+                    } else {
+                        if !platform.displace_owner_bo(output_idx, previous.ack.bo_idx) {
+                            log::error!(
+                                "render scene: could not displace prepared Owner buffer {}",
+                                previous.ack.bo_idx
+                            );
+                            platform.renderer_failed = true;
+                            return Err(SceneError::Present(PresentError::Io(io::Error::other(
+                                "Owner prepared buffer was not in a displaceable phase",
+                            ))));
+                        }
+                        state.owner_displaced.push_back(previous);
                     }
-                    state.owner_displaced.push_back(previous);
                 }
                 state.owner_prepared = Some(PreparedComposed {
                     output_key,
                     managed_key,
-                    pool_slot: slot,
+                    managed: None,
+                    pool_slot: Some(slot),
                     ack,
                 });
                 // The generation identifies the latest prepared intent. It

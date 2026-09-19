@@ -16,10 +16,6 @@ use crate::{
 /// The framebuffer is the image rendered for this output. The plane and CRTC
 /// properties come from the output's KMS discovery, so the builder cannot
 /// accidentally substitute a property from another device.
-#[allow(
-    dead_code,
-    reason = "Task 5 wires the owner-route producer to this builder"
-)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ComposedPlane<'a> {
     pub(crate) output: &'a Output,
@@ -33,20 +29,17 @@ pub(crate) struct ComposedPlane<'a> {
 /// platform's device entry instead of doing a property enumeration for every
 /// composed frame. Property ids are stable for a CRTC while that KMS device
 /// and topology incarnation remain in use.
-#[allow(
-    dead_code,
-    reason = "Task 5 wires the owner-route producer to this cache"
-)]
 #[derive(Debug, Default)]
 pub(crate) struct ActivePropertyCache {
     by_crtc: BTreeMap<u32, u32>,
 }
 
 impl ActivePropertyCache {
-    #[allow(
-        dead_code,
-        reason = "Task 5 wires the owner-route producer to discovery"
-    )]
+    #[cfg(test)]
+    pub(crate) fn insert_for_tests(&mut self, crtc: u32, property_id: u32) {
+        self.by_crtc.insert(crtc, property_id);
+    }
+
     pub(crate) fn get_or_discover(
         &mut self,
         device: &Device,
@@ -63,10 +56,6 @@ impl ActivePropertyCache {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(
-    dead_code,
-    reason = "Task 5 wires the owner-route producer to discovery"
-)]
 pub(crate) enum ComposedPropertyError {
     #[error("a composed description needs at least one output member")]
     EmptyMembers,
@@ -95,10 +84,6 @@ pub(crate) enum ComposedPropertyError {
 /// Discovery is fallible by design. A producer must treat an error as
 /// readiness failure; this helper never turns a missing DRM property into a
 /// panic or a partially-built commit description.
-#[allow(
-    dead_code,
-    reason = "Task 5 wires the owner-route producer to discovery"
-)]
 pub(crate) fn discover_composed_property_ids(
     device: &Device,
     members: &[ComposedPlane<'_>],
@@ -166,10 +151,6 @@ pub(crate) fn discover_composed_property_ids(
     })
 }
 
-#[allow(
-    dead_code,
-    reason = "Task 5 wires the owner-route producer to discovery"
-)]
 fn output_out_fence_ptr_property(device: &Device, output: &Output) -> io::Result<u32> {
     output.crtc_out_fence_ptr_prop.map(u32::from).map_or_else(
         || {
@@ -186,10 +167,6 @@ fn output_out_fence_ptr_property(device: &Device, output: &Output) -> io::Result
 /// The owner request builder appends `OUT_FENCE_PTR` to each expected CRTC;
 /// this function deliberately does not. Composed commits are non-Present and
 /// carry neither a page-flip event nor Present consumers.
-#[allow(
-    dead_code,
-    reason = "Task 5 wires the owner-route producer to this builder"
-)]
 pub(crate) fn composed_description(
     members: &[ComposedPlane<'_>],
     property_ids: PropertyIds,
