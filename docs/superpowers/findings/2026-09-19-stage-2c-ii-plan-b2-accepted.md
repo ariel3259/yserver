@@ -54,6 +54,10 @@ gnu/musl/freebsd clean; `c0_adm` 129/0 five times in debug and once in release;
 failed only `device_lock::dropping_a_device_lock_does_not_unlock_a_shared_description`
 (12/12 alone; a module this branch does not touch — the known flaky family).
 
+## Hardware gate (spec §10.4) — 2026-09-19
+
+Run by the coordinator with the GPU free: no GPU clients, no compositor, no Steam or WiVRn. All three suites of the branch's hardware gate passed: `render_acceptance -- --ignored` **163/163**, `c0_2ci -- --ignored --test-threads=1` **21/21**, and the library's other ignored tests (`--ignored --skip c0_2ci`) **74/74** — **258/258** in total. The GPU was free again afterwards. These suites do not exercise the conductor, which has no production caller (R8). What they prove is that 2c-ii's changes to shared paths — the DRM drain, `route_owner_event`, the host-call routing and the split direct seam — left the hardware behaviour intact.
+
 ## What this round taught
 
 - Three review rounds kept finding owner-event producers one at a time (the
