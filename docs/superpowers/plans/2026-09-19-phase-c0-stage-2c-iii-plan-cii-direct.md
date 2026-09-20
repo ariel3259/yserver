@@ -2,7 +2,12 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
-**Revision 1 (2026-09-19)** — not yet reviewed.
+**Revision 2 (2026-09-19)** — incorporates codex round 1 (`../findings/2026-09-19-stage-2c-iii-plan-cii-review-round1.md`: 1 blocking, 4 major, all verified against the tree and accepted).
+- **B-1:** a missing `Presented` had no defined carrier for the clock sample its `Skip` must use. Decision 7 names the source, the binding and the F8 when no validated sample exists; Task 6 tests it with distinct samples per CRTC.
+- **M-1:** S1 was unkillable — the consumer-outside-the-event-set refusal comes from closure construction (`closure.rs:215`), not from `validate_completion_context`. Task 1 now uses a structurally valid description with an invalid `CompletionContext`, and gains a real direct-dispatch registration-failure case.
+- **M-2:** Task 4's evidence would have rested on the injected source, which the spec forbids. The production request and resource interfaces move into Task 4, and Task 6's tests re-run the Task 4 scenarios through the production-backed source.
+- **M-3:** S4 needs a CRTC-ineligible candidate and S6 a real layout change between `decide` and `lock`; both are named now.
+- **M-4:** the newer-cursor invariant gets its own case and mutation (S23).
 
 **Goal:** Convert the direct scanout producer to the owner, behind the same transport fork plan Ci built for the composed one. That means the Present-carrying owner entry, one production eligibility predicate, the layout hooks that invalidate a queued successor, the direct producer's own owner-route module, the present-pin leases carried by value (F13b-D1), the direct commit's Present carriage, retirement promotion through the conductor, and the composed invalidation direct entry owes.
 
@@ -17,7 +22,8 @@
 3. **The conductor's direct source stops guessing members** (Ci's carried item). Ci's Task 2 fills an empty `CommitResources` member set from the current state's members; the real producer supplies the `GroupMember`s of the CRTCs the direct frame covers, and the guess is removed in the same task that supplies them.
 4. **The direct frame is the single Present authority** (spec §3.3, as corrected by the design's round 3). `CommitDescription::present_consumers` carries **CRTC ids** — the members of the kernel event set whose page event supplies MSC/UST — never a serial. The `CompletedPresentEvent` stays with the frame, which the conductor's confirmation already moves into the accepted slot; confirmation also binds it to the commit's `CommitId`. `Presented` delivers the sample to that frame; the frame's single publication at retirement is the only CompleteNotify that request gets.
 5. **Cursor and gamma stay stage 4's** (§5.6). Cii adds no payload and no producer; what it proves is that a direct commit never carries an unchanged cursor and that a primary flip event does not retire a newer cursor generation.
-6. **Test names start with `c0_conv_cii_`**, so one filter selects this plan. `_vulkan` tests carry `#[ignore = "needs live Vulkan ICD"]` and build on Ci's owner-route live fixture (`for_tests_with_vk_live_scene_real_drm`; the plain variant has no real DRM node and cannot allocate a pool).
+6. **The `Skip` clock sample has one source and one binding (round-1 B-1).** A direct frame already carries `completion_clock: Option<PresentClockSample>`, the exact sample of its reference CRTC (`backend.rs:588`-`603`). On the owner route that field is filled **only** from an `OwnerEvent::Presented`'s sample for that frame's reference CRTC, bound by `(CommitId, reference CRTC)`; no other CRTC's sample and no other commit's may fill it. An accepted Present that reaches retirement with the field still `None` terminalizes as `Skip` with the platform's last **validated** sample for that CRTC (`present_get_completion_clock`, `platform.rs:5242`) — and if that CRTC has no validated sample at all, that is an F8 stop, not a fabricated `(0, 0)` timestamp.
+7. **Test names start with `c0_conv_cii_`**, so one filter selects this plan. `_vulkan` tests carry `#[ignore = "needs live Vulkan ICD"]` and build on Ci's owner-route live fixture (`for_tests_with_vk_live_scene_real_drm`; the plain variant has no real DRM node and cannot allocate a pool).
 
 ## Limits stated
 
@@ -62,20 +68,21 @@ Baseline before Task 1 (commit `528ac2a4`): `c0_conv_ci_` 38/38 with `--include-
 | --- | --- | --- |
 | A Present-carrying description is begun through one public entry with its `CompletionContext` and a fallible, CommitId-aware ledger (§5.0) | `c0_conv_cii_present_entry_registers_and_refuses` | S1: skip the completion-context validation in the new entry |
 | That entry keeps Ci's failure invariants (§4.0) | `c0_conv_cii_present_entry_failed_ledger_leaves_nothing` | S2: keep the slot reserved on a ledger error |
-| One production eligibility predicate, same answer for both routes (§5.1) | `c0_conv_cii_eligibility_is_one_predicate`, `c0_conv_cii_eligibility_matches_legacy_vulkan` | S3: let the owner route skip the border-clip input; S4: let it skip `direct_present_crtc_eligible` |
-| A queued successor whose ancestor gains a border never reaches a commit, promoted or not (§5.2) | `c0_conv_cii_border_invalidates_queued_successor_vulkan`, `c0_conv_cii_border_invalidates_promoted_successor_vulkan` | S5: drop the layout-generation bump at one enumerated site; S6: skip the eligibility recheck at `lock` |
+| One production eligibility predicate, same answer for both routes (§5.1) | `c0_conv_cii_eligibility_is_one_predicate`, `c0_conv_cii_eligibility_matches_legacy_vulkan` (both include a **CRTC-ineligible** candidate, round-1 M-3) | S3: let the owner route skip the border-clip input; S4: let it skip `direct_present_crtc_eligible` |
+| A queued successor whose ancestor gains a border never reaches a commit, promoted or not (§5.2) | `c0_conv_cii_border_invalidates_queued_successor_vulkan`, `c0_conv_cii_border_invalidates_promoted_successor_vulkan`, `c0_conv_cii_layout_change_between_decide_and_lock_vulkan` (round-1 M-3) | S5: drop the layout-generation bump at one enumerated site; S6: skip the eligibility recheck at `lock` |
 | Layout hooks cover the real sites (§5.2) | the enumeration of Task 3, each site with its own case in `c0_conv_cii_layout_hooks_bump_the_generation_vulkan` | S7: drop the bump at a second enumerated site |
 | The owner route takes its own module behind one fork point; Legacy is unchanged (decision 1) | `c0_conv_cii_legacy_direct_unchanged_vulkan`, `c0_conv_cii_owner_direct_offers_instead_of_flipping_vulkan` | S8: force the legacy submit under `Owner`; S9: offer under `Legacy` |
 | The producer supplies the commit's members; no guess remains (decision 3) | `c0_conv_cii_direct_members_come_from_the_producer` | S10: restore the current-state guess |
 | Present-pin leases travel by value into `CommitResources` and are released only by the ledger (§5.4) | `c0_conv_cii_direct_carries_its_pins_vulkan`, `c0_conv_cii_direct_pins_released_only_by_the_ledger_vulkan` | S11: build an empty lease set; S12: release the source pin at dispatch |
 | The direct commit carries its Present as CRTC ids, with the page-flip event and the context (§3.3, decision 4) | `c0_conv_cii_direct_description_carries_present_vulkan` | S13: drop `present_consumers`; S14: put a Present serial in `present_consumers` |
 | One publication per Present request; `Presented` only supplies the sample (§3.3) | `c0_conv_cii_direct_present_completes_once_vulkan` | S15: publish from an owner-event consumer as well |
-| A missing `Presented` terminalizes as `Skip` with the last validated clock, never a fabricated timestamp (§3.3, stage 2c §3) | `c0_conv_cii_direct_missing_presented_skips_vulkan` | S16: publish `Flip` with a synthesized timestamp |
-| Retirement promotion goes through the conductor, ordered predecessor → `Skip` → admission → publication (§5.3) | `c0_conv_cii_retirement_promotion_order_vulkan` | S17: commit the successor from the event handler again |
-| A displaced successor idles once with its `Skip` deferred behind the predecessor (§5.3) | `c0_conv_cii_displaced_successor_defers_its_skip_vulkan` | S18: publish the `Skip` immediately; S19: idle twice |
-| Direct entry invalidates every composed buffer of the affected outputs (§5.5, DMG-5) | `c0_conv_cii_direct_entry_invalidates_composed_vulkan` | S20: drop the invalidation on direct entry |
-| No direct milestone applies composed damage (§5.5) | `c0_conv_cii_direct_milestones_leave_composed_damage_vulkan` | S21: apply composed damage at the direct commit's `HardwareComplete` |
-| A direct commit never carries an unchanged cursor; a primary flip event does not retire a newer cursor generation (§5.6, C.0 §12) | `c0_conv_cii_direct_never_carries_an_unchanged_cursor` | S22: carry the unchanged cursor generation |
+| A missing `Presented` terminalizes as `Skip` with the last validated clock of its own reference CRTC (§3.3, decision 6) | `c0_conv_cii_direct_missing_presented_skips_vulkan` | S16: publish `Flip` with a synthesized timestamp; S17: fill the sample from another CRTC's or another commit's `Presented` |
+| Retirement promotion goes through the conductor, ordered predecessor → `Skip` → admission → publication (§5.3) | `c0_conv_cii_retirement_promotion_order_vulkan` | S18: commit the successor from the event handler again |
+| A displaced successor idles once with its `Skip` deferred behind the predecessor (§5.3) | `c0_conv_cii_displaced_successor_defers_its_skip_vulkan` | S19: publish the `Skip` immediately; S20: idle twice |
+| Direct entry invalidates every composed buffer of the affected outputs (§5.5, DMG-5) | `c0_conv_cii_direct_entry_invalidates_composed_vulkan` | S21: drop the invalidation on direct entry |
+| No direct milestone applies composed damage (§5.5) | `c0_conv_cii_direct_milestones_leave_composed_damage_vulkan` | S22: apply composed damage at the direct commit's `HardwareComplete` |
+| A direct commit never carries an unchanged cursor (§5.6) | `c0_conv_cii_direct_never_carries_an_unchanged_cursor` | S23: carry the unchanged cursor generation |
+| A primary flip event does not retire a newer cursor generation (§5.6, C.0 §12; round-1 M-4) | `c0_conv_cii_primary_flip_does_not_retire_a_newer_cursor_vulkan` | S24: retire the live newer generation when the primary commit completes |
 
 ---
 
@@ -87,7 +94,10 @@ Baseline before Task 1 (commit `528ac2a4`): `c0_conv_ci_` 38/38 with `--include-
 
 **Invariants (spec §5.0, §4.0):** the entry applies every check `begin_with_context` applies today, including the completion-context validation and the closure/out-fence coverage rules; a closure error leaves the owner exactly as before the call, with the slot released and no live record, and hands the error back by value; `begin_with_ledger` keeps refusing Present-carrying descriptions.
 
-**Named tests:** `c0_conv_cii_present_entry_registers_and_refuses` (a Present-carrying description is accepted and its record carries the expected completion CRTCs; a description whose consumer is outside the kernel event set is refused before the closure runs), `c0_conv_cii_present_entry_failed_ledger_leaves_nothing`.
+**Named tests:**
+- `c0_conv_cii_present_entry_registers_and_refuses` — a Present-carrying description is accepted and its record carries the expected completion CRTCs; and a **structurally valid** description with an independently invalid `CompletionContext` is refused **before the ledger closure runs** (round-1 M-1: a consumer outside the kernel event set is refused by closure construction, `closure.rs:215`, so it cannot witness S1).
+- `c0_conv_cii_present_entry_failed_ledger_leaves_nothing`.
+- `c0_conv_cii_direct_registration_failure_aborts_the_token` — a **real direct dispatch** whose dependency registration fails after `lock`: the owner is idle, the decider is exactly as before `lock`, the frame and its pins are back with the producer, and the obligations that were registered carry the record's own `CommitId` (round-1 M-1).
 
 - [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
@@ -122,6 +132,8 @@ Baseline before Task 1 (commit `528ac2a4`): `c0_conv_ci_` 38/38 with `--include-
 ### Task 4: The direct producer's fork and its module
 
 **Files:** new `crates/yserver/src/kms/render/direct_owner.rs` (register it in `render/mod.rs`), `backend.rs` (`try_present_direct`'s single fork point and the retirement path's), `admission.rs`; tests.
+
+**This task also brings the minimum production interfaces the source needs** (round-1 M-2): the direct `CommitDescription` builder and the direct `CommitResources` the conductor dispatches come from the producer here, not from the injected source, because the spec forbids an exit criterion resting on that source. Tasks 5 and 6 then complete them (members, leases, Present carriage); the tests below are **re-run unchanged** at the end of Task 6 against the finished production path, and Task 6's report says so.
 
 **Invariants (decision 1, spec §5.3):**
 - `try_present_direct` keeps the prepare half and asks **once** whether this output's device takes the owner route; the owner half is a call into `direct_owner.rs`. The legacy half — `submit_direct_frame`, `submit_queued_direct_successor` — is untouched, and no owner branch sits inside either.
@@ -179,4 +191,4 @@ Baseline before Task 1 (commit `528ac2a4`): `c0_conv_ci_` 38/38 with `--include-
 
 After each task: reads the diff against the invariants and the constraints (one fork point, no owner branch inside a legacy function, no assertion weakened), re-runs every check outside codex including the GPU filters, and commits with `Implemented-By: codex (model gpt-5.6-luna, reasoning effort xhigh)` and `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 
-After Task 7: applies S1–S22 by line against the implemented code, confirming each compiled and each fails its named test; runs the full hardware gate with the user's go-ahead; writes the acceptance finding and the `docs/status.md` entry. A surviving mutation goes back as a finding unless it is shown equivalent, and the showing is recorded.
+After Task 7: applies S1–S24 by line against the implemented code, confirming each compiled and each fails its named test; runs the full hardware gate with the user's go-ahead; writes the acceptance finding and the `docs/status.md` entry. A surviving mutation goes back as a finding unless it is shown equivalent, and the showing is recorded.
