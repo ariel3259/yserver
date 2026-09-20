@@ -591,7 +591,14 @@ struct DirectPresentFrame {
     source_id: DrawableId,
     candidate: PresentScanoutCandidate,
     fallback_target: PaintTarget,
+    /// The exact KMS membership captured while the producer prepared this
+    /// frame. It must not be reconstructed from the consumer's current state
+    /// at dispatch time.
+    members: Vec<crate::kms::render::resources::GroupMember>,
     event: yserver_core::backend::CompletedPresentEvent,
+    /// Commit that accepted this frame. `Presented` may populate the clock
+    /// only when its owner event names this exact id.
+    commit_id: Option<crate::kms::owner::identity::CommitId>,
     /// Output whose CRTC domain owns CompleteNotify/MSC for this Present.
     completion_output_idx: usize,
     /// Exact pageflip sample from the selected/reference CRTC. Xorg waits for
@@ -600,6 +607,66 @@ struct DirectPresentFrame {
     completion_clock: Option<yserver_core::backend::PresentClockSample>,
     awaiting_outputs: HashSet<usize>,
     admission_source_generation: Option<u64>,
+}
+
+/// The result of the one production direct-scanout eligibility evaluation.
+///
+/// The preparation values are carried along because `try_present_direct`
+/// needs them after the decision to retain the existing prepare/submit split;
+/// admission consumes only `eligible` and `layout_generation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectEligibility {
+    pub(crate) eligible: bool,
+    pub(crate) layout_generation: u64,
+    source_id: Option<DrawableId>,
+    paint_target: Option<PaintTarget>,
+    authoritative_root: bool,
+}
+
+impl DirectEligibility {
+    pub(crate) fn refused(layout_generation: u64) -> Self {
+        Self {
+            eligible: false,
+            layout_generation,
+            source_id: None,
+            paint_target: None,
+            authoritative_root: false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn direct_present_eligibility_decision(
+    direct_crtc_eligible: bool,
+    scanout_allowed: bool,
+    kms_outputs_active: bool,
+    cursor_hw: bool,
+    root_overlay_empty: bool,
+    authoritative_root: bool,
+    unbordered: bool,
+    x_off: i16,
+    y_off: i16,
+    valid_region_xid: u32,
+    layout_generation: u64,
+) -> DirectEligibility {
+    DirectEligibility {
+        eligible: direct_crtc_eligible
+            && scanout_direct_eligible(
+                scanout_allowed,
+                kms_outputs_active,
+                cursor_hw,
+                root_overlay_empty,
+                authoritative_root,
+                unbordered,
+                x_off,
+                y_off,
+                valid_region_xid,
+            ),
+        layout_generation,
+        source_id: None,
+        paint_target: None,
+        authoritative_root,
+    }
 }
 
 /// Require a short stable run before entering direct ownership. Compositors
@@ -2297,6 +2364,7 @@ impl KmsBackend {
         if let Some(id) = self.cow_id.take() {
             self.store_decref_with_invalidate(id);
         }
+        self.admission_note_layout_change_all_devices("composite overlay window released");
     }
 
     fn finish_deferred_cow_release(&mut self) {
@@ -2422,6 +2490,108 @@ impl KmsBackend {
         self.present_source_pins
             .insert(pin_id, PresentPinEntry::new(id, lease));
         pin_id
+    }
+
+    fn direct_group_members_for_candidate(
+        &self,
+        candidate: PresentScanoutCandidate,
+    ) -> Vec<crate::kms::render::resources::GroupMember> {
+        let Some(crtc_key) = self.present_crtc_key(candidate.crtc_id) else {
+            return Vec::new();
+        };
+        let topology_generation = self
+            .platform
+            .owner_ref(crtc_key.device_key)
+            .map_or(0, |owner| owner.topology_generation());
+        self.platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == crtc_key.device_key)
+            .map(|output| {
+                crate::kms::render::resources::GroupMember::new(
+                    CrtcKey::for_output(output),
+                    topology_generation,
+                    1,
+                )
+            })
+            .collect()
+    }
+
+    /// Move the producer's two direct Present leases into the owner resource
+    /// envelope. The pin table entry remains as the frame's logical drawable
+    /// lifetime token; only its resource-service lease changes hands.
+    pub(crate) fn take_direct_owner_resources(
+        &mut self,
+    ) -> Result<
+        crate::kms::render::resources::CommitResources,
+        crate::kms::render::resources::ResourceError,
+    > {
+        let Some(frame) = self.scanout_m2.queued_successor.as_ref() else {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        };
+        let source_pin = frame.source_pin;
+        let fallback_target_pin = frame.fallback_target_pin;
+        let members = frame.members.clone();
+        if members.is_empty() {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        }
+        if !self.present_source_pins.contains_key(&source_pin)
+            || !self.present_source_pins.contains_key(&fallback_target_pin)
+        {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        }
+
+        let source = self
+            .present_source_pins
+            .get_mut(&source_pin)
+            .and_then(|entry| entry.lease.take());
+        let fallback = self
+            .present_source_pins
+            .get_mut(&fallback_target_pin)
+            .and_then(|entry| entry.lease.take());
+        Ok(crate::kms::render::resources::CommitResources::new(
+            Vec::new(),
+            source,
+            fallback,
+            None,
+            members,
+            Vec::new(),
+        ))
+    }
+
+    fn restore_direct_owner_resources(
+        &mut self,
+        resources: &mut crate::kms::render::resources::CommitResources,
+    ) -> Result<(), crate::kms::render::resources::ResourceError> {
+        let Some(frame) = self.scanout_m2.queued_successor.as_ref() else {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        };
+        let source_pin = frame.source_pin;
+        let fallback_target_pin = frame.fallback_target_pin;
+        let source_conflict = resources.source.is_some()
+            && self
+                .present_source_pins
+                .get(&source_pin)
+                .is_none_or(|entry| entry.lease.is_some());
+        let fallback_conflict = resources.fallback.is_some()
+            && self
+                .present_source_pins
+                .get(&fallback_target_pin)
+                .is_none_or(|entry| entry.lease.is_some());
+        if source_conflict || fallback_conflict {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        }
+        if let Some(lease) = resources.source.take()
+            && let Some(entry) = self.present_source_pins.get_mut(&source_pin)
+        {
+            entry.lease = Some(lease);
+        }
+        if let Some(lease) = resources.fallback.take()
+            && let Some(entry) = self.present_source_pins.get_mut(&fallback_target_pin)
+        {
+            entry.lease = Some(lease);
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -2646,7 +2816,11 @@ impl KmsBackend {
 
     /// Move a managed successor into the in-flight frame slot after its owner
     /// transaction was confirmed at the send boundary.
-    pub(crate) fn managed_confirm_direct_dispatch(&mut self, source_generation: u64) -> bool {
+    pub(crate) fn managed_confirm_direct_dispatch(
+        &mut self,
+        source_generation: u64,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> bool {
         let Some(frame) = self.scanout_m2.queued_successor.take() else {
             return false;
         };
@@ -2654,21 +2828,68 @@ impl KmsBackend {
             self.scanout_m2.queued_successor = Some(frame);
             return false;
         }
+        let mut frame = frame;
+        frame.commit_id = Some(commit);
         self.scanout_m2.pending = Some(frame);
         self.scanout_m2.hold_direct = true;
         self.scanout_m2.sync_ownership();
         true
     }
 
+    /// Correlate one owner Presented event with the still-pending direct
+    /// frame. The reference CRTC is the only sample that can stamp this
+    /// Present; samples for the other grouped CRTCs remain platform history
+    /// only. A frame that has already retired is stale and cannot revive or
+    /// rewrite its publication.
+    fn managed_record_direct_presented(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        samples: &std::collections::BTreeMap<u32, crate::kms::owner::clock::ClockSample>,
+    ) -> bool {
+        let Some(frame) = self
+            .scanout_m2
+            .pending
+            .as_mut()
+            .filter(|frame| frame.commit_id == Some(commit))
+        else {
+            return false;
+        };
+        let Some(output) = self.platform.outputs.get(frame.completion_output_idx) else {
+            return false;
+        };
+        let crtc = u32::from(output.output.crtc);
+        let Some(sample) = samples.get(&crtc).copied() else {
+            return true;
+        };
+        frame.completion_clock = Some(yserver_core::backend::PresentClockSample {
+            msc: sample.msc,
+            ust: sample.ust,
+            source: yserver_core::backend::PresentClockSource::PageFlip,
+        });
+        true
+    }
+
     /// Retire the managed direct predecessor before a retirement admission
-    /// wake. The event remains in `completed` until the core drains it after
-    /// the handler returns. The retired frame keeps both pins while it is
+    /// wake. The owner can complete a Present-carrying record only after its
+    /// `Presented`, so this path publishes only the commit-bound `Flip`.
+    /// The event remains in `completed` until the core drains it after the
+    /// handler returns. The retired frame keeps both pins while it is
     /// current; only the previous current frame is released here.
     pub(crate) fn managed_enqueue_retired_direct_completion(&mut self) -> (Vec<u64>, Vec<u64>) {
         let mut completions = Vec::new();
         if let Some(mut pending) = self.scanout_m2.pending.take() {
+            let Some(completion_clock) = pending.completion_clock else {
+                log::error!(
+                    "direct Present {} reached retirement without its Presented sample",
+                    pending.event.present_id
+                );
+                self.scanout_m2.pending = Some(pending);
+                self.scanout_m2.sync_ownership();
+                return (completions, Vec::new());
+            };
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
             pending.event.emit_idle = false;
+            pending.event.completion_clock = Some(completion_clock);
             completions.push(pending.event.present_id);
             self.scanout_m2.completed.push(pending.event.clone());
             if let Some(previous) = self.scanout_m2.current.replace(pending) {
@@ -2686,6 +2907,43 @@ impl KmsBackend {
             .completed
             .append(&mut self.scanout_m2.deferred_successor_skips);
         (completions, skips)
+    }
+
+    /// Terminalize a Present whose owner record reached `CompletionUnknown`
+    /// before any `Presented` could be correlated. The owner ledger has
+    /// already proved the terminal path before this is called, so the frame's
+    /// logical pin entries can be removed while the storage leases remain
+    /// owned by the quarantined ledger resource. A historical clock is used
+    /// only when the reference CRTC has one; the accessor deliberately does
+    /// not manufacture the legacy `(0, 0)` value.
+    pub(crate) fn managed_enqueue_unknown_direct_completion(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> Option<u64> {
+        let matches = self
+            .scanout_m2
+            .pending
+            .as_ref()
+            .is_some_and(|frame| frame.commit_id == Some(commit));
+        if !matches {
+            return None;
+        }
+        let mut pending = self.scanout_m2.pending.take()?;
+        pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
+        pending.event.emit_idle = true;
+        pending.event.completion_clock = self
+            .platform
+            .outputs
+            .get(pending.completion_output_idx)
+            .map(CrtcKey::for_output)
+            .and_then(|key| self.platform.present_get_completion_clock_if_known(key));
+        let present_id = pending.event.present_id;
+        self.scanout_m2.completed.push(pending.event);
+        <Self as Backend>::release_present_source(self, pending.source_pin);
+        <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
+        self.note_present_skip();
+        self.scanout_m2.sync_ownership();
+        Some(present_id)
     }
 
     #[allow(dead_code)]
@@ -3174,7 +3432,16 @@ impl KmsBackend {
             // Like Xorg's present_flip_try_ready and wlroots' frame_pending
             // gate, submit at most one successor only after the kernel has
             // retired the preceding transaction.
-            self.submit_queued_direct_successor();
+            let owner_device = self
+                .platform
+                .outputs
+                .get(output_idx)
+                .map(|output| output.key.device_key);
+            if let Some(device) = owner_device.filter(|device| self.admission_is_active(*device)) {
+                crate::kms::render::direct_owner::retirement_wake(self, device);
+            } else {
+                self.submit_queued_direct_successor();
+            }
         }
         true
     }
@@ -3219,6 +3486,119 @@ impl KmsBackend {
             .primary_device()
             .is_some_and(|primary| crtc_key.device_key == primary.key)
             && self.direct_scanout_topology_eligible()
+    }
+
+    /// Gather and evaluate every direct-scanout gate at one instant.
+    ///
+    /// This is the production predicate shared by the legacy producer and
+    /// the admission source. `layout_generation` is the conductor generation
+    /// belonging to the candidate's CRTC domain; an unresolved CRTC has no
+    /// domain and therefore reports generation zero while remaining refused.
+    pub(crate) fn direct_present_eligibility(
+        &self,
+        candidate: PresentScanoutCandidate,
+    ) -> DirectEligibility {
+        let source_id = self.store.lookup(candidate.src_host_xid);
+        let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
+        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_id = paint_target.map(|target| target.backing_id());
+        let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
+        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
+        let root_coverage = leaf_id
+            .and_then(|id| self.window_absolute_rect(id))
+            .is_some_and(|rect| {
+                rect.offset.x == 0
+                    && rect.offset.y == 0
+                    && (rect.extent.width, rect.extent.height) == root
+                    && (
+                        u32::from(candidate.src_width),
+                        u32::from(candidate.src_height),
+                    ) == root
+            });
+        let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
+        // #133 step 3 (3.5): reject any candidate whose resolved paint
+        // chain carries a border clip. A bordered storage starts at its
+        // outer origin, not at content (0, 0).
+        let unbordered = paint_target.is_none_or(|target| !target.has_border_clip());
+        let layout_generation = self
+            .present_crtc_key(candidate.crtc_id)
+            .and_then(|key| self.admission_conductors.get(&key.device_key))
+            .map_or(0, |conductor| conductor.layout_generation);
+        let mut eligibility = direct_present_eligibility_decision(
+            self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch),
+            self.scanout_allowed(),
+            self.kms_outputs_active,
+            matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Hw
+            ),
+            self.scene.root_overlay.is_empty(),
+            authoritative_root,
+            unbordered,
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+            layout_generation,
+        );
+        eligibility.source_id = source_id;
+        eligibility.paint_target = paint_target;
+        eligibility
+    }
+
+    /// Evaluate the frame named by an admission direct successor. A missing
+    /// or mismatched frame is a closed refusal; it cannot authorize a wake.
+    pub(crate) fn direct_successor_eligibility(
+        &self,
+        device: DrmDeviceKey,
+        source_generation: u64,
+    ) -> DirectEligibility {
+        let layout_generation = self
+            .admission_conductors
+            .get(&device)
+            .map_or(0, |conductor| conductor.layout_generation);
+        let Some(frame) = self
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .filter(|frame| frame.admission_source_generation == Some(source_generation))
+        else {
+            return DirectEligibility::refused(layout_generation);
+        };
+        let mut eligibility = self.direct_present_eligibility(frame.candidate);
+        if self
+            .present_crtc_key(frame.candidate.crtc_id)
+            .is_none_or(|key| key.device_key != device)
+        {
+            eligibility.eligible = false;
+            eligibility.layout_generation = layout_generation;
+        }
+        eligibility
+    }
+
+    /// Return the producer frame named by an owner admission decision.
+    /// Keeping this lookup behind the backend preserves the direct frame's
+    /// ownership while letting the owner-route module build its description.
+    pub(crate) fn direct_successor_source_for_owner(
+        &self,
+        source_generation: u64,
+    ) -> Option<DrawableId> {
+        self.scanout_m2
+            .queued_successor
+            .as_ref()
+            .filter(|frame| frame.admission_source_generation == Some(source_generation))
+            .map(|frame| frame.source_id)
+    }
+
+    /// Resolve the imported framebuffer retained by the producer's M1 probe.
+    pub(crate) fn direct_source_framebuffer_for_owner(
+        &self,
+        source_id: DrawableId,
+    ) -> Option<::drm::control::framebuffer::Handle> {
+        self.scanout_m1
+            .entries
+            .get(&source_id)
+            .and_then(ScanoutM1ProbeEntry::framebuffer)
+            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
     }
 
     fn scanout_m1_topology_signature(&self) -> u64 {
@@ -3279,6 +3659,7 @@ impl KmsBackend {
         self.scene
             .invalidate_all_owner_damage_transactions(&mut self.platform);
         self.crtc_config_topology_epoch = self.crtc_config_topology_epoch.wrapping_add(1);
+        self.admission_note_layout_change_all_devices("CRTC/topology epoch changed");
 
         let mut tokens: Vec<_> = self.pending_crtc_config_probes.keys().copied().collect();
         tokens.sort_unstable_by_key(|token| token.0);
@@ -15367,7 +15748,9 @@ impl KmsBackend {
         if vk_rects.is_empty() {
             return;
         }
-        self.scene.root_overlay_toggle(client, value, &vk_rects);
+        if self.scene.root_overlay_toggle(client, value, &vk_rects) {
+            self.admission_note_layout_change_all_devices("root overlay changed");
+        }
     }
 
     fn emit_stroke_output(
@@ -16455,6 +16838,7 @@ impl KmsBackend {
                 );
             }
         }
+        self.admission_note_layout_change_all_devices("window storage allocation");
     }
 
     // ── Stage 3a: Core-text helpers ─────────────────────────────
@@ -19212,6 +19596,48 @@ impl KmsBackend {
         self.present_crtc_output(crtc_id).map(|(_, key)| key)
     }
 
+    /// Build the owner completion context for a direct request from the same
+    /// CRTC set that the description places in its kernel event closure.
+    /// Keeping this beside the live RANDR-to-KMS lookup prevents a direct
+    /// request from certifying a stale clock epoch or a CRTC from another
+    /// device.
+    pub(crate) fn direct_owner_completion_context(
+        &self,
+        device: DrmDeviceKey,
+        crtcs: &[u32],
+    ) -> Result<crate::kms::owner::completion::CompletionContext, String> {
+        use std::collections::BTreeMap;
+
+        use crate::kms::{executor::HostCallClass, owner::completion::CompletionClass};
+
+        let owner = self
+            .platform
+            .owner_ref(device)
+            .ok_or_else(|| "direct owner is unavailable".to_string())?;
+        let mut clocks = BTreeMap::new();
+        let mut mode_periods = BTreeMap::new();
+        for &crtc in crtcs {
+            if !self.platform.outputs.iter().any(|output| {
+                output.key.device_key == device && u32::from(output.output.crtc) == crtc
+            }) {
+                return Err(format!("direct owner CRTC {crtc} is unavailable"));
+            }
+            let Some(key) = owner.clock_key_for_hardware_crtc(crtc) else {
+                return Err(format!("direct owner CRTC {crtc} has no clock"));
+            };
+            clocks.insert(crtc, key);
+            mode_periods.insert(crtc, None);
+        }
+        Ok(crate::kms::owner::completion::CompletionContext {
+            class: CompletionClass::FastUpdate,
+            host_class: HostCallClass::SeatActiveNonblock,
+            allow_modeset: false,
+            clocks,
+            mode_periods,
+            lifecycle_observed_max: None,
+        })
+    }
+
     fn refresh_present_crtc_clock_epochs(&mut self) {
         let live: Vec<(u32, CrtcKey)> = self
             .crtc_key_by_id
@@ -19770,7 +20196,11 @@ impl KmsBackend {
             .owner_ref(device_key)
             .is_some_and(|owner| owner.slot().occupant().is_none());
         if wake_eligible && self.admission_is_active(device_key) && !recovery_stopped && slot_free {
-            let _ = self.admission_wake(device_key, has_retirement);
+            if has_retirement {
+                crate::kms::render::direct_owner::retirement_wake(self, device_key);
+            } else {
+                let _ = self.admission_wake(device_key, false);
+            }
         }
         consumed
     }
@@ -19896,20 +20326,26 @@ impl KmsBackend {
                 true
             }
             crate::kms::owner::device::OwnerEvent::Presented { commit, samples } => {
-                for (crtc_id, sample) in &samples {
-                    if let Some(handle) =
-                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(*crtc_id)
-                    {
-                        let crtc_key = CrtcKey::new(device_key, handle);
-                        self.platform
-                            .record_vblank_clock(crtc_key, sample.msc, sample.ust);
-                        let clock_sample = PresentClockSample {
-                            msc: sample.msc,
-                            ust: sample.ust,
-                            source: PresentClockSource::PageFlip,
-                        };
-                        self.platform
-                            .record_completion_clock(crtc_key, clock_sample);
+                // A stale/unknown Presented is telemetry, not a clock
+                // source. Correlate it with the accepted direct frame before
+                // allowing any of its samples to rewrite per-CRTC history.
+                let correlated = self.managed_record_direct_presented(commit, &samples);
+                if correlated {
+                    for (crtc_id, sample) in &samples {
+                        if let Some(handle) =
+                            ::drm::control::from_u32::<::drm::control::crtc::Handle>(*crtc_id)
+                        {
+                            let crtc_key = CrtcKey::new(device_key, handle);
+                            self.platform
+                                .record_vblank_clock(crtc_key, sample.msc, sample.ust);
+                            let clock_sample = PresentClockSample {
+                                msc: sample.msc,
+                                ust: sample.ust,
+                                source: PresentClockSource::PageFlip,
+                            };
+                            self.platform
+                                .record_completion_clock(crtc_key, clock_sample);
+                        }
                     }
                 }
                 let Some(service) = &mut self.resource_service else {
@@ -19923,6 +20359,10 @@ impl KmsBackend {
                     .is_ok()
             }
             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => {
+                let completion_unknown = matches!(
+                    terminal,
+                    crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                );
                 let never_dispatched = matches!(
                     terminal,
                     crate::kms::owner::record::TerminalState::FailedBeforeSubmit(
@@ -19945,14 +20385,18 @@ impl KmsBackend {
                 let Some(service) = &mut self.resource_service else {
                     return false;
                 };
-                admission_handled
+                let consumed = admission_handled
                     && self
                         .commit_consumer
                         .consume(
                             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal },
                             service,
                         )
-                        .is_ok()
+                        .is_ok();
+                if consumed && completion_unknown {
+                    self.managed_enqueue_unknown_direct_completion(commit);
+                }
+                consumed
             }
             crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
                 let admission_active = self.admission_is_active(device_key);
@@ -20175,13 +20619,22 @@ impl KmsBackend {
             return Err(err);
         }
 
+        let members = self.direct_group_members_for_candidate(candidate);
+        if members.is_empty() {
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            return Ok(false);
+        }
         let frame = DirectPresentFrame {
             source_pin,
             fallback_target_pin,
             source_id,
             candidate,
             fallback_target,
+            members,
             event,
+            commit_id: None,
             completion_output_idx,
             completion_clock: None,
             awaiting_outputs: HashSet::new(),
@@ -20207,7 +20660,7 @@ impl KmsBackend {
     pub(crate) fn managed_prepare_direct_dispatch(
         &mut self,
     ) -> Result<Option<PreparedDirectDispatch>, crate::kms::render::resources::ResourceError> {
-        use crate::kms::render::resources::{CommitResources, DirectRole};
+        use crate::kms::render::resources::DirectRole;
 
         if self.scanout_m2.queued_successor_role.is_none() {
             return Ok(None);
@@ -20253,12 +20706,41 @@ impl KmsBackend {
             return Err(error);
         }
 
-        let pending = CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new());
+        let pending = match crate::kms::render::direct_owner::resources(self) {
+            Ok(resources) => resources,
+            Err(error) => {
+                if let Err(restore_error) = self
+                    .commit_consumer
+                    .capacity
+                    .move_role(&mut successor, DirectRole::Successor)
+                {
+                    self.commit_consumer.capacity.close_admission();
+                    successor.discharged = true;
+                    if let Some(retirement) = retirement {
+                        self.discharge_bare_reservation(retirement);
+                    }
+                    return Err(restore_error);
+                }
+                self.scanout_m2.queued_successor_role = Some(successor);
+                if let Some(retirement) = retirement {
+                    self.discharge_bare_reservation(retirement);
+                }
+                return Err(error);
+            }
+        };
         let resources = match self.commit_consumer.capacity.attach(successor, pending) {
             Ok(resources) => resources,
-            Err((error, mut successor, _resources)) => {
+            Err((error, mut successor, mut resources)) => {
                 // `attach` can only fail if the reservation table was already
                 // inconsistent. Restore the queued role on this path too.
+                if let Err(restore_error) = self.restore_direct_owner_resources(&mut resources) {
+                    self.commit_consumer.capacity.close_admission();
+                    successor.discharged = true;
+                    if let Some(retirement) = retirement {
+                        self.discharge_bare_reservation(retirement);
+                    }
+                    return Err(restore_error);
+                }
                 if let Err(restore_error) = self
                     .commit_consumer
                     .capacity
@@ -20315,13 +20797,24 @@ impl KmsBackend {
     ) -> Result<(), crate::kms::render::resources::ResourceError> {
         use crate::kms::render::resources::DirectRole;
 
-        let submitted = prepared
-            .resources
-            .direct_role
-            .take()
-            .expect("prepared dispatch owns the Submitted role");
+        let mut resources = prepared.resources;
+        let submitted = resources.direct_role.take().ok_or_else(|| {
+            self.commit_consumer.capacity.close_admission();
+            if let Some(retirement) = prepared.retirement.take() {
+                self.discharge_bare_reservation(retirement);
+            }
+            crate::kms::render::resources::ResourceError::InvalidState
+        })?;
         if let Err((error, mut submitted)) = self.commit_consumer.capacity.finish_role(submitted) {
             submitted.discharged = true;
+            if let Some(retirement) = prepared.retirement.take() {
+                self.discharge_bare_reservation(retirement);
+            }
+            return Err(error);
+        }
+
+        if let Err(error) = self.restore_direct_owner_resources(&mut resources) {
+            self.commit_consumer.capacity.close_admission();
             if let Some(retirement) = prepared.retirement.take() {
                 self.discharge_bare_reservation(retirement);
             }
@@ -20660,7 +21153,11 @@ impl Backend for KmsBackend {
             }
             order.push(host);
         }
+        let order_changed = self.core.top_level_order != order;
         self.core.top_level_order = order;
+        if order_changed {
+            self.admission_note_layout_change_all_devices("top-level topology projection changed");
+        }
         self.scene.wake_for_damage();
     }
 
@@ -21310,46 +21807,11 @@ impl Backend for KmsBackend {
         if self.scanout_m2.reentry_blocked_until_composed {
             return Ok(false);
         }
-        let source_id = self.store.lookup(candidate.src_host_xid);
-        let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
-        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
-        let paint_id = paint_target.map(|target| target.backing_id());
-        let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
-        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
-        let root_coverage = leaf_id
-            .and_then(|id| self.window_absolute_rect(id))
-            .is_some_and(|rect| {
-                rect.offset.x == 0
-                    && rect.offset.y == 0
-                    && (rect.extent.width, rect.extent.height) == root
-                    && (
-                        u32::from(candidate.src_width),
-                        u32::from(candidate.src_height),
-                    ) == root
-            });
-        let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
-        // #133 step 3 (3.5): reject any candidate whose resolved paint
-        // chain carries a border clip. `has_border_clip()` is true iff
-        // some window between the presented drawable and its backing has
-        // `border_width > 0`, which is exactly the case where content no
-        // longer starts at storage (0, 0). A candidate that does not
-        // resolve at all is rejected further down.
-        let unbordered = paint_target.is_none_or(|t| !t.has_border_clip());
-        let eligible = self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            && scanout_direct_eligible(
-                self.scanout_allowed(),
-                self.kms_outputs_active,
-                matches!(
-                    self.scene.cursor_mode(),
-                    crate::kms::render::scene::CursorPlaneMode::Hw
-                ),
-                self.scene.root_overlay.is_empty(),
-                authoritative_root,
-                unbordered,
-                candidate.x_off,
-                candidate.y_off,
-                candidate.valid_region_xid,
-            );
+        let eligibility = self.direct_present_eligibility(candidate);
+        let source_id = eligibility.source_id;
+        let paint_target = eligibility.paint_target;
+        let authoritative_root = eligibility.authoritative_root;
+        let eligible = eligibility.eligible;
         if !eligible {
             // A child/video/game Present updates the COW shadow, but Muffin's
             // currently scanned root-stage buffer remains authoritative until
@@ -21415,6 +21877,20 @@ impl Backend for KmsBackend {
             return Ok(false);
         }
 
+        let Some(output) = self.platform.outputs.get(completion_output_idx) else {
+            return Ok(false);
+        };
+        let owner_device = output.key.device_key;
+        if self.admission_is_active(owner_device) {
+            return crate::kms::render::direct_owner::offer(
+                self,
+                owner_device,
+                source_id,
+                candidate,
+                event,
+            );
+        }
+
         let source_pin = self.pin_direct_source(source_id);
         let fallback_target_pin = self.pin_direct_source(fallback_target.backing_id());
         let present_id = candidate.present_id;
@@ -21424,7 +21900,9 @@ impl Backend for KmsBackend {
             source_id,
             candidate,
             fallback_target,
+            members: Vec::new(),
             event,
+            commit_id: None,
             completion_output_idx,
             completion_clock: None,
             awaiting_outputs: HashSet::new(),
@@ -23003,15 +23481,21 @@ impl Backend for KmsBackend {
         if self.direct_frame_references_host_drawable(host_xid) {
             self.request_direct_unflip("destroy_direct_frame_drawable");
         }
-        if let Some(id) = self.store.lookup(host_xid) {
+        let had_storage = if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
-        }
-        self.windows.remove(&host_xid);
+            true
+        } else {
+            false
+        };
+        let had_window = self.windows.remove(&host_xid).is_some();
         // Step 2 (DRIFT 2): top_level_order is no longer mutated here — it
         // is a projection of core children, reprojected by the destroy
         // core handler via `sync_top_level_order` after the resource child
         // is removed. (Scene already skips xids absent from windows, so
         // a transient stale entry between teardown and sync is harmless.)
+        if had_storage || had_window {
+            self.admission_note_layout_change_all_devices("window destroyed");
+        }
         self.scene.wake_for_damage();
         Ok(())
     }
@@ -23020,9 +23504,15 @@ impl Backend for KmsBackend {
         if self.direct_frame_references_host_drawable(host_xid) {
             self.request_direct_unflip("map_direct_frame_drawable");
         }
+        let geometry_changed = self.windows.get(&host_xid).is_some_and(|geom| !geom.mapped);
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
         }
+        let storage_changed = self
+            .store
+            .lookup(host_xid)
+            .and_then(|id| self.store.get(id))
+            .is_some_and(|drawable| !drawable.scene_participating);
         if let Some(id) = self.store.lookup(host_xid) {
             self.store.set_scene_participating(id, true);
         }
@@ -23054,6 +23544,9 @@ impl Backend for KmsBackend {
                 }
             }
         }
+        if geometry_changed || storage_changed {
+            self.admission_note_layout_change_all_devices("window mapped");
+        }
         self.scene.wake_for_damage();
         Ok(())
     }
@@ -23062,11 +23555,20 @@ impl Backend for KmsBackend {
         if self.direct_frame_references_host_drawable(host_xid) {
             self.request_direct_unflip("unmap_direct_frame_drawable");
         }
+        let geometry_changed = self.windows.get(&host_xid).is_some_and(|geom| geom.mapped);
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
         }
+        let storage_changed = self
+            .store
+            .lookup(host_xid)
+            .and_then(|id| self.store.get(id))
+            .is_some_and(|drawable| drawable.scene_participating);
         if let Some(id) = self.store.lookup(host_xid) {
             self.store.set_scene_participating(id, false);
+        }
+        if geometry_changed || storage_changed {
+            self.admission_note_layout_change_all_devices("window unmapped");
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -23091,11 +23593,14 @@ impl Backend for KmsBackend {
             // before register). v1 tolerates this.
             return Ok(());
         };
+        let mut layout_changed = false;
         let mut size_changed = false;
         if let Some(x) = config.x {
+            layout_changed |= x != geom.x;
             geom.x = x;
         }
         if let Some(y) = config.y {
+            layout_changed |= y != geom.y;
             geom.y = y;
         }
         if let Some(w) = config.width
@@ -23103,12 +23608,14 @@ impl Backend for KmsBackend {
         {
             geom.width = w;
             size_changed = true;
+            layout_changed = true;
         }
         if let Some(h) = config.height
             && h != geom.height
         {
             geom.height = h;
             size_changed = true;
+            layout_changed = true;
         }
         // #133 step 2 (P3): mirror `border_width` from the configure.
         // Deliberately NOT folded into `size_changed`: the two need
@@ -23118,6 +23625,7 @@ impl Backend for KmsBackend {
         if let Some(bw) = config.border_width {
             border_width_changed = bw != geom.border_width;
             geom.border_width = bw;
+            layout_changed |= border_width_changed;
         }
         // #133 step 6 (P8) — a `border_width` change is checked FIRST
         // and takes the whole configure with it, including a combined
@@ -23195,7 +23703,11 @@ impl Backend for KmsBackend {
                 .is_some_and(|g| g.parent.is_some());
             if is_subwindow {
                 self.restack_subwindow(host_xid, stack_mode, config.sibling);
+                layout_changed = true;
             }
+        }
+        if layout_changed {
+            self.admission_note_layout_change_all_devices("window configure/layout change");
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -23252,7 +23764,7 @@ impl Backend for KmsBackend {
             );
         };
         let new_rank = self.alloc_window_stack_rank();
-        if let Some(geom) = self.windows.get_mut(&host_xid) {
+        let layout_changed = if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.x = x;
             geom.y = y;
             // The parent update is load-bearing — `build_scene` recurses by
@@ -23261,11 +23773,17 @@ impl Backend for KmsBackend {
             // and once via the recurse).
             geom.parent = parent;
             geom.stack_rank = new_rank;
-        }
+            true
+        } else {
+            false
+        };
         // Step 2 (DRIFT 2): top_level_order is no longer reconciled here —
         // it projects core children, reprojected by the reparent core
         // handler via `sync_top_level_order` after the core tree moves the
         // window (across the root boundary).
+        if layout_changed {
+            self.admission_note_layout_change_all_devices("window reparented");
+        }
         self.scene.wake_for_damage();
         Ok(())
     }
@@ -23460,7 +23978,9 @@ impl Backend for KmsBackend {
     }
 
     fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
-        self.scene.root_overlay_on_disconnect(client_id);
+        if self.scene.root_overlay_on_disconnect(client_id) {
+            self.admission_note_layout_change_all_devices("client root overlay removed");
+        }
     }
 
     fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
@@ -23512,6 +24032,10 @@ impl Backend for KmsBackend {
         // path) so either reading is fine, and pre-flip keeps the
         // two branches symmetric.
         let pre_flip_rect = self.window_absolute_rect(w_id);
+        let participation_changed = self
+            .store
+            .get(w_id)
+            .is_some_and(|drawable| drawable.scene_participating != participating);
 
         self.store.set_scene_participating(w_id, participating);
 
@@ -23521,6 +24045,9 @@ impl Backend for KmsBackend {
             // No tracked geometry (root or untracked) — coarse
             // marker is correctness-preserving.
             self.scene.mark_scene_structure_dirty();
+        }
+        if participation_changed {
+            self.admission_note_layout_change_all_devices("window scene participation changed");
         }
         Ok(())
     }
@@ -23619,6 +24146,7 @@ impl Backend for KmsBackend {
             return Ok(existing);
         }
         let w_xid = host_window.as_raw();
+        let mut route_changed = false;
 
         // Allocate a fresh backing via the existing
         // `create_pixmap` path (3f.10 pool + 3f.14 zero-fill).
@@ -23659,6 +24187,7 @@ impl Backend for KmsBackend {
             // record stays uninstalled (protocol error upstream).
             if let Some(w_id) = self.store.lookup(w_xid) {
                 self.store.set_redirected_target(w_id, Some(b_id));
+                route_changed = true;
                 // The route flip changes what the walk samples for W (the
                 // backing's view, extent and UV denominator). The content is
                 // the same, but the tick only walks when told something
@@ -23699,6 +24228,9 @@ impl Backend for KmsBackend {
             },
         );
         self.core.host_window_to_backing.insert(w_xid, backing);
+        if route_changed {
+            self.admission_note_layout_change_all_devices("redirect route installed");
+        }
         // Step 2c — the window now samples the backing instead of its own
         // storage, which the scene diff reads as a signature change. Same
         // reasoning as the release path: schedule a tick so that damage is not
@@ -23838,6 +24370,7 @@ impl Backend for KmsBackend {
                         == Some(b_id)
                 })
                 .collect();
+            let route_changed = !routed_windows.is_empty();
             for w_xid in routed_windows {
                 if let Some(w_id) = self.store.lookup(w_xid) {
                     self.store.set_redirected_target(w_id, None);
@@ -23856,6 +24389,9 @@ impl Backend for KmsBackend {
             // store's `set_scene_participating` short-circuits
             // the damage-clear branch when `was == v`).
             self.store.set_scene_participating(b_id, false);
+            if route_changed {
+                self.admission_note_layout_change_all_devices("redirect route removed");
+            }
         }
         if self.core.alias_registry.decref(backing) {
             self.free_pixmap(origin, raw)?;
@@ -24001,6 +24537,7 @@ impl Backend for KmsBackend {
         // children via `sync_top_level_order` AFTER materialize_cow_resource
         // (which inserts the COW as a root child capped on top).
         self.scene.mark_scene_structure_dirty();
+        self.admission_note_layout_change_all_devices("composite overlay window materialized");
         Ok(true)
     }
 
@@ -43985,6 +44522,7 @@ mod tests {
                 options: 0,
             },
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            members: Vec::new(),
             event: CompletedPresentEvent {
                 client_id: yserver_protocol::x11::ClientId(1),
                 serial: 1,
@@ -44001,6 +44539,7 @@ mod tests {
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_FLIP,
                 emit_idle: false,
             },
+            commit_id: None,
             completion_output_idx: 0,
             completion_clock,
             awaiting_outputs: std::collections::HashSet::new(),
@@ -47185,6 +47724,7 @@ mod tests {
             source_id,
             candidate,
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            members: Vec::new(),
             event: CompletedPresentEvent {
                 client_id: yserver_protocol::x11::ClientId(1),
                 serial: 9,
@@ -47205,6 +47745,7 @@ mod tests {
                 },
                 emit_idle: !current,
             },
+            commit_id: None,
             completion_output_idx: 0,
             completion_clock,
             awaiting_outputs: if current {
@@ -47784,7 +48325,9 @@ mod tests {
             source_id,
             candidate,
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            members: Vec::new(),
             event,
+            commit_id: None,
             completion_output_idx: 0,
             completion_clock: None,
             awaiting_outputs: std::collections::HashSet::from([0, 1]),
@@ -49456,9 +49999,9 @@ mod tests {
         };
 
         let mut backend = super::KmsBackend::for_tests();
+        seed_direct_owner_description_properties_for_tests(&mut backend);
         let device_key = backend.platform.primary_device().unwrap().key;
         let mut service = ResourceService::new(device_key, IncarnationId::from_raw(1));
-
         let (id_a, candidate_a, event_a) =
             managed_prepare_ready_candidate(&mut backend, 0x7301, 0x7302, 40, 1);
         assert!(
@@ -49499,6 +50042,29 @@ mod tests {
                 .unwrap()
         );
         backend
+    }
+
+    fn seed_direct_owner_description_properties_for_tests(backend: &mut super::KmsBackend) {
+        let test_crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<Vec<_>>();
+        for output in &mut backend.platform.outputs {
+            output.output.plane = ::drm::control::from_u32(10).expect("fixture plane");
+            output.output.plane_fb_id_prop =
+                ::drm::control::from_u32(19).expect("fixture FB_ID property");
+            output.output.plane_crtc_id_prop =
+                ::drm::control::from_u32(20).expect("fixture CRTC_ID property");
+            output.output.crtc_out_fence_ptr_prop =
+                Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
+        }
+        for crtc in test_crtcs {
+            backend.platform.devices[0]
+                .active_property_cache
+                .insert_for_tests(crtc, 21);
+        }
     }
 
     #[test]
@@ -50292,7 +50858,11 @@ mod tests {
                 .extend(resources);
         }
 
-        fn direct_eligible(&self, _source_generation: u64) -> bool {
+        fn direct_eligible(
+            &self,
+            _source_generation: u64,
+            _eligibility: crate::kms::render::backend::DirectEligibility,
+        ) -> bool {
             self.direct_eligible.get()
         }
     }
@@ -50449,6 +51019,21 @@ mod tests {
         })
     }
 
+    fn reinstall_owner_executor_for_direct_test(backend: &mut super::KmsBackend) {
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("owner executor"),
+        );
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("replacement owner executor"),
+        );
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_legacy_tick_flips_as_before_vulkan() {
@@ -50467,6 +51052,2071 @@ mod tests {
                 .damage_state_for_tests(0)
                 .is_some_and(|(_, staged)| staged),
             "the legacy observable is a staged ScanoutDamage frame"
+        );
+    }
+
+    fn c0_direct_eligibility_candidate(
+        backend: &mut super::KmsBackend,
+        crtc_id: u32,
+        target_xid: u32,
+        source_xid: u32,
+        border_width: u16,
+    ) -> yserver_core::backend::PresentScanoutCandidate {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use ash::vk;
+
+        let width = backend.platform.fb_w;
+        let height = backend.platform.fb_h;
+        seed_bordered_window(backend, target_xid, None, 0, 0, width, height, border_width);
+        backend
+            .store
+            .allocate(
+                source_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: u32::from(width),
+                        height: u32::from(height),
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("eligibility source");
+
+        bind_test_randr_crtc(backend, 0, crtc_id);
+        let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+        yserver_core::backend::PresentScanoutCandidate {
+            client_id: 1,
+            present_id: u64::from(source_xid),
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: source_xid,
+            dst_window_xid: target_xid,
+            src_host_xid: source_xid,
+            paint_dst_host_xid: target_xid,
+            completion_dst_host_xid: target_xid,
+            src_width: width,
+            src_height: height,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        }
+    }
+
+    fn c0_direct_pure_eligibility(
+        backend: &super::KmsBackend,
+        candidate: &yserver_core::backend::PresentScanoutCandidate,
+    ) -> bool {
+        let leaf_id = backend.store.lookup(candidate.paint_dst_host_xid);
+        let paint_target = backend.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_id = paint_target.map(|target| target.backing_id());
+        let target = backend.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
+        let root = (
+            u32::from(backend.platform.fb_w),
+            u32::from(backend.platform.fb_h),
+        );
+        let root_coverage = leaf_id
+            .and_then(|id| backend.window_absolute_rect(id))
+            .is_some_and(|rect| {
+                rect.offset.x == 0
+                    && rect.offset.y == 0
+                    && (rect.extent.width, rect.extent.height) == root
+                    && (
+                        u32::from(candidate.src_width),
+                        u32::from(candidate.src_height),
+                    ) == root
+            });
+        super::scanout_direct_eligible(
+            backend.scanout_allowed(),
+            backend.kms_outputs_active,
+            matches!(
+                backend.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Hw
+            ),
+            backend.scene.root_overlay.is_empty(),
+            super::scanout_m2_is_authoritative_root(target, root_coverage),
+            paint_target.is_none_or(|target| !target.has_border_clip()),
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+        )
+    }
+
+    #[test]
+    fn c0_conv_cii_eligibility_combination_rule() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        assert_eq!(
+            backend.admission_note_layout_change(device),
+            crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+        );
+
+        let current_generation = backend.admission_conductors[&device].layout_generation;
+        let gate_cases = [
+            (
+                "all-gates",
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                0,
+                0,
+                0,
+            ),
+            ("vt", true, false, true, true, true, true, true, 0, 0, 0),
+            (
+                "outputs", true, true, false, true, true, true, true, 0, 0, 0,
+            ),
+            ("cursor", true, true, true, false, true, true, true, 0, 0, 0),
+            (
+                "overlay", true, true, true, true, false, true, true, 0, 0, 0,
+            ),
+            ("root", true, true, true, true, true, false, true, 0, 0, 0),
+            ("border", true, true, true, true, true, true, true, 1, 0, 0),
+            // The pure scanout core accepts this row; only the CRTC-domain
+            // predicate refuses it.
+            (
+                "crtc-domain",
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                0,
+                0,
+                0,
+            ),
+        ];
+        for (
+            name,
+            direct_crtc_eligible,
+            scanout_allowed,
+            kms_outputs_active,
+            cursor_hw,
+            root_overlay_empty,
+            authoritative_root,
+            unbordered,
+            x_off,
+            y_off,
+            valid_region_xid,
+        ) in gate_cases
+        {
+            let pure = super::scanout_direct_eligible(
+                scanout_allowed,
+                kms_outputs_active,
+                cursor_hw,
+                root_overlay_empty,
+                authoritative_root,
+                unbordered,
+                x_off,
+                y_off,
+                valid_region_xid,
+            );
+            let result = super::direct_present_eligibility_decision(
+                direct_crtc_eligible,
+                scanout_allowed,
+                kms_outputs_active,
+                cursor_hw,
+                root_overlay_empty,
+                authoritative_root,
+                unbordered,
+                x_off,
+                y_off,
+                valid_region_xid,
+                current_generation,
+            );
+            assert_eq!(result.eligible, direct_crtc_eligible && pure, "{name}");
+            assert_eq!(result.layout_generation, current_generation, "{name}");
+        }
+
+        assert_eq!(
+            super::direct_present_eligibility_decision(
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                0,
+                0,
+                0,
+                current_generation,
+            )
+            .layout_generation,
+            current_generation
+        );
+    }
+
+    #[test]
+    fn c0_conv_cii_eligibility_is_one_predicate() {
+        let mut backend = super::KmsBackend::for_tests();
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let device = backend.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let unbordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC312, 0xC313, 0);
+        let bordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC314, 0xC315, 1);
+
+        assert!(
+            c0_direct_pure_eligibility(&backend, &unbordered),
+            "the baseline candidate must pass the pure scanout gates"
+        );
+        assert!(
+            backend.direct_present_crtc_eligible(unbordered.crtc_id, unbordered.crtc_epoch),
+            "the baseline candidate must pass the gathered CRTC gate"
+        );
+        assert!(
+            backend.direct_present_eligibility(unbordered).eligible,
+            "the baseline candidate must be eligible through the production predicate"
+        );
+
+        let bordered_result = backend.direct_present_eligibility(bordered);
+        assert!(
+            bordered_result
+                .paint_target
+                .is_some_and(|target| target.has_border_clip()),
+            "the border case must reach the production border input"
+        );
+        assert!(
+            backend.direct_present_crtc_eligible(bordered.crtc_id, bordered.crtc_epoch),
+            "the border case must be ineligible only through its border clip"
+        );
+        assert!(
+            !bordered_result.eligible,
+            "the production predicate must reject the bordered candidate"
+        );
+
+        let stale = yserver_core::backend::PresentScanoutCandidate {
+            crtc_epoch: unbordered.crtc_epoch.saturating_sub(1),
+            ..unbordered
+        };
+        assert!(
+            c0_direct_pure_eligibility(&backend, &stale),
+            "the stale candidate must pass every pure scanout gate"
+        );
+        assert!(
+            !backend.direct_present_crtc_eligible(stale.crtc_id, stale.crtc_epoch),
+            "the stale candidate must fail the gathered CRTC gate"
+        );
+        assert!(
+            !backend.direct_present_eligibility(stale).eligible,
+            "the production predicate must reject the stale CRTC candidate"
+        );
+
+        let unknown = yserver_core::backend::PresentScanoutCandidate {
+            crtc_id: 0xC3FF,
+            ..unbordered
+        };
+        assert!(c0_direct_pure_eligibility(&backend, &unknown));
+        assert!(!backend.direct_present_crtc_eligible(unknown.crtc_id, unknown.crtc_epoch));
+        assert!(!backend.direct_present_eligibility(unknown).eligible);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_eligibility_matches_legacy_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let device = backend.platform.primary_device().expect("device").key;
+        let owner_candidate =
+            c0_direct_eligibility_candidate(&mut backend, 0xC401, 0xC402, 0xC403, 0);
+        let owner_bordered =
+            c0_direct_eligibility_candidate(&mut backend, 0xC401, 0xC404, 0xC405, 1);
+        let owner_stale = yserver_core::backend::PresentScanoutCandidate {
+            crtc_epoch: owner_candidate.crtc_epoch.saturating_sub(1),
+            ..owner_candidate
+        };
+        assert!(c0_direct_pure_eligibility(&backend, &owner_candidate));
+        assert!(c0_direct_pure_eligibility(&backend, &owner_stale));
+        assert!(
+            backend
+                .direct_present_crtc_eligible(owner_candidate.crtc_id, owner_candidate.crtc_epoch)
+        );
+        assert!(
+            backend.direct_present_crtc_eligible(owner_bordered.crtc_id, owner_bordered.crtc_epoch)
+        );
+        let owner_answers = [
+            backend.direct_present_eligibility(owner_candidate).eligible,
+            backend.direct_present_eligibility(owner_bordered).eligible,
+            backend.direct_present_eligibility(owner_stale).eligible,
+        ];
+        assert_eq!(owner_answers, [true, false, false]);
+
+        install_admission_legacy_gate(&mut backend, device);
+        let legacy_candidate = owner_candidate;
+        let legacy_answers = [
+            backend
+                .direct_present_eligibility(legacy_candidate)
+                .eligible,
+            backend.direct_present_eligibility(owner_bordered).eligible,
+            backend
+                .direct_present_eligibility(yserver_core::backend::PresentScanoutCandidate {
+                    crtc_epoch: legacy_candidate.crtc_epoch.saturating_sub(1),
+                    ..legacy_candidate
+                })
+                .eligible,
+        ];
+        assert_eq!(owner_answers, legacy_answers);
+        assert_eq!(legacy_answers, [true, false, false]);
+        assert!(super::scanout_direct_eligible(
+            true, true, true, true, true, true, 0, 0, 0
+        ));
+        assert!(
+            !super::direct_present_eligibility_decision(
+                false, true, true, true, true, true, true, 0, 0, 0, 0
+            )
+            .eligible
+        );
+        assert!(!legacy_answers[2], "the stale CRTC must stay ineligible");
+    }
+
+    fn c0_conv_cii_generation(backend: &super::KmsBackend, device: DrmDeviceKey) -> u64 {
+        backend.admission_conductors[&device].layout_generation
+    }
+
+    fn c0_conv_cii_assert_generation_bumped(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        site: &str,
+        mutation: impl FnOnce(&mut super::KmsBackend),
+    ) {
+        let before = c0_conv_cii_generation(backend, device);
+        mutation(backend);
+        let after = c0_conv_cii_generation(backend, device);
+        assert_eq!(
+            after,
+            before + 1,
+            "{site} must advance the admission layout generation exactly once"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_layout_hooks_bump_the_generation_vulkan() {
+        use yserver_core::{
+            backend::{Backend, WindowHandle},
+            host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+        };
+        use yserver_protocol::x11::ResourceId;
+
+        let mut fixture = owner_live_fixture()
+            .expect("environmental skip: no live Vulkan ICD/DRM fixture available");
+        let backend = &mut fixture.backend;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let root = WindowHandle::from_raw(backend.window_id()).expect("root handle");
+
+        c0_conv_cii_assert_generation_bumped(backend, device, "register_top_level", |backend| {
+            backend
+                .register_top_level(None, ResourceId(0x00c0_0101), 0xc001_0101)
+                .expect("register_top_level");
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "register_subwindow", |backend| {
+            backend
+                .register_subwindow(None, ResourceId(0x00c0_0102), 0xc001_0102)
+                .expect("register_subwindow");
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "create_subwindow", |backend| {
+            backend
+                .create_subwindow(
+                    None,
+                    root,
+                    10,
+                    20,
+                    160,
+                    120,
+                    0,
+                    HostSubwindowVisual::CopyFromParent,
+                    None,
+                    None,
+                )
+                .expect("create_subwindow");
+        });
+        let child = backend
+            .windows
+            .keys()
+            .copied()
+            .find(|xid| *xid != 0xc001_0101 && *xid != 0xc001_0102 && *xid != backend.window_id())
+            .expect("created child");
+
+        c0_conv_cii_assert_generation_bumped(backend, device, "configure geometry", |backend| {
+            backend
+                .configure_subwindow(
+                    None,
+                    child,
+                    HostSubwindowConfig {
+                        x: Some(11),
+                        ..Default::default()
+                    },
+                )
+                .expect("configure geometry");
+        });
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "configure border relayout",
+            |backend| {
+                backend
+                    .configure_subwindow(
+                        None,
+                        child,
+                        HostSubwindowConfig {
+                            border_width: Some(2),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("configure border");
+            },
+        );
+        c0_conv_cii_assert_generation_bumped(backend, device, "subwindow restack", |backend| {
+            backend
+                .configure_subwindow(
+                    None,
+                    child,
+                    HostSubwindowConfig {
+                        stack_mode: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .expect("configure restack");
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "map_subwindow", |backend| {
+            backend.map_subwindow(None, child).expect("map_subwindow");
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "unmap_subwindow", |backend| {
+            backend
+                .unmap_subwindow(None, child)
+                .expect("unmap_subwindow");
+        });
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "set_window_scene_participation",
+            |backend| {
+                backend
+                    .set_window_scene_participation(
+                        None,
+                        WindowHandle::from_raw(child).expect("child handle"),
+                        true,
+                    )
+                    .expect("set window scene participation");
+            },
+        );
+        c0_conv_cii_assert_generation_bumped(backend, device, "reparent_subwindow", |backend| {
+            backend
+                .reparent_subwindow(None, child, backend.window_id(), 30, 40)
+                .expect("reparent_subwindow");
+        });
+
+        let mut backing = None;
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "allocate_redirected_backing",
+            |backend| {
+                backing = Some(
+                    backend
+                        .allocate_redirected_backing(
+                            None,
+                            WindowHandle::from_raw(child).expect("child handle"),
+                            164,
+                            124,
+                            24,
+                        )
+                        .expect("allocate redirected backing"),
+                );
+            },
+        );
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "release_redirected_backing",
+            |backend| {
+                backend
+                    .release_redirected_backing(None, backing.expect("redirected backing"))
+                    .expect("release redirected backing");
+            },
+        );
+
+        backend.core.current_function = yserver_core::backend::GcFunction::Invert;
+        backend.core.current_subwindow_mode =
+            yserver_core::backend::SubwindowMode::IncludeInferiors;
+        let origin = Some(yserver_core::backend::OriginContext {
+            client_id: yserver_protocol::x11::ClientId(91),
+            nested_seq: 0,
+            opcode: 70,
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "root overlay capture", |backend| {
+            backend.capture_root_overlay(
+                origin,
+                !0,
+                &[super::Rectangle16 {
+                    x: 10,
+                    y: 10,
+                    width: 20,
+                    height: 20,
+                }],
+            );
+        });
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "client overlay disconnect",
+            |backend| {
+                backend.client_disconnected(yserver_protocol::x11::ClientId(91));
+            },
+        );
+
+        c0_conv_cii_assert_generation_bumped(backend, device, "get_overlay_window", |backend| {
+            assert!(
+                backend
+                    .get_overlay_window(None)
+                    .expect("get overlay window")
+            );
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "finish_cow_release", |backend| {
+            assert!(
+                backend
+                    .release_overlay_window(None)
+                    .expect("release overlay window")
+            );
+        });
+
+        let mut state = ServerState::new();
+        seed_state_window(
+            &mut state,
+            backend,
+            ResourceId(0x00c0_0202),
+            yserver_core::resources::ROOT_WINDOW,
+            0,
+            0,
+            100,
+            100,
+        );
+        c0_conv_cii_assert_generation_bumped(backend, device, "topology installation", |backend| {
+            backend.sync_top_level_order(&state);
+        });
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "virtual screen topology",
+            |backend| {
+                let width = backend.platform.fb_w;
+                let height = backend.platform.fb_h;
+                backend
+                    .apply_virtual_screen_extent(width, height)
+                    .expect("apply virtual screen extent");
+            },
+        );
+
+        c0_conv_cii_assert_generation_bumped(backend, device, "destroy_subwindow", |backend| {
+            backend
+                .destroy_subwindow(None, child)
+                .expect("destroy_subwindow");
+        });
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_border_invalidates_queued_successor_vulkan() {
+        use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+        let mut fixture = owner_live_fixture()
+            .expect("environmental skip: no live Vulkan ICD/DRM fixture available");
+        let backend = &mut fixture.backend;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let target = backend
+            .create_subwindow(
+                None,
+                yserver_core::backend::WindowHandle::from_raw(backend.window_id())
+                    .expect("root handle"),
+                0,
+                0,
+                80,
+                80,
+                0,
+                yserver_core::host_x11::HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .expect("target window")
+            .as_raw();
+        let (source_id, candidate, event) = admission_direct_candidate(backend, 81);
+        let present_id = event.present_id;
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("queue direct successor")
+        );
+
+        backend
+            .configure_subwindow(
+                None,
+                target,
+                HostSubwindowConfig {
+                    border_width: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("border configure");
+
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(backend.scanout_m2.idled.len(), 1);
+        assert_eq!(backend.scanout_m2.idled[0].present_id, present_id);
+        assert_eq!(backend.scanout_m2.completed.len(), 1);
+        assert_eq!(
+            backend.scanout_m2.completed[0].completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_border_invalidates_promoted_successor_vulkan() {
+        use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+        let mut fixture = owner_live_fixture()
+            .expect("environmental skip: no live Vulkan ICD/DRM fixture available");
+        let backend = &mut fixture.backend;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let target = backend
+            .create_subwindow(
+                None,
+                yserver_core::backend::WindowHandle::from_raw(backend.window_id())
+                    .expect("root handle"),
+                0,
+                0,
+                80,
+                80,
+                0,
+                yserver_core::host_x11::HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .expect("target window")
+            .as_raw();
+        let (commit, resources) = admission_stage_direct_predecessor(backend, 82);
+        let (source_id, candidate, event) = admission_direct_candidate(backend, 83);
+        let present_id = event.present_id;
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("queue direct successor")
+        );
+
+        backend
+            .configure_subwindow(
+                None,
+                target,
+                HostSubwindowConfig {
+                    border_width: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("border configure");
+        assert!(backend.scanout_m2.pending.is_some());
+
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                admission_presented_event(backend, commit),
+                admission_completion_retired_event(commit, resources),
+            ],
+            std::time::Instant::now(),
+        );
+
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(backend.scanout_m2.completed.len(), 2);
+        assert_eq!(backend.scanout_m2.completed[1].present_id, present_id);
+        assert_eq!(
+            backend.scanout_m2.completed[1].completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_layout_change_between_decide_and_lock_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, ReadinessSnapshot};
+        use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+        let mut fixture = owner_live_fixture()
+            .expect("environmental skip: no live Vulkan ICD/DRM fixture available");
+        let backend = &mut fixture.backend;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let target = backend
+            .create_subwindow(
+                None,
+                yserver_core::backend::WindowHandle::from_raw(backend.window_id())
+                    .expect("root handle"),
+                0,
+                0,
+                80,
+                80,
+                0,
+                yserver_core::host_x11::HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .expect("target window")
+            .as_raw();
+        let (source_id, candidate, event) = admission_direct_candidate(backend, 84);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("queue direct successor")
+        );
+        let source_generation = backend.admission_conductors[&device]
+            .admission
+            .direct()
+            .expect("direct descriptor")
+            .successor
+            .source_generation;
+        let old_generation = c0_conv_cii_generation(backend, device);
+        let topology_generation = backend
+            .platform
+            .owner_ref(device)
+            .expect("owner")
+            .topology_generation();
+        let mut snapshot = ReadinessSnapshot::new(old_generation, topology_generation);
+        snapshot.report(IntentKey::Direct { source_generation }, Readiness::Ready);
+        let decision = backend.admission_conductors[&device]
+            .admission
+            .decide(&snapshot)
+            .expect("direct decision before interleave");
+
+        backend
+            .configure_subwindow(
+                None,
+                target,
+                HostSubwindowConfig {
+                    border_width: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("real layout mutation between decide and lock");
+        assert_eq!(c0_conv_cii_generation(backend, device), old_generation + 1);
+
+        let lock_result = backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("admission conductor")
+            .admission
+            .lock(decision, &snapshot);
+        assert!(matches!(
+            lock_result,
+            Err(crate::kms::owner::admission::AdmissionError::DecisionMismatch)
+        ));
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+    }
+
+    fn c0_conv_cii_try_candidate(
+        backend: &mut super::KmsBackend,
+        target_xid: u32,
+        source_xid: u32,
+        crtc_id: u32,
+        present_id: u64,
+    ) -> (
+        yserver_core::backend::PresentScanoutCandidate,
+        yserver_core::backend::CompletedPresentEvent,
+    ) {
+        use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+
+        let candidate =
+            c0_direct_eligibility_candidate(backend, crtc_id, target_xid, source_xid, 0);
+        let candidate = yserver_core::backend::PresentScanoutCandidate {
+            present_id,
+            ..candidate
+        };
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        for output_idx in 0..backend.platform.outputs.len() {
+            c0_conv_cii_prepare_owner_clock(
+                backend,
+                device,
+                output_idx,
+                yserver_core::backend::PresentClockSample {
+                    msc: 1_000 + present_id,
+                    ust: 1_000_000 + present_id,
+                    source: yserver_core::backend::PresentClockSource::IdleSequence,
+                },
+            );
+        }
+        let source_id = backend
+            .store
+            .lookup(source_xid)
+            .expect("direct source drawable");
+        let fb_handle = ::drm::control::from_u32::<::drm::control::framebuffer::Handle>(
+            u32::try_from(1000 + present_id).expect("test framebuffer handle"),
+        )
+        .expect("test framebuffer handle");
+        let gem_handle = ::drm::control::from_u32::<::drm::buffer::Handle>(
+            u32::try_from(2000 + present_id).expect("test GEM handle"),
+        )
+        .expect("test GEM handle");
+        let device = std::rc::Rc::new(crate::drm::Device::for_tests().expect("fake DRM device"));
+        let framebuffer = crate::drm::modeset::DirectScanoutProbeFramebuffer {
+            inner: crate::drm::modeset::ProbeFbOwnership::Legacy {
+                device,
+                fb: fb_handle,
+                gem: gem_handle,
+            },
+        };
+        backend
+            .scanout_m1
+            .entries
+            .insert(source_id, super::ScanoutM1ProbeEntry::accepted(framebuffer));
+        backend.scanout_m2.eligible_root_streak =
+            super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION.saturating_sub(1);
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: u32::try_from(present_id).expect("test Present serial"),
+            host_xid: source_xid,
+            dst_host_xid: target_xid,
+            options: 0,
+            present_id,
+            window_generation: 1,
+            crtc_id,
+            crtc_epoch: candidate.crtc_epoch,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        };
+        (candidate, event)
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_legacy_direct_unchanged_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        backend.admission_conductors.clear();
+        install_admission_legacy_gate(&mut backend, device);
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) = c0_conv_cii_try_candidate(&mut backend, 0xC501, 0xC502, 0xC503, 1);
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("legacy direct submit")
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(1)
+        );
+        assert!(
+            backend.device_owner_for_tests(0).live_record().is_none(),
+            "without a conductor the legacy direct submit must not create an owner record"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_owner_direct_offers_instead_of_flipping_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC511, 0xC512, 0xC513, 11);
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        assert!(
+            backend.device_owner_for_tests(0).live_record().is_some(),
+            "the owner route must dispatch the offered direct successor through the conductor"
+        );
+        assert_eq!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.direct()),
+            None,
+            "a confirmed offer is no longer queued in the admission decider"
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(11)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_displaced_successor_defers_its_skip_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (first_candidate, first_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC521, 0xC522, 0xC523, 21);
+        let (second_candidate, second_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC531, 0xC532, 0xC533, 31);
+        let (third_candidate, third_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC541, 0xC542, 0xC543, 41);
+        assert!(
+            backend
+                .try_present_direct(first_candidate, first_event)
+                .expect("first owner direct offer")
+        );
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first owner commit")
+            .commit_id();
+        assert!(
+            backend
+                .try_present_direct(second_candidate, second_event)
+                .expect("queued owner direct offer")
+        );
+        assert!(
+            backend
+                .try_present_direct(third_candidate, third_event)
+                .expect("latest owner direct offer")
+        );
+
+        assert!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.direct())
+                .is_some(),
+            "the owner decider retains the latest direct successor"
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .deferred_successor_skips
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![31]
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .idled
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![31]
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(41)
+        );
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, first_commit);
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_041, 1, 41);
+
+        let mut idled = backend.drain_retired_present_idle_events();
+        idled.extend(
+            backend
+                .scanout_m2
+                .completed
+                .iter()
+                .filter(|event| event.emit_idle)
+                .cloned(),
+        );
+        assert_eq!(
+            idled
+                .iter()
+                .filter(|event| event.present_id == 31)
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![31],
+            "the displaced successor must idle exactly once after predecessor retirement"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_retirement_promotion_order_vulkan() {
+        use crate::kms::render::admission::AdmissionTraceStep;
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (first_candidate, first_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC551, 0xC552, 0xC553, 51);
+        let (second_candidate, second_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC561, 0xC562, 0xC563, 61);
+        assert!(
+            backend
+                .try_present_direct(first_candidate, first_event)
+                .expect("first owner direct offer")
+        );
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first owner commit")
+            .commit_id();
+        assert!(
+            backend
+                .try_present_direct(second_candidate, second_event)
+                .expect("queued owner direct offer")
+        );
+
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, first_commit);
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_061, 1, 61);
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("retirement wake must promote the queued successor")
+            .commit_id();
+        assert_ne!(second_commit, first_commit);
+        assert_eq!(
+            backend.admission_trace_for_tests(device),
+            vec![
+                AdmissionTraceStep::Decided,
+                AdmissionTraceStep::Dispatched(first_commit),
+                AdmissionTraceStep::Consumed(first_commit),
+                AdmissionTraceStep::Enqueued {
+                    completions: vec![51],
+                    skips: Vec::new(),
+                },
+                AdmissionTraceStep::Decided,
+                AdmissionTraceStep::Dispatched(second_commit),
+            ]
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(61)
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .completed
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![51]
+        );
+    }
+
+    fn c0_conv_cii_make_present_storage_managed(
+        backend: &mut super::KmsBackend,
+        drawable: super::DrawableId,
+    ) {
+        use crate::kms::render::{resources::StorageBacking, target::PaintTarget};
+
+        let (extent, format) = {
+            let storage = &backend
+                .store
+                .get(drawable)
+                .expect("present drawable")
+                .storage;
+            (storage.extent(), storage.format())
+        };
+        let storage = super::Storage::for_tests_null(extent, format);
+        let target = PaintTarget::new(drawable, (0, 0), None, 24);
+        let lease = storage
+            .into_managed(
+                backend
+                    .resource_service
+                    .as_mut()
+                    .expect("live resource service"),
+                &backend.platform,
+                target,
+                (0, 0),
+            )
+            .map_err(|(error, _storage)| error)
+            .expect("test present storage adoption");
+        backend
+            .store
+            .get_mut(drawable)
+            .expect("present drawable")
+            .storage = super::Storage::from_backing(StorageBacking::Managed(lease));
+    }
+
+    fn c0_conv_cii_prepare_owner_clock(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        sample: yserver_core::backend::PresentClockSample,
+    ) {
+        let crtc_key = CrtcKey::for_output(&backend.platform.outputs[output_idx]);
+        c0_conv_cii_install_owner_clock(backend, device, output_idx, sample.msc);
+        backend.platform.record_completion_clock(crtc_key, sample);
+    }
+
+    fn c0_conv_cii_install_owner_clock(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        reference: u64,
+    ) {
+        let crtc_key = CrtcKey::for_output(&backend.platform.outputs[output_idx]);
+        let fallback_epoch = backend.clock_epoch_for_crtc_key(crtc_key);
+        let owner = backend.platform.owner_for(device).expect("direct owner");
+        let key = owner
+            .clock_key_for_hardware_crtc(u32::from(crtc_key.crtc))
+            .unwrap_or(crate::kms::owner::clock::ClockKey {
+                hardware_crtc: u32::from(crtc_key.crtc),
+                epoch: fallback_epoch,
+            });
+        let (lifecycle, topology_generation) = owner.clock_context();
+        if owner.clock(key).is_none() {
+            owner
+                .install_clock(key, lifecycle, topology_generation)
+                .expect("install direct owner clock");
+        }
+        owner
+            .clock_mut(key)
+            .expect("direct owner clock")
+            .install_reference(reference);
+    }
+
+    fn c0_conv_cii_presented_event(
+        commit: crate::kms::owner::identity::CommitId,
+        samples: &[(u32, yserver_core::backend::PresentClockSample)],
+    ) -> crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources> {
+        crate::kms::owner::device::OwnerEvent::Presented {
+            commit,
+            samples: samples
+                .iter()
+                .map(|(crtc, sample)| {
+                    (
+                        *crtc,
+                        crate::kms::owner::clock::ClockSample {
+                            msc: sample.msc,
+                            ust: sample.ust,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn c0_conv_cii_accept_direct_owner_commit(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+    ) {
+        let count = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .closure()
+            .expected_completion()
+            .len();
+        backend.record_host_call_events(vec![(
+            device,
+            crate::kms::owner::test_fixtures::accepted(
+                commit,
+                (1u32 << u32::try_from(count).expect("test fence count")) - 1,
+                count,
+            ),
+        )]);
+    }
+
+    fn c0_conv_cii_complete_direct_owner_hardware(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) {
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(
+            backend.route_owner_event_batch(device, completion, std::time::Instant::now()),
+            "owner completion batch must be consumed"
+        );
+    }
+
+    fn c0_conv_cii_page_flip_direct_owner(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        raw_sequence: u32,
+        tv_sec: u32,
+        usec: u32,
+    ) {
+        let (incarnation, event) = {
+            let owner = backend.platform.owner_ref(device).expect("direct owner");
+            let token = owner
+                .live_record()
+                .expect("direct owner record")
+                .event_token();
+            (
+                owner.incarnation(),
+                crate::drm::event_stream::DrmEventRecord::PageFlip {
+                    crtc_id: u32::from(backend.platform.outputs[output_idx].output.crtc),
+                    sequence: raw_sequence,
+                    tv_sec,
+                    tv_usec: usec,
+                    user_data: token.as_user_data(),
+                },
+            )
+        };
+        let events = backend
+            .platform
+            .owner_for(device)
+            .expect("direct owner")
+            .apply_drm_event(incarnation, event, std::time::Instant::now());
+        assert!(
+            backend.route_owner_event_batch(device, events, std::time::Instant::now()),
+            "owner page-flip batch must be consumed"
+        );
+    }
+
+    fn c0_conv_cii_expire_direct_owner_present(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) {
+        let deadline = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.completion_deadline())
+            .expect("Present completion deadline");
+        let events = backend
+            .platform
+            .owner_for(device)
+            .expect("direct owner")
+            .tick_completion(deadline + std::time::Duration::from_nanos(1));
+        assert!(
+            backend.route_owner_event_batch(device, events, std::time::Instant::now()),
+            "owner deadline batch must be consumed"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_description_carries_present_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc701, 0xc702, 0xc703, 701);
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 70,
+                ust: 7_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct dispatch")
+        );
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record");
+        assert_eq!(
+            record.closure().present_event(),
+            record.closure().kernel_event(),
+            "every kernel event CRTC must be a Present consumer"
+        );
+        assert!(!record.closure().kernel_event().is_empty());
+        assert!(
+            !record
+                .closure()
+                .present_event()
+                .contains(&u32::try_from(candidate.present_id).expect("test Present id")),
+            "the Present serial must not be carried as a CRTC consumer"
+        );
+        assert_eq!(
+            record.completion_context().clocks.len(),
+            record.closure().kernel_event().len()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_present_completes_once_vulkan() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        for hardware_complete_first in [false, true] {
+            let OwnerLiveFixture {
+                mut backend,
+                _registry,
+            } = owner_live_fixture_with_output_count(2, false)
+                .expect("environmental skip: no live Vulkan ICD available");
+            let device = backend.platform.primary_device().expect("device").key;
+            backend.scanout_m2.test_submit_direct_without_drm = true;
+            let (candidate, event) =
+                c0_conv_cii_try_candidate(&mut backend, 0xc711, 0xc712, 0xc713, 711);
+            let reference_crtc = u32::from(backend.platform.outputs[0].output.crtc);
+            let reference = PresentClockSample {
+                msc: 710,
+                ust: 71_000,
+                source: PresentClockSource::PageFlip,
+            };
+            let other = PresentClockSample {
+                msc: 970,
+                ust: 97_000,
+                source: PresentClockSource::PageFlip,
+            };
+            c0_conv_cii_prepare_owner_clock(&mut backend, device, 0, reference);
+            c0_conv_cii_prepare_owner_clock(&mut backend, device, 1, other);
+            assert!(
+                backend
+                    .try_present_direct(candidate, event)
+                    .expect("owner direct dispatch")
+            );
+            let commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("direct owner record")
+                .commit_id();
+            let foreign = crate::kms::owner::identity::CommitId::from_raw(0xdead);
+            let before_foreign = backend
+                .platform
+                .present_get_completion_clock(output_crtc_key(&backend, 0));
+            backend.route_owner_event_batch(
+                device,
+                vec![c0_conv_cii_presented_event(
+                    foreign,
+                    &[(
+                        reference_crtc,
+                        PresentClockSample {
+                            msc: 1_700,
+                            ust: 170_000,
+                            source: PresentClockSource::PageFlip,
+                        },
+                    )],
+                )],
+                std::time::Instant::now(),
+            );
+            assert_eq!(
+                backend
+                    .platform
+                    .present_get_completion_clock(output_crtc_key(&backend, 0)),
+                before_foreign,
+                "a foreign Presented must not move the reference clock"
+            );
+            assert!(backend.scanout_m2.completed.is_empty());
+
+            c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+            if hardware_complete_first {
+                c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+            }
+            c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 710, 0, 71_000);
+            c0_conv_cii_page_flip_direct_owner(&mut backend, device, 1, 970, 0, 97_000);
+            if !hardware_complete_first {
+                c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+            }
+            assert_eq!(
+                backend
+                    .scanout_m2
+                    .completed
+                    .iter()
+                    .filter(|event| event.present_id == 711)
+                    .count(),
+                1,
+                "the frame has one and only one publication"
+            );
+            let completed = backend
+                .scanout_m2
+                .completed
+                .iter()
+                .find(|event| event.present_id == 711)
+                .expect("direct completion");
+            assert_eq!(
+                completed.completion_mode,
+                yserver_protocol::x11::present::COMPLETE_MODE_FLIP
+            );
+            assert_eq!(completed.completion_clock, Some(reference));
+            assert!(backend.scanout_m2.idled.is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_unknown_terminal_skips_vulkan() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture_with_output_count(2, false)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let old = PresentClockSample {
+            msc: 801,
+            ust: 80_100,
+            source: PresentClockSource::IdleSequence,
+        };
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc721, 0xc722, 0xc723, 721);
+        backend
+            .platform
+            .completion_clocks
+            .remove(&output_crtc_key(&backend, 0));
+        c0_conv_cii_prepare_owner_clock(&mut backend, device, 0, old);
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            1,
+            PresentClockSample {
+                msc: 8_801,
+                ust: 880_100,
+                source: PresentClockSource::IdleSequence,
+            },
+        );
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct dispatch")
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_expire_direct_owner_present(&mut backend, device);
+        let completed = backend
+            .scanout_m2
+            .completed
+            .iter()
+            .find(|event| event.present_id == 721)
+            .expect("missing-Present terminalization");
+        assert_eq!(
+            completed.completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert_eq!(completed.completion_clock, Some(old));
+        assert!(backend.scanout_m2.idled.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_skip_without_history_is_unstamped_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc731, 0xc732, 0xc733, 731);
+        backend
+            .platform
+            .completion_clocks
+            .remove(&output_crtc_key(&backend, 0));
+        let reference = 731_u64;
+        c0_conv_cii_install_owner_clock(&mut backend, device, 0, reference);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct dispatch without a historical sample")
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_expire_direct_owner_present(&mut backend, device);
+        let completed = backend
+            .scanout_m2
+            .completed
+            .iter()
+            .find(|event| event.present_id == 731)
+            .expect("missing-Present terminalization");
+        assert_eq!(
+            completed.completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert_eq!(completed.completion_clock, None);
+        assert!(backend.scanout_m2.idled.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_stale_presented_does_not_move_the_clocks_vulkan() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let prior = PresentClockSample {
+            msc: 3_901,
+            ust: 390_100,
+            source: PresentClockSource::IdleSequence,
+        };
+        c0_conv_cii_prepare_owner_clock(&mut backend, device, 0, prior);
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc741, 0xc742, 0xc743, 741);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct dispatch")
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let stale = yserver_core::backend::PresentClockSample {
+            msc: 4_901,
+            ust: 490_100,
+            source: PresentClockSource::PageFlip,
+        };
+        backend.route_owner_event_batch(
+            device,
+            vec![c0_conv_cii_presented_event(
+                crate::kms::owner::identity::CommitId::from_raw(commit.get() + 1),
+                &[(crtc, stale)],
+            )],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            backend
+                .platform
+                .present_get_completion_clock(output_crtc_key(&backend, 0)),
+            prior
+        );
+    }
+
+    #[test]
+    fn c0_conv_cii_direct_members_come_from_the_producer() {
+        use crate::kms::render::resources::GroupMember;
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().expect("test device").key;
+        let (source_id, candidate, event) =
+            managed_prepare_ready_candidate(&mut backend, 0xc601, 0xc602, 40, 101);
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(source_id, candidate, event)
+                .expect("prepare direct candidate")
+        );
+
+        let expected = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| {
+                GroupMember::new(
+                    CrtcKey::for_output(output),
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .map_or(0, |owner| owner.topology_generation()),
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let prepared = backend
+            .managed_prepare_direct_dispatch()
+            .expect("prepare direct dispatch")
+            .expect("prepared direct dispatch");
+
+        assert_eq!(
+            prepared.resources.crtcs, expected,
+            "the direct resource envelope must carry the producer frame's members"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_carries_its_pins_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc611, 0xc612, 0xc613, 111);
+        let source_id = backend
+            .store
+            .lookup(candidate.src_host_xid)
+            .expect("source");
+        let fallback_id = backend
+            .store
+            .lookup(candidate.paint_dst_host_xid)
+            .expect("fallback");
+        c0_conv_cii_make_present_storage_managed(&mut backend, source_id);
+        c0_conv_cii_make_present_storage_managed(&mut backend, fallback_id);
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record");
+        let crate::kms::owner::ledger::LedgerState::Submitted(submitted) = record.ledger() else {
+            panic!("direct dispatch must retain a Submitted ledger");
+        };
+        let resources = &submitted.new_resources()[0];
+        assert!(
+            resources.source.is_some(),
+            "source pin lease was not carried"
+        );
+        assert!(
+            resources.fallback.is_some(),
+            "fallback-target pin lease was not carried"
+        );
+        let frame = backend
+            .scanout_m2
+            .pending
+            .as_ref()
+            .expect("confirmed direct frame");
+        assert!(backend.present_source_pins.contains_key(&frame.source_pin));
+        assert!(
+            backend
+                .present_source_pins
+                .contains_key(&frame.fallback_target_pin)
+        );
+        assert!(
+            backend.present_source_pin_lease(frame.source_pin).is_none(),
+            "the source lease must have moved into the ledger"
+        );
+        assert!(
+            backend
+                .present_source_pin_lease(frame.fallback_target_pin)
+                .is_none(),
+            "the fallback lease must have moved into the ledger"
+        );
+        assert_eq!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.direct()),
+            None
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_pins_released_only_by_the_ledger_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc621, 0xc622, 0xc623, 121);
+        let source_id = backend
+            .store
+            .lookup(candidate.src_host_xid)
+            .expect("source");
+        let fallback_id = backend
+            .store
+            .lookup(candidate.paint_dst_host_xid)
+            .expect("fallback");
+        c0_conv_cii_make_present_storage_managed(&mut backend, source_id);
+        c0_conv_cii_make_present_storage_managed(&mut backend, fallback_id);
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        let (source_pin, fallback_pin) = {
+            let frame = backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .expect("confirmed direct frame");
+            (frame.source_pin, frame.fallback_target_pin)
+        };
+        assert!(backend.present_source_pins.contains_key(&source_pin));
+        assert!(backend.present_source_pins.contains_key(&fallback_pin));
+        assert!(backend.present_source_pin_lease(source_pin).is_none());
+        assert!(backend.present_source_pin_lease(fallback_pin).is_none());
+
+        let ledger = format!(
+            "{:?}",
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("direct owner record")
+                .ledger()
+        );
+        assert!(
+            ledger.contains("has_source: true"),
+            "source left the ledger: {ledger}"
+        );
+        assert!(
+            ledger.contains("has_fallback: true"),
+            "fallback left the ledger: {ledger}"
+        );
+
+        // Route the owner milestones through the real event boundary. The
+        // retirement moves the frame to the consumer's current slot; it must
+        // not release either dispatched lease while that ledger resource is
+        // still current.
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_121, 1, 121_000);
+        assert!(backend.present_source_pins.contains_key(&source_pin));
+        assert!(backend.present_source_pins.contains_key(&fallback_pin));
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|resources| { resources.source.is_some() && resources.fallback.is_some() }),
+            "frame retirement must leave both leases owned by the ledger resource"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_entry_matches_legacy_invalidation_vulkan() {
+        fn damage_signature(backend: &super::KmsBackend) -> (u64, Vec<u64>, bool) {
+            backend
+                .scene
+                .scanout_damage_signature_for_tests(0)
+                .expect("live output damage")
+        }
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let before_owner = damage_signature(&backend);
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc801, 0xc802, 0xc803, 801);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        let after_owner = damage_signature(&backend);
+        assert_eq!(
+            after_owner, before_owner,
+            "Owner direct entry must not invalidate or stage composed damage"
+        );
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.admission_conductors.clear();
+        install_admission_legacy_gate(&mut backend, device);
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let before_legacy = damage_signature(&backend);
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc811, 0xc812, 0xc813, 811);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("legacy direct submit")
+        );
+        let after_legacy = damage_signature(&backend);
+        assert_eq!(
+            after_legacy, before_legacy,
+            "Legacy direct entry must not invalidate or stage composed damage"
+        );
+        assert_eq!(
+            after_owner, after_legacy,
+            "Owner and Legacy must have the same composed damage state at entry"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_milestones_leave_composed_damage_vulkan() {
+        fn damage_signature(backend: &super::KmsBackend) -> (u64, Vec<u64>, bool) {
+            backend
+                .scene
+                .scanout_damage_signature_for_tests(0)
+                .expect("live output damage")
+        }
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let before = damage_signature(&backend);
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc821, 0xc822, 0xc823, 821);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        assert_eq!(damage_signature(&backend), before, "direct entry");
+
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        assert_eq!(
+            damage_signature(&backend),
+            before,
+            "Accepted must not apply composed damage"
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+
+        assert!(backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            damage_signature(&backend),
+            before,
+            "HardwareComplete must not apply composed damage"
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_expire_direct_owner_present(&mut backend, device);
+        assert_eq!(
+            damage_signature(&backend),
+            before,
+            "CompletionUnknown must not apply composed damage"
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+    }
+
+    #[test]
+    fn c0_conv_cii_direct_never_carries_an_unchanged_cursor() {
+        use std::collections::BTreeSet;
+
+        use crate::kms::owner::admission::{
+            Admission, Admitted, DirectSuccessor, IntentKey, MaintenanceClass, MaintenanceKey,
+            Readiness, ReadinessSnapshot,
+        };
+
+        let cursor = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Cursor,
+        };
+        let mut admission = Admission::new();
+        admission.note_completed(cursor, 7);
+        admission
+            .set_maintenance(cursor, 7, false)
+            .expect("same cursor generation is an omission");
+        assert!(
+            admission.maintenance(cursor).is_none(),
+            "set_maintenance must omit a generation already current before decide can carry it"
+        );
+        admission
+            .set_direct_successor(DirectSuccessor {
+                source_generation: 1,
+                layout_generation: 0,
+                topology_generation: 0,
+                crtcs: BTreeSet::from([1]),
+            })
+            .expect("direct successor");
+
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.retirement_wake = true;
+        snapshot.report(
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+            Readiness::Ready,
+        );
+        snapshot.report(
+            IntentKey::Maintenance {
+                key: cursor,
+                generation: 7,
+            },
+            Readiness::Ready,
+        );
+        snapshot.report_compatible(
+            IntentKey::Maintenance {
+                key: cursor,
+                generation: 7,
+            },
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+        );
+        let decision = admission.decide(&snapshot).expect("direct decision");
+        assert!(matches!(decision.admitted, Admitted::Direct { .. }));
+        assert!(
+            decision.carried.is_empty(),
+            "a direct primary must omit an unchanged cursor generation"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_primary_flip_does_not_retire_a_newer_cursor_vulkan() {
+        use std::sync::Arc;
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let cursor = |version| crate::kms::render::scene::CursorEntry {
+            id: crate::kms::render::store::DrawableId::for_tests(0xc900 + version),
+            extent: ash::vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            hot_x: 0,
+            hot_y: 0,
+            record_version: version,
+            bgra_bytes: Some(Arc::new(vec![0, 0, 0, 255])),
+        };
+        backend.scene.register_cursor(cursor(41));
+        assert_eq!(
+            backend.scene.cursor_record_version_for_tests(),
+            Some(41),
+            "the old cursor generation is live before direct entry"
+        );
+
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc901, 0xc902, 0xc903, 901);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+
+        backend.scene.register_cursor(cursor(42));
+        assert_eq!(
+            backend.scene.cursor_record_version_for_tests(),
+            Some(42),
+            "the newer cursor generation must supersede the one at direct entry"
+        );
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        assert_eq!(backend.scene.cursor_record_version_for_tests(), Some(42));
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        assert_eq!(backend.scene.cursor_record_version_for_tests(), Some(42));
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_901, 1, 901_000);
+        assert_eq!(
+            backend.scene.cursor_record_version_for_tests(),
+            Some(42),
+            "the primary flip must not retire a newer cursor generation"
         );
     }
 
@@ -52484,6 +55134,7 @@ mod tests {
 
     fn admission_backend_with_stub_executor() -> super::KmsBackend {
         let mut backend = super::KmsBackend::for_tests();
+        seed_direct_owner_description_properties_for_tests(&mut backend);
         let executor = crate::kms::executor::test_support::spawn_stub_helper(
             crate::kms::executor::test_support::StubBehaviour::NeverReply,
         )
@@ -52498,6 +55149,16 @@ mod tests {
             device,
             incarnation,
         ));
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 900,
+                ust: 90_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
         backend
     }
 
@@ -52514,6 +55175,16 @@ mod tests {
             device,
             incarnation,
         ));
+        c0_conv_cii_prepare_owner_clock(
+            backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 900,
+                ust: 90_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
     }
 
     fn admission_stage_direct_predecessor(
@@ -52536,7 +55207,7 @@ mod tests {
             .managed_dispatch_direct_successor(commit)
             .expect("predecessor dispatch")
             .expect("predecessor resources");
-        assert!(backend.managed_confirm_direct_dispatch(u64::MAX));
+        assert!(backend.managed_confirm_direct_dispatch(u64::MAX, commit));
         (commit, resources)
     }
 
@@ -52548,6 +55219,23 @@ mod tests {
             commit,
             resources: crate::kms::owner::ledger::Submitted::new(Vec::new(), vec![resources])
                 .accepted(),
+        }
+    }
+
+    fn admission_presented_event(
+        backend: &super::KmsBackend,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources> {
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        crate::kms::owner::device::OwnerEvent::Presented {
+            commit,
+            samples: std::collections::BTreeMap::from([(
+                crtc,
+                crate::kms::owner::clock::ClockSample {
+                    msc: 900,
+                    ust: 90_000,
+                },
+            )]),
         }
     }
 
@@ -53940,7 +56628,7 @@ mod tests {
             .expect("spawn stub executor"),
         );
         install_admission_owner_gate(&mut backend, device);
-        let (source, _, _, describe_page_flip, _, _, _, _) =
+        let (source, _, _, _describe_page_flip, _, _, _, _) =
             AdmissionSourceFixture::new_with_controls();
         backend.install_admission_conductor_for_tests(device, source);
         let idled_before = backend.scanout_m2.idled.len();
@@ -53950,7 +56638,7 @@ mod tests {
                 .admission_offer_direct(device, source_id, candidate, event)
                 .expect("direct offer")
         );
-        describe_page_flip.set(true);
+        backend.platform.outputs[0].output.crtc_out_fence_ptr_prop = None;
 
         assert!(matches!(
             backend.admission_wake(device, false),
@@ -54255,7 +56943,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit_a, resources_a)],
+            vec![
+                admission_presented_event(&backend, commit_a),
+                admission_completion_retired_event(commit_a, resources_a),
+            ],
             std::time::Instant::now(),
         );
 
@@ -54337,6 +57028,7 @@ mod tests {
     #[test]
     fn c0_adm_conductor_retirement_wake_refusal_publishes_the_skip() {
         let mut backend = super::KmsBackend::for_tests();
+        seed_direct_owner_description_properties_for_tests(&mut backend);
         admission_install_executor(
             &mut backend,
             crate::kms::owner::test_fixtures::reaped_executor_for_tests(),
@@ -54356,7 +57048,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit_a, resources_a)],
+            vec![
+                admission_presented_event(&backend, commit_a),
+                admission_completion_retired_event(commit_a, resources_a),
+            ],
             std::time::Instant::now(),
         );
 
@@ -54387,7 +57082,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit_a, resources_a)],
+            vec![
+                admission_presented_event(&backend, commit_a),
+                admission_completion_retired_event(commit_a, resources_a),
+            ],
             std::time::Instant::now(),
         );
 
@@ -54513,7 +57211,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit_a, resources_a)],
+            vec![
+                admission_presented_event(&backend, commit_a),
+                admission_completion_retired_event(commit_a, resources_a),
+            ],
             std::time::Instant::now(),
         );
 
@@ -54773,6 +57474,7 @@ mod tests {
         backend.route_owner_event_batch(
             device,
             vec![
+                admission_presented_event(&backend, commit_a),
                 admission_completion_retired_event(commit_a, resources_a),
                 terminal,
             ],
@@ -55862,7 +58564,11 @@ mod tests {
             self.restored.borrow_mut().extend(resources);
         }
 
-        fn direct_eligible(&self, _source_generation: u64) -> bool {
+        fn direct_eligible(
+            &self,
+            _source_generation: u64,
+            _eligibility: crate::kms::render::backend::DirectEligibility,
+        ) -> bool {
             true
         }
     }
@@ -56044,6 +58750,150 @@ mod tests {
     }
 
     #[test]
+    fn c0_conv_cii_direct_registration_failure_aborts_the_token() {
+        use crate::kms::render::resources::{AllocationPayload, TransportState};
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("direct executor"),
+        );
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 913,
+                ust: 91_300,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
+        let first = backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .adopt(AllocationPayload::Spy(
+                crate::kms::render::resources::tests::SpyAllocation {
+                    drops: std::rc::Rc::new(std::cell::Cell::new(0)),
+                },
+            ))
+            .expect("first old allocation");
+        let old_key = first.key();
+        backend.commit_consumer.current_resources[0]
+            .allocations
+            .push(first);
+
+        // Let one dependency register and force the second registration to
+        // fail. This exercises the real direct admission wake after its token
+        // has been locked, rather than the managed seam in isolation.
+        let second = backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .adopt(AllocationPayload::Spy(
+                crate::kms::render::resources::tests::SpyAllocation {
+                    drops: std::rc::Rc::new(std::cell::Cell::new(0)),
+                },
+            ))
+            .expect("second old allocation");
+        let second_key = second.key();
+        backend.commit_consumer.current_resources[0]
+            .allocations
+            .push(second);
+        backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .freeze(second_key)
+            .expect("freeze the second old allocation");
+
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 913);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        let frame_before = {
+            let frame = backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .expect("queued direct frame");
+            (
+                frame.source_id,
+                frame.source_pin,
+                frame.fallback_target_pin,
+                frame.candidate.present_id,
+            )
+        };
+        let admission_before = format!("{:?}", backend.admission_conductors[&device].admission);
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::BeginRefused
+        ));
+        assert_eq!(
+            backend.platform.transport_gate(&device).unwrap().state(),
+            TransportState::Owner
+        );
+        assert!(backend.device_owner_for_tests(0).slot().is_idle());
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert_eq!(
+            format!("{:?}", backend.admission_conductors[&device].admission),
+            admission_before,
+            "registration failure must abort without changing the decider"
+        );
+        let frame_after = {
+            let frame = backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .expect("failed dispatch returns the frame to its producer");
+            (
+                frame.source_id,
+                frame.source_pin,
+                frame.fallback_target_pin,
+                frame.candidate.present_id,
+            )
+        };
+        assert_eq!(frame_after, frame_before);
+        assert_eq!(
+            backend
+                .scanout_m2
+                .queued_successor_role
+                .as_ref()
+                .expect("failed dispatch returns the successor role")
+                .role(),
+            crate::kms::render::resources::DirectRole::Successor
+        );
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(backend.commit_consumer.releasing_resources.len(), 0);
+        assert!(
+            !backend
+                .resource_service
+                .as_ref()
+                .expect("resource service")
+                .has_pending_obligations(&old_key)
+        );
+        assert_eq!(
+            backend
+                .resource_service
+                .as_ref()
+                .expect("resource service")
+                .kms_commit_for_tests(old_key),
+            Some(crate::kms::owner::identity::CommitId::from_raw(1)),
+            "the cancelled dependency keeps the record's own CommitId"
+        );
+    }
+
+    #[test]
     fn c0_conv_cir_dispatch_failure_policy_matrix() {
         use crate::kms::render::resources::{DirectRole, TransportState};
 
@@ -56211,7 +59061,7 @@ mod tests {
                 .expect("direct executor"),
             );
             install_admission_owner_gate(&mut backend, device);
-            let (source, _, _, describe_page_flip, _, _, _, _) =
+            let (source, _, _, _describe_page_flip, _, _, _, _) =
                 AdmissionSourceFixture::new_with_controls();
             backend.install_admission_conductor_for_tests(device, source);
             let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 911);
@@ -56220,7 +59070,7 @@ mod tests {
                     .admission_offer_direct(device, source_id, candidate, event)
                     .expect("direct offer")
             );
-            describe_page_flip.set(true);
+            backend.platform.outputs[0].output.crtc_out_fence_ptr_prop = None;
 
             assert!(matches!(
                 backend.admission_wake(device, false),
@@ -56434,6 +59284,16 @@ mod tests {
         backend.platform.devices[0].executor = Some(executor);
         backend.platform.devices[0].owner = Some(
             crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 901,
+                ust: 90_100,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
         );
         let member_a = task2_member(device, 1);
         let member_b = task2_member(device, 2);

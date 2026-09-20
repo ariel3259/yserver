@@ -978,6 +978,12 @@ pub(crate) struct SceneCompositor {
     /// states without a live Vulkan device.
     #[cfg(test)]
     test_flip_in_flight_override: Option<bool>,
+    /// Test-only override for the cursor-plane input used by direct-scanout
+    /// eligibility. Live scene fixtures start before a cursor transition has
+    /// retired, so this makes the baseline candidate pass the unrelated
+    /// cursor gate without bypassing the backend predicate under test.
+    #[cfg(test)]
+    test_cursor_mode_override: Option<CursorPlaneMode>,
 }
 
 pub(crate) struct ComposedOffer {
@@ -1417,6 +1423,8 @@ impl SceneCompositor {
             scene_structure_dirty: true,
             #[cfg(test)]
             test_flip_in_flight_override: None,
+            #[cfg(test)]
+            test_cursor_mode_override: None,
         })
     }
 
@@ -1537,6 +1545,8 @@ impl SceneCompositor {
             scene_structure_dirty: false,
             #[cfg(test)]
             test_flip_in_flight_override: None,
+            #[cfg(test)]
+            test_cursor_mode_override: None,
         }
     }
 
@@ -2527,6 +2537,38 @@ impl SceneCompositor {
             .map(|state| (state.damage.owes_repaint(), state.damage.has_staged_frame()))
     }
 
+    /// Test-only snapshot of the complete scanout-damage observables for one
+    /// output. The coarse `damage_state_for_tests` pair cannot distinguish a
+    /// fresh BO (full `missing`, empty `pending`) from an invalidation (full
+    /// `missing`, full `pending`), so conversion tests observe the actual
+    /// transaction state without mutating it.
+    #[cfg(test)]
+    pub(crate) fn scanout_damage_signature_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<(u64, Vec<u64>, bool)> {
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        Some((
+            state.damage.pending_area(),
+            (0..state.damage.bo_count())
+                .map(|bo_idx| state.damage.missing_area(bo_idx))
+                .collect(),
+            state.damage.has_staged_frame(),
+        ))
+    }
+
+    /// Test-only observation of the scene's currently registered cursor
+    /// generation. Direct primary retirement must not replace this value with
+    /// the generation that was current when the primary commit entered
+    /// flight.
+    #[cfg(test)]
+    pub(crate) fn cursor_record_version_for_tests(&self) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.cursor.as_ref())
+            .map(|cursor| cursor.record_version)
+    }
+
     #[cfg(test)]
     pub(crate) fn repaint_for_tests(
         &self,
@@ -2747,7 +2789,7 @@ impl SceneCompositor {
         client: yserver_protocol::x11::ClientId,
         value: u32,
         rects: &[ash::vk::Rect2D],
-    ) {
+    ) -> bool {
         let outcome = self.root_overlay.toggle(client, value, rects);
         if outcome.changed {
             let mut dmg = rects.to_vec();
@@ -2770,6 +2812,7 @@ impl SceneCompositor {
             self.mark_scene_structure_damage_rects(&dmg);
             self.wake_for_damage();
         }
+        outcome.changed
     }
 
     /// Clear the overlay (RandR/topology change) and damage the vacated rects.
@@ -2784,12 +2827,17 @@ impl SceneCompositor {
     }
 
     /// Drop a disconnecting client's overlay contribution.
-    pub(crate) fn root_overlay_on_disconnect(&mut self, client: yserver_protocol::x11::ClientId) {
+    pub(crate) fn root_overlay_on_disconnect(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+    ) -> bool {
         let vacated = self.root_overlay.all_rects();
-        if self.root_overlay.on_client_disconnect(client) {
+        let changed = self.root_overlay.on_client_disconnect(client);
+        if changed {
             self.mark_scene_structure_damage_rects(&vacated);
             self.wake_for_damage();
         }
+        changed
     }
 
     /// Earliest pending commit-retry deadline across outputs.
@@ -2871,6 +2919,13 @@ impl SceneCompositor {
         self.test_flip_in_flight_override = Some(value);
     }
 
+    /// Test-only: make the cursor-plane mode an explicit eligibility input
+    /// while retaining the production `cursor_mode` query at the predicate.
+    #[cfg(test)]
+    pub(crate) fn test_set_cursor_mode(&mut self, mode: CursorPlaneMode) {
+        self.test_cursor_mode_override = Some(mode);
+    }
+
     /// Stage 5 Phase D — cursor-plane mode aggregate query for the
     /// pointer fast path. Returns `Hw` ONLY when every active
     /// output has retired its Sw→Hw transition AND no PendingAck
@@ -2879,6 +2934,10 @@ impl SceneCompositor {
     /// mix) returns `Mixed`; the fast path falls back to scene
     /// wake until the plane is fully consistent.
     pub(crate) fn cursor_mode(&self) -> CursorPlaneMode {
+        #[cfg(test)]
+        if let Some(mode) = self.test_cursor_mode_override {
+            return mode;
+        }
         let Some(inner) = self.inner.as_ref() else {
             return CursorPlaneMode::Sw;
         };

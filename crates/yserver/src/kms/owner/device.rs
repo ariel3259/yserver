@@ -319,6 +319,16 @@ impl<R> DeviceCommitOwner<R> {
         self.clocks.get(&key)
     }
 
+    /// Return the currently installed epoch for one hardware CRTC. The
+    /// render side uses this when a stable KMS CRTC is represented by several
+    /// successive RANDR resource ids.
+    pub(crate) fn clock_key_for_hardware_crtc(&self, hardware_crtc: u32) -> Option<ClockKey> {
+        self.clocks
+            .keys()
+            .find(|key| key.hardware_crtc == hardware_crtc)
+            .copied()
+    }
+
     #[doc(hidden)]
     pub fn clock_mut(&mut self, key: ClockKey) -> Option<&mut CrtcClock> {
         self.clocks.get_mut(&key)
@@ -1458,8 +1468,15 @@ impl<R> DeviceCommitOwner<R> {
         Ok((commit, Vec::new()))
     }
 
+    /// Begin a commit with an explicit completion context and a fallible,
+    /// CommitId-aware resource ledger.
+    ///
+    /// Unlike [`Self::begin_with_fallible_ledger`], this entry accepts a
+    /// Present-carrying description. All request construction, closure,
+    /// completion-context, slot, and ledger ordering remains in the shared
+    /// begin body above.
     #[allow(clippy::type_complexity)]
-    fn begin_with_context_and_fallible_ledger<F, E>(
+    pub fn begin_with_context_and_fallible_ledger<F, E>(
         &mut self,
         desc: &CommitDescription,
         ledger: F,
@@ -2132,6 +2149,14 @@ impl<R> DeviceCommitOwner<R> {
         };
         record.mark_accepted();
         record.mark_hardware_complete();
+        let deadline = Instant::now();
+        record.completion_state_mut().present_deadlines = record
+            .closure()
+            .present_event()
+            .iter()
+            .copied()
+            .map(|crtc| (crtc, deadline))
+            .collect();
         self.try_complete()
     }
     #[doc(hidden)]
@@ -2915,6 +2940,141 @@ mod tests {
         let mut present_consumers = single_active_crtc();
         present_consumers.present_consumers.push(1234);
         assert_refused(present_consumers);
+    }
+
+    #[test]
+    fn c0_conv_cii_present_entry_registers_and_refuses() {
+        use std::{cell::Cell, rc::Rc};
+
+        let key = ClockKey {
+            hardware_crtc: 1,
+            epoch: ClockEpochId::first(),
+        };
+
+        // A structurally valid Present description is accepted by the new
+        // context-carrying entry, and the record retains the kernel closure
+        // that supplies its completion event.
+        {
+            let mut owner = owner_for_tests();
+            owner
+                .install_clock(key, LifecycleEpochId::first(), 1)
+                .expect("install test clock");
+            owner
+                .clock_mut(key)
+                .expect("test clock")
+                .install_reference(7);
+            let context = fast_context_for_crtcs(&[(1, key)]);
+            let seen_commit = Rc::new(Cell::new(None));
+            let seen_by_ledger = Rc::clone(&seen_commit);
+            let (commit, _) = owner
+                .begin_with_context_and_fallible_ledger(
+                    &single_active_crtc_with_present(1),
+                    move |allocated| {
+                        seen_by_ledger.set(Some(allocated));
+                        Ok::<_, ()>(ledger())
+                    },
+                    context,
+                )
+                .expect("Present entry should begin");
+            assert_eq!(seen_commit.get(), Some(commit));
+            assert_eq!(
+                owner
+                    .live_record()
+                    .expect("Present record")
+                    .closure()
+                    .expected_completion(),
+                &[1]
+            );
+        }
+
+        // A valid description with an independently invalid context is
+        // refused before the fallible ledger closure can run.
+        {
+            let mut owner = owner_for_tests();
+            let called = Cell::new(false);
+            let result = owner.begin_with_context_and_fallible_ledger(
+                &single_active_crtc_with_present(1),
+                |_commit| {
+                    called.set(true);
+                    Ok::<_, ()>(ledger())
+                },
+                fast_context_for_crtcs(&[]),
+            );
+            assert!(matches!(
+                result,
+                Err(FallibleBeginError::Refused {
+                    error: DispatchError::InvalidCompletionContext,
+                    ..
+                })
+            ));
+            assert!(!called.get());
+            assert!(owner.slot().is_idle());
+            assert!(owner.live_record().is_none());
+        }
+
+        // The old entry still refuses a Present description before invoking
+        // its infallible builder or touching owner state.
+        {
+            let mut owner = owner_for_tests();
+            let called = Cell::new(false);
+            let result = owner.begin_with_ledger(&single_active_crtc_with_present(1), |_commit| {
+                called.set(true);
+                ledger()
+            });
+            assert!(matches!(
+                result,
+                Err((DispatchError::InvalidCompletionContext, _))
+            ));
+            assert!(!called.get());
+            assert!(owner.slot().is_idle());
+            assert!(owner.live_record().is_none());
+        }
+    }
+
+    #[test]
+    fn c0_conv_cii_present_entry_failed_ledger_leaves_nothing() {
+        #[derive(Debug, PartialEq)]
+        struct LedgerError {
+            resources: Vec<TestResource>,
+        }
+
+        let key = ClockKey {
+            hardware_crtc: 1,
+            epoch: ClockEpochId::first(),
+        };
+        let mut owner = owner_for_tests();
+        owner
+            .install_clock(key, LifecycleEpochId::first(), 1)
+            .expect("install test clock");
+        owner
+            .clock_mut(key)
+            .expect("test clock")
+            .install_reference(7);
+        let error = owner
+            .begin_with_context_and_fallible_ledger(
+                &single_active_crtc_with_present(1),
+                |_commit| {
+                    Err(LedgerError {
+                        resources: vec![TestResource::NewFramebuffer(99)],
+                    })
+                },
+                fast_context_for_crtcs(&[(1, key)]),
+            )
+            .expect_err("the ledger closure must fail this Present begin");
+
+        match error {
+            FallibleBeginError::Ledger(LedgerError { resources }) => {
+                assert_eq!(resources, vec![TestResource::NewFramebuffer(99)]);
+            }
+            FallibleBeginError::Refused { error, .. } => {
+                panic!("the Present request was refused before the ledger closure: {error:?}")
+            }
+            FallibleBeginError::Cleanup { .. } => {
+                panic!("the owner failed to release its just-made reservation")
+            }
+        }
+        assert!(owner.slot().is_idle());
+        assert!(owner.live_record().is_none());
     }
 
     #[test]

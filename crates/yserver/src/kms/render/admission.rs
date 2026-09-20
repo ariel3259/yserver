@@ -24,7 +24,9 @@ use crate::{
             record::{FailureCause, RefusalCause, TerminalState},
         },
         render::{
-            backend::{KmsBackend, PreparedDirectDispatch, effective_refresh_matches},
+            backend::{
+                DirectEligibility, KmsBackend, PreparedDirectDispatch, effective_refresh_matches,
+            },
             platform::CrtcKey,
             resources::{
                 CommitResources, GroupMember, ResourceError, register_commit_dependencies,
@@ -255,9 +257,9 @@ pub(crate) trait AdmissionSource {
     /// Return resources to the composed intent when owner admission cannot
     /// construct a ledger. The source owns the returned intent-side storage.
     fn restore_composed_resources(&mut self, resources: Vec<CommitResources>);
-    /// Whether the queued direct successor passes current direct eligibility.
-    /// 2c-iii replaces this with the real predicate.
-    fn direct_eligible(&self, source_generation: u64) -> bool;
+    /// Whether the queued direct successor passes the production eligibility
+    /// result supplied by the backend.
+    fn direct_eligible(&self, source_generation: u64, eligibility: DirectEligibility) -> bool;
 }
 
 #[allow(dead_code)]
@@ -784,6 +786,24 @@ impl KmsBackend {
         self.admission_wake(device, false)
     }
 
+    /// Advance every live device's layout generation after a backend scene
+    /// mutation. Layout changes are backend-global, while admission state is
+    /// intentionally per DRM device; collect the keys first so a wake can
+    /// mutate the conductors without holding a map borrow.
+    pub(crate) fn admission_note_layout_change_all_devices(&mut self, reason: &'static str) {
+        let devices: Vec<_> = self.admission_conductors.keys().copied().collect();
+        for device in devices {
+            if matches!(
+                self.admission_note_layout_change(device),
+                AdmissionOutcome::TransportClosed
+            ) {
+                log::error!(
+                    "admission layout generation overflow or queued successor mismatch for {device:?}: {reason}"
+                );
+            }
+        }
+    }
+
     /// Build the readiness input consumed by A1. This is mutable because an
     /// ineligible direct successor is invalidated at the first snapshot that
     /// observes the lost eligibility.
@@ -852,6 +872,13 @@ impl KmsBackend {
         } else {
             BTreeSet::new()
         };
+        let direct_eligibility = self
+            .admission_conductors
+            .get(&device)
+            .and_then(|conductor| conductor.admission.direct())
+            .map(|direct| {
+                self.direct_successor_eligibility(device, direct.successor.source_generation)
+            });
         let mut invalidate = None;
         let snapshot = {
             let conductor = self
@@ -897,7 +924,9 @@ impl KmsBackend {
                 let key = IntentKey::Direct {
                     source_generation: generation,
                 };
-                let eligible = conductor.source.direct_eligible(generation);
+                let eligibility = direct_eligibility
+                    .unwrap_or_else(|| DirectEligibility::refused(conductor.layout_generation));
+                let eligible = conductor.source.direct_eligible(generation, eligibility);
                 let readiness = if !eligible {
                     invalidate = Some(generation);
                     Readiness::Waiting(WaitReason::NotDirectEligible)
@@ -1410,7 +1439,11 @@ impl KmsBackend {
 
         let prepared = match self.managed_prepare_direct_dispatch() {
             Ok(Some(prepared)) => prepared,
-            Ok(None) | Err(_) => {
+            Ok(None) => {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::PreparationRefused;
+            }
+            Err(_error) => {
                 self.admission_abort(device, token);
                 return AdmissionOutcome::PreparationRefused;
             }
@@ -1421,55 +1454,86 @@ impl KmsBackend {
         } = prepared;
         let mut resources = Some(prepared_resources);
         let mut retirement = retirement;
-        let desc = self
-            .admission_conductors
-            .get_mut(&device)
-            .expect("active admission conductor")
-            .source
-            .describe(&decision);
+        let (desc, context) =
+            match crate::kms::render::direct_owner::description(self, device, &decision) {
+                Ok(description) => description,
+                Err(error) => {
+                    log::warn!("direct owner description refused: {error}");
+                    return self.admission_handle_dispatch_failure(
+                        device,
+                        token,
+                        DispatchFailureRoute::Direct {
+                            retirement: retirement.take(),
+                        },
+                        DispatchFailureResources::Refused {
+                            new: resources.take().into_iter().collect(),
+                        },
+                    );
+                }
+            };
 
-        let direct_crtcs = match decision_primary(&decision) {
-            Some(Admitted::Direct { successor }) => Some(successor.crtcs.clone()),
-            _ => None,
-        };
         let result = {
             let consumer = &mut self.commit_consumer;
             let Some(service) = self.resource_service.as_mut() else {
-                self.admission_abort(device, token);
-                return AdmissionOutcome::BeginRefused;
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Refused {
+                        new: resources.take().into_iter().collect(),
+                    },
+                );
             };
-            let device_entry = self
+            let Some(device_entry) = self
                 .platform
                 .devices
                 .iter_mut()
                 .find(|entry| entry.key == device)
-                .expect("admission device");
-            let owner = device_entry.owner.as_mut().expect("admission owner");
-            owner.begin_with_fallible_ledger(&desc, |commit| {
-                let mut new_resource = resources
-                    .take()
-                    .ok_or_else(|| (ResourceError::InvalidState, Vec::new(), Vec::new()))?;
-                if new_resource.crtcs.is_empty()
-                    && let Some(direct_crtcs) = direct_crtcs.as_ref()
-                {
-                    new_resource.crtcs = consumer
-                        .current_resources
+            else {
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Refused {
+                        new: resources.take().into_iter().collect(),
+                    },
+                );
+            };
+            let Some(owner) = device_entry.owner.as_mut() else {
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Refused {
+                        new: resources.take().into_iter().collect(),
+                    },
+                );
+            };
+            owner.begin_with_context_and_fallible_ledger(
+                &desc,
+                |commit| {
+                    let new_resource = resources
+                        .take()
+                        .ok_or_else(|| (ResourceError::InvalidState, Vec::new(), Vec::new()))?;
+                    let new = vec![new_resource.with_commit_id(commit)];
+                    let members = new
                         .iter()
                         .flat_map(|resources| resources.crtcs.iter().copied())
-                        .filter(|member| direct_crtcs.contains(&u32::from(member.crtc.crtc)))
-                        .collect();
-                }
-                let new = vec![new_resource.with_commit_id(commit)];
-                let members = new
-                    .iter()
-                    .flat_map(|resources| resources.crtcs.iter().copied())
-                    .collect::<Vec<GroupMember>>();
-                let old = match consumer.take_current_for_members(&members) {
-                    Ok(old) => old,
-                    Err(error) => return Err((error, Vec::new(), new)),
-                };
-                register_commit_dependencies(commit, old, new, service)
-            })
+                        .collect::<Vec<GroupMember>>();
+                    let old = match consumer.take_current_for_members(&members) {
+                        Ok(old) => old,
+                        Err(error) => return Err((error, Vec::new(), new)),
+                    };
+                    register_commit_dependencies(commit, old, new, service)
+                },
+                context,
+            )
         };
 
         let commit = match result {
@@ -1607,7 +1671,7 @@ impl KmsBackend {
                 }
             }
             Some(Admitted::Direct { successor }) => {
-                if !self.managed_confirm_direct_dispatch(successor.source_generation) {
+                if !self.managed_confirm_direct_dispatch(successor.source_generation, commit) {
                     if let Some(gate) = self.platform.transport_gate_mut(&device) {
                         gate.force_close();
                     }

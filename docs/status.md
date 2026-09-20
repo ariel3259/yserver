@@ -33,6 +33,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-20 Phase C.0 stage 2c-iii, plan Cii accepted (fixture level):** the
+  direct scanout producer now has an `Owner` half behind the same transport fork
+  as the composed one. One production eligibility predicate answers both routes,
+  fifteen enumerated sites advance the layout generation that invalidates a
+  queued successor, the owner half lives in its own `direct_owner` module behind
+  a single fork point, the producer supplies the commit's members and its
+  present-pin leases by value (F13b-D1 closed), and the commit carries its
+  Present as CRTC ids with the frame as the single completion authority.
+  `Legacy`, which production still uses, is unchanged. Tasks `f9e38620`..
+  `65bd21b4`; S1–S31 caught; hardware gate 306/306. Three F8 stops amended the
+  plan rather than the code, one of them a **spec correction**: DMG-5's claim
+  that direct *entry* invalidates composed buffers does not describe the merged
+  base, which invalidates on the *return*; that path goes to Ciii. Details in the
+  [acceptance finding](superpowers/findings/2026-09-20-stage-2c-iii-plan-cii-accepted.md).
 - **2026-09-19 Phase C.0 stage 2c-iii, plan Ci-refactor accepted:** the owner
   route's duplicated state is gone. One `OwnerBuffer` per owner-held scanout
   buffer replaces the scene's four queues and the eight `BoPhase::Owner*`

@@ -5250,6 +5250,17 @@ impl PlatformBackend {
             })
     }
 
+    /// Latest completion-eligible clock for one CRTC, if this epoch has
+    /// actually produced a validated sample. Unlike
+    /// [`Self::present_get_completion_clock`], this never manufactures the
+    /// `(0, 0)` sentinel used by the legacy core accessor.
+    pub(crate) fn present_get_completion_clock_if_known(
+        &self,
+        crtc_key: CrtcKey,
+    ) -> Option<PresentClockSample> {
+        self.completion_clocks.get(&crtc_key).copied()
+    }
+
     /// Record a general vblank sample without allowing late events to move
     /// this CRTC domain's Present clock backwards.
     pub(crate) fn record_vblank_clock(&mut self, crtc_key: CrtcKey, msc: u64, ust: u64) {

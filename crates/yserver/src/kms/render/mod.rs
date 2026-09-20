@@ -14,6 +14,7 @@ pub(crate) mod composed_commit;
 pub(crate) mod composite_pool_ring;
 pub(crate) mod cursor;
 pub(crate) mod descriptor_pool_ring;
+pub(crate) mod direct_owner;
 pub(crate) mod engine;
 pub(crate) mod frame_builder;
 pub(crate) mod glyph_atlas;
