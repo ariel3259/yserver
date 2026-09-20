@@ -2757,7 +2757,7 @@ impl SceneCompositor {
         client: yserver_protocol::x11::ClientId,
         value: u32,
         rects: &[ash::vk::Rect2D],
-    ) {
+    ) -> bool {
         let outcome = self.root_overlay.toggle(client, value, rects);
         if outcome.changed {
             let mut dmg = rects.to_vec();
@@ -2780,6 +2780,7 @@ impl SceneCompositor {
             self.mark_scene_structure_damage_rects(&dmg);
             self.wake_for_damage();
         }
+        outcome.changed
     }
 
     /// Clear the overlay (RandR/topology change) and damage the vacated rects.
@@ -2794,12 +2795,17 @@ impl SceneCompositor {
     }
 
     /// Drop a disconnecting client's overlay contribution.
-    pub(crate) fn root_overlay_on_disconnect(&mut self, client: yserver_protocol::x11::ClientId) {
+    pub(crate) fn root_overlay_on_disconnect(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+    ) -> bool {
         let vacated = self.root_overlay.all_rects();
-        if self.root_overlay.on_client_disconnect(client) {
+        let changed = self.root_overlay.on_client_disconnect(client);
+        if changed {
             self.mark_scene_structure_damage_rects(&vacated);
             self.wake_for_damage();
         }
+        changed
     }
 
     /// Earliest pending commit-retry deadline across outputs.

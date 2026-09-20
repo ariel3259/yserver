@@ -2357,6 +2357,7 @@ impl KmsBackend {
         if let Some(id) = self.cow_id.take() {
             self.store_decref_with_invalidate(id);
         }
+        self.admission_note_layout_change_all_devices("composite overlay window released");
     }
 
     fn finish_deferred_cow_release(&mut self) {
@@ -3426,6 +3427,7 @@ impl KmsBackend {
         self.scene
             .invalidate_all_owner_damage_transactions(&mut self.platform);
         self.crtc_config_topology_epoch = self.crtc_config_topology_epoch.wrapping_add(1);
+        self.admission_note_layout_change_all_devices("CRTC/topology epoch changed");
 
         let mut tokens: Vec<_> = self.pending_crtc_config_probes.keys().copied().collect();
         tokens.sort_unstable_by_key(|token| token.0);
@@ -15514,7 +15516,9 @@ impl KmsBackend {
         if vk_rects.is_empty() {
             return;
         }
-        self.scene.root_overlay_toggle(client, value, &vk_rects);
+        if self.scene.root_overlay_toggle(client, value, &vk_rects) {
+            self.admission_note_layout_change_all_devices("root overlay changed");
+        }
     }
 
     fn emit_stroke_output(
@@ -16602,6 +16606,7 @@ impl KmsBackend {
                 );
             }
         }
+        self.admission_note_layout_change_all_devices("window storage allocation");
     }
 
     // ── Stage 3a: Core-text helpers ─────────────────────────────
@@ -20807,7 +20812,11 @@ impl Backend for KmsBackend {
             }
             order.push(host);
         }
+        let order_changed = self.core.top_level_order != order;
         self.core.top_level_order = order;
+        if order_changed {
+            self.admission_note_layout_change_all_devices("top-level topology projection changed");
+        }
         self.scene.wake_for_damage();
     }
 
@@ -23115,15 +23124,21 @@ impl Backend for KmsBackend {
         if self.direct_frame_references_host_drawable(host_xid) {
             self.request_direct_unflip("destroy_direct_frame_drawable");
         }
-        if let Some(id) = self.store.lookup(host_xid) {
+        let had_storage = if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
-        }
-        self.windows.remove(&host_xid);
+            true
+        } else {
+            false
+        };
+        let had_window = self.windows.remove(&host_xid).is_some();
         // Step 2 (DRIFT 2): top_level_order is no longer mutated here — it
         // is a projection of core children, reprojected by the destroy
         // core handler via `sync_top_level_order` after the resource child
         // is removed. (Scene already skips xids absent from windows, so
         // a transient stale entry between teardown and sync is harmless.)
+        if had_storage || had_window {
+            self.admission_note_layout_change_all_devices("window destroyed");
+        }
         self.scene.wake_for_damage();
         Ok(())
     }
@@ -23132,9 +23147,15 @@ impl Backend for KmsBackend {
         if self.direct_frame_references_host_drawable(host_xid) {
             self.request_direct_unflip("map_direct_frame_drawable");
         }
+        let geometry_changed = self.windows.get(&host_xid).is_some_and(|geom| !geom.mapped);
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
         }
+        let storage_changed = self
+            .store
+            .lookup(host_xid)
+            .and_then(|id| self.store.get(id))
+            .is_some_and(|drawable| !drawable.scene_participating);
         if let Some(id) = self.store.lookup(host_xid) {
             self.store.set_scene_participating(id, true);
         }
@@ -23166,6 +23187,9 @@ impl Backend for KmsBackend {
                 }
             }
         }
+        if geometry_changed || storage_changed {
+            self.admission_note_layout_change_all_devices("window mapped");
+        }
         self.scene.wake_for_damage();
         Ok(())
     }
@@ -23174,11 +23198,20 @@ impl Backend for KmsBackend {
         if self.direct_frame_references_host_drawable(host_xid) {
             self.request_direct_unflip("unmap_direct_frame_drawable");
         }
+        let geometry_changed = self.windows.get(&host_xid).is_some_and(|geom| geom.mapped);
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
         }
+        let storage_changed = self
+            .store
+            .lookup(host_xid)
+            .and_then(|id| self.store.get(id))
+            .is_some_and(|drawable| drawable.scene_participating);
         if let Some(id) = self.store.lookup(host_xid) {
             self.store.set_scene_participating(id, false);
+        }
+        if geometry_changed || storage_changed {
+            self.admission_note_layout_change_all_devices("window unmapped");
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -23203,11 +23236,14 @@ impl Backend for KmsBackend {
             // before register). v1 tolerates this.
             return Ok(());
         };
+        let mut layout_changed = false;
         let mut size_changed = false;
         if let Some(x) = config.x {
+            layout_changed |= x != geom.x;
             geom.x = x;
         }
         if let Some(y) = config.y {
+            layout_changed |= y != geom.y;
             geom.y = y;
         }
         if let Some(w) = config.width
@@ -23215,12 +23251,14 @@ impl Backend for KmsBackend {
         {
             geom.width = w;
             size_changed = true;
+            layout_changed = true;
         }
         if let Some(h) = config.height
             && h != geom.height
         {
             geom.height = h;
             size_changed = true;
+            layout_changed = true;
         }
         // #133 step 2 (P3): mirror `border_width` from the configure.
         // Deliberately NOT folded into `size_changed`: the two need
@@ -23230,6 +23268,7 @@ impl Backend for KmsBackend {
         if let Some(bw) = config.border_width {
             border_width_changed = bw != geom.border_width;
             geom.border_width = bw;
+            layout_changed |= border_width_changed;
         }
         // #133 step 6 (P8) — a `border_width` change is checked FIRST
         // and takes the whole configure with it, including a combined
@@ -23307,7 +23346,11 @@ impl Backend for KmsBackend {
                 .is_some_and(|g| g.parent.is_some());
             if is_subwindow {
                 self.restack_subwindow(host_xid, stack_mode, config.sibling);
+                layout_changed = true;
             }
+        }
+        if layout_changed {
+            self.admission_note_layout_change_all_devices("window configure/layout change");
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -23364,7 +23407,7 @@ impl Backend for KmsBackend {
             );
         };
         let new_rank = self.alloc_window_stack_rank();
-        if let Some(geom) = self.windows.get_mut(&host_xid) {
+        let layout_changed = if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.x = x;
             geom.y = y;
             // The parent update is load-bearing — `build_scene` recurses by
@@ -23373,11 +23416,17 @@ impl Backend for KmsBackend {
             // and once via the recurse).
             geom.parent = parent;
             geom.stack_rank = new_rank;
-        }
+            true
+        } else {
+            false
+        };
         // Step 2 (DRIFT 2): top_level_order is no longer reconciled here —
         // it projects core children, reprojected by the reparent core
         // handler via `sync_top_level_order` after the core tree moves the
         // window (across the root boundary).
+        if layout_changed {
+            self.admission_note_layout_change_all_devices("window reparented");
+        }
         self.scene.wake_for_damage();
         Ok(())
     }
@@ -23572,7 +23621,9 @@ impl Backend for KmsBackend {
     }
 
     fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
-        self.scene.root_overlay_on_disconnect(client_id);
+        if self.scene.root_overlay_on_disconnect(client_id) {
+            self.admission_note_layout_change_all_devices("client root overlay removed");
+        }
     }
 
     fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
@@ -23624,6 +23675,10 @@ impl Backend for KmsBackend {
         // path) so either reading is fine, and pre-flip keeps the
         // two branches symmetric.
         let pre_flip_rect = self.window_absolute_rect(w_id);
+        let participation_changed = self
+            .store
+            .get(w_id)
+            .is_some_and(|drawable| drawable.scene_participating != participating);
 
         self.store.set_scene_participating(w_id, participating);
 
@@ -23633,6 +23688,9 @@ impl Backend for KmsBackend {
             // No tracked geometry (root or untracked) — coarse
             // marker is correctness-preserving.
             self.scene.mark_scene_structure_dirty();
+        }
+        if participation_changed {
+            self.admission_note_layout_change_all_devices("window scene participation changed");
         }
         Ok(())
     }
@@ -23731,6 +23789,7 @@ impl Backend for KmsBackend {
             return Ok(existing);
         }
         let w_xid = host_window.as_raw();
+        let mut route_changed = false;
 
         // Allocate a fresh backing via the existing
         // `create_pixmap` path (3f.10 pool + 3f.14 zero-fill).
@@ -23771,6 +23830,7 @@ impl Backend for KmsBackend {
             // record stays uninstalled (protocol error upstream).
             if let Some(w_id) = self.store.lookup(w_xid) {
                 self.store.set_redirected_target(w_id, Some(b_id));
+                route_changed = true;
                 // The route flip changes what the walk samples for W (the
                 // backing's view, extent and UV denominator). The content is
                 // the same, but the tick only walks when told something
@@ -23811,6 +23871,9 @@ impl Backend for KmsBackend {
             },
         );
         self.core.host_window_to_backing.insert(w_xid, backing);
+        if route_changed {
+            self.admission_note_layout_change_all_devices("redirect route installed");
+        }
         // Step 2c — the window now samples the backing instead of its own
         // storage, which the scene diff reads as a signature change. Same
         // reasoning as the release path: schedule a tick so that damage is not
@@ -23950,6 +24013,7 @@ impl Backend for KmsBackend {
                         == Some(b_id)
                 })
                 .collect();
+            let route_changed = !routed_windows.is_empty();
             for w_xid in routed_windows {
                 if let Some(w_id) = self.store.lookup(w_xid) {
                     self.store.set_redirected_target(w_id, None);
@@ -23968,6 +24032,9 @@ impl Backend for KmsBackend {
             // store's `set_scene_participating` short-circuits
             // the damage-clear branch when `was == v`).
             self.store.set_scene_participating(b_id, false);
+            if route_changed {
+                self.admission_note_layout_change_all_devices("redirect route removed");
+            }
         }
         if self.core.alias_registry.decref(backing) {
             self.free_pixmap(origin, raw)?;
@@ -24113,6 +24180,7 @@ impl Backend for KmsBackend {
         // children via `sync_top_level_order` AFTER materialize_cow_resource
         // (which inserts the COW as a root child capped on top).
         self.scene.mark_scene_structure_dirty();
+        self.admission_note_layout_change_all_devices("composite overlay window materialized");
         Ok(true)
     }
 
@@ -50923,6 +50991,463 @@ mod tests {
             .eligible
         );
         assert!(!legacy_answers[2], "the stale CRTC must stay ineligible");
+    }
+
+    fn c0_conv_cii_generation(backend: &super::KmsBackend, device: DrmDeviceKey) -> u64 {
+        backend.admission_conductors[&device].layout_generation
+    }
+
+    fn c0_conv_cii_assert_generation_bumped(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        site: &str,
+        mutation: impl FnOnce(&mut super::KmsBackend),
+    ) {
+        let before = c0_conv_cii_generation(backend, device);
+        mutation(backend);
+        let after = c0_conv_cii_generation(backend, device);
+        assert_eq!(
+            after,
+            before + 1,
+            "{site} must advance the admission layout generation exactly once"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_layout_hooks_bump_the_generation_vulkan() {
+        use yserver_core::{
+            backend::{Backend, WindowHandle},
+            host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+        };
+        use yserver_protocol::x11::ResourceId;
+
+        let mut fixture = owner_live_fixture()
+            .expect("environmental skip: no live Vulkan ICD/DRM fixture available");
+        let backend = &mut fixture.backend;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let root = WindowHandle::from_raw(backend.window_id()).expect("root handle");
+
+        c0_conv_cii_assert_generation_bumped(backend, device, "register_top_level", |backend| {
+            backend
+                .register_top_level(None, ResourceId(0x00c0_0101), 0xc001_0101)
+                .expect("register_top_level");
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "register_subwindow", |backend| {
+            backend
+                .register_subwindow(None, ResourceId(0x00c0_0102), 0xc001_0102)
+                .expect("register_subwindow");
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "create_subwindow", |backend| {
+            backend
+                .create_subwindow(
+                    None,
+                    root,
+                    10,
+                    20,
+                    160,
+                    120,
+                    0,
+                    HostSubwindowVisual::CopyFromParent,
+                    None,
+                    None,
+                )
+                .expect("create_subwindow");
+        });
+        let child = backend
+            .windows
+            .keys()
+            .copied()
+            .find(|xid| *xid != 0xc001_0101 && *xid != 0xc001_0102 && *xid != backend.window_id())
+            .expect("created child");
+
+        c0_conv_cii_assert_generation_bumped(backend, device, "configure geometry", |backend| {
+            backend
+                .configure_subwindow(
+                    None,
+                    child,
+                    HostSubwindowConfig {
+                        x: Some(11),
+                        ..Default::default()
+                    },
+                )
+                .expect("configure geometry");
+        });
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "configure border relayout",
+            |backend| {
+                backend
+                    .configure_subwindow(
+                        None,
+                        child,
+                        HostSubwindowConfig {
+                            border_width: Some(2),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("configure border");
+            },
+        );
+        c0_conv_cii_assert_generation_bumped(backend, device, "subwindow restack", |backend| {
+            backend
+                .configure_subwindow(
+                    None,
+                    child,
+                    HostSubwindowConfig {
+                        stack_mode: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .expect("configure restack");
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "map_subwindow", |backend| {
+            backend.map_subwindow(None, child).expect("map_subwindow");
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "unmap_subwindow", |backend| {
+            backend
+                .unmap_subwindow(None, child)
+                .expect("unmap_subwindow");
+        });
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "set_window_scene_participation",
+            |backend| {
+                backend
+                    .set_window_scene_participation(
+                        None,
+                        WindowHandle::from_raw(child).expect("child handle"),
+                        true,
+                    )
+                    .expect("set window scene participation");
+            },
+        );
+        c0_conv_cii_assert_generation_bumped(backend, device, "reparent_subwindow", |backend| {
+            backend
+                .reparent_subwindow(None, child, backend.window_id(), 30, 40)
+                .expect("reparent_subwindow");
+        });
+
+        let mut backing = None;
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "allocate_redirected_backing",
+            |backend| {
+                backing = Some(
+                    backend
+                        .allocate_redirected_backing(
+                            None,
+                            WindowHandle::from_raw(child).expect("child handle"),
+                            164,
+                            124,
+                            24,
+                        )
+                        .expect("allocate redirected backing"),
+                );
+            },
+        );
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "release_redirected_backing",
+            |backend| {
+                backend
+                    .release_redirected_backing(None, backing.expect("redirected backing"))
+                    .expect("release redirected backing");
+            },
+        );
+
+        backend.core.current_function = yserver_core::backend::GcFunction::Invert;
+        backend.core.current_subwindow_mode =
+            yserver_core::backend::SubwindowMode::IncludeInferiors;
+        let origin = Some(yserver_core::backend::OriginContext {
+            client_id: yserver_protocol::x11::ClientId(91),
+            nested_seq: 0,
+            opcode: 70,
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "root overlay capture", |backend| {
+            backend.capture_root_overlay(
+                origin,
+                !0,
+                &[super::Rectangle16 {
+                    x: 10,
+                    y: 10,
+                    width: 20,
+                    height: 20,
+                }],
+            );
+        });
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "client overlay disconnect",
+            |backend| {
+                backend.client_disconnected(yserver_protocol::x11::ClientId(91));
+            },
+        );
+
+        c0_conv_cii_assert_generation_bumped(backend, device, "get_overlay_window", |backend| {
+            assert!(
+                backend
+                    .get_overlay_window(None)
+                    .expect("get overlay window")
+            );
+        });
+        c0_conv_cii_assert_generation_bumped(backend, device, "finish_cow_release", |backend| {
+            assert!(
+                backend
+                    .release_overlay_window(None)
+                    .expect("release overlay window")
+            );
+        });
+
+        let mut state = ServerState::new();
+        seed_state_window(
+            &mut state,
+            backend,
+            ResourceId(0x00c0_0202),
+            yserver_core::resources::ROOT_WINDOW,
+            0,
+            0,
+            100,
+            100,
+        );
+        c0_conv_cii_assert_generation_bumped(backend, device, "topology installation", |backend| {
+            backend.sync_top_level_order(&state);
+        });
+        c0_conv_cii_assert_generation_bumped(
+            backend,
+            device,
+            "virtual screen topology",
+            |backend| {
+                let width = backend.platform.fb_w;
+                let height = backend.platform.fb_h;
+                backend
+                    .apply_virtual_screen_extent(width, height)
+                    .expect("apply virtual screen extent");
+            },
+        );
+
+        c0_conv_cii_assert_generation_bumped(backend, device, "destroy_subwindow", |backend| {
+            backend
+                .destroy_subwindow(None, child)
+                .expect("destroy_subwindow");
+        });
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_border_invalidates_queued_successor_vulkan() {
+        use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+        let mut fixture = owner_live_fixture()
+            .expect("environmental skip: no live Vulkan ICD/DRM fixture available");
+        let backend = &mut fixture.backend;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let target = backend
+            .create_subwindow(
+                None,
+                yserver_core::backend::WindowHandle::from_raw(backend.window_id())
+                    .expect("root handle"),
+                0,
+                0,
+                80,
+                80,
+                0,
+                yserver_core::host_x11::HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .expect("target window")
+            .as_raw();
+        let (source_id, candidate, event) = admission_direct_candidate(backend, 81);
+        let present_id = event.present_id;
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("queue direct successor")
+        );
+
+        backend
+            .configure_subwindow(
+                None,
+                target,
+                HostSubwindowConfig {
+                    border_width: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("border configure");
+
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(backend.scanout_m2.idled.len(), 1);
+        assert_eq!(backend.scanout_m2.idled[0].present_id, present_id);
+        assert_eq!(backend.scanout_m2.completed.len(), 1);
+        assert_eq!(
+            backend.scanout_m2.completed[0].completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_border_invalidates_promoted_successor_vulkan() {
+        use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+        let mut fixture = owner_live_fixture()
+            .expect("environmental skip: no live Vulkan ICD/DRM fixture available");
+        let backend = &mut fixture.backend;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let target = backend
+            .create_subwindow(
+                None,
+                yserver_core::backend::WindowHandle::from_raw(backend.window_id())
+                    .expect("root handle"),
+                0,
+                0,
+                80,
+                80,
+                0,
+                yserver_core::host_x11::HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .expect("target window")
+            .as_raw();
+        let (commit, resources) = admission_stage_direct_predecessor(backend, 82);
+        let (source_id, candidate, event) = admission_direct_candidate(backend, 83);
+        let present_id = event.present_id;
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("queue direct successor")
+        );
+
+        backend
+            .configure_subwindow(
+                None,
+                target,
+                HostSubwindowConfig {
+                    border_width: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("border configure");
+        assert!(backend.scanout_m2.pending.is_some());
+
+        backend.route_owner_event_batch(
+            device,
+            vec![admission_completion_retired_event(commit, resources)],
+            std::time::Instant::now(),
+        );
+
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(backend.scanout_m2.completed.len(), 2);
+        assert_eq!(backend.scanout_m2.completed[1].present_id, present_id);
+        assert_eq!(
+            backend.scanout_m2.completed[1].completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_layout_change_between_decide_and_lock_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, ReadinessSnapshot};
+        use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+        let mut fixture = owner_live_fixture()
+            .expect("environmental skip: no live Vulkan ICD/DRM fixture available");
+        let backend = &mut fixture.backend;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let target = backend
+            .create_subwindow(
+                None,
+                yserver_core::backend::WindowHandle::from_raw(backend.window_id())
+                    .expect("root handle"),
+                0,
+                0,
+                80,
+                80,
+                0,
+                yserver_core::host_x11::HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .expect("target window")
+            .as_raw();
+        let (source_id, candidate, event) = admission_direct_candidate(backend, 84);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("queue direct successor")
+        );
+        let source_generation = backend.admission_conductors[&device]
+            .admission
+            .direct()
+            .expect("direct descriptor")
+            .successor
+            .source_generation;
+        let old_generation = c0_conv_cii_generation(backend, device);
+        let topology_generation = backend
+            .platform
+            .owner_ref(device)
+            .expect("owner")
+            .topology_generation();
+        let mut snapshot = ReadinessSnapshot::new(old_generation, topology_generation);
+        snapshot.report(IntentKey::Direct { source_generation }, Readiness::Ready);
+        let decision = backend.admission_conductors[&device]
+            .admission
+            .decide(&snapshot)
+            .expect("direct decision before interleave");
+
+        backend
+            .configure_subwindow(
+                None,
+                target,
+                HostSubwindowConfig {
+                    border_width: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("real layout mutation between decide and lock");
+        assert_eq!(c0_conv_cii_generation(backend, device), old_generation + 1);
+
+        let lock_result = backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("admission conductor")
+            .admission
+            .lock(decision, &snapshot);
+        assert!(matches!(
+            lock_result,
+            Err(crate::kms::owner::admission::AdmissionError::DecisionMismatch)
+        ));
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
     }
 
     #[test]

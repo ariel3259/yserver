@@ -786,6 +786,24 @@ impl KmsBackend {
         self.admission_wake(device, false)
     }
 
+    /// Advance every live device's layout generation after a backend scene
+    /// mutation. Layout changes are backend-global, while admission state is
+    /// intentionally per DRM device; collect the keys first so a wake can
+    /// mutate the conductors without holding a map borrow.
+    pub(crate) fn admission_note_layout_change_all_devices(&mut self, reason: &'static str) {
+        let devices: Vec<_> = self.admission_conductors.keys().copied().collect();
+        for device in devices {
+            if matches!(
+                self.admission_note_layout_change(device),
+                AdmissionOutcome::TransportClosed
+            ) {
+                log::error!(
+                    "admission layout generation overflow or queued successor mismatch for {device:?}: {reason}"
+                );
+            }
+        }
+    }
+
     /// Build the readiness input consumed by A1. This is mutable because an
     /// ineligible direct successor is invalidated at the first snapshot that
     /// observes the lost eligibility.
