@@ -33,6 +33,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-19 Phase C.0 stage 2c-iii, plan Ci-refactor accepted:** the owner
+  route's duplicated state is gone. One `OwnerBuffer` per owner-held scanout
+  buffer replaces the scene's four queues and the eight `BoPhase::Owner*`
+  variants, so "exactly one state per buffer" is a type invariant rather than a
+  test; the primary and direct dispatches share one failure path and the owner
+  one `begin` body. Measuring that path showed only 3 of its 11 policy rows are
+  reachable from production, so the rest collapse into one fail-closed path —
+  a behaviour change on unreachable cells only, authorized by amending the
+  stage design's §8.3 first (`a1adc3b1`). Tasks `39a68bac`, `e82f632f`,
+  `bd429355`, `2bc520a0`; every Ci mutation still caught (R19 now caught rather
+  than equivalent); `c0_conv_ci_` 38/38 and `c0_conv_cir_` 7/7 on the GPU;
+  hardware gate 287/287. Details in the
+  [parity and acceptance finding](superpowers/findings/2026-09-19-stage-2c-iii-plan-ci-refactor-accepted.md).
 - **2026-09-19 Phase C.0 stage 2c-iii, plan Ci accepted (fixture level):** the
   shared managed composed route now has an `Owner` half behind the transport fork
   — render-completion readiness, a real `CommitDescription`, per-member old-state
