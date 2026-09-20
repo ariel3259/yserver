@@ -3487,7 +3487,7 @@ impl KmsBackend {
     /// slowest CRTC; keep those layouts on the normal per-output composed path
     /// so each output retains its native cadence. A future direct path can
     /// relax this only with per-output authoritative sources and lifetimes.
-    fn direct_scanout_topology_eligible(&self) -> bool {
+    pub(crate) fn direct_scanout_topology_eligible(&self) -> bool {
         let Some(primary) = self.platform.primary_device() else {
             return false;
         };
@@ -20525,6 +20525,44 @@ impl KmsBackend {
                 }
                 true
             }
+            crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                commit,
+                mut resources,
+            } => {
+                // An unflip moves the old Current role into ExitRetirement
+                // before begin. A pre-IPC refusal returns that old state as
+                // still current, so restore the capacity role before the
+                // shared consumer takes ownership of the vector.
+                for resource in &mut resources {
+                    if let Some(role) = resource.direct_role.as_mut()
+                        && role.role() == crate::kms::render::resources::DirectRole::ExitRetirement
+                        && self
+                            .commit_consumer
+                            .capacity
+                            .move_role(role, crate::kms::render::resources::DirectRole::Current)
+                            .is_err()
+                    {
+                        if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
+                            gate.force_close();
+                        }
+                        return false;
+                    }
+                }
+                let commit_key = crate::kms::render::resources::CommitKey::new(device_key, commit);
+                let Some(service) = &mut self.resource_service else {
+                    return false;
+                };
+                self.commit_consumer
+                    .consume(
+                        commit_key,
+                        crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                            commit,
+                            resources,
+                        },
+                        service,
+                    )
+                    .is_ok()
+            }
             event => {
                 let commit_key = match &event {
                     crate::kms::owner::device::OwnerEvent::Dispatched { commit }
@@ -20559,7 +20597,10 @@ impl KmsBackend {
     /// unreachable) `move_into_reserved` failure path. Never a bare `drop`:
     /// `RoleReservation::Drop` treats an undischarged token as a lost charge
     /// and closes admission.
-    fn discharge_bare_reservation(&mut self, role: crate::kms::render::resources::RoleReservation) {
+    pub(crate) fn discharge_bare_reservation(
+        &mut self,
+        role: crate::kms::render::resources::RoleReservation,
+    ) {
         if let Err((_err, mut leaked)) = self.commit_consumer.capacity.cancel_reservation(role) {
             // Not `Reserved` under this serial -- should not happen for a
             // bare queued token, but `cancel_reservation` already closed
@@ -21673,9 +21714,10 @@ impl Backend for KmsBackend {
                         self.telemetry.maybe_emit(self.engine.pending_count());
                         return Ok(());
                     }
-                    // Task 2 consumes the ready Unflip admission and builds
-                    // its owner transaction at this same fork. Until then,
-                    // never fall through to the Legacy primary sink.
+                    // The owner route consumes the ready Unflip admission at
+                    // this same transaction fork. Never fall through to the
+                    // Legacy primary sink on an Owner device.
+                    let _ = self.admission_wake(device, false);
                     self.drain_render_telemetry();
                     self.telemetry.maybe_emit(self.engine.pending_count());
                     return Ok(());
@@ -56210,6 +56252,460 @@ mod tests {
                 })?;
         }
         Ok(backend)
+    }
+
+    fn c0_conv_ciii_owner_dispatch_fixture(
+        output_count: usize,
+    ) -> Result<super::KmsBackend, std::io::Error> {
+        let mut backend = raw_live_scene_fixture_with_output_count(output_count)?;
+        for (output_idx, output) in backend.platform.outputs.iter_mut().enumerate() {
+            let crtc = u32::from(output.output.crtc);
+            output.output.plane =
+                ::drm::control::from_u32(10 + u32::try_from(output_idx).unwrap_or(u32::MAX))
+                    .expect("fixture primary plane");
+            output.output.plane_fb_id_prop =
+                ::drm::control::from_u32(19).expect("fixture FB_ID property");
+            output.output.plane_crtc_id_prop =
+                ::drm::control::from_u32(20).expect("fixture CRTC_ID property");
+            output.output.crtc_out_fence_ptr_prop =
+                Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
+            backend.platform.devices[0]
+                .active_property_cache
+                .insert_for_tests(crtc, 21);
+        }
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+        )
+        .map_err(|error| std::io::Error::other(format!("stub executor: {error}")))?;
+        let (incarnation, lifecycle) = executor.owner_identity();
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            device,
+            incarnation,
+        ));
+        let gate = crate::kms::render::resources::tests::owner_gate_for_tests(device, incarnation);
+        backend.platform.install_transport_gate(gate);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        Ok(backend)
+    }
+
+    fn c0_conv_ciii_mark_retained_composed(backend: &mut super::KmsBackend) {
+        for pool in &mut backend.platform.scanout_pools {
+            let pool = pool.as_mut().expect("live output has a scanout pool");
+            let bo = pool
+                .display_pool_mut()
+                .bos
+                .first_mut()
+                .expect("live output has a reusable scanout BO");
+            if !matches!(
+                bo.state.phase,
+                crate::kms::vk::scanout::BoPhase::Free | crate::kms::vk::scanout::BoPhase::OnScreen
+            ) {
+                let _ = bo.state.transition_to_free_after_modeset_reset();
+            }
+            bo.state.mark_on_screen_after_modeset();
+        }
+    }
+
+    fn c0_conv_ciii_install_current_direct(backend: &mut super::KmsBackend) {
+        let (source_id, candidate, event) = admission_direct_candidate(backend, 900);
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(source_id, candidate, event)
+                .expect("prepare direct predecessor")
+        );
+        backend.managed_tag_queued_direct_successor(900);
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = crate::kms::owner::identity::CommitId::for_tests(19_000);
+        let commit_key = crate::kms::render::resources::CommitKey::new(device, commit);
+        let resources = backend
+            .managed_dispatch_direct_successor(commit_key)
+            .expect("dispatch direct predecessor")
+            .expect("direct predecessor resources");
+        assert!(backend.managed_confirm_direct_dispatch(900, commit_key));
+        backend
+            .scanout_m2
+            .pending
+            .as_mut()
+            .expect("direct predecessor pending frame")
+            .completion_clock = Some(yserver_core::backend::PresentClockSample {
+            msc: 19_000,
+            ust: 19_000_000,
+            source: yserver_core::backend::PresentClockSource::PageFlip,
+        });
+        backend.managed_enqueue_retired_direct_completion(commit_key);
+        let service = backend.resource_service.as_mut().expect("resource service");
+        backend
+            .commit_consumer
+            .consume(
+                commit_key,
+                crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                    commit,
+                    resources: crate::kms::owner::ledger::Submitted::new(
+                        Vec::new(),
+                        vec![resources],
+                    )
+                    .accepted(),
+                },
+                service,
+            )
+            .expect("install current direct resources");
+    }
+
+    fn c0_conv_ciii_add_uncovered_current_resource(
+        backend: &mut super::KmsBackend,
+    ) -> crate::kms::render::resources::AllocationKey {
+        use std::{cell::Cell, rc::Rc};
+
+        use crate::{
+            kms::render::{
+                platform::CrtcKey,
+                resources::{AllocationPayload, CommitResources, GroupMember},
+            },
+            platform::drm::DrmDeviceKey,
+        };
+
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("fixture device")
+            .key;
+        let topology_generation = backend
+            .platform
+            .owner_ref(device)
+            .expect("fixture owner")
+            .topology_generation();
+        let uncovered_member = GroupMember::new(
+            CrtcKey::new(
+                DrmDeviceKey {
+                    major: device.major,
+                    minor: device.minor,
+                },
+                ::drm::control::from_u32(0xdead).expect("uncovered CRTC"),
+            ),
+            topology_generation,
+            1,
+        );
+        let drops = Rc::new(Cell::new(0));
+        let allocation = backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .adopt(AllocationPayload::Spy(
+                crate::kms::render::resources::tests::SpyAllocation {
+                    drops: Rc::clone(&drops),
+                },
+            ))
+            .expect("uncovered current allocation");
+        let allocation_key = allocation.key();
+        let uncovered = CommitResources::new(
+            vec![allocation],
+            None,
+            None,
+            None,
+            vec![uncovered_member],
+            Vec::new(),
+        );
+        backend.commit_consumer.current_resources.push(uncovered);
+        allocation_key
+    }
+
+    fn c0_conv_ciii_request_ready_unflip(
+        backend: &mut super::KmsBackend,
+    ) -> crate::platform::drm::DrmDeviceKey {
+        let device = backend.platform.primary_device().expect("device").key;
+        c0_conv_ciii_mark_retained_composed(backend);
+        for output_idx in 0..backend.platform.outputs.len() {
+            assert!(
+                backend
+                    .platform
+                    .retained_composed_framebuffer(output_idx)
+                    .is_some(),
+                "test setup retained no composed framebuffer for output {output_idx}"
+            );
+        }
+        c0_conv_ciii_install_current_direct(backend);
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect();
+        backend
+            .admission_request_unflip(device, crtcs)
+            .expect("request unflip");
+        backend.scanout_m2.unflip_shadow_ready = true;
+        device
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_dispatches_and_others_stay_unsupported() {
+        use crate::kms::{owner::admission::Tier, render::admission::AdmissionOutcome};
+
+        let mut backend =
+            c0_conv_ciii_owner_dispatch_fixture(1).expect("environmental skip: no live Vulkan ICD");
+        let device = c0_conv_ciii_request_ready_unflip(&mut backend);
+        let readiness = backend
+            .admission_snapshot(device, false)
+            .expect("unflip snapshot");
+        assert_eq!(
+            readiness.readiness(crate::kms::owner::admission::IntentKey::Unflip),
+            Some(crate::kms::owner::admission::Readiness::Ready),
+            "unflip readiness before dispatch: {:?}",
+            readiness.readiness(crate::kms::owner::admission::IntentKey::Unflip)
+        );
+        let outcome = backend.admission_wake(device, false);
+        assert!(
+            matches!(outcome, AdmissionOutcome::Dispatched(_)),
+            "unflip outcome: {outcome:?}"
+        );
+
+        let mut topology = admission_backend_with_stub_executor();
+        let topology_device = topology.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut topology, topology_device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        topology.install_admission_conductor_for_tests(topology_device, source);
+        topology
+            .admission_conductors
+            .get_mut(&topology_device)
+            .expect("conductor")
+            .admission
+            .request_topology(1)
+            .expect("topology request");
+        assert_eq!(
+            topology.admission_wake(topology_device, false),
+            AdmissionOutcome::Unsupported(Tier::Topology)
+        );
+        assert!(topology.device_owner_for_tests(0).live_record().is_none());
+
+        let mut cursor = admission_backend_with_stub_executor();
+        let cursor_device = cursor.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut cursor, cursor_device);
+        let (source, _, _, _, recovery_ready) =
+            AdmissionSourceFixture::new_with_snapshot_controls();
+        recovery_ready.borrow_mut().insert(1);
+        cursor.install_admission_conductor_for_tests(cursor_device, source);
+        cursor
+            .admission_conductors
+            .get_mut(&cursor_device)
+            .expect("conductor")
+            .admission
+            .request_cursor_recovery(1);
+        assert_eq!(
+            cursor.admission_wake(cursor_device, false),
+            AdmissionOutcome::Unsupported(Tier::Unflip)
+        );
+        assert!(cursor.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_commit_takes_the_exit_retirement_old_state_vulkan() {
+        use crate::kms::{owner::ledger::LedgerState, render::resources::DirectRole};
+
+        let mut backend =
+            c0_conv_ciii_owner_dispatch_fixture(2).expect("environmental skip: no live Vulkan ICD");
+        let device = c0_conv_ciii_request_ready_unflip(&mut backend);
+        let uncovered_allocation = c0_conv_ciii_add_uncovered_current_resource(&mut backend);
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("unflip owner record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("accepted unflip owner record");
+        let LedgerState::Accepted(accepted) = record.ledger() else {
+            panic!("unflip owner ledger was not accepted");
+        };
+        assert_eq!(accepted.old().len(), 1, "one direct state is retiring");
+        assert_eq!(accepted.new().len(), 1, "one composed member state is new");
+        assert_eq!(
+            accepted.old()[0]
+                .direct_role
+                .as_ref()
+                .expect("old direct role")
+                .role(),
+            DirectRole::ExitRetirement
+        );
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(backend.commit_consumer.current_resources[0].crtcs.len(), 1);
+        assert_eq!(
+            backend.commit_consumer.current_resources[0].crtcs[0]
+                .crtc
+                .crtc,
+            ::drm::control::from_u32(0xdead).expect("uncovered CRTC"),
+            "the uncovered CRTC must remain in current_resources"
+        );
+        assert_eq!(
+            backend.commit_consumer.current_resources[0].allocations[0].key(),
+            uncovered_allocation,
+            "the uncovered allocation remains attached to the current resource"
+        );
+        assert!(
+            backend
+                .resource_service
+                .as_ref()
+                .expect("resource service")
+                .contains(&uncovered_allocation),
+            "the uncovered allocation remains owned by the resource service"
+        );
+        assert!(
+            backend.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .is_none_or(|role| role.role() != DirectRole::ExitRetirement),
+            "the uncovered resource must not be moved into exit retirement"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_commit_covers_every_crtc_vulkan() {
+        let mut backend =
+            c0_conv_ciii_owner_dispatch_fixture(2).expect("environmental skip: no live Vulkan ICD");
+        let device = c0_conv_ciii_request_ready_unflip(&mut backend);
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("unflip owner record");
+        let expected_crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            record
+                .closure()
+                .expected_completion()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_crtcs,
+            "the unflip closure must include every device CRTC"
+        );
+        let properties = record
+            .request_properties_for_tests()
+            .expect("serialized unflip request");
+        for output in &backend.platform.outputs {
+            let crtc = u32::from(output.output.crtc);
+            assert!(properties.objects.contains(&crtc));
+            assert!(
+                properties.objects.contains(&u32::from(output.output.plane)),
+                "missing plane for CRTC {crtc}"
+            );
+        }
+
+        let mut ineligible =
+            c0_conv_ciii_owner_dispatch_fixture(2).expect("environmental skip: no live Vulkan ICD");
+        ineligible.platform.outputs[1].output.picked.vrefresh = 59;
+        let ineligible_device = c0_conv_ciii_request_ready_unflip(&mut ineligible);
+        assert!(matches!(
+            ineligible.admission_wake(ineligible_device, false),
+            crate::kms::render::admission::AdmissionOutcome::PreparationRefused
+        ));
+        assert!(ineligible.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_legacy_unflip_unchanged_vulkan() {
+        let mut backend = super::KmsBackend::for_tests();
+        let target = seed_window(&mut backend, 0xc910, None, 0, 0);
+        install_direct_frame_for_target_test(&mut backend, 0xc911, target, true);
+        backend.scanout_m2.unflip_shadow_ready = true;
+        backend.request_direct_unflip("c0_ciii_legacy_characterization");
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(backend.admission_conductors.is_empty());
+        backend.tick_maybe_composite_for_tests();
+        assert!(backend.admission_conductors.is_empty());
+        assert!(backend.scanout_m2.degraded_composed_unflip);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_owner_unflip_commits_instead_of_submitting_vulkan() {
+        let mut backend =
+            c0_conv_ciii_owner_dispatch_fixture(1).expect("environmental skip: no live Vulkan ICD");
+        c0_conv_ciii_request_ready_unflip(&mut backend);
+        backend.scanout_m2.unflip_requested = true;
+        backend.tick_maybe_composite_for_tests();
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        assert!(!backend.scanout_m2.degraded_composed_unflip);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_dispatch_failure_fails_closed_vulkan() {
+        use crate::kms::render::resources::DirectRole;
+
+        let mut backend =
+            c0_conv_ciii_owner_dispatch_fixture(1).expect("environmental skip: no live Vulkan ICD");
+        let device = c0_conv_ciii_request_ready_unflip(&mut backend);
+        backend.scanout_m2.unflip_requested = true;
+        backend.scene.scene_structure_dirty = false;
+        backend.scene.mark_scene_structure_dirty();
+        let pin_count = backend.present_source_pins.len();
+        let current = backend
+            .commit_consumer
+            .current_resources
+            .first()
+            .expect("current direct resources")
+            .crtcs
+            .clone();
+        backend
+            .commit_consumer
+            .current_resources
+            .first_mut()
+            .expect("current direct resources")
+            .crtcs
+            .push(current[0]);
+
+        backend.tick_maybe_composite_for_tests();
+        assert_eq!(
+            backend.platform.transport_gate(&device).unwrap().state(),
+            crate::kms::render::resources::TransportState::Closed
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert_eq!(backend.present_source_pins.len(), pin_count);
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(
+            backend.commit_consumer.current_resources[0]
+                .direct_role
+                .as_ref()
+                .expect("restored current role")
+                .role(),
+            DirectRole::Current
+        );
+        assert!(
+            backend
+                .commit_consumer
+                .capacity
+                .is_vacant(DirectRole::ExitRetirement)
+        );
+        assert!(!backend.scanout_m2.degraded_composed_unflip);
+        assert!(
+            backend.scene.scene_structure_dirty_for_tests(),
+            "a failed owner dispatch must return before the degraded scene path"
+        );
     }
 
     #[test]

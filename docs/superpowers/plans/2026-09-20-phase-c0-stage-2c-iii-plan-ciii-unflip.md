@@ -2,6 +2,21 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 14 (2026-09-20)** — **T12 replaced, after task 2 measured it
+unreachable.** T12 was "describe only the CRTCs named in the barrier". The
+implementation cannot express it: `unflip_owner::description` builds the plane
+set by filtering the platform's outputs **by device** and never reads the
+barrier's set at all, and `unflip_owner::members` refuses outright when the
+barrier is not the device's complete direct group (fail closed). So the
+original mutation is a no-op concept, not an escape — a better shape than the
+one the plan assumed. The criterion keeps its evidence through a
+description-side mutation instead: **T12 is now "describe only the first output
+of the device"**, and the coordinator confirmed it fails
+`c0_conv_ciii_unflip_commit_covers_every_crtc_vulkan`. The refusal of a
+non-complete barrier is recorded here as the route's behaviour; on the owner
+route the barrier is always the complete group, because
+`unflip_owner::request` builds it from the device's outputs.
+
 **Revision 13 (2026-09-20)** — a **factual correction**, reported as an F8 stop
 by the implementer before it wrote a line, which is exactly the behaviour the
 honesty rule asks for.
@@ -529,7 +544,7 @@ user's go-ahead.
 | A failed materialization leaves the unflip requested, unadmitted and retried on the next tick even when its cause is one-shot, never dispatched (§6.1, decision 2; round-4 B-1) | `c0_conv_ciii_unflip_shadow_failure_defers_admission_vulkan` | T6: treat a failed materialization as ready; T7: retry it inside the readiness computation; T39: retry only in the request funnel, so a one-shot cause stalls |
 | `Unflip` is dispatched; `Topology` and `CursorRecovery` stay `Unsupported` (§6.1) | `c0_conv_ciii_unflip_dispatches_and_others_stay_unsupported` | T8: keep `Unflip` in `decision_requires_unsupported`; T9: drop `Topology` from it as well |
 | The unflip commit's old state is the current direct resources of the members it covers, carrying the exit-retirement role (§6.1, 2c-i §8.5, decision 2) | `c0_conv_ciii_unflip_commit_takes_the_exit_retirement_old_state_vulkan` | T10: leave the old state empty; T11: take the device's whole current state instead of the members' |
-| The unflip commit replaces the **complete** plane set of its device in one transaction, each CRTC with that output's retained composed framebuffer (§6.1) | `c0_conv_ciii_unflip_commit_covers_every_crtc_vulkan` | T12: describe only the CRTCs named in the barrier; T13: skip the topology-eligibility precondition |
+| The unflip commit replaces the **complete** plane set of its device in one transaction, each CRTC with that output's retained composed framebuffer (§6.1) | `c0_conv_ciii_unflip_commit_covers_every_crtc_vulkan` | T12: describe only the first output of the device (revision 14); T13: skip the topology-eligibility precondition |
 | The owner route takes its own module behind one fork point; Legacy is unchanged (decision 1) | `c0_conv_ciii_legacy_unflip_unchanged_vulkan`, `c0_conv_ciii_owner_unflip_commits_instead_of_submitting_vulkan` | T14: force `submit_composed_unflip` under `Owner`; T15: take the owner route under `Legacy` |
 | A failed owner unflip dispatch fails closed and never degrades to per-output legacy flips (decision 5) | `c0_conv_ciii_unflip_dispatch_failure_fails_closed_vulkan` | T16: fall through into the degraded per-output path under `Owner` |
 | A failed unflip dispatch leaves capacity as it was: old resources in `current_resources` with the `Current` role, no exit-retirement reservation outstanding (round-3 M-1) | `c0_conv_ciii_unflip_dispatch_failure_fails_closed_vulkan` | T35: skip the role restoration on the unflip failure row |
