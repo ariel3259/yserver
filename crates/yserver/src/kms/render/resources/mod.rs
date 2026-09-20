@@ -684,6 +684,21 @@ impl ResourceService {
             .map(|(_, _, disp)| *disp)
     }
 
+    #[cfg(test)]
+    pub(crate) fn kms_commit_for_tests(
+        &self,
+        key: AllocationKey,
+    ) -> Option<crate::kms::owner::identity::CommitId> {
+        self.entries
+            .get(&key)?
+            .availability
+            .borrow()
+            .kms_dispositions
+            .values()
+            .next()
+            .map(|(_, commit, _)| *commit)
+    }
+
     pub(crate) fn record_kms_discharged(
         &mut self,
         key: AllocationKey,

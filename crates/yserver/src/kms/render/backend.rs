@@ -56044,6 +56044,140 @@ mod tests {
     }
 
     #[test]
+    fn c0_conv_cii_direct_registration_failure_aborts_the_token() {
+        use crate::kms::render::resources::{AllocationPayload, TransportState};
+
+        let mut backend = backend_with_current_and_successor_for_admission_seam();
+        let device = backend.platform.primary_device().unwrap().key;
+        admission_install_executor(
+            &mut backend,
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("direct executor"),
+        );
+        let first = backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .adopt(AllocationPayload::Spy(
+                crate::kms::render::resources::tests::SpyAllocation {
+                    drops: std::rc::Rc::new(std::cell::Cell::new(0)),
+                },
+            ))
+            .expect("first old allocation");
+        let old_key = first.key();
+        backend.commit_consumer.current_resources[0]
+            .allocations
+            .push(first);
+
+        // Let one dependency register and force the second registration to
+        // fail. This exercises the real direct admission wake after its token
+        // has been locked, rather than the managed seam in isolation.
+        let second = backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .adopt(AllocationPayload::Spy(
+                crate::kms::render::resources::tests::SpyAllocation {
+                    drops: std::rc::Rc::new(std::cell::Cell::new(0)),
+                },
+            ))
+            .expect("second old allocation");
+        let second_key = second.key();
+        backend.commit_consumer.current_resources[0]
+            .allocations
+            .push(second);
+        backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .freeze(second_key)
+            .expect("freeze the second old allocation");
+
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 913);
+        assert!(
+            backend
+                .admission_offer_direct(device, source_id, candidate, event)
+                .expect("direct offer")
+        );
+        let frame_before = {
+            let frame = backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .expect("queued direct frame");
+            (
+                frame.source_id,
+                frame.source_pin,
+                frame.fallback_target_pin,
+                frame.candidate.present_id,
+            )
+        };
+        let admission_before = format!("{:?}", backend.admission_conductors[&device].admission);
+
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::BeginRefused
+        ));
+        assert_eq!(
+            backend.platform.transport_gate(&device).unwrap().state(),
+            TransportState::Owner
+        );
+        assert!(backend.device_owner_for_tests(0).slot().is_idle());
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert_eq!(
+            format!("{:?}", backend.admission_conductors[&device].admission),
+            admission_before,
+            "registration failure must abort without changing the decider"
+        );
+        let frame_after = {
+            let frame = backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .expect("failed dispatch returns the frame to its producer");
+            (
+                frame.source_id,
+                frame.source_pin,
+                frame.fallback_target_pin,
+                frame.candidate.present_id,
+            )
+        };
+        assert_eq!(frame_after, frame_before);
+        assert_eq!(
+            backend
+                .scanout_m2
+                .queued_successor_role
+                .as_ref()
+                .expect("failed dispatch returns the successor role")
+                .role(),
+            crate::kms::render::resources::DirectRole::Successor
+        );
+        assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+        assert_eq!(backend.commit_consumer.releasing_resources.len(), 0);
+        assert!(
+            !backend
+                .resource_service
+                .as_ref()
+                .expect("resource service")
+                .has_pending_obligations(&old_key)
+        );
+        assert_eq!(
+            backend
+                .resource_service
+                .as_ref()
+                .expect("resource service")
+                .kms_commit_for_tests(old_key),
+            Some(crate::kms::owner::identity::CommitId::from_raw(1)),
+            "the cancelled dependency keeps the record's own CommitId"
+        );
+    }
+
+    #[test]
     fn c0_conv_cir_dispatch_failure_policy_matrix() {
         use crate::kms::render::resources::{DirectRole, TransportState};
 
