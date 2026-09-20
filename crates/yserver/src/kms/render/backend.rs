@@ -50638,14 +50638,8 @@ mod tests {
             "the drained offer is consumed by the owner wake"
         );
         assert_eq!(
-            backend.platform.scanout_pools[0]
-                .as_ref()
-                .expect("live-scene pool")
-                .display_pool()
-                .bos[first_bo]
-                .state
-                .phase,
-            crate::kms::vk::scanout::BoPhase::OwnerSubmitted
+            owner_state_for_tests(&backend, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted)
         );
 
         backend.scene.mark_scene_structure_dirty();
@@ -50664,14 +50658,8 @@ mod tests {
         assert_eq!(submitted_generation, first_generation);
         assert!(snapshot_count > 0, "submitted PendingAck snapshots survive");
         assert_eq!(
-            backend.platform.scanout_pools[0]
-                .as_ref()
-                .expect("live-scene pool")
-                .display_pool()
-                .bos[submitted_bo]
-                .state
-                .phase,
-            crate::kms::vk::scanout::BoPhase::OwnerSubmitted
+            owner_state_for_tests(&backend, submitted_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted)
         );
     }
 
@@ -50736,19 +50724,14 @@ mod tests {
             Some(&[crtc][..]),
             "the drained generation is admitted in the same wake"
         );
+        let prepared_bo = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("prepared")
+            .0;
         assert_eq!(
-            backend.platform.scanout_pools[0]
-                .as_ref()
-                .expect("live-scene pool")
-                .display_pool()
-                .bos[backend
-                .scene
-                .owner_prepared_for_tests(0)
-                .expect("prepared")
-                .0]
-                .state
-                .phase,
-            crate::kms::vk::scanout::BoPhase::OwnerSubmitted
+            owner_state_for_tests(&backend, prepared_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted)
         );
     }
 
@@ -50777,16 +50760,10 @@ mod tests {
         assert_ne!(first_bo, second_bo);
         assert!(!second_waiting || second_generation > first_generation);
         assert_eq!(backend.scene.owner_displaced_len_for_tests(0), 1);
-        assert!(matches!(
-            backend.platform.scanout_pools[0]
-                .as_ref()
-                .expect("live-scene pool")
-                .display_pool()
-                .bos[first_bo]
-                .state
-                .phase,
-            crate::kms::vk::scanout::BoPhase::OwnerDisplaced
-        ));
+        assert_eq!(
+            owner_state_for_tests(&backend, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced)
+        );
         assert_eq!(backend.scene.pending_ack_count_for_tests(0), 0);
         assert!(
             backend
@@ -50842,10 +50819,10 @@ mod tests {
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
         // The tick's retire pass frees the displaced buffer and the same tick
         // may immediately acquire it for the next generation (measured on the
-        // GPU: `[OwnerDisplaced, OwnerDesired, Free]` became
-        // `[OwnerRendering, OwnerDisplaced, Free]` with generation 3 in buffer
-        // 0). Either outcome proves the buffer went through `Free`; a buffer
-        // that never left `OwnerDisplaced` could be neither.
+        // The logical states were `[Displaced, Desired, Free]` and became
+        // `[Rendering, Displaced, Free]` with generation 3 in buffer 0.
+        // Either outcome proves the buffer went through physical `Free`; a
+        // buffer that never left `Displaced` could be neither.
         let first_phase = backend.platform.scanout_pools[0]
             .as_ref()
             .expect("live-scene pool")
@@ -50955,6 +50932,368 @@ mod tests {
             .bos[bo_idx]
             .state
             .phase
+    }
+
+    fn owner_state_for_tests(
+        backend: &super::KmsBackend,
+        bo_idx: usize,
+    ) -> Option<crate::kms::render::owner_buffer::OwnerBufferState> {
+        backend.scene.owner_state_for_tests(0, bo_idx)
+    }
+
+    fn assert_owner_membership_agrees_for_tests(backend: &super::KmsBackend, label: &str) {
+        let pool = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live-scene pool")
+            .display_pool();
+        for (bo_idx, bo) in pool.bos.iter().enumerate() {
+            let physical_owner = matches!(bo.state.phase, crate::kms::vk::scanout::BoPhase::Owner);
+            let logical_owner = backend.scene.owner_state_for_tests(0, bo_idx).is_some();
+            assert_eq!(
+                physical_owner, logical_owner,
+                "{label}: BO {bo_idx} physical owner={physical_owner}, logical owner={logical_owner}"
+            );
+        }
+    }
+
+    fn assert_owner_state_for_tests(
+        backend: &super::KmsBackend,
+        bo_idx: usize,
+        expected: crate::kms::render::owner_buffer::OwnerBufferState,
+        label: &str,
+    ) {
+        assert_eq!(
+            owner_state_for_tests(backend, bo_idx),
+            Some(expected),
+            "{label}: BO {bo_idx}"
+        );
+    }
+
+    fn reinstall_owner_executor_for_cir_test(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) {
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("owner executor"),
+        );
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("replacement owner executor"),
+        );
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cir_owner_membership_agrees_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+
+        assert_owner_membership_agrees_for_tests(&backend, "initial");
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (first_bo, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("first owner generation");
+        assert_owner_membership_agrees_for_tests(&backend, "Rendering");
+
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first owner commit")
+            .commit_id();
+        assert_owner_membership_agrees_for_tests(&backend, "Submitted");
+
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted {
+                commit: first_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_owner_membership_agrees_for_tests(&backend, "Accepted");
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                commit: first_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_owner_membership_agrees_for_tests(&backend, "HardwareComplete");
+        let first_completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, first_completion, std::time::Instant::now());
+        assert_owner_membership_agrees_for_tests(&backend, "Current");
+
+        reinstall_owner_executor_for_cir_test(&mut backend, device);
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("second owner generation");
+        assert_ne!(first_bo, second_bo);
+        assert_owner_membership_agrees_for_tests(&backend, "second Rendering");
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("second owner commit")
+            .commit_id();
+        assert_owner_membership_agrees_for_tests(&backend, "second Submitted");
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_owner_membership_agrees_for_tests(&backend, "second Accepted");
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_owner_membership_agrees_for_tests(&backend, "second HardwareComplete");
+        let second_completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, second_completion, std::time::Instant::now());
+        assert_owner_membership_agrees_for_tests(&backend, "second Current and first Releasing");
+
+        backend.scene.wake_for_damage();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_owner_membership_agrees_for_tests(&backend, "release");
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cir_owner_state_sequence_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+
+        // Rendering → Submitted → Accepted → Current, then the next
+        // retirement moves the predecessor through Releasing.
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (first_bo, first_generation, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("first owner generation");
+        assert_owner_state_for_tests(
+            &backend,
+            first_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Rendering,
+            "first Rendering",
+        );
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first owner commit")
+            .commit_id();
+        assert_owner_state_for_tests(
+            &backend,
+            first_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Submitted,
+            "first Submitted",
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted {
+                commit: first_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_owner_state_for_tests(
+            &backend,
+            first_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Accepted,
+            "first Accepted",
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                commit: first_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        let first_completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, first_completion, std::time::Instant::now());
+        assert_owner_state_for_tests(
+            &backend,
+            first_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Current,
+            "first Current",
+        );
+
+        reinstall_owner_executor_for_cir_test(&mut backend, device);
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, second_generation, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("second owner generation");
+        assert!(second_generation > first_generation);
+        assert_owner_state_for_tests(
+            &backend,
+            second_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Rendering,
+            "second Rendering",
+        );
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("second owner commit")
+            .commit_id();
+        assert_owner_state_for_tests(
+            &backend,
+            second_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Submitted,
+            "second Submitted",
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_owner_state_for_tests(
+            &backend,
+            second_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Accepted,
+            "second Accepted",
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        let second_completion = backend.complete_owner_for_tests(0);
+        backend.route_owner_event_batch(device, second_completion, std::time::Instant::now());
+        assert_owner_state_for_tests(
+            &backend,
+            first_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Releasing,
+            "previous Releasing",
+        );
+        assert_owner_state_for_tests(
+            &backend,
+            second_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Current,
+            "second Current",
+        );
+        backend.scene.wake_for_damage();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_ne!(
+            owner_state_for_tests(&backend, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Releasing),
+            "previous buffer leaves Releasing after the release pass"
+        );
+
+        // A newer Rendering generation displaces an older one before
+        // admission, and the pre-IPC refusal restores Desired.
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (displaced_bo, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("displaced generation");
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_owner_state_for_tests(
+            &backend,
+            displaced_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Displaced,
+            "Displaced",
+        );
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (desired_bo, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("pre-IPC generation");
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("owner executor"),
+        );
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        assert_owner_state_for_tests(
+            &backend,
+            desired_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Desired,
+            "pre-IPC refusal Desired",
+        );
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (unknown_bo, _, _) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("unknown-completion generation");
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let unknown_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("unknown-completion owner commit")
+            .commit_id();
+        backend.route_owner_event_batch(
+            device,
+            vec![owner_terminal_event_for_tests(
+                unknown_commit,
+                crate::kms::owner::record::TerminalState::CompletionUnknown(
+                    crate::kms::owner::record::UnknownCause::ContradictoryEvidence,
+                ),
+            )],
+            std::time::Instant::now(),
+        );
+        assert_owner_state_for_tests(
+            &backend,
+            unknown_bo,
+            crate::kms::render::owner_buffer::OwnerBufferState::Quarantined,
+            "CompletionUnknown Quarantined",
+        );
     }
 
     #[test]
@@ -51116,8 +51455,8 @@ mod tests {
             "a pre-accept rejection closes without staging"
         );
         assert_eq!(
-            owner_bo_phase_for_tests(&backend, bo_idx),
-            crate::kms::vk::scanout::BoPhase::OwnerDisplaced,
+            owner_state_for_tests(&backend, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
             "an ioctl rejection takes the submitted buffer to Displaced"
         );
     }
@@ -51153,8 +51492,8 @@ mod tests {
             "unknown completion invalidates the output and owes a repaint"
         );
         assert_eq!(
-            owner_bo_phase_for_tests(&backend, bo_idx),
-            crate::kms::vk::scanout::BoPhase::OwnerQuarantined,
+            owner_state_for_tests(&backend, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Quarantined),
             "unknown completion quarantines the submitted buffer"
         );
     }
@@ -51297,8 +51636,8 @@ mod tests {
             std::time::Instant::now(),
         );
         assert_eq!(
-            owner_bo_phase_for_tests(&backend, first_bo),
-            crate::kms::vk::scanout::BoPhase::OwnerAccepted,
+            owner_state_for_tests(&backend, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Accepted),
             "Accepted advances Submitted to Accepted"
         );
 
@@ -51312,16 +51651,16 @@ mod tests {
         backend.scene.wake_for_damage();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
         assert_eq!(
-            owner_bo_phase_for_tests(&backend, first_bo),
-            crate::kms::vk::scanout::BoPhase::OwnerAccepted,
+            owner_state_for_tests(&backend, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Accepted),
             "the release pass cannot free the buffer before CompletionRetired"
         );
 
         let first_completion = backend.complete_owner_for_tests(0);
         backend.route_owner_event_batch(device, first_completion, std::time::Instant::now());
         assert_eq!(
-            owner_bo_phase_for_tests(&backend, first_bo),
-            crate::kms::vk::scanout::BoPhase::OwnerCurrent,
+            owner_state_for_tests(&backend, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Current),
             "CompletionRetired advances Accepted to Current"
         );
 
@@ -51392,8 +51731,8 @@ mod tests {
         backend.scene.wake_for_damage();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
         assert_eq!(
-            owner_bo_phase_for_tests(&backend, first_bo),
-            crate::kms::vk::scanout::BoPhase::OwnerReleasing,
+            owner_state_for_tests(&backend, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Releasing),
             "the displacing CompletionRetired enters Releasing"
         );
         assert_ne!(
@@ -51449,10 +51788,9 @@ mod tests {
             .expect("pre-IPC refusal restores the prepared generation");
         assert_eq!(restored_generation, generation);
         assert!(!waiting, "the refused generation is desired again");
-        let phase = owner_bo_phase_for_tests(&backend, bo_idx);
         assert_eq!(
-            phase,
-            crate::kms::vk::scanout::BoPhase::OwnerDesired,
+            owner_state_for_tests(&backend, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Desired),
             "the pre-IPC refusal returns its buffer to Desired"
         );
     }
@@ -55703,6 +56041,291 @@ mod tests {
                 .is_some(),
             "the failed registration remains queued for a later real wake"
         );
+    }
+
+    #[test]
+    fn c0_conv_cir_dispatch_failure_policy_matrix() {
+        use crate::kms::render::resources::{DirectRole, TransportState};
+
+        // primary / Ledger / restore succeeds: the source-backed composed
+        // route takes the new resources, registration fails on the frozen old
+        // allocation, and the source receives the new resources back.
+        {
+            let mut backend = admission_backend_with_stub_executor();
+            let device = backend.platform.primary_device().unwrap().key;
+            let member = task2_member(device, 1);
+            let old = task2_resource(&mut backend, member);
+            let old_key = old.allocations[0].key();
+            let next = task2_resource(&mut backend, member);
+            backend
+                .resource_service
+                .as_mut()
+                .expect("resource service")
+                .freeze(old_key)
+                .expect("freeze old allocation");
+            backend.commit_consumer.current_resources = vec![old];
+            install_admission_owner_gate(&mut backend, device);
+            let (source, restored) = Task2ResourceSource::with_restore(vec![next]);
+            backend.install_admission_conductor_for_tests(device, source);
+            backend
+                .admission_offer_composed(device, 1, 1)
+                .expect("composed offer");
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert!(backend.device_owner_for_tests(0).slot().is_idle());
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+            assert_eq!(restored.borrow().len(), 1);
+            assert!(
+                backend.admission_conductors[&device]
+                    .admission
+                    .composed(1)
+                    .is_some()
+            );
+        }
+
+        // primary / Refused: the source description rejects before its ledger
+        // closure runs, so no composed resource is moved at all.
+        {
+            let mut backend = admission_backend_with_stub_executor();
+            let device = backend.platform.primary_device().unwrap().key;
+            install_admission_owner_gate(&mut backend, device);
+            let (
+                source,
+                _,
+                _,
+                describe_page_flip,
+                _,
+                _,
+                composed_resource_calls,
+                composed_resource_dropped,
+            ) = AdmissionSourceFixture::new_with_controls();
+            backend.install_admission_conductor_for_tests(device, source);
+            backend
+                .admission_offer_composed(device, 1, 1)
+                .expect("composed offer");
+            describe_page_flip.set(true);
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert_eq!(composed_resource_calls.get(), 0);
+            assert!(!composed_resource_dropped.get());
+            assert!(backend.device_owner_for_tests(0).slot().is_idle());
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert!(backend.commit_consumer.current_resources.is_empty());
+        }
+
+        // direct / Ledger / undo succeeds: the prepared successor is moved to
+        // Submitted, the deliberately malformed current member list makes
+        // ledger registration refuse, and the shared failure path restores
+        // the successor role.
+        {
+            let mut backend = backend_with_current_and_successor_for_admission_seam();
+            let device = backend.platform.primary_device().unwrap().key;
+            let member = backend.commit_consumer.current_resources[0].crtcs[0];
+            let current_role = backend.commit_consumer.current_resources[0]
+                .direct_role
+                .take()
+                .expect("direct current role");
+            let mut replacement = task2_resource(&mut backend, member);
+            let old_key = replacement.allocations[0].key();
+            replacement.direct_role = Some(current_role);
+            backend.commit_consumer.current_resources[0] = replacement;
+            backend
+                .resource_service
+                .as_mut()
+                .expect("resource service")
+                .freeze(old_key)
+                .expect("freeze old allocation");
+            admission_install_executor(
+                &mut backend,
+                crate::kms::executor::test_support::spawn_stub_helper(
+                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                )
+                .expect("direct executor"),
+            );
+            install_admission_owner_gate(&mut backend, device);
+            let (source, _, _) = AdmissionSourceFixture::new();
+            backend.install_admission_conductor_for_tests(device, source);
+            let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 910);
+            assert!(
+                backend
+                    .admission_offer_direct(device, source_id, candidate, event)
+                    .expect("direct offer")
+            );
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert!(backend.device_owner_for_tests(0).slot().is_idle());
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+            assert_eq!(backend.commit_consumer.releasing_resources.len(), 0);
+            assert_eq!(
+                backend
+                    .scanout_m2
+                    .queued_successor_role
+                    .as_ref()
+                    .expect("undo restores successor")
+                    .role(),
+                DirectRole::Successor
+            );
+        }
+
+        // direct / Refused / resource present: the owner refuses a Present
+        // description before calling the ledger closure. Preparation has
+        // moved Successor -> Submitted and attach has made that exact token
+        // Occupied; because Refused returns before the closure, no production
+        // operation can mutate capacity before the managed undo seam, so a
+        // finish-role mismatch is unreachable. The row normally has an open
+        // ledger and reserve(Successor) succeeds, but the ledger may already
+        // be closed by the consumer's real error path; then reserve returns
+        // Busy. Ci ignores either undo result, so both cases keep the whole
+        // old policy: BeginRefused and an open transport.
+        {
+            let mut backend = backend_with_current_and_successor_for_admission_seam();
+            let device = backend.platform.primary_device().unwrap().key;
+            admission_install_executor(
+                &mut backend,
+                crate::kms::executor::test_support::spawn_stub_helper(
+                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                )
+                .expect("direct executor"),
+            );
+            install_admission_owner_gate(&mut backend, device);
+            let (source, _, _, describe_page_flip, _, _, _, _) =
+                AdmissionSourceFixture::new_with_controls();
+            backend.install_admission_conductor_for_tests(device, source);
+            let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 911);
+            assert!(
+                backend
+                    .admission_offer_direct(device, source_id, candidate, event)
+                    .expect("direct offer")
+            );
+            describe_page_flip.set(true);
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert!(backend.device_owner_for_tests(0).slot().is_idle());
+            assert!(!backend.admission_conductors[&device].admission.is_locked());
+            assert_eq!(backend.commit_consumer.current_resources.len(), 1);
+            assert_eq!(
+                backend
+                    .scanout_m2
+                    .queued_successor_role
+                    .as_ref()
+                    .expect("undo restores successor")
+                    .role(),
+                DirectRole::Successor
+            );
+        }
+
+        // direct / Refused / resource present / undo fails: this is reachable,
+        // not a collapsed row. A real consumer error closes the capacity
+        // ledger before the direct dispatch. With no Current resource,
+        // preparation still moves the queued Successor to Submitted and
+        // attach occupies it; the owner's Refused result still precedes the
+        // ledger closure, so the managed undo finishes Submitted and then
+        // reserve(Successor) returns Busy. Ci ignores that failure and keeps
+        // BeginRefused with the transport open.
+        {
+            use std::{cell::Cell, rc::Rc};
+
+            use crate::kms::render::resources::{CommitResources, DirectRole, RoleReservation};
+
+            let mut backend = super::KmsBackend::for_tests();
+            let device = backend.platform.primary_device().unwrap().key;
+            install_admission_resource_service(&mut backend);
+            let invalid_role = RoleReservation::new_for_test(
+                DirectRole::Submitted,
+                u64::MAX,
+                Rc::new(Cell::new(false)),
+            );
+            backend.commit_consumer.releasing_resources.push(
+                CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new())
+                    .with_direct_role(invalid_role),
+            );
+            admission_install_executor(
+                &mut backend,
+                crate::kms::executor::test_support::spawn_stub_helper(
+                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                )
+                .expect("direct executor"),
+            );
+            install_admission_owner_gate(&mut backend, device);
+            let (source, _, _, describe_page_flip, _, _, _, _) =
+                AdmissionSourceFixture::new_with_controls();
+            backend.install_admission_conductor_for_tests(device, source);
+            let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 912);
+            assert!(
+                backend
+                    .admission_offer_direct(device, source_id, candidate, event)
+                    .expect("direct offer")
+            );
+            assert!(
+                backend
+                    .commit_consumer
+                    .on_available(
+                        &[],
+                        backend.resource_service.as_mut().expect("resource service"),
+                    )
+                    .is_err()
+            );
+            assert!(backend.commit_consumer.capacity.is_admission_closed());
+            describe_page_flip.set(true);
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert!(backend.commit_consumer.capacity.is_admission_closed());
+            assert!(backend.scanout_m2.queued_successor_role.is_none());
+        }
+
+        // F8/collapse measurement for the remaining cells: Cleanup requires
+        // the owner to fail releasing the slot reserved by that same begin;
+        // the owner owns that slot exclusively during the synchronous
+        // closure, so production cannot produce it. Primary restoration gets
+        // only the state just moved and its production inverse is exact;
+        // direct preparation supplies exactly one resource. Missing/extra
+        // resources are therefore also not production outputs. Direct Ledger
+        // undo can observe an already-closed ledger or exhausted serial, but
+        // Ci already mapped that failure to TransportClosed with the gate
+        // closed, which is the shared fail-closed result. Frozen allocations
+        // affect resource registration/releasability, not the direct undo's
+        // capacity operations. The behavior-changing cells are therefore
+        // only the production-unreachable Cleanup, direct-Ledger
+        // missing-resource, and direct-Refused missing/extra-resource cases;
+        // already-fail-closed restore failures share Ci's old result, while
+        // direct Refused/failed-undo is explicitly kept open.
     }
 
     #[test]

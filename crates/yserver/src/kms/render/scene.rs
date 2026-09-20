@@ -74,6 +74,7 @@ use drm::control::framebuffer;
 use yserver_protocol::x11::xfixes;
 
 use super::{
+    owner_buffer::{OwnerBuffer, OwnerBufferIdentity, OwnerBufferState},
     platform::{CrtcKey, FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
     region::Region,
     resources::{AllocationKey, CoreRetirementBatch, ResourceError, ResourceService},
@@ -477,19 +478,10 @@ struct OutputSceneState {
     /// `pool_slots[i]`. Released to the ring on flip retirement.
     pool_slots: VecDeque<usize>,
     pending_acks: VecDeque<PendingAck>,
-    /// Owner-route composed generations are not page-flip acks. The active
-    /// generation remains here until its render completion is drained and
-    /// offered; a newer generation moves it to `owner_displaced`.
-    owner_prepared: Option<PreparedComposed>,
-    /// Owner generations already moved into an in-flight commit. A later
-    /// scene tick must retain these acknowledgements until the owner commit
-    /// resolves; they are not candidates for latest-wins displacement.
-    owner_submitted: VecDeque<PreparedComposed>,
-    /// Owner generations whose commits have retired. At most one entry per
-    /// output is OwnerCurrent; older entries remain OwnerReleasing until the
-    /// resource service proves that every release gate is clear.
-    owner_current: VecDeque<PreparedComposed>,
-    owner_displaced: VecDeque<PreparedComposed>,
+    /// Every owner-held generation for this output, ordered by immutable
+    /// generation. The logical lifecycle lives in each `OwnerBuffer`; the
+    /// platform's single `BoPhase::Owner` marker only records membership.
+    owner_buffers: Vec<OwnerBuffer<PendingAck>>,
     /// Fence-gated descriptor-pool slot releases. At
     /// `handle_page_flip_complete` we want to pop the matching
     /// `pool_slots` entry and free it, but the compose CB's Vulkan
@@ -1000,23 +992,8 @@ pub(crate) struct PreparedComposedLocation {
     pub(crate) bo_idx: usize,
 }
 
-struct PreparedComposed {
-    output_key: OutputKey,
-    managed_key: AllocationKey,
-    managed: Option<crate::kms::render::resources::AllocationLease>,
-    /// Commit identity once admission has moved this generation out of
-    /// `OwnerDesired`. Cleared by pre-IPC restoration and once completion
-    /// retirement moves the generation to `owner_current`.
-    commit_id: Option<crate::kms::owner::identity::CommitId>,
-    /// `None` after admission has released the descriptor slot. The scanout
-    /// BO remains owned by the owner ledger, so a later scene tick must not
-    /// try to displace or release that slot a second time.
-    pool_slot: Option<usize>,
-    ack: PendingAck,
-}
-
 /// Damage-side contents of one owner commit member. The scanout allocation,
-/// GPU ticket and descriptor slot remain with `PreparedComposed`; this value is
+/// GPU ticket and descriptor slot remain with the `OwnerBuffer`; this value is
 /// the exact snapshot/retirement payload that crosses the owner milestones.
 #[derive(Clone)]
 struct OwnerDamageMember {
@@ -1469,10 +1446,7 @@ impl SceneCompositor {
             pool_slots: VecDeque::with_capacity(4),
             pending_pool_releases: VecDeque::with_capacity(4),
             pending_acks: VecDeque::with_capacity(4),
-            owner_prepared: None,
-            owner_submitted: VecDeque::with_capacity(4),
-            owner_current: VecDeque::with_capacity(4),
-            owner_displaced: VecDeque::with_capacity(4),
+            owner_buffers: Vec::with_capacity(4),
             failed_submit_bos: VecDeque::with_capacity(4),
             damage_history: BufferAgeRing::new(bo_depth + 1),
             current_generation: 0,
@@ -1579,15 +1553,90 @@ impl SceneCompositor {
             .unwrap_or_default()
     }
 
+    fn owner_buffer_index(state: &OutputSceneState, bo_idx: usize) -> Option<usize> {
+        state
+            .owner_buffers
+            .iter()
+            .position(|buffer| buffer.identity().bo_idx == bo_idx)
+    }
+
+    fn owner_prepared_index(state: &OutputSceneState) -> Option<usize> {
+        state
+            .owner_buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, buffer)| buffer.is_prepared())
+            .max_by_key(|(_, buffer)| buffer.identity().generation)
+            .map(|(index, _)| index)
+    }
+
+    fn owner_current_index(state: &OutputSceneState) -> Option<usize> {
+        state
+            .owner_buffers
+            .iter()
+            .position(|buffer| buffer.state() == OwnerBufferState::Current)
+    }
+
+    fn insert_owner_buffer(
+        state: &mut OutputSceneState,
+        output_idx: usize,
+        buffer: OwnerBuffer<PendingAck>,
+        platform: &mut PlatformBackend,
+    ) -> Result<(), Box<OwnerBuffer<PendingAck>>> {
+        let bo_idx = buffer.identity().bo_idx;
+        if Self::owner_buffer_index(state, bo_idx).is_some()
+            || (buffer.state() == OwnerBufferState::Current
+                && Self::owner_current_index(state).is_some())
+        {
+            return Err(Box::new(buffer));
+        }
+        if !platform.enter_owner_buffer(output_idx, bo_idx) {
+            return Err(Box::new(buffer));
+        }
+        let position = state
+            .owner_buffers
+            .partition_point(|entry| entry.identity().generation < buffer.identity().generation);
+        state.owner_buffers.insert(position, buffer);
+        Ok(())
+    }
+
+    fn insert_existing_owner_buffer(
+        state: &mut OutputSceneState,
+        buffer: OwnerBuffer<PendingAck>,
+        platform: &PlatformBackend,
+        output_idx: usize,
+    ) -> Result<(), Box<OwnerBuffer<PendingAck>>> {
+        let bo_idx = buffer.identity().bo_idx;
+        if Self::owner_buffer_index(state, bo_idx).is_some()
+            || (buffer.state() == OwnerBufferState::Current
+                && Self::owner_current_index(state).is_some())
+            || platform.owner_bo_phase(output_idx, bo_idx)
+                != Some(crate::kms::vk::scanout::BoPhase::Owner)
+        {
+            return Err(Box::new(buffer));
+        }
+        let position = state
+            .owner_buffers
+            .partition_point(|entry| entry.identity().generation < buffer.identity().generation);
+        state.owner_buffers.insert(position, buffer);
+        Ok(())
+    }
+
     pub(crate) fn owner_composed_ready(&self, output_idx: usize, generation: u64) -> bool {
         self.inner
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))
-            .and_then(|state| state.owner_prepared.as_ref())
-            .is_some_and(|prepared| {
-                prepared.ack.generation == generation
-                    && prepared.ack.stage == InFlightStage::OwnerDesired
-                    && prepared.managed.is_some()
+            .and_then(Self::owner_prepared_index)
+            .and_then(|index| {
+                self.inner
+                    .as_ref()
+                    .and_then(|inner| inner.outputs.get(output_idx))
+                    .and_then(|state| state.owner_buffers.get(index))
+            })
+            .is_some_and(|buffer| {
+                buffer.identity().generation == generation
+                    && buffer.state() == OwnerBufferState::Desired
+                    && buffer.allocation_lease().is_some()
             })
     }
 
@@ -1599,15 +1648,21 @@ impl SceneCompositor {
         self.inner
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))
-            .and_then(|state| state.owner_prepared.as_ref())
-            .filter(|prepared| {
-                prepared.ack.generation == generation
-                    && prepared.ack.stage == InFlightStage::OwnerDesired
-                    && prepared.managed.is_some()
-            })
-            .map(|prepared| PreparedComposedLocation {
-                output_idx,
-                bo_idx: prepared.ack.bo_idx,
+            .and_then(Self::owner_prepared_index)
+            .and_then(|index| {
+                self.inner
+                    .as_ref()
+                    .and_then(|inner| inner.outputs.get(output_idx))
+                    .and_then(|state| state.owner_buffers.get(index))
+                    .filter(|buffer| {
+                        buffer.identity().generation == generation
+                            && buffer.state() == OwnerBufferState::Desired
+                            && buffer.allocation_lease().is_some()
+                    })
+                    .map(|buffer| PreparedComposedLocation {
+                        output_idx,
+                        bo_idx: buffer.identity().bo_idx,
+                    })
             })
     }
 
@@ -1632,15 +1687,18 @@ impl SceneCompositor {
         else {
             return Err(ResourceError::InvalidState);
         };
-        let Some(prepared) = state.owner_prepared.as_ref() else {
+        let Some(index) = Self::owner_prepared_index(state) else {
             return Err(ResourceError::InvalidState);
         };
-        if prepared.ack.generation != generation
-            || prepared.ack.stage != InFlightStage::OwnerDesired
+        let Some(prepared) = state.owner_buffers.get(index) else {
+            return Err(ResourceError::InvalidState);
+        };
+        if prepared.identity().generation != generation
+            || prepared.state() != OwnerBufferState::Desired
         {
             return Err(ResourceError::InvalidState);
         }
-        let Some(managed) = prepared.managed.as_ref() else {
+        let Some(managed) = prepared.allocation_lease() else {
             return Err(ResourceError::InvalidState);
         };
         service.with_scanout_read(managed, |allocation| {
@@ -1651,9 +1709,9 @@ impl SceneCompositor {
         })
     }
 
-    /// Move the prepared scanout lease into the owner ledger's new state.
-    /// The phase transition and the lease move are one operation: if the
-    /// prepared buffer is not still desired, no lease is consumed.
+    /// Move the desired owner buffer into the owner ledger's Submitted state.
+    /// The physical BO is already marked `Owner`; only the logical
+    /// `OwnerBuffer` transition and the lease move happen here.
     pub(crate) fn take_owner_composed_resources(
         &mut self,
         location: PreparedComposedLocation,
@@ -1668,42 +1726,45 @@ impl SceneCompositor {
         let Some(state) = inner.outputs.get_mut(location.output_idx) else {
             return Err(ResourceError::InvalidState);
         };
-        let Some(prepared) = state.owner_prepared.as_mut() else {
+        let Some(index) = Self::owner_prepared_index(state) else {
             return Err(ResourceError::InvalidState);
         };
-        if prepared.ack.generation != generation
-            || prepared.ack.stage != InFlightStage::OwnerDesired
+        let Some(prepared) = state.owner_buffers.get(index) else {
+            return Err(ResourceError::InvalidState);
+        };
+        if prepared.identity().generation != generation
+            || prepared.identity().bo_idx != location.bo_idx
+            || prepared.state() != OwnerBufferState::Desired
+            || scanout_pools
+                .get(location.output_idx)
+                .and_then(Option::as_ref)
+                .and_then(|scanout| scanout.display_pool().bos.get(location.bo_idx))
+                .is_none_or(|bo| bo.state.phase != BoPhase::Owner)
         {
             return Err(ResourceError::InvalidState);
         }
-        let Some(managed) = prepared.managed.take() else {
-            return Err(ResourceError::InvalidState);
-        };
-        let phase_changed = scanout_pools
-            .get_mut(location.output_idx)
-            .and_then(Option::as_mut)
-            .is_some_and(|scanout| {
-                scanout
-                    .display_pool_mut()
-                    .bos
-                    .get_mut(location.bo_idx)
-                    .is_some_and(|bo| bo.state.transition_to_owner_submitted())
-            });
-        if !phase_changed {
-            prepared.managed = Some(managed);
-            return Err(ResourceError::InvalidState);
-        }
 
-        if let Some(pool_slot) = prepared.pool_slot.take() {
+        let prepared = state.owner_buffers.remove(index);
+        let (mut submitted, managed) = match prepared.into_submitted(commit) {
+            Ok(result) => result,
+            Err(prepared) => {
+                state.owner_buffers.insert(index, *prepared);
+                return Err(ResourceError::InvalidState);
+            }
+        };
+        if let Some(pool_slot) = submitted.take_descriptor_slot() {
             // Admission occurs only after the render-completion drain, so the
             // compose fence has completed before this dispatch-time release.
             // Releasing the descriptor slot here is therefore behind the
             // compose-fence gate required by the pool ring.
             state.pool_ring.release(pool_slot);
         }
-
-        prepared.ack.stage = InFlightStage::OwnerSubmitted;
-        prepared.commit_id = Some(commit);
+        let Some(ack) = submitted.pending_ack_mut() else {
+            state.owner_buffers.insert(index, submitted);
+            return Err(ResourceError::InvalidState);
+        };
+        ack.stage = InFlightStage::OwnerSubmitted;
+        state.owner_buffers.insert(index, submitted);
 
         Ok(vec![crate::kms::render::resources::CommitResources::new(
             vec![managed],
@@ -1740,23 +1801,24 @@ impl SceneCompositor {
                 return false;
             }
             let key = resources.allocations[0].key();
-            let Some((output_idx, prepared)) =
+            let Some((output_idx, index, prepared)) =
                 inner
                     .outputs
                     .iter()
                     .enumerate()
                     .find_map(|(output_idx, state)| {
                         state
-                            .owner_prepared
-                            .as_ref()
-                            .filter(|prepared| {
-                                prepared.managed_key == key
-                                    && prepared.managed.is_none()
+                            .owner_buffers
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, prepared)| {
+                                (prepared.identity().managed_key == key
+                                    && prepared.state() == OwnerBufferState::Submitted
                                     && resources
                                         .commit_id
-                                        .is_none_or(|commit| prepared.commit_id == Some(commit))
+                                        .is_none_or(|commit| prepared.commit_id() == Some(commit)))
+                                .then_some((output_idx, index, prepared))
                             })
-                            .map(|prepared| (output_idx, prepared))
                     })
             else {
                 return false;
@@ -1767,37 +1829,51 @@ impl SceneCompositor {
             let Some(scanout) = scanout_pools.get(output_idx).and_then(Option::as_ref) else {
                 return false;
             };
-            let Some(bo) = scanout.display_pool().bos.get(prepared.ack.bo_idx) else {
+            let Some(bo) = scanout.display_pool().bos.get(prepared.identity().bo_idx) else {
                 return false;
             };
-            if bo.state.phase != BoPhase::OwnerSubmitted {
+            if bo.state.phase != BoPhase::Owner {
                 return false;
             }
-            targets.push((output_idx, prepared.ack.bo_idx));
+            targets.push((output_idx, index));
         }
 
-        for (mut resources, (output_idx, bo_idx)) in resources.into_iter().zip(targets) {
+        for (mut resources, (output_idx, index)) in resources.into_iter().zip(targets) {
             let Some(managed) = resources.allocations.pop() else {
                 return false;
             };
             let Some(state) = inner.outputs.get_mut(output_idx) else {
                 return false;
             };
-            let Some(prepared) = state.owner_prepared.as_mut() else {
-                return false;
-            };
-            let phase_changed = scanout_pools
-                .get_mut(output_idx)
-                .and_then(Option::as_mut)
-                .and_then(|scanout| scanout.display_pool_mut().bos.get_mut(bo_idx))
-                .is_some_and(|bo| bo.state.transition_to_owner_desired_after_refusal());
-            if !phase_changed {
-                prepared.managed = Some(managed);
+            if index >= state.owner_buffers.len()
+                || state.owner_buffers[index].state() != OwnerBufferState::Submitted
+            {
                 return false;
             }
-            prepared.ack.stage = InFlightStage::OwnerDesired;
-            prepared.commit_id = None;
-            prepared.managed = Some(managed);
+            let prepared = state.owner_buffers.remove(index);
+            let mut prepared = match prepared.into_desired_after_refusal(managed) {
+                Ok(prepared) => prepared,
+                Err(returned) => {
+                    let (prepared, _managed) = *returned;
+                    state.owner_buffers.insert(index, prepared);
+                    return false;
+                }
+            };
+            let Some(ack) = prepared.pending_ack_mut() else {
+                state.owner_buffers.insert(index, prepared);
+                return false;
+            };
+            ack.stage = InFlightStage::OwnerDesired;
+            if scanout_pools
+                .get(output_idx)
+                .and_then(Option::as_ref)
+                .and_then(|scanout| scanout.display_pool().bos.get(prepared.identity().bo_idx))
+                .is_none_or(|bo| bo.state.phase != BoPhase::Owner)
+            {
+                state.owner_buffers.insert(index, prepared);
+                return false;
+            }
+            state.owner_buffers.insert(index, prepared);
         }
         true
     }
@@ -1830,14 +1906,17 @@ impl SceneCompositor {
             let Some(state) = inner.outputs.get(location.output_idx) else {
                 return false;
             };
-            let Some(prepared) = state.owner_prepared.as_ref() else {
+            let Some(prepared) = state.owner_buffers.iter().find(|prepared| {
+                prepared.identity().bo_idx == location.bo_idx
+                    && prepared.identity().generation == *generation
+                    && prepared.state() == OwnerBufferState::Submitted
+            }) else {
                 return false;
             };
-            if prepared.ack.bo_idx != location.bo_idx
-                || prepared.ack.generation != *generation
-                || prepared.ack.stage != InFlightStage::OwnerSubmitted
-                || prepared.managed.is_some()
-                || prepared.output_key.device_key != member.crtc.device_key
+            if prepared
+                .pending_ack()
+                .is_none_or(|ack| ack.stage != InFlightStage::OwnerSubmitted)
+                || prepared.identity().output_key.device_key != member.crtc.device_key
             {
                 return false;
             }
@@ -1847,11 +1926,17 @@ impl SceneCompositor {
             .iter()
             .map(|(location, _generation, member)| {
                 let state = inner.outputs.get_mut(location.output_idx)?;
-                let prepared = state.owner_prepared.as_mut()?;
-                Some(prepared.ack.take_owner_damage_member(
-                    prepared.output_key.clone(),
-                    u32::from(member.crtc.crtc),
-                ))
+                let prepared = state.owner_buffers.iter_mut().find(|prepared| {
+                    prepared.identity().bo_idx == location.bo_idx
+                        && prepared.identity().generation == *_generation
+                        && prepared.state() == OwnerBufferState::Submitted
+                })?;
+                let output_key = prepared.identity().output_key.clone();
+                Some(
+                    prepared
+                        .pending_ack_mut()?
+                        .take_owner_damage_member(output_key, u32::from(member.crtc.crtc)),
+                )
             })
             .collect::<Option<Vec<_>>>();
         let Some(members) = members else {
@@ -1972,7 +2057,6 @@ impl SceneCompositor {
             return;
         };
         let transaction = inner.owner_damage_transactions.remove(&commit);
-        clear_owner_commit_id(inner, commit);
         let Some(transaction) = transaction else {
             return;
         };
@@ -1996,28 +2080,40 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        for (output_idx, state) in inner.outputs.iter().enumerate() {
-            let Some(prepared) = state
-                .owner_prepared
-                .as_ref()
-                .filter(|prepared| prepared.commit_id == Some(commit))
-                .or_else(|| {
-                    state
-                        .owner_submitted
-                        .iter()
-                        .find(|prepared| prepared.commit_id == Some(commit))
-                })
+        loop {
+            let Some((output_idx, index)) =
+                inner
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(output_idx, state)| {
+                        state
+                            .owner_buffers
+                            .iter()
+                            .position(|buffer| {
+                                buffer.commit_id() == Some(commit)
+                                    && buffer.state() == OwnerBufferState::Submitted
+                            })
+                            .map(|index| (output_idx, index))
+                    })
             else {
-                continue;
+                return;
             };
-            if platform.accept_owner_bo(output_idx, prepared.ack.bo_idx) {
-                continue;
+            let state = &mut inner.outputs[output_idx];
+            let buffer = state.owner_buffers.remove(index);
+            let buffer = match buffer.into_accepted() {
+                Ok(buffer) => buffer,
+                Err(buffer) => {
+                    state.owner_buffers.insert(index, *buffer);
+                    return;
+                }
+            };
+            if let Err(buffer) =
+                Self::insert_existing_owner_buffer(state, buffer, platform, output_idx)
+            {
+                state.owner_buffers.insert(index, *buffer);
+                return;
             }
-            log::error!(
-                "render scene: owner commit {commit:?} buffer {} was not OwnerSubmitted",
-                prepared.ack.bo_idx
-            );
-            return;
         }
     }
 
@@ -2029,52 +2125,41 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let Some((output_idx, mut prepared, from_submitted, submitted_idx)) = inner
-            .outputs
-            .iter_mut()
-            .enumerate()
-            .find_map(|(output_idx, state)| {
-                if state
-                    .owner_prepared
-                    .as_ref()
-                    .is_some_and(|prepared| prepared.commit_id == Some(commit))
-                {
-                    return state
-                        .owner_prepared
-                        .take()
-                        .map(|prepared| (output_idx, prepared, false, None));
-                }
-                let submitted_idx = state
-                    .owner_submitted
+        loop {
+            let Some((output_idx, index)) =
+                inner
+                    .outputs
                     .iter()
-                    .position(|prepared| prepared.commit_id == Some(commit))?;
-                let prepared = state.owner_submitted.remove(submitted_idx)?;
-                Some((output_idx, prepared, true, Some(submitted_idx)))
-            })
-        else {
-            return;
-        };
-        if !platform.reject_owner_submitted_bo(output_idx, prepared.ack.bo_idx) {
-            // The only accepted rejection phase is OwnerSubmitted. Keep the
-            // generation identified if a stale or contradictory event tries
-            // to close anything else.
-            if from_submitted {
-                if let Some(index) = submitted_idx {
-                    inner.outputs[output_idx]
-                        .owner_submitted
-                        .insert(index, prepared);
-                } else {
-                    inner.outputs[output_idx].owner_prepared = Some(prepared);
+                    .enumerate()
+                    .find_map(|(output_idx, state)| {
+                        state
+                            .owner_buffers
+                            .iter()
+                            .position(|buffer| {
+                                buffer.commit_id() == Some(commit)
+                                    && buffer.state() == OwnerBufferState::Submitted
+                            })
+                            .map(|index| (output_idx, index))
+                    })
+            else {
+                return;
+            };
+            let state = &mut inner.outputs[output_idx];
+            let prepared = state.owner_buffers.remove(index);
+            let prepared = match prepared.into_displaced() {
+                Ok(prepared) => prepared,
+                Err(prepared) => {
+                    state.owner_buffers.insert(index, *prepared);
+                    return;
                 }
-            } else {
-                inner.outputs[output_idx].owner_prepared = Some(prepared);
+            };
+            if let Err(prepared) =
+                Self::insert_existing_owner_buffer(state, prepared, platform, output_idx)
+            {
+                state.owner_buffers.insert(index, *prepared);
+                return;
             }
-            return;
         }
-        prepared.commit_id = None;
-        inner.outputs[output_idx]
-            .owner_displaced
-            .push_back(prepared);
     }
 
     fn quarantine_owner_buffer(
@@ -2085,47 +2170,38 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let Some((output_idx, mut prepared)) =
-            inner
-                .outputs
-                .iter_mut()
-                .enumerate()
-                .find_map(|(output_idx, state)| {
-                    if state
-                        .owner_prepared
-                        .as_ref()
-                        .is_some_and(|prepared| prepared.commit_id == Some(commit))
-                    {
-                        return state
-                            .owner_prepared
-                            .take()
-                            .map(|prepared| (output_idx, prepared));
-                    }
-                    let submitted_idx = state
-                        .owner_submitted
-                        .iter()
-                        .position(|prepared| prepared.commit_id == Some(commit))?;
-                    Some((output_idx, state.owner_submitted.remove(submitted_idx)?))
-                })
-        else {
-            return;
-        };
-        if !platform.quarantine_owner_bo(output_idx, prepared.ack.bo_idx) {
-            log::error!(
-                "render scene: owner commit {commit:?} buffer {} was not quarantineable",
-                prepared.ack.bo_idx
-            );
-            prepared.commit_id = Some(commit);
-            inner.outputs[output_idx]
-                .owner_submitted
-                .push_back(prepared);
-            return;
+        loop {
+            let Some((output_idx, index)) =
+                inner
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(output_idx, state)| {
+                        state
+                            .owner_buffers
+                            .iter()
+                            .position(|buffer| buffer.commit_id() == Some(commit))
+                            .map(|index| (output_idx, index))
+                    })
+            else {
+                return;
+            };
+            let state = &mut inner.outputs[output_idx];
+            let prepared = state.owner_buffers.remove(index);
+            let prepared = match prepared.into_quarantined() {
+                Ok(prepared) => prepared,
+                Err(prepared) => {
+                    state.owner_buffers.insert(index, *prepared);
+                    return;
+                }
+            };
+            if let Err(prepared) =
+                Self::insert_existing_owner_buffer(state, prepared, platform, output_idx)
+            {
+                state.owner_buffers.insert(index, *prepared);
+                return;
+            }
         }
-        prepared.commit_id = None;
-        // There is intentionally no quarantine queue. Dropping the scene
-        // record cannot make the BO reusable: its physical phase is the
-        // terminal OwnerQuarantined state and pool acquisition only accepts
-        // Free BOs.
     }
 
     fn retire_owner_buffer(
@@ -2137,78 +2213,63 @@ impl SceneCompositor {
             return;
         };
         // A bundled owner commit has one CompletionRetired event carrying the
-        // bundle's resources. Resolve every scene member keyed by this commit;
-        // consuming only the first one leaves the remaining outputs attached
-        // to their prepared slots and makes a later per-output admission look
-        // permanently unavailable.
+        // bundle's resources. Resolve every scene member keyed by this commit.
         loop {
-            let Some((output_idx, mut prepared, from_prepared, submitted_idx)) = inner
-                .outputs
-                .iter_mut()
-                .enumerate()
-                .find_map(|(output_idx, state)| {
-                    if state
-                        .owner_prepared
-                        .as_ref()
-                        .is_some_and(|prepared| prepared.commit_id == Some(commit))
-                    {
-                        return state
-                            .owner_prepared
-                            .take()
-                            .map(|prepared| (output_idx, prepared, true, None));
-                    }
-                    let submitted_idx = state
-                        .owner_submitted
-                        .iter()
-                        .position(|prepared| prepared.commit_id == Some(commit))?;
-                    let prepared = state.owner_submitted.remove(submitted_idx)?;
-                    Some((output_idx, prepared, false, Some(submitted_idx)))
-                })
+            let Some((output_idx, index)) =
+                inner
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(output_idx, state)| {
+                        state
+                            .owner_buffers
+                            .iter()
+                            .position(|buffer| {
+                                buffer.commit_id() == Some(commit)
+                                    && buffer.state() == OwnerBufferState::Accepted
+                            })
+                            .map(|index| (output_idx, index))
+                    })
             else {
                 return;
             };
-
-            let output_key = prepared.output_key.clone();
-            let old_current_idx = inner.outputs[output_idx]
-                .owner_current
-                .iter()
-                .position(|old| {
-                    old.output_key == output_key
-                        && platform.owner_bo_phase(output_idx, old.ack.bo_idx)
-                            == Some(BoPhase::OwnerCurrent)
-                });
-            if let Some(old_idx) = old_current_idx
-                && !platform.release_owner_current_bo(
-                    output_idx,
-                    inner.outputs[output_idx].owner_current[old_idx].ack.bo_idx,
-                )
-            {
-                restore_owner_prepared_after_resolution_failure(
-                    &mut inner.outputs[output_idx],
-                    prepared,
-                    from_prepared,
-                    submitted_idx,
-                );
-                return;
-            }
-
-            if !platform.current_owner_bo(output_idx, prepared.ack.bo_idx) {
-                if let Some(old_idx) = old_current_idx {
-                    let old_bo_idx = inner.outputs[output_idx].owner_current[old_idx].ack.bo_idx;
-                    let _ = platform
-                        .restore_owner_current_bo_after_release_abort(output_idx, old_bo_idx);
+            let state = &mut inner.outputs[output_idx];
+            let old_index = Self::owner_current_index(state);
+            let prepared = state.owner_buffers.remove(index);
+            let prepared = match prepared.into_current() {
+                Ok(prepared) => prepared,
+                Err(prepared) => {
+                    state.owner_buffers.insert(index, *prepared);
+                    return;
                 }
-                restore_owner_prepared_after_resolution_failure(
-                    &mut inner.outputs[output_idx],
-                    prepared,
-                    from_prepared,
-                    submitted_idx,
-                );
+            };
+            let mut old = old_index.map(|old_index| {
+                let old_index = old_index - usize::from(old_index > index);
+                state.owner_buffers.remove(old_index)
+            });
+            if let Some(old_buffer) = old.take() {
+                let old_buffer = match old_buffer.into_releasing() {
+                    Ok(old_buffer) => old_buffer,
+                    Err(old_buffer) => {
+                        state.owner_buffers.insert(index, prepared);
+                        state.owner_buffers.insert(old_index.unwrap(), *old_buffer);
+                        return;
+                    }
+                };
+                if let Err(old_buffer) =
+                    Self::insert_existing_owner_buffer(state, old_buffer, platform, output_idx)
+                {
+                    state.owner_buffers.insert(index, prepared);
+                    state.owner_buffers.insert(old_index.unwrap(), *old_buffer);
+                    return;
+                }
+            }
+            if let Err(prepared) =
+                Self::insert_existing_owner_buffer(state, prepared, platform, output_idx)
+            {
+                state.owner_buffers.insert(index, *prepared);
                 return;
             }
-
-            prepared.commit_id = None;
-            inner.outputs[output_idx].owner_current.push_back(prepared);
         }
     }
 
@@ -2304,16 +2365,17 @@ impl SceneCompositor {
                 continue;
             };
             let submitted = inner.outputs.get(output_idx).is_some_and(|state| {
-                state.owner_prepared.as_ref().is_some_and(|prepared| {
-                    prepared.output_key == member.output_key
-                        && prepared.ack.bo_idx == member.bo_idx
-                        && prepared.ack.generation == member.generation
-                        && prepared.ack.stage == InFlightStage::OwnerSubmitted
-                }) || state.owner_submitted.iter().any(|prepared| {
-                    prepared.output_key == member.output_key
-                        && prepared.ack.bo_idx == member.bo_idx
-                        && prepared.ack.generation == member.generation
-                        && prepared.ack.stage == InFlightStage::OwnerSubmitted
+                state.owner_buffers.iter().any(|buffer| {
+                    buffer.identity().output_key == member.output_key
+                        && buffer.identity().bo_idx == member.bo_idx
+                        && buffer.identity().generation == member.generation
+                        && matches!(
+                            buffer.state(),
+                            OwnerBufferState::Submitted | OwnerBufferState::Accepted
+                        )
+                        && buffer
+                            .pending_ack()
+                            .is_some_and(|ack| ack.stage == InFlightStage::OwnerSubmitted)
                 })
             });
             if !submitted {
@@ -2375,18 +2437,43 @@ impl SceneCompositor {
 
     #[cfg(test)]
     pub(crate) fn owner_prepared_for_tests(&self, output_idx: usize) -> Option<(usize, u64, bool)> {
-        let prepared = self
-            .inner
-            .as_ref()?
-            .outputs
-            .get(output_idx)?
-            .owner_prepared
-            .as_ref()?;
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        let prepared = state
+            .owner_buffers
+            .iter()
+            .filter(|buffer| {
+                !matches!(
+                    buffer.state(),
+                    OwnerBufferState::Displaced
+                        | OwnerBufferState::Releasing
+                        | OwnerBufferState::Quarantined
+                )
+            })
+            .max_by_key(|buffer| buffer.identity().generation)?;
         Some((
-            prepared.ack.bo_idx,
-            prepared.ack.generation,
-            matches!(prepared.ack.stage, InFlightStage::OwnerRenderWaiting { .. }),
+            prepared.identity().bo_idx,
+            prepared.identity().generation,
+            prepared.state() == OwnerBufferState::Rendering,
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_state_for_tests(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> Option<OwnerBufferState> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .and_then(|state| Self::owner_buffer_index(state, bo_idx))
+            .and_then(|index| {
+                self.inner
+                    .as_ref()
+                    .and_then(|inner| inner.outputs.get(output_idx))
+                    .and_then(|state| state.owner_buffers.get(index))
+            })
+            .map(OwnerBuffer::state)
     }
 
     #[cfg(test)]
@@ -2394,7 +2481,13 @@ impl SceneCompositor {
         self.inner
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))
-            .map_or(0, |state| state.owner_displaced.len())
+            .map_or(0, |state| {
+                state
+                    .owner_buffers
+                    .iter()
+                    .filter(|buffer| buffer.state() == OwnerBufferState::Displaced)
+                    .count()
+            })
     }
 
     #[cfg(test)]
@@ -2402,13 +2495,11 @@ impl SceneCompositor {
         &self,
         output_idx: usize,
     ) -> Option<(usize, u64, usize)> {
-        let prepared = self
-            .inner
-            .as_ref()?
-            .outputs
-            .get(output_idx)?
-            .owner_submitted
-            .front()?;
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        let prepared = state
+            .owner_buffers
+            .iter()
+            .find(|buffer| buffer.state() == OwnerBufferState::Submitted)?;
         let transaction_snapshot_count = self
             .inner
             .as_ref()?
@@ -2416,15 +2507,15 @@ impl SceneCompositor {
             .values()
             .flat_map(|transaction| transaction.members.iter())
             .filter(|member| {
-                member.output_key == prepared.output_key
-                    && member.generation == prepared.ack.generation
+                member.output_key == prepared.identity().output_key
+                    && member.generation == prepared.identity().generation
             })
             .map(|member| member.drawable_snapshots.len())
             .sum::<usize>();
         Some((
-            prepared.ack.bo_idx,
-            prepared.ack.generation,
-            prepared.ack.drawable_snapshots.len() + transaction_snapshot_count,
+            prepared.identity().bo_idx,
+            prepared.identity().generation,
+            prepared.pending_ack()?.drawable_snapshots.len() + transaction_snapshot_count,
         ))
     }
 
@@ -2468,10 +2559,16 @@ impl SceneCompositor {
         else {
             return (0, false);
         };
-        let Some(prepared) = state.owner_displaced.front() else {
+        let Some(prepared) = state
+            .owner_buffers
+            .iter()
+            .find(|buffer| buffer.state() == OwnerBufferState::Displaced)
+        else {
             return (0, false);
         };
-        let snapshots = &prepared.ack.drawable_snapshots;
+        let Some(snapshots) = prepared.pending_ack().map(|ack| &ack.drawable_snapshots) else {
+            return (0, false);
+        };
         (
             snapshots.len(),
             snapshots
@@ -2866,24 +2963,42 @@ impl SceneCompositor {
         platform.clear_scanout_render_completions();
         let vk = inner.vk.clone();
         for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
-            if let Some(prepared) = o.owner_prepared.take() {
-                if prepared.managed.is_none() {
-                    // Admission already moved the lease into the owner
-                    // ledger. There is no scene-owned resource or descriptor
-                    // slot left to displace here.
-                } else if platform.displace_owner_bo(output_idx, prepared.ack.bo_idx) {
-                    o.owner_displaced.push_back(prepared);
-                } else {
+            let prepared_indices = o
+                .owner_buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, buffer)| buffer.is_prepared())
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            for index in prepared_indices.into_iter().rev() {
+                let prepared = o.owner_buffers.remove(index);
+                let prepared = match prepared.into_displaced() {
+                    Ok(prepared) => prepared,
+                    Err(prepared) => {
+                        o.owner_buffers.insert(index, *prepared);
+                        continue;
+                    }
+                };
+                if let Err(prepared) =
+                    Self::insert_existing_owner_buffer(o, prepared, platform, output_idx)
+                {
+                    o.owner_buffers.insert(index, *prepared);
                     log::error!(
-                        "render scene drain: Owner prepared buffer {} was not displaceable",
-                        prepared.ack.bo_idx
+                        "render scene drain: Owner prepared buffer could not remain owner-held"
                     );
                     platform.renderer_failed = true;
                 }
             }
-            while let Some(mut prepared) = o.owner_displaced.pop_front() {
-                let wait_ok = prepared.ack.ticket.as_ref().is_none_or(|ticket| {
-                    match ticket.wait(&vk) {
+            while let Some(index) = o
+                .owner_buffers
+                .iter()
+                .position(|buffer| buffer.state() == OwnerBufferState::Displaced)
+            {
+                let mut prepared = o.owner_buffers.remove(index);
+                let wait_ok = prepared
+                    .pending_ack()
+                    .and_then(|ack| ack.ticket.as_ref())
+                    .is_none_or(|ticket| match ticket.wait(&vk) {
                         Ok(()) => true,
                         Err(error) => {
                             log::error!(
@@ -2892,27 +3007,37 @@ impl SceneCompositor {
                             platform.renderer_failed = true;
                             false
                         }
-                    }
-                });
+                    });
                 if wait_ok {
-                    if let Some(batch) = prepared.ack.managed_batch.take()
+                    if let Some(batch) = prepared
+                        .pending_ack_mut()
+                        .and_then(|ack| ack.managed_batch.take())
                         && let Some(service) = resource_service.as_deref_mut()
                     {
                         service.register_batch(batch);
                     }
-                    if platform.release_owner_displaced_bo(output_idx, prepared.ack.bo_idx) {
-                        if let Some(pool_slot) = prepared.pool_slot {
-                            o.pool_ring.release(pool_slot);
+                    let bo_idx = prepared.identity().bo_idx;
+                    if platform.leave_owner_buffer(output_idx, bo_idx) {
+                        let pool_slot = prepared.take_descriptor_slot();
+                        if prepared.into_free().is_ok() {
+                            if let Some(pool_slot) = pool_slot {
+                                o.pool_ring.release(pool_slot);
+                            }
+                        } else {
+                            log::error!(
+                                "render scene drain: displaced owner buffer {bo_idx} was not freeable"
+                            );
+                            platform.renderer_failed = true;
                         }
                     } else {
                         log::error!(
-                            "render scene drain: Owner displaced buffer {} was not releasable",
-                            prepared.ack.bo_idx
+                            "render scene drain: Owner displaced buffer {bo_idx} was not releasable"
                         );
                         platform.renderer_failed = true;
+                        o.owner_buffers.insert(index, prepared);
                     }
                 } else {
-                    o.owner_displaced.push_back(prepared);
+                    o.owner_buffers.insert(index, prepared);
                 }
             }
             // B.2-context fix (codex audit followup): wait for any
@@ -3586,56 +3711,83 @@ fn handle_scanout_render_completion_inner(
         );
         return false;
     };
-    let owner_prepared_matches = inner
-        .outputs
-        .get(output_idx)
-        .and_then(|state| state.owner_prepared.as_ref())
-        .is_some_and(|prepared| {
-            prepared.output_key == output_key
-                && prepared.ack.bo_idx == bo_idx
-                && prepared.ack.stage.matches_owner_render_completion(job_id)
+    let owner_buffer_index = inner.outputs[output_idx]
+        .owner_buffers
+        .iter()
+        .position(|buffer| {
+            buffer.identity().output_key == output_key
+                && buffer.identity().bo_idx == bo_idx
+                && buffer
+                    .pending_ack()
+                    .is_some_and(|ack| ack.stage.matches_owner_render_completion(job_id))
         });
-    if owner_prepared_matches {
+    if let Some(owner_buffer_index) = owner_buffer_index {
         let Some(service) = resource_service else {
             log::error!("render Owner scanout: render completion arrived without ResourceService");
             platform.renderer_failed = true;
             return false;
         };
-        if !platform.complete_owner_rendering_bo(output_idx, bo_idx) {
+        let state = &mut inner.outputs[output_idx];
+        let mut prepared = state.owner_buffers.remove(owner_buffer_index);
+        let Some(batch) = prepared
+            .pending_ack_mut()
+            .and_then(|ack| ack.managed_batch.take())
+        else {
             log::error!(
-                "render Owner scanout: buffer {bo_idx} was not OwnerRendering at completion"
+                "render Owner scanout: owner generation {} had no GPU batch",
+                prepared.identity().generation
             );
+            state.owner_buffers.insert(owner_buffer_index, prepared);
             platform.renderer_failed = true;
+            return false;
+        };
+        let generation = prepared.identity().generation;
+        if prepared.state() == OwnerBufferState::Displaced {
+            service.register_batch(batch);
+            if let Err(error) = service.service_completions(std::time::Instant::now()) {
+                log::warn!(
+                    "render Owner scanout: displaced compose completion failed for generation {generation}: {error:?}"
+                );
+            }
+            if let Some(ack) = prepared.pending_ack_mut() {
+                ack.stage = InFlightStage::OwnerDesired;
+            }
+            state.owner_buffers.insert(owner_buffer_index, prepared);
+            drop(fd);
+            return true;
+        }
+        if prepared.state() != OwnerBufferState::Rendering {
+            state.owner_buffers.insert(owner_buffer_index, prepared);
             return false;
         }
-        let Some(prepared) = inner.outputs[output_idx].owner_prepared.as_mut() else {
-            log::error!("render Owner scanout: prepared generation disappeared at completion");
-            platform.renderer_failed = true;
-            return false;
-        };
-        let Some(batch) = prepared.ack.managed_batch.take() else {
-            log::error!(
-                "render Owner scanout: prepared generation {} had no GPU batch",
-                prepared.ack.generation
-            );
-            platform.renderer_failed = true;
-            return false;
-        };
         let managed = service.reserve(
-            prepared.managed_key,
+            prepared.identity().managed_key,
             crate::kms::render::resources::UseKind::Retain,
         );
         service.register_batch(batch);
         let Ok(managed) = managed else {
             log::error!(
-                "render Owner scanout: could not retain prepared generation {} after completion",
-                prepared.ack.generation
+                "render Owner scanout: could not retain generation {generation} after completion"
             );
+            state.owner_buffers.insert(owner_buffer_index, prepared);
             platform.renderer_failed = true;
             return false;
         };
-        prepared.managed = Some(managed);
-        prepared.ack.stage = InFlightStage::OwnerDesired;
+        let mut desired = match prepared.into_desired(managed) {
+            Ok(desired) => desired,
+            Err(returned) => {
+                let (prepared, _managed) = *returned;
+                state.owner_buffers.insert(owner_buffer_index, prepared);
+                platform.renderer_failed = true;
+                return false;
+            }
+        };
+        let Some(ack) = desired.pending_ack_mut() else {
+            state.owner_buffers.insert(owner_buffer_index, desired);
+            platform.renderer_failed = true;
+            return false;
+        };
+        ack.stage = InFlightStage::OwnerDesired;
         // The render-completion fd is the evidence that this compose has
         // finished.  Let the resource service consume that evidence before
         // the offer can reach admission: its poll/commit path drops the
@@ -3645,53 +3797,23 @@ fn handle_scanout_render_completion_inner(
         if let Err(error) = service.service_completions(std::time::Instant::now()) {
             log::warn!(
                 "render Owner scanout: compose completion service failed for generation {}: {error:?}",
-                prepared.ack.generation,
+                generation,
             );
+        }
+        if let Err(desired) =
+            SceneCompositor::insert_existing_owner_buffer(state, desired, platform, output_idx)
+        {
+            state.owner_buffers.insert(owner_buffer_index, *desired);
+            platform.renderer_failed = true;
+            return false;
         }
         inner.owner_offers.push_back(ComposedOffer {
             device: output_key.device_key,
             crtc: u32::from(platform.outputs[output_idx].output.crtc),
-            generation: prepared.ack.generation,
+            generation,
         });
         // `fd` is intentionally dropped here. Owner carries no producer fd
         // through an ioctl; the drain owns and closes the notification.
-        drop(fd);
-        return true;
-    }
-    if let Some(displaced_idx) =
-        inner.outputs[output_idx]
-            .owner_displaced
-            .iter()
-            .position(|prepared| {
-                prepared.output_key == output_key
-                    && prepared.ack.bo_idx == bo_idx
-                    && prepared.ack.stage.matches_owner_render_completion(job_id)
-            })
-    {
-        let Some(service) = resource_service else {
-            log::error!(
-                "render Owner scanout: displaced completion arrived without ResourceService"
-            );
-            platform.renderer_failed = true;
-            return false;
-        };
-        let prepared = &mut inner.outputs[output_idx].owner_displaced[displaced_idx];
-        let Some(batch) = prepared.ack.managed_batch.take() else {
-            log::error!(
-                "render Owner scanout: displaced generation {} had no GPU batch",
-                prepared.ack.generation
-            );
-            platform.renderer_failed = true;
-            return false;
-        };
-        service.register_batch(batch);
-        if let Err(error) = service.service_completions(std::time::Instant::now()) {
-            log::warn!(
-                "render Owner scanout: displaced compose completion service failed for generation {}: {error:?}",
-                prepared.ack.generation,
-            );
-        }
-        prepared.ack.stage = InFlightStage::OwnerDesired;
         drop(fd);
         return true;
     }
@@ -4159,42 +4281,6 @@ fn apply_cursor_transition_on_retire(
     }
 }
 
-fn clear_owner_commit_id(
-    inner: &mut SceneCompositorInner,
-    commit: crate::kms::owner::identity::CommitId,
-) {
-    for state in &mut inner.outputs {
-        if state
-            .owner_prepared
-            .as_ref()
-            .is_some_and(|prepared| prepared.commit_id == Some(commit))
-            && let Some(prepared) = state.owner_prepared.as_mut()
-        {
-            prepared.commit_id = None;
-        }
-        for prepared in &mut state.owner_submitted {
-            if prepared.commit_id == Some(commit) {
-                prepared.commit_id = None;
-            }
-        }
-    }
-}
-
-fn restore_owner_prepared_after_resolution_failure(
-    state: &mut OutputSceneState,
-    prepared: PreparedComposed,
-    from_prepared: bool,
-    submitted_idx: Option<usize>,
-) {
-    if from_prepared {
-        state.owner_prepared = Some(prepared);
-    } else if let Some(index) = submitted_idx {
-        state.owner_submitted.insert(index, prepared);
-    } else {
-        state.owner_submitted.push_front(prepared);
-    }
-}
-
 fn retire_failed_submit_bos(
     state: &mut OutputSceneState,
     output_idx: usize,
@@ -4263,32 +4349,49 @@ fn retire_owner_displaced(
     let Some(service) = resource_service else {
         return;
     };
-    let mut remaining = VecDeque::with_capacity(state.owner_displaced.len());
-    while let Some(prepared) = state.owner_displaced.pop_front() {
+    let displaced_count = state
+        .owner_buffers
+        .iter()
+        .filter(|buffer| buffer.state() == OwnerBufferState::Displaced)
+        .count();
+    for _ in 0..displaced_count {
+        let Some(index) = state
+            .owner_buffers
+            .iter()
+            .position(|buffer| buffer.state() == OwnerBufferState::Displaced)
+        else {
+            break;
+        };
+        let mut prepared = state.owner_buffers.remove(index);
         // A batch is Some until its render completion is drained and handed
         // to ResourceService.  Only the service's later readiness result can
         // free a displaced owner buffer; the completion fd alone is not a
         // substitute for the compose fence.
-        let ready =
-            prepared.ack.managed_batch.is_none() && service.is_releasable(&prepared.managed_key);
+        let ready = prepared
+            .pending_ack()
+            .is_some_and(|ack| ack.managed_batch.is_none())
+            && service.is_releasable(&prepared.identity().managed_key);
         if ready {
-            if platform.release_owner_displaced_bo(output_idx, prepared.ack.bo_idx) {
-                if let Some(pool_slot) = prepared.pool_slot {
-                    state.pool_ring.release(pool_slot);
+            let bo_idx = prepared.identity().bo_idx;
+            if platform.leave_owner_buffer(output_idx, bo_idx) {
+                let pool_slot = prepared.take_descriptor_slot();
+                if prepared.into_free().is_ok() {
+                    if let Some(pool_slot) = pool_slot {
+                        state.pool_ring.release(pool_slot);
+                    }
+                } else {
+                    log::error!("render scene: owner displaced buffer {bo_idx} was not freeable");
+                    platform.renderer_failed = true;
                 }
             } else {
-                log::error!(
-                    "render scene: owner displaced buffer {} was not in OwnerDisplaced",
-                    prepared.ack.bo_idx
-                );
+                log::error!("render scene: owner displaced buffer {bo_idx} was not in Displaced");
                 platform.renderer_failed = true;
-                remaining.push_back(prepared);
+                state.owner_buffers.insert(index, prepared);
             }
         } else {
-            remaining.push_back(prepared);
+            state.owner_buffers.insert(index, prepared);
         }
     }
-    state.owner_displaced = remaining;
 }
 
 fn retire_owner_current(
@@ -4300,26 +4403,38 @@ fn retire_owner_current(
     let Some(service) = resource_service else {
         return;
     };
-    let mut remaining = VecDeque::with_capacity(state.owner_current.len());
-    while let Some(prepared) = state.owner_current.pop_front() {
-        let releasing = platform.owner_bo_phase(output_idx, prepared.ack.bo_idx)
-            == Some(BoPhase::OwnerReleasing);
-        let ready = releasing
-            && prepared.ack.managed_batch.is_none()
-            && service.is_releasable(&prepared.managed_key);
+    let releasing_count = state
+        .owner_buffers
+        .iter()
+        .filter(|buffer| buffer.state() == OwnerBufferState::Releasing)
+        .count();
+    for _ in 0..releasing_count {
+        let Some(index) = state
+            .owner_buffers
+            .iter()
+            .position(|buffer| buffer.state() == OwnerBufferState::Releasing)
+        else {
+            break;
+        };
+        let prepared = state.owner_buffers.remove(index);
+        let ready = prepared
+            .pending_ack()
+            .is_some_and(|ack| ack.managed_batch.is_none())
+            && service.is_releasable(&prepared.identity().managed_key);
         if ready {
-            if platform.release_owner_releasing_bo(output_idx, prepared.ack.bo_idx) {
-                if let Some(pool_slot) = prepared.pool_slot {
-                    state.pool_ring.release(pool_slot);
+            let bo_idx = prepared.identity().bo_idx;
+            if platform.leave_owner_buffer(output_idx, bo_idx) {
+                if prepared.into_free().is_err() {
+                    log::error!("render scene: owner releasing buffer {bo_idx} was not freeable");
+                    platform.renderer_failed = true;
                 }
             } else {
-                remaining.push_back(prepared);
+                state.owner_buffers.insert(index, prepared);
             }
         } else {
-            remaining.push_back(prepared);
+            state.owner_buffers.insert(index, prepared);
         }
     }
-    state.owner_current = remaining;
 }
 
 /// Drain the deferred descriptor-pool slot releases queued by
@@ -6358,40 +6473,48 @@ fn tick_one_output(
                         "Owner submit lost its managed allocation key",
                     ))));
                 };
-                if let Some(previous) = state.owner_prepared.take() {
-                    let owner_commit_in_flight = previous.commit_id.is_some()
-                        || matches!(
-                            platform.owner_bo_phase(output_idx, previous.ack.bo_idx),
-                            Some(BoPhase::OwnerSubmitted | BoPhase::OwnerAccepted)
-                        );
-                    if owner_commit_in_flight {
-                        // This generation is already owned by the in-flight
-                        // owner commit. Keep its PendingAck beside the newer
-                        // prepared generation; it is never latest-wins
-                        // displaced by a scene tick.
-                        state.owner_submitted.push_back(previous);
-                    } else {
-                        if !platform.displace_owner_bo(output_idx, previous.ack.bo_idx) {
-                            log::error!(
-                                "render scene: could not displace prepared Owner buffer {}",
-                                previous.ack.bo_idx
-                            );
+                if let Some(previous_index) = SceneCompositor::owner_prepared_index(state) {
+                    let previous = state.owner_buffers.remove(previous_index);
+                    let previous = match previous.into_displaced() {
+                        Ok(previous) => previous,
+                        Err(previous) => {
+                            state.owner_buffers.insert(previous_index, *previous);
+                            log::error!("render scene: prepared Owner buffer was not displaceable");
                             platform.renderer_failed = true;
                             return Err(SceneError::Present(PresentError::Io(io::Error::other(
-                                "Owner prepared buffer was not in a displaceable phase",
+                                "Owner prepared buffer was not in a displaceable state",
                             ))));
                         }
-                        state.owner_displaced.push_back(previous);
+                    };
+                    if let Err(previous) = SceneCompositor::insert_existing_owner_buffer(
+                        state, previous, platform, output_idx,
+                    ) {
+                        state.owner_buffers.insert(previous_index, *previous);
+                        platform.renderer_failed = true;
+                        return Err(SceneError::Present(PresentError::Io(io::Error::other(
+                            "Owner prepared buffer lost its owner membership",
+                        ))));
                     }
                 }
-                state.owner_prepared = Some(PreparedComposed {
-                    output_key,
-                    managed_key,
-                    managed: None,
-                    commit_id: None,
-                    pool_slot: Some(slot),
+                let owner_buffer = OwnerBuffer::rendering(
+                    OwnerBufferIdentity {
+                        output_key: output_key.clone(),
+                        crtc: u32::from(platform.outputs[output_idx].output.crtc),
+                        bo_idx,
+                        generation: frame_gen,
+                        managed_key,
+                    },
                     ack,
-                });
+                    slot,
+                );
+                if let Err(_owner_buffer) =
+                    SceneCompositor::insert_owner_buffer(state, output_idx, owner_buffer, platform)
+                {
+                    platform.renderer_failed = true;
+                    return Err(SceneError::Present(PresentError::Io(io::Error::other(
+                        "Owner submit could not install owner membership",
+                    ))));
+                }
                 // The generation identifies the latest prepared intent. It
                 // is not damage staging or a page-flip retirement claim.
                 state.current_generation = frame_gen;
@@ -9718,7 +9841,6 @@ fn submit_owner_shared_scanout_frame(
             return Err(PresentError::Vk(error));
         }
     };
-    bo.state.transition_to_owner_rendering();
     Ok((submitted, completion, batch))
 }
 

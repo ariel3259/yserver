@@ -605,6 +605,43 @@ the mutations. Each plan is written only after the previous one is accepted, so
 it cites implemented interfaces. Each plan carries a `docs/status.md` step.
 This document itself is reviewed by codex before plan Ci is written.
 
+**Plan Ci — done** (2026-09-19): implemented in `914f2818`..`f153c3a5`, accepted
+at fixture level with the hardware gate at 285/285
+(`../findings/2026-09-19-stage-2c-iii-plan-ci-accepted.md`).
+
+**Plan Ci-refactor, between Ci and Cii (user, 2026-09-19).** Behaviour-preserving,
+no new design: (b) one per-buffer owner state machine as a type, in place of the
+four owner queues and the owner `BoPhase` variants, so that "exactly one state per
+buffer" is enforced by the type rather than by tests; (d) one dispatch error and
+restore path shared by the primary and direct dispatches, and one owner begin
+entry in place of the fallible and infallible duplicates. Accepted only if every
+`c0_conv_ci_`, `c0_adm`, `c0_2ci` and `--lib` result and the hardware gate are
+unchanged, and every mutation caught in Ci's acceptance is still caught when
+re-applied to the new code. Reviewed by codex before implementation, like the
+other plans. Removing the legacy primary branches stays at the end of stage 4:
+production uses them until `Owner` goes live.
+
+*Amended (user, 2026-09-19), after the plan's Task 3 measured its own subject.*
+The refactor may also **collapse dispatch-failure policies that production
+cannot reach** into a single fail-closed path — close the transport gate, abort
+the token, return `TransportClosed` — under all of these conditions: every row
+that is reachable through production entries keeps today's outcome, gate state
+and resource disposition exactly; the unreachable conditions are identified by
+measurement recorded in the plan and its commits, not by assumption; and the
+acceptance numbers above, the mutation parity and the hardware gate are
+unchanged. This is the one exception to "behaviour-preserving" in this plan, and
+it exists because eight of the eleven rows of the dispatch-failure table
+describe situations that cannot occur (a `Cleanup` error needs `slot.release` to
+fail on the commit just reserved; the direct missing/extra-resource rows cannot
+come from a real preparation), and a table that documents unobservable
+behaviour is where the next reader's wrong assumption starts. Evidence for the
+collapsed path is a policy-level test on the real policy function, which proves
+the mapping only — never reachability or end-to-end restoration.
+
+**Constraint on Cii and Ciii (user, 2026-09-19):** new owner-route code lives in
+its own functions or modules, reached from one fork point per producer, never as
+branches interleaved in existing legacy functions.
+
 ### 8.4. Gate
 
 `cargo +nightly fmt`; `cargo clippy --all-targets -- -D warnings` in the default

@@ -48,6 +48,115 @@ pub(crate) enum AdmissionOutcome {
     Unsupported(Tier),
 }
 
+enum DispatchFailureRoute {
+    Primary {
+        backend_composed: bool,
+    },
+    Direct {
+        retirement: Option<crate::kms::render::resources::RoleReservation>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DispatchFailureKind {
+    Ledger,
+    Cleanup,
+    Refused,
+}
+
+enum DispatchFailureResources {
+    Ledger {
+        old: Vec<CommitResources>,
+        new: Vec<CommitResources>,
+    },
+    Cleanup {
+        old: Vec<CommitResources>,
+        new: Vec<CommitResources>,
+    },
+    Refused {
+        new: Vec<CommitResources>,
+    },
+}
+
+impl DispatchFailureResources {
+    fn split(
+        self,
+    ) -> (
+        DispatchFailureKind,
+        Vec<CommitResources>,
+        Vec<CommitResources>,
+    ) {
+        match self {
+            Self::Ledger { old, new } => (DispatchFailureKind::Ledger, old, new),
+            Self::Cleanup { old, new } => (DispatchFailureKind::Cleanup, old, new),
+            Self::Refused { new } => (DispatchFailureKind::Refused, Vec::new(), new),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchFailureOutcome {
+    BeginRefused,
+    TransportClosed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DispatchFailureAction {
+    outcome: DispatchFailureOutcome,
+    close_gate: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResourceRestore {
+    Succeeded,
+    Failed,
+    Missing,
+    Extra,
+    NotAttempted,
+}
+
+fn dispatch_failure_policy(
+    route: DispatchFailureRouteKind,
+    kind: DispatchFailureKind,
+    restore: ResourceRestore,
+) -> DispatchFailureAction {
+    match (route, kind, restore) {
+        (
+            DispatchFailureRouteKind::Primary,
+            DispatchFailureKind::Ledger,
+            ResourceRestore::Succeeded,
+        )
+        | (
+            DispatchFailureRouteKind::Direct,
+            DispatchFailureKind::Ledger,
+            ResourceRestore::Succeeded,
+        )
+        | (
+            DispatchFailureRouteKind::Primary,
+            DispatchFailureKind::Refused,
+            ResourceRestore::NotAttempted,
+        )
+        | (
+            DispatchFailureRouteKind::Direct,
+            DispatchFailureKind::Refused,
+            ResourceRestore::Succeeded | ResourceRestore::Failed,
+        ) => DispatchFailureAction {
+            outcome: DispatchFailureOutcome::BeginRefused,
+            close_gate: false,
+        },
+        _ => DispatchFailureAction {
+            outcome: DispatchFailureOutcome::TransportClosed,
+            close_gate: true,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DispatchFailureRouteKind {
+    Primary,
+    Direct,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AdmissionTraceStep {
@@ -977,6 +1086,74 @@ impl KmsBackend {
         self.admission_dispatch_decision(device, token, decision.clone())
     }
 
+    fn restore_direct_dispatch_resources(
+        &mut self,
+        mut new: Vec<CommitResources>,
+        retirement: Option<crate::kms::render::resources::RoleReservation>,
+    ) -> ResourceRestore {
+        let Some(resources) = new.pop() else {
+            return ResourceRestore::Missing;
+        };
+        if !new.is_empty() {
+            return ResourceRestore::Extra;
+        }
+        if self
+            .managed_undo_direct_dispatch(PreparedDirectDispatch {
+                resources,
+                retirement,
+            })
+            .is_ok()
+        {
+            ResourceRestore::Succeeded
+        } else {
+            ResourceRestore::Failed
+        }
+    }
+
+    fn admission_handle_dispatch_failure(
+        &mut self,
+        device: DrmDeviceKey,
+        token: AdmissionToken,
+        route: DispatchFailureRoute,
+        failure: DispatchFailureResources,
+    ) -> AdmissionOutcome {
+        let (kind, old, new) = failure.split();
+        self.commit_consumer.current_resources.extend(old);
+
+        let (route_kind, restore) = match route {
+            DispatchFailureRoute::Primary { backend_composed } => {
+                let restore = if matches!(kind, DispatchFailureKind::Refused) {
+                    ResourceRestore::NotAttempted
+                } else if self.restore_primary_composed_resources(device, backend_composed, new) {
+                    ResourceRestore::Succeeded
+                } else {
+                    ResourceRestore::Failed
+                };
+                (DispatchFailureRouteKind::Primary, restore)
+            }
+            DispatchFailureRoute::Direct { retirement } => (
+                DispatchFailureRouteKind::Direct,
+                self.restore_direct_dispatch_resources(new, retirement),
+            ),
+        };
+        let action = dispatch_failure_policy(route_kind, kind, restore);
+        if action.outcome == DispatchFailureOutcome::TransportClosed {
+            log::error!(
+                "admission dispatch failure is fail-closed: route={route_kind:?}, kind={kind:?}, resource_restore={restore:?}"
+            );
+        }
+        if action.close_gate
+            && let Some(gate) = self.platform.transport_gate_mut(&device)
+        {
+            gate.force_close();
+        }
+        self.admission_abort(device, token);
+        match action.outcome {
+            DispatchFailureOutcome::BeginRefused => AdmissionOutcome::BeginRefused,
+            DispatchFailureOutcome::TransportClosed => AdmissionOutcome::TransportClosed,
+        }
+    }
+
     fn admission_dispatch_primary(
         &mut self,
         device: DrmDeviceKey,
@@ -1025,13 +1202,7 @@ impl KmsBackend {
             };
             conductor.source.describe(&decision)
         };
-        enum PrimaryBeginError {
-            Ledger(Vec<CommitResources>, Vec<CommitResources>),
-            Cleanup(Vec<CommitResources>, Vec<CommitResources>),
-            Refused,
-        }
-
-        let result: Result<CommitId, PrimaryBeginError> = {
+        let result: Result<CommitId, DispatchFailureResources> = {
             let consumer = &mut self.commit_consumer;
             let Some(service) = self.resource_service.as_mut() else {
                 self.admission_abort(device, token);
@@ -1093,13 +1264,15 @@ impl KmsBackend {
                 }) {
                     Ok((commit, _events)) => Ok(commit),
                     Err(FallibleBeginError::Ledger((_error, old, new))) => {
-                        Err(PrimaryBeginError::Ledger(old, new))
+                        Err(DispatchFailureResources::Ledger { old, new })
                     }
                     Err(FallibleBeginError::Cleanup {
                         error: (_error, old, new),
                         ..
-                    }) => Err(PrimaryBeginError::Cleanup(old, new)),
-                    Err(FallibleBeginError::Refused { .. }) => Err(PrimaryBeginError::Refused),
+                    }) => Err(DispatchFailureResources::Cleanup { old, new }),
+                    Err(FallibleBeginError::Refused { .. }) => {
+                        Err(DispatchFailureResources::Refused { new: Vec::new() })
+                    }
                 }
             } else {
                 let Some(conductor) = self.admission_conductors.get_mut(&device) else {
@@ -1137,46 +1310,30 @@ impl KmsBackend {
                 }) {
                     Ok((commit, _events)) => Ok(commit),
                     Err(FallibleBeginError::Ledger((_error, old, new))) => {
-                        Err(PrimaryBeginError::Ledger(old, new))
+                        Err(DispatchFailureResources::Ledger { old, new })
                     }
                     Err(FallibleBeginError::Cleanup {
                         error: (_error, old, new),
                         ..
-                    }) => Err(PrimaryBeginError::Cleanup(old, new)),
-                    Err(FallibleBeginError::Refused { .. }) => Err(PrimaryBeginError::Refused),
+                    }) => Err(DispatchFailureResources::Cleanup { old, new }),
+                    Err(FallibleBeginError::Refused { .. }) => {
+                        Err(DispatchFailureResources::Refused { new: Vec::new() })
+                    }
                 }
             }
         };
 
         let commit = match result {
             Ok(commit) => commit,
-            Err(PrimaryBeginError::Ledger(old, new)) => {
-                self.commit_consumer.current_resources.extend(old);
-                if !self.restore_primary_composed_resources(device, use_backend_composed, new) {
-                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
-                        gate.force_close();
-                    }
-                    self.admission_abort(device, token);
-                    return AdmissionOutcome::TransportClosed;
-                }
-                self.admission_abort(device, token);
-                return AdmissionOutcome::BeginRefused;
-            }
-            Err(PrimaryBeginError::Cleanup(old, new)) => {
-                self.commit_consumer.current_resources.extend(old);
-                if !self.restore_primary_composed_resources(device, use_backend_composed, new) {
-                    self.admission_abort(device, token);
-                    return AdmissionOutcome::TransportClosed;
-                }
-                if let Some(gate) = self.platform.transport_gate_mut(&device) {
-                    gate.force_close();
-                }
-                self.admission_abort(device, token);
-                return AdmissionOutcome::BeginRefused;
-            }
-            Err(PrimaryBeginError::Refused) => {
-                self.admission_abort(device, token);
-                return AdmissionOutcome::BeginRefused;
+            Err(failure) => {
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Primary {
+                        backend_composed: use_backend_composed,
+                    },
+                    failure,
+                );
             }
         };
         #[cfg(not(test))]
@@ -1317,75 +1474,40 @@ impl KmsBackend {
 
         let commit = match result {
             Ok((commit, _events)) => commit,
-            Err(FallibleBeginError::Ledger((_error, old, mut new))) => {
-                self.commit_consumer.current_resources.extend(old);
-                let Some(resources) = new.pop() else {
-                    self.admission_abort(device, token);
-                    return AdmissionOutcome::TransportClosed;
-                };
-                if !new.is_empty()
-                    || self
-                        .managed_undo_direct_dispatch(PreparedDirectDispatch {
-                            resources,
-                            retirement,
-                        })
-                        .is_err()
-                {
-                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
-                        gate.force_close();
-                    }
-                    self.admission_abort(device, token);
-                    return AdmissionOutcome::TransportClosed;
-                }
-                self.admission_abort(device, token);
-                return AdmissionOutcome::BeginRefused;
+            Err(FallibleBeginError::Ledger((_error, old, new))) => {
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Ledger { old, new },
+                );
             }
             Err(FallibleBeginError::Cleanup {
-                error: (_error, old, mut new),
+                error: (_error, old, new),
                 ..
             }) => {
-                self.commit_consumer.current_resources.extend(old);
-                let Some(resources) = new.pop() else {
-                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
-                        gate.force_close();
-                    }
-                    self.admission_abort(device, token);
-                    return AdmissionOutcome::TransportClosed;
-                };
-                if !new.is_empty()
-                    || self
-                        .managed_undo_direct_dispatch(PreparedDirectDispatch {
-                            resources,
-                            retirement,
-                        })
-                        .is_err()
-                {
-                    if let Some(gate) = self.platform.transport_gate_mut(&device) {
-                        gate.force_close();
-                    }
-                    self.admission_abort(device, token);
-                    return AdmissionOutcome::TransportClosed;
-                }
-                if let Some(gate) = self.platform.transport_gate_mut(&device) {
-                    gate.force_close();
-                }
-                self.admission_abort(device, token);
-                return AdmissionOutcome::TransportClosed;
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Cleanup { old, new },
+                );
             }
             Err(FallibleBeginError::Refused { .. }) => {
-                let prepared = PreparedDirectDispatch {
-                    resources: match resources.take() {
-                        Some(resources) => resources,
-                        None => {
-                            self.admission_abort(device, token);
-                            return AdmissionOutcome::TransportClosed;
-                        }
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
                     },
-                    retirement,
-                };
-                let _ = self.managed_undo_direct_dispatch(prepared);
-                self.admission_abort(device, token);
-                return AdmissionOutcome::BeginRefused;
+                    DispatchFailureResources::Refused {
+                        new: resources.take().into_iter().collect(),
+                    },
+                );
             }
         };
         if let Some(retirement) = retirement.take() {
@@ -1852,4 +1974,30 @@ fn has_current_direct(backend: &KmsBackend) -> bool {
                 role.role() == crate::kms::render::resources::DirectRole::Current
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c0_conv_cir_dispatch_failure_fallback_is_fail_closed() {
+        // This proves the mapping only — not reachability or end-to-end restoration.
+        for (route, kind, restore) in [
+            (
+                DispatchFailureRouteKind::Primary,
+                DispatchFailureKind::Cleanup,
+                ResourceRestore::Succeeded,
+            ),
+            (
+                DispatchFailureRouteKind::Direct,
+                DispatchFailureKind::Cleanup,
+                ResourceRestore::Succeeded,
+            ),
+        ] {
+            let action = dispatch_failure_policy(route, kind, restore);
+            assert_eq!(action.outcome, DispatchFailureOutcome::TransportClosed);
+            assert!(action.close_gate);
+        }
+    }
 }
