@@ -2312,10 +2312,28 @@ impl KmsBackend {
         }
     }
 
+    pub(crate) fn direct_scanout_device_for_unflip(&self) -> Option<DrmDeviceKey> {
+        let frame_device = self
+            .scanout_m2
+            .pending
+            .as_ref()
+            .or(self.scanout_m2.current.as_ref())
+            .or(self.scanout_m2.queued_successor.as_ref())
+            .and_then(|frame| {
+                self.platform
+                    .outputs
+                    .iter()
+                    .find(|output| u32::from(output.output.crtc) == frame.candidate.crtc_id)
+                    .map(|output| output.key.device_key)
+            });
+        frame_device.or_else(|| self.platform.primary_device().map(|device| device.key))
+    }
+
     pub(crate) fn request_direct_unflip(&mut self, reason: &'static str) {
         if !self.scanout_m2.active() {
             return;
         }
+        let first_request = !self.scanout_m2.unflip_requested;
         if !self.scanout_m2.unflip_requested {
             self.scanout_m2.unflip_reason = Some(reason);
         }
@@ -2323,6 +2341,13 @@ impl KmsBackend {
         self.scanout_m2.unflip_last_reason = Some(reason);
         self.scanout_m2.hold_direct = false;
         self.scanout_m2.sync_ownership();
+        if first_request
+            && let Some(device) = self
+                .direct_scanout_device_for_unflip()
+                .filter(|&device| self.admission_is_active(device))
+        {
+            crate::kms::render::unflip_owner::request(self, device);
+        }
     }
 
     fn direct_frame_references_host_drawable(&self, host_xid: u32) -> bool {
@@ -20971,6 +20996,30 @@ impl KmsBackend {
         Ok(can_reenter)
     }
 
+    /// Prepare an owner-route unflip without occupying a direct capacity role.
+    /// The dispatch takes the current resources into `ExitRetirement`; the
+    /// request only cancels unsent work, materializes the fallback shadow, and
+    /// recomputes the re-entry barrier.
+    pub(crate) fn managed_prepare_direct_unflip_request(&mut self) -> io::Result<()> {
+        self.managed_terminalize_queued_direct_successor(None);
+        let result = self.materialize_direct_shadow_for_unflip();
+        self.scanout_m2.reentry_blocked_until_composed = !self.managed_can_enter_direct();
+        result
+    }
+
+    /// Retry only the owner unflip's shadow materialization. This is called at
+    /// the transaction fork, not from readiness, so a one-shot cause still has
+    /// a later tick edge without repeating the request-side effects.
+    pub(crate) fn managed_retry_direct_unflip_shadow(&mut self) -> io::Result<()> {
+        let result = self.materialize_direct_shadow_for_unflip();
+        self.scanout_m2.reentry_blocked_until_composed = !self.managed_can_enter_direct();
+        result
+    }
+
+    pub(crate) fn direct_unflip_shadow_ready(&self) -> bool {
+        self.scanout_m2.unflip_shadow_ready
+    }
+
     /// Check whether direct entry is permitted under managed capacity rules (8.5).
     #[allow(dead_code)]
     pub(crate) fn managed_can_enter_direct(&self) -> bool {
@@ -21615,6 +21664,22 @@ impl Backend for KmsBackend {
                 return Ok(());
             }
             if self.scanout_m2.current.is_some() && self.scanout_m2.unflip_requested {
+                if let Some(device) = self
+                    .direct_scanout_device_for_unflip()
+                    .filter(|&device| self.admission_is_active(device))
+                {
+                    if !crate::kms::render::unflip_owner::retry_materialization(self, device) {
+                        self.drain_render_telemetry();
+                        self.telemetry.maybe_emit(self.engine.pending_count());
+                        return Ok(());
+                    }
+                    // Task 2 consumes the ready Unflip admission and builds
+                    // its owner transaction at this same fork. Until then,
+                    // never fall through to the Legacy primary sink.
+                    self.drain_render_telemetry();
+                    self.telemetry.maybe_emit(self.engine.pending_count());
+                    return Ok(());
+                }
                 if let Err(error) = self.submit_composed_unflip() {
                     log::error!(
                         "scanout_m2: synchronized composed unflip failed: {error}; degrading to per-output composed flips"
@@ -55713,23 +55778,13 @@ mod tests {
     #[test]
     fn c0_adm_conductor_unflip_waits_without_a_composed_return() {
         use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
-        use std::collections::BTreeSet;
-
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
         install_admission_owner_gate(&mut backend, device);
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
-        let crtcs = backend
-            .platform
-            .outputs
-            .iter()
-            .filter(|output| output.key.device_key == device)
-            .map(|output| u32::from(output.output.crtc))
-            .collect::<BTreeSet<_>>();
-        backend
-            .admission_request_unflip(device, crtcs)
-            .expect("unflip request");
+        backend.scanout_m2.test_force_active = true;
+        backend.request_direct_unflip("c0_adm_unflip_wait");
         let snapshot = backend
             .admission_snapshot(device, false)
             .expect("owner snapshot");
@@ -55741,23 +55796,13 @@ mod tests {
 
     #[test]
     fn c0_adm_conductor_direct_offer_is_refused_before_the_seam_while_unflip_is_pending() {
-        use std::collections::BTreeSet;
-
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
         install_admission_owner_gate(&mut backend, device);
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
-        let crtcs = backend
-            .platform
-            .outputs
-            .iter()
-            .filter(|output| output.key.device_key == device)
-            .map(|output| u32::from(output.output.crtc))
-            .collect::<BTreeSet<_>>();
-        backend
-            .admission_request_unflip(device, crtcs)
-            .expect("unflip request");
+        backend.scanout_m2.test_force_active = true;
+        backend.request_direct_unflip("c0_adm_unflip_direct_offer");
         let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 3);
         let occupied = backend.commit_consumer.capacity.occupied();
         assert!(
@@ -55777,8 +55822,6 @@ mod tests {
 
     #[test]
     fn c0_adm_conductor_unflip_request_terminalizes_the_queued_frame() {
-        use std::collections::BTreeSet;
-
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
         install_admission_owner_gate(&mut backend, device);
@@ -55791,16 +55834,7 @@ mod tests {
                 .expect("direct offer")
         );
         let occupied = backend.commit_consumer.capacity.occupied();
-        let crtcs = backend
-            .platform
-            .outputs
-            .iter()
-            .filter(|output| output.key.device_key == device)
-            .map(|output| u32::from(output.output.crtc))
-            .collect::<BTreeSet<_>>();
-        backend
-            .admission_request_unflip(device, crtcs)
-            .expect("unflip request");
+        backend.request_direct_unflip("c0_adm_unflip_terminalize");
 
         assert!(
             backend.admission_conductors[&device]
@@ -55823,6 +55857,436 @@ mod tests {
                 .unflip()
                 .is_some()
         );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_every_unflip_cause_reaches_the_owner_request_vulkan() {
+        fn owner_backend() -> super::KmsBackend {
+            let mut backend = super::KmsBackend::for_tests();
+            let device = backend.platform.primary_device().expect("device").key;
+            install_admission_owner_gate(&mut backend, device);
+            let (source, _, _) = AdmissionSourceFixture::new();
+            backend.install_admission_conductor_for_tests(device, source);
+            backend.scanout_m2.test_force_active = true;
+            backend
+        }
+
+        let mut cursor = owner_backend();
+        cursor.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
+            ebusy_count: 0,
+            fallback_changed: true,
+            retry_required: false,
+        });
+        let device = cursor.platform.primary_device().expect("device").key;
+        assert!(
+            cursor.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_some()
+        );
+        assert_eq!(
+            cursor.scanout_m2.unflip_last_reason,
+            Some("cursor_move_fallback_or_retry")
+        );
+
+        let mut topology = owner_backend();
+        topology.scanout_m2.unflip_shadow_ready = true;
+        let width = topology.platform.fb_w.saturating_add(1);
+        topology
+            .apply_virtual_screen_extent(width, topology.platform.fb_h)
+            .expect("topology cause");
+        let device = topology.platform.primary_device().expect("device").key;
+        assert!(
+            topology.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_some()
+        );
+
+        let mut tick = owner_backend();
+        tick.scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Sw);
+        tick.tick_maybe_composite_for_tests();
+        let device = tick.platform.primary_device().expect("device").key;
+        assert!(
+            tick.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_some()
+        );
+
+        // A second real cause is idempotent: it cannot replace the original
+        // request or create another admission barrier.
+        let first_reason = cursor.scanout_m2.unflip_reason;
+        cursor.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
+            ebusy_count: 0,
+            fallback_changed: true,
+            retry_required: false,
+        });
+        assert_eq!(cursor.scanout_m2.unflip_reason, first_reason);
+
+        let mut legacy = super::KmsBackend::for_tests();
+        let device = legacy.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut legacy, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        legacy.install_admission_conductor_for_tests(device, source);
+        install_admission_legacy_gate(&mut legacy, device);
+        legacy.get_overlay_window(None).expect("materialize COW");
+        let cow_id = legacy.cow_id.expect("COW");
+        let target_xid = 0xC780;
+        seed_window(&mut legacy, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut legacy, target_xid, cow_id, false);
+        let successor = legacy.scanout_m2.pending.take().expect("test successor");
+        legacy.queue_direct_successor(successor);
+        legacy.request_direct_unflip("c0_ciii_legacy_cause");
+        assert!(legacy.scanout_m2.unflip_requested);
+        assert!(
+            legacy.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_none()
+        );
+        assert!(legacy.scanout_m2.queued_successor.is_some());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_readiness_waits_on_each_precondition_vulkan() {
+        use crate::kms::{
+            owner::admission::{IntentKey, Readiness, WaitReason},
+            render::resources::{CommitResources, DirectRole},
+        };
+        use std::collections::BTreeSet;
+
+        fn mark_retained_composed_buffers(backend: &mut super::KmsBackend) {
+            for pool in &mut backend.platform.scanout_pools {
+                let pool = pool.as_mut().expect("live output has a scanout pool");
+                let bo = pool
+                    .display_pool_mut()
+                    .bos
+                    .iter_mut()
+                    .find(|bo| {
+                        matches!(
+                            bo.state.phase,
+                            crate::kms::vk::scanout::BoPhase::Free
+                                | crate::kms::vk::scanout::BoPhase::OnScreen
+                        )
+                    })
+                    .expect("live output has a reusable scanout BO");
+                bo.state.mark_on_screen_after_modeset();
+            }
+        }
+
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        mark_retained_composed_buffers(&mut backend);
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<BTreeSet<_>>();
+        backend
+            .admission_request_unflip(device, crtcs.clone())
+            .expect("unflip request");
+        backend.scanout_m2.unflip_shadow_ready = false;
+        backend.scanout_m2.reentry_blocked_until_composed = true;
+        let snapshot = backend.admission_snapshot(device, false).expect("snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Unflip),
+            Some(Readiness::Waiting(WaitReason::UnflipShadowNotMaterialized))
+        );
+        assert!(backend.scanout_m2.reentry_blocked_until_composed);
+
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        mark_retained_composed_buffers(&mut backend);
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<BTreeSet<_>>();
+        backend
+            .admission_request_unflip(device, crtcs)
+            .expect("unflip request");
+        backend.scanout_m2.unflip_shadow_ready = true;
+        let exit_slot = backend
+            .commit_consumer
+            .capacity
+            .reserve(DirectRole::ExitRetirement)
+            .expect("foreign exit retirement reservation");
+        let exit_resources = backend
+            .commit_consumer
+            .capacity
+            .attach(
+                exit_slot,
+                CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new()),
+            )
+            .expect("foreign exit retirement");
+        backend
+            .commit_consumer
+            .releasing_resources
+            .push(exit_resources);
+        let snapshot = backend.admission_snapshot(device, false).expect("snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Unflip),
+            Some(Readiness::Waiting(WaitReason::ExitRetirementOccupied))
+        );
+
+        let mut backend = raw_live_scene_fixture_with_output_count(2)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend.scanout_m2.unflip_shadow_ready = true;
+        let pool = backend.platform.scanout_pools[0]
+            .as_mut()
+            .expect("output 0 has a scanout pool");
+        let bo = pool
+            .display_pool_mut()
+            .bos
+            .iter_mut()
+            .find(|bo| {
+                matches!(
+                    bo.state.phase,
+                    crate::kms::vk::scanout::BoPhase::Free
+                        | crate::kms::vk::scanout::BoPhase::OnScreen
+                )
+            })
+            .expect("output 0 has a reusable scanout BO");
+        bo.state.mark_on_screen_after_modeset();
+        assert!(
+            backend.platform.retained_composed_framebuffer(0).is_some(),
+            "output 0 must hold the retained composed framebuffer"
+        );
+        assert!(
+            backend.platform.retained_composed_framebuffer(1).is_none(),
+            "output 1 must be the one output missing its retained framebuffer"
+        );
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<BTreeSet<_>>();
+        backend
+            .admission_request_unflip(device, crtcs)
+            .expect("unflip request with missing composed return");
+        let snapshot = backend
+            .admission_snapshot(device, false)
+            .expect("owner snapshot with missing composed return");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Unflip),
+            Some(Readiness::Waiting(WaitReason::ComposedReturnNotEstablished))
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_successful_shadow_reaches_ready_and_wakes_admission_vulkan() {
+        use crate::kms::{
+            owner::admission::{IntentKey, Readiness},
+            render::admission::AdmissionTraceStep,
+        };
+
+        let mut backend = raw_live_scene_fixture_with_output_count(1)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        backend.get_overlay_window(None).expect("materialize COW");
+        let cow_id = backend.cow_id.expect("COW");
+        let (source_id, _, _, _) =
+            install_direct_frame_for_target_test(&mut backend, 0xC7D0, cow_id, true);
+        let source_storage = backend
+            .platform
+            .allocate_drawable_storage(100, 100, 24)
+            .expect("real direct source storage");
+        backend
+            .store
+            .get_mut(source_id)
+            .expect("direct source drawable")
+            .storage = source_storage;
+
+        let pool = backend.platform.scanout_pools[0]
+            .as_mut()
+            .expect("live output has a scanout pool");
+        let bo = pool
+            .display_pool_mut()
+            .bos
+            .iter_mut()
+            .find(|bo| {
+                matches!(
+                    bo.state.phase,
+                    crate::kms::vk::scanout::BoPhase::Free
+                        | crate::kms::vk::scanout::BoPhase::OnScreen
+                )
+            })
+            .expect("live output has a reusable scanout BO");
+        bo.state.mark_on_screen_after_modeset();
+        assert!(
+            backend.platform.retained_composed_framebuffer(0).is_some(),
+            "the happy path must start with a retained composed framebuffer"
+        );
+
+        backend.request_direct_unflip("c0_ciii_successful_shadow");
+        assert!(
+            backend.direct_unflip_shadow_ready(),
+            "the request must record successful real shadow materialization"
+        );
+        let snapshot = backend
+            .admission_snapshot(device, false)
+            .expect("owner snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Unflip),
+            Some(Readiness::Ready),
+            "a successfully materialized shadow plus the retained composed return must admit"
+        );
+        assert!(
+            backend.admission_trace_for_tests(device).is_empty(),
+            "the first request wakes before materialization, so the later retry must provide the ready wake"
+        );
+
+        backend.tick_maybe_composite_for_tests();
+        assert!(
+            backend
+                .admission_trace_for_tests(device)
+                .contains(&AdmissionTraceStep::Decided),
+            "the transaction-fork retry must wake admission after the shadow becomes ready"
+        );
+    }
+
+    fn raw_live_scene_fixture_with_output_count(
+        output_count: usize,
+    ) -> Result<super::KmsBackend, std::io::Error> {
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        if output_count > 1 {
+            let vk =
+                backend.platform.vk.as_ref().cloned().ok_or_else(|| {
+                    std::io::Error::other("live-scene fixture has no Vulkan context")
+                })?;
+            for output_idx in 1..output_count {
+                backend.platform.append_test_output_with_scanout_pool(
+                    std::sync::Arc::clone(&vk),
+                    &format!("test-output-{output_idx}"),
+                )?;
+            }
+            let output_width = backend.platform.outputs[0].width;
+            for (output_idx, output) in backend.platform.outputs.iter_mut().enumerate() {
+                output.x = i32::from(output_width)
+                    .saturating_mul(i32::try_from(output_idx).unwrap_or(i32::MAX));
+            }
+            let fb_w = output_width.saturating_mul(u16::try_from(output_count).unwrap_or(u16::MAX));
+            backend.apply_virtual_screen_extent(fb_w, backend.platform.outputs[0].height)?;
+            backend
+                .scene
+                .rebuild_outputs(&backend.platform)
+                .map_err(|error| {
+                    std::io::Error::other(format!("rebuild multi-output scene: {error:?}"))
+                })?;
+        }
+        Ok(backend)
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_request_prepares_without_occupying_capacity_vulkan() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend.get_overlay_window(None).expect("materialize COW");
+        let cow_id = backend.cow_id.expect("COW");
+        let target_xid = 0xC700;
+        seed_window(&mut backend, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut backend, target_xid, cow_id, true);
+        let (_, _, _, _) =
+            install_direct_frame_for_target_test(&mut backend, target_xid + 10, cow_id, false);
+        let successor = backend.scanout_m2.pending.take().expect("test successor");
+        backend.queue_direct_successor(successor);
+        backend.request_direct_unflip("c0_ciii_request_prepare");
+
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_some(),
+            "the request must enter the owner admission barrier"
+        );
+        assert!(!backend.scanout_m2.unflip_shadow_ready);
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(backend.scanout_m2.idled.len(), 1);
+        assert!(
+            backend
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement),
+            "the request must not reserve ExitRetirement"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_shadow_failure_defers_admission_vulkan() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        backend.get_overlay_window(None).expect("materialize COW");
+        let cow_id = backend.cow_id.expect("COW");
+        let target_xid = 0xC7A0;
+        seed_window(&mut backend, target_xid, None, 0, 0);
+        install_direct_frame_for_target_test(&mut backend, target_xid, cow_id, true);
+        backend.request_direct_unflip("c0_ciii_one_shot_failure");
+
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_some(),
+            "a failed materialization must leave the request pending"
+        );
+        assert!(!backend.scanout_m2.unflip_shadow_ready);
+        backend.scanout_m2.reentry_blocked_until_composed = false;
+        backend.tick_maybe_composite_for_tests();
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(!backend.scanout_m2.unflip_shadow_ready);
+        assert!(backend.scanout_m2.reentry_blocked_until_composed);
     }
 
     #[test]

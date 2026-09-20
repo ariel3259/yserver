@@ -724,7 +724,6 @@ impl KmsBackend {
             .expect("active admission conductor")
             .admission
             .request_unflip(crtcs)?;
-        self.request_direct_unflip("admission_unflip");
         if let Some(successor) = displaced {
             let terminalized =
                 self.managed_terminalize_queued_direct_successor(Some(successor.source_generation));
@@ -981,6 +980,8 @@ impl KmsBackend {
                     Readiness::Waiting(WaitReason::ExitRetirementOccupied)
                 } else if !composed_return_established {
                     Readiness::Waiting(WaitReason::ComposedReturnNotEstablished)
+                } else if !self.direct_unflip_shadow_ready() {
+                    Readiness::Waiting(WaitReason::UnflipShadowNotMaterialized)
                 } else {
                     Readiness::Ready
                 };

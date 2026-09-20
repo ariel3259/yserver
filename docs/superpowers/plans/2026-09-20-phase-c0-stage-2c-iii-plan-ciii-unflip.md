@@ -524,7 +524,7 @@ user's go-ahead.
 | Criterion (spec) | Tests | Mutation that must fail them |
 | --- | --- | --- |
 | Every production cause of an unflip reaches the owner request on an `Owner` device, and only the legacy flags on a `Legacy` one, through an **acyclic** entry (§6.1, decision 3; round-3 B-1) | `c0_conv_ciii_every_unflip_cause_reaches_the_owner_request_vulkan` (at least three distinct causes, one raised twice) | T1: fork only for the cursor cause; T2: take the owner request under `Legacy`; T38: restore the admission primitive's call back into the funnel |
-| An unflip is not admitted until the exit-retirement position is free, every affected output has its retained composed framebuffer **and** the direct shadow is materialized (§6.1) | `c0_conv_ciii_unflip_readiness_waits_on_each_precondition` (one case per precondition, each with the others satisfied) | T3: report `Ready` while the shadow is unmaterialized; T4: report `Ready` while a **foreign** exit retirement is in flight |
+| An unflip is not admitted until the exit-retirement position is free, every affected output has its retained composed framebuffer **and** the direct shadow is materialized (§6.1) | `c0_conv_ciii_unflip_readiness_waits_on_each_precondition_vulkan` (three negative cases, including two outputs with exactly one retained framebuffer missing) and `c0_conv_ciii_unflip_successful_shadow_reaches_ready_and_wakes_admission_vulkan` (successful shadow, `Ready` snapshot, and retry wake) | T3: report `Ready` while the shadow is unmaterialized; T4: report `Ready` while a **foreign** exit retirement is in flight |
 | The request materializes the shadow and terminalizes unsent direct work, and occupies no capacity role (§6.1, decision 2) | `c0_conv_ciii_unflip_request_prepares_without_occupying_capacity_vulkan` | T5: reserve `ExitRetirement` in the request, as revision 1 did |
 | A failed materialization leaves the unflip requested, unadmitted and retried on the next tick even when its cause is one-shot, never dispatched (§6.1, decision 2; round-4 B-1) | `c0_conv_ciii_unflip_shadow_failure_defers_admission_vulkan` | T6: treat a failed materialization as ready; T7: retry it inside the readiness computation; T39: retry only in the request funnel, so a one-shot cause stalls |
 | `Unflip` is dispatched; `Topology` and `CursorRecovery` stay `Unsupported` (§6.1) | `c0_conv_ciii_unflip_dispatches_and_others_stay_unsupported` | T8: keep `Unflip` in `decision_requires_unsupported`; T9: drop `Topology` from it as well |
@@ -581,8 +581,13 @@ fails the request; `admission_snapshot` has no side effect.
   three distinct causes, each driven through its real caller, and one of them
   raised **twice** (the idempotence half); the test would not terminate if the
   funnel and the primitive still called each other.
-- `c0_conv_ciii_unflip_readiness_waits_on_each_precondition` — three cases,
-  each with the other two satisfied, each naming its own `WaitReason`.
+- `c0_conv_ciii_unflip_readiness_waits_on_each_precondition_vulkan` — three
+  negative cases, each with the other preconditions satisfied; its composed
+  return case has two outputs and exactly one missing retained framebuffer.
+- `c0_conv_ciii_unflip_successful_shadow_reaches_ready_and_wakes_admission_vulkan`
+  — a real direct source and fallback target make shadow materialization
+  succeed; the snapshot is `Ready`, and the normal retry tick records the
+  admission wake.
 - `c0_conv_ciii_unflip_request_prepares_without_occupying_capacity_vulkan`.
 - `c0_conv_ciii_unflip_shadow_failure_defers_admission_vulkan`.
 
