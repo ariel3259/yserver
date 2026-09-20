@@ -2,6 +2,26 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 10 (2026-09-20)** — incorporates codex round 9
+(`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round9.md`: 1 blocking,
+1 major, both verified against the tree by the author and accepted; round 8's
+M-1 audited APPLIED and its M-2 TRADED, closed here).
+
+- **B-1, confirmed: the return effects were device-blind.** Task 5 named the
+  legacy return's own helpers, and both are global:
+  `invalidate_all_scanout_damage` invalidates **every** scene output
+  (`scene.rs:1491`) and `mark_scene_structure_dirty` adds full-output
+  structure damage to every output (`scene.rs:2691`). Device A's unflip would
+  repaint device B — the very defect this plan's decision 9 calls a defect.
+  Task 5 now takes one scene operation over the **recorded affected output
+  identities**, with an A/B case and T48.
+- **M-1, confirmed: plan, spec and exit table disagreed on the P3-3 step.**
+  Revision 9 moved the retaining commit before the unflip but left the exit
+  table saying "step 4". The table is corrected, and **spec §6.4 is annotated**
+  (2026-09-20) to record that the plan exercised the choice that section
+  delegates and why the illustrative ordering cannot retain anything. Legacy
+  behaviour and the rest of §6.4 are untouched.
+
 **Revision 9 (2026-09-20)** — incorporates codex round 8
 (`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round8.md`: **0
 blocking**, 2 major, both verified against the tree by the author and
@@ -459,6 +479,7 @@ user's go-ahead.
 | Every affected output is repainted in full before it is scanned out again; **per output** (§6.1, DMG-5) | `c0_conv_ciii_unflip_return_repaints_each_output_in_full_vulkan` (at least two outputs, distinct damage before the direct entry) | T19: invalidate only the reference output; T20: apply the pre-entry damage to the returning composed buffer |
 | Direct re-entry stays blocked until **every** affected output has proven its full repaint, across as many ticks as it takes (§6.1, DMG-5; round-7 M-1) | `c0_conv_ciii_staggered_return_holds_the_reentry_barrier_vulkan` | T45: clear the barrier after the first output's proof; T46: discharge an output at submission instead of at its proof |
 | The proof is the scene's application of the repaint, not its submission and not an invalidated member (§6.1, DMG-5; round-8 M-1) | `c0_conv_ciii_an_invalidated_member_does_not_discharge_its_output_vulkan` | T47: emit the return proof on the invalidating branch as well |
+| The return effects touch only the unflip's own outputs, never another device's (§6.2, §6.1; round-9 B-1) | `c0_conv_ciii_unflip_return_leaves_the_other_device_alone` | T48: widen the return operation to every scene output, as the legacy helpers do |
 | The retired unflip is recognised from what its dispatch recorded, not from scene state (decision 6) | `c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan`, driven with an ordinary composed commit retiring first | T21: run the return effects for any retiring composed commit while an unflip is requested |
 | The unflip transaction carries no cursor and no gamma property, so both survive it unchanged (§6.1, C.0 §12, decision 7) | `c0_conv_ciii_unflip_carries_no_cursor_or_gamma_vulkan` | T22: add a cursor-plane property to the transaction; T23: add a gamma property |
 | On an `Owner` device no primary or unflip legacy write is issued, at any enumerated site (§6.3) | the enumeration of Task 7, each site with its own case in `c0_conv_ciii_owner_device_issues_no_legacy_primary_write_vulkan`, observed by the **sink-entry recorder**, never by the gate's refusal (round-2 M-1) | T24-T26: force the legacy branch at each enumerated site in turn |
@@ -471,9 +492,9 @@ user's go-ahead.
 | A terminal or `CompletionUnknown` on one device leaves another device's Present disposition and pins alone (§6.2; round-4 M-1) | `c0_conv_ciii_foreign_terminal_leaves_a_pending_present_alone` | T40: drop the device comparison from the `present_dispositions` scan; T41: match the pending direct frame by `CommitId` alone |
 | One device's milestones never accept, apply, remove or block another device's damage transaction or owner buffer (§6.2; round-5 B-1) | `c0_conv_ciii_foreign_milestones_leave_a_damage_transaction_alone` | T42: key `owner_damage_transactions` by `CommitId` alone; T43: scan owner buffers without comparing the device |
 | A `Presented` or `CompletionRetired` on one device never samples, publishes, promotes or releases another device's pending direct frame (§6.2, §3.3; round-6 B-1) | `c0_conv_ciii_foreign_milestones_leave_a_pending_direct_frame_alone` | T44: publish the pending frame at retirement without matching its `CommitKey`, as today's no-argument helper does |
-| On real hardware in `Owner`: a composed frame, a direct frame, the unflip back, and a commit retaining an allocation of the old state for the same member (§6.4) | `c0_hw_ciii_owner_route_on_card1_drm` | — (the run itself is the evidence; its two mutations are below) |
-| A displaced buffer's `KmsRelease` is discharged by the real completion — P3-2 (§6.4, debt spec §9.3/§9.5) | the same test, steps 1-3 | T32: drop the displaced buffer's registration |
-| A retained allocation registers no `KmsRelease` and is not released — P3-3 (§6.4) | the same test, step 4 | T33: register the retained allocation |
+| On real hardware in `Owner`: a composed frame, a direct frame, a second direct commit retaining the first's allocation for the same member, and the unflip back (§6.4 as annotated 2026-09-20) | `c0_hw_ciii_owner_route_on_card1_drm` | — (the run itself is the evidence; its two mutations are below) |
+| A displaced buffer's `KmsRelease` is discharged by the real completion — P3-2 (§6.4, debt spec §9.3/§9.5) | the same test, the steps that displace a buffer: 1, 2 and 4 | T32: drop the displaced buffer's registration |
+| A retained allocation registers no `KmsRelease` and is not released — P3-3 (§6.4) | the same test, step 3 — the retaining direct commit | T33: register the retained allocation |
 
 ---
 
@@ -704,9 +725,20 @@ counterpart at `:3355`-`:3378`), `scene.rs` (the per-output return proof);
 tests.
 
 **Interfaces:** the unflip commit's `CompletionRetired` runs the return
-effects once: stop direct scanout, block re-entry until composed, invalidate
-every affected output's composed buffers, mark the scene structure dirty. The
-commit is recognised as the unflip from state its dispatch recorded.
+effects once: stop direct scanout, block re-entry until composed, and — through
+**one scene operation taking the recorded affected output identities** —
+invalidate those outputs' composed buffers and give them their structural
+damage. The commit is recognised as the unflip from state its dispatch
+recorded.
+
+**The return effects are scoped to the owning device (round-9 B-1).** The
+legacy return calls two global helpers: `invalidate_all_scanout_damage`
+invalidates **every** scene output (`scene.rs:1491`) and
+`mark_scene_structure_dirty` adds full-output structure damage to every output
+(`scene.rs:2691`). On the owner route neither may be used: they would repaint
+a device that had nothing to do with this unflip, which decision 9 calls a
+defect. The new operation takes the affected output identities and touches
+nothing else. Legacy keeps the global helpers.
 
 **The re-entry barrier is cumulative and per output (round-7 M-1).** The
 baseline clears `reentry_blocked_until_composed` only when **one**
@@ -753,6 +785,9 @@ output's proof.
 - `c0_conv_ciii_an_invalidated_member_does_not_discharge_its_output_vulkan` —
   a `HardwareComplete` whose member cannot be confirmed invalidates that
   output and leaves it owing its repaint (round-8 M-1).
+- `c0_conv_ciii_unflip_return_leaves_the_other_device_alone` — devices A and B
+  both have scene outputs; A's unflip retires; B's damage and structure state
+  are unchanged (round-9 B-1).
 
 - [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
