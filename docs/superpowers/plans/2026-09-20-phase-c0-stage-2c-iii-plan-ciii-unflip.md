@@ -2,6 +2,24 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 8 (2026-09-20)** — incorporates codex round 7
+(`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round7.md`: **0
+blocking**, 1 major, verified against the tree by the author and accepted;
+round 6 audited APPLIED at the type, consumer, test and mutation levels — the
+`CommitKey` closed that family).
+
+- **M-1, confirmed: the re-entry barrier had no cumulative owner.** Task 5 said
+  re-entry stays blocked "until a composed frame has been presented on every
+  affected output" but named neither the per-output proof nor anything that
+  accumulates it. The baseline clears `reentry_blocked_until_composed` only
+  when **one** `scene.tick` returns as many composed outputs as the device has
+  (`backend.rs:21679`-`21686`) — a same-tick submission count. With output A
+  repainting on tick 1 and B on tick 2, no tick ever returns both and re-entry
+  stays blocked forever; relaxing it to "any composed result" would let direct
+  re-enter before B's repaint, which DMG-5 forbids. Task 5 now carries the
+  affected-output set and discharges it per output, with a staggered test and
+  T45.
+
 **Revision 7 (2026-09-20)** — incorporates codex round 6
 (`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round6.md`: 1 blocking,
 verified against the tree by the author and accepted; round 5 audited APPLIED).
@@ -413,6 +431,7 @@ user's go-ahead.
 | A failed unflip dispatch leaves capacity as it was: old resources in `current_resources` with the `Current` role, no exit-retirement reservation outstanding (round-3 M-1) | `c0_conv_ciii_unflip_dispatch_failure_fails_closed_vulkan` | T35: skip the role restoration on the unflip failure row |
 | The unflip commit's retirement stops direct scanout, blocks re-entry until composed, and invalidates every affected output's composed buffers exactly once (§6.1, DMG-5, Cii F8 3) | `c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan` | T17: drop the invalidation on the owner return path; T18: run the return effects at `HardwareComplete` instead of `CompletionRetired` |
 | Every affected output is repainted in full before it is scanned out again; **per output** (§6.1, DMG-5) | `c0_conv_ciii_unflip_return_repaints_each_output_in_full_vulkan` (at least two outputs, distinct damage before the direct entry) | T19: invalidate only the reference output; T20: apply the pre-entry damage to the returning composed buffer |
+| Direct re-entry stays blocked until **every** affected output has proven its full repaint, across as many ticks as it takes (§6.1, DMG-5; round-7 M-1) | `c0_conv_ciii_staggered_return_holds_the_reentry_barrier_vulkan` | T45: clear the barrier after the first output's proof |
 | The retired unflip is recognised from what its dispatch recorded, not from scene state (decision 6) | `c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan`, driven with an ordinary composed commit retiring first | T21: run the return effects for any retiring composed commit while an unflip is requested |
 | The unflip transaction carries no cursor and no gamma property, so both survive it unchanged (§6.1, C.0 §12, decision 7) | `c0_conv_ciii_unflip_carries_no_cursor_or_gamma_vulkan` | T22: add a cursor-plane property to the transaction; T23: add a gamma property |
 | On an `Owner` device no primary or unflip legacy write is issued, at any enumerated site (§6.3) | the enumeration of Task 7, each site with its own case in `c0_conv_ciii_owner_device_issues_no_legacy_primary_write_vulkan`, observed by the **sink-entry recorder**, never by the gate's refusal (round-2 M-1) | T24-T26: force the legacy branch at each enumerated site in turn |
@@ -661,14 +680,28 @@ effects once: stop direct scanout, block re-entry until composed, invalidate
 every affected output's composed buffers, mark the scene structure dirty. The
 commit is recognised as the unflip from state its dispatch recorded.
 
+**The re-entry barrier is cumulative and per output (round-7 M-1).** The
+baseline clears `reentry_blocked_until_composed` only when **one**
+`scene.tick` returns as many composed outputs as the device has
+(`backend.rs:21679`-`21686`): a same-tick submission count, which a staggered
+return never satisfies. On the owner route the unflip's retirement **records
+its affected-output set**, and each output leaves that set when it supplies
+its own proof; re-entry unblocks when the set is empty, however many ticks
+that takes. **The proof must establish that the full repaint is on screen, not
+merely submitted** — a submission count cannot discharge DMG-5. Name the
+milestone you use and why it proves presentation; if no owner milestone on
+this route establishes it per output, that is an **F8 stop**, not a weaker
+proof. Legacy's rule is untouched.
+
 **Invariants (spec §6.1, DMG-5, Cii F8 3):** the invalidation happens on the
 **return**, at the unflip commit's retirement, and exactly once; every affected
 output is invalidated, not only the reference one; each affected output is
 repainted **in full** before it is scanned out again, and no damage recorded
 before or during the direct interval survives into that repaint; an ordinary
 composed commit retiring while an unflip is outstanding runs none of these
-effects; direct re-entry stays blocked until a composed frame has been
-presented on every affected output (`managed_can_enter_direct`).
+effects; direct re-entry stays blocked while any affected output still owes
+its repaint, and unblocks once none does — never on a single tick's count and
+never before the last output's proof.
 
 **Named tests:**
 - `c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan` — also drives an
@@ -676,6 +709,10 @@ presented on every affected output (`managed_can_enter_direct`).
 - `c0_conv_ciii_unflip_return_repaints_each_output_in_full_vulkan` — at least
   two outputs, with distinct damage recorded on each before the direct entry;
   the assertion is per output.
+- `c0_conv_ciii_staggered_return_holds_the_reentry_barrier_vulkan` — two
+  outputs returning on **different ticks**: after the first the barrier still
+  holds and direct cannot re-enter, after the second it clears and direct can
+  (round-7 M-1).
 
 - [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
