@@ -2,6 +2,37 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 4 (2026-09-20)** — incorporates codex round 3
+(`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round3.md`: 2 blocking,
+1 major, all three verified against the tree by the author and accepted;
+rounds 1 and 2 audited APPLIED, with round-1 B-1 marked TRADED and closed
+here).
+
+- **B-1, confirmed: the request path would recurse.** `admission_request_unflip`
+  itself calls `request_direct_unflip` (`admission.rs:727`), so making the
+  funnel fork into it is a cycle that never reaches a wake. Decision 3 now
+  fixes an acyclic boundary: the funnel owns the legacy flags, the admission
+  primitive never calls the funnel, and that callback is removed — with its two
+  existing test callers (`backend.rs:55683`, `:55711`) named, because they
+  depend on the effect it has today.
+- **B-2, confirmed: commit ids collide across devices.** Each
+  `DeviceCommitOwner` mints `CommitId`s from **its own** allocator starting at
+  1 (`owner/device.rs:217`, `identity.rs:136`-`150`), while the backend keeps
+  **one** `CommitResourceConsumer` (`backend.rs:1501`) whose correlation maps
+  are keyed by a bare `CommitId` (`resources/commit.rs:130`-`145`) and whose
+  matching compares `res.commit_id == Some(commit)` with no device
+  (`:286`). Device A's cached `HardwareComplete` is therefore consumed by
+  device B's commit of the same number, discharging B's `KmsRelease`
+  obligations without B's own completion — §6.2's isolation and §3.2 both
+  broken. Task 6 gains the namespacing and the interleaved two-owner test with
+  **equal numeric** ids.
+- **M-1, confirmed: no capacity rollback on a failed unflip dispatch.** The
+  shared failure handler returns the old resources with
+  `current_resources.extend(old)` (`admission.rs:1150`) and never restores
+  their `DirectRole`, so a failure after the exit-retirement move would leave a
+  buffer in the current collection holding an `ExitRetirement` role while it is
+  still on screen. Task 2 gains the rollback invariant and T35.
+
 **Revision 3 (2026-09-20)** — incorporates codex round 2
 (`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round2.md`: 1 blocking,
 1 major, both verified against the tree by the author and accepted; round 1:
@@ -123,16 +154,25 @@ especially "Carried to Ciii" and the three F8 stops, before Task 1.
      each tick while the unflip is requested and the shadow is unmaterialized,
      before admission is woken. `admission_snapshot` only **reads**
      `unflip_shadow_ready`; a readiness computation has no side effect.
-3. **One request entry for every cause (round-1 B-1c).** Today
-   `admission_request_unflip` (`admission.rs:713`) has only test callers, while
-   every real cause — cursor fallback, cursor bind failure, a failed successor
-   send, overlay and topology invalidation, the composite-tick reasons — calls
-   `request_direct_unflip` (`backend.rs:2315`; about twenty call sites).
-   `request_direct_unflip` therefore becomes the **per-device request entry**:
-   it keeps its legacy effects and, on an `Owner` device, forks once into the
-   owner half, which reaches `admission_request_unflip` for the device of the
-   direct group. Spec §6.1 requires exactly that. No cause is edited; the
-   funnel they already share is what forks.
+3. **One request entry for every cause, and it must be acyclic (round-1 B-1c,
+   round-3 B-1).** Today `admission_request_unflip` (`admission.rs:713`) has
+   only test callers, while every real cause — cursor fallback, cursor bind
+   failure, a failed successor send, overlay and topology invalidation, the
+   composite-tick reasons — calls `request_direct_unflip` (`backend.rs:2315`;
+   about twenty call sites). `request_direct_unflip` therefore becomes the
+   **per-device request entry**: it keeps its legacy effects and, on an `Owner`
+   device, forks once into the owner half. Spec §6.1 requires exactly that. No
+   cause is edited; the funnel they already share is what forks.
+   **The direction is one-way.** `admission_request_unflip` calls
+   `request_direct_unflip` today (`admission.rs:727`), so forking the funnel
+   into it without removing that call is infinite recursion. The boundary:
+   **the funnel owns the legacy flags; the admission primitive never calls the
+   funnel.** That callback is removed, and the two existing test callers
+   (`backend.rs:55683`, `:55711`), which today get the flag effects through it,
+   are moved onto the funnel or given the effect explicitly — the task says
+   which, and neither is deleted. A second cause arriving while an unflip is
+   already requested is harmless: no second intent, no second terminalization,
+   no second materialization.
 4. **One transaction replacing the complete plane set** (§6.1). The owner
    description covers **every** CRTC of the device with that output's retained
    composed framebuffer (`retained_composed_framebuffer`), never a per-CRTC
@@ -283,7 +323,7 @@ user's go-ahead.
 
 | Criterion (spec) | Tests | Mutation that must fail them |
 | --- | --- | --- |
-| Every production cause of an unflip reaches the owner request on an `Owner` device, and only the legacy flags on a `Legacy` one (§6.1, decision 3) | `c0_conv_ciii_every_unflip_cause_reaches_the_owner_request_vulkan` (at least three distinct causes) | T1: fork only for the cursor cause; T2: take the owner request under `Legacy` |
+| Every production cause of an unflip reaches the owner request on an `Owner` device, and only the legacy flags on a `Legacy` one, through an **acyclic** entry (§6.1, decision 3; round-3 B-1) | `c0_conv_ciii_every_unflip_cause_reaches_the_owner_request_vulkan` (at least three distinct causes, one raised twice) | T1: fork only for the cursor cause; T2: take the owner request under `Legacy`; T38: restore the admission primitive's call back into the funnel |
 | An unflip is not admitted until the exit-retirement position is free, every affected output has its retained composed framebuffer **and** the direct shadow is materialized (§6.1) | `c0_conv_ciii_unflip_readiness_waits_on_each_precondition` (one case per precondition, each with the others satisfied) | T3: report `Ready` while the shadow is unmaterialized; T4: report `Ready` while a **foreign** exit retirement is in flight |
 | The request materializes the shadow and terminalizes unsent direct work, and occupies no capacity role (§6.1, decision 2) | `c0_conv_ciii_unflip_request_prepares_without_occupying_capacity_vulkan` | T5: reserve `ExitRetirement` in the request, as revision 1 did |
 | A failed materialization leaves the unflip requested, unadmitted and retried on the next tick, never dispatched (§6.1, decision 2) | `c0_conv_ciii_unflip_shadow_failure_defers_admission_vulkan` | T6: treat a failed materialization as ready; T7: retry it inside the readiness computation |
@@ -292,6 +332,7 @@ user's go-ahead.
 | The unflip commit replaces the **complete** plane set of its device in one transaction, each CRTC with that output's retained composed framebuffer (§6.1) | `c0_conv_ciii_unflip_commit_covers_every_crtc_vulkan` | T12: describe only the CRTCs named in the barrier; T13: skip the topology-eligibility precondition |
 | The owner route takes its own module behind one fork point; Legacy is unchanged (decision 1) | `c0_conv_ciii_legacy_unflip_unchanged_vulkan`, `c0_conv_ciii_owner_unflip_commits_instead_of_submitting_vulkan` | T14: force `submit_composed_unflip` under `Owner`; T15: take the owner route under `Legacy` |
 | A failed owner unflip dispatch fails closed and never degrades to per-output legacy flips (decision 5) | `c0_conv_ciii_unflip_dispatch_failure_fails_closed_vulkan` | T16: fall through into the degraded per-output path under `Owner` |
+| A failed unflip dispatch leaves capacity as it was: old resources in `current_resources` with the `Current` role, no exit-retirement reservation outstanding (round-3 M-1) | `c0_conv_ciii_unflip_dispatch_failure_fails_closed_vulkan` | T35: skip the role restoration on the unflip failure row |
 | The unflip commit's retirement stops direct scanout, blocks re-entry until composed, and invalidates every affected output's composed buffers exactly once (§6.1, DMG-5, Cii F8 3) | `c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan` | T17: drop the invalidation on the owner return path; T18: run the return effects at `HardwareComplete` instead of `CompletionRetired` |
 | Every affected output is repainted in full before it is scanned out again; **per output** (§6.1, DMG-5) | `c0_conv_ciii_unflip_return_repaints_each_output_in_full_vulkan` (at least two outputs, distinct damage before the direct entry) | T19: invalidate only the reference output; T20: apply the pre-entry damage to the returning composed buffer |
 | The retired unflip is recognised from what its dispatch recorded, not from scene state (decision 6) | `c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan`, driven with an ordinary composed commit retiring first | T21: run the return effects for any retiring composed commit while an unflip is requested |
@@ -302,6 +343,7 @@ user's go-ahead.
 | An event, wake, refusal or bound violation on one device changes nothing on another (§6.2) | `c0_conv_ciii_devices_are_independent` (one case per kind: owner event batch, admission wake, refused offer, bound violation) | T28: route the batch to every conductor; T29: close every device's gate on a bound violation |
 | A device's layout generation, composed intents, maintenance and receipts belong to that device alone (§6.2) | `c0_conv_ciii_conductor_state_is_per_device` | T30: bump every conductor's layout generation on one device's change |
 | A grouped direct unit never crosses devices (§6.2) | `c0_conv_ciii_direct_group_never_crosses_devices_vulkan` | T31: drop the single-device precondition from `direct_scanout_topology_eligible` |
+| Two owners' equal numeric `CommitId`s never correlate across devices (§6.2, §3.2; round-3 B-2) | `c0_conv_ciii_equal_commit_ids_do_not_cross_devices` | T36: key the completion cache by `CommitId` alone; T37: match a releasing resource without comparing its device |
 | On real hardware in `Owner`: a composed frame, a direct frame, the unflip back, and a commit retaining an allocation of the old state for the same member (§6.4) | `c0_hw_ciii_owner_route_on_card1_drm` | — (the run itself is the evidence; its two mutations are below) |
 | A displaced buffer's `KmsRelease` is discharged by the real completion — P3-2 (§6.4, debt spec §9.3/§9.5) | the same test, steps 1-3 | T32: drop the displaced buffer's registration |
 | A retained allocation registers no `KmsRelease` and is not released — P3-3 (§6.4) | the same test, step 4 | T33: register the retained allocation |
@@ -326,7 +368,9 @@ the fork point's retry) sets.
 
 **Invariants (spec §6.1, decisions 2 and 3):** every production cause of an
 unflip reaches the owner request on an `Owner` device and only the legacy flags
-on a `Legacy` one; the request occupies **no** capacity role; an unflip is
+on a `Legacy` one; the call graph is **acyclic** — the admission primitive
+never calls the funnel back (round-3 B-1) — and a repeated request while one is
+already outstanding changes nothing; the request occupies **no** capacity role; an unflip is
 admitted only when the exit-retirement position is free of any **other** exit
 retirement, every affected output has its retained composed framebuffer, and
 the shadow is materialized; a failed materialization leaves the unflip
@@ -335,7 +379,9 @@ fails the request; `admission_snapshot` has no side effect.
 
 **Named tests:**
 - `c0_conv_ciii_every_unflip_cause_reaches_the_owner_request_vulkan` — at least
-  three distinct causes, each driven through its real caller.
+  three distinct causes, each driven through its real caller, and one of them
+  raised **twice** (the idempotence half); the test would not terminate if the
+  funnel and the primitive still called each other.
 - `c0_conv_ciii_unflip_readiness_waits_on_each_precondition` — three cases,
   each with the other two satisfied, each naming its own `WaitReason`.
 - `c0_conv_ciii_unflip_request_prepares_without_occupying_capacity_vulkan`.
@@ -366,7 +412,12 @@ request; the description covers every CRTC of the device, each with that
 output's retained composed framebuffer, in one transaction;
 `direct_scanout_topology_eligible` is a precondition of the dispatch, not an
 assumption; resources move by value; a dispatch failure fails closed through
-the shared path and never reaches the degraded per-output fallback;
+the shared path, never reaches the degraded per-output fallback, and **leaves
+capacity exactly as it was before the dispatch** — the old resources back in
+`current_resources` carrying the `Current` role, with no `ExitRetirement`
+reservation outstanding. The shared handler restores the vector but not the
+role (`admission.rs:1150`), so the unflip's failure row restores it (round-3
+M-1);
 production's `submit_composed_unflip` and its degraded fallback are untouched,
 including the `scanout_m2` bookkeeping they do (`unflip_awaiting_outputs`,
 `degraded_composed_unflip`).
@@ -379,8 +430,9 @@ including the `scanout_m2` bookkeeping they do (`unflip_awaiting_outputs`,
 - `c0_conv_ciii_legacy_unflip_unchanged_vulkan` and
   `c0_conv_ciii_owner_unflip_commits_instead_of_submitting_vulkan`.
 - `c0_conv_ciii_unflip_dispatch_failure_fails_closed_vulkan` — the transport
-  closes, no legacy write is issued, and the direct frame's pins are still
-  held.
+  closes, no legacy write is issued, the direct frame's pins are still held,
+  **and** the old resources are back in `current_resources` with the `Current`
+  role and no exit-retirement reservation outstanding (round-3 M-1).
 
 - [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
@@ -493,22 +545,46 @@ the recorder's count, never on a refusal error or on missing owner progress.
 **Files:** `admission.rs`, `backend.rs` and `platform.rs` where a device-blind
 path is found; tests.
 
-**Interfaces:** none new unless a defect is found. The fixture is **not** the
-live single-device one (decision 10): two seeded KMS devices with their own
-gates, the shape `platform.rs:8798` and `platform.rs:9797` already use.
+**Interfaces:** the commit-correlation key. Each `DeviceCommitOwner` mints
+`CommitId`s from its own allocator starting at 1 (`owner/device.rs:217`,
+`identity.rs:136`-`150`), while the backend keeps one
+`CommitResourceConsumer` (`backend.rs:1501`) whose `hardware_completed_commits`,
+`commit_members` and `reserved_retirements` are keyed by a bare `CommitId`
+(`resources/commit.rs:130`-`145`) and whose releasing-resource match compares
+`res.commit_id == Some(commit)` with no device (`:286`). **Every commit
+correlation becomes keyed by `(DrmDeviceKey, CommitId)`** — the caches, the
+members, the reserved retirements, the rejected-resource lookup and the
+resources' own recorded identity. `route_owner_event_batch` already carries the
+device, so the key is available at every consumption site. Splitting the
+consumer per device is **not** the shape: `DirectCapacity` is one direct group
+for the whole backend by design (decision 9).
+
+The fixture is **not** the live single-device one (decision 10): two seeded KMS
+devices with their own gates, the shape `platform.rs:8798` and
+`platform.rs:9797` already use.
 
 **Invariants (spec §6.2):** one conductor per `DrmDeviceKey`, each with its own
 admission, layout generation and transport state; an event, wake, refusal or
 bound violation on one device changes nothing on another — not its layout
 generation, not its composed intents, not its maintenance store, not its
 receipts, not its gate, not its owner; a grouped direct unit never crosses
-devices. Device-blind paths that are deliberate (decision 9) are named in the
-report rather than rewritten; a device-blind path that changes another device's
-state is a defect, fixed here.
+devices. **No device can discharge, cache, consume or restore another's
+resources, even when both owners issue the same numeric `CommitId`**
+(round-3 B-2): a cached `HardwareComplete` belongs to one device, and a
+`CompletionRetired` of the same number on another device neither consumes it
+nor discharges any `KmsRelease` obligation. Device-blind paths that are
+deliberate (decision 9) are named in the report rather than rewritten; a
+device-blind path that changes another device's state is a defect, fixed
+here.
 
 **Named tests:**
 - `c0_conv_ciii_devices_are_independent` — four cases: an owner event batch, an
   admission wake, a refused offer, and a bound violation that closes a gate.
+- `c0_conv_ciii_equal_commit_ids_do_not_cross_devices` — two owners whose
+  commits carry the **same numeric** `CommitId`, interleaved: A's
+  `HardwareComplete` is cached, B's `CompletionRetired` of the same number
+  arrives first, and B discharges nothing of its own that its own completion
+  has not proven, while A's cache survives for A (round-3 B-2).
 - `c0_conv_ciii_conductor_state_is_per_device`.
 - `c0_conv_ciii_direct_group_never_crosses_devices_vulkan`.
 
