@@ -1,4 +1,4 @@
-# Stage 2c-iii, plan Ciii — unflip, multi-device, route selection, hardware
+# Stage 2c-iii, plan Ciii — the unflip, its route, and the hardware run
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
@@ -269,11 +269,11 @@ five APPLIED and M-2 TRADED, closed here).
 
 **Goal:** Finish the conversion of stage 2c-iii's producers. The owner route
 gains its third producer — the unflip back to composed — and with it the return
-path's composed invalidation that plan Cii's third F8 stop handed forward. Then
-the two properties the stage has claimed but never demonstrated: that one
-device's conductor is self-contained, and that on an `Owner` device no primary
-or unflip legacy write is issued from any converted submit site. Last, the tty2
-hardware run of spec §6.4 with P3-2/P3-3.
+path's composed invalidation that plan Cii's third F8 stop handed forward. Then the
+property the stage has claimed but never demonstrated: that on an `Owner`
+device no primary or unflip legacy write is issued from any converted submit
+site. Last, the tty2 hardware run of spec §6.4 with P3-2/P3-3. (Device
+isolation, the stage's other undemonstrated property, is plan Ciii-identity's.)
 
 **Architecture:** The unflip is a producer, so it takes the same shape Ci and
 Cii took (user's constraint, spec §8.3): its owner-route code lives in **its own
