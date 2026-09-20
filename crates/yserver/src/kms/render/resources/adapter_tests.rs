@@ -8,7 +8,7 @@ use std::{
 use ash::vk::{self, Handle};
 
 use super::{
-    AllocationPayload, CommitResourceConsumer, CommitResources, CompletionDisposition,
+    AllocationPayload, CommitKey, CommitResourceConsumer, CommitResources, CompletionDisposition,
     CompletionIngress, CopiedSourceAllocation, CoreRetirementBatch, DeviceBarrier, DirectCapacity,
     DirectRole, DrmCleanupRegistry, DrmDeviceKey, FileOwnedBacking, GemOwner, GroupMember,
     IncarnationBundle, IncarnationId, ObligationKind, PresentDisposition, PresentKey,
@@ -451,13 +451,18 @@ fn c0_2ci_adapter_grouped_frame_reversed_evidence() {
         vec![member_a, member_b],
         vec![(shared_key, ob_a, member_a), (shared_key, ob_b, member_b)],
     );
-    res.commit_id = Some(commit);
+    let commit_key = CommitKey::new(dev, commit);
+    res.commit_id = Some(commit_key);
     consumer.releasing_resources.push(res);
 
     // Reversed evidence: non-reference CRTC B hardware-completes first
-    consumer.commit_members.insert(commit, vec![member_b]);
+    consumer.commit_members.insert(commit_key, vec![member_b]);
     consumer
-        .consume(OwnerEvent::HardwareComplete { commit }, &mut service)
+        .consume(
+            commit_key,
+            OwnerEvent::HardwareComplete { commit },
+            &mut service,
+        )
         .unwrap();
     consumer.on_available(&[shared_key], &mut service).unwrap();
     service.service_ready();
@@ -485,7 +490,11 @@ fn c0_2ci_adapter_grouped_frame_reversed_evidence() {
         },
     );
     consumer
-        .consume(OwnerEvent::Presented { commit, samples }, &mut service)
+        .consume(
+            commit_key,
+            OwnerEvent::Presented { commit, samples },
+            &mut service,
+        )
         .unwrap();
 
     // Verify reference CRTC (CRTC 2) supplied the presentation sample
@@ -511,9 +520,13 @@ fn c0_2ci_adapter_grouped_frame_reversed_evidence() {
     );
 
     // CRTC A (reference CRTC) hardware-completes later
-    consumer.commit_members.insert(commit, vec![member_a]);
+    consumer.commit_members.insert(commit_key, vec![member_a]);
     consumer
-        .consume(OwnerEvent::HardwareComplete { commit }, &mut service)
+        .consume(
+            commit_key,
+            OwnerEvent::HardwareComplete { commit },
+            &mut service,
+        )
         .unwrap();
     consumer.on_available(&[shared_key], &mut service).unwrap();
     service.service_ready();
@@ -552,7 +565,9 @@ fn c0_2ci_adapter_rejection_accepted_skip_supersession() {
         commit,
         resources: vec![res],
     };
-    consumer.consume(event, &mut service).unwrap();
+    consumer
+        .consume(CommitKey::new(dev, commit), event, &mut service)
+        .unwrap();
 
     // Obligation is cancelled, so not pending
     assert!(!service.has_pending_obligations(&old_key));

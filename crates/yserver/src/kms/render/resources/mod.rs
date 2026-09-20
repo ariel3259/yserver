@@ -37,8 +37,8 @@ pub(crate) use availability::{
 pub(crate) use capacity::{DirectCapacity, DirectRole, RoleReservation, RoleState};
 #[allow(unused_imports)]
 pub(crate) use commit::{
-    CommitResourceConsumer, CommitResources, GroupMember, PresentRelease, cancel_pre_ipc_commit,
-    register_commit_dependencies,
+    CommitKey, CommitResourceConsumer, CommitResources, GroupMember, PresentRelease,
+    cancel_pre_ipc_commit, register_commit_dependencies,
 };
 #[allow(unused_imports)]
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};

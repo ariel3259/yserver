@@ -77,7 +77,7 @@ use super::{
     owner_buffer::{OwnerBuffer, OwnerBufferIdentity, OwnerBufferState},
     platform::{CrtcKey, FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
     region::Region,
-    resources::{AllocationKey, CoreRetirementBatch, ResourceError, ResourceService},
+    resources::{AllocationKey, CommitKey, CoreRetirementBatch, ResourceError, ResourceService},
     scanout_damage::ScanoutDamage,
     scene_diff::{
         ParticipantId, PresenceSignature, ScenePresence, SceneRole, presence_from_place,
@@ -1077,8 +1077,7 @@ struct SceneCompositorInner {
     /// visible pointer feedback.
     cursor: Option<CursorEntry>,
     owner_offers: VecDeque<ComposedOffer>,
-    owner_damage_transactions:
-        HashMap<crate::kms::owner::identity::CommitId, OwnerDamageTransaction>,
+    owner_damage_transactions: HashMap<CommitKey, OwnerDamageTransaction>,
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -1824,9 +1823,11 @@ impl SceneCompositor {
                             .find_map(|(index, prepared)| {
                                 (prepared.identity().managed_key == key
                                     && prepared.state() == OwnerBufferState::Submitted
-                                    && resources
-                                        .commit_id
-                                        .is_none_or(|commit| prepared.commit_id() == Some(commit)))
+                                    && resources.commit_id.is_none_or(|commit| {
+                                        prepared.commit_id() == Some(commit.commit)
+                                            && prepared.identity().output_key.device_key
+                                                == commit.device
+                                    }))
                                 .then_some((output_idx, index, prepared))
                             })
                     })
@@ -1894,7 +1895,7 @@ impl SceneCompositor {
     /// reaches this method.
     pub(crate) fn install_owner_damage_transaction(
         &mut self,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: CommitKey,
         specs: &[(
             PreparedComposedLocation,
             u64,
@@ -1974,33 +1975,37 @@ impl SceneCompositor {
 
         match event {
             OwnerEvent::Accepted { commit } => {
-                self.owner_damage_accept(*commit, platform);
-                self.accept_owner_buffer(*commit, platform);
+                let commit = CommitKey::new(device, *commit);
+                self.owner_damage_accept(commit, platform);
+                self.accept_owner_buffer(commit, platform);
             }
-            OwnerEvent::HardwareComplete { commit } => {
-                self.owner_damage_hardware_complete(*commit, store, platform)
-            }
+            OwnerEvent::HardwareComplete { commit } => self.owner_damage_hardware_complete(
+                CommitKey::new(device, *commit),
+                store,
+                platform,
+            ),
             OwnerEvent::CompletionRetired { commit, .. } => {
-                self.retire_owner_buffer(*commit, platform)
+                self.retire_owner_buffer(CommitKey::new(device, *commit), platform)
             }
             OwnerEvent::Terminal { commit, terminal } => match terminal {
                 TerminalState::FailedBeforeSubmit(cause) => {
-                    self.owner_damage_close(*commit, platform);
+                    self.owner_damage_close(CommitKey::new(device, *commit), platform);
                     if matches!(
                         cause,
                         crate::kms::owner::record::FailureCause::IoctlRejected { .. }
                     ) {
-                        self.reject_owner_buffer(*commit, platform);
+                        self.reject_owner_buffer(CommitKey::new(device, *commit), platform);
                     }
                 }
                 TerminalState::CompletionUnknown(_) => {
-                    self.quarantine_owner_buffer(*commit, platform);
-                    self.invalidate_owner_damage_transaction(*commit, platform);
+                    let commit = CommitKey::new(device, *commit);
+                    self.quarantine_owner_buffer(commit, platform);
+                    self.invalidate_owner_damage_transaction(commit, platform);
                 }
                 TerminalState::Completed => {}
             },
             OwnerEvent::Quarantined { commit } => {
-                self.invalidate_owner_damage_transaction(*commit, platform)
+                self.invalidate_owner_damage_transaction(CommitKey::new(device, *commit), platform)
             }
             OwnerEvent::MechanismFailed { .. } => {
                 self.invalidate_owner_damage_transactions_for_device(device, platform)
@@ -2043,11 +2048,12 @@ impl SceneCompositor {
                 inner
                     .owner_damage_transactions
                     .iter()
-                    .filter(|(_, transaction)| {
-                        transaction
-                            .members
-                            .iter()
-                            .any(|member| member.output_key.device_key == device)
+                    .filter(|(commit, transaction)| {
+                        commit.device == device
+                            || transaction
+                                .members
+                                .iter()
+                                .any(|member| member.output_key.device_key == device)
                     })
                     .map(|(commit, _)| *commit)
                     .collect::<Vec<_>>()
@@ -2060,7 +2066,7 @@ impl SceneCompositor {
 
     fn invalidate_owner_damage_transaction(
         &mut self,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: CommitKey,
         platform: &mut PlatformBackend,
     ) {
         let Some(inner) = self.inner.as_mut() else {
@@ -2082,11 +2088,7 @@ impl SceneCompositor {
         }
     }
 
-    fn accept_owner_buffer(
-        &mut self,
-        commit: crate::kms::owner::identity::CommitId,
-        platform: &mut PlatformBackend,
-    ) {
+    fn accept_owner_buffer(&mut self, commit: CommitKey, platform: &mut PlatformBackend) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -2101,7 +2103,8 @@ impl SceneCompositor {
                             .owner_buffers
                             .iter()
                             .position(|buffer| {
-                                buffer.commit_id() == Some(commit)
+                                buffer.commit_id() == Some(commit.commit)
+                                    && buffer.identity().output_key.device_key == commit.device
                                     && buffer.state() == OwnerBufferState::Submitted
                             })
                             .map(|index| (output_idx, index))
@@ -2127,11 +2130,7 @@ impl SceneCompositor {
         }
     }
 
-    fn reject_owner_buffer(
-        &mut self,
-        commit: crate::kms::owner::identity::CommitId,
-        platform: &mut PlatformBackend,
-    ) {
+    fn reject_owner_buffer(&mut self, commit: CommitKey, platform: &mut PlatformBackend) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -2146,7 +2145,8 @@ impl SceneCompositor {
                             .owner_buffers
                             .iter()
                             .position(|buffer| {
-                                buffer.commit_id() == Some(commit)
+                                buffer.commit_id() == Some(commit.commit)
+                                    && buffer.identity().output_key.device_key == commit.device
                                     && buffer.state() == OwnerBufferState::Submitted
                             })
                             .map(|index| (output_idx, index))
@@ -2172,11 +2172,7 @@ impl SceneCompositor {
         }
     }
 
-    fn quarantine_owner_buffer(
-        &mut self,
-        commit: crate::kms::owner::identity::CommitId,
-        platform: &mut PlatformBackend,
-    ) {
+    fn quarantine_owner_buffer(&mut self, commit: CommitKey, platform: &mut PlatformBackend) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -2190,7 +2186,10 @@ impl SceneCompositor {
                         state
                             .owner_buffers
                             .iter()
-                            .position(|buffer| buffer.commit_id() == Some(commit))
+                            .position(|buffer| {
+                                buffer.commit_id() == Some(commit.commit)
+                                    && buffer.identity().output_key.device_key == commit.device
+                            })
                             .map(|index| (output_idx, index))
                     })
             else {
@@ -2214,11 +2213,7 @@ impl SceneCompositor {
         }
     }
 
-    fn retire_owner_buffer(
-        &mut self,
-        commit: crate::kms::owner::identity::CommitId,
-        platform: &mut PlatformBackend,
-    ) {
+    fn retire_owner_buffer(&mut self, commit: CommitKey, platform: &mut PlatformBackend) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -2235,7 +2230,8 @@ impl SceneCompositor {
                             .owner_buffers
                             .iter()
                             .position(|buffer| {
-                                buffer.commit_id() == Some(commit)
+                                buffer.commit_id() == Some(commit.commit)
+                                    && buffer.identity().output_key.device_key == commit.device
                                     && buffer.state() == OwnerBufferState::Accepted
                             })
                             .map(|index| (output_idx, index))
@@ -2283,11 +2279,7 @@ impl SceneCompositor {
         }
     }
 
-    fn owner_damage_close(
-        &mut self,
-        commit: crate::kms::owner::identity::CommitId,
-        platform: &mut PlatformBackend,
-    ) {
+    fn owner_damage_close(&mut self, commit: CommitKey, platform: &mut PlatformBackend) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -2307,11 +2299,7 @@ impl SceneCompositor {
         }
     }
 
-    fn owner_damage_accept(
-        &mut self,
-        commit: crate::kms::owner::identity::CommitId,
-        platform: &mut PlatformBackend,
-    ) {
+    fn owner_damage_accept(&mut self, commit: CommitKey, platform: &mut PlatformBackend) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -2356,7 +2344,7 @@ impl SceneCompositor {
 
     fn owner_damage_hardware_complete(
         &mut self,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: CommitKey,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
     ) {
@@ -2406,10 +2394,7 @@ impl SceneCompositor {
     }
 
     #[cfg(test)]
-    pub(crate) fn owner_damage_snapshot_count_for_tests(
-        &self,
-        commit: crate::kms::owner::identity::CommitId,
-    ) -> usize {
+    pub(crate) fn owner_damage_snapshot_count_for_tests(&self, commit: CommitKey) -> usize {
         self.inner
             .as_ref()
             .and_then(|inner| inner.owner_damage_transactions.get(&commit))
@@ -2425,7 +2410,7 @@ impl SceneCompositor {
     #[cfg(test)]
     pub(crate) fn owner_damage_snapshot_ids_for_tests(
         &self,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: CommitKey,
     ) -> Vec<super::store::DrawableId> {
         self.inner
             .as_ref()

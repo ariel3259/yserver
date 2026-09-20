@@ -8,8 +8,8 @@ use crate::{
             identity::IncarnationId,
         },
         render::resources::{
-            AllocationKey, CommitResourceConsumer, CommitResources, RecipientReservation,
-            ResourceError, ResourceService, TransportGate,
+            AllocationKey, CommitKey, CommitResourceConsumer, CommitResources,
+            RecipientReservation, ResourceError, ResourceService, TransportGate,
             drm_cleanup::{DrmCleanupRegistry, FileFamilyClosed},
         },
     },
@@ -93,6 +93,22 @@ pub(crate) enum KmsDisposition {
 pub(crate) struct CompletionIngress {
     pub(crate) pending_events: Vec<OwnerEvent<CommitResources>>,
     pub(crate) returned_descriptors: Vec<OwnedFd>,
+}
+
+fn event_commit_key<R>(device: DrmDeviceKey, event: &OwnerEvent<R>) -> Option<CommitKey> {
+    match event {
+        OwnerEvent::Dispatched { commit }
+        | OwnerEvent::Accepted { commit }
+        | OwnerEvent::HardwareComplete { commit }
+        | OwnerEvent::Presented { commit, .. }
+        | OwnerEvent::Terminal { commit, .. }
+        | OwnerEvent::CompletionRetired { commit, .. }
+        | OwnerEvent::ResourcesReleased { commit, .. }
+        | OwnerEvent::ResourcesStillCurrent { commit, .. }
+        | OwnerEvent::Quarantined { commit }
+        | OwnerEvent::ValidationResolved { commit, .. } => Some(CommitKey::new(device, *commit)),
+        _ => None,
+    }
 }
 
 impl CompletionIngress {
@@ -233,7 +249,13 @@ impl HandoffRouter {
         if revoked > 0 {
             let events = bundle.owner.quarantine_live();
             for ev in events {
-                if let Err(err) = bundle.consumer.consume(ev, &mut bundle.resources) {
+                let Some(commit_key) = event_commit_key(slot.device, &ev) else {
+                    continue;
+                };
+                if let Err(err) = bundle
+                    .consumer
+                    .consume(commit_key, ev, &mut bundle.resources)
+                {
                     bundle.gate.force_close();
                     return Err((err, slot, bundle));
                 }
@@ -251,7 +273,11 @@ impl HandoffRouter {
         for bundle in self.recipients.values_mut() {
             let events = std::mem::take(&mut bundle.ingress.pending_events);
             for ev in events {
-                bundle.consumer.consume(ev, &mut bundle.resources)?;
+                if let Some(commit_key) = event_commit_key(bundle.resources.device(), &ev) {
+                    bundle
+                        .consumer
+                        .consume(commit_key, ev, &mut bundle.resources)?;
+                }
             }
             let available = bundle.resources.service_completions(now)?;
             bundle

@@ -16,6 +16,32 @@ use crate::{
     platform::drm::DrmDeviceKey,
 };
 
+fn test_commit_key(commit: CommitId) -> CommitKey {
+    CommitKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        commit,
+    )
+}
+
+fn event_commit_key<R>(event: &OwnerEvent<R>) -> Option<CommitKey> {
+    match event {
+        OwnerEvent::Dispatched { commit }
+        | OwnerEvent::Accepted { commit }
+        | OwnerEvent::HardwareComplete { commit }
+        | OwnerEvent::Presented { commit, .. }
+        | OwnerEvent::Terminal { commit, .. }
+        | OwnerEvent::CompletionRetired { commit, .. }
+        | OwnerEvent::ResourcesReleased { commit, .. }
+        | OwnerEvent::ResourcesStillCurrent { commit, .. }
+        | OwnerEvent::Quarantined { commit }
+        | OwnerEvent::ValidationResolved { commit, .. } => Some(test_commit_key(*commit)),
+        _ => None,
+    }
+}
+
 /// Used only by the `_vulkan` tests that bind a real `GpuObligation` (via
 /// `GpuObligation::new`) to exercise the real `poll_signaled_result` path,
 /// or that otherwise need a genuine live device. R12: an absent ICD is an
@@ -3563,6 +3589,7 @@ fn c0_2ci_commit_owner_integration_with_actual_leases() {
     let accepted = crate::kms::owner::ledger::Submitted::new(vec![old], vec![new]).accepted();
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit: commit_id,
                 resources: accepted,
@@ -3641,7 +3668,9 @@ fn c0_2ci_commit_owner_integration_with_actual_leases() {
             let mut poll_set = DummyPollSet;
             let hw_events = owner.observe_fences(&mut query, &mut poll_set, Instant::now());
             for ev in hw_events {
-                consumer.consume(ev, &mut service).unwrap();
+                if let Some(commit_key) = event_commit_key(&ev) {
+                    consumer.consume(commit_key, ev, &mut service).unwrap();
+                }
             }
             assert_eq!(old_drops.get(), 0);
             assert_eq!(new_drops.get(), 0);
@@ -3649,7 +3678,9 @@ fn c0_2ci_commit_owner_integration_with_actual_leases() {
             let flip_events =
                 owner.apply_drm_event(IncarnationId::first(), page_event, Instant::now());
             for ev in flip_events {
-                consumer.consume(ev, &mut service).unwrap();
+                if let Some(commit_key) = event_commit_key(&ev) {
+                    consumer.consume(commit_key, ev, &mut service).unwrap();
+                }
             }
             assert_eq!(old_drops.get(), 0);
             assert_eq!(new_drops.get(), 0);
@@ -3658,7 +3689,9 @@ fn c0_2ci_commit_owner_integration_with_actual_leases() {
             let flip_events =
                 owner.apply_drm_event(IncarnationId::first(), page_event, Instant::now());
             for ev in flip_events {
-                consumer.consume(ev, &mut service).unwrap();
+                if let Some(commit_key) = event_commit_key(&ev) {
+                    consumer.consume(commit_key, ev, &mut service).unwrap();
+                }
             }
             assert_eq!(old_drops.get(), 0);
             assert_eq!(new_drops.get(), 0);
@@ -3667,7 +3700,9 @@ fn c0_2ci_commit_owner_integration_with_actual_leases() {
             let mut poll_set = DummyPollSet;
             let hw_events = owner.observe_fences(&mut query, &mut poll_set, Instant::now());
             for ev in hw_events {
-                consumer.consume(ev, &mut service).unwrap();
+                if let Some(commit_key) = event_commit_key(&ev) {
+                    consumer.consume(commit_key, ev, &mut service).unwrap();
+                }
             }
             assert_eq!(old_drops.get(), 0);
             assert_eq!(new_drops.get(), 0);
@@ -3758,6 +3793,7 @@ fn c0_2ci_commit_hardware_complete_discharges_old_only() {
 
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit: commit_id,
                 resources: accepted,
@@ -3775,6 +3811,7 @@ fn c0_2ci_commit_hardware_complete_discharges_old_only() {
     // The test body calls NO apply_validated_proof!
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
             &mut service,
         )
@@ -3853,6 +3890,7 @@ fn c0_2ci_commit_resources_still_current_cancels_not_discharges() {
     // Rejection: displacement never occurred!
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
                 commit: commit_id,
                 resources: vec![old_res],
@@ -3924,6 +3962,7 @@ fn c0_2ci_commit_resources_released_cancels_not_discharges() {
     // Rejection before dispatch even took: `ResourcesReleased`.
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::ResourcesReleased {
                 commit: commit_id,
                 resources: vec![old_res],
@@ -3992,6 +4031,7 @@ fn c0_2ci_commit_topology_replacement_reused_numeric_crtc() {
 
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit: commit_id,
                 resources: accepted,
@@ -4003,6 +4043,7 @@ fn c0_2ci_commit_topology_replacement_reused_numeric_crtc() {
     // HardwareComplete arrives for commit (which has membership [new_member])
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
             &mut service,
         )
@@ -4106,6 +4147,7 @@ fn c0_2ci_present_release_consumption_and_completion_suppression() {
     let submitted = crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]);
     consumer
         .consume(
+            test_commit_key(commit_1),
             OwnerEvent::CompletionRetired {
                 commit: commit_1,
                 resources: submitted.accepted(),
@@ -4117,6 +4159,7 @@ fn c0_2ci_present_release_consumption_and_completion_suppression() {
     // 1. Presented: marks completion Emitted, but keeps release Retained
     consumer
         .consume(
+            test_commit_key(commit_1),
             OwnerEvent::Presented {
                 commit: commit_1,
                 samples: std::collections::BTreeMap::new(),
@@ -4142,6 +4185,7 @@ fn c0_2ci_present_release_consumption_and_completion_suppression() {
 
     consumer
         .consume(
+            test_commit_key(commit_2),
             OwnerEvent::Terminal {
                 commit: commit_2,
                 terminal: TerminalState::FailedBeforeSubmit(
@@ -4233,6 +4277,7 @@ fn c0_2ci_commit_grouped_skip_and_duplicate_protection() {
 
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit: commit_id,
                 resources: accepted,
@@ -4244,6 +4289,7 @@ fn c0_2ci_commit_grouped_skip_and_duplicate_protection() {
     // HardwareComplete arrives
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
             &mut service,
         )
@@ -4264,6 +4310,7 @@ fn c0_2ci_commit_grouped_skip_and_duplicate_protection() {
     assert!(
         consumer
             .consume(
+                test_commit_key(commit_id),
                 crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
                 &mut service,
             )
@@ -4274,6 +4321,7 @@ fn c0_2ci_commit_grouped_skip_and_duplicate_protection() {
     assert!(
         consumer
             .consume(
+                test_commit_key(commit_id),
                 crate::kms::owner::device::OwnerEvent::Presented {
                     commit: commit_id,
                     samples: std::collections::BTreeMap::new(),
@@ -4487,11 +4535,12 @@ fn c0_2ci_capacity_delayed_on_available_discharges_and_unblocks() {
         .capacity
         .reserve(DirectRole::OrdinaryRetirement)
         .unwrap();
-    consumer.prereserve_retirement(commit_id, old_retire_slot);
+    consumer.prereserve_retirement(test_commit_key(commit_id), old_retire_slot);
 
     // Commit accepted and retired: old moves into pre-reserved OrdinaryRetirement, new moves to Current
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit: commit_id,
                 resources: crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res])
@@ -4510,6 +4559,7 @@ fn c0_2ci_capacity_delayed_on_available_discharges_and_unblocks() {
     // HardwareComplete discharges KMS obligation only
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
             &mut service,
         )
@@ -4567,6 +4617,7 @@ fn c0_2ci_capacity_delayed_on_available_discharges_and_unblocks() {
     // Rejection event arrives
     consumer
         .consume(
+            test_commit_key(rej_commit),
             crate::kms::owner::device::OwnerEvent::ResourcesReleased {
                 commit: rej_commit,
                 resources: vec![rej_res],
@@ -4756,6 +4807,7 @@ fn c0_2ci_capacity_comprehensive_six_roles_and_contract_8_6() {
     let commit_1 = CommitId::for_tests(301);
     consumer
         .consume(
+            test_commit_key(commit_1),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit: commit_1,
                 resources: crate::kms::owner::ledger::Submitted::new(vec![], vec![res_a])
@@ -4801,7 +4853,7 @@ fn c0_2ci_capacity_comprehensive_six_roles_and_contract_8_6() {
         .capacity
         .reserve(DirectRole::OrdinaryRetirement)
         .unwrap();
-    consumer.prereserve_retirement(commit_2, retire_slot);
+    consumer.prereserve_retirement(test_commit_key(commit_2), retire_slot);
 
     let mut old_a = consumer.take_current().into_iter().next().unwrap();
     old_a.kms_obligations = vec![(key_a, kms_a1, member_a), (key_a, kms_a2, member_b)];
@@ -4809,6 +4861,7 @@ fn c0_2ci_capacity_comprehensive_six_roles_and_contract_8_6() {
     // Commit 2 retires: A moves into pre-reserved OrdinaryRetirement, B moves to Current
     consumer
         .consume(
+            test_commit_key(commit_2),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit: commit_2,
                 resources: crate::kms::owner::ledger::Submitted::new(vec![old_a], vec![res_b])
@@ -4913,6 +4966,7 @@ fn c0_2ci_capacity_comprehensive_six_roles_and_contract_8_6() {
     // HardwareComplete arrives for commit_2 on member_a only
     consumer
         .consume(
+            test_commit_key(commit_2),
             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_2 },
             &mut service,
         )
@@ -5039,7 +5093,7 @@ fn c0_2ci_handoff_success_routes_late_events_and_completions() {
         vec![member],
         vec![(old_key, old_kms, member)],
     )
-    .with_commit_id(commit_id);
+    .with_commit_id(test_commit_key(commit_id));
 
     let mut consumer = CommitResourceConsumer::new();
     // Old resources awaiting release
@@ -5459,7 +5513,7 @@ fn c0_2ci_handoff_under_executor_stalled_revokes_grant_and_quarantines() {
         vec![member],
         vec![(old_key, old_kms, member)],
     )
-    .with_commit_id(commit);
+    .with_commit_id(test_commit_key(commit));
     consumer.current_resources.push(old_res);
 
     let calls = Rc::new(RefCell::new(Vec::new()));
@@ -5643,6 +5697,7 @@ fn c0_2ci_commit_terminal_completed_does_not_freeze_and_becomes_releasable() {
     // 1. HardwareComplete arrives (can arrive before or after CompletionRetired)
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
             &mut service,
         )
@@ -5653,6 +5708,7 @@ fn c0_2ci_commit_terminal_completed_does_not_freeze_and_becomes_releasable() {
         crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]).accepted();
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit: commit_id,
                 resources: accepted,
@@ -5664,6 +5720,7 @@ fn c0_2ci_commit_terminal_completed_does_not_freeze_and_becomes_releasable() {
     // 3. Terminal { Completed } arrives
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::Terminal {
                 commit: commit_id,
                 terminal: TerminalState::Completed,
@@ -5728,6 +5785,7 @@ fn c0_2ci_commit_terminal_failed_before_submit_does_not_freeze_current_set() {
     // Terminal { FailedBeforeSubmit } arrives BEFORE ResourcesStillCurrent on rejection (device.rs:2233-2246)
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::Terminal {
                 commit: commit_id,
                 terminal: TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
@@ -5741,6 +5799,7 @@ fn c0_2ci_commit_terminal_failed_before_submit_does_not_freeze_current_set() {
     // ResourcesStillCurrent arrives
     consumer
         .consume(
+            test_commit_key(commit_id),
             crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
                 commit: commit_id,
                 resources: vec![current_res],
@@ -5795,9 +5854,9 @@ fn c0_2ci_commit_terminal_completion_unknown_freezes_only_that_commit() {
     let commit2 = CommitId::for_tests(704);
 
     let res1 = CommitResources::new(vec![alloc1], None, None, None, vec![member], vec![])
-        .with_commit_id(commit1);
+        .with_commit_id(test_commit_key(commit1));
     let res2 = CommitResources::new(vec![alloc2], None, None, None, vec![member], vec![])
-        .with_commit_id(commit2);
+        .with_commit_id(test_commit_key(commit2));
 
     let mut consumer = CommitResourceConsumer::new();
     consumer.releasing_resources.push(res1);
@@ -5806,6 +5865,7 @@ fn c0_2ci_commit_terminal_completion_unknown_freezes_only_that_commit() {
     // Terminal { CompletionUnknown } for commit1 only!
     consumer
         .consume(
+            test_commit_key(commit1),
             crate::kms::owner::device::OwnerEvent::Terminal {
                 commit: commit1,
                 terminal: TerminalState::CompletionUnknown(UnknownCause::IncompleteFenceOutput {
@@ -5864,9 +5924,9 @@ fn c0_2ci_commit_quarantined_closes_gate_and_freezes_only_that_commit() {
     let commit2 = CommitId::for_tests(706);
 
     let res1 = CommitResources::new(vec![alloc1], None, None, None, vec![member], vec![])
-        .with_commit_id(commit1);
+        .with_commit_id(test_commit_key(commit1));
     let res2 = CommitResources::new(vec![alloc2], None, None, None, vec![member], vec![])
-        .with_commit_id(commit2);
+        .with_commit_id(test_commit_key(commit2));
 
     consumer.releasing_resources.push(res1);
     consumer.releasing_resources.push(res2);
@@ -5874,6 +5934,7 @@ fn c0_2ci_commit_quarantined_closes_gate_and_freezes_only_that_commit() {
     // Quarantined arrives for commit1
     consumer
         .consume(
+            test_commit_key(commit1),
             crate::kms::owner::device::OwnerEvent::Quarantined { commit: commit1 },
             &mut service,
         )
@@ -5930,6 +5991,7 @@ fn c0_2ci_commit_presented_selects_reference_crtc_sample() {
     let mut service = ResourceService::new(dev, incarnation);
     consumer
         .consume(
+            test_commit_key(commit),
             crate::kms::owner::device::OwnerEvent::Presented { commit, samples },
             &mut service,
         )
@@ -6328,6 +6390,7 @@ fn c0_2ci_commit_discharge_atomic_validate_then_apply_failure_rolls_back() {
     let mut consumer = CommitResourceConsumer::new();
     consumer
         .consume(
+            test_commit_key(commit),
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit,
                 resources: accepted,
@@ -6338,6 +6401,7 @@ fn c0_2ci_commit_discharge_atomic_validate_then_apply_failure_rolls_back() {
 
     // HardwareComplete arrives - atomic validate-all encounters ob2_invalid!
     let err = consumer.consume(
+        test_commit_key(commit),
         crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
         &mut service,
     );
@@ -6352,4 +6416,141 @@ fn c0_2ci_commit_discharge_atomic_validate_then_apply_failure_rolls_back() {
     drop(consumer);
     service.service_ready();
     assert_eq!(drops_old.get(), 1);
+}
+
+#[test]
+fn c0_conv_ciii_id_equal_commit_ids_do_not_cross_devices() {
+    use crate::kms::owner::{
+        device::DeviceCommitOwner, identity::IncarnationId, ledger::Submitted,
+        lifecycle::LifecycleEpochId,
+    };
+
+    let device_a = DrmDeviceKey {
+        major: 226,
+        minor: 101,
+    };
+    let device_b = DrmDeviceKey {
+        major: 226,
+        minor: 102,
+    };
+    let mut owner_a = DeviceCommitOwner::<CommitResources>::new(
+        IncarnationId::from_raw(101),
+        LifecycleEpochId::first(),
+        1,
+    );
+    let mut owner_b = DeviceCommitOwner::<CommitResources>::new(
+        IncarnationId::from_raw(102),
+        LifecycleEpochId::first(),
+        1,
+    );
+    let description = crate::kms::owner::test_fixtures::single_active_crtc();
+    let (commit_a, _) = owner_a
+        .begin(&description, Submitted::new(Vec::new(), Vec::new()))
+        .expect("owner A issues commit");
+    let (commit_b, _) = owner_b
+        .begin(&description, Submitted::new(Vec::new(), Vec::new()))
+        .expect("owner B issues commit");
+    assert_eq!(
+        commit_a, commit_b,
+        "the two owner allocators must collide numerically"
+    );
+
+    let key_a = CommitKey::new(device_a, commit_a);
+    let key_b = CommitKey::new(device_b, commit_b);
+    let mut consumer = CommitResourceConsumer::new();
+    let mut service = ResourceService::new(device_a, IncarnationId::from_raw(101));
+
+    consumer
+        .consume(
+            key_a,
+            OwnerEvent::HardwareComplete { commit: commit_a },
+            &mut service,
+        )
+        .expect("A hardware completion is cacheable");
+    consumer
+        .consume(
+            key_b,
+            OwnerEvent::CompletionRetired {
+                commit: commit_b,
+                resources: Submitted::new(Vec::new(), Vec::new()).accepted(),
+            },
+            &mut service,
+        )
+        .expect("B retirement is consumable");
+
+    assert!(consumer.hardware_completed_commits.contains(&key_a));
+    assert!(!consumer.hardware_completed_commits.contains(&key_b));
+    assert_eq!(consumer.commit_members.get(&key_b), Some(&Vec::new()));
+
+    let mut consumer = CommitResourceConsumer::new();
+    let mut service = ResourceService::new(device_a, IncarnationId::from_raw(101));
+    let held = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::new(Cell::new(0)),
+        }))
+        .expect("A's releasing allocation");
+    let allocation_key = held.key();
+    let member = GroupMember::new(
+        CrtcKey::new(
+            device_a,
+            ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
+        ),
+        1,
+        1,
+    );
+    let kms_obligation = service
+        .register_kms(allocation_key, key_a.commit, member)
+        .expect("A's KmsRelease obligation");
+    let releasing_a = CommitResources::new(
+        vec![held],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(allocation_key, kms_obligation, member)],
+    );
+
+    // Put A's real releasing resource behind the same consumer entry point
+    // used by the owner retirement path.  The later HardwareComplete events
+    // must then distinguish the two devices, not merely their equal numbers.
+    consumer
+        .consume(
+            key_a,
+            OwnerEvent::CompletionRetired {
+                commit: commit_a,
+                resources: Submitted::new(vec![releasing_a], Vec::new()).accepted(),
+            },
+            &mut service,
+        )
+        .expect("A retirement is consumable");
+    assert!(service.has_pending_obligations(&allocation_key));
+
+    consumer
+        .consume(
+            key_b,
+            OwnerEvent::HardwareComplete { commit: commit_b },
+            &mut service,
+        )
+        .expect("B hardware completion is consumable");
+
+    assert!(
+        service.has_pending_obligations(&allocation_key),
+        "B's equal numeric completion must not discharge A's KmsRelease"
+    );
+
+    consumer
+        .consume(
+            key_a,
+            OwnerEvent::HardwareComplete { commit: commit_a },
+            &mut service,
+        )
+        .expect("A hardware completion discharges A's resource");
+    assert!(
+        !service.has_pending_obligations(&allocation_key),
+        "A's own completion must discharge A's KmsRelease"
+    );
+
+    assert!(consumer.hardware_completed_commits.contains(&key_b));
+    assert!(!consumer.hardware_completed_commits.contains(&key_a));
+    assert!(!consumer.commit_members.contains_key(&key_b));
 }

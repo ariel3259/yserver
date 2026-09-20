@@ -33,6 +33,24 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-20 Phase C.0 stage 2c-iii, plan Ciii-identity accepted:** commit
+  identity is now device-qualified, which is a repair of a one-device assumption
+  of stages 2c-i and 2c-ii rather than unflip work. Each `DeviceCommitOwner`
+  numbers its commits from 1, so two owner devices issue the same numbers, and
+  every consumer in the backend, the resource service and the scene correlated by
+  that bare number: one device's cached completion, Present dispositions, pending
+  direct frame and pins, damage transactions and owner buffers were all reachable
+  by another device's commit of the same number — release before proof, across
+  devices. A `CommitKey { device, commit }` is now the only thing a correlating
+  consumer takes, so a device-blind site **does not compile**; that type, not an
+  enumeration, is what closed a family four review rounds had each reopened. The
+  conductor, gate, owner and direct-group halves of §6.2 needed no production
+  change and gained their evidence on a two-device fixture. Tasks `b955a5f5` and
+  `2ce060f8`; thirteen mutations caught, two of them at sites the plan had not
+  enumerated; hardware gate **313/313**. This plan exists because plan Ciii was
+  split at its revision 11, after ten review rounds. Details, including a
+  mutation whose pairing is not proven and an unreproduced `--lib` failure, in
+  the [acceptance finding](superpowers/findings/2026-09-20-stage-2c-iii-plan-ciii-identity-accepted.md).
 - **2026-09-20 Phase C.0 stage 2c-iii, plan Cii accepted (fixture level):** the
   direct scanout producer now has an `Owner` half behind the same transport fork
   as the composed one. One production eligibility predicate answers both routes,

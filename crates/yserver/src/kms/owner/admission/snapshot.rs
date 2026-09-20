@@ -28,6 +28,7 @@ pub enum WaitReason {
     OrdinaryRetirementOccupied,
     ExitRetirementOccupied,
     ComposedReturnNotEstablished,
+    UnflipShadowNotMaterialized,
     NotDirectEligible,
 }
 

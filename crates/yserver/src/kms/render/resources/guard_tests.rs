@@ -411,9 +411,10 @@ fn c0_2ci_guard_completion_retired_returns_failed_move_into_reserved() {
     let (mut service, old_alloc, _drops) = spy_service();
     let mut consumer = CommitResourceConsumer::new();
     let commit = CommitId::for_tests(920);
+    let commit_key = CommitKey::new(service.device(), commit);
     // Never reserved in the consumer's capacity: move_into_reserved rejects it.
     consumer.prereserve_retirement(
-        commit,
+        commit_key,
         RoleReservation::new_for_test(DirectRole::OrdinaryRetirement, 998, closed_cell()),
     );
     let old =
@@ -423,6 +424,7 @@ fn c0_2ci_guard_completion_retired_returns_failed_move_into_reserved() {
     let accepted = crate::kms::owner::ledger::Submitted::new(vec![old], vec![]).accepted();
     assert_eq!(
         consumer.consume(
+            commit_key,
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
                 commit,
                 resources: accepted,
@@ -441,6 +443,8 @@ fn c0_2ci_guard_completion_retired_returns_failed_move_into_reserved() {
 fn c0_2ci_guard_completion_retired_returns_failed_move_into_ordinary_retirement() {
     let (mut service, old_alloc, _drops) = spy_service();
     let mut consumer = CommitResourceConsumer::new();
+    let commit = CommitId::for_tests(922);
+    let commit_key = CommitKey::new(service.device(), commit);
     // No retirement slot pre-reserved for this commit and OrdinaryRetirement
     // vacant: consume takes the `else if` branch. The Current token was never
     // reserved in the consumer's capacity, so move_role rejects it.
@@ -451,8 +455,9 @@ fn c0_2ci_guard_completion_retired_returns_failed_move_into_ordinary_retirement(
     let accepted = crate::kms::owner::ledger::Submitted::new(vec![old], vec![]).accepted();
     assert_eq!(
         consumer.consume(
+            commit_key,
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
-                commit: CommitId::for_tests(922),
+                commit,
                 resources: accepted,
             },
             &mut service,
@@ -469,6 +474,8 @@ fn c0_2ci_guard_completion_retired_returns_failed_move_into_ordinary_retirement(
 fn c0_2ci_guard_completion_retired_returns_failed_submitted_to_current() {
     let (mut service, new_alloc, _drops) = spy_service();
     let mut consumer = CommitResourceConsumer::new();
+    let commit = CommitId::for_tests(921);
+    let commit_key = CommitKey::new(service.device(), commit);
     let new =
         CommitResources::new(vec![new_alloc], None, None, None, vec![], vec![]).with_direct_role(
             RoleReservation::new_for_test(DirectRole::Submitted, 997, closed_cell()),
@@ -476,8 +483,9 @@ fn c0_2ci_guard_completion_retired_returns_failed_submitted_to_current() {
     let accepted = crate::kms::owner::ledger::Submitted::new(vec![], vec![new]).accepted();
     assert_eq!(
         consumer.consume(
+            commit_key,
             crate::kms::owner::device::OwnerEvent::CompletionRetired {
-                commit: CommitId::for_tests(921),
+                commit,
                 resources: accepted,
             },
             &mut service,

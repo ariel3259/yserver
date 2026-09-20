@@ -4,6 +4,8 @@ use std::{
     fmt,
 };
 
+use crate::{kms::owner::identity::CommitId, platform::drm::DrmDeviceKey};
+
 use crate::kms::render::{
     platform::CrtcKey,
     resources::{
@@ -16,6 +18,18 @@ use crate::kms::render::{
         transport::TransportGateHandle,
     },
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CommitKey {
+    pub(crate) device: DrmDeviceKey,
+    pub(crate) commit: CommitId,
+}
+
+impl CommitKey {
+    pub(crate) const fn new(device: DrmDeviceKey, commit: CommitId) -> Self {
+        Self { device, commit }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GroupMember {
@@ -77,7 +91,7 @@ pub struct CommitResources {
     /// discharged by this commit's `HardwareComplete` (round-3 M-1).
     pub(crate) kms_obligations: Vec<(AllocationKey, ObligationId, GroupMember)>,
     pub(crate) direct_role: Option<RoleReservation>,
-    pub(crate) commit_id: Option<crate::kms::owner::identity::CommitId>,
+    pub(crate) commit_id: Option<CommitKey>,
 }
 
 impl fmt::Debug for CommitResources {
@@ -121,7 +135,7 @@ impl CommitResources {
         self
     }
 
-    pub(crate) fn with_commit_id(mut self, commit: crate::kms::owner::identity::CommitId) -> Self {
+    pub(crate) fn with_commit_id(mut self, commit: CommitKey) -> Self {
         self.commit_id = Some(commit);
         self
     }
@@ -132,16 +146,15 @@ pub struct CommitResourceConsumer {
     pub(crate) current_resources: Vec<CommitResources>,
     pub(crate) releasing_resources: Vec<CommitResources>,
     pub(crate) rejected_resources: Vec<CommitResources>,
-    pub(crate) hardware_completed_commits: BTreeSet<crate::kms::owner::identity::CommitId>,
-    pub(crate) commit_members: BTreeMap<crate::kms::owner::identity::CommitId, Vec<GroupMember>>,
+    pub(crate) hardware_completed_commits: BTreeSet<CommitKey>,
+    pub(crate) commit_members: BTreeMap<CommitKey, Vec<GroupMember>>,
     pub(crate) present_dispositions: BTreeMap<PresentKey, PresentDisposition>,
     pub(crate) reference_crtcs: BTreeMap<PresentKey, u32>,
     pub(crate) capacity: DirectCapacity,
     pub(crate) direct_admission_scheduled: bool,
     pub(crate) gate_handle: Option<TransportGateHandle>,
     pub(crate) released_presents: Vec<PresentRelease>,
-    pub(crate) reserved_retirements:
-        BTreeMap<crate::kms::owner::identity::CommitId, RoleReservation>,
+    pub(crate) reserved_retirements: BTreeMap<CommitKey, RoleReservation>,
 }
 
 impl CommitResourceConsumer {
@@ -149,11 +162,7 @@ impl CommitResourceConsumer {
         Self::default()
     }
 
-    pub(crate) fn prereserve_retirement(
-        &mut self,
-        commit: crate::kms::owner::identity::CommitId,
-        slot: RoleReservation,
-    ) {
+    pub(crate) fn prereserve_retirement(&mut self, commit: CommitKey, slot: RoleReservation) {
         self.reserved_retirements.insert(commit, slot);
     }
 
@@ -202,10 +211,7 @@ impl CommitResourceConsumer {
     /// The owner tags every released entry with the record's commit id, so a
     /// composed caller can hand exactly that state back to its prepared
     /// generation without touching another rejected commit.
-    pub(crate) fn take_rejected_for_commit(
-        &mut self,
-        commit: crate::kms::owner::identity::CommitId,
-    ) -> Vec<CommitResources> {
+    pub(crate) fn take_rejected_for_commit(&mut self, commit: CommitKey) -> Vec<CommitResources> {
         let rejected = std::mem::take(&mut self.rejected_resources);
         let mut matching = Vec::new();
         let mut retained = Vec::with_capacity(rejected.len());
@@ -251,11 +257,7 @@ impl CommitResourceConsumer {
         self.reference_crtcs.insert(key, reference_crtc);
     }
 
-    fn freeze_commit_entries(
-        &self,
-        commit: crate::kms::owner::identity::CommitId,
-        service: &mut ResourceService,
-    ) {
+    fn freeze_commit_entries(&self, commit: CommitKey, service: &mut ResourceService) {
         for res in &self.releasing_resources {
             if res.commit_id == Some(commit) {
                 freeze_resource_allocations(res, service);
@@ -275,15 +277,16 @@ impl CommitResourceConsumer {
 
     pub(crate) fn consume(
         &mut self,
+        commit_key: CommitKey,
         event: crate::kms::owner::device::OwnerEvent<CommitResources>,
         service: &mut ResourceService,
     ) -> Result<(), ResourceError> {
         match event {
-            crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } => {
+            crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: _ } => {
                 let mut found = false;
-                let members = self.commit_members.remove(&commit);
+                let members = self.commit_members.remove(&commit_key);
                 for res in &mut self.releasing_resources {
-                    if res.commit_id == Some(commit) {
+                    if res.commit_id == Some(commit_key) {
                         found = true;
                         let target_members = members
                             .as_ref()
@@ -293,20 +296,23 @@ impl CommitResourceConsumer {
                     }
                 }
                 if !found {
-                    self.hardware_completed_commits.insert(commit);
+                    self.hardware_completed_commits.insert(commit_key);
                 }
                 Ok(())
             }
-            crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: _,
+                resources,
+            } => {
                 let (mut old, mut new) = resources.into_parts();
                 let mut members: Vec<GroupMember> =
                     new.iter().flat_map(|r| r.crtcs.iter().copied()).collect();
                 if members.is_empty() {
                     members = old.iter().flat_map(|r| r.crtcs.iter().copied()).collect();
                 }
-                let hw_completed = self.hardware_completed_commits.remove(&commit);
+                let hw_completed = self.hardware_completed_commits.remove(&commit_key);
                 for res in &mut old {
-                    res.commit_id = Some(commit);
+                    res.commit_id = Some(commit_key);
                     if hw_completed {
                         discharge_commit_kms_obligations(res, &members, service)?;
                     }
@@ -314,11 +320,11 @@ impl CommitResourceConsumer {
                     if let Some(ref mut role) = res.direct_role
                         && role.role == DirectRole::Current
                     {
-                        if let Some(reserved) = self.reserved_retirements.remove(&commit) {
+                        if let Some(reserved) = self.reserved_retirements.remove(&commit_key) {
                             if let Err((err, recovered)) =
                                 self.capacity.move_into_reserved(role, reserved)
                             {
-                                self.reserved_retirements.insert(commit, recovered);
+                                self.reserved_retirements.insert(commit_key, recovered);
                                 self.capacity.close_admission();
                                 return Err(err);
                             }
@@ -333,7 +339,7 @@ impl CommitResourceConsumer {
                     }
                 }
                 if !hw_completed {
-                    self.commit_members.insert(commit, members);
+                    self.commit_members.insert(commit_key, members);
                 }
                 // M-7: new submitted moves into Current
                 for res in &mut new {
@@ -350,12 +356,12 @@ impl CommitResourceConsumer {
                 Ok(())
             }
             crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
-                commit,
+                commit: _,
                 mut resources,
             } => {
-                self.hardware_completed_commits.remove(&commit);
-                self.commit_members.remove(&commit);
-                if let Some(reserved) = self.reserved_retirements.remove(&commit) {
+                self.hardware_completed_commits.remove(&commit_key);
+                self.commit_members.remove(&commit_key);
+                if let Some(reserved) = self.reserved_retirements.remove(&commit_key) {
                     let _ = self.capacity.cancel_reservation(reserved);
                 }
                 for res in &mut resources {
@@ -367,53 +373,58 @@ impl CommitResourceConsumer {
                 Ok(())
             }
             crate::kms::owner::device::OwnerEvent::ResourcesReleased {
-                commit,
+                commit: _,
                 mut resources,
             } => {
-                self.hardware_completed_commits.remove(&commit);
-                self.commit_members.remove(&commit);
-                if let Some(reserved) = self.reserved_retirements.remove(&commit) {
+                self.hardware_completed_commits.remove(&commit_key);
+                self.commit_members.remove(&commit_key);
+                if let Some(reserved) = self.reserved_retirements.remove(&commit_key) {
                     let _ = self.capacity.cancel_reservation(reserved);
                 }
                 for res in &mut resources {
                     for (key, obligation_id, _) in res.kms_obligations.drain(..) {
                         let _ = service.cancel(key, obligation_id);
                     }
-                    res.commit_id = Some(commit);
+                    res.commit_id = Some(commit_key);
                 }
                 self.rejected_resources.extend(resources);
                 Ok(())
             }
-            crate::kms::owner::device::OwnerEvent::Quarantined { commit } => {
+            crate::kms::owner::device::OwnerEvent::Quarantined { commit: _ } => {
                 if let Some(gate) = &self.gate_handle {
                     gate.close_gate();
                 }
-                self.freeze_commit_entries(commit, service);
+                self.freeze_commit_entries(commit_key, service);
                 Ok(())
             }
-            crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => {
-                match terminal {
-                    crate::kms::owner::record::TerminalState::Completed => Ok(()),
-                    crate::kms::owner::record::TerminalState::FailedBeforeSubmit(_) => {
-                        for (key, disp) in &mut self.present_dispositions {
-                            if key.commit == commit
-                                && disp.completion == CompletionDisposition::Pending
-                            {
-                                disp.completion = CompletionDisposition::Suppressed;
-                                disp.release = ReleaseDisposition::Retained;
-                            }
+            crate::kms::owner::device::OwnerEvent::Terminal {
+                commit: _,
+                terminal,
+            } => match terminal {
+                crate::kms::owner::record::TerminalState::Completed => Ok(()),
+                crate::kms::owner::record::TerminalState::FailedBeforeSubmit(_) => {
+                    for (key, disp) in &mut self.present_dispositions {
+                        if key.device == commit_key.device
+                            && key.commit == commit_key.commit
+                            && disp.completion == CompletionDisposition::Pending
+                        {
+                            disp.completion = CompletionDisposition::Suppressed;
+                            disp.release = ReleaseDisposition::Retained;
                         }
-                        Ok(())
                     }
-                    crate::kms::owner::record::TerminalState::CompletionUnknown(_) => {
-                        self.freeze_commit_entries(commit, service);
-                        Ok(())
-                    }
+                    Ok(())
                 }
-            }
-            crate::kms::owner::device::OwnerEvent::Presented { commit, samples } => {
+                crate::kms::owner::record::TerminalState::CompletionUnknown(_) => {
+                    self.freeze_commit_entries(commit_key, service);
+                    Ok(())
+                }
+            },
+            crate::kms::owner::device::OwnerEvent::Presented { commit: _, samples } => {
                 for (key, disp) in &mut self.present_dispositions {
-                    if key.commit == commit && disp.completion == CompletionDisposition::Pending {
+                    if key.device == commit_key.device
+                        && key.commit == commit_key.commit
+                        && disp.completion == CompletionDisposition::Pending
+                    {
                         disp.completion = CompletionDisposition::Emitted;
                         disp.release = ReleaseDisposition::Retained;
                         if let Some(&ref_crtc) = self.reference_crtcs.get(key) {
@@ -454,7 +465,9 @@ impl CommitResourceConsumer {
                                 let pid = present_rel.event.present_id;
                                 for (k, disp) in &mut self.present_dispositions {
                                     if k.present_id == pid
-                                        && res.commit_id.is_none_or(|c| k.commit == c)
+                                        && res.commit_id.is_none_or(|c| {
+                                            k.device == c.device && k.commit == c.commit
+                                        })
                                     {
                                         disp.release = ReleaseDisposition::Released;
                                     }
@@ -476,7 +489,11 @@ impl CommitResourceConsumer {
                     if let Some(present_rel) = res.present.take() {
                         let pid = present_rel.event.present_id;
                         for (k, disp) in &mut self.present_dispositions {
-                            if k.present_id == pid && res.commit_id.is_none_or(|c| k.commit == c) {
+                            if k.present_id == pid
+                                && res
+                                    .commit_id
+                                    .is_none_or(|c| k.device == c.device && k.commit == c.commit)
+                            {
                                 disp.release = ReleaseDisposition::Released;
                             }
                         }
@@ -507,7 +524,9 @@ impl CommitResourceConsumer {
                                 let pid = present_rel.event.present_id;
                                 for (k, disp) in &mut self.present_dispositions {
                                     if k.present_id == pid
-                                        && res.commit_id.is_none_or(|c| k.commit == c)
+                                        && res.commit_id.is_none_or(|c| {
+                                            k.device == c.device && k.commit == c.commit
+                                        })
                                     {
                                         disp.release = ReleaseDisposition::Released;
                                     }
@@ -529,7 +548,11 @@ impl CommitResourceConsumer {
                     if let Some(present_rel) = res.present.take() {
                         let pid = present_rel.event.present_id;
                         for (k, disp) in &mut self.present_dispositions {
-                            if k.present_id == pid && res.commit_id.is_none_or(|c| k.commit == c) {
+                            if k.present_id == pid
+                                && res
+                                    .commit_id
+                                    .is_none_or(|c| k.device == c.device && k.commit == c.commit)
+                            {
                                 disp.release = ReleaseDisposition::Released;
                             }
                         }
