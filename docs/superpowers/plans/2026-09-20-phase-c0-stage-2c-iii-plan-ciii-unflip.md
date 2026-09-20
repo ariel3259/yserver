@@ -2,6 +2,27 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 7 (2026-09-20)** — incorporates codex round 6
+(`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round6.md`: 1 blocking,
+verified against the tree by the author and accepted; round 5 audited APPLIED).
+
+- **B-1, confirmed: the direct frame's ordinary milestones.** Rounds 4, 5 and 6
+  each found one more consumer correlating by a bare commit number — this time
+  the pending direct frame's normal path: `managed_record_direct_presented`
+  matches it by `commit_id == Some(commit)` with no device
+  (`backend.rs:2844`-`2856`), and `managed_enqueue_retired_direct_completion`
+  takes **no argument at all** and unconditionally `take()`s the pending frame
+  (`backend.rs:2878`-`2899`), so device B's `CompletionRetired` would publish
+  device A's Present and release A's preceding frame without A's own proof.
+- **The fix is structural, so this stops being a discovery loop.** Task 1 no
+  longer relies on an enumeration alone: it introduces a **`CommitKey`**
+  (device + `CommitId`) and makes every correlating consumer take it, so a
+  site that still correlates by a bare `CommitId` **fails to compile** rather
+  than waiting for another review round. The enumeration below becomes the
+  migration checklist, not the safety net — the same move the Ci-refactor made
+  with `OwnerBuffer`. Any correlation left device-blind on purpose is named in
+  the task's report.
+
 **Revision 6 (2026-09-20)** — incorporates codex round 5
 (`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round5.md`: 1 blocking,
 verified against the tree by the author and accepted; round 4's B-1 audited
@@ -403,6 +424,7 @@ user's go-ahead.
 | Two owners' equal numeric `CommitId`s never correlate across devices (§6.2, §3.2; round-3 B-2) | `c0_conv_ciii_equal_commit_ids_do_not_cross_devices` | T36: key the completion cache by `CommitId` alone; T37: match a releasing resource without comparing its device |
 | A terminal or `CompletionUnknown` on one device leaves another device's Present disposition and pins alone (§6.2; round-4 M-1) | `c0_conv_ciii_foreign_terminal_leaves_a_pending_present_alone` | T40: drop the device comparison from the `present_dispositions` scan; T41: match the pending direct frame by `CommitId` alone |
 | One device's milestones never accept, apply, remove or block another device's damage transaction or owner buffer (§6.2; round-5 B-1) | `c0_conv_ciii_foreign_milestones_leave_a_damage_transaction_alone` | T42: key `owner_damage_transactions` by `CommitId` alone; T43: scan owner buffers without comparing the device |
+| A `Presented` or `CompletionRetired` on one device never samples, publishes, promotes or releases another device's pending direct frame (§6.2, §3.3; round-6 B-1) | `c0_conv_ciii_foreign_milestones_leave_a_pending_direct_frame_alone` | T44: publish the pending frame at retirement without matching its `CommitKey`, as today's no-argument helper does |
 | On real hardware in `Owner`: a composed frame, a direct frame, the unflip back, and a commit retaining an allocation of the old state for the same member (§6.4) | `c0_hw_ciii_owner_route_on_card1_drm` | — (the run itself is the evidence; its two mutations are below) |
 | A displaced buffer's `KmsRelease` is discharged by the real completion — P3-2 (§6.4, debt spec §9.3/§9.5) | the same test, steps 1-3 | T32: drop the displaced buffer's registration |
 | A retained allocation registers no `KmsRelease` and is not released — P3-3 (§6.4) | the same test, step 4 | T33: register the retained allocation |
@@ -420,9 +442,18 @@ frame), `scene.rs` (the damage transactions and the owner-buffer scans); tests.
 `identity.rs:136`-`150`), so two owner devices issue the same numbers. The
 consumers that correlate by those numbers are shared.
 
-**The inventory (round-3 B-2, round-4 M-1).** Every site below is converted,
-and the enumeration is this task's scope boundary — a site found later is an
-F8 stop, not a silent addition:
+**The mechanism (round-6 B-1).** Correlation stops being possible by number:
+this task introduces a **`CommitKey`** — a `DrmDeviceKey` and a `CommitId`
+together — and **every consumer that correlates takes a `CommitKey`**, never a
+bare `CommitId`. A site that still correlates by number then fails to compile,
+which is what ends the per-round discovery of one more consumer. The owner's
+own internal records, which never leave their device, may keep the plain id;
+any other correlation deliberately left device-blind is **named in the task's
+report** with why.
+
+**The migration checklist (round-3 B-2, round-4 M-1, round-5 B-1, round-6
+B-1).** Every site below is converted; it is a checklist, not the safety net —
+the type is:
 - the single `CommitResourceConsumer` (`backend.rs:1501`) and its
   `hardware_completed_commits`, `commit_members` and `reserved_retirements`,
   keyed by a bare `CommitId` (`resources/commit.rs:130`-`145`);
@@ -443,7 +474,15 @@ F8 stop, not a silent addition:
   are called with the number alone (`:1956`-`:2004`);
 - the owner-buffer transitions, which scan every output for
   `buffer.commit_id() == Some(commit)` without a device (`scene.rs:2085`,
-  `:2175`, `:2217`).
+  `:2175`, `:2217`);
+- the pending direct frame's **ordinary** milestones (round-6 B-1):
+  `managed_record_direct_presented`, which matches the frame by `CommitId`
+  alone (`backend.rs:2844`-`2856`), and
+  `managed_enqueue_retired_direct_completion`, which takes **no argument** and
+  unconditionally takes the pending frame (`backend.rs:2878`-`2899`), together
+  with the routing that calls them (`backend.rs:20328`-`20358`,
+  `:20401`-`:20465`). Both take the frame's `CommitKey` and do nothing unless
+  it matches.
 
 Splitting the consumer per device is **not** the shape: `DirectCapacity` is one
 direct group for the whole backend by design (decision 9). What changes is the
@@ -456,7 +495,9 @@ owners issue the same numeric `CommitId`. A cached `HardwareComplete` belongs to
 `CompletionRetired` of the same number on another device neither consumes it
 nor discharges any `KmsRelease` obligation. A `Terminal` or `CompletionUnknown`
 on one device neither changes another device's Present disposition nor
-releases another device's pins. One device's damage transaction is neither
+releases another device's pins, and a `Presented` or `CompletionRetired` on one
+device neither samples, publishes, promotes nor releases another device's
+pending direct frame — **release-before-proof is impossible across devices**. One device's damage transaction is neither
 accepted, applied nor removed by another device's milestone of the same
 number, and installing a transaction on one device is never refused because
 another device already holds that number. Every later task's recorded commit
@@ -473,6 +514,11 @@ identity — the unflip retirement's included — uses this qualified key
   Present is pending; B's commit of the same number reaches
   `FailedBeforeSubmit` and then `CompletionUnknown`; A's disposition and A's
   pins are untouched.
+- `c0_conv_ciii_foreign_milestones_leave_a_pending_direct_frame_alone` — A's
+  direct frame is pending **with its `Presented` sample already recorded**; B's
+  commit of the same number delivers `Presented` and then `CompletionRetired`;
+  A's pending frame, A's current frame, the publication queue and A's pins are
+  all unchanged (round-6 B-1).
 - `c0_conv_ciii_foreign_milestones_leave_a_damage_transaction_alone` — A and B
   each hold a live damage transaction and an owner buffer under the **same**
   numeric `CommitId`; B's `Accepted`, `HardwareComplete`, `Terminal` and
