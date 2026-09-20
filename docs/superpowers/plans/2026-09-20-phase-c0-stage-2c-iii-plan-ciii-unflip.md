@@ -2,6 +2,22 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 13 (2026-09-20)** — a **factual correction**, reported as an F8 stop
+by the implementer before it wrote a line, which is exactly the behaviour the
+honesty rule asks for.
+
+- Revisions 4 and 5 said `admission_request_unflip` has **two** existing test
+  callers and pinned two line numbers. It has **three**, and it had three
+  before any of this stage's commits: `backend.rs:55683`, `:55711` and `:55754`
+  at `5a34c6ec`, now `:55731`, `:55759` and `:55802` after the identity plan's
+  two commits shifted them. The author's original grep was truncated and the
+  count went into the plan unchecked.
+- The correction is also made robust: the live text no longer pins line
+  numbers for these, because they move with every commit above them. **Every**
+  existing test caller must keep working and none is deleted; find them with a
+  grep at the commit you start from. The older revision blocks keep the numbers
+  they were written with, as historical record.
+
 **Revision 12 (2026-09-20)** — **the plan was split** (user decision: "partí
 el plan, ya llevamos 11 revisiones"). Revision 11's Tasks 1 and 2 — commit
 identity as a `CommitKey`, and multi-device isolation — moved out whole into
@@ -180,8 +196,8 @@ here).
   funnel fork into it is a cycle that never reaches a wake. Decision 3 now
   fixes an acyclic boundary: the funnel owns the legacy flags, the admission
   primitive never calls the funnel, and that callback is removed — with its two
-  existing test callers (`backend.rs:55683`, `:55711`) named, because they
-  depend on the effect it has today.
+  existing test callers named, because they depend on the effect it has today
+  (revision 13: there are three of them, not two).
 - **B-2, confirmed: commit ids collide across devices.** Each
   `DeviceCommitOwner` mints `CommitId`s from **its own** allocator starting at
   1 (`owner/device.rs:217`, `identity.rs:136`-`150`), while the backend keeps
@@ -237,7 +253,7 @@ five APPLIED and M-2 TRADED, closed here).
   operation that retries it; decision 2 now names the site, and the snapshot
   only reads the flag. (c) No production cause reached
   `admission_request_unflip` — its only callers are tests
-  (`backend.rs:55683`, `:55711`), while every real cause calls
+  (three test callers, revision 13), while every real cause calls
   `request_direct_unflip`, which sets `scanout_m2` flags and nothing else
   (`backend.rs:2315`-`2325`). Spec §6.1 requires those causes to enter the
   owner request; decision 3 gives them one entry.
@@ -341,10 +357,11 @@ especially "Carried to Ciii" and the three F8 stops, before the first task.
    `request_direct_unflip` today (`admission.rs:727`), so forking the funnel
    into it without removing that call is infinite recursion. The boundary:
    **the funnel owns the legacy flags; the admission primitive never calls the
-   funnel.** That callback is removed, and the two existing test callers
-   (`backend.rs:55683`, `:55711`), which today get the flag effects through it,
-   are moved onto the funnel or given the effect explicitly — the task says
-   which, and neither is deleted. A second cause arriving while an unflip is
+   funnel.** That callback is removed, and **every** existing test caller of
+   `admission_request_unflip` — three of them at `2ce060f8`, found with a grep
+   rather than by line number, since they move with every commit above them —
+   which today gets the flag effects through it, is moved onto the funnel or
+   given the effect explicitly. The task says which, and **none is deleted**. A second cause arriving while an unflip is
    already requested is harmless: no second intent, no second terminalization,
    no second materialization.
 4. **One transaction replacing the complete plane set** (§6.1). The owner
