@@ -109,7 +109,9 @@ Baseline before Task 1 (commit `528ac2a4`): `c0_conv_ci_` 38/38 with `--include-
 
 **Invariants (spec §5.1, decision 2):** one function gathers the inputs and returns both the decision and the layout/eligibility generation it was decided under. `try_present_direct` calls it where it computes them today; the conductor's source answers `direct_eligible` with the same function. No second predicate, and no copy of its inputs, remains anywhere. `scanout_direct_eligible`'s pure core keeps its signature and its tests.
 
-**Named tests:** `c0_conv_cii_eligibility_is_one_predicate` (deterministic: for a table of input combinations the function's answer equals `scanout_direct_eligible`'s over the same inputs, and the generation it reports is the conductor's current one), `c0_conv_cii_eligibility_matches_legacy_vulkan` (the same candidate, on the same fixture, answers identically whether the device is `Legacy` or `Owner`).
+**Named tests:**
+- `c0_conv_cii_eligibility_is_one_predicate` — deterministic: for a table of input combinations the function's answer equals `scanout_direct_eligible`'s over the same inputs, and the generation it reports is the conductor's current one. The table **includes a candidate that is ineligible only through `direct_present_crtc_eligible`** (a stale CRTC epoch or an unknown CRTC id), which `scanout_direct_eligible` alone cannot reject (round-1 M-3, mutation S4).
+- `c0_conv_cii_eligibility_matches_legacy_vulkan` — the same candidates, on the same fixture, answer identically whether the device is `Legacy` or `Owner`, including that CRTC-ineligible one.
 
 - [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
@@ -123,7 +125,7 @@ Baseline before Task 1 (commit `528ac2a4`): `c0_conv_ci_` 38/38 with `--include-
 
 **Invariants (spec §5.2):** each enumerated change advances the conductor's layout generation through `admission_note_layout_change`; a successor queued as eligible whose ancestor then gains a border never reaches a commit, including when retirement promotes it; the recheck at `lock` refuses a stale eligibility generation before the owner holds anything.
 
-**Named tests:** `c0_conv_cii_layout_hooks_bump_the_generation_vulkan` with one case per enumerated site; `c0_conv_cii_border_invalidates_queued_successor_vulkan`; `c0_conv_cii_border_invalidates_promoted_successor_vulkan`.
+**Named tests:** `c0_conv_cii_layout_hooks_bump_the_generation_vulkan` with one case per enumerated site; `c0_conv_cii_border_invalidates_queued_successor_vulkan`; `c0_conv_cii_border_invalidates_promoted_successor_vulkan`; and `c0_conv_cii_layout_change_between_decide_and_lock_vulkan` (round-1 M-3, mutation S6) — a **real** layout change applied after the decision and before `lock`, so the stale-generation refusal happens at the lock boundary and the owner receives nothing. Say how you interleave it through production entries; if the boundary cannot be reached without a test-only hook, F8.
 
 - [ ] Steps: enumerate and report; tests; red; implement; checks; stop dirty and report.
 
@@ -169,7 +171,9 @@ Baseline before Task 1 (commit `528ac2a4`): `c0_conv_ci_` 38/38 with `--include-
 - the frame's publication at retirement is the only CompleteNotify/FIFO wake for that request; no other consumer publishes or wakes for it;
 - an accepted Present without validated presentation terminalizes as `Skip` with the last validated clock sample, never a fabricated `Flip` timestamp; no idle or release before the ledger proves it.
 
-**Named tests:** `c0_conv_cii_direct_description_carries_present_vulkan`, `c0_conv_cii_direct_present_completes_once_vulkan` (both event orders), `c0_conv_cii_direct_missing_presented_skips_vulkan`.
+**Named tests:** `c0_conv_cii_direct_description_carries_present_vulkan`, `c0_conv_cii_direct_present_completes_once_vulkan` (both event orders), and `c0_conv_cii_direct_missing_presented_skips_vulkan` — driven with **distinct samples per CRTC and per commit**, so a `Skip` stamped from another CRTC's or another commit's `Presented` fails it (round-1 B-1, mutation S17); it also covers the case where the reference CRTC has no validated sample at all, which is an F8 stop rather than a `(0, 0)` stamp.
+
+**This task also re-runs Task 4's scenarios** (`c0_conv_cii_owner_direct_offers_instead_of_flipping_vulkan`, `c0_conv_cii_displaced_successor_defers_its_skip_vulkan`, `c0_conv_cii_retirement_promotion_order_vulkan`) against the finished production-backed source, and the report says they were re-run and with what result (round-1 M-2).
 
 - [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
@@ -181,7 +185,7 @@ Baseline before Task 1 (commit `528ac2a4`): `c0_conv_ci_` 38/38 with `--include-
 
 **Invariants (spec §5.5, §5.6):** entering direct invalidates every composed buffer of the affected outputs, exactly as the legacy route does; no milestone of a direct transaction applies composed damage; a direct commit never carries an unchanged cursor generation, and a primary flip event does not retire a newer cursor generation.
 
-**Named tests:** `c0_conv_cii_direct_entry_invalidates_composed_vulkan`, `c0_conv_cii_direct_milestones_leave_composed_damage_vulkan`, `c0_conv_cii_direct_never_carries_an_unchanged_cursor`.
+**Named tests:** `c0_conv_cii_direct_entry_invalidates_composed_vulkan`, `c0_conv_cii_direct_milestones_leave_composed_damage_vulkan`, `c0_conv_cii_direct_never_carries_an_unchanged_cursor`, and `c0_conv_cii_primary_flip_does_not_retire_a_newer_cursor_vulkan` (round-1 M-4, mutation S24) — a cursor generation newer than the one the completing primary commit carried is still live after that commit's milestones, and only its own commit retires it.
 
 - [ ] Steps: tests; red; implement; checks (Task 7 also runs `cargo check --workspace --target` for `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `x86_64-unknown-freebsd`); stop dirty and report.
 
