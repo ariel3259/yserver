@@ -2,6 +2,32 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 5 (2026-09-20)** — incorporates codex round 4
+(`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round4.md`: 1 blocking,
+1 major, both verified against the tree by the author and accepted; round 3
+audited APPLIED throughout).
+
+- **B-1, confirmed: the retry had no tick edge.** Revision 3 gave the plan two
+  fork points, and "retried at the fork point" then read as the **request**
+  funnel — which is cause-driven (`backend.rs:2315`), so a one-shot cause
+  (a failed successor send) whose materialization fails would never be retried
+  and the unflip would stall forever. The retry edge is now named exactly: the
+  **transaction** fork in `maybe_composite` (`backend.rs:21586`), which every
+  tick reaches while the unflip is requested. T39 catches putting it back in
+  the funnel.
+- **M-1, confirmed: other consumers still correlate by a bare commit number.**
+  Beyond the resource maps of round-3 B-2, three more sites drop the device:
+  the `Terminal` handler scans `present_dispositions` comparing only
+  `key.commit` although `PresentKey` carries a device
+  (`resources/present.rs:4`-`8`, `resources/commit.rs:394`-`400`); the event
+  routing has `device_key` and does not pass it to the consumer
+  (`backend.rs:20361`); and the pending direct frame records only a `CommitId`,
+  which `managed_enqueue_unknown_direct_completion` matches without a device
+  (`backend.rs:588`, `:2921`). Device B's terminal event could therefore skip
+  device A's Present and release A's pins. The identity work is now **Task 7**
+  of its own, with that inventory, its own test and T40/T41; the hardware test
+  becomes Task 8.
+
 **Revision 4 (2026-09-20)** — incorporates codex round 3
 (`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round3.md`: 2 blocking,
 1 major, all three verified against the tree by the author and accepted;
@@ -87,8 +113,9 @@ five APPLIED and M-2 TRADED, closed here).
   written after this one is accepted; see "Limits stated". Stage 2c-iii is not
   complete until that plan is accepted.
 - **M-2, confirmed.** §6.4's hardware run was coordinator prose with no test
-  and no name, which §8.2 does not allow. It is **Task 7** now, with its test
-  named, its filter fixed and its two mutations numbered.
+  and no name, which §8.2 does not allow. It became a task of its own, with its
+  test named, its filter fixed and its two mutations numbered (Task 7 then,
+  Task 8 since revision 5).
 - **M-3, confirmed.** The three `cargo check --workspace --target` gates of
   spec §8.4 were missing; they are in the gate block below.
 - **M-4, confirmed.** Revision 1 had the cursor invariant backwards.
@@ -150,9 +177,15 @@ especially "Carried to Ciii" and the three F8 stops, before Task 1.
      exit-retirement position is free" (`admission.rs:827`-`830`): no *other*
      exit retirement is in flight. Reserving it in the request makes the
      unflip wait on itself forever, which is round-1 B-1a.
-   - **Retry:** a failed materialization is retried **at the fork point**, on
-     each tick while the unflip is requested and the shadow is unmaterialized,
-     before admission is woken. `admission_snapshot` only **reads**
+   - **Retry (round-4 B-1):** a failed materialization is retried at the
+     **transaction** fork — `maybe_composite`'s owner branch, at the
+     `submit_composed_unflip` call site (`backend.rs:21586`) — **not** at the
+     request funnel, which is cause-driven and may never be entered again.
+     Every tick reaches that branch while `scanout_m2.active()`, the unflip is
+     requested and a direct frame is current (`backend.rs:21578`-`21586`).
+     There the owner route retries **materialization only** — no second
+     intent, no second terminalization — and wakes admission; it commits only
+     once the shadow is ready. `admission_snapshot` only **reads**
      `unflip_shadow_ready`; a readiness computation has no side effect.
 3. **One request entry for every cause, and it must be acyclic (round-1 B-1c,
    round-3 B-1).** Today `admission_request_unflip` (`admission.rs:713`) has
@@ -233,7 +266,7 @@ especially "Carried to Ciii" and the three F8 stops, before Task 1.
     multi-device evidence of Task 6 is not built on it; `test_kms_device` plus
     `install_transport_gate` is the shape the platform's own multi-device tests
     already use (`platform.rs:8798`, `platform.rs:9797`). The hardware test of
-    Task 7 is named **outside** this prefix — `c0_hw_ciii_owner_route_on_card1_drm`,
+    Task 8 is named **outside** this prefix — `c0_hw_ciii_owner_route_on_card1_drm`,
     `#[ignore]`d, `_drm` suffix — so no filter the implementer may run selects
     it (round-2 B-1), and **codex does not run it**: it needs DRM master from
     tty2.
@@ -299,12 +332,12 @@ cargo test -p yserver --lib c0_2ci
 cargo test -p yserver --lib
 ```
 
-None of these filters selects Task 7's hardware test: it is named outside the
+None of these filters selects Task 8's hardware test: it is named outside the
 `c0_conv_ciii_` prefix, as `c0_hw_ciii_owner_route_on_card1_drm` (round-2 B-1),
 precisely so that no filter the implementer is allowed to run can reach it. It
 takes DRM master from tty2 and is the coordinator's (decision 10).
 
-**Portability (spec §8.4, round-1 M-3).** The **last task** and the coordinator
+**Portability (spec §8.4, round-1 M-3).** The **last task** (Task 8) and the coordinator
 at acceptance additionally run, for `x86_64-unknown-linux-gnu`,
 `x86_64-unknown-linux-musl` and `x86_64-unknown-freebsd`:
 
@@ -326,7 +359,7 @@ user's go-ahead.
 | Every production cause of an unflip reaches the owner request on an `Owner` device, and only the legacy flags on a `Legacy` one, through an **acyclic** entry (§6.1, decision 3; round-3 B-1) | `c0_conv_ciii_every_unflip_cause_reaches_the_owner_request_vulkan` (at least three distinct causes, one raised twice) | T1: fork only for the cursor cause; T2: take the owner request under `Legacy`; T38: restore the admission primitive's call back into the funnel |
 | An unflip is not admitted until the exit-retirement position is free, every affected output has its retained composed framebuffer **and** the direct shadow is materialized (§6.1) | `c0_conv_ciii_unflip_readiness_waits_on_each_precondition` (one case per precondition, each with the others satisfied) | T3: report `Ready` while the shadow is unmaterialized; T4: report `Ready` while a **foreign** exit retirement is in flight |
 | The request materializes the shadow and terminalizes unsent direct work, and occupies no capacity role (§6.1, decision 2) | `c0_conv_ciii_unflip_request_prepares_without_occupying_capacity_vulkan` | T5: reserve `ExitRetirement` in the request, as revision 1 did |
-| A failed materialization leaves the unflip requested, unadmitted and retried on the next tick, never dispatched (§6.1, decision 2) | `c0_conv_ciii_unflip_shadow_failure_defers_admission_vulkan` | T6: treat a failed materialization as ready; T7: retry it inside the readiness computation |
+| A failed materialization leaves the unflip requested, unadmitted and retried on the next tick even when its cause is one-shot, never dispatched (§6.1, decision 2; round-4 B-1) | `c0_conv_ciii_unflip_shadow_failure_defers_admission_vulkan` | T6: treat a failed materialization as ready; T7: retry it inside the readiness computation; T39: retry only in the request funnel, so a one-shot cause stalls |
 | `Unflip` is dispatched; `Topology` and `CursorRecovery` stay `Unsupported` (§6.1) | `c0_conv_ciii_unflip_dispatches_and_others_stay_unsupported` | T8: keep `Unflip` in `decision_requires_unsupported`; T9: drop `Topology` from it as well |
 | The unflip commit's old state is the current direct resources of the members it covers, carrying the exit-retirement role (§6.1, 2c-i §8.5, decision 2) | `c0_conv_ciii_unflip_commit_takes_the_exit_retirement_old_state_vulkan` | T10: leave the old state empty; T11: take the device's whole current state instead of the members' |
 | The unflip commit replaces the **complete** plane set of its device in one transaction, each CRTC with that output's retained composed framebuffer (§6.1) | `c0_conv_ciii_unflip_commit_covers_every_crtc_vulkan` | T12: describe only the CRTCs named in the barrier; T13: skip the topology-eligibility precondition |
@@ -344,6 +377,7 @@ user's go-ahead.
 | A device's layout generation, composed intents, maintenance and receipts belong to that device alone (§6.2) | `c0_conv_ciii_conductor_state_is_per_device` | T30: bump every conductor's layout generation on one device's change |
 | A grouped direct unit never crosses devices (§6.2) | `c0_conv_ciii_direct_group_never_crosses_devices_vulkan` | T31: drop the single-device precondition from `direct_scanout_topology_eligible` |
 | Two owners' equal numeric `CommitId`s never correlate across devices (§6.2, §3.2; round-3 B-2) | `c0_conv_ciii_equal_commit_ids_do_not_cross_devices` | T36: key the completion cache by `CommitId` alone; T37: match a releasing resource without comparing its device |
+| A terminal or `CompletionUnknown` on one device leaves another device's Present disposition and pins alone (§6.2; round-4 M-1) | `c0_conv_ciii_foreign_terminal_leaves_a_pending_present_alone` | T40: drop the device comparison from the `present_dispositions` scan; T41: match the pending direct frame by `CommitId` alone |
 | On real hardware in `Owner`: a composed frame, a direct frame, the unflip back, and a commit retaining an allocation of the old state for the same member (§6.4) | `c0_hw_ciii_owner_route_on_card1_drm` | — (the run itself is the evidence; its two mutations are below) |
 | A displaced buffer's `KmsRelease` is discharged by the real completion — P3-2 (§6.4, debt spec §9.3/§9.5) | the same test, steps 1-3 | T32: drop the displaced buffer's registration |
 | A retained allocation registers no `KmsRelease` and is not released — P3-3 (§6.4) | the same test, step 4 | T33: register the retained allocation |
@@ -545,19 +579,9 @@ the recorder's count, never on a refusal error or on missing owner progress.
 **Files:** `admission.rs`, `backend.rs` and `platform.rs` where a device-blind
 path is found; tests.
 
-**Interfaces:** the commit-correlation key. Each `DeviceCommitOwner` mints
-`CommitId`s from its own allocator starting at 1 (`owner/device.rs:217`,
-`identity.rs:136`-`150`), while the backend keeps one
-`CommitResourceConsumer` (`backend.rs:1501`) whose `hardware_completed_commits`,
-`commit_members` and `reserved_retirements` are keyed by a bare `CommitId`
-(`resources/commit.rs:130`-`145`) and whose releasing-resource match compares
-`res.commit_id == Some(commit)` with no device (`:286`). **Every commit
-correlation becomes keyed by `(DrmDeviceKey, CommitId)`** — the caches, the
-members, the reserved retirements, the rejected-resource lookup and the
-resources' own recorded identity. `route_owner_event_batch` already carries the
-device, so the key is available at every consumption site. Splitting the
-consumer per device is **not** the shape: `DirectCapacity` is one direct group
-for the whole backend by design (decision 9).
+**Interfaces:** none new unless a defect is found. Commit identity is **Task
+7's**; this task proves the conductor, gate, owner and direct-group halves of
+§6.2.
 
 The fixture is **not** the live single-device one (decision 10): two seeded KMS
 devices with their own gates, the shape `platform.rs:8798` and
@@ -568,11 +592,7 @@ admission, layout generation and transport state; an event, wake, refusal or
 bound violation on one device changes nothing on another — not its layout
 generation, not its composed intents, not its maintenance store, not its
 receipts, not its gate, not its owner; a grouped direct unit never crosses
-devices. **No device can discharge, cache, consume or restore another's
-resources, even when both owners issue the same numeric `CommitId`**
-(round-3 B-2): a cached `HardwareComplete` belongs to one device, and a
-`CompletionRetired` of the same number on another device neither consumes it
-nor discharges any `KmsRelease` obligation. Device-blind paths that are
+devices. Device-blind paths that are
 deliberate (decision 9) are named in the report rather than rewritten; a
 device-blind path that changes another device's state is a defect, fixed
 here.
@@ -580,11 +600,6 @@ here.
 **Named tests:**
 - `c0_conv_ciii_devices_are_independent` — four cases: an owner event batch, an
   admission wake, a refused offer, and a bound violation that closes a gate.
-- `c0_conv_ciii_equal_commit_ids_do_not_cross_devices` — two owners whose
-  commits carry the **same numeric** `CommitId`, interleaved: A's
-  `HardwareComplete` is cached, B's `CompletionRetired` of the same number
-  arrives first, and B discharges nothing of its own that its own completion
-  has not proven, while A's cache survives for A (round-3 B-2).
 - `c0_conv_ciii_conductor_state_is_per_device`.
 - `c0_conv_ciii_direct_group_never_crosses_devices_vulkan`.
 
@@ -592,7 +607,65 @@ here.
 
 ---
 
-### Task 7: The hardware test of spec §6.4
+### Task 7: Commit identity is device-qualified
+
+**Files:** `crates/yserver/src/kms/render/resources/commit.rs`,
+`resources/present.rs`, `backend.rs` (the event routing and the pending direct
+frame); tests.
+
+**Why this is a task and not an assumption.** Each `DeviceCommitOwner` mints
+`CommitId`s from **its own** allocator starting at 1 (`owner/device.rs:217`,
+`identity.rs:136`-`150`), so two owner devices issue the same numbers. The
+consumers that correlate by those numbers are shared.
+
+**The inventory (round-3 B-2, round-4 M-1).** Every site below is converted,
+and the enumeration is this task's scope boundary — a site found later is an
+F8 stop, not a silent addition:
+- the single `CommitResourceConsumer` (`backend.rs:1501`) and its
+  `hardware_completed_commits`, `commit_members` and `reserved_retirements`,
+  keyed by a bare `CommitId` (`resources/commit.rs:130`-`145`);
+- its releasing/rejected-resource match, `res.commit_id == Some(commit)`, with
+  no device (`resources/commit.rs:286`);
+- the `Terminal` handler's scan of `present_dispositions`, comparing only
+  `key.commit` although `PresentKey` already carries a device
+  (`resources/present.rs:4`-`8`, `resources/commit.rs:394`-`400`), and the
+  `Presented` consumer beside it;
+- the owner-event routing, which holds `device_key` and does not pass it to the
+  consumer (`backend.rs:20361`);
+- the pending direct frame's recorded identity and
+  `managed_enqueue_unknown_direct_completion`, which matches it by `CommitId`
+  alone (`backend.rs:588`, `:2921`).
+
+Splitting the consumer per device is **not** the shape: `DirectCapacity` is one
+direct group for the whole backend by design (decision 9). What changes is the
+**key**, to `(DrmDeviceKey, CommitId)`; `route_owner_event_batch` already
+carries the device at every consumption site.
+
+**Invariants (spec §6.2, §3.2):** no device can discharge, cache, consume,
+terminalize or restore another's work, even when both owners issue the same
+numeric `CommitId`. A cached `HardwareComplete` belongs to one device; a
+`CompletionRetired` of the same number on another device neither consumes it
+nor discharges any `KmsRelease` obligation. A `Terminal` or `CompletionUnknown`
+on one device neither changes another device's Present disposition nor
+releases another device's pins.
+
+**Named tests:**
+- `c0_conv_ciii_equal_commit_ids_do_not_cross_devices` — two owners whose
+  commits carry the **same numeric** `CommitId`, interleaved: A's
+  `HardwareComplete` is cached, B's `CompletionRetired` of the same number
+  arrives first, and B discharges nothing its own completion has not proven,
+  while A's cache survives for A.
+- `c0_conv_ciii_foreign_terminal_leaves_a_pending_present_alone` — A's direct
+  Present is pending; B's commit of the same number reaches
+  `FailedBeforeSubmit` and then `CompletionUnknown`; A's disposition and A's
+  pins are untouched.
+
+- [ ] Steps: enumerate and report the sites; tests; red; implement; checks;
+  stop dirty and report.
+
+---
+
+### Task 8: The hardware test of spec §6.4
 
 **Files:** the test module that holds the owner-route `_drm` tests; tests only
 — no production code unless an F8 stop says otherwise.
@@ -649,7 +722,7 @@ each is caught by its named test, then commit. `_vulkan` tests and their
 mutations run on the GPU with the user's go-ahead, from tty when the user asks
 for it.
 
-After Task 7, with the user's go-ahead and the GPU free: the full hardware gate
+After Task 8, with the user's go-ahead and the GPU free: the full hardware gate
 (`render_acceptance -- --ignored`, `c0_2ci -- --ignored`, the library's other
 ignored tests — 306/306 at `5a34c6ec`, plus this plan's new `_vulkan` tests),
 then, from tty2, `c0_hw_ciii_owner_route_on_card1_drm` and its two mutations
