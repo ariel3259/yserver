@@ -591,6 +591,10 @@ struct DirectPresentFrame {
     source_id: DrawableId,
     candidate: PresentScanoutCandidate,
     fallback_target: PaintTarget,
+    /// The exact KMS membership captured while the producer prepared this
+    /// frame. It must not be reconstructed from the consumer's current state
+    /// at dispatch time.
+    members: Vec<crate::kms::render::resources::GroupMember>,
     event: yserver_core::backend::CompletedPresentEvent,
     /// Output whose CRTC domain owns CompleteNotify/MSC for this Present.
     completion_output_idx: usize,
@@ -2483,6 +2487,108 @@ impl KmsBackend {
         self.present_source_pins
             .insert(pin_id, PresentPinEntry::new(id, lease));
         pin_id
+    }
+
+    fn direct_group_members_for_candidate(
+        &self,
+        candidate: PresentScanoutCandidate,
+    ) -> Vec<crate::kms::render::resources::GroupMember> {
+        let Some(crtc_key) = self.present_crtc_key(candidate.crtc_id) else {
+            return Vec::new();
+        };
+        let topology_generation = self
+            .platform
+            .owner_ref(crtc_key.device_key)
+            .map_or(0, |owner| owner.topology_generation());
+        self.platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == crtc_key.device_key)
+            .map(|output| {
+                crate::kms::render::resources::GroupMember::new(
+                    CrtcKey::for_output(output),
+                    topology_generation,
+                    1,
+                )
+            })
+            .collect()
+    }
+
+    /// Move the producer's two direct Present leases into the owner resource
+    /// envelope. The pin table entry remains as the frame's logical drawable
+    /// lifetime token; only its resource-service lease changes hands.
+    pub(crate) fn take_direct_owner_resources(
+        &mut self,
+    ) -> Result<
+        crate::kms::render::resources::CommitResources,
+        crate::kms::render::resources::ResourceError,
+    > {
+        let Some(frame) = self.scanout_m2.queued_successor.as_ref() else {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        };
+        let source_pin = frame.source_pin;
+        let fallback_target_pin = frame.fallback_target_pin;
+        let members = frame.members.clone();
+        if members.is_empty() {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        }
+        if !self.present_source_pins.contains_key(&source_pin)
+            || !self.present_source_pins.contains_key(&fallback_target_pin)
+        {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        }
+
+        let source = self
+            .present_source_pins
+            .get_mut(&source_pin)
+            .and_then(|entry| entry.lease.take());
+        let fallback = self
+            .present_source_pins
+            .get_mut(&fallback_target_pin)
+            .and_then(|entry| entry.lease.take());
+        Ok(crate::kms::render::resources::CommitResources::new(
+            Vec::new(),
+            source,
+            fallback,
+            None,
+            members,
+            Vec::new(),
+        ))
+    }
+
+    fn restore_direct_owner_resources(
+        &mut self,
+        resources: &mut crate::kms::render::resources::CommitResources,
+    ) -> Result<(), crate::kms::render::resources::ResourceError> {
+        let Some(frame) = self.scanout_m2.queued_successor.as_ref() else {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        };
+        let source_pin = frame.source_pin;
+        let fallback_target_pin = frame.fallback_target_pin;
+        let source_conflict = resources.source.is_some()
+            && self
+                .present_source_pins
+                .get(&source_pin)
+                .is_none_or(|entry| entry.lease.is_some());
+        let fallback_conflict = resources.fallback.is_some()
+            && self
+                .present_source_pins
+                .get(&fallback_target_pin)
+                .is_none_or(|entry| entry.lease.is_some());
+        if source_conflict || fallback_conflict {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        }
+        if let Some(lease) = resources.source.take()
+            && let Some(entry) = self.present_source_pins.get_mut(&source_pin)
+        {
+            entry.lease = Some(lease);
+        }
+        if let Some(lease) = resources.fallback.take()
+            && let Some(entry) = self.present_source_pins.get_mut(&fallback_target_pin)
+        {
+            entry.lease = Some(lease);
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -20366,12 +20472,20 @@ impl KmsBackend {
             return Err(err);
         }
 
+        let members = self.direct_group_members_for_candidate(candidate);
+        if members.is_empty() {
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            return Ok(false);
+        }
         let frame = DirectPresentFrame {
             source_pin,
             fallback_target_pin,
             source_id,
             candidate,
             fallback_target,
+            members,
             event,
             completion_output_idx,
             completion_clock: None,
@@ -20444,12 +20558,41 @@ impl KmsBackend {
             return Err(error);
         }
 
-        let pending = crate::kms::render::direct_owner::resources();
+        let pending = match crate::kms::render::direct_owner::resources(self) {
+            Ok(resources) => resources,
+            Err(error) => {
+                if let Err(restore_error) = self
+                    .commit_consumer
+                    .capacity
+                    .move_role(&mut successor, DirectRole::Successor)
+                {
+                    self.commit_consumer.capacity.close_admission();
+                    successor.discharged = true;
+                    if let Some(retirement) = retirement {
+                        self.discharge_bare_reservation(retirement);
+                    }
+                    return Err(restore_error);
+                }
+                self.scanout_m2.queued_successor_role = Some(successor);
+                if let Some(retirement) = retirement {
+                    self.discharge_bare_reservation(retirement);
+                }
+                return Err(error);
+            }
+        };
         let resources = match self.commit_consumer.capacity.attach(successor, pending) {
             Ok(resources) => resources,
-            Err((error, mut successor, _resources)) => {
+            Err((error, mut successor, mut resources)) => {
                 // `attach` can only fail if the reservation table was already
                 // inconsistent. Restore the queued role on this path too.
+                if let Err(restore_error) = self.restore_direct_owner_resources(&mut resources) {
+                    self.commit_consumer.capacity.close_admission();
+                    successor.discharged = true;
+                    if let Some(retirement) = retirement {
+                        self.discharge_bare_reservation(retirement);
+                    }
+                    return Err(restore_error);
+                }
                 if let Err(restore_error) = self
                     .commit_consumer
                     .capacity
@@ -20506,13 +20649,24 @@ impl KmsBackend {
     ) -> Result<(), crate::kms::render::resources::ResourceError> {
         use crate::kms::render::resources::DirectRole;
 
-        let submitted = prepared
-            .resources
-            .direct_role
-            .take()
-            .expect("prepared dispatch owns the Submitted role");
+        let mut resources = prepared.resources;
+        let submitted = resources.direct_role.take().ok_or_else(|| {
+            self.commit_consumer.capacity.close_admission();
+            if let Some(retirement) = prepared.retirement.take() {
+                self.discharge_bare_reservation(retirement);
+            }
+            crate::kms::render::resources::ResourceError::InvalidState
+        })?;
         if let Err((error, mut submitted)) = self.commit_consumer.capacity.finish_role(submitted) {
             submitted.discharged = true;
+            if let Some(retirement) = prepared.retirement.take() {
+                self.discharge_bare_reservation(retirement);
+            }
+            return Err(error);
+        }
+
+        if let Err(error) = self.restore_direct_owner_resources(&mut resources) {
+            self.commit_consumer.capacity.close_admission();
             if let Some(retirement) = prepared.retirement.take() {
                 self.discharge_bare_reservation(retirement);
             }
@@ -21598,6 +21752,7 @@ impl Backend for KmsBackend {
             source_id,
             candidate,
             fallback_target,
+            members: Vec::new(),
             event,
             completion_output_idx,
             completion_clock: None,
@@ -44218,6 +44373,7 @@ mod tests {
                 options: 0,
             },
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            members: Vec::new(),
             event: CompletedPresentEvent {
                 client_id: yserver_protocol::x11::ClientId(1),
                 serial: 1,
@@ -47418,6 +47574,7 @@ mod tests {
             source_id,
             candidate,
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            members: Vec::new(),
             event: CompletedPresentEvent {
                 client_id: yserver_protocol::x11::ClientId(1),
                 serial: 9,
@@ -48017,6 +48174,7 @@ mod tests {
             source_id,
             candidate,
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            members: Vec::new(),
             event,
             completion_output_idx: 0,
             completion_clock: None,
@@ -51844,6 +52002,244 @@ mod tests {
                 .map(|event| event.present_id)
                 .collect::<Vec<_>>(),
             vec![51]
+        );
+    }
+
+    fn c0_conv_cii_make_present_storage_managed(
+        backend: &mut super::KmsBackend,
+        drawable: super::DrawableId,
+    ) {
+        use crate::kms::render::{resources::StorageBacking, target::PaintTarget};
+
+        let (extent, format) = {
+            let storage = &backend
+                .store
+                .get(drawable)
+                .expect("present drawable")
+                .storage;
+            (storage.extent(), storage.format())
+        };
+        let storage = super::Storage::for_tests_null(extent, format);
+        let target = PaintTarget::new(drawable, (0, 0), None, 24);
+        let lease = storage
+            .into_managed(
+                backend
+                    .resource_service
+                    .as_mut()
+                    .expect("live resource service"),
+                &backend.platform,
+                target,
+                (0, 0),
+            )
+            .map_err(|(error, _storage)| error)
+            .expect("test present storage adoption");
+        backend
+            .store
+            .get_mut(drawable)
+            .expect("present drawable")
+            .storage = super::Storage::from_backing(StorageBacking::Managed(lease));
+    }
+
+    #[test]
+    fn c0_conv_cii_direct_members_come_from_the_producer() {
+        use crate::kms::render::resources::GroupMember;
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().expect("test device").key;
+        let (source_id, candidate, event) =
+            managed_prepare_ready_candidate(&mut backend, 0xc601, 0xc602, 40, 101);
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(source_id, candidate, event)
+                .expect("prepare direct candidate")
+        );
+
+        let expected = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| {
+                GroupMember::new(
+                    CrtcKey::for_output(output),
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .map_or(0, |owner| owner.topology_generation()),
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let prepared = backend
+            .managed_prepare_direct_dispatch()
+            .expect("prepare direct dispatch")
+            .expect("prepared direct dispatch");
+
+        assert_eq!(
+            prepared.resources.crtcs, expected,
+            "the direct resource envelope must carry the producer frame's members"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_carries_its_pins_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc611, 0xc612, 0xc613, 111);
+        let source_id = backend
+            .store
+            .lookup(candidate.src_host_xid)
+            .expect("source");
+        let fallback_id = backend
+            .store
+            .lookup(candidate.paint_dst_host_xid)
+            .expect("fallback");
+        c0_conv_cii_make_present_storage_managed(&mut backend, source_id);
+        c0_conv_cii_make_present_storage_managed(&mut backend, fallback_id);
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record");
+        let crate::kms::owner::ledger::LedgerState::Submitted(submitted) = record.ledger() else {
+            panic!("direct dispatch must retain a Submitted ledger");
+        };
+        let resources = &submitted.new_resources()[0];
+        assert!(
+            resources.source.is_some(),
+            "source pin lease was not carried"
+        );
+        assert!(
+            resources.fallback.is_some(),
+            "fallback-target pin lease was not carried"
+        );
+        let frame = backend
+            .scanout_m2
+            .pending
+            .as_ref()
+            .expect("confirmed direct frame");
+        assert!(backend.present_source_pins.contains_key(&frame.source_pin));
+        assert!(
+            backend
+                .present_source_pins
+                .contains_key(&frame.fallback_target_pin)
+        );
+        assert!(
+            backend.present_source_pin_lease(frame.source_pin).is_none(),
+            "the source lease must have moved into the ledger"
+        );
+        assert!(
+            backend
+                .present_source_pin_lease(frame.fallback_target_pin)
+                .is_none(),
+            "the fallback lease must have moved into the ledger"
+        );
+        assert_eq!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.direct()),
+            None
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_pins_released_only_by_the_ledger_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc621, 0xc622, 0xc623, 121);
+        let source_id = backend
+            .store
+            .lookup(candidate.src_host_xid)
+            .expect("source");
+        let fallback_id = backend
+            .store
+            .lookup(candidate.paint_dst_host_xid)
+            .expect("fallback");
+        c0_conv_cii_make_present_storage_managed(&mut backend, source_id);
+        c0_conv_cii_make_present_storage_managed(&mut backend, fallback_id);
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        let (source_pin, fallback_pin) = {
+            let frame = backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .expect("confirmed direct frame");
+            (frame.source_pin, frame.fallback_target_pin)
+        };
+        assert!(backend.present_source_pins.contains_key(&source_pin));
+        assert!(backend.present_source_pins.contains_key(&fallback_pin));
+        assert!(backend.present_source_pin_lease(source_pin).is_none());
+        assert!(backend.present_source_pin_lease(fallback_pin).is_none());
+
+        let ledger = format!(
+            "{:?}",
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("direct owner record")
+                .ledger()
+        );
+        assert!(
+            ledger.contains("has_source: true"),
+            "source left the ledger: {ledger}"
+        );
+        assert!(
+            ledger.contains("has_fallback: true"),
+            "fallback left the ledger: {ledger}"
+        );
+
+        // Route the owner milestones through the real event boundary. The
+        // retirement moves the frame to the consumer's current slot; it must
+        // not release either dispatched lease while that ledger resource is
+        // still current.
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
+            ],
+            std::time::Instant::now(),
+        );
+        let completion = backend.complete_owner_for_tests(0);
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        backend.route_owner_event_batch(device, completion, std::time::Instant::now());
+        assert!(backend.present_source_pins.contains_key(&source_pin));
+        assert!(backend.present_source_pins.contains_key(&fallback_pin));
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|resources| { resources.source.is_some() && resources.fallback.is_some() }),
+            "frame retirement must leave both leases owned by the ledger resource"
         );
     }
 

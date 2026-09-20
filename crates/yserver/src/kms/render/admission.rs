@@ -1471,37 +1471,53 @@ impl KmsBackend {
             }
         };
 
-        let direct_crtcs = match decision_primary(&decision) {
-            Some(Admitted::Direct { successor }) => Some(successor.crtcs.clone()),
-            _ => None,
-        };
         let result = {
             let consumer = &mut self.commit_consumer;
             let Some(service) = self.resource_service.as_mut() else {
-                self.admission_abort(device, token);
-                return AdmissionOutcome::BeginRefused;
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Refused {
+                        new: resources.take().into_iter().collect(),
+                    },
+                );
             };
-            let device_entry = self
+            let Some(device_entry) = self
                 .platform
                 .devices
                 .iter_mut()
                 .find(|entry| entry.key == device)
-                .expect("admission device");
-            let owner = device_entry.owner.as_mut().expect("admission owner");
+            else {
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Refused {
+                        new: resources.take().into_iter().collect(),
+                    },
+                );
+            };
+            let Some(owner) = device_entry.owner.as_mut() else {
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Refused {
+                        new: resources.take().into_iter().collect(),
+                    },
+                );
+            };
             owner.begin_with_fallible_ledger(&desc, |commit| {
-                let mut new_resource = resources
+                let new_resource = resources
                     .take()
                     .ok_or_else(|| (ResourceError::InvalidState, Vec::new(), Vec::new()))?;
-                if new_resource.crtcs.is_empty()
-                    && let Some(direct_crtcs) = direct_crtcs.as_ref()
-                {
-                    new_resource.crtcs = consumer
-                        .current_resources
-                        .iter()
-                        .flat_map(|resources| resources.crtcs.iter().copied())
-                        .filter(|member| direct_crtcs.contains(&u32::from(member.crtc.crtc)))
-                        .collect();
-                }
                 let new = vec![new_resource.with_commit_id(commit)];
                 let members = new
                     .iter()

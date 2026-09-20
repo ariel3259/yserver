@@ -18,7 +18,7 @@ use crate::{
             composed_commit::{
                 ComposedPlane, composed_description, discover_composed_property_ids,
             },
-            resources::CommitResources,
+            resources::{CommitResources, ResourceError},
             store::DrawableId,
         },
     },
@@ -123,13 +123,12 @@ pub(crate) fn description(
     Ok(description)
 }
 
-/// Construct the producer-owned resource envelope for a direct commit.
+/// Move the producer-owned members and Present pin leases into a direct commit.
 ///
-/// Task 5 fills this envelope with the frame's members and present-pin leases;
-/// keeping construction here makes the production dispatch independent of the
-/// injected `AdmissionSource` from the start of the owner route.
-pub(crate) fn resources() -> CommitResources {
-    CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new())
+/// The queued frame is the source of truth. In particular, this does not
+/// inspect the consumer's current resource state to reconstruct membership.
+pub(crate) fn resources(backend: &mut KmsBackend) -> Result<CommitResources, ResourceError> {
+    backend.take_direct_owner_resources()
 }
 
 /// Wake the owner conductor after a direct retirement has been enqueued.
