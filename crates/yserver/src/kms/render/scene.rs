@@ -2537,6 +2537,38 @@ impl SceneCompositor {
             .map(|state| (state.damage.owes_repaint(), state.damage.has_staged_frame()))
     }
 
+    /// Test-only snapshot of the complete scanout-damage observables for one
+    /// output. The coarse `damage_state_for_tests` pair cannot distinguish a
+    /// fresh BO (full `missing`, empty `pending`) from an invalidation (full
+    /// `missing`, full `pending`), so conversion tests observe the actual
+    /// transaction state without mutating it.
+    #[cfg(test)]
+    pub(crate) fn scanout_damage_signature_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<(u64, Vec<u64>, bool)> {
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        Some((
+            state.damage.pending_area(),
+            (0..state.damage.bo_count())
+                .map(|bo_idx| state.damage.missing_area(bo_idx))
+                .collect(),
+            state.damage.has_staged_frame(),
+        ))
+    }
+
+    /// Test-only observation of the scene's currently registered cursor
+    /// generation. Direct primary retirement must not replace this value with
+    /// the generation that was current when the primary commit entered
+    /// flight.
+    #[cfg(test)]
+    pub(crate) fn cursor_record_version_for_tests(&self) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.cursor.as_ref())
+            .map(|cursor| cursor.record_version)
+    }
+
     #[cfg(test)]
     pub(crate) fn repaint_for_tests(
         &self,

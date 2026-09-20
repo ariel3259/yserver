@@ -122,6 +122,11 @@ pub(crate) fn description(
     )
     .map_err(|error| format!("discover direct owner properties: {error}"))?;
 
+    // This is intentionally a primary-only description. Cursor and gamma
+    // maintenance are stage 4 payloads; Cii must not copy an unchanged
+    // generation into the direct primary request. The scene has no owner
+    // damage transaction for this producer either, so owner milestones
+    // cannot stage or retire composed damage.
     let mut description = composed_description(&members, property_ids);
     description.page_flip_event = true;
     description.present_consumers = successor.crtcs.iter().copied().collect();

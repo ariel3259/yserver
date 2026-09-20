@@ -52852,6 +52852,244 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_entry_matches_legacy_invalidation_vulkan() {
+        fn damage_signature(backend: &super::KmsBackend) -> (u64, Vec<u64>, bool) {
+            backend
+                .scene
+                .scanout_damage_signature_for_tests(0)
+                .expect("live output damage")
+        }
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let before_owner = damage_signature(&backend);
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc801, 0xc802, 0xc803, 801);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        let after_owner = damage_signature(&backend);
+        assert_eq!(
+            after_owner, before_owner,
+            "Owner direct entry must not invalidate or stage composed damage"
+        );
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.admission_conductors.clear();
+        install_admission_legacy_gate(&mut backend, device);
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let before_legacy = damage_signature(&backend);
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc811, 0xc812, 0xc813, 811);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("legacy direct submit")
+        );
+        let after_legacy = damage_signature(&backend);
+        assert_eq!(
+            after_legacy, before_legacy,
+            "Legacy direct entry must not invalidate or stage composed damage"
+        );
+        assert_eq!(
+            after_owner, after_legacy,
+            "Owner and Legacy must have the same composed damage state at entry"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_milestones_leave_composed_damage_vulkan() {
+        fn damage_signature(backend: &super::KmsBackend) -> (u64, Vec<u64>, bool) {
+            backend
+                .scene
+                .scanout_damage_signature_for_tests(0)
+                .expect("live output damage")
+        }
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let before = damage_signature(&backend);
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc821, 0xc822, 0xc823, 821);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        assert_eq!(damage_signature(&backend), before, "direct entry");
+
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        assert_eq!(
+            damage_signature(&backend),
+            before,
+            "Accepted must not apply composed damage"
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+
+        assert!(backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            damage_signature(&backend),
+            before,
+            "HardwareComplete must not apply composed damage"
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_expire_direct_owner_present(&mut backend, device);
+        assert_eq!(
+            damage_signature(&backend),
+            before,
+            "CompletionUnknown must not apply composed damage"
+        );
+        assert_eq!(backend.scene.owner_damage_transaction_count_for_tests(), 0);
+    }
+
+    #[test]
+    fn c0_conv_cii_direct_never_carries_an_unchanged_cursor() {
+        use std::collections::BTreeSet;
+
+        use crate::kms::owner::admission::{
+            Admission, Admitted, DirectSuccessor, IntentKey, MaintenanceClass, MaintenanceKey,
+            Readiness, ReadinessSnapshot,
+        };
+
+        let cursor = MaintenanceKey {
+            crtc: 1,
+            class: MaintenanceClass::Cursor,
+        };
+        let mut admission = Admission::new();
+        admission.note_completed(cursor, 7);
+        admission
+            .set_maintenance(cursor, 7, false)
+            .expect("same cursor generation is an omission");
+        admission
+            .set_direct_successor(DirectSuccessor {
+                source_generation: 1,
+                layout_generation: 0,
+                topology_generation: 0,
+                crtcs: BTreeSet::from([1]),
+            })
+            .expect("direct successor");
+
+        let mut snapshot = ReadinessSnapshot::new(0, 0);
+        snapshot.retirement_wake = true;
+        snapshot.report(
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+            Readiness::Ready,
+        );
+        snapshot.report(
+            IntentKey::Maintenance {
+                key: cursor,
+                generation: 7,
+            },
+            Readiness::Ready,
+        );
+        snapshot.report_compatible(
+            IntentKey::Maintenance {
+                key: cursor,
+                generation: 7,
+            },
+            IntentKey::Direct {
+                source_generation: 1,
+            },
+        );
+        let decision = admission.decide(&snapshot).expect("direct decision");
+        assert!(matches!(decision.admitted, Admitted::Direct { .. }));
+        assert!(
+            decision.carried.is_empty(),
+            "a direct primary must omit an unchanged cursor generation"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_primary_flip_does_not_retire_a_newer_cursor_vulkan() {
+        use std::sync::Arc;
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let cursor = |version| crate::kms::render::scene::CursorEntry {
+            id: crate::kms::render::store::DrawableId::for_tests(0xc900 + version),
+            extent: ash::vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            hot_x: 0,
+            hot_y: 0,
+            record_version: version,
+            bgra_bytes: Some(Arc::new(vec![0, 0, 0, 255])),
+        };
+        backend.scene.register_cursor(cursor(41));
+        assert_eq!(
+            backend.scene.cursor_record_version_for_tests(),
+            Some(41),
+            "the old cursor generation is live before direct entry"
+        );
+
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc901, 0xc902, 0xc903, 901);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+
+        backend.scene.register_cursor(cursor(42));
+        assert_eq!(
+            backend.scene.cursor_record_version_for_tests(),
+            Some(42),
+            "the newer cursor generation must supersede the one at direct entry"
+        );
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        assert_eq!(backend.scene.cursor_record_version_for_tests(), Some(42));
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        assert_eq!(backend.scene.cursor_record_version_for_tests(), Some(42));
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_901, 1, 901_000);
+        assert_eq!(
+            backend.scene.cursor_record_version_for_tests(),
+            Some(42),
+            "the primary flip must not retire a newer cursor generation"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_owner_tick_accumulates_damage_vulkan() {
         let OwnerLiveFixture {
             mut backend,
