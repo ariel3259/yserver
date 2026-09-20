@@ -1454,22 +1454,23 @@ impl KmsBackend {
         } = prepared;
         let mut resources = Some(prepared_resources);
         let mut retirement = retirement;
-        let desc = match crate::kms::render::direct_owner::description(self, device, &decision) {
-            Ok(desc) => desc,
-            Err(error) => {
-                log::warn!("direct owner description refused: {error}");
-                return self.admission_handle_dispatch_failure(
-                    device,
-                    token,
-                    DispatchFailureRoute::Direct {
-                        retirement: retirement.take(),
-                    },
-                    DispatchFailureResources::Refused {
-                        new: resources.take().into_iter().collect(),
-                    },
-                );
-            }
-        };
+        let (desc, context) =
+            match crate::kms::render::direct_owner::description(self, device, &decision) {
+                Ok(description) => description,
+                Err(error) => {
+                    log::warn!("direct owner description refused: {error}");
+                    return self.admission_handle_dispatch_failure(
+                        device,
+                        token,
+                        DispatchFailureRoute::Direct {
+                            retirement: retirement.take(),
+                        },
+                        DispatchFailureResources::Refused {
+                            new: resources.take().into_iter().collect(),
+                        },
+                    );
+                }
+            };
 
         let result = {
             let consumer = &mut self.commit_consumer;
@@ -1514,21 +1515,25 @@ impl KmsBackend {
                     },
                 );
             };
-            owner.begin_with_fallible_ledger(&desc, |commit| {
-                let new_resource = resources
-                    .take()
-                    .ok_or_else(|| (ResourceError::InvalidState, Vec::new(), Vec::new()))?;
-                let new = vec![new_resource.with_commit_id(commit)];
-                let members = new
-                    .iter()
-                    .flat_map(|resources| resources.crtcs.iter().copied())
-                    .collect::<Vec<GroupMember>>();
-                let old = match consumer.take_current_for_members(&members) {
-                    Ok(old) => old,
-                    Err(error) => return Err((error, Vec::new(), new)),
-                };
-                register_commit_dependencies(commit, old, new, service)
-            })
+            owner.begin_with_context_and_fallible_ledger(
+                &desc,
+                |commit| {
+                    let new_resource = resources
+                        .take()
+                        .ok_or_else(|| (ResourceError::InvalidState, Vec::new(), Vec::new()))?;
+                    let new = vec![new_resource.with_commit_id(commit)];
+                    let members = new
+                        .iter()
+                        .flat_map(|resources| resources.crtcs.iter().copied())
+                        .collect::<Vec<GroupMember>>();
+                    let old = match consumer.take_current_for_members(&members) {
+                        Ok(old) => old,
+                        Err(error) => return Err((error, Vec::new(), new)),
+                    };
+                    register_commit_dependencies(commit, old, new, service)
+                },
+                context,
+            )
         };
 
         let commit = match result {
@@ -1666,7 +1671,7 @@ impl KmsBackend {
                 }
             }
             Some(Admitted::Direct { successor }) => {
-                if !self.managed_confirm_direct_dispatch(successor.source_generation) {
+                if !self.managed_confirm_direct_dispatch(successor.source_generation, commit) {
                     if let Some(gate) = self.platform.transport_gate_mut(&device) {
                         gate.force_close();
                     }

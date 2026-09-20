@@ -70,7 +70,13 @@ pub(crate) fn description(
     backend: &mut KmsBackend,
     device: DrmDeviceKey,
     decision: &AdmissionDecision,
-) -> Result<CommitDescription, String> {
+) -> Result<
+    (
+        CommitDescription,
+        crate::kms::owner::completion::CompletionContext,
+    ),
+    String,
+> {
     let successor = decision_direct_successor(decision)
         .ok_or_else(|| "direct owner description needs a direct primary".to_string())?;
     let source_id = backend
@@ -117,10 +123,11 @@ pub(crate) fn description(
     .map_err(|error| format!("discover direct owner properties: {error}"))?;
 
     let mut description = composed_description(&members, property_ids);
-    // Task 6 adds the Present event/context through the context-carrying
-    // owner entry.
-    description.page_flip_event = false;
-    Ok(description)
+    description.page_flip_event = true;
+    description.present_consumers = successor.crtcs.iter().copied().collect();
+    let context =
+        backend.direct_owner_completion_context(device, &description.present_consumers)?;
+    Ok((description, context))
 }
 
 /// Move the producer-owned members and Present pin leases into a direct commit.

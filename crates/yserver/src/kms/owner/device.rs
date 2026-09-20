@@ -319,6 +319,16 @@ impl<R> DeviceCommitOwner<R> {
         self.clocks.get(&key)
     }
 
+    /// Return the currently installed epoch for one hardware CRTC. The
+    /// render side uses this when a stable KMS CRTC is represented by several
+    /// successive RANDR resource ids.
+    pub(crate) fn clock_key_for_hardware_crtc(&self, hardware_crtc: u32) -> Option<ClockKey> {
+        self.clocks
+            .keys()
+            .find(|key| key.hardware_crtc == hardware_crtc)
+            .copied()
+    }
+
     #[doc(hidden)]
     pub fn clock_mut(&mut self, key: ClockKey) -> Option<&mut CrtcClock> {
         self.clocks.get_mut(&key)
@@ -2139,6 +2149,14 @@ impl<R> DeviceCommitOwner<R> {
         };
         record.mark_accepted();
         record.mark_hardware_complete();
+        let deadline = Instant::now();
+        record.completion_state_mut().present_deadlines = record
+            .closure()
+            .present_event()
+            .iter()
+            .copied()
+            .map(|crtc| (crtc, deadline))
+            .collect();
         self.try_complete()
     }
     #[doc(hidden)]

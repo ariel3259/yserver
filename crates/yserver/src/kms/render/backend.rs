@@ -596,6 +596,9 @@ struct DirectPresentFrame {
     /// at dispatch time.
     members: Vec<crate::kms::render::resources::GroupMember>,
     event: yserver_core::backend::CompletedPresentEvent,
+    /// Commit that accepted this frame. `Presented` may populate the clock
+    /// only when its owner event names this exact id.
+    commit_id: Option<crate::kms::owner::identity::CommitId>,
     /// Output whose CRTC domain owns CompleteNotify/MSC for this Present.
     completion_output_idx: usize,
     /// Exact pageflip sample from the selected/reference CRTC. Xorg waits for
@@ -2813,7 +2816,11 @@ impl KmsBackend {
 
     /// Move a managed successor into the in-flight frame slot after its owner
     /// transaction was confirmed at the send boundary.
-    pub(crate) fn managed_confirm_direct_dispatch(&mut self, source_generation: u64) -> bool {
+    pub(crate) fn managed_confirm_direct_dispatch(
+        &mut self,
+        source_generation: u64,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> bool {
         let Some(frame) = self.scanout_m2.queued_successor.take() else {
             return false;
         };
@@ -2821,21 +2828,68 @@ impl KmsBackend {
             self.scanout_m2.queued_successor = Some(frame);
             return false;
         }
+        let mut frame = frame;
+        frame.commit_id = Some(commit);
         self.scanout_m2.pending = Some(frame);
         self.scanout_m2.hold_direct = true;
         self.scanout_m2.sync_ownership();
         true
     }
 
+    /// Correlate one owner Presented event with the still-pending direct
+    /// frame. The reference CRTC is the only sample that can stamp this
+    /// Present; samples for the other grouped CRTCs remain platform history
+    /// only. A frame that has already retired is stale and cannot revive or
+    /// rewrite its publication.
+    fn managed_record_direct_presented(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+        samples: &std::collections::BTreeMap<u32, crate::kms::owner::clock::ClockSample>,
+    ) -> bool {
+        let Some(frame) = self
+            .scanout_m2
+            .pending
+            .as_mut()
+            .filter(|frame| frame.commit_id == Some(commit))
+        else {
+            return false;
+        };
+        let Some(output) = self.platform.outputs.get(frame.completion_output_idx) else {
+            return false;
+        };
+        let crtc = u32::from(output.output.crtc);
+        let Some(sample) = samples.get(&crtc).copied() else {
+            return true;
+        };
+        frame.completion_clock = Some(yserver_core::backend::PresentClockSample {
+            msc: sample.msc,
+            ust: sample.ust,
+            source: yserver_core::backend::PresentClockSource::PageFlip,
+        });
+        true
+    }
+
     /// Retire the managed direct predecessor before a retirement admission
-    /// wake. The event remains in `completed` until the core drains it after
-    /// the handler returns. The retired frame keeps both pins while it is
+    /// wake. The owner can complete a Present-carrying record only after its
+    /// `Presented`, so this path publishes only the commit-bound `Flip`.
+    /// The event remains in `completed` until the core drains it after the
+    /// handler returns. The retired frame keeps both pins while it is
     /// current; only the previous current frame is released here.
     pub(crate) fn managed_enqueue_retired_direct_completion(&mut self) -> (Vec<u64>, Vec<u64>) {
         let mut completions = Vec::new();
         if let Some(mut pending) = self.scanout_m2.pending.take() {
+            let Some(completion_clock) = pending.completion_clock else {
+                log::error!(
+                    "direct Present {} reached retirement without its Presented sample",
+                    pending.event.present_id
+                );
+                self.scanout_m2.pending = Some(pending);
+                self.scanout_m2.sync_ownership();
+                return (completions, Vec::new());
+            };
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
             pending.event.emit_idle = false;
+            pending.event.completion_clock = Some(completion_clock);
             completions.push(pending.event.present_id);
             self.scanout_m2.completed.push(pending.event.clone());
             if let Some(previous) = self.scanout_m2.current.replace(pending) {
@@ -2853,6 +2907,43 @@ impl KmsBackend {
             .completed
             .append(&mut self.scanout_m2.deferred_successor_skips);
         (completions, skips)
+    }
+
+    /// Terminalize a Present whose owner record reached `CompletionUnknown`
+    /// before any `Presented` could be correlated. The owner ledger has
+    /// already proved the terminal path before this is called, so the frame's
+    /// logical pin entries can be removed while the storage leases remain
+    /// owned by the quarantined ledger resource. A historical clock is used
+    /// only when the reference CRTC has one; the accessor deliberately does
+    /// not manufacture the legacy `(0, 0)` value.
+    pub(crate) fn managed_enqueue_unknown_direct_completion(
+        &mut self,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> Option<u64> {
+        let matches = self
+            .scanout_m2
+            .pending
+            .as_ref()
+            .is_some_and(|frame| frame.commit_id == Some(commit));
+        if !matches {
+            return None;
+        }
+        let mut pending = self.scanout_m2.pending.take()?;
+        pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
+        pending.event.emit_idle = true;
+        pending.event.completion_clock = self
+            .platform
+            .outputs
+            .get(pending.completion_output_idx)
+            .map(CrtcKey::for_output)
+            .and_then(|key| self.platform.present_get_completion_clock_if_known(key));
+        let present_id = pending.event.present_id;
+        self.scanout_m2.completed.push(pending.event);
+        <Self as Backend>::release_present_source(self, pending.source_pin);
+        <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
+        self.note_present_skip();
+        self.scanout_m2.sync_ownership();
+        Some(present_id)
     }
 
     #[allow(dead_code)]
@@ -19505,6 +19596,48 @@ impl KmsBackend {
         self.present_crtc_output(crtc_id).map(|(_, key)| key)
     }
 
+    /// Build the owner completion context for a direct request from the same
+    /// CRTC set that the description places in its kernel event closure.
+    /// Keeping this beside the live RANDR-to-KMS lookup prevents a direct
+    /// request from certifying a stale clock epoch or a CRTC from another
+    /// device.
+    pub(crate) fn direct_owner_completion_context(
+        &self,
+        device: DrmDeviceKey,
+        crtcs: &[u32],
+    ) -> Result<crate::kms::owner::completion::CompletionContext, String> {
+        use std::collections::BTreeMap;
+
+        use crate::kms::{executor::HostCallClass, owner::completion::CompletionClass};
+
+        let owner = self
+            .platform
+            .owner_ref(device)
+            .ok_or_else(|| "direct owner is unavailable".to_string())?;
+        let mut clocks = BTreeMap::new();
+        let mut mode_periods = BTreeMap::new();
+        for &crtc in crtcs {
+            if !self.platform.outputs.iter().any(|output| {
+                output.key.device_key == device && u32::from(output.output.crtc) == crtc
+            }) {
+                return Err(format!("direct owner CRTC {crtc} is unavailable"));
+            }
+            let Some(key) = owner.clock_key_for_hardware_crtc(crtc) else {
+                return Err(format!("direct owner CRTC {crtc} has no clock"));
+            };
+            clocks.insert(crtc, key);
+            mode_periods.insert(crtc, None);
+        }
+        Ok(crate::kms::owner::completion::CompletionContext {
+            class: CompletionClass::FastUpdate,
+            host_class: HostCallClass::SeatActiveNonblock,
+            allow_modeset: false,
+            clocks,
+            mode_periods,
+            lifecycle_observed_max: None,
+        })
+    }
+
     fn refresh_present_crtc_clock_epochs(&mut self) {
         let live: Vec<(u32, CrtcKey)> = self
             .crtc_key_by_id
@@ -20193,20 +20326,26 @@ impl KmsBackend {
                 true
             }
             crate::kms::owner::device::OwnerEvent::Presented { commit, samples } => {
-                for (crtc_id, sample) in &samples {
-                    if let Some(handle) =
-                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(*crtc_id)
-                    {
-                        let crtc_key = CrtcKey::new(device_key, handle);
-                        self.platform
-                            .record_vblank_clock(crtc_key, sample.msc, sample.ust);
-                        let clock_sample = PresentClockSample {
-                            msc: sample.msc,
-                            ust: sample.ust,
-                            source: PresentClockSource::PageFlip,
-                        };
-                        self.platform
-                            .record_completion_clock(crtc_key, clock_sample);
+                // A stale/unknown Presented is telemetry, not a clock
+                // source. Correlate it with the accepted direct frame before
+                // allowing any of its samples to rewrite per-CRTC history.
+                let correlated = self.managed_record_direct_presented(commit, &samples);
+                if correlated {
+                    for (crtc_id, sample) in &samples {
+                        if let Some(handle) =
+                            ::drm::control::from_u32::<::drm::control::crtc::Handle>(*crtc_id)
+                        {
+                            let crtc_key = CrtcKey::new(device_key, handle);
+                            self.platform
+                                .record_vblank_clock(crtc_key, sample.msc, sample.ust);
+                            let clock_sample = PresentClockSample {
+                                msc: sample.msc,
+                                ust: sample.ust,
+                                source: PresentClockSource::PageFlip,
+                            };
+                            self.platform
+                                .record_completion_clock(crtc_key, clock_sample);
+                        }
                     }
                 }
                 let Some(service) = &mut self.resource_service else {
@@ -20220,6 +20359,10 @@ impl KmsBackend {
                     .is_ok()
             }
             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => {
+                let completion_unknown = matches!(
+                    terminal,
+                    crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                );
                 let never_dispatched = matches!(
                     terminal,
                     crate::kms::owner::record::TerminalState::FailedBeforeSubmit(
@@ -20242,14 +20385,18 @@ impl KmsBackend {
                 let Some(service) = &mut self.resource_service else {
                     return false;
                 };
-                admission_handled
+                let consumed = admission_handled
                     && self
                         .commit_consumer
                         .consume(
                             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal },
                             service,
                         )
-                        .is_ok()
+                        .is_ok();
+                if consumed && completion_unknown {
+                    self.managed_enqueue_unknown_direct_completion(commit);
+                }
+                consumed
             }
             crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
                 let admission_active = self.admission_is_active(device_key);
@@ -20487,6 +20634,7 @@ impl KmsBackend {
             fallback_target,
             members,
             event,
+            commit_id: None,
             completion_output_idx,
             completion_clock: None,
             awaiting_outputs: HashSet::new(),
@@ -21754,6 +21902,7 @@ impl Backend for KmsBackend {
             fallback_target,
             members: Vec::new(),
             event,
+            commit_id: None,
             completion_output_idx,
             completion_clock: None,
             awaiting_outputs: HashSet::new(),
@@ -44390,6 +44539,7 @@ mod tests {
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_FLIP,
                 emit_idle: false,
             },
+            commit_id: None,
             completion_output_idx: 0,
             completion_clock,
             awaiting_outputs: std::collections::HashSet::new(),
@@ -47595,6 +47745,7 @@ mod tests {
                 },
                 emit_idle: !current,
             },
+            commit_id: None,
             completion_output_idx: 0,
             completion_clock,
             awaiting_outputs: if current {
@@ -48176,6 +48327,7 @@ mod tests {
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
             members: Vec::new(),
             event,
+            commit_id: None,
             completion_output_idx: 0,
             completion_clock: None,
             awaiting_outputs: std::collections::HashSet::from([0, 1]),
@@ -51602,7 +51754,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit, resources)],
+            vec![
+                admission_presented_event(backend, commit),
+                admission_completion_retired_event(commit, resources),
+            ],
             std::time::Instant::now(),
         );
 
@@ -51717,6 +51872,23 @@ mod tests {
             present_id,
             ..candidate
         };
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        for output_idx in 0..backend.platform.outputs.len() {
+            c0_conv_cii_prepare_owner_clock(
+                backend,
+                device,
+                output_idx,
+                yserver_core::backend::PresentClockSample {
+                    msc: 1_000 + present_id,
+                    ust: 1_000_000 + present_id,
+                    source: yserver_core::backend::PresentClockSource::IdleSequence,
+                },
+            );
+        }
         let source_id = backend
             .store
             .lookup(source_xid)
@@ -51932,6 +52104,8 @@ mod tests {
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let (first_candidate, first_event) =
             c0_conv_cii_try_candidate(&mut backend, 0xC551, 0xC552, 0xC553, 51);
+        let (second_candidate, second_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC561, 0xC562, 0xC563, 61);
         assert!(
             backend
                 .try_present_direct(first_candidate, first_event)
@@ -51942,30 +52116,16 @@ mod tests {
             .live_record()
             .expect("first owner commit")
             .commit_id();
-        let (second_candidate, second_event) =
-            c0_conv_cii_try_candidate(&mut backend, 0xC561, 0xC562, 0xC563, 61);
         assert!(
             backend
                 .try_present_direct(second_candidate, second_event)
                 .expect("queued owner direct offer")
         );
 
-        backend.route_owner_event_batch(
-            device,
-            vec![
-                crate::kms::owner::device::OwnerEvent::Accepted {
-                    commit: first_commit,
-                },
-                crate::kms::owner::device::OwnerEvent::HardwareComplete {
-                    commit: first_commit,
-                },
-            ],
-            std::time::Instant::now(),
-        );
-        let completion = backend.complete_owner_for_tests(0);
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, first_commit);
         reinstall_owner_executor_for_direct_test(&mut backend);
-        backend.route_owner_event_batch(device, completion, std::time::Instant::now());
-
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_061, 1, 61);
         let second_commit = backend
             .device_owner_for_tests(0)
             .live_record()
@@ -52038,6 +52198,460 @@ mod tests {
             .get_mut(drawable)
             .expect("present drawable")
             .storage = super::Storage::from_backing(StorageBacking::Managed(lease));
+    }
+
+    fn c0_conv_cii_prepare_owner_clock(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        sample: yserver_core::backend::PresentClockSample,
+    ) {
+        let crtc_key = CrtcKey::for_output(&backend.platform.outputs[output_idx]);
+        c0_conv_cii_install_owner_clock(backend, device, output_idx, sample.msc);
+        backend.platform.record_completion_clock(crtc_key, sample);
+    }
+
+    fn c0_conv_cii_install_owner_clock(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        reference: u64,
+    ) {
+        let crtc_key = CrtcKey::for_output(&backend.platform.outputs[output_idx]);
+        let fallback_epoch = backend.clock_epoch_for_crtc_key(crtc_key);
+        let owner = backend.platform.owner_for(device).expect("direct owner");
+        let key = owner
+            .clock_key_for_hardware_crtc(u32::from(crtc_key.crtc))
+            .unwrap_or(crate::kms::owner::clock::ClockKey {
+                hardware_crtc: u32::from(crtc_key.crtc),
+                epoch: fallback_epoch,
+            });
+        let (lifecycle, topology_generation) = owner.clock_context();
+        if owner.clock(key).is_none() {
+            owner
+                .install_clock(key, lifecycle, topology_generation)
+                .expect("install direct owner clock");
+        }
+        owner
+            .clock_mut(key)
+            .expect("direct owner clock")
+            .install_reference(reference);
+    }
+
+    fn c0_conv_cii_presented_event(
+        commit: crate::kms::owner::identity::CommitId,
+        samples: &[(u32, yserver_core::backend::PresentClockSample)],
+    ) -> crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources> {
+        crate::kms::owner::device::OwnerEvent::Presented {
+            commit,
+            samples: samples
+                .iter()
+                .map(|(crtc, sample)| {
+                    (
+                        *crtc,
+                        crate::kms::owner::clock::ClockSample {
+                            msc: sample.msc,
+                            ust: sample.ust,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn c0_conv_cii_accept_direct_owner_commit(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+    ) {
+        let count = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .closure()
+            .expected_completion()
+            .len();
+        backend.record_host_call_events(vec![(
+            device,
+            crate::kms::owner::test_fixtures::accepted(
+                commit,
+                (1u32 << u32::try_from(count).expect("test fence count")) - 1,
+                count,
+            ),
+        )]);
+    }
+
+    fn c0_conv_cii_complete_direct_owner_hardware(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) {
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(
+            backend.route_owner_event_batch(device, completion, std::time::Instant::now()),
+            "owner completion batch must be consumed"
+        );
+    }
+
+    fn c0_conv_cii_page_flip_direct_owner(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        raw_sequence: u32,
+        tv_sec: u32,
+        usec: u32,
+    ) {
+        let (incarnation, event) = {
+            let owner = backend.platform.owner_ref(device).expect("direct owner");
+            let token = owner
+                .live_record()
+                .expect("direct owner record")
+                .event_token();
+            (
+                owner.incarnation(),
+                crate::drm::event_stream::DrmEventRecord::PageFlip {
+                    crtc_id: u32::from(backend.platform.outputs[output_idx].output.crtc),
+                    sequence: raw_sequence,
+                    tv_sec,
+                    tv_usec: usec,
+                    user_data: token.as_user_data(),
+                },
+            )
+        };
+        let events = backend
+            .platform
+            .owner_for(device)
+            .expect("direct owner")
+            .apply_drm_event(incarnation, event, std::time::Instant::now());
+        assert!(
+            backend.route_owner_event_batch(device, events, std::time::Instant::now()),
+            "owner page-flip batch must be consumed"
+        );
+    }
+
+    fn c0_conv_cii_expire_direct_owner_present(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) {
+        let deadline = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.completion_deadline())
+            .expect("Present completion deadline");
+        let events = backend
+            .platform
+            .owner_for(device)
+            .expect("direct owner")
+            .tick_completion(deadline + std::time::Duration::from_nanos(1));
+        assert!(
+            backend.route_owner_event_batch(device, events, std::time::Instant::now()),
+            "owner deadline batch must be consumed"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_description_carries_present_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc701, 0xc702, 0xc703, 701);
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 70,
+                ust: 7_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct dispatch")
+        );
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record");
+        assert_eq!(
+            record.closure().present_event(),
+            record.closure().kernel_event(),
+            "every kernel event CRTC must be a Present consumer"
+        );
+        assert!(!record.closure().kernel_event().is_empty());
+        assert!(
+            !record
+                .closure()
+                .present_event()
+                .contains(&u32::try_from(candidate.present_id).expect("test Present id")),
+            "the Present serial must not be carried as a CRTC consumer"
+        );
+        assert_eq!(
+            record.completion_context().clocks.len(),
+            record.closure().kernel_event().len()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_present_completes_once_vulkan() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        for hardware_complete_first in [false, true] {
+            let OwnerLiveFixture {
+                mut backend,
+                _registry,
+            } = owner_live_fixture_with_output_count(2, false)
+                .expect("environmental skip: no live Vulkan ICD available");
+            let device = backend.platform.primary_device().expect("device").key;
+            backend.scanout_m2.test_submit_direct_without_drm = true;
+            let (candidate, event) =
+                c0_conv_cii_try_candidate(&mut backend, 0xc711, 0xc712, 0xc713, 711);
+            let reference_crtc = u32::from(backend.platform.outputs[0].output.crtc);
+            let reference = PresentClockSample {
+                msc: 710,
+                ust: 71_000,
+                source: PresentClockSource::PageFlip,
+            };
+            let other = PresentClockSample {
+                msc: 970,
+                ust: 97_000,
+                source: PresentClockSource::PageFlip,
+            };
+            c0_conv_cii_prepare_owner_clock(&mut backend, device, 0, reference);
+            c0_conv_cii_prepare_owner_clock(&mut backend, device, 1, other);
+            assert!(
+                backend
+                    .try_present_direct(candidate, event)
+                    .expect("owner direct dispatch")
+            );
+            let commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("direct owner record")
+                .commit_id();
+            let foreign = crate::kms::owner::identity::CommitId::from_raw(0xdead);
+            let before_foreign = backend
+                .platform
+                .present_get_completion_clock(output_crtc_key(&backend, 0));
+            backend.route_owner_event_batch(
+                device,
+                vec![c0_conv_cii_presented_event(
+                    foreign,
+                    &[(
+                        reference_crtc,
+                        PresentClockSample {
+                            msc: 1_700,
+                            ust: 170_000,
+                            source: PresentClockSource::PageFlip,
+                        },
+                    )],
+                )],
+                std::time::Instant::now(),
+            );
+            assert_eq!(
+                backend
+                    .platform
+                    .present_get_completion_clock(output_crtc_key(&backend, 0)),
+                before_foreign,
+                "a foreign Presented must not move the reference clock"
+            );
+            assert!(backend.scanout_m2.completed.is_empty());
+
+            c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+            if hardware_complete_first {
+                c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+            }
+            c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 710, 0, 71_000);
+            c0_conv_cii_page_flip_direct_owner(&mut backend, device, 1, 970, 0, 97_000);
+            if !hardware_complete_first {
+                c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+            }
+            assert_eq!(
+                backend
+                    .scanout_m2
+                    .completed
+                    .iter()
+                    .filter(|event| event.present_id == 711)
+                    .count(),
+                1,
+                "the frame has one and only one publication"
+            );
+            let completed = backend
+                .scanout_m2
+                .completed
+                .iter()
+                .find(|event| event.present_id == 711)
+                .expect("direct completion");
+            assert_eq!(
+                completed.completion_mode,
+                yserver_protocol::x11::present::COMPLETE_MODE_FLIP
+            );
+            assert_eq!(completed.completion_clock, Some(reference));
+            assert!(backend.scanout_m2.idled.is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_unknown_terminal_skips_vulkan() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture_with_output_count(2, false)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let old = PresentClockSample {
+            msc: 801,
+            ust: 80_100,
+            source: PresentClockSource::IdleSequence,
+        };
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc721, 0xc722, 0xc723, 721);
+        backend
+            .platform
+            .completion_clocks
+            .remove(&output_crtc_key(&backend, 0));
+        c0_conv_cii_prepare_owner_clock(&mut backend, device, 0, old);
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            1,
+            PresentClockSample {
+                msc: 8_801,
+                ust: 880_100,
+                source: PresentClockSource::IdleSequence,
+            },
+        );
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct dispatch")
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_expire_direct_owner_present(&mut backend, device);
+        let completed = backend
+            .scanout_m2
+            .completed
+            .iter()
+            .find(|event| event.present_id == 721)
+            .expect("missing-Present terminalization");
+        assert_eq!(
+            completed.completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert_eq!(completed.completion_clock, Some(old));
+        assert!(backend.scanout_m2.idled.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_direct_skip_without_history_is_unstamped_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc731, 0xc732, 0xc733, 731);
+        backend
+            .platform
+            .completion_clocks
+            .remove(&output_crtc_key(&backend, 0));
+        let reference = 731_u64;
+        c0_conv_cii_install_owner_clock(&mut backend, device, 0, reference);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct dispatch without a historical sample")
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_expire_direct_owner_present(&mut backend, device);
+        let completed = backend
+            .scanout_m2
+            .completed
+            .iter()
+            .find(|event| event.present_id == 731)
+            .expect("missing-Present terminalization");
+        assert_eq!(
+            completed.completion_mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert_eq!(completed.completion_clock, None);
+        assert!(backend.scanout_m2.idled.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_stale_presented_does_not_move_the_clocks_vulkan() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let prior = PresentClockSample {
+            msc: 3_901,
+            ust: 390_100,
+            source: PresentClockSource::IdleSequence,
+        };
+        c0_conv_cii_prepare_owner_clock(&mut backend, device, 0, prior);
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc741, 0xc742, 0xc743, 741);
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct dispatch")
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct owner record")
+            .commit_id();
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let stale = yserver_core::backend::PresentClockSample {
+            msc: 4_901,
+            ust: 490_100,
+            source: PresentClockSource::PageFlip,
+        };
+        backend.route_owner_event_batch(
+            device,
+            vec![c0_conv_cii_presented_event(
+                crate::kms::owner::identity::CommitId::from_raw(commit.get() + 1),
+                &[(crtc, stale)],
+            )],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            backend
+                .platform
+                .present_get_completion_clock(output_crtc_key(&backend, 0)),
+            prior
+        );
     }
 
     #[test]
@@ -52220,17 +52834,10 @@ mod tests {
             .live_record()
             .expect("direct owner record")
             .commit_id();
-        backend.route_owner_event_batch(
-            device,
-            vec![
-                crate::kms::owner::device::OwnerEvent::Accepted { commit },
-                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
-            ],
-            std::time::Instant::now(),
-        );
-        let completion = backend.complete_owner_for_tests(0);
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
         reinstall_owner_executor_for_direct_test(&mut backend);
-        backend.route_owner_event_batch(device, completion, std::time::Instant::now());
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_121, 1, 121_000);
         assert!(backend.present_source_pins.contains_key(&source_pin));
         assert!(backend.present_source_pins.contains_key(&fallback_pin));
         assert!(
@@ -54272,6 +54879,16 @@ mod tests {
             device,
             incarnation,
         ));
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 900,
+                ust: 90_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
         backend
     }
 
@@ -54288,6 +54905,16 @@ mod tests {
             device,
             incarnation,
         ));
+        c0_conv_cii_prepare_owner_clock(
+            backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 900,
+                ust: 90_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
     }
 
     fn admission_stage_direct_predecessor(
@@ -54310,7 +54937,7 @@ mod tests {
             .managed_dispatch_direct_successor(commit)
             .expect("predecessor dispatch")
             .expect("predecessor resources");
-        assert!(backend.managed_confirm_direct_dispatch(u64::MAX));
+        assert!(backend.managed_confirm_direct_dispatch(u64::MAX, commit));
         (commit, resources)
     }
 
@@ -54322,6 +54949,23 @@ mod tests {
             commit,
             resources: crate::kms::owner::ledger::Submitted::new(Vec::new(), vec![resources])
                 .accepted(),
+        }
+    }
+
+    fn admission_presented_event(
+        backend: &super::KmsBackend,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources> {
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        crate::kms::owner::device::OwnerEvent::Presented {
+            commit,
+            samples: std::collections::BTreeMap::from([(
+                crtc,
+                crate::kms::owner::clock::ClockSample {
+                    msc: 900,
+                    ust: 90_000,
+                },
+            )]),
         }
     }
 
@@ -56029,7 +56673,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit_a, resources_a)],
+            vec![
+                admission_presented_event(&backend, commit_a),
+                admission_completion_retired_event(commit_a, resources_a),
+            ],
             std::time::Instant::now(),
         );
 
@@ -56131,7 +56778,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit_a, resources_a)],
+            vec![
+                admission_presented_event(&backend, commit_a),
+                admission_completion_retired_event(commit_a, resources_a),
+            ],
             std::time::Instant::now(),
         );
 
@@ -56162,7 +56812,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit_a, resources_a)],
+            vec![
+                admission_presented_event(&backend, commit_a),
+                admission_completion_retired_event(commit_a, resources_a),
+            ],
             std::time::Instant::now(),
         );
 
@@ -56288,7 +56941,10 @@ mod tests {
 
         backend.route_owner_event_batch(
             device,
-            vec![admission_completion_retired_event(commit_a, resources_a)],
+            vec![
+                admission_presented_event(&backend, commit_a),
+                admission_completion_retired_event(commit_a, resources_a),
+            ],
             std::time::Instant::now(),
         );
 
@@ -56548,6 +57204,7 @@ mod tests {
         backend.route_owner_event_batch(
             device,
             vec![
+                admission_presented_event(&backend, commit_a),
                 admission_completion_retired_event(commit_a, resources_a),
                 terminal,
             ],
@@ -57835,6 +58492,16 @@ mod tests {
             )
             .expect("direct executor"),
         );
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 913,
+                ust: 91_300,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
         let first = backend
             .resource_service
             .as_mut()
@@ -58347,6 +59014,16 @@ mod tests {
         backend.platform.devices[0].executor = Some(executor);
         backend.platform.devices[0].owner = Some(
             crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        c0_conv_cii_prepare_owner_clock(
+            &mut backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 901,
+                ust: 90_100,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
         );
         let member_a = task2_member(device, 1);
         let member_b = task2_member(device, 2);
