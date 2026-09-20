@@ -837,6 +837,10 @@ impl KmsBackend {
             .commit_consumer
             .capacity
             .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement);
+        let backend_composed = self
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| conductor.backend_composed);
         let composed_return_established = self
             .platform
             .outputs
@@ -844,14 +848,29 @@ impl KmsBackend {
             .enumerate()
             .filter(|(_, output)| output.key.device_key == device)
             .all(|(output_idx, _)| {
-                self.platform
-                    .retained_composed_framebuffer(output_idx)
-                    .is_some()
+                if backend_composed {
+                    let bo_fb_handle = self
+                        .platform
+                        .scanout_pools
+                        .get(output_idx)
+                        .and_then(Option::as_ref)
+                        .and_then(|scanout| scanout.display_pool().bos.first())
+                        .and_then(|bo| bo.fb_handle);
+                    self.resource_service
+                        .as_mut()
+                        .and_then(|service| {
+                            self.scene
+                                .owner_current_framebuffer(output_idx, bo_fb_handle, service)
+                                .ok()
+                        })
+                        .flatten()
+                        .is_some()
+                } else {
+                    self.platform
+                        .retained_composed_framebuffer(output_idx)
+                        .is_some()
+                }
             });
-        let backend_composed = self
-            .admission_conductors
-            .get(&device)
-            .is_some_and(|conductor| conductor.backend_composed);
         let composed_intents = self
             .admission_conductors
             .get(&device)
@@ -1307,8 +1326,29 @@ impl KmsBackend {
             let owner = device_entry.owner.as_mut().expect("admission owner");
             owner.send_on(device_entry.executor.as_mut().expect("admission executor"))
         };
+        let affected_outputs = members
+            .iter()
+            .filter_map(|member| {
+                self.platform
+                    .outputs
+                    .iter()
+                    .find(|output| {
+                        crate::kms::render::platform::CrtcKey::for_output(output) == member.crtc
+                    })
+                    .map(|output| output.key.clone())
+            })
+            .collect::<Vec<_>>();
         match send_result {
-            Ok(_events) => self.admission_confirm(device, token, commit, decision),
+            Ok(_events) => {
+                let outcome = self.admission_confirm(device, token, commit, decision);
+                if matches!(outcome, AdmissionOutcome::Dispatched(_)) {
+                    self.record_owner_unflip_return(
+                        crate::kms::render::resources::CommitKey::new(device, commit),
+                        affected_outputs,
+                    );
+                }
+                outcome
+            }
             Err(error @ DispatchError::Refused { .. }) => {
                 self.admission_dispose_refusal(device, token, decision.admitted, error)
             }

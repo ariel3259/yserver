@@ -96,14 +96,28 @@ pub(crate) fn description(
     let framebuffers = output_indices
         .iter()
         .map(|&output_idx| {
-            backend
+            let bo_fb_handle = backend
                 .platform
-                .retained_composed_framebuffer(output_idx)
-                .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "owner unflip: output {output_idx} has no retained composed framebuffer"
-                    ))
-                })
+                .scanout_pools
+                .get(output_idx)
+                .and_then(Option::as_ref)
+                .and_then(|scanout| scanout.display_pool().bos.first())
+                .and_then(|bo| bo.fb_handle);
+            let framebuffer = if let Some(service) = backend.resource_service.as_mut() {
+                backend
+                    .scene
+                    .owner_current_framebuffer(output_idx, bo_fb_handle, service)
+                    .ok()
+                    .flatten()
+                    .or_else(|| backend.platform.retained_composed_framebuffer(output_idx))
+            } else {
+                backend.platform.retained_composed_framebuffer(output_idx)
+            };
+            framebuffer.ok_or_else(|| {
+                io::Error::other(format!(
+                    "owner unflip: output {output_idx} has no retained composed framebuffer"
+                ))
+            })
         })
         .collect::<io::Result<Vec<_>>>()?;
     let planes = output_indices
@@ -124,9 +138,10 @@ pub(crate) fn description(
     Ok(composed_description(&planes, property_ids))
 }
 
-/// The composed return has no direct-capacity role of its own, but it carries
-/// every member so the ledger can register the old direct allocations as KMS
-/// dependencies until the replacement completes.
+/// The composed return has no direct-capacity role of its own. Keep one
+/// resource entry per member so a later scene commit can replace one output's
+/// returned ownership while another output is still awaiting its proof; the
+/// owner transaction itself remains one atomic complete-device replacement.
 pub(crate) fn resources(
     backend: &KmsBackend,
     device: DrmDeviceKey,
@@ -139,14 +154,10 @@ pub(crate) fn resources(
     if members.is_empty() {
         return Err(ResourceError::InvalidProof);
     }
-    Ok(vec![CommitResources::new(
-        Vec::new(),
-        None,
-        None,
-        None,
-        members,
-        Vec::new(),
-    )])
+    Ok(members
+        .into_iter()
+        .map(|member| CommitResources::new(Vec::new(), None, None, None, vec![member], Vec::new()))
+        .collect())
 }
 
 /// Enter the owner admission request once for the direct group, then perform
