@@ -524,6 +524,21 @@ producers:
    fixture. The retained allocation gets no `KmsRelease` obligation and is not
    released, while any displaced allocation in the same commit is.
 
+**Position of the retaining commit — the plan's delegated choice, exercised
+(2026-09-20, plan Ciii revision 9, its review round 8 M-1).** The ordering
+above puts the retaining commit *after* the unflip, and there it cannot
+retain anything: the unflip's retirement makes the composed resources current,
+so a following direct commit takes **composed** as its old state and shares no
+allocation with its new state, while retention is recognised only when the
+same allocation key appears in old and new for the same member
+(`resources/commit.rs:654`-`668`). Exercising the choice this section
+delegates, plan Ciii places it as a **second direct commit presenting the same
+source buffer while the first is still current**, before the unflip. The run is
+therefore composed → direct → the retaining direct commit → unflip; **P3-2**
+rides on the steps that displace a buffer and **P3-3** on the retaining commit.
+The illustrative ordering above is superseded for that reason only; nothing
+else in this section changes.
+
 Because section 3.2 gives `KmsRelease` a production caller, this test also
 carries **P3-2** (a displaced buffer's `KmsRelease` is discharged by the real
 completion — steps 1–3) and **P3-3** (a retained buffer registers none — step
