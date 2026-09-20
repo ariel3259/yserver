@@ -59798,4 +59798,361 @@ mod tests {
             "A's CompletionRetired must advance A's buffer"
         );
     }
+
+    fn c0_conv_ciii_id_two_device_backend() -> (super::KmsBackend, DrmDeviceKey, DrmDeviceKey) {
+        let mut backend = super::KmsBackend::for_tests();
+        let device_a = backend.platform.devices[0].key;
+        let device_b = test_device_key(91);
+        push_test_device(&mut backend, device_b);
+        install_admission_owner_gate(&mut backend, device_a);
+        install_admission_owner_gate(&mut backend, device_b);
+        backend.install_admission_conductor_for_tests(
+            device_a,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend.install_admission_conductor_for_tests(
+            device_b,
+            AdmissionSourceFixture::new_source().0,
+        );
+        (backend, device_a, device_b)
+    }
+
+    fn c0_conv_ciii_id_push_output_for_device(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        crtc_id: u32,
+        connector_name: &str,
+    ) {
+        use crate::kms::backend::ActiveOutput;
+
+        let mut seed = PlatformBackend::for_tests();
+        let mut output = seed.outputs.remove(0);
+        output.key = OutputKey::new(device, connector_name);
+        output.scanout_route.kms_device_key = device;
+        output.output.connector_name = connector_name.to_owned();
+        output.output.connector = ::drm::control::from_u32(crtc_id).expect("fixture connector");
+        output.output.encoder = ::drm::control::from_u32(crtc_id).expect("fixture encoder");
+        output.output.crtc = ::drm::control::from_u32(crtc_id).expect("fixture CRTC");
+        output.output.plane = ::drm::control::from_u32(crtc_id).expect("fixture plane");
+        output.output.modes[0].name = connector_name.to_owned();
+        backend.platform.outputs.push(ActiveOutput::new(
+            output.scanout_route,
+            output.output,
+            crate::drm::Swapchain::empty_for_tests(),
+            output.x,
+            output.y,
+        ));
+        backend.platform.scanout_pools.push(None);
+        backend.platform.bo_generations.push(Vec::new());
+        backend.platform.first_pageflip_logged.push(false);
+    }
+
+    #[test]
+    fn c0_conv_ciii_id_devices_are_independent() {
+        use crate::kms::{
+            owner::{
+                admission::IntentKey,
+                device::OwnerEvent,
+                identity::{CommitId, IncarnationId},
+                ledger::Submitted,
+            },
+            render::{admission::MaintenancePayload, resources::ResourceService},
+        };
+        use std::sync::Arc;
+
+        // An event batch delivered for A may consume A's conductor state, but
+        // it must not be replayed through B's conductor.
+        {
+            let (mut backend, device_a, device_b) = c0_conv_ciii_id_two_device_backend();
+            backend
+                .install_resource_service(ResourceService::new(device_a, IncarnationId::first()));
+            assert!(backend.route_owner_event_batch(
+                device_a,
+                vec![OwnerEvent::CompletionRetired {
+                    commit: CommitId::for_tests(1),
+                    resources: Submitted::new(Vec::new(), Vec::new()).accepted(),
+                }],
+                std::time::Instant::now(),
+            ));
+            assert!(
+                !backend.admission_trace_for_tests(device_a).is_empty(),
+                "A's owner event must reach A's conductor"
+            );
+            assert!(
+                backend.admission_trace_for_tests(device_b).is_empty(),
+                "A's owner event must not reach B's conductor"
+            );
+        }
+
+        // A wake may decide or refuse A's work without consuming B's queued
+        // intent or advancing any of B's admission sequence state.
+        {
+            let mut backend = admission_backend_with_stub_executor();
+            let device_a = backend.platform.devices[0].key;
+            let device_b = test_device_key(95);
+            push_test_device(&mut backend, device_b);
+            install_admission_owner_gate(&mut backend, device_a);
+            install_admission_owner_gate(&mut backend, device_b);
+            backend.install_admission_conductor_for_tests(
+                device_a,
+                AdmissionSourceFixture::new_source().0,
+            );
+            backend.install_admission_conductor_for_tests(
+                device_b,
+                AdmissionSourceFixture::new_source().0,
+            );
+            backend
+                .admission_offer_composed(device_a, 1, 1)
+                .expect("A composed offer");
+            backend
+                .admission_offer_composed(device_b, 1, 7)
+                .expect("B composed offer");
+            let before = (
+                backend.admission_conductors[&device_b].layout_generation,
+                backend.admission_conductors[&device_b]
+                    .admission
+                    .composed(1),
+                backend.admission_conductors[&device_b].admission.sequence(),
+                backend.admission_trace_for_tests(device_b),
+                backend
+                    .platform
+                    .owner_ref(device_b)
+                    .expect("B owner")
+                    .slot()
+                    .occupant()
+                    .is_none(),
+            );
+            assert!(matches!(
+                backend.admission_wake(device_a, false),
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ));
+            assert_eq!(
+                (
+                    backend.admission_conductors[&device_b].layout_generation,
+                    backend.admission_conductors[&device_b]
+                        .admission
+                        .composed(1),
+                    backend.admission_conductors[&device_b].admission.sequence(),
+                    backend.admission_trace_for_tests(device_b),
+                    backend
+                        .platform
+                        .owner_ref(device_b)
+                        .expect("B owner")
+                        .slot()
+                        .occupant()
+                        .is_none(),
+                ),
+                before,
+                "A's wake must not consume B's queued admission"
+            );
+        }
+
+        // A pre-IPC refusal is driven by the reaped stub executor. Its
+        // refusal disposition and direct cleanup must stay on A.
+        {
+            let mut backend = admission_backend_with_stub_executor();
+            let device_a = backend.platform.devices[0].key;
+            let device_b = test_device_key(92);
+            push_test_device(&mut backend, device_b);
+            admission_install_executor(
+                &mut backend,
+                crate::kms::owner::test_fixtures::reaped_executor_for_tests(),
+            );
+            install_admission_owner_gate(&mut backend, device_a);
+            install_admission_owner_gate(&mut backend, device_b);
+            backend.install_admission_conductor_for_tests(
+                device_a,
+                AdmissionSourceFixture::new_source().0,
+            );
+            backend.install_admission_conductor_for_tests(
+                device_b,
+                AdmissionSourceFixture::new_source().0,
+            );
+            let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 91);
+            assert!(
+                backend
+                    .admission_offer_direct(device_a, source_id, candidate, event)
+                    .expect("A direct offer")
+            );
+            let before_b = (
+                backend.admission_conductors[&device_b].layout_generation,
+                backend.admission_conductors[&device_b].admission.sequence(),
+                backend.admission_trace_for_tests(device_b),
+                backend.platform.transport_gate(&device_b).unwrap().state(),
+            );
+            assert!(matches!(
+                backend.admission_wake(device_a, false),
+                crate::kms::render::admission::AdmissionOutcome::SendRefused(_)
+            ));
+            assert_eq!(
+                (
+                    backend.admission_conductors[&device_b].layout_generation,
+                    backend.admission_conductors[&device_b].admission.sequence(),
+                    backend.admission_trace_for_tests(device_b),
+                    backend.platform.transport_gate(&device_b).unwrap().state(),
+                ),
+                before_b,
+                "A's refusal must not mutate B's conductor or gate"
+            );
+        }
+
+        // A bound violation closes only A's gate. The setup mirrors the
+        // existing admission bound test and uses crafted maintenance offers
+        // plus the real owner-event route for the executor boundary.
+        {
+            let mut backend = admission_backend_with_stub_executor();
+            let device_a = backend.platform.devices[0].key;
+            let device_b = test_device_key(93);
+            push_test_device(&mut backend, device_b);
+            admission_install_executor(
+                &mut backend,
+                crate::kms::executor::test_support::spawn_stub_helper(
+                    crate::kms::executor::test_support::StubBehaviour::RejectWith(libc::EINVAL),
+                )
+                .expect("rejecting stub executor"),
+            );
+            install_admission_owner_gate(&mut backend, device_a);
+            install_admission_owner_gate(&mut backend, device_b);
+            let (source, readiness, _compatibility, _group, _recovery_ready) =
+                AdmissionSourceFixture::new_with_snapshot_controls();
+            backend.install_admission_conductor_for_tests(device_a, source);
+            backend.install_admission_conductor_for_tests(
+                device_b,
+                AdmissionSourceFixture::new_source().0,
+            );
+            backend
+                .admission_offer_composed(device_a, 1, 1)
+                .expect("A primary offer");
+            assert!(matches!(
+                backend.admission_wake(device_a, false),
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ));
+
+            let gamma = crate::kms::owner::admission::MaintenanceKey {
+                crtc: 1,
+                class: crate::kms::owner::admission::MaintenanceClass::Gamma,
+            };
+            let cursor = crate::kms::owner::admission::MaintenanceKey {
+                crtc: 1,
+                class: crate::kms::owner::admission::MaintenanceClass::Cursor,
+            };
+            for (key, generation) in [(gamma, 2), (cursor, 3)] {
+                backend
+                    .admission_offer_maintenance(
+                        device_a,
+                        key,
+                        MaintenancePayload {
+                            generation,
+                            data: Arc::<[u8]>::from(vec![generation as u8]),
+                        },
+                    )
+                    .expect("A maintenance offer");
+                AdmissionSourceFixture::set_readiness(
+                    &readiness,
+                    IntentKey::Maintenance { key, generation },
+                    crate::kms::owner::admission::Readiness::Waiting(
+                        crate::kms::owner::admission::WaitReason::SourceWaits,
+                    ),
+                );
+            }
+            wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+            backend.before_block();
+            AdmissionSourceFixture::set_readiness(
+                &readiness,
+                IntentKey::Maintenance {
+                    key: gamma,
+                    generation: 2,
+                },
+                crate::kms::owner::admission::Readiness::Ready,
+            );
+            assert!(
+                backend
+                    .admission_conductors
+                    .get_mut(&device_a)
+                    .expect("A conductor")
+                    .admission
+                    .set_bound_waited_for_tests(cursor)
+            );
+
+            assert_eq!(
+                backend.admission_wake(device_a, false),
+                crate::kms::render::admission::AdmissionOutcome::TransportClosed
+            );
+            assert_eq!(
+                backend.platform.transport_gate(&device_a).unwrap().state(),
+                crate::kms::render::resources::TransportState::Closed
+            );
+            assert_eq!(
+                backend.platform.transport_gate(&device_b).unwrap().state(),
+                crate::kms::render::resources::TransportState::Owner,
+                "A's bound violation must not close B's gate"
+            );
+        }
+    }
+
+    #[test]
+    fn c0_conv_ciii_id_conductor_state_is_per_device() {
+        let (mut backend, device_a, device_b) = c0_conv_ciii_id_two_device_backend();
+        backend
+            .admission_offer_composed(device_b, 1, 7)
+            .expect("B composed offer");
+        let before_b = (
+            backend.admission_conductors[&device_b].layout_generation,
+            backend.admission_conductors[&device_b]
+                .admission
+                .composed(1),
+            backend.admission_conductors[&device_b].next_direct_source_generation,
+            backend.admission_trace_for_tests(device_b),
+        );
+
+        assert!(matches!(
+            backend.admission_note_layout_change(device_a),
+            crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+        ));
+        assert_eq!(backend.admission_conductors[&device_a].layout_generation, 1);
+        assert_eq!(
+            (
+                backend.admission_conductors[&device_b].layout_generation,
+                backend.admission_conductors[&device_b]
+                    .admission
+                    .composed(1),
+                backend.admission_conductors[&device_b].next_direct_source_generation,
+                backend.admission_trace_for_tests(device_b),
+            ),
+            before_b,
+            "A's layout change must not mutate B's conductor"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_id_direct_group_never_crosses_devices_vulkan() {
+        let mut backend = super::KmsBackend::for_tests_with_vk()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let device_a = backend.platform.devices[0].key;
+        let device_b = test_device_key(94);
+        push_test_device(&mut backend, device_b);
+        install_admission_owner_gate(&mut backend, device_a);
+        install_admission_owner_gate(&mut backend, device_b);
+        backend.install_admission_conductor_for_tests(
+            device_a,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend.install_admission_conductor_for_tests(
+            device_b,
+            AdmissionSourceFixture::new_source().0,
+        );
+        c0_conv_ciii_id_push_output_for_device(&mut backend, device_b, 2, "secondary");
+
+        assert_eq!(backend.platform.devices.len(), 2);
+        assert_eq!(backend.platform.outputs.len(), 2);
+        assert_ne!(
+            backend.platform.outputs[0].key.device_key,
+            backend.platform.outputs[1].key.device_key
+        );
+        assert!(
+            !backend.direct_scanout_topology_eligible(),
+            "a grouped direct unit must refuse outputs owned by different DRM devices"
+        );
+    }
 }
