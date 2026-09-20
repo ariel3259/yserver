@@ -2,6 +2,25 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 11 (2026-09-20)** — incorporates codex round 10
+(`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round10.md`: **0
+blocking**, 1 major, verified against the tree by the author and accepted;
+round 9's two findings audited APPLIED).
+
+- **M-1, confirmed: the A/B test of revision 10 cannot exist.**
+  `direct_scanout_topology_eligible` is true only when **every** platform
+  output belongs to the primary device (`backend.rs:3457`-`3470`), and Task 4
+  makes it a dispatch precondition. With an output on device B, device A can
+  never enter the grouped direct route, so there is no real unflip on A whose
+  retirement the test claimed to drive — and with B removed, widening the
+  operation to every output is observationally identical to the correct set,
+  so T48 would be uncatchable. The evidence becomes **compositional**: one
+  single-device test proves the dispatch-recorded identities reach the scoped
+  operation, and a separately named **component-level** test proves the
+  operation itself leaves another device's outputs alone. The plan says so
+  plainly rather than claiming a multi-device unflip that the topology
+  predicate forbids.
+
 **Revision 10 (2026-09-20)** — incorporates codex round 9
 (`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round9.md`: 1 blocking,
 1 major, both verified against the tree by the author and accepted; round 8's
@@ -400,6 +419,11 @@ especially "Carried to Ciii" and the three F8 stops, before the first task.
   plan.
 - Recovery from a transport closed by a failed dispatch is stage 4's
   (decision 5).
+- **A dispatched unflip on a multi-device topology cannot be tested**, because
+  the grouped direct route requires every output on the primary device
+  (`backend.rs:3457`-`3470`). The return's device scoping is proven
+  compositionally instead: routing on one device, the scoped operation itself
+  at component level (round-10 M-1).
 
 ## Global Constraints
 
@@ -479,7 +503,7 @@ user's go-ahead.
 | Every affected output is repainted in full before it is scanned out again; **per output** (§6.1, DMG-5) | `c0_conv_ciii_unflip_return_repaints_each_output_in_full_vulkan` (at least two outputs, distinct damage before the direct entry) | T19: invalidate only the reference output; T20: apply the pre-entry damage to the returning composed buffer |
 | Direct re-entry stays blocked until **every** affected output has proven its full repaint, across as many ticks as it takes (§6.1, DMG-5; round-7 M-1) | `c0_conv_ciii_staggered_return_holds_the_reentry_barrier_vulkan` | T45: clear the barrier after the first output's proof; T46: discharge an output at submission instead of at its proof |
 | The proof is the scene's application of the repaint, not its submission and not an invalidated member (§6.1, DMG-5; round-8 M-1) | `c0_conv_ciii_an_invalidated_member_does_not_discharge_its_output_vulkan` | T47: emit the return proof on the invalidating branch as well |
-| The return effects touch only the unflip's own outputs, never another device's (§6.2, §6.1; round-9 B-1) | `c0_conv_ciii_unflip_return_leaves_the_other_device_alone` | T48: widen the return operation to every scene output, as the legacy helpers do |
+| The return effects touch only the unflip's own outputs, never another device's (§6.2, §6.1; round-9 B-1, round-10 M-1) | `c0_conv_ciii_unflip_return_routes_to_the_scoped_operation_vulkan` (routing, single device) **and** `c0_conv_ciii_scoped_return_leaves_other_outputs_alone` (the operation, component level, two devices) | T48: widen the return operation to every scene output, as the legacy helpers do |
 | The retired unflip is recognised from what its dispatch recorded, not from scene state (decision 6) | `c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan`, driven with an ordinary composed commit retiring first | T21: run the return effects for any retiring composed commit while an unflip is requested |
 | The unflip transaction carries no cursor and no gamma property, so both survive it unchanged (§6.1, C.0 §12, decision 7) | `c0_conv_ciii_unflip_carries_no_cursor_or_gamma_vulkan` | T22: add a cursor-plane property to the transaction; T23: add a gamma property |
 | On an `Owner` device no primary or unflip legacy write is issued, at any enumerated site (§6.3) | the enumeration of Task 7, each site with its own case in `c0_conv_ciii_owner_device_issues_no_legacy_primary_write_vulkan`, observed by the **sink-entry recorder**, never by the gate's refusal (round-2 M-1) | T24-T26: force the legacy branch at each enumerated site in turn |
@@ -785,9 +809,17 @@ output's proof.
 - `c0_conv_ciii_an_invalidated_member_does_not_discharge_its_output_vulkan` —
   a `HardwareComplete` whose member cannot be confirmed invalidates that
   output and leaves it owing its repaint (round-8 M-1).
-- `c0_conv_ciii_unflip_return_leaves_the_other_device_alone` — devices A and B
-  both have scene outputs; A's unflip retires; B's damage and structure state
-  are unchanged (round-9 B-1).
+- `c0_conv_ciii_unflip_return_routes_to_the_scoped_operation_vulkan` — a real
+  single-device unflip retirement, proving the identities its dispatch
+  recorded are what reaches the scoped operation, and that nothing else
+  performs the invalidation (round-9 B-1).
+- `c0_conv_ciii_scoped_return_leaves_other_outputs_alone` — **component
+  level, and named as such**: the scoped operation is driven directly with
+  outputs on two devices, and the other device's damage and structure state
+  are unchanged. It does **not** claim a dispatched unflip on a multi-device
+  topology: the grouped direct route requires every output on the primary
+  device (`backend.rs:3457`-`3470`), so that scenario does not exist today.
+  That limit is recorded here, not worked around (round-10 M-1).
 
 - [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
