@@ -1269,6 +1269,14 @@ impl KmsBackend {
                         };
                         new.append(&mut resources);
                     }
+                    let new = new
+                        .into_iter()
+                        .map(|resources| {
+                            resources.with_commit_id(crate::kms::render::resources::CommitKey::new(
+                                device, commit,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
                     let members = new
                         .iter()
                         .flat_map(|resources| resources.crtcs.iter().copied())
@@ -1285,7 +1293,10 @@ impl KmsBackend {
                         .iter()
                         .map(|spec| (spec.location, spec.generation, spec.member))
                         .collect::<Vec<_>>();
-                    if !scene.install_owner_damage_transaction(commit, &transaction_specs) {
+                    if !scene.install_owner_damage_transaction(
+                        crate::kms::render::resources::CommitKey::new(device, commit),
+                        &transaction_specs,
+                    ) {
                         let (old, new) = submitted.into_parts();
                         return Err((ResourceError::InvalidState, old, new));
                     }
@@ -1327,6 +1338,14 @@ impl KmsBackend {
                         None => Vec::new(),
                         Some(_) => Vec::new(),
                     };
+                    let new = new
+                        .into_iter()
+                        .map(|resources| {
+                            resources.with_commit_id(crate::kms::render::resources::CommitKey::new(
+                                device, commit,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
                     let members = new
                         .iter()
                         .flat_map(|resources| resources.crtcs.iter().copied())
@@ -1521,7 +1540,9 @@ impl KmsBackend {
                     let new_resource = resources
                         .take()
                         .ok_or_else(|| (ResourceError::InvalidState, Vec::new(), Vec::new()))?;
-                    let new = vec![new_resource.with_commit_id(commit)];
+                    let new = vec![new_resource.with_commit_id(
+                        crate::kms::render::resources::CommitKey::new(device, commit),
+                    )];
                     let members = new
                         .iter()
                         .flat_map(|resources| resources.crtcs.iter().copied())
@@ -1575,8 +1596,10 @@ impl KmsBackend {
             }
         };
         if let Some(retirement) = retirement.take() {
-            self.commit_consumer
-                .prereserve_retirement(commit, retirement);
+            self.commit_consumer.prereserve_retirement(
+                crate::kms::render::resources::CommitKey::new(device, commit),
+                retirement,
+            );
         }
         let send_result = {
             let device_entry = self
@@ -1671,7 +1694,10 @@ impl KmsBackend {
                 }
             }
             Some(Admitted::Direct { successor }) => {
-                if !self.managed_confirm_direct_dispatch(successor.source_generation, commit) {
+                if !self.managed_confirm_direct_dispatch(
+                    successor.source_generation,
+                    crate::kms::render::resources::CommitKey::new(device, commit),
+                ) {
                     if let Some(gate) = self.platform.transport_gate_mut(&device) {
                         gate.force_close();
                     }
@@ -1923,7 +1949,9 @@ impl KmsBackend {
             && self.route_owner_event_batch(device, events, std::time::Instant::now());
         let restored = if consumed && restores_composed {
             refused_commit.is_some_and(|commit| {
-                let resources = self.commit_consumer.take_rejected_for_commit(commit);
+                let resources = self.commit_consumer.take_rejected_for_commit(
+                    crate::kms::render::resources::CommitKey::new(device, commit),
+                );
                 !resources.is_empty()
                     && self.scene.restore_owner_composed_resources(
                         resources,

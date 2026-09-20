@@ -22,6 +22,10 @@ impl PresentKey {
             present_id,
         }
     }
+
+    pub(crate) fn commit_key(&self) -> super::commit::CommitKey {
+        super::commit::CommitKey::new(self.device, self.commit)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

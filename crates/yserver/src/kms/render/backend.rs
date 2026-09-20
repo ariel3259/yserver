@@ -598,7 +598,7 @@ struct DirectPresentFrame {
     event: yserver_core::backend::CompletedPresentEvent,
     /// Commit that accepted this frame. `Presented` may populate the clock
     /// only when its owner event names this exact id.
-    commit_id: Option<crate::kms::owner::identity::CommitId>,
+    commit_id: Option<crate::kms::render::resources::CommitKey>,
     /// Output whose CRTC domain owns CompleteNotify/MSC for this Present.
     completion_output_idx: usize,
     /// Exact pageflip sample from the selected/reference CRTC. Xorg waits for
@@ -2819,7 +2819,7 @@ impl KmsBackend {
     pub(crate) fn managed_confirm_direct_dispatch(
         &mut self,
         source_generation: u64,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: crate::kms::render::resources::CommitKey,
     ) -> bool {
         let Some(frame) = self.scanout_m2.queued_successor.take() else {
             return false;
@@ -2843,7 +2843,7 @@ impl KmsBackend {
     /// rewrite its publication.
     fn managed_record_direct_presented(
         &mut self,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: crate::kms::render::resources::CommitKey,
         samples: &std::collections::BTreeMap<u32, crate::kms::owner::clock::ClockSample>,
     ) -> bool {
         let Some(frame) = self
@@ -2875,9 +2875,17 @@ impl KmsBackend {
     /// The event remains in `completed` until the core drains it after the
     /// handler returns. The retired frame keeps both pins while it is
     /// current; only the previous current frame is released here.
-    pub(crate) fn managed_enqueue_retired_direct_completion(&mut self) -> (Vec<u64>, Vec<u64>) {
+    pub(crate) fn managed_enqueue_retired_direct_completion(
+        &mut self,
+        commit: crate::kms::render::resources::CommitKey,
+    ) -> (Vec<u64>, Vec<u64>) {
         let mut completions = Vec::new();
-        if let Some(mut pending) = self.scanout_m2.pending.take() {
+        let matches = self
+            .scanout_m2
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.commit_id == Some(commit));
+        if matches && let Some(mut pending) = self.scanout_m2.pending.take() {
             let Some(completion_clock) = pending.completion_clock else {
                 log::error!(
                     "direct Present {} reached retirement without its Presented sample",
@@ -2918,7 +2926,7 @@ impl KmsBackend {
     /// not manufacture the legacy `(0, 0)` value.
     pub(crate) fn managed_enqueue_unknown_direct_completion(
         &mut self,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: crate::kms::render::resources::CommitKey,
     ) -> Option<u64> {
         let matches = self
             .scanout_m2
@@ -20326,10 +20334,11 @@ impl KmsBackend {
                 true
             }
             crate::kms::owner::device::OwnerEvent::Presented { commit, samples } => {
+                let commit_key = crate::kms::render::resources::CommitKey::new(device_key, commit);
                 // A stale/unknown Presented is telemetry, not a clock
                 // source. Correlate it with the accepted direct frame before
                 // allowing any of its samples to rewrite per-CRTC history.
-                let correlated = self.managed_record_direct_presented(commit, &samples);
+                let correlated = self.managed_record_direct_presented(commit_key, &samples);
                 if correlated {
                     for (crtc_id, sample) in &samples {
                         if let Some(handle) =
@@ -20353,12 +20362,14 @@ impl KmsBackend {
                 };
                 self.commit_consumer
                     .consume(
+                        commit_key,
                         crate::kms::owner::device::OwnerEvent::Presented { commit, samples },
                         service,
                     )
                     .is_ok()
             }
             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => {
+                let commit_key = crate::kms::render::resources::CommitKey::new(device_key, commit);
                 let completion_unknown = matches!(
                     terminal,
                     crate::kms::owner::record::TerminalState::CompletionUnknown(_)
@@ -20389,16 +20400,18 @@ impl KmsBackend {
                     && self
                         .commit_consumer
                         .consume(
+                            commit_key,
                             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal },
                             service,
                         )
                         .is_ok();
                 if consumed && completion_unknown {
-                    self.managed_enqueue_unknown_direct_completion(commit);
+                    self.managed_enqueue_unknown_direct_completion(commit_key);
                 }
                 consumed
             }
             crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
+                let commit_key = crate::kms::render::resources::CommitKey::new(device_key, commit);
                 let admission_active = self.admission_is_active(device_key);
                 let conductor_installed = self.admission_conductors.contains_key(&device_key);
                 let maintenance_only = self
@@ -20419,6 +20432,7 @@ impl KmsBackend {
                         return false;
                     };
                     if let Err(error) = self.commit_consumer.consume(
+                        commit_key,
                         crate::kms::owner::device::OwnerEvent::CompletionRetired {
                             commit,
                             resources,
@@ -20451,7 +20465,8 @@ impl KmsBackend {
                 }
                 #[cfg(test)]
                 {
-                    let (completions, skips) = self.managed_enqueue_retired_direct_completion();
+                    let (completions, skips) =
+                        self.managed_enqueue_retired_direct_completion(commit_key);
                     if let Some(conductor) = self.admission_conductors.get_mut(&device_key) {
                         conductor.trace.push(
                             crate::kms::render::admission::AdmissionTraceStep::Enqueued {
@@ -20462,7 +20477,7 @@ impl KmsBackend {
                     }
                 }
                 #[cfg(not(test))]
-                self.managed_enqueue_retired_direct_completion();
+                self.managed_enqueue_retired_direct_completion(commit_key);
                 true
             }
             crate::kms::owner::device::OwnerEvent::SequenceArmFailed { key, .. } => {
@@ -20486,10 +20501,26 @@ impl KmsBackend {
                 true
             }
             event => {
+                let commit_key = match &event {
+                    crate::kms::owner::device::OwnerEvent::Dispatched { commit }
+                    | crate::kms::owner::device::OwnerEvent::Accepted { commit }
+                    | crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }
+                    | crate::kms::owner::device::OwnerEvent::ResourcesReleased { commit, .. }
+                    | crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                        commit, ..
+                    }
+                    | crate::kms::owner::device::OwnerEvent::Quarantined { commit }
+                    | crate::kms::owner::device::OwnerEvent::ValidationResolved {
+                        commit, ..
+                    } => crate::kms::render::resources::CommitKey::new(device_key, *commit),
+                    _ => return true,
+                };
                 let Some(service) = &mut self.resource_service else {
                     return false;
                 };
-                self.commit_consumer.consume(event, service).is_ok()
+                self.commit_consumer
+                    .consume(commit_key, event, service)
+                    .is_ok()
             }
         }
     }
@@ -20773,7 +20804,7 @@ impl KmsBackend {
     pub(crate) fn managed_bind_direct_dispatch(
         &mut self,
         prepared: PreparedDirectDispatch,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: crate::kms::render::resources::CommitKey,
     ) -> crate::kms::render::resources::CommitResources {
         let PreparedDirectDispatch {
             resources,
@@ -20856,7 +20887,7 @@ impl KmsBackend {
     #[allow(dead_code)]
     pub(crate) fn managed_dispatch_direct_successor(
         &mut self,
-        commit: crate::kms::owner::identity::CommitId,
+        commit: crate::kms::render::resources::CommitKey,
     ) -> Result<
         Option<crate::kms::render::resources::CommitResources>,
         crate::kms::render::resources::ResourceError,
@@ -50009,8 +50040,10 @@ mod tests {
                 .managed_prepare_direct_candidate(id_a, candidate_a, event_a)
                 .unwrap()
         );
+        let commit_a = CommitId::for_tests(9301);
+        let commit_key_a = crate::kms::render::resources::CommitKey::new(device_key, commit_a);
         let mut resources_a = backend
-            .managed_dispatch_direct_successor(CommitId::for_tests(9301))
+            .managed_dispatch_direct_successor(commit_key_a)
             .unwrap()
             .expect("dispatch current frame");
         resources_a.crtcs = vec![crate::kms::render::resources::GroupMember::new(
@@ -50021,8 +50054,9 @@ mod tests {
         backend
             .commit_consumer
             .consume(
+                commit_key_a,
                 crate::kms::owner::device::OwnerEvent::CompletionRetired {
-                    commit: CommitId::for_tests(9301),
+                    commit: commit_a,
                     resources: crate::kms::owner::ledger::Submitted::new(
                         Vec::new(),
                         vec![resources_a],
@@ -50114,8 +50148,10 @@ mod tests {
 
         let commit = CommitId::for_tests(9302);
         let mut old_seam = backend_with_current_and_successor_for_admission_seam();
+        let device = old_seam.platform.primary_device().unwrap().key;
+        let commit_key = crate::kms::render::resources::CommitKey::new(device, commit);
         let old_resources = old_seam
-            .managed_dispatch_direct_successor(commit)
+            .managed_dispatch_direct_successor(commit_key)
             .unwrap()
             .expect("the old composition dispatches");
 
@@ -50124,7 +50160,7 @@ mod tests {
             .managed_prepare_direct_dispatch()
             .expect("prepare")
             .expect("the split seam dispatches");
-        let split_resources = split_seam.managed_bind_direct_dispatch(prepared, commit);
+        let split_resources = split_seam.managed_bind_direct_dispatch(prepared, commit_key);
 
         assert_eq!(
             old_resources.direct_role.as_ref().unwrap().role(),
@@ -50200,8 +50236,9 @@ mod tests {
         );
 
         let commit_a = CommitId::for_tests(9001);
+        let commit_key_a = crate::kms::render::resources::CommitKey::new(device_key, commit_a);
         let res_a = b
-            .managed_dispatch_direct_successor(commit_a)
+            .managed_dispatch_direct_successor(commit_key_a)
             .unwrap()
             .expect("dispatch A");
         assert_eq!(
@@ -50214,6 +50251,7 @@ mod tests {
 
         b.commit_consumer
             .consume(
+                commit_key_a,
                 crate::kms::owner::device::OwnerEvent::CompletionRetired {
                     commit: commit_a,
                     resources: crate::kms::owner::ledger::Submitted::new(vec![], vec![res_a])
@@ -50242,8 +50280,9 @@ mod tests {
         assert_eq!(b.commit_consumer.capacity.occupied(), 2); // Current(A) + Successor(B)
 
         let commit_b = CommitId::for_tests(9002);
+        let commit_key_b = crate::kms::render::resources::CommitKey::new(device_key, commit_b);
         let res_b = b
-            .managed_dispatch_direct_successor(commit_b)
+            .managed_dispatch_direct_successor(commit_key_b)
             .unwrap()
             .expect("dispatch B");
         assert_eq!(
@@ -50256,6 +50295,7 @@ mod tests {
         let old = b.commit_consumer.take_current();
         b.commit_consumer
             .consume(
+                commit_key_b,
                 crate::kms::owner::device::OwnerEvent::CompletionRetired {
                     commit: commit_b,
                     resources: crate::kms::owner::ledger::Submitted::new(old, vec![res_b])
@@ -54008,7 +54048,9 @@ mod tests {
             _registry,
         } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
-        let snapshots = backend.scene.owner_damage_snapshot_count_for_tests(commit);
+        let snapshots = backend.scene.owner_damage_snapshot_count_for_tests(
+            crate::kms::render::resources::CommitKey::new(device, commit),
+        );
         assert!(
             snapshots > 0,
             "the transaction carries the captured snapshots"
@@ -54455,7 +54497,9 @@ mod tests {
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         let drawable = backend
             .scene
-            .owner_damage_snapshot_ids_for_tests(commit)
+            .owner_damage_snapshot_ids_for_tests(crate::kms::render::resources::CommitKey::new(
+                device, commit,
+            ))
             .into_iter()
             .next()
             .expect("the live frame captured a drawable snapshot");
@@ -54727,7 +54771,9 @@ mod tests {
         assert!(
             !backend
                 .scene
-                .owner_damage_snapshot_ids_for_tests(commit)
+                .owner_damage_snapshot_ids_for_tests(crate::kms::render::resources::CommitKey::new(
+                    device, commit
+                ),)
                 .contains(
                     &backend
                         .store
@@ -55203,11 +55249,13 @@ mod tests {
         backend.managed_tag_queued_direct_successor(u64::MAX);
         let commit =
             crate::kms::owner::identity::CommitId::for_tests(12_000 + u64::from(present_id));
+        let device = backend.platform.primary_device().unwrap().key;
+        let commit_key = crate::kms::render::resources::CommitKey::new(device, commit);
         let resources = backend
-            .managed_dispatch_direct_successor(commit)
+            .managed_dispatch_direct_successor(commit_key)
             .expect("predecessor dispatch")
             .expect("predecessor resources");
-        assert!(backend.managed_confirm_direct_dispatch(u64::MAX, commit));
+        assert!(backend.managed_confirm_direct_dispatch(u64::MAX, commit_key));
         (commit, resources)
     }
 
@@ -56573,7 +56621,9 @@ mod tests {
                     events: vec![
                         OwnerEvent::ResourcesReleased {
                             commit,
-                            resources: vec![prepared.resources.with_commit_id(commit)],
+                            resources: vec![prepared.resources.with_commit_id(
+                                crate::kms::render::resources::CommitKey::new(device, commit),
+                            )],
                         },
                         OwnerEvent::ResourcesStillCurrent {
                             commit,
@@ -57551,7 +57601,13 @@ mod tests {
                 .commit_consumer
                 .rejected_resources
                 .iter()
-                .any(|resource| resource.commit_id == Some(rejected_commit))
+                .any(|resource| {
+                    resource.commit_id
+                        == Some(crate::kms::render::resources::CommitKey::new(
+                            device,
+                            rejected_commit,
+                        ))
+                })
         );
     }
 
@@ -59333,6 +59389,413 @@ mod tests {
                 .current_resources
                 .iter()
                 .any(|res| { res.crtcs == vec![member_b] && res.kms_obligations.is_empty() })
+        );
+    }
+
+    fn c0_conv_ciii_id_owner_keys(
+        backend: &super::KmsBackend,
+    ) -> (
+        crate::kms::render::resources::CommitKey,
+        crate::kms::render::resources::CommitKey,
+    ) {
+        use crate::kms::owner::{
+            device::DeviceCommitOwner, identity::IncarnationId, ledger::Submitted,
+            lifecycle::LifecycleEpochId,
+        };
+
+        let device_a = backend.platform.devices[0].key;
+        let device_b = backend.platform.devices[1].key;
+        let description = crate::kms::owner::test_fixtures::single_active_crtc();
+        let mut owner_a = DeviceCommitOwner::<crate::kms::render::resources::CommitResources>::new(
+            IncarnationId::from_raw(201),
+            LifecycleEpochId::first(),
+            1,
+        );
+        let mut owner_b = DeviceCommitOwner::<crate::kms::render::resources::CommitResources>::new(
+            IncarnationId::from_raw(202),
+            LifecycleEpochId::first(),
+            1,
+        );
+        let (commit_a, _) = owner_a
+            .begin(&description, Submitted::new(Vec::new(), Vec::new()))
+            .expect("owner A issues commit");
+        let (commit_b, _) = owner_b
+            .begin(&description, Submitted::new(Vec::new(), Vec::new()))
+            .expect("owner B issues commit");
+        assert_eq!(
+            commit_a, commit_b,
+            "the two owner allocators must collide numerically"
+        );
+        (
+            crate::kms::render::resources::CommitKey::new(device_a, commit_a),
+            crate::kms::render::resources::CommitKey::new(device_b, commit_b),
+        )
+    }
+
+    fn c0_conv_ciii_id_pending_direct_backend() -> (
+        super::KmsBackend,
+        crate::kms::render::resources::CommitKey,
+        crate::kms::render::resources::CommitKey,
+        u64,
+        u64,
+    ) {
+        let mut backend = super::KmsBackend::for_tests();
+        let device_b = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        };
+        push_test_device(&mut backend, device_b);
+        let (key_a, key_b) = c0_conv_ciii_id_owner_keys(&backend);
+        let (source_id, candidate, event) =
+            managed_prepare_ready_candidate(&mut backend, 0xD101, 0xD102, 1, 1);
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(source_id, candidate, event)
+                .expect("direct candidate preparation")
+        );
+        backend.managed_tag_queued_direct_successor(7);
+        assert!(backend.managed_confirm_direct_dispatch(7, key_a));
+        let (source_pin, fallback_pin) = {
+            let frame = backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .expect("confirmed direct frame");
+            (frame.source_pin, frame.fallback_target_pin)
+        };
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            key_a.device,
+            crate::kms::owner::identity::IncarnationId::from_raw(201),
+        ));
+        (backend, key_a, key_b, source_pin, fallback_pin)
+    }
+
+    #[test]
+    fn c0_conv_ciii_id_foreign_terminal_leaves_a_pending_present_alone() {
+        use crate::kms::{
+            owner::{
+                identity::IncarnationId,
+                record::{FailureCause, TerminalState, UnknownCause},
+            },
+            render::resources::{CompletionDisposition, PresentDisposition, PresentKey},
+        };
+
+        let (mut backend, key_a, key_b, source_pin, fallback_pin) =
+            c0_conv_ciii_id_pending_direct_backend();
+        assert_eq!(
+            key_a.commit, key_b.commit,
+            "A's PresentKey and B's terminal events must collide numerically"
+        );
+        assert_ne!(key_a.device, key_b.device);
+        let present_key =
+            PresentKey::new(key_a.device, IncarnationId::from_raw(201), key_a.commit, 1);
+        backend
+            .commit_consumer
+            .record_present_disposition(present_key, PresentDisposition::pending());
+        let before_disposition = backend
+            .commit_consumer
+            .present_disposition(&present_key)
+            .expect("pending A Present");
+        let before_pin_count = backend.present_source_pins.len();
+
+        assert!(backend.route_owner_event_batch(
+            key_b.device,
+            vec![crate::kms::owner::device::OwnerEvent::Terminal {
+                commit: key_b.commit,
+                terminal: TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected {
+                    errno: libc::EBUSY,
+                }),
+            }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            backend.commit_consumer.present_disposition(&present_key),
+            Some(before_disposition),
+            "B's FailedBeforeSubmit must not touch A's Present"
+        );
+        assert!(backend.route_owner_event_batch(
+            key_b.device,
+            vec![crate::kms::owner::device::OwnerEvent::Terminal {
+                commit: key_b.commit,
+                terminal: TerminalState::CompletionUnknown(UnknownCause::ContradictoryEvidence),
+            }],
+            std::time::Instant::now(),
+        ));
+
+        assert_eq!(
+            backend.commit_consumer.present_disposition(&present_key),
+            Some(before_disposition)
+        );
+        assert_eq!(
+            backend
+                .commit_consumer
+                .present_disposition(&present_key)
+                .expect("A Present remains recorded")
+                .completion,
+            CompletionDisposition::Pending
+        );
+        assert_eq!(backend.present_source_pins.len(), before_pin_count);
+        assert!(backend.present_source_pins.contains_key(&source_pin));
+        assert!(backend.present_source_pins.contains_key(&fallback_pin));
+        assert!(backend.scanout_m2.pending.is_some());
+    }
+
+    #[test]
+    fn c0_conv_ciii_id_foreign_presented_leaves_a_pending_present_alone() {
+        use crate::kms::{
+            owner::{clock::ClockSample, identity::IncarnationId},
+            render::resources::{PresentDisposition, PresentKey},
+        };
+
+        let (mut backend, key_a, key_b, _source_pin, _fallback_pin) =
+            c0_conv_ciii_id_pending_direct_backend();
+        assert_eq!(
+            key_a.commit, key_b.commit,
+            "A's PresentKey and B's Presented event must collide numerically"
+        );
+        assert_ne!(key_a.device, key_b.device);
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let sample_a = ClockSample {
+            msc: 31,
+            ust: 3_100,
+        };
+        let sample_b = ClockSample {
+            msc: 42,
+            ust: 4_200,
+        };
+        let present_key =
+            PresentKey::new(key_a.device, IncarnationId::from_raw(201), key_a.commit, 2);
+        backend
+            .commit_consumer
+            .record_present_disposition_with_reference(
+                present_key,
+                PresentDisposition::pending(),
+                crtc,
+            );
+
+        assert!(backend.route_owner_event_batch(
+            key_b.device,
+            vec![crate::kms::owner::device::OwnerEvent::Presented {
+                commit: key_b.commit,
+                samples: std::collections::BTreeMap::from([(crtc, sample_b)]),
+            }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            backend.commit_consumer.present_disposition(&present_key),
+            Some(PresentDisposition::pending()),
+            "B's Presented must leave A's disposition pending and unstamped"
+        );
+
+        assert!(backend.route_owner_event_batch(
+            key_a.device,
+            vec![crate::kms::owner::device::OwnerEvent::Presented {
+                commit: key_a.commit,
+                samples: std::collections::BTreeMap::from([(crtc, sample_a)]),
+            }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            backend.commit_consumer.present_disposition(&present_key),
+            Some(PresentDisposition::emitted_retained().with_sample(sample_a)),
+            "A's Presented must stamp A from A's reference CRTC"
+        );
+    }
+
+    #[test]
+    fn c0_conv_ciii_id_foreign_milestones_leave_a_pending_direct_frame_alone() {
+        use crate::kms::owner::clock::ClockSample;
+
+        let (mut backend, key_a, key_b, source_pin, fallback_pin) =
+            c0_conv_ciii_id_pending_direct_backend();
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let sample_a = ClockSample {
+            msc: 11,
+            ust: 1_100,
+        };
+        let sample_b = ClockSample {
+            msc: 22,
+            ust: 2_200,
+        };
+        assert!(backend.route_owner_event_batch(
+            key_a.device,
+            vec![crate::kms::owner::device::OwnerEvent::Presented {
+                commit: key_a.commit,
+                samples: std::collections::BTreeMap::from([(crtc, sample_a)]),
+            }],
+            std::time::Instant::now(),
+        ));
+        let before_clock = backend
+            .scanout_m2
+            .pending
+            .as_ref()
+            .and_then(|frame| frame.completion_clock);
+        assert!(
+            before_clock.is_some(),
+            "A's Presented sample must be recorded first"
+        );
+        let before_pins = backend.present_source_pins.len();
+
+        backend.install_admission_conductor_for_tests(
+            key_b.device,
+            AdmissionSourceFixture::new_source().0,
+        );
+        assert!(backend.route_owner_event_batch(
+            key_b.device,
+            vec![crate::kms::owner::device::OwnerEvent::Presented {
+                commit: key_b.commit,
+                samples: std::collections::BTreeMap::from([(crtc, sample_b)]),
+            }],
+            std::time::Instant::now(),
+        ));
+        assert!(backend.route_owner_event_batch(
+            key_b.device,
+            vec![crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: key_b.commit,
+                resources: crate::kms::owner::ledger::Submitted::new(
+                    Vec::<crate::kms::render::resources::CommitResources>::new(),
+                    Vec::new(),
+                )
+                .accepted(),
+            }],
+            std::time::Instant::now(),
+        ));
+
+        let pending = backend
+            .scanout_m2
+            .pending
+            .as_ref()
+            .expect("foreign retirement must not take A's pending frame");
+        assert_eq!(pending.commit_id, Some(key_a));
+        assert_eq!(pending.completion_clock, before_clock);
+        assert!(backend.scanout_m2.current.is_none());
+        assert!(backend.scanout_m2.completed.is_empty());
+        assert_eq!(backend.present_source_pins.len(), before_pins);
+        assert!(backend.present_source_pins.contains_key(&source_pin));
+        assert!(backend.present_source_pins.contains_key(&fallback_pin));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_id_foreign_milestones_leave_a_damage_transaction_alone() {
+        use crate::kms::owner::{ledger::Submitted, record::TerminalState};
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture {
+            backend: mut backend_b,
+            _registry: _registry_b,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (device_a, commit_a) = owner_damage_commit_for_tests(&mut backend);
+        let (device_b_live, commit_b) = owner_damage_commit_for_tests(&mut backend_b);
+        let before_b_transactions = backend_b.scene.owner_damage_transaction_count_for_tests();
+        let before_b_snapshots = backend_b.scene.owner_damage_snapshot_count_for_tests(
+            crate::kms::render::resources::CommitKey::new(device_b_live, commit_b),
+        );
+        assert_eq!(before_b_transactions, 1);
+        assert!(before_b_snapshots > 0);
+        let device_b = crate::platform::drm::DrmDeviceKey {
+            major: device_a.major,
+            minor: device_a.minor.saturating_add(1),
+        };
+        assert_eq!(
+            commit_a, commit_b,
+            "the two owner allocators must collide numerically"
+        );
+
+        let before_transactions = backend.scene.owner_damage_transaction_count_for_tests();
+        let before_snapshots = backend.scene.owner_damage_snapshot_count_for_tests(
+            crate::kms::render::resources::CommitKey::new(device_a, commit_a),
+        );
+        let before_damage = backend.scene.damage_state_for_tests(0);
+        let before_owner = backend
+            .scene
+            .owner_submitted_for_tests(0)
+            .expect("A's owner buffer remains submitted");
+        let before_owner_state = backend.scene.owner_state_for_tests(0, before_owner.0);
+        assert_eq!(before_transactions, 1);
+        assert!(before_snapshots > 0);
+        assert_eq!(
+            before_owner_state,
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted)
+        );
+
+        assert!(backend.route_owner_event_batch(
+            device_b,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit: commit_b },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_b },
+                crate::kms::owner::device::OwnerEvent::Terminal {
+                    commit: commit_b,
+                    terminal: TerminalState::Completed,
+                },
+                crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                    commit: commit_b,
+                    resources: Submitted::new(Vec::new(), Vec::new()).accepted(),
+                },
+            ],
+            std::time::Instant::now(),
+        ));
+
+        assert_eq!(
+            backend.scene.owner_damage_transaction_count_for_tests(),
+            before_transactions
+        );
+        assert_eq!(
+            backend.scene.owner_damage_snapshot_count_for_tests(
+                crate::kms::render::resources::CommitKey::new(device_a, commit_a),
+            ),
+            before_snapshots
+        );
+        assert_eq!(backend.scene.damage_state_for_tests(0), before_damage);
+        assert_eq!(
+            backend.scene.owner_submitted_for_tests(0),
+            Some(before_owner),
+            "B's milestones must not accept, advance or remove A's submitted buffer"
+        );
+        assert_eq!(
+            backend.scene.owner_state_for_tests(0, before_owner.0),
+            before_owner_state
+        );
+
+        assert!(backend.route_owner_event_batch(
+            device_a,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted { commit: commit_a }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            backend.scene.owner_state_for_tests(0, before_owner.0),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Accepted),
+            "A's Accepted must move A's buffer"
+        );
+        assert!(backend.route_owner_event_batch(
+            device_a,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_a }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            backend.scene.owner_damage_transaction_count_for_tests(),
+            0,
+            "A's HardwareComplete must consume A's transaction"
+        );
+        assert_eq!(
+            backend.scene.owner_state_for_tests(0, before_owner.0),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Accepted)
+        );
+        assert!(backend.route_owner_event_batch(
+            device_a,
+            vec![crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: commit_a,
+                resources: Submitted::new(Vec::new(), Vec::new()).accepted(),
+            }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            backend.scene.owner_state_for_tests(0, before_owner.0),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Current),
+            "A's CompletionRetired must advance A's buffer"
         );
     }
 }
