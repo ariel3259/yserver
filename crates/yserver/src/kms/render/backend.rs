@@ -52031,20 +52031,25 @@ mod tests {
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let (first_candidate, first_event) =
             c0_conv_cii_try_candidate(&mut backend, 0xC521, 0xC522, 0xC523, 21);
+        let (second_candidate, second_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC531, 0xC532, 0xC533, 31);
+        let (third_candidate, third_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC541, 0xC542, 0xC543, 41);
         assert!(
             backend
                 .try_present_direct(first_candidate, first_event)
                 .expect("first owner direct offer")
         );
-        let (second_candidate, second_event) =
-            c0_conv_cii_try_candidate(&mut backend, 0xC531, 0xC532, 0xC533, 31);
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first owner commit")
+            .commit_id();
         assert!(
             backend
                 .try_present_direct(second_candidate, second_event)
                 .expect("queued owner direct offer")
         );
-        let (third_candidate, third_event) =
-            c0_conv_cii_try_candidate(&mut backend, 0xC541, 0xC542, 0xC543, 41);
         assert!(
             backend
                 .try_present_direct(third_candidate, third_event)
@@ -52084,6 +52089,29 @@ mod tests {
                 .as_ref()
                 .map(|frame| frame.candidate.present_id),
             Some(41)
+        );
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, first_commit);
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_041, 1, 41);
+
+        let mut idled = backend.drain_retired_present_idle_events();
+        idled.extend(
+            backend
+                .scanout_m2
+                .completed
+                .iter()
+                .filter(|event| event.emit_idle)
+                .cloned(),
+        );
+        assert_eq!(
+            idled
+                .iter()
+                .filter(|event| event.present_id == 31)
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![31],
+            "the displaced successor must idle exactly once after predecessor retirement"
         );
     }
 
@@ -52986,6 +53014,10 @@ mod tests {
         admission
             .set_maintenance(cursor, 7, false)
             .expect("same cursor generation is an omission");
+        assert!(
+            admission.maintenance(cursor).is_none(),
+            "set_maintenance must omit a generation already current before decide can carry it"
+        );
         admission
             .set_direct_successor(DirectSuccessor {
                 source_generation: 1,
