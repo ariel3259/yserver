@@ -2,6 +2,28 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for hardware work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`), never `_drm`, `render_acceptance`, unfiltered `--ignored`, or anything that modesets or takes DRM master while the user is looking at the screen; no deletes outside the worktree. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests and the mutations each must catch. Execute tasks in order, one per run. You can run the `_vulkan` tests yourself: nothing is done until its tests pass on the real GPU, in debug and release. Do not ask for approval; a real design choice the plan leaves open, or a claim here that does not hold in the code, is an F8 stop you report.
 
+**Revision 3 (2026-09-20)** — incorporates codex round 2
+(`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round2.md`: 1 blocking,
+1 major, both verified against the tree by the author and accepted; round 1:
+five APPLIED and M-2 TRADED, closed here).
+
+- **B-1, confirmed and dangerous.** Revision 2's routine gate
+  `cargo test --lib c0_conv_ciii_ -- --include-ignored` **does** match
+  `c0_conv_ciii_owner_route_on_card1_drm` by substring, so the sentence
+  claiming it never selects the `_drm` test was false and the implementer
+  would have taken DRM master while the user is on the screen. The hardware
+  test is renamed **out of** the routine prefix — `c0_hw_ciii_owner_route_on_card1_drm`
+  — so no filter the implementer is allowed to run can select it, and the
+  coordinator selects it by its own name.
+- **M-1, confirmed.** Revision 2's route-exclusivity mutations could not
+  produce the observation it demanded: `allows_legacy` is state-only and is
+  `false` under `Owner` (`resources/transport.rs:412`-`414`), and each sink
+  returns before building its atomic request (`modeset.rs:1718`-`1733`), so a
+  forced legacy branch changes no plane and the only visible effect is the
+  gate's refusal — which spec §6.3 forbids as the observation. Task 5 now
+  defines the observation: a recorder **inside each real sink, before any
+  permit check**, counting that the legacy sink was entered at all.
+
 **Revision 2 (2026-09-20)** — incorporates codex round 1
 (`../findings/2026-09-20-stage-2c-iii-plan-ciii-review-round1.md`: 2 blocking,
 4 major, **all six verified against the tree by the author and accepted**).
@@ -171,8 +193,10 @@ especially "Carried to Ciii" and the three F8 stops, before Task 1.
     multi-device evidence of Task 6 is not built on it; `test_kms_device` plus
     `install_transport_gate` is the shape the platform's own multi-device tests
     already use (`platform.rs:8798`, `platform.rs:9797`). The hardware test of
-    Task 7 carries `#[ignore]` and a `_drm` suffix, and **codex does not run
-    it**: it needs DRM master from tty2.
+    Task 7 is named **outside** this prefix — `c0_hw_ciii_owner_route_on_card1_drm`,
+    `#[ignore]`d, `_drm` suffix — so no filter the implementer may run selects
+    it (round-2 B-1), and **codex does not run it**: it needs DRM master from
+    tty2.
 
 ## Limits stated
 
@@ -235,8 +259,10 @@ cargo test -p yserver --lib c0_2ci
 cargo test -p yserver --lib
 ```
 
-`--include-ignored` here never selects Task 7's `_drm` test: that one needs DRM
-master from tty2 and is the coordinator's (decision 10).
+None of these filters selects Task 7's hardware test: it is named outside the
+`c0_conv_ciii_` prefix, as `c0_hw_ciii_owner_route_on_card1_drm` (round-2 B-1),
+precisely so that no filter the implementer is allowed to run can reach it. It
+takes DRM master from tty2 and is the coordinator's (decision 10).
 
 **Portability (spec §8.4, round-1 M-3).** The **last task** and the coordinator
 at acceptance additionally run, for `x86_64-unknown-linux-gnu`,
@@ -270,12 +296,13 @@ user's go-ahead.
 | Every affected output is repainted in full before it is scanned out again; **per output** (§6.1, DMG-5) | `c0_conv_ciii_unflip_return_repaints_each_output_in_full_vulkan` (at least two outputs, distinct damage before the direct entry) | T19: invalidate only the reference output; T20: apply the pre-entry damage to the returning composed buffer |
 | The retired unflip is recognised from what its dispatch recorded, not from scene state (decision 6) | `c0_conv_ciii_unflip_retirement_returns_to_composed_vulkan`, driven with an ordinary composed commit retiring first | T21: run the return effects for any retiring composed commit while an unflip is requested |
 | The unflip transaction carries no cursor and no gamma property, so both survive it unchanged (§6.1, C.0 §12, decision 7) | `c0_conv_ciii_unflip_carries_no_cursor_or_gamma_vulkan` | T22: add a cursor-plane property to the transaction; T23: add a gamma property |
-| On an `Owner` device no primary or unflip legacy write is issued, at any enumerated site (§6.3) | the enumeration of Task 5, each site with its own case in `c0_conv_ciii_owner_device_issues_no_legacy_primary_write_vulkan`, **observed at the site, not at the gate** | T24-T26: force the legacy branch at each enumerated site in turn |
+| On an `Owner` device no primary or unflip legacy write is issued, at any enumerated site (§6.3) | the enumeration of Task 5, each site with its own case in `c0_conv_ciii_owner_device_issues_no_legacy_primary_write_vulkan`, observed by the **sink-entry recorder**, never by the gate's refusal (round-2 M-1) | T24-T26: force the legacy branch at each enumerated site in turn |
+| The sink-entry recorder itself observes entry, not authorization (round-2 M-1) | `c0_conv_ciii_sink_recorder_counts_entry_before_the_permit` | T34: move the recorder after the permit check |
 | On a `Legacy` device behaviour is identical to today (§6.3) | `c0_conv_ciii_legacy_device_unchanged_vulkan` plus the full software gate | T27: read another device's transport state at one enumerated site |
 | An event, wake, refusal or bound violation on one device changes nothing on another (§6.2) | `c0_conv_ciii_devices_are_independent` (one case per kind: owner event batch, admission wake, refused offer, bound violation) | T28: route the batch to every conductor; T29: close every device's gate on a bound violation |
 | A device's layout generation, composed intents, maintenance and receipts belong to that device alone (§6.2) | `c0_conv_ciii_conductor_state_is_per_device` | T30: bump every conductor's layout generation on one device's change |
 | A grouped direct unit never crosses devices (§6.2) | `c0_conv_ciii_direct_group_never_crosses_devices_vulkan` | T31: drop the single-device precondition from `direct_scanout_topology_eligible` |
-| On real hardware in `Owner`: a composed frame, a direct frame, the unflip back, and a commit retaining an allocation of the old state for the same member (§6.4) | `c0_conv_ciii_owner_route_on_card1_drm` | — (the run itself is the evidence; its two mutations are below) |
+| On real hardware in `Owner`: a composed frame, a direct frame, the unflip back, and a commit retaining an allocation of the old state for the same member (§6.4) | `c0_hw_ciii_owner_route_on_card1_drm` | — (the run itself is the evidence; its two mutations are below) |
 | A displaced buffer's `KmsRelease` is discharged by the real completion — P3-2 (§6.4, debt spec §9.3/§9.5) | the same test, steps 1-3 | T32: drop the displaced buffer's registration |
 | A retained allocation registers no `KmsRelease` and is not released — P3-3 (§6.4) | the same test, step 4 | T33: register the retained allocation |
 
@@ -428,21 +455,36 @@ promotion that shares it (`backend.rs:2695`, reached from
 in scope here: it belongs to the copied-route plan, and until then no device
 with a copied output can enter `Owner` (round-1 M-1).
 
+**The observation (round-2 M-1).** `allows_legacy` is state-only and returns
+`false` under `Owner` (`resources/transport.rs:412`-`414`), and each sink
+returns before building its atomic request (`modeset.rs:1718`-`1733`): a forced
+legacy branch therefore changes no plane, and its only visible effect would be
+the gate's refusal — which §6.3 forbids as the observation. So this task first
+adds a **sink-entry recorder**: in each real legacy sink, as its **first**
+statement, **before** any permit check, a `#[cfg(test)]` record of the entry
+with its `WriterClass` and device. It must not change control flow, must not
+depend on the permit's answer, and is scaffolding — add it to the C.0
+structural-debt inventory item (f), to be deleted with the legacy branches.
+"No legacy write is issued" is then **"no sink was entered"**, which is
+independent of the gate.
+
 **Invariants (spec §6.3, decision 8):** each site reads the transport state of
 **its own** device before writing; on an `Owner` device no primary or unflip
-legacy write is issued from any of them; on a `Legacy` device the behaviour is
-identical to today. Each site's mutation forces its legacy branch, and the test
-that fails must observe **the write that happened** — the commit that did not
-reach the owner, the plane that changed outside a transaction — and **not** the
-transport gate's refusal.
+legacy write is issued from any of them — no sink is entered — and on a
+`Legacy` device the behaviour is identical to today, sinks included. Each
+site's mutation forces its legacy branch, and the test that fails does so on
+the recorder's count, never on a refusal error or on missing owner progress.
 
 **Named tests:**
 - `c0_conv_ciii_owner_device_issues_no_legacy_primary_write_vulkan` — one case
-  per enumerated site.
+  per enumerated site, each asserting the recorder counted nothing.
+- `c0_conv_ciii_sink_recorder_counts_entry_before_the_permit` — a `Legacy`
+  device's sink and an `Owner` device's refused sink both record their entry,
+  so the recorder is proven to observe entry and not authorization.
 - `c0_conv_ciii_legacy_device_unchanged_vulkan`.
 
-- [ ] Steps: enumerate and report the sites; tests; red; implement; checks;
-  stop dirty and report.
+- [ ] Steps: enumerate and report the sites; the recorder; tests; red;
+  implement; checks; stop dirty and report.
 
 ---
 
@@ -483,9 +525,10 @@ state is a defect, fixed here.
 master on card1 and must run from tty2. Codex's gate for this task is the
 software one; the coordinator runs the test and its two mutations.
 
-**Interfaces:** one `#[ignore]`d test, `c0_conv_ciii_owner_route_on_card1_drm`,
-selected by `cargo test -p yserver --lib c0_conv_ciii_owner_route_on_card1_drm
--- --ignored --test-threads=1`. It establishes `Owner` on card1 with the
+**Interfaces:** one `#[ignore]`d test, `c0_hw_ciii_owner_route_on_card1_drm` —
+named outside the `c0_conv_ciii_` prefix so no filter the implementer may run
+selects it (round-2 B-1) — chosen by `cargo test -p yserver --lib
+c0_hw_ciii_owner_route_on_card1_drm -- --ignored --test-threads=1`. It establishes `Owner` on card1 with the
 writer-coverage evidence of the debt spec §4.4 and drives, with the real
 conductor, helper and producers:
 
@@ -514,7 +557,7 @@ this test drives: `admission.rs:1280` and `:1338` (primary dispatch) and
 `admission.rs:1533` (direct dispatch). The condition of spec §3.2 holds.
 
 **Named tests:**
-- `c0_conv_ciii_owner_route_on_card1_drm`.
+- `c0_hw_ciii_owner_route_on_card1_drm`.
 
 - [ ] Steps: write the test; software checks; the three `cargo check
   --workspace --target` gates; stop dirty and report. Do **not** run the
@@ -533,7 +576,7 @@ for it.
 After Task 7, with the user's go-ahead and the GPU free: the full hardware gate
 (`render_acceptance -- --ignored`, `c0_2ci -- --ignored`, the library's other
 ignored tests — 306/306 at `5a34c6ec`, plus this plan's new `_vulkan` tests),
-then, from tty2, `c0_conv_ciii_owner_route_on_card1_drm` and its two mutations
+then, from tty2, `c0_hw_ciii_owner_route_on_card1_drm` and its two mutations
 T32 and T33 under the same filter, then the acceptance finding and
 `docs/status.md`. The acceptance records that stage 2c-iii still owes the
 copied-route plan.
