@@ -1439,7 +1439,11 @@ impl KmsBackend {
 
         let prepared = match self.managed_prepare_direct_dispatch() {
             Ok(Some(prepared)) => prepared,
-            Ok(None) | Err(_) => {
+            Ok(None) => {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::PreparationRefused;
+            }
+            Err(_error) => {
                 self.admission_abort(device, token);
                 return AdmissionOutcome::PreparationRefused;
             }
@@ -1450,12 +1454,22 @@ impl KmsBackend {
         } = prepared;
         let mut resources = Some(prepared_resources);
         let mut retirement = retirement;
-        let desc = self
-            .admission_conductors
-            .get_mut(&device)
-            .expect("active admission conductor")
-            .source
-            .describe(&decision);
+        let desc = match crate::kms::render::direct_owner::description(self, device, &decision) {
+            Ok(desc) => desc,
+            Err(error) => {
+                log::warn!("direct owner description refused: {error}");
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: retirement.take(),
+                    },
+                    DispatchFailureResources::Refused {
+                        new: resources.take().into_iter().collect(),
+                    },
+                );
+            }
+        };
 
         let direct_crtcs = match decision_primary(&decision) {
             Some(Admitted::Direct { successor }) => Some(successor.crtcs.clone()),

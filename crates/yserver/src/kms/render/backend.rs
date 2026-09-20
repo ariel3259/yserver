@@ -3235,7 +3235,16 @@ impl KmsBackend {
             // Like Xorg's present_flip_try_ready and wlroots' frame_pending
             // gate, submit at most one successor only after the kernel has
             // retired the preceding transaction.
-            self.submit_queued_direct_successor();
+            let owner_device = self
+                .platform
+                .outputs
+                .get(output_idx)
+                .map(|output| output.key.device_key);
+            if let Some(device) = owner_device.filter(|device| self.admission_is_active(*device)) {
+                crate::kms::render::direct_owner::retirement_wake(self, device);
+            } else {
+                self.submit_queued_direct_successor();
+            }
         }
         true
     }
@@ -3367,6 +3376,32 @@ impl KmsBackend {
             eligibility.layout_generation = layout_generation;
         }
         eligibility
+    }
+
+    /// Return the producer frame named by an owner admission decision.
+    /// Keeping this lookup behind the backend preserves the direct frame's
+    /// ownership while letting the owner-route module build its description.
+    pub(crate) fn direct_successor_source_for_owner(
+        &self,
+        source_generation: u64,
+    ) -> Option<DrawableId> {
+        self.scanout_m2
+            .queued_successor
+            .as_ref()
+            .filter(|frame| frame.admission_source_generation == Some(source_generation))
+            .map(|frame| frame.source_id)
+    }
+
+    /// Resolve the imported framebuffer retained by the producer's M1 probe.
+    pub(crate) fn direct_source_framebuffer_for_owner(
+        &self,
+        source_id: DrawableId,
+    ) -> Option<::drm::control::framebuffer::Handle> {
+        self.scanout_m1
+            .entries
+            .get(&source_id)
+            .and_then(ScanoutM1ProbeEntry::framebuffer)
+            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
     }
 
     fn scanout_m1_topology_signature(&self) -> u64 {
@@ -19922,7 +19957,11 @@ impl KmsBackend {
             .owner_ref(device_key)
             .is_some_and(|owner| owner.slot().occupant().is_none());
         if wake_eligible && self.admission_is_active(device_key) && !recovery_stopped && slot_free {
-            let _ = self.admission_wake(device_key, has_retirement);
+            if has_retirement {
+                crate::kms::render::direct_owner::retirement_wake(self, device_key);
+            } else {
+                let _ = self.admission_wake(device_key, false);
+            }
         }
         consumed
     }
@@ -20359,7 +20398,7 @@ impl KmsBackend {
     pub(crate) fn managed_prepare_direct_dispatch(
         &mut self,
     ) -> Result<Option<PreparedDirectDispatch>, crate::kms::render::resources::ResourceError> {
-        use crate::kms::render::resources::{CommitResources, DirectRole};
+        use crate::kms::render::resources::DirectRole;
 
         if self.scanout_m2.queued_successor_role.is_none() {
             return Ok(None);
@@ -20405,7 +20444,7 @@ impl KmsBackend {
             return Err(error);
         }
 
-        let pending = CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new());
+        let pending = crate::kms::render::direct_owner::resources();
         let resources = match self.commit_consumer.capacity.attach(successor, pending) {
             Ok(resources) => resources,
             Err((error, mut successor, _resources)) => {
@@ -21534,6 +21573,20 @@ impl Backend for KmsBackend {
         if !framebuffer_ready {
             self.request_direct_unflip("eligible_direct_successor_framebuffer_missing");
             return Ok(false);
+        }
+
+        let Some(output) = self.platform.outputs.get(completion_output_idx) else {
+            return Ok(false);
+        };
+        let owner_device = output.key.device_key;
+        if self.admission_is_active(owner_device) {
+            return crate::kms::render::direct_owner::offer(
+                self,
+                owner_device,
+                source_id,
+                candidate,
+                event,
+            );
         }
 
         let source_pin = self.pin_direct_source(source_id);
@@ -49636,9 +49689,9 @@ mod tests {
         };
 
         let mut backend = super::KmsBackend::for_tests();
+        seed_direct_owner_description_properties_for_tests(&mut backend);
         let device_key = backend.platform.primary_device().unwrap().key;
         let mut service = ResourceService::new(device_key, IncarnationId::from_raw(1));
-
         let (id_a, candidate_a, event_a) =
             managed_prepare_ready_candidate(&mut backend, 0x7301, 0x7302, 40, 1);
         assert!(
@@ -49679,6 +49732,29 @@ mod tests {
                 .unwrap()
         );
         backend
+    }
+
+    fn seed_direct_owner_description_properties_for_tests(backend: &mut super::KmsBackend) {
+        let test_crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<Vec<_>>();
+        for output in &mut backend.platform.outputs {
+            output.output.plane = ::drm::control::from_u32(10).expect("fixture plane");
+            output.output.plane_fb_id_prop =
+                ::drm::control::from_u32(19).expect("fixture FB_ID property");
+            output.output.plane_crtc_id_prop =
+                ::drm::control::from_u32(20).expect("fixture CRTC_ID property");
+            output.output.crtc_out_fence_ptr_prop =
+                Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
+        }
+        for crtc in test_crtcs {
+            backend.platform.devices[0]
+                .active_property_cache
+                .insert_for_tests(crtc, 21);
+        }
     }
 
     #[test]
@@ -50633,6 +50709,21 @@ mod tests {
         })
     }
 
+    fn reinstall_owner_executor_for_direct_test(backend: &mut super::KmsBackend) {
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0]
+                .executor
+                .as_mut()
+                .expect("owner executor"),
+        );
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("replacement owner executor"),
+        );
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_legacy_tick_flips_as_before_vulkan() {
@@ -51448,6 +51539,312 @@ mod tests {
         assert!(backend.device_owner_for_tests(0).live_record().is_none());
         assert!(backend.scanout_m2.pending.is_none());
         assert!(backend.scanout_m2.queued_successor.is_none());
+    }
+
+    fn c0_conv_cii_try_candidate(
+        backend: &mut super::KmsBackend,
+        target_xid: u32,
+        source_xid: u32,
+        crtc_id: u32,
+        present_id: u64,
+    ) -> (
+        yserver_core::backend::PresentScanoutCandidate,
+        yserver_core::backend::CompletedPresentEvent,
+    ) {
+        use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+
+        let candidate =
+            c0_direct_eligibility_candidate(backend, crtc_id, target_xid, source_xid, 0);
+        let candidate = yserver_core::backend::PresentScanoutCandidate {
+            present_id,
+            ..candidate
+        };
+        let source_id = backend
+            .store
+            .lookup(source_xid)
+            .expect("direct source drawable");
+        let fb_handle = ::drm::control::from_u32::<::drm::control::framebuffer::Handle>(
+            u32::try_from(1000 + present_id).expect("test framebuffer handle"),
+        )
+        .expect("test framebuffer handle");
+        let gem_handle = ::drm::control::from_u32::<::drm::buffer::Handle>(
+            u32::try_from(2000 + present_id).expect("test GEM handle"),
+        )
+        .expect("test GEM handle");
+        let device = std::rc::Rc::new(crate::drm::Device::for_tests().expect("fake DRM device"));
+        let framebuffer = crate::drm::modeset::DirectScanoutProbeFramebuffer {
+            inner: crate::drm::modeset::ProbeFbOwnership::Legacy {
+                device,
+                fb: fb_handle,
+                gem: gem_handle,
+            },
+        };
+        backend
+            .scanout_m1
+            .entries
+            .insert(source_id, super::ScanoutM1ProbeEntry::accepted(framebuffer));
+        backend.scanout_m2.eligible_root_streak =
+            super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION.saturating_sub(1);
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: u32::try_from(present_id).expect("test Present serial"),
+            host_xid: source_xid,
+            dst_host_xid: target_xid,
+            options: 0,
+            present_id,
+            window_generation: 1,
+            crtc_id,
+            crtc_epoch: candidate.crtc_epoch,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        };
+        (candidate, event)
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_legacy_direct_unchanged_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        backend.admission_conductors.clear();
+        install_admission_legacy_gate(&mut backend, device);
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) = c0_conv_cii_try_candidate(&mut backend, 0xC501, 0xC502, 0xC503, 1);
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("legacy direct submit")
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(1)
+        );
+        assert!(
+            backend.device_owner_for_tests(0).live_record().is_none(),
+            "without a conductor the legacy direct submit must not create an owner record"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_owner_direct_offers_instead_of_flipping_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC511, 0xC512, 0xC513, 11);
+
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("owner direct offer")
+        );
+        assert!(
+            backend.device_owner_for_tests(0).live_record().is_some(),
+            "the owner route must dispatch the offered direct successor through the conductor"
+        );
+        assert_eq!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.direct()),
+            None,
+            "a confirmed offer is no longer queued in the admission decider"
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(11)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_displaced_successor_defers_its_skip_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (first_candidate, first_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC521, 0xC522, 0xC523, 21);
+        assert!(
+            backend
+                .try_present_direct(first_candidate, first_event)
+                .expect("first owner direct offer")
+        );
+        let (second_candidate, second_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC531, 0xC532, 0xC533, 31);
+        assert!(
+            backend
+                .try_present_direct(second_candidate, second_event)
+                .expect("queued owner direct offer")
+        );
+        let (third_candidate, third_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC541, 0xC542, 0xC543, 41);
+        assert!(
+            backend
+                .try_present_direct(third_candidate, third_event)
+                .expect("latest owner direct offer")
+        );
+
+        assert!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .and_then(|conductor| conductor.admission.direct())
+                .is_some(),
+            "the owner decider retains the latest direct successor"
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .deferred_successor_skips
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![31]
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .idled
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![31]
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(41)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_retirement_promotion_order_vulkan() {
+        use crate::kms::render::admission::AdmissionTraceStep;
+
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+        let (first_candidate, first_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC551, 0xC552, 0xC553, 51);
+        assert!(
+            backend
+                .try_present_direct(first_candidate, first_event)
+                .expect("first owner direct offer")
+        );
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first owner commit")
+            .commit_id();
+        let (second_candidate, second_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xC561, 0xC562, 0xC563, 61);
+        assert!(
+            backend
+                .try_present_direct(second_candidate, second_event)
+                .expect("queued owner direct offer")
+        );
+
+        backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: first_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: first_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+        let completion = backend.complete_owner_for_tests(0);
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        backend.route_owner_event_batch(device, completion, std::time::Instant::now());
+
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("retirement wake must promote the queued successor")
+            .commit_id();
+        assert_ne!(second_commit, first_commit);
+        assert_eq!(
+            backend.admission_trace_for_tests(device),
+            vec![
+                AdmissionTraceStep::Decided,
+                AdmissionTraceStep::Dispatched(first_commit),
+                AdmissionTraceStep::Consumed(first_commit),
+                AdmissionTraceStep::Enqueued {
+                    completions: vec![51],
+                    skips: Vec::new(),
+                },
+                AdmissionTraceStep::Decided,
+                AdmissionTraceStep::Dispatched(second_commit),
+            ]
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(61)
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .completed
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![51]
+        );
     }
 
     #[test]
@@ -53464,6 +53861,7 @@ mod tests {
 
     fn admission_backend_with_stub_executor() -> super::KmsBackend {
         let mut backend = super::KmsBackend::for_tests();
+        seed_direct_owner_description_properties_for_tests(&mut backend);
         let executor = crate::kms::executor::test_support::spawn_stub_helper(
             crate::kms::executor::test_support::StubBehaviour::NeverReply,
         )
@@ -54920,7 +55318,7 @@ mod tests {
             .expect("spawn stub executor"),
         );
         install_admission_owner_gate(&mut backend, device);
-        let (source, _, _, describe_page_flip, _, _, _, _) =
+        let (source, _, _, _describe_page_flip, _, _, _, _) =
             AdmissionSourceFixture::new_with_controls();
         backend.install_admission_conductor_for_tests(device, source);
         let idled_before = backend.scanout_m2.idled.len();
@@ -54930,7 +55328,7 @@ mod tests {
                 .admission_offer_direct(device, source_id, candidate, event)
                 .expect("direct offer")
         );
-        describe_page_flip.set(true);
+        backend.platform.outputs[0].output.crtc_out_fence_ptr_prop = None;
 
         assert!(matches!(
             backend.admission_wake(device, false),
@@ -55317,6 +55715,7 @@ mod tests {
     #[test]
     fn c0_adm_conductor_retirement_wake_refusal_publishes_the_skip() {
         let mut backend = super::KmsBackend::for_tests();
+        seed_direct_owner_description_properties_for_tests(&mut backend);
         admission_install_executor(
             &mut backend,
             crate::kms::owner::test_fixtures::reaped_executor_for_tests(),
@@ -57329,7 +57728,7 @@ mod tests {
                 .expect("direct executor"),
             );
             install_admission_owner_gate(&mut backend, device);
-            let (source, _, _, describe_page_flip, _, _, _, _) =
+            let (source, _, _, _describe_page_flip, _, _, _, _) =
                 AdmissionSourceFixture::new_with_controls();
             backend.install_admission_conductor_for_tests(device, source);
             let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 911);
@@ -57338,7 +57737,7 @@ mod tests {
                     .admission_offer_direct(device, source_id, candidate, event)
                     .expect("direct offer")
             );
-            describe_page_flip.set(true);
+            backend.platform.outputs[0].output.crtc_out_fence_ptr_prop = None;
 
             assert!(matches!(
                 backend.admission_wake(device, false),
