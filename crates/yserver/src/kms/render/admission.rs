@@ -57,7 +57,7 @@ enum DispatchFailureRoute {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum DispatchFailureKind {
     Ledger,
     Cleanup,
@@ -94,24 +94,25 @@ impl DispatchFailureResources {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DispatchFailureOutcome {
     BeginRefused,
     TransportClosed,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DispatchFailureAction {
     outcome: DispatchFailureOutcome,
     close_gate: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ResourceRestore {
     Succeeded,
     Failed,
     Missing,
     Extra,
+    NotAttempted,
 }
 
 fn dispatch_failure_policy(
@@ -119,60 +120,38 @@ fn dispatch_failure_policy(
     kind: DispatchFailureKind,
     restore: ResourceRestore,
 ) -> DispatchFailureAction {
-    use DispatchFailureKind::{Cleanup, Ledger, Refused};
-    use DispatchFailureOutcome::{BeginRefused, TransportClosed};
-    use DispatchFailureRouteKind::{Direct, Primary};
-    use ResourceRestore::{Extra, Failed, Missing, Succeeded};
-
     match (route, kind, restore) {
-        (Primary, Ledger, Succeeded) => DispatchFailureAction {
-            outcome: BeginRefused,
+        (
+            DispatchFailureRouteKind::Primary,
+            DispatchFailureKind::Ledger,
+            ResourceRestore::Succeeded,
+        )
+        | (
+            DispatchFailureRouteKind::Direct,
+            DispatchFailureKind::Ledger,
+            ResourceRestore::Succeeded,
+        )
+        | (
+            DispatchFailureRouteKind::Primary,
+            DispatchFailureKind::Refused,
+            ResourceRestore::NotAttempted,
+        )
+        | (
+            DispatchFailureRouteKind::Direct,
+            DispatchFailureKind::Refused,
+            ResourceRestore::Succeeded | ResourceRestore::Failed,
+        ) => DispatchFailureAction {
+            outcome: DispatchFailureOutcome::BeginRefused,
             close_gate: false,
         },
-        (Primary, Ledger, Failed | Missing | Extra) => DispatchFailureAction {
-            outcome: TransportClosed,
+        _ => DispatchFailureAction {
+            outcome: DispatchFailureOutcome::TransportClosed,
             close_gate: true,
-        },
-        (Primary, Cleanup, Succeeded) => DispatchFailureAction {
-            outcome: BeginRefused,
-            close_gate: true,
-        },
-        (Primary, Cleanup, Failed | Missing | Extra) => DispatchFailureAction {
-            outcome: TransportClosed,
-            close_gate: false,
-        },
-        (Primary, Refused, _) => DispatchFailureAction {
-            outcome: BeginRefused,
-            close_gate: false,
-        },
-        (Direct, Ledger, Missing) => DispatchFailureAction {
-            outcome: TransportClosed,
-            close_gate: false,
-        },
-        (Direct, Ledger, Failed | Extra) => DispatchFailureAction {
-            outcome: TransportClosed,
-            close_gate: true,
-        },
-        (Direct, Ledger, Succeeded) => DispatchFailureAction {
-            outcome: BeginRefused,
-            close_gate: false,
-        },
-        (Direct, Cleanup, _) => DispatchFailureAction {
-            outcome: TransportClosed,
-            close_gate: true,
-        },
-        (Direct, Refused, Missing | Extra) => DispatchFailureAction {
-            outcome: TransportClosed,
-            close_gate: false,
-        },
-        (Direct, Refused, Succeeded | Failed) => DispatchFailureAction {
-            outcome: BeginRefused,
-            close_gate: false,
         },
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum DispatchFailureRouteKind {
     Primary,
     Direct,
@@ -1144,7 +1123,7 @@ impl KmsBackend {
         let (route_kind, restore) = match route {
             DispatchFailureRoute::Primary { backend_composed } => {
                 let restore = if matches!(kind, DispatchFailureKind::Refused) {
-                    ResourceRestore::Missing
+                    ResourceRestore::NotAttempted
                 } else if self.restore_primary_composed_resources(device, backend_composed, new) {
                     ResourceRestore::Succeeded
                 } else {
@@ -1158,6 +1137,11 @@ impl KmsBackend {
             ),
         };
         let action = dispatch_failure_policy(route_kind, kind, restore);
+        if action.outcome == DispatchFailureOutcome::TransportClosed {
+            log::error!(
+                "admission dispatch failure is fail-closed: route={route_kind:?}, kind={kind:?}, resource_restore={restore:?}"
+            );
+        }
         if action.close_gate
             && let Some(gate) = self.platform.transport_gate_mut(&device)
         {
@@ -1990,4 +1974,30 @@ fn has_current_direct(backend: &KmsBackend) -> bool {
                 role.role() == crate::kms::render::resources::DirectRole::Current
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c0_conv_cir_dispatch_failure_fallback_is_fail_closed() {
+        // This proves the mapping only — not reachability or end-to-end restoration.
+        for (route, kind, restore) in [
+            (
+                DispatchFailureRouteKind::Primary,
+                DispatchFailureKind::Cleanup,
+                ResourceRestore::Succeeded,
+            ),
+            (
+                DispatchFailureRouteKind::Direct,
+                DispatchFailureKind::Cleanup,
+                ResourceRestore::Succeeded,
+            ),
+        ] {
+            let action = dispatch_failure_policy(route, kind, restore);
+            assert_eq!(action.outcome, DispatchFailureOutcome::TransportClosed);
+            assert!(action.close_gate);
+        }
+    }
 }

@@ -56191,8 +56191,15 @@ mod tests {
         }
 
         // direct / Refused / resource present: the owner refuses a Present
-        // description before calling the ledger closure. The prepared
-        // successor is returned through the managed undo seam.
+        // description before calling the ledger closure. Preparation has
+        // moved Successor -> Submitted and attach has made that exact token
+        // Occupied; because Refused returns before the closure, no production
+        // operation can mutate capacity before the managed undo seam, so a
+        // finish-role mismatch is unreachable. The row normally has an open
+        // ledger and reserve(Successor) succeeds, but the ledger may already
+        // be closed by the consumer's real error path; then reserve returns
+        // Busy. Ci ignores either undo result, so both cases keep the whole
+        // old policy: BeginRefused and an open transport.
         {
             let mut backend = backend_with_current_and_successor_for_admission_seam();
             let device = backend.platform.primary_device().unwrap().key;
@@ -56237,14 +56244,88 @@ mod tests {
             );
         }
 
-        // F8: primary Ledger/restore-fails, both primary Cleanup rows, direct
-        // Ledger with no returned resource, undo failure, or extra resources,
-        // both direct Cleanup rows, and direct Refused with a missing resource
-        // cannot be reached through the production dispatch closures. The
-        // primary restore is synchronous and receives only the state it just
-        // moved; the owner slot release is exclusively owned by begin; and
-        // direct preparation always supplies exactly one resource. No
-        // test-only hook is introduced to manufacture those states.
+        // direct / Refused / resource present / undo fails: this is reachable,
+        // not a collapsed row. A real consumer error closes the capacity
+        // ledger before the direct dispatch. With no Current resource,
+        // preparation still moves the queued Successor to Submitted and
+        // attach occupies it; the owner's Refused result still precedes the
+        // ledger closure, so the managed undo finishes Submitted and then
+        // reserve(Successor) returns Busy. Ci ignores that failure and keeps
+        // BeginRefused with the transport open.
+        {
+            use std::{cell::Cell, rc::Rc};
+
+            use crate::kms::render::resources::{CommitResources, DirectRole, RoleReservation};
+
+            let mut backend = super::KmsBackend::for_tests();
+            let device = backend.platform.primary_device().unwrap().key;
+            install_admission_resource_service(&mut backend);
+            let invalid_role = RoleReservation::new_for_test(
+                DirectRole::Submitted,
+                u64::MAX,
+                Rc::new(Cell::new(false)),
+            );
+            backend.commit_consumer.releasing_resources.push(
+                CommitResources::new(Vec::new(), None, None, None, Vec::new(), Vec::new())
+                    .with_direct_role(invalid_role),
+            );
+            admission_install_executor(
+                &mut backend,
+                crate::kms::executor::test_support::spawn_stub_helper(
+                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                )
+                .expect("direct executor"),
+            );
+            install_admission_owner_gate(&mut backend, device);
+            let (source, _, _, describe_page_flip, _, _, _, _) =
+                AdmissionSourceFixture::new_with_controls();
+            backend.install_admission_conductor_for_tests(device, source);
+            let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 912);
+            assert!(
+                backend
+                    .admission_offer_direct(device, source_id, candidate, event)
+                    .expect("direct offer")
+            );
+            assert!(
+                backend
+                    .commit_consumer
+                    .on_available(
+                        &[],
+                        backend.resource_service.as_mut().expect("resource service"),
+                    )
+                    .is_err()
+            );
+            assert!(backend.commit_consumer.capacity.is_admission_closed());
+            describe_page_flip.set(true);
+
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::BeginRefused
+            ));
+            assert_eq!(
+                backend.platform.transport_gate(&device).unwrap().state(),
+                TransportState::Owner
+            );
+            assert!(backend.commit_consumer.capacity.is_admission_closed());
+            assert!(backend.scanout_m2.queued_successor_role.is_none());
+        }
+
+        // F8/collapse measurement for the remaining cells: Cleanup requires
+        // the owner to fail releasing the slot reserved by that same begin;
+        // the owner owns that slot exclusively during the synchronous
+        // closure, so production cannot produce it. Primary restoration gets
+        // only the state just moved and its production inverse is exact;
+        // direct preparation supplies exactly one resource. Missing/extra
+        // resources are therefore also not production outputs. Direct Ledger
+        // undo can observe an already-closed ledger or exhausted serial, but
+        // Ci already mapped that failure to TransportClosed with the gate
+        // closed, which is the shared fail-closed result. Frozen allocations
+        // affect resource registration/releasability, not the direct undo's
+        // capacity operations. The behavior-changing cells are therefore
+        // only the production-unreachable Cleanup, direct-Ledger
+        // missing-resource, and direct-Refused missing/extra-resource cases;
+        // already-fail-closed restore failures share Ci's old result, while
+        // direct Refused/failed-undo is explicitly kept open.
     }
 
     #[test]
