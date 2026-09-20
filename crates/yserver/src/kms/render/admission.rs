@@ -24,7 +24,9 @@ use crate::{
             record::{FailureCause, RefusalCause, TerminalState},
         },
         render::{
-            backend::{KmsBackend, PreparedDirectDispatch, effective_refresh_matches},
+            backend::{
+                DirectEligibility, KmsBackend, PreparedDirectDispatch, effective_refresh_matches,
+            },
             platform::CrtcKey,
             resources::{
                 CommitResources, GroupMember, ResourceError, register_commit_dependencies,
@@ -255,9 +257,9 @@ pub(crate) trait AdmissionSource {
     /// Return resources to the composed intent when owner admission cannot
     /// construct a ledger. The source owns the returned intent-side storage.
     fn restore_composed_resources(&mut self, resources: Vec<CommitResources>);
-    /// Whether the queued direct successor passes current direct eligibility.
-    /// 2c-iii replaces this with the real predicate.
-    fn direct_eligible(&self, source_generation: u64) -> bool;
+    /// Whether the queued direct successor passes the production eligibility
+    /// result supplied by the backend.
+    fn direct_eligible(&self, source_generation: u64, eligibility: DirectEligibility) -> bool;
 }
 
 #[allow(dead_code)]
@@ -852,6 +854,13 @@ impl KmsBackend {
         } else {
             BTreeSet::new()
         };
+        let direct_eligibility = self
+            .admission_conductors
+            .get(&device)
+            .and_then(|conductor| conductor.admission.direct())
+            .map(|direct| {
+                self.direct_successor_eligibility(device, direct.successor.source_generation)
+            });
         let mut invalidate = None;
         let snapshot = {
             let conductor = self
@@ -897,7 +906,9 @@ impl KmsBackend {
                 let key = IntentKey::Direct {
                     source_generation: generation,
                 };
-                let eligible = conductor.source.direct_eligible(generation);
+                let eligibility = direct_eligibility
+                    .unwrap_or_else(|| DirectEligibility::refused(conductor.layout_generation));
+                let eligible = conductor.source.direct_eligible(generation, eligibility);
                 let readiness = if !eligible {
                     invalidate = Some(generation);
                     Readiness::Waiting(WaitReason::NotDirectEligible)

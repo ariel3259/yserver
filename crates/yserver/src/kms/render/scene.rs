@@ -978,6 +978,12 @@ pub(crate) struct SceneCompositor {
     /// states without a live Vulkan device.
     #[cfg(test)]
     test_flip_in_flight_override: Option<bool>,
+    /// Test-only override for the cursor-plane input used by direct-scanout
+    /// eligibility. Live scene fixtures start before a cursor transition has
+    /// retired, so this makes the baseline candidate pass the unrelated
+    /// cursor gate without bypassing the backend predicate under test.
+    #[cfg(test)]
+    test_cursor_mode_override: Option<CursorPlaneMode>,
 }
 
 pub(crate) struct ComposedOffer {
@@ -1417,6 +1423,8 @@ impl SceneCompositor {
             scene_structure_dirty: true,
             #[cfg(test)]
             test_flip_in_flight_override: None,
+            #[cfg(test)]
+            test_cursor_mode_override: None,
         })
     }
 
@@ -1537,6 +1545,8 @@ impl SceneCompositor {
             scene_structure_dirty: false,
             #[cfg(test)]
             test_flip_in_flight_override: None,
+            #[cfg(test)]
+            test_cursor_mode_override: None,
         }
     }
 
@@ -2871,6 +2881,13 @@ impl SceneCompositor {
         self.test_flip_in_flight_override = Some(value);
     }
 
+    /// Test-only: make the cursor-plane mode an explicit eligibility input
+    /// while retaining the production `cursor_mode` query at the predicate.
+    #[cfg(test)]
+    pub(crate) fn test_set_cursor_mode(&mut self, mode: CursorPlaneMode) {
+        self.test_cursor_mode_override = Some(mode);
+    }
+
     /// Stage 5 Phase D — cursor-plane mode aggregate query for the
     /// pointer fast path. Returns `Hw` ONLY when every active
     /// output has retired its Sw→Hw transition AND no PendingAck
@@ -2879,6 +2896,10 @@ impl SceneCompositor {
     /// mix) returns `Mixed`; the fast path falls back to scene
     /// wake until the plane is fully consistent.
     pub(crate) fn cursor_mode(&self) -> CursorPlaneMode {
+        #[cfg(test)]
+        if let Some(mode) = self.test_cursor_mode_override {
+            return mode;
+        }
         let Some(inner) = self.inner.as_ref() else {
             return CursorPlaneMode::Sw;
         };

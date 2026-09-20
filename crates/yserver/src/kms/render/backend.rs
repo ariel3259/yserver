@@ -602,6 +602,66 @@ struct DirectPresentFrame {
     admission_source_generation: Option<u64>,
 }
 
+/// The result of the one production direct-scanout eligibility evaluation.
+///
+/// The preparation values are carried along because `try_present_direct`
+/// needs them after the decision to retain the existing prepare/submit split;
+/// admission consumes only `eligible` and `layout_generation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectEligibility {
+    pub(crate) eligible: bool,
+    pub(crate) layout_generation: u64,
+    source_id: Option<DrawableId>,
+    paint_target: Option<PaintTarget>,
+    authoritative_root: bool,
+}
+
+impl DirectEligibility {
+    pub(crate) fn refused(layout_generation: u64) -> Self {
+        Self {
+            eligible: false,
+            layout_generation,
+            source_id: None,
+            paint_target: None,
+            authoritative_root: false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn direct_present_eligibility_decision(
+    direct_crtc_eligible: bool,
+    scanout_allowed: bool,
+    kms_outputs_active: bool,
+    cursor_hw: bool,
+    root_overlay_empty: bool,
+    authoritative_root: bool,
+    unbordered: bool,
+    x_off: i16,
+    y_off: i16,
+    valid_region_xid: u32,
+    layout_generation: u64,
+) -> DirectEligibility {
+    DirectEligibility {
+        eligible: direct_crtc_eligible
+            && scanout_direct_eligible(
+                scanout_allowed,
+                kms_outputs_active,
+                cursor_hw,
+                root_overlay_empty,
+                authoritative_root,
+                unbordered,
+                x_off,
+                y_off,
+                valid_region_xid,
+            ),
+        layout_generation,
+        source_id: None,
+        paint_target: None,
+        authoritative_root,
+    }
+}
+
 /// Require a short stable run before entering direct ownership. Compositors
 /// such as E27 alternate full-root Presents with authoritative region-limited
 /// Presents; entering on every eligible member of that stream otherwise
@@ -3219,6 +3279,93 @@ impl KmsBackend {
             .primary_device()
             .is_some_and(|primary| crtc_key.device_key == primary.key)
             && self.direct_scanout_topology_eligible()
+    }
+
+    /// Gather and evaluate every direct-scanout gate at one instant.
+    ///
+    /// This is the production predicate shared by the legacy producer and
+    /// the admission source. `layout_generation` is the conductor generation
+    /// belonging to the candidate's CRTC domain; an unresolved CRTC has no
+    /// domain and therefore reports generation zero while remaining refused.
+    pub(crate) fn direct_present_eligibility(
+        &self,
+        candidate: PresentScanoutCandidate,
+    ) -> DirectEligibility {
+        let source_id = self.store.lookup(candidate.src_host_xid);
+        let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
+        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_id = paint_target.map(|target| target.backing_id());
+        let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
+        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
+        let root_coverage = leaf_id
+            .and_then(|id| self.window_absolute_rect(id))
+            .is_some_and(|rect| {
+                rect.offset.x == 0
+                    && rect.offset.y == 0
+                    && (rect.extent.width, rect.extent.height) == root
+                    && (
+                        u32::from(candidate.src_width),
+                        u32::from(candidate.src_height),
+                    ) == root
+            });
+        let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
+        // #133 step 3 (3.5): reject any candidate whose resolved paint
+        // chain carries a border clip. A bordered storage starts at its
+        // outer origin, not at content (0, 0).
+        let unbordered = paint_target.is_none_or(|target| !target.has_border_clip());
+        let layout_generation = self
+            .present_crtc_key(candidate.crtc_id)
+            .and_then(|key| self.admission_conductors.get(&key.device_key))
+            .map_or(0, |conductor| conductor.layout_generation);
+        let mut eligibility = direct_present_eligibility_decision(
+            self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch),
+            self.scanout_allowed(),
+            self.kms_outputs_active,
+            matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Hw
+            ),
+            self.scene.root_overlay.is_empty(),
+            authoritative_root,
+            unbordered,
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+            layout_generation,
+        );
+        eligibility.source_id = source_id;
+        eligibility.paint_target = paint_target;
+        eligibility
+    }
+
+    /// Evaluate the frame named by an admission direct successor. A missing
+    /// or mismatched frame is a closed refusal; it cannot authorize a wake.
+    pub(crate) fn direct_successor_eligibility(
+        &self,
+        device: DrmDeviceKey,
+        source_generation: u64,
+    ) -> DirectEligibility {
+        let layout_generation = self
+            .admission_conductors
+            .get(&device)
+            .map_or(0, |conductor| conductor.layout_generation);
+        let Some(frame) = self
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .filter(|frame| frame.admission_source_generation == Some(source_generation))
+        else {
+            return DirectEligibility::refused(layout_generation);
+        };
+        let mut eligibility = self.direct_present_eligibility(frame.candidate);
+        if self
+            .present_crtc_key(frame.candidate.crtc_id)
+            .is_none_or(|key| key.device_key != device)
+        {
+            eligibility.eligible = false;
+            eligibility.layout_generation = layout_generation;
+        }
+        eligibility
     }
 
     fn scanout_m1_topology_signature(&self) -> u64 {
@@ -21310,46 +21457,11 @@ impl Backend for KmsBackend {
         if self.scanout_m2.reentry_blocked_until_composed {
             return Ok(false);
         }
-        let source_id = self.store.lookup(candidate.src_host_xid);
-        let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
-        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
-        let paint_id = paint_target.map(|target| target.backing_id());
-        let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
-        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
-        let root_coverage = leaf_id
-            .and_then(|id| self.window_absolute_rect(id))
-            .is_some_and(|rect| {
-                rect.offset.x == 0
-                    && rect.offset.y == 0
-                    && (rect.extent.width, rect.extent.height) == root
-                    && (
-                        u32::from(candidate.src_width),
-                        u32::from(candidate.src_height),
-                    ) == root
-            });
-        let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
-        // #133 step 3 (3.5): reject any candidate whose resolved paint
-        // chain carries a border clip. `has_border_clip()` is true iff
-        // some window between the presented drawable and its backing has
-        // `border_width > 0`, which is exactly the case where content no
-        // longer starts at storage (0, 0). A candidate that does not
-        // resolve at all is rejected further down.
-        let unbordered = paint_target.is_none_or(|t| !t.has_border_clip());
-        let eligible = self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            && scanout_direct_eligible(
-                self.scanout_allowed(),
-                self.kms_outputs_active,
-                matches!(
-                    self.scene.cursor_mode(),
-                    crate::kms::render::scene::CursorPlaneMode::Hw
-                ),
-                self.scene.root_overlay.is_empty(),
-                authoritative_root,
-                unbordered,
-                candidate.x_off,
-                candidate.y_off,
-                candidate.valid_region_xid,
-            );
+        let eligibility = self.direct_present_eligibility(candidate);
+        let source_id = eligibility.source_id;
+        let paint_target = eligibility.paint_target;
+        let authoritative_root = eligibility.authoritative_root;
+        let eligible = eligibility.eligible;
         if !eligible {
             // A child/video/game Present updates the COW shadow, but Muffin's
             // currently scanned root-stage buffer remains authoritative until
@@ -50292,7 +50404,11 @@ mod tests {
                 .extend(resources);
         }
 
-        fn direct_eligible(&self, _source_generation: u64) -> bool {
+        fn direct_eligible(
+            &self,
+            _source_generation: u64,
+            _eligibility: crate::kms::render::backend::DirectEligibility,
+        ) -> bool {
             self.direct_eligible.get()
         }
     }
@@ -50468,6 +50584,345 @@ mod tests {
                 .is_some_and(|(_, staged)| staged),
             "the legacy observable is a staged ScanoutDamage frame"
         );
+    }
+
+    fn c0_direct_eligibility_candidate(
+        backend: &mut super::KmsBackend,
+        crtc_id: u32,
+        target_xid: u32,
+        source_xid: u32,
+        border_width: u16,
+    ) -> yserver_core::backend::PresentScanoutCandidate {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use ash::vk;
+
+        let width = backend.platform.fb_w;
+        let height = backend.platform.fb_h;
+        seed_bordered_window(backend, target_xid, None, 0, 0, width, height, border_width);
+        backend
+            .store
+            .allocate(
+                source_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: u32::from(width),
+                        height: u32::from(height),
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("eligibility source");
+
+        bind_test_randr_crtc(backend, 0, crtc_id);
+        let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+        yserver_core::backend::PresentScanoutCandidate {
+            client_id: 1,
+            present_id: u64::from(source_xid),
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: source_xid,
+            dst_window_xid: target_xid,
+            src_host_xid: source_xid,
+            paint_dst_host_xid: target_xid,
+            completion_dst_host_xid: target_xid,
+            src_width: width,
+            src_height: height,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        }
+    }
+
+    fn c0_direct_pure_eligibility(
+        backend: &super::KmsBackend,
+        candidate: &yserver_core::backend::PresentScanoutCandidate,
+    ) -> bool {
+        let leaf_id = backend.store.lookup(candidate.paint_dst_host_xid);
+        let paint_target = backend.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_id = paint_target.map(|target| target.backing_id());
+        let target = backend.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
+        let root = (
+            u32::from(backend.platform.fb_w),
+            u32::from(backend.platform.fb_h),
+        );
+        let root_coverage = leaf_id
+            .and_then(|id| backend.window_absolute_rect(id))
+            .is_some_and(|rect| {
+                rect.offset.x == 0
+                    && rect.offset.y == 0
+                    && (rect.extent.width, rect.extent.height) == root
+                    && (
+                        u32::from(candidate.src_width),
+                        u32::from(candidate.src_height),
+                    ) == root
+            });
+        super::scanout_direct_eligible(
+            backend.scanout_allowed(),
+            backend.kms_outputs_active,
+            matches!(
+                backend.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Hw
+            ),
+            backend.scene.root_overlay.is_empty(),
+            super::scanout_m2_is_authoritative_root(target, root_coverage),
+            paint_target.is_none_or(|target| !target.has_border_clip()),
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+        )
+    }
+
+    #[test]
+    fn c0_conv_cii_eligibility_combination_rule() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+        assert_eq!(
+            backend.admission_note_layout_change(device),
+            crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+        );
+
+        let current_generation = backend.admission_conductors[&device].layout_generation;
+        let gate_cases = [
+            (
+                "all-gates",
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                0,
+                0,
+                0,
+            ),
+            ("vt", true, false, true, true, true, true, true, 0, 0, 0),
+            (
+                "outputs", true, true, false, true, true, true, true, 0, 0, 0,
+            ),
+            ("cursor", true, true, true, false, true, true, true, 0, 0, 0),
+            (
+                "overlay", true, true, true, true, false, true, true, 0, 0, 0,
+            ),
+            ("root", true, true, true, true, true, false, true, 0, 0, 0),
+            ("border", true, true, true, true, true, true, true, 1, 0, 0),
+            // The pure scanout core accepts this row; only the CRTC-domain
+            // predicate refuses it.
+            (
+                "crtc-domain",
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                0,
+                0,
+                0,
+            ),
+        ];
+        for (
+            name,
+            direct_crtc_eligible,
+            scanout_allowed,
+            kms_outputs_active,
+            cursor_hw,
+            root_overlay_empty,
+            authoritative_root,
+            unbordered,
+            x_off,
+            y_off,
+            valid_region_xid,
+        ) in gate_cases
+        {
+            let pure = super::scanout_direct_eligible(
+                scanout_allowed,
+                kms_outputs_active,
+                cursor_hw,
+                root_overlay_empty,
+                authoritative_root,
+                unbordered,
+                x_off,
+                y_off,
+                valid_region_xid,
+            );
+            let result = super::direct_present_eligibility_decision(
+                direct_crtc_eligible,
+                scanout_allowed,
+                kms_outputs_active,
+                cursor_hw,
+                root_overlay_empty,
+                authoritative_root,
+                unbordered,
+                x_off,
+                y_off,
+                valid_region_xid,
+                current_generation,
+            );
+            assert_eq!(result.eligible, direct_crtc_eligible && pure, "{name}");
+            assert_eq!(result.layout_generation, current_generation, "{name}");
+        }
+
+        assert_eq!(
+            super::direct_present_eligibility_decision(
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                0,
+                0,
+                0,
+                current_generation,
+            )
+            .layout_generation,
+            current_generation
+        );
+    }
+
+    #[test]
+    fn c0_conv_cii_eligibility_is_one_predicate() {
+        let mut backend = super::KmsBackend::for_tests();
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let device = backend.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut backend, device);
+        let (source, _, _) = AdmissionSourceFixture::new();
+        backend.install_admission_conductor_for_tests(device, source);
+
+        let unbordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC312, 0xC313, 0);
+        let bordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC314, 0xC315, 1);
+
+        assert!(
+            c0_direct_pure_eligibility(&backend, &unbordered),
+            "the baseline candidate must pass the pure scanout gates"
+        );
+        assert!(
+            backend.direct_present_crtc_eligible(unbordered.crtc_id, unbordered.crtc_epoch),
+            "the baseline candidate must pass the gathered CRTC gate"
+        );
+        assert!(
+            backend.direct_present_eligibility(unbordered).eligible,
+            "the baseline candidate must be eligible through the production predicate"
+        );
+
+        let bordered_result = backend.direct_present_eligibility(bordered);
+        assert!(
+            bordered_result
+                .paint_target
+                .is_some_and(|target| target.has_border_clip()),
+            "the border case must reach the production border input"
+        );
+        assert!(
+            backend.direct_present_crtc_eligible(bordered.crtc_id, bordered.crtc_epoch),
+            "the border case must be ineligible only through its border clip"
+        );
+        assert!(
+            !bordered_result.eligible,
+            "the production predicate must reject the bordered candidate"
+        );
+
+        let stale = yserver_core::backend::PresentScanoutCandidate {
+            crtc_epoch: unbordered.crtc_epoch.saturating_sub(1),
+            ..unbordered
+        };
+        assert!(
+            c0_direct_pure_eligibility(&backend, &stale),
+            "the stale candidate must pass every pure scanout gate"
+        );
+        assert!(
+            !backend.direct_present_crtc_eligible(stale.crtc_id, stale.crtc_epoch),
+            "the stale candidate must fail the gathered CRTC gate"
+        );
+        assert!(
+            !backend.direct_present_eligibility(stale).eligible,
+            "the production predicate must reject the stale CRTC candidate"
+        );
+
+        let unknown = yserver_core::backend::PresentScanoutCandidate {
+            crtc_id: 0xC3FF,
+            ..unbordered
+        };
+        assert!(c0_direct_pure_eligibility(&backend, &unknown));
+        assert!(!backend.direct_present_crtc_eligible(unknown.crtc_id, unknown.crtc_epoch));
+        assert!(!backend.direct_present_eligibility(unknown).eligible);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cii_eligibility_matches_legacy_vulkan() {
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let device = backend.platform.primary_device().expect("device").key;
+        let owner_candidate =
+            c0_direct_eligibility_candidate(&mut backend, 0xC401, 0xC402, 0xC403, 0);
+        let owner_bordered =
+            c0_direct_eligibility_candidate(&mut backend, 0xC401, 0xC404, 0xC405, 1);
+        let owner_stale = yserver_core::backend::PresentScanoutCandidate {
+            crtc_epoch: owner_candidate.crtc_epoch.saturating_sub(1),
+            ..owner_candidate
+        };
+        assert!(c0_direct_pure_eligibility(&backend, &owner_candidate));
+        assert!(c0_direct_pure_eligibility(&backend, &owner_stale));
+        assert!(
+            backend
+                .direct_present_crtc_eligible(owner_candidate.crtc_id, owner_candidate.crtc_epoch)
+        );
+        assert!(
+            backend.direct_present_crtc_eligible(owner_bordered.crtc_id, owner_bordered.crtc_epoch)
+        );
+        let owner_answers = [
+            backend.direct_present_eligibility(owner_candidate).eligible,
+            backend.direct_present_eligibility(owner_bordered).eligible,
+            backend.direct_present_eligibility(owner_stale).eligible,
+        ];
+        assert_eq!(owner_answers, [true, false, false]);
+
+        install_admission_legacy_gate(&mut backend, device);
+        let legacy_candidate = owner_candidate;
+        let legacy_answers = [
+            backend
+                .direct_present_eligibility(legacy_candidate)
+                .eligible,
+            backend.direct_present_eligibility(owner_bordered).eligible,
+            backend
+                .direct_present_eligibility(yserver_core::backend::PresentScanoutCandidate {
+                    crtc_epoch: legacy_candidate.crtc_epoch.saturating_sub(1),
+                    ..legacy_candidate
+                })
+                .eligible,
+        ];
+        assert_eq!(owner_answers, legacy_answers);
+        assert_eq!(legacy_answers, [true, false, false]);
+        assert!(super::scanout_direct_eligible(
+            true, true, true, true, true, true, 0, 0, 0
+        ));
+        assert!(
+            !super::direct_present_eligibility_decision(
+                false, true, true, true, true, true, true, 0, 0, 0, 0
+            )
+            .eligible
+        );
+        assert!(!legacy_answers[2], "the stale CRTC must stay ineligible");
     }
 
     #[test]
@@ -55862,7 +56317,11 @@ mod tests {
             self.restored.borrow_mut().extend(resources);
         }
 
-        fn direct_eligible(&self, _source_generation: u64) -> bool {
+        fn direct_eligible(
+            &self,
+            _source_generation: u64,
+            _eligibility: crate::kms::render::backend::DirectEligibility,
+        ) -> bool {
             true
         }
     }
