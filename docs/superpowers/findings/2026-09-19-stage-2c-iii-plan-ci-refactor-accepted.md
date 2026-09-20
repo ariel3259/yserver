@@ -50,8 +50,16 @@ fmt; clippy default, `tcp-transport`, `xdmcp`; `c0_conv_ci_` 38/38 with
 `c0_conv_cir_` 7/7 in both; `c0_adm` 129/0; `c0_2ci` 180/0/21; `--lib`
 1926/0/123 (Ci's 1921 plus this plan's five new tests).
 
-## Still owed before acceptance
+## Hardware gate — 2026-09-19, ACCEPTED
 
-The full hardware gate (`render_acceptance`, `c0_2ci -- --ignored`, the
-library's other ignored tests), to be run with the user's go-ahead, and this
-document's result line plus a `docs/status.md` entry once it passes.
+Run by the coordinator with the user's go-ahead and the GPU free (no GPU
+processes before or after): `render_acceptance -- --ignored` **164/164**;
+`c0_2ci -- --ignored` **21/21**; the library's other ignored tests
+(`--ignored --skip c0_2ci`) **102/102**. **287/287 in total**, against Ci's
+285/285 plus this plan's two new `_vulkan` tests. Nothing was skipped and
+nothing failed.
+
+**Plan Ci-refactor is accepted**: behaviour unchanged where production can
+observe it, the collapsed rows authorized by the amended §8.3, every Ci
+mutation still caught (R19 now caught rather than equivalent), and the
+hardware gate green.
