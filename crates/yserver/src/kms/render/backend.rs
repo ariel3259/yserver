@@ -56789,6 +56789,55 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_unflip_carries_no_cursor_or_gamma_vulkan() {
+        let mut backend =
+            c0_conv_ciii_owner_dispatch_fixture(1).expect("environmental skip: no live Vulkan ICD");
+        let device = c0_conv_ciii_request_ready_unflip(&mut backend);
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("unflip owner record");
+        let request = record
+            .request_properties_for_tests()
+            .expect("serialized unflip request");
+        let output = &backend.platform.outputs[0].output;
+        let crtc = u32::from(output.crtc);
+        let primary_plane = u32::from(output.plane);
+        let active = 21;
+        let out_fence_ptr = 22;
+        let primary_fb = u32::from(output.plane_fb_id_prop);
+        let primary_crtc_id = u32::from(output.plane_crtc_id_prop);
+
+        let mut property_cursor = 0usize;
+        let mut rows = Vec::new();
+        for (object, property_count) in request.objects.iter().zip(&request.count_props) {
+            let start = property_cursor;
+            property_cursor += *property_count as usize;
+            rows.push((*object, request.props[start..property_cursor].to_vec()));
+        }
+        assert_eq!(
+            property_cursor,
+            request.props.len(),
+            "the captured owner request property rows must be complete"
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                (crtc, vec![active, out_fence_ptr]),
+                (primary_plane, vec![primary_fb, primary_crtc_id]),
+            ],
+            "the unflip must carry only primary-plane properties; cursor and gamma state must remain untouched"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ciii_legacy_unflip_unchanged_vulkan() {
         let mut backend = super::KmsBackend::for_tests();
         let target = seed_window(&mut backend, 0xc910, None, 0, 0);
