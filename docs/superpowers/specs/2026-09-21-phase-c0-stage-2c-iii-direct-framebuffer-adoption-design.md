@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-iii — direct framebuffer adoption and retention
 
-**Status:** design, revision 3 (2026-09-21). Its three design sections (the
+**Status:** design, revision 4 (2026-09-21). Its three design sections (the
 ownership boundary, the handoff and ownership table, the evidence) were
 approved one by one with the user in brainstorming, together with the scope
 decision of section 1.1. Revision 2 incorporates codex round 1
@@ -18,7 +18,15 @@ retry-capable owner (B-1, 2.6); **storage is not adopted at preparation** —
 the source is retained by the present pin the frame already holds and the
 index uses a store-side backing identity (M-1, 2.5 rewritten); the index is
 removed on the allocation's direct-lease count reaching zero, kept by one
-component (M-2, 2.3). The implementation plan follows the next review.
+component (M-2, 2.3).
+Revision 4 incorporates codex round 3
+(`../findings/2026-09-21-stage-2c-iii-direct-fb-adoption-review-round3.md`:
+1 blocking, 2 major, all verified and accepted): the pending-cleanup entry
+carries an incarnation-counted alias and a defined freeze/handoff disposition
+(B-1, 2.6); the direct-lease count lives at the lease boundary in the resource
+service, not in the commit consumer (M-1, 2.3); a rejected unflip restores
+`ExitRetirement → Current` (M-2, 3.3). The implementation plan follows the
+next review.
 
 **Why this document exists.** Plan Ciii's Task 6 stopped with an F8
 (`../findings/2026-09-21-stage-2c-iii-plan-ciii-task6-f8.md`): the real direct
@@ -117,17 +125,24 @@ to a live allocation of the **current** incarnation; a mismatch, a failed
 upgrade or a different topology generation forces a fresh probe and import,
 which never aliases the previous one.
 
-**Removal (round-2 M-2).** One component owns the allocation-correlated count:
-the commit consumer, which already sees every direct-role transition, keeps a
-count of live direct-role leases **per `AllocationKey`**. The index entry is
-removed on that count's `1 → 0` transition (the allocation's last direct role
-retired — 2c-i: "remove the index when its position retires"), on incarnation
-loss, and when the source drawable is dropped (the existing removal site). A
-`2 → 1` transition (a same-source successor terminalized while the current
-commit still scans the allocation) keeps the index, so the next same-source
-successor still reuses the current allocation. The capacity's role slots
-(`capacity.rs:29`) record no allocation identity and are not extended for
-this. A second candidate whose lookup succeeds reuses the same allocation with
+**Removal (round-2 M-2, round-3 M-1).** The count lives where leases are
+minted and dropped: the **resource service**. A `DirectFramebufferAllocation`
+is leased **only** by direct-frame holders — the prepared candidate, the
+successor, the commit's `allocations` in every role — and by nobody else
+(storage is never adopted here, 2.5, and no other consumer takes a lease on a
+framebuffer allocation; the plan pins this with a mutation). So the service's
+live-use count on that `AllocationKey` **is** the direct-lease count, and it
+sees every mint and drop the commit consumer cannot: preparation, successor
+replacement, dispatch undo, pre-IPC refusal, as well as the commit events.
+The index entry is removed when the service observes that key's last lease
+dropped (`1 → 0`, on its existing lease-drop/readiness pass — 2c-i: "remove
+the index when its position retires"), on incarnation loss, and when the source
+drawable is dropped (the existing removal site). A `2 → 1` transition (a
+same-source successor terminalized while the current commit still scans the
+allocation) keeps the index, so the next same-source successor still reuses the
+current allocation. A never-dispatched allocation (replaced while `Successor`)
+reaches `1 → 0` the same way. The capacity's role slots (`capacity.rs:29`)
+record no allocation identity and are not extended for this. A second candidate whose lookup succeeds reuses the same allocation with
 a new lease. This is what makes P3-3 observable: the successor carries the same
 `AllocationKey` as the current commit.
 
@@ -191,17 +206,32 @@ candidate is rejected; the next Present of that source re-probes. That failure
 is a service-level fault, so it also closes admission on the device, as a lock
 mismatch does (2c-ii §7).
 
-**Cleanup itself is fallible (round-2 B-1).** `discharge_file_owned`
-(`drm_cleanup.rs:613`) puts the right back into the payload when `consume`
-fails — frozen family, `RMFB` or `GEM_CLOSE` error — and today nothing retains
-such a payload. So the registry gains a bounded **pending-cleanup owner**: a
-payload whose cleanup failed is retained there, with its right and its
-`Preparing` charge, until a later cleanup attempt succeeds (the registry's own
-R3 retry, resuming from `FramebufferRemoved`) or the existing teardown barrier
-takes ownership of the whole family. It is never dropped and never
-reconstructed as a cache owner; the capacity charge is released only with the
-payload. This is the 2c-i rule that uncertain cleanup retains its position
-while the transport closes.
+**Cleanup itself is fallible (round-2 B-1, round-3 B-1).**
+`discharge_file_owned` (`drm_cleanup.rs:613`) puts the right back into the
+payload when `consume` fails — frozen family, `RMFB` or `GEM_CLOSE` error —
+and keeps the payload's `Rc<Device>` alias; today nothing retains such a
+payload, and the registry's alias accounting is keyed only by adopted
+`AllocationKey`s (`register_payload_alias`, `drm_cleanup.rs:310`). So the
+registry gains a bounded **pending-cleanup owner** whose entries are
+**keyless and counted**: each holds the payload (right, GEM, device alias) and
+its `Preparing` charge, and is counted in the incarnation's alias total
+exactly like an adopted payload alias, so the fd-family barrier can never
+certify closure while one exists. Its dispositions:
+
+- **retry** — while the incarnation is live, the registry's R3 retry
+  (resuming from `FramebufferRemoved`) may succeed; then the right is spent,
+  the device alias dropped, the charge released, the entry gone;
+- **freeze / handoff** — when the incarnation freezes, the entry is moved into
+  the incarnation bundle with the rest of the pending cleanup (2c-i's "pending
+  cleanup and every fd-family alias move together"); ordinary `consume` cannot
+  succeed after the freeze (`drm_cleanup.rs:326`), so the entry is not retried;
+- **family closed** — after the family's closure the entry's right is marked
+  closed (its objects died with the fd family; no stale-handle ioctl is
+  issued), the device alias is dropped, the charge released, the entry gone.
+
+It is never dropped and never reconstructed as a cache owner; the charge is
+released only with the entry. This is the 2c-i rule that uncertain cleanup
+retains its position while the transport closes.
 
 ## 3. Handoff and the ownership table
 
@@ -229,13 +259,17 @@ what permits FB/GEM cleanup:
 | Adoption refused before `into_managed` (2.6 step 1) | cache (strong) | cache (strong); candidate rejected, `Preparing` cancelled | as today |
 | Adoption | cache (strong) | service; cache = index; lease in `Preparing` | never while a lease exists |
 | Service adoption fails after `into_managed` (2.6 step 3) | payload (sole) | registry cleanup (sole), index absent, admission closed | the registry, exactly once |
-| Cleanup of that payload fails (`RMFB`/`GEM_CLOSE`/frozen) | registry cleanup | registry pending-cleanup owner, `Preparing` charge kept | a later successful retry, or the teardown barrier |
+| Cleanup of that payload fails (`RMFB`/`GEM_CLOSE`/frozen) | registry cleanup | registry pending-cleanup entry (keyless, alias-counted), `Preparing` charge kept | a later successful retry; or freeze → bundle → family closed |
 | Successor replacement | lease in `Successor` | lease dropped (never-submitted path); the allocation persists if another lease holds it | the last lease release |
 | Capacity / `begin` / pre-IPC refusal | lease on the candidate | lease back on the candidate → `Desired`, exactly once | — |
 | Kernel rejection | commit's `allocations` | `ResourcesStillCurrent` returns the old; the new goes to `rejected` and its lease is released | lease release |
 | `Completed` + retirement | old in `Current` | old → releasing with its `KmsRelease` obligation; new → `Current` | `KmsRelease` discharged **and** no lease |
 | Reuse (same-source successor) | same key in `Current` | the retained allocation registers **no** obligation (P3-3) | — |
 | `CompletionUnknown` / quarantine | commit | retained in quarantine, never released here | stage 3's teardown barrier |
+| Unflip dispatched (round-3 M-2) | lease in `Current` | lease in `ExitRetirement` (the whole record moves, as the baseline seam does); index and count unchanged | — |
+| Unflip **rejected** by the kernel | lease in `ExitRetirement` | `ResourcesStillCurrent` returns the record **and restores its role to `Current`**; exit capacity released; index and count unchanged | — |
+| Unflip completed | lease in `ExitRetirement` | releasing with its `KmsRelease` obligation | discharge + no lease |
+| Unflip unknown | lease in `ExitRetirement` | retained under the teardown owner | stage 3's barrier |
 | Cache eviction | `Managed` index | index gone; allocation unchanged | — |
 | Direct-lease count `1 → 0` / incarnation lost / source drawable dropped | live index | index removed; the allocation follows its own release | — |
 | Direct-lease count `2 → 1` (successor terminalized, current still scanning) | live index | index kept | — |
@@ -268,9 +302,12 @@ break its named test:
 | The framebuffer's source retention is the frame's present pin; storage is never adopted at preparation; a managed source passes its read lease (2.5) | release the pin before the framebuffer lease; adopt the storage at preparation (a raw-storage consumer must then panic in the test) |
 | The index key uses the backing serial: a relayout/re-import of the source changes it (2.3) | key by DrawableId alone |
 | The index holds a live-checked token; a stale or foreign-incarnation entry forces a fresh probe (2.3) | upgrade the token without checking the incarnation |
-| The index is removed on the direct-lease count's `1 → 0` and kept on `2 → 1` (2.3) | remove on `2 → 1`; never remove |
+| The index is removed on the service's last-lease drop (`1 → 0`) and kept on `2 → 1`, including a never-dispatched allocation replaced while `Successor` (2.3) | remove on `2 → 1`; never remove; count only committed leases |
+| Only direct-frame holders lease a framebuffer allocation (2.3) | take a lease on it from a non-direct consumer (the test must observe the count go wrong) |
 | Service adoption failure after `into_managed` releases exactly once through the registry and closes admission (2.6) | drop the returned payload; reconstruct the cache as strong owner |
 | A failed cleanup (forced `RMFB` and forced `GEM_CLOSE` failure, each) retains the payload in the pending-cleanup owner with its charge, and a later retry releases exactly once (2.6) | drop the payload on cleanup failure; release the `Preparing` charge before cleanup succeeds |
+| A pending-cleanup entry is counted as an incarnation alias, moves into the bundle at freeze, and is closed with the family without a stale ioctl (2.6) | leave it out of the alias count; retry `consume` after the freeze; issue `RMFB` on a closed family |
+| A rejected unflip restores `ExitRetirement → Current` with its index and count intact (3.3) | append the returned record without restoring its role |
 | Both completion orders keep one lease owner: `HardwareComplete` before and after `CompletionRetired` (round-1 M-2) | discharge the framebuffer's obligation at `HardwareComplete` when no retirement recorded it |
 | `ResourcesStillCurrent` returns the framebuffer lease to current; `ResourcesReleased` releases it (M-2) | drop the lease on `ResourcesStillCurrent` |
 | Unknown / quarantine retains the lease, never releases it (M-2) | release it on `CompletionUnknown` |
