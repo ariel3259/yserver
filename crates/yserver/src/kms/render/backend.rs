@@ -3638,6 +3638,13 @@ impl KmsBackend {
                     ) == root
             });
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
+        // Upstream #163: an unredirected target is direct-eligible only while
+        // it is still the top-level the composed root scene would show
+        // (mapped, covering the root, nothing raised above it). Evaluated
+        // here so both routes -- the legacy producer and the admission
+        // source -- apply it.
+        let scene_eligible = !matches!(target, ScanoutM0Target::Unredirected)
+            || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root);
         // #133 step 3 (3.5): reject any candidate whose resolved paint
         // chain carries a border clip. A bordered storage starts at its
         // outer origin, not at content (0, 0).
@@ -3655,13 +3662,14 @@ impl KmsBackend {
                 crate::kms::render::scene::CursorPlaneMode::Hw
             ),
             self.scene.root_overlay.is_empty(),
-            authoritative_root,
+            authoritative_root && scene_eligible,
             unbordered,
             candidate.x_off,
             candidate.y_off,
             candidate.valid_region_xid,
             layout_generation,
         );
+        eligibility.authoritative_root = authoritative_root;
         eligibility.source_id = source_id;
         eligibility.paint_target = paint_target;
         eligibility
@@ -4322,6 +4330,66 @@ impl KmsBackend {
         } else {
             ScanoutM0Target::Other
         }
+    }
+
+    /// Whether an unredirected Present target is still the window which the
+    /// scene would show for the whole root. Direct scanout bypasses that
+    /// scene, so a mapped top-level raised above the candidate (or a workspace
+    /// switch which unmaps it) must keep later Presents composed.
+    fn unredirected_direct_scene_eligible(&self, leaf_xid: u32, root: (u32, u32)) -> bool {
+        let mut top_xid = leaf_xid;
+        let mut reached_top_level = false;
+        // Resource validation prevents cycles in production, but keep this
+        // conservative for transient/backend-test state.
+        for _ in 0..=self.windows.len() {
+            let Some(geometry) = self.windows.get(&top_xid) else {
+                return false;
+            };
+            match geometry.parent {
+                None => {
+                    reached_top_level = true;
+                    break;
+                }
+                Some(parent) if parent == self.core.window_id => {
+                    reached_top_level = true;
+                    break;
+                }
+                Some(parent) => top_xid = parent,
+            }
+        }
+        if !reached_top_level {
+            return false;
+        }
+        let Some(candidate) = self.windows.get(&top_xid) else {
+            return false;
+        };
+        let root_w = i32::try_from(root.0).unwrap_or(i32::MAX);
+        let root_h = i32::try_from(root.1).unwrap_or(i32::MAX);
+        let covers_root = i32::from(candidate.x) <= 0
+            && i32::from(candidate.y) <= 0
+            && i32::from(candidate.x) + i32::from(candidate.width) >= root_w
+            && i32::from(candidate.y) + i32::from(candidate.height) >= root_h;
+        if !candidate.mapped || !covers_root {
+            return false;
+        }
+
+        let cow_xid = self.cow_host_xid();
+        let topmost_on_root = self
+            .core
+            .top_level_order
+            .iter()
+            .rev()
+            .filter(|&&xid| Some(xid) != cow_xid)
+            .find(|&&xid| {
+                self.windows.get(&xid).is_some_and(|geometry| {
+                    geometry.mapped
+                        && i32::from(geometry.x) < root_w
+                        && i32::from(geometry.y) < root_h
+                        && i32::from(geometry.x) + i32::from(geometry.width) > 0
+                        && i32::from(geometry.y) + i32::from(geometry.height) > 0
+                })
+            });
+        topmost_on_root.is_some_and(|&xid| xid == top_xid)
     }
 
     fn observe_scanout_m0(&mut self, candidate: PresentScanoutCandidate) {
@@ -21378,6 +21446,14 @@ impl Backend for KmsBackend {
             order.push(host);
         }
         let order_changed = self.core.top_level_order != order;
+        if order_changed {
+            // A direct frame bypasses the composed root scene. A real
+            // top-level restack changes that scene even when the direct
+            // Present target itself is untouched, so retire it through the
+            // normal composed replacement path before accepting another
+            // direct Present (upstream #163).
+            self.request_direct_unflip("top_level_stack_changed");
+        }
         self.core.top_level_order = order;
         if order_changed {
             self.admission_note_layout_change_all_devices("top-level topology projection changed");
@@ -43442,6 +43518,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sync_top_level_order_restack_requests_direct_unflip() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let below = ResourceId(0x0010_0a10);
+        let above = ResourceId(0x0010_0a20);
+        seed_state_window(&mut state, &mut b, below, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, above, ROOT_WINDOW, 0, 0, 100, 100);
+        let _ = state.resources.map_window(below);
+        let _ = state.resources.map_window(above);
+        b.sync_top_level_order(&state);
+
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let _ = install_direct_frame_for_target_test(&mut b, synth_host_xid(below), cow_id, true);
+
+        state.resources.configure_window(ConfigureWindowRequest {
+            window: below,
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: Some(0), // Above, no sibling -> raise to top.
+        });
+        b.sync_top_level_order(&state);
+
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+    }
+
+    #[test]
+    fn sync_top_level_order_without_restack_keeps_direct_scanout_active() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let target = ResourceId(0x0010_0a30);
+        seed_state_window(&mut state, &mut b, target, ROOT_WINDOW, 0, 0, 100, 100);
+        let _ = state.resources.map_window(target);
+        b.sync_top_level_order(&state);
+
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let _ = install_direct_frame_for_target_test(&mut b, synth_host_xid(target), cow_id, true);
+
+        b.sync_top_level_order(&state);
+
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+    }
+
+    /// A direct Present bypasses the scene compositor, so a fullscreen
+    /// unredirected window may only scan out directly while it remains the
+    /// frontmost mapped top-level on that output.  Without this gate,
+    /// `sync_top_level_order`'s composed unflip is just a one-frame pulse:
+    /// the next Present from the now-covered fullscreen window re-enters
+    /// direct scanout and hides the raised window again (#160).
+    #[test]
+    fn unredirected_direct_scanout_rejects_a_fullscreen_window_covered_by_a_raised_top_level() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let fullscreen = ResourceId(0x0010_0a40);
+        let raised = ResourceId(0x0010_0a41);
+        seed_state_window(&mut state, &mut b, fullscreen, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, raised, ROOT_WINDOW, 20, 20, 40, 40);
+        b.windows.get_mut(&synth_host_xid(raised)).unwrap().mapped = false;
+        let _ = state.resources.map_window(fullscreen);
+        b.sync_top_level_order(&state);
+
+        assert!(
+            b.unredirected_direct_scene_eligible(synth_host_xid(fullscreen), (100, 100)),
+            "the mapped fullscreen window is eligible while no mapped top-level covers it"
+        );
+
+        let _ = state.resources.map_window(raised);
+        b.windows.get_mut(&synth_host_xid(raised)).unwrap().mapped = true;
+        b.sync_top_level_order(&state);
+
+        assert!(
+            !b.unredirected_direct_scene_eligible(synth_host_xid(fullscreen), (100, 100)),
+            "a raised mapped top-level must keep the covered fullscreen window out of direct scanout"
+        );
+    }
+
+    /// Window depth is not a statement about whether the currently presented
+    /// pixels are opaque. In particular, full-screen GL/EGL clients commonly
+    /// use a depth-32 visual and have always been eligible for direct scanout.
+    #[test]
+    fn unredirected_direct_scanout_keeps_an_uncovered_depth32_fullscreen_window_eligible() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let fullscreen = ResourceId(0x0010_0a42);
+        seed_state_window(&mut state, &mut b, fullscreen, ROOT_WINDOW, 0, 0, 100, 100);
+        b.windows
+            .get_mut(&synth_host_xid(fullscreen))
+            .unwrap()
+            .depth = 32;
+        let _ = state.resources.map_window(fullscreen);
+        b.sync_top_level_order(&state);
+
+        assert!(
+            b.unredirected_direct_scene_eligible(synth_host_xid(fullscreen), (100, 100)),
+            "an uncovered depth-32 fullscreen window must retain direct-scanout eligibility"
+        );
+    }
+
     // ── Cross-layer agreement regression gates ──
     //
     // These pin scenarios where the core hit-test and the backend
@@ -51350,6 +51545,12 @@ mod tests {
         let width = backend.platform.fb_w;
         let height = backend.platform.fb_h;
         seed_bordered_window(backend, target_xid, None, 0, 0, width, height, border_width);
+        // Upstream #163: an unredirected candidate is direct-eligible only
+        // while its top-level is the frontmost mapped window on the root.
+        // Project the seeded window the way `sync_top_level_order` would.
+        if !backend.core.top_level_order.contains(&target_xid) {
+            backend.core.top_level_order.push(target_xid);
+        }
         backend
             .store
             .allocate(
@@ -51555,8 +51756,11 @@ mod tests {
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
 
-        let unbordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC312, 0xC313, 0);
+        // Seed the bordered window first: upstream #163 keeps only the
+        // frontmost mapped top-level direct-eligible, and the unbordered
+        // candidate is the one that must stay eligible here.
         let bordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC314, 0xC315, 1);
+        let unbordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC312, 0xC313, 0);
 
         assert!(
             c0_direct_pure_eligibility(&backend, &unbordered),
