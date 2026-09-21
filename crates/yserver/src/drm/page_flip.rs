@@ -137,6 +137,11 @@ pub fn submit_flip_with_fences(
     out_fence_holder: &mut i32,
     legacy_write_permitted: bool,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    crate::drm::record_legacy_sink_entry_for_tests(
+        device,
+        crate::kms::render::resources::WriterClass::Primary,
+    );
     if !legacy_write_permitted {
         return Err(crate::drm::transport_gate_refusal("page-flip"));
     }

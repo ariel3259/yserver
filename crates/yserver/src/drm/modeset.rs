@@ -1653,6 +1653,11 @@ pub(crate) fn submit_direct_scanout(
     planes: &[DirectScanoutPlaneState<'_>],
     legacy_write_permitted: bool,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    crate::drm::record_legacy_sink_entry_for_tests(
+        device,
+        crate::kms::render::resources::WriterClass::Primary,
+    );
     if !legacy_write_permitted {
         return Err(crate::drm::transport_gate_refusal("direct-scanout"));
     }
@@ -1724,6 +1729,11 @@ pub(crate) fn submit_composed_scanout(
     planes: &[ComposedScanoutPlaneState<'_>],
     legacy_write_permitted: bool,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    crate::drm::record_legacy_sink_entry_for_tests(
+        device,
+        crate::kms::render::resources::WriterClass::Unflip,
+    );
     if !legacy_write_permitted {
         return Err(crate::drm::transport_gate_refusal("composed-unflip"));
     }

@@ -56838,7 +56838,188 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn c0_conv_ciii_legacy_unflip_unchanged_vulkan() {
+    fn c0_conv_ciii_owner_device_issues_no_legacy_primary_write_vulkan() {
+        crate::drm::clear_legacy_sink_entries_for_tests();
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.outputs[0].key.device_key;
+        backend.scene.mark_scene_structure_damage_rect(
+            0,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: 19,
+                    height: 23,
+                },
+            },
+        );
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let entries = crate::drm::legacy_sink_entries_for_tests();
+        assert_eq!(
+            entries.len(),
+            0,
+            "composed Owner submit must not enter the legacy primary sink"
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("scene owner commit")
+            .commit_id();
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        c0_conv_ciii_apply_scene_commit_hardware(&mut backend, device, commit);
+        c0_conv_ciii_complete_scene_commit(&mut backend, 0, device);
+
+        crate::drm::clear_legacy_sink_entries_for_tests();
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc951, 0xc952, 0xc953, 951);
+        let direct_result = backend.try_present_direct(candidate, event);
+        assert_eq!(
+            crate::drm::legacy_sink_entries_for_tests().len(),
+            0,
+            "direct Owner submit must not enter the legacy primary sink"
+        );
+        assert!(direct_result.expect("owner direct offer"));
+
+        crate::drm::clear_legacy_sink_entries_for_tests();
+        let OwnerLiveFixture {
+            mut backend,
+            _registry,
+        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        let (first_candidate, first_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc961, 0xc962, 0xc963, 961);
+        let (successor_candidate, successor_event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc971, 0xc972, 0xc973, 971);
+        let first_result = backend.try_present_direct(first_candidate, first_event);
+        assert_eq!(
+            crate::drm::legacy_sink_entries_for_tests().len(),
+            0,
+            "first Owner promotion offer must not enter the legacy primary sink"
+        );
+        assert!(first_result.expect("first owner direct offer"));
+        let first_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first owner commit")
+            .commit_id();
+        let successor_result = backend.try_present_direct(successor_candidate, successor_event);
+        assert_eq!(
+            crate::drm::legacy_sink_entries_for_tests().len(),
+            0,
+            "queued Owner promotion offer must not enter the legacy primary sink"
+        );
+        assert!(successor_result.expect("queued owner direct offer"));
+        assert!(backend.scanout_m2.queued_successor.is_some());
+        assert_eq!(
+            crate::drm::legacy_sink_entries_for_tests().len(),
+            0,
+            "Owner promotion offers must not enter the legacy primary sink"
+        );
+
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, first_commit);
+        reinstall_owner_executor_for_direct_test(&mut backend);
+        c0_conv_cii_complete_direct_owner_hardware(&mut backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut backend, device, 0, 1_071, 1, 71);
+        assert_eq!(
+            crate::drm::legacy_sink_entries_for_tests().len(),
+            0,
+            "Owner retirement promotion must not enter the legacy primary sink"
+        );
+
+        let second_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("retirement wake must promote the queued successor")
+            .commit_id();
+        assert_ne!(second_commit, first_commit);
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(971)
+        );
+        assert_eq!(
+            crate::drm::legacy_sink_entries_for_tests().len(),
+            0,
+            "Owner retirement promotion must not enter the legacy primary sink"
+        );
+
+        crate::drm::clear_legacy_sink_entries_for_tests();
+        let mut backend = c0_conv_ciii_owner_dispatch_fixture(1)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let _device = c0_conv_ciii_request_ready_unflip(&mut backend);
+        backend.scanout_m2.unflip_requested = true;
+        backend.tick_maybe_composite_for_tests();
+        assert_eq!(
+            crate::drm::legacy_sink_entries_for_tests().len(),
+            0,
+            "Owner unflip submit must not enter the legacy unflip sink"
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+    }
+
+    #[test]
+    fn c0_conv_ciii_t27_direct_route_reads_the_candidate_device() {
+        let mut backend = admission_backend_with_stub_executor();
+        let device_a = backend.platform.devices[0].key;
+        let device_b = test_device_key(96);
+        push_test_device(&mut backend, device_b);
+        assert_ne!(device_a, device_b);
+        install_admission_legacy_gate(&mut backend, device_a);
+        install_admission_owner_gate(&mut backend, device_b);
+        backend.install_admission_conductor_for_tests(
+            device_a,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend.install_admission_conductor_for_tests(
+            device_b,
+            AdmissionSourceFixture::new_source().0,
+        );
+        assert!(!backend.admission_is_active(device_a));
+        assert!(backend.admission_is_active(device_b));
+        backend.scanout_m2.test_submit_direct_without_drm = true;
+
+        let (candidate, event) =
+            c0_conv_cii_try_candidate(&mut backend, 0xc981, 0xc982, 0xc983, 981);
+        crate::drm::clear_legacy_sink_entries_for_tests();
+        assert!(
+            backend
+                .try_present_direct(candidate, event)
+                .expect("Legacy direct route")
+        );
+        assert_eq!(
+            backend
+                .scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(981),
+            "a Legacy candidate device must use the legacy direct path"
+        );
+        assert!(
+            backend.device_owner_for_tests(0).live_record().is_none(),
+            "a Legacy candidate device must not create an owner commit"
+        );
+        assert_eq!(
+            crate::drm::legacy_sink_entries_for_tests().len(),
+            0,
+            "the hardware-free direct seam bypass must not enter a legacy sink"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_legacy_device_unchanged_vulkan() {
         let mut backend = super::KmsBackend::for_tests();
         let target = seed_window(&mut backend, 0xc910, None, 0, 0);
         install_direct_frame_for_target_test(&mut backend, 0xc911, target, true);

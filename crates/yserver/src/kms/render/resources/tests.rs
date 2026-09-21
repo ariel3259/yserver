@@ -3325,6 +3325,71 @@ fn c0_2ci_sink_output_disable_gate_four_states() {
     });
 }
 
+#[test]
+fn c0_conv_ciii_sink_recorder_counts_entry_before_the_permit() {
+    let platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    let device = Rc::clone(&platform.devices[0].device);
+    let output = &platform.outputs[0].output;
+    let fb = ::drm::control::from_u32(1).unwrap();
+    let legacy = sink_gate_at_state(TransportState::Legacy);
+    let owner = sink_gate_at_state(TransportState::Owner);
+
+    crate::drm::clear_legacy_sink_entries_for_tests();
+
+    let planes = [crate::drm::modeset::DirectScanoutPlaneState {
+        output,
+        src_x: 0,
+        src_y: 0,
+        src_w: 800,
+        src_h: 600,
+    }];
+    let composed = [crate::drm::modeset::ComposedScanoutPlaneState { output, fb }];
+
+    for permitted in [
+        legacy.allows_legacy(WriterClass::Primary),
+        owner.allows_legacy(WriterClass::Primary),
+    ] {
+        let mut out_fence = -1;
+        assert!(
+            crate::drm::page_flip::submit_flip_with_fences(
+                &device,
+                output,
+                fb,
+                -1,
+                &mut out_fence,
+                permitted,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::drm::modeset::submit_direct_scanout(&device, fb, &planes, permitted).is_err()
+        );
+        assert!(
+            crate::drm::modeset::submit_composed_scanout(&device, &composed, permitted,).is_err()
+        );
+    }
+
+    let entries = crate::drm::legacy_sink_entries_for_tests();
+    assert_eq!(
+        entries.len(),
+        6,
+        "every sink call must be observed at entry"
+    );
+    assert_eq!(
+        entries.iter().map(|(_, class)| *class).collect::<Vec<_>>(),
+        vec![
+            WriterClass::Primary,
+            WriterClass::Primary,
+            WriterClass::Unflip,
+            WriterClass::Primary,
+            WriterClass::Primary,
+            WriterClass::Unflip,
+        ],
+    );
+    assert!(entries.iter().all(|(device, _)| !device.is_empty()));
+    assert!(entries.windows(2).all(|window| window[0].0 == window[1].0));
+}
+
 /// F5b-m1 (gamma four-way test): drives `apply_gamma_to_live_output` under
 /// `WriterClass::Gamma` through four gate states (Legacy, Quiescing, Owner, Closed)
 /// on a real primary DRM node opened without master.
