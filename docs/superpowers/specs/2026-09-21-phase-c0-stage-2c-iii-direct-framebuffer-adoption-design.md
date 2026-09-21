@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-iii — direct framebuffer adoption and retention
 
-**Status:** design, revision 4 (2026-09-21). Its three design sections (the
+**Status:** design, revision 5 (2026-09-21). Its three design sections (the
 ownership boundary, the handoff and ownership table, the evidence) were
 approved one by one with the user in brainstorming, together with the scope
 decision of section 1.1. Revision 2 incorporates codex round 1
@@ -25,8 +25,8 @@ Revision 4 incorporates codex round 3
 carries an incarnation-counted alias and a defined freeze/handoff disposition
 (B-1, 2.6); the direct-lease count lives at the lease boundary in the resource
 service, not in the commit consumer (M-1, 2.3); a rejected unflip restores
-`ExitRetirement → Current` (M-2, 3.3). The implementation plan follows the
-next review.
+`ExitRetirement → Current` (M-2, 3.3). Revision 5 adds 4.2a (the fixture
+note from plan Cfb's round 2). Plan: `../plans/2026-09-21-phase-c0-stage-2c-iii-plan-cfb-direct-framebuffer-adoption.md`.
 
 **Why this document exists.** Plan Ciii's Task 6 stopped with an F8
 (`../findings/2026-09-21-stage-2c-iii-plan-ciii-task6-f8.md`): the real direct
@@ -313,6 +313,14 @@ break its named test:
 | Unknown / quarantine retains the lease, never releases it (M-2) | release it on `CompletionUnknown` |
 | Dispatch undo (`managed_undo_direct_dispatch`) and successor terminalization return the lease once (M-2) | release it twice |
 | Unflip exit retirement moves the framebuffer lease with the `ExitRetirement` role (M-2) | leave it in `Current` |
+
+**4.2a. Fixture note (plan Cfb round 2, M-3).** The M1 probe's `TEST_ONLY`
+validation needs DRM master, which no Vulkan fixture holds; its import half
+(PRIME fd → GEM, `ADDFB2`) does not. The hardware-free evidence above is
+therefore built on candidates whose framebuffer is a **real import on the real
+node** with the validation omitted — never on a fabricated entry — and only
+the Ciii hardware run exercises the full probe. The plan splits the probe
+accordingly (a behaviour-preserving refactor) and names the fixture helper.
 
 **4.3. Re-entry into Ciii.** With this plan accepted, plan Ciii Task 6 resumes
 as written: composed → direct → same-source direct → unflip on card1, with T32
