@@ -57,6 +57,9 @@ enum DispatchFailureRoute {
     Direct {
         retirement: Option<crate::kms::render::resources::RoleReservation>,
     },
+    Unflip {
+        members: Vec<GroupMember>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -108,7 +111,7 @@ struct DispatchFailureAction {
     close_gate: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResourceRestore {
     Succeeded,
     Failed,
@@ -146,6 +149,12 @@ fn dispatch_failure_policy(
             outcome: DispatchFailureOutcome::BeginRefused,
             close_gate: false,
         },
+        (DispatchFailureRouteKind::Unflip, _, ResourceRestore::Succeeded) => {
+            DispatchFailureAction {
+                outcome: DispatchFailureOutcome::TransportClosed,
+                close_gate: true,
+            }
+        }
         _ => DispatchFailureAction {
             outcome: DispatchFailureOutcome::TransportClosed,
             close_gate: true,
@@ -157,6 +166,7 @@ fn dispatch_failure_policy(
 enum DispatchFailureRouteKind {
     Primary,
     Direct,
+    Unflip,
 }
 
 #[cfg(test)]
@@ -181,7 +191,7 @@ pub(crate) enum AdmissionPreparationHook {
 fn decision_requires_unsupported(decision: &AdmissionDecision) -> bool {
     matches!(
         decision.admitted,
-        Admitted::Topology { .. } | Admitted::Unflip { .. } | Admitted::CursorRecovery { .. }
+        Admitted::Topology { .. } | Admitted::CursorRecovery { .. }
     )
 }
 
@@ -827,6 +837,10 @@ impl KmsBackend {
             .commit_consumer
             .capacity
             .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement);
+        let backend_composed = self
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| conductor.backend_composed);
         let composed_return_established = self
             .platform
             .outputs
@@ -834,14 +848,29 @@ impl KmsBackend {
             .enumerate()
             .filter(|(_, output)| output.key.device_key == device)
             .all(|(output_idx, _)| {
-                self.platform
-                    .retained_composed_framebuffer(output_idx)
-                    .is_some()
+                if backend_composed {
+                    let bo_fb_handle = self
+                        .platform
+                        .scanout_pools
+                        .get(output_idx)
+                        .and_then(Option::as_ref)
+                        .and_then(|scanout| scanout.display_pool().bos.first())
+                        .and_then(|bo| bo.fb_handle);
+                    self.resource_service
+                        .as_mut()
+                        .and_then(|service| {
+                            self.scene
+                                .owner_current_framebuffer(output_idx, bo_fb_handle, service)
+                                .ok()
+                        })
+                        .flatten()
+                        .is_some()
+                } else {
+                    self.platform
+                        .retained_composed_framebuffer(output_idx)
+                        .is_some()
+                }
             });
-        let backend_composed = self
-            .admission_conductors
-            .get(&device)
-            .is_some_and(|conductor| conductor.backend_composed);
         let composed_intents = self
             .admission_conductors
             .get(&device)
@@ -1083,6 +1112,8 @@ impl KmsBackend {
     ) -> AdmissionOutcome {
         if decision_requires_unsupported(&decision) {
             self.admission_abort_unsupported(device, token, &decision)
+        } else if matches!(decision.admitted, Admitted::Unflip { .. }) {
+            self.admission_dispatch_unflip(device, token, decision)
         } else if matches!(decision_primary(&decision), Some(Admitted::Direct { .. })) {
             self.admission_dispatch_direct(device, token, decision)
         } else if matches!(
@@ -1093,6 +1124,238 @@ impl KmsBackend {
         } else {
             self.admission_abort(device, token);
             AdmissionOutcome::Unsupported(decision.tier)
+        }
+    }
+
+    fn admission_dispatch_unflip(
+        &mut self,
+        device: DrmDeviceKey,
+        token: AdmissionToken,
+        decision: AdmissionDecision,
+    ) -> AdmissionOutcome {
+        let members = match &decision.admitted {
+            Admitted::Unflip { crtcs } => {
+                match crate::kms::render::unflip_owner::members(self, device, crtcs) {
+                    Ok(members) => members,
+                    Err(_error) => {
+                        self.admission_abort(device, token);
+                        return AdmissionOutcome::PreparationRefused;
+                    }
+                }
+            }
+            _ => {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::Unsupported(decision.tier);
+            }
+        };
+        let desc =
+            match crate::kms::render::unflip_owner::description(self, device, &decision.admitted) {
+                Ok(desc) => desc,
+                Err(_error) => {
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::PreparationRefused;
+                }
+            };
+        let new_resources =
+            match crate::kms::render::unflip_owner::resources(self, device, &decision.admitted) {
+                Ok(resources) => resources,
+                Err(_error) => {
+                    self.admission_abort(device, token);
+                    return AdmissionOutcome::PreparationRefused;
+                }
+            };
+        if self.resource_service.is_none() {
+            self.admission_abort(device, token);
+            return AdmissionOutcome::BeginRefused;
+        }
+
+        let exit_slot = match self
+            .commit_consumer
+            .capacity
+            .reserve(crate::kms::render::resources::DirectRole::ExitRetirement)
+        {
+            Ok(slot) => slot,
+            Err(_error) => {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::PreparationRefused;
+            }
+        };
+        let mut old_resources = match self.commit_consumer.take_current_for_members(&members) {
+            Ok(old) if !old.is_empty() => old,
+            Ok(old) => {
+                self.discharge_bare_reservation(exit_slot);
+                self.commit_consumer.current_resources.extend(old);
+                self.admission_abort(device, token);
+                return AdmissionOutcome::PreparationRefused;
+            }
+            Err(_error) => {
+                self.discharge_bare_reservation(exit_slot);
+                self.admission_abort(device, token);
+                return AdmissionOutcome::PreparationRefused;
+            }
+        };
+        let Some(current) = old_resources.iter_mut().find_map(|resources| {
+            resources
+                .direct_role
+                .as_mut()
+                .filter(|role| role.role() == crate::kms::render::resources::DirectRole::Current)
+        }) else {
+            self.discharge_bare_reservation(exit_slot);
+            self.commit_consumer.current_resources.extend(old_resources);
+            self.admission_abort(device, token);
+            return AdmissionOutcome::PreparationRefused;
+        };
+        if let Err((_error, leaked)) = self
+            .commit_consumer
+            .capacity
+            .move_into_reserved(current, exit_slot)
+        {
+            self.discharge_bare_reservation(leaked);
+            self.commit_consumer.current_resources.extend(old_resources);
+            self.admission_abort(device, token);
+            return AdmissionOutcome::PreparationRefused;
+        }
+
+        let mut old_state = Some(old_resources);
+        let mut new_state = Some(new_resources);
+        let result = {
+            let consumer = &mut self.commit_consumer;
+            let service = self
+                .resource_service
+                .as_mut()
+                .expect("resource service checked above");
+            let Some(device_entry) = self
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == device)
+            else {
+                let old = old_state.take().expect("unflip old state");
+                consumer.current_resources.extend(old);
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Unflip { members },
+                    DispatchFailureResources::Refused {
+                        new: new_state.take().unwrap_or_default(),
+                    },
+                );
+            };
+            let Some(owner) = device_entry.owner.as_mut() else {
+                let old = old_state.take().expect("unflip old state");
+                consumer.current_resources.extend(old);
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Unflip { members },
+                    DispatchFailureResources::Refused {
+                        new: new_state.take().unwrap_or_default(),
+                    },
+                );
+            };
+            owner.begin_with_fallible_ledger(&desc, |commit| {
+                let old = old_state.take().ok_or((
+                    crate::kms::render::resources::ResourceError::InvalidState,
+                    Vec::new(),
+                    Vec::new(),
+                ))?;
+                let Some(new) = new_state.take() else {
+                    return Err((
+                        crate::kms::render::resources::ResourceError::InvalidState,
+                        old,
+                        Vec::new(),
+                    ));
+                };
+                let new = new
+                    .into_iter()
+                    .map(|resources| {
+                        resources.with_commit_id(crate::kms::render::resources::CommitKey::new(
+                            device, commit,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                register_commit_dependencies(commit, old, new, service)
+            })
+        };
+
+        let commit = match result {
+            Ok((commit, _events)) => commit,
+            Err(FallibleBeginError::Ledger((_error, old, new))) => {
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Unflip { members },
+                    DispatchFailureResources::Ledger { old, new },
+                );
+            }
+            Err(FallibleBeginError::Cleanup {
+                error: (_error, old, new),
+                ..
+            }) => {
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Unflip { members },
+                    DispatchFailureResources::Cleanup { old, new },
+                );
+            }
+            Err(FallibleBeginError::Refused { .. }) => {
+                let old = old_state.take().expect("refused unflip old state");
+                self.commit_consumer.current_resources.extend(old);
+                let restored = self.restore_unflip_dispatch_resources(
+                    new_state.take().unwrap_or_default(),
+                    &members,
+                );
+                self.admission_abort(device, token);
+                if restored == ResourceRestore::Succeeded {
+                    return AdmissionOutcome::BeginRefused;
+                }
+                if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                    gate.force_close();
+                }
+                return AdmissionOutcome::TransportClosed;
+            }
+        };
+        let send_result = {
+            let device_entry = self
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == device)
+                .expect("admission device");
+            let owner = device_entry.owner.as_mut().expect("admission owner");
+            owner.send_on(device_entry.executor.as_mut().expect("admission executor"))
+        };
+        let affected_outputs = members
+            .iter()
+            .filter_map(|member| {
+                self.platform
+                    .outputs
+                    .iter()
+                    .find(|output| {
+                        crate::kms::render::platform::CrtcKey::for_output(output) == member.crtc
+                    })
+                    .map(|output| output.key.clone())
+            })
+            .collect::<Vec<_>>();
+        match send_result {
+            Ok(_events) => {
+                let outcome = self.admission_confirm(device, token, commit, decision);
+                if matches!(outcome, AdmissionOutcome::Dispatched(_)) {
+                    self.record_owner_unflip_return(
+                        crate::kms::render::resources::CommitKey::new(device, commit),
+                        affected_outputs,
+                    );
+                }
+                outcome
+            }
+            Err(error @ DispatchError::Refused { .. }) => {
+                self.admission_dispose_refusal(device, token, decision.admitted, error)
+            }
+            Err(_error) => {
+                self.admission_abort(device, token);
+                AdmissionOutcome::BeginRefused
+            }
         }
     }
 
@@ -1140,6 +1403,44 @@ impl KmsBackend {
         }
     }
 
+    fn restore_unflip_dispatch_resources(
+        &mut self,
+        new: Vec<CommitResources>,
+        members: &[GroupMember],
+    ) -> ResourceRestore {
+        if new.iter().any(|resources| resources.direct_role.is_some()) {
+            return ResourceRestore::Extra;
+        }
+        let Some(resources) = self
+            .commit_consumer
+            .current_resources
+            .iter_mut()
+            .find(|resources| {
+                members
+                    .iter()
+                    .all(|member| resources.crtcs.contains(member))
+            })
+        else {
+            return ResourceRestore::Missing;
+        };
+        let Some(role) = resources.direct_role.as_mut() else {
+            return ResourceRestore::Missing;
+        };
+        if role.role() != crate::kms::render::resources::DirectRole::ExitRetirement {
+            return ResourceRestore::Failed;
+        }
+        if self
+            .commit_consumer
+            .capacity
+            .move_role(role, crate::kms::render::resources::DirectRole::Current)
+            .is_err()
+        {
+            ResourceRestore::Failed
+        } else {
+            ResourceRestore::Succeeded
+        }
+    }
+
     fn admission_handle_dispatch_failure(
         &mut self,
         device: DrmDeviceKey,
@@ -1164,6 +1465,10 @@ impl KmsBackend {
             DispatchFailureRoute::Direct { retirement } => (
                 DispatchFailureRouteKind::Direct,
                 self.restore_direct_dispatch_resources(new, retirement),
+            ),
+            DispatchFailureRoute::Unflip { members } => (
+                DispatchFailureRouteKind::Unflip,
+                self.restore_unflip_dispatch_resources(new, &members),
             ),
         };
         let action = dispatch_failure_policy(route_kind, kind, restore);
@@ -1705,10 +2010,9 @@ impl KmsBackend {
                     return AdmissionOutcome::TransportClosed;
                 }
             }
+            Some(Admitted::Unflip { .. }) => {}
             None | Some(Admitted::Maintenance { .. }) => {}
-            Some(Admitted::Topology { .. })
-            | Some(Admitted::Unflip { .. })
-            | Some(Admitted::CursorRecovery { .. }) => {
+            Some(Admitted::Topology { .. }) | Some(Admitted::CursorRecovery { .. }) => {
                 return AdmissionOutcome::Unsupported(confirmed.decision.tier);
             }
         }

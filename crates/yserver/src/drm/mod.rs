@@ -31,3 +31,38 @@ pub use swapchain::Swapchain;
 pub(crate) fn transport_gate_refusal(op: &str) -> std::io::Error {
     std::io::Error::other(format!("transport gate: legacy {op} write refused"))
 }
+
+// Test-only scaffolding for the C.0 structural-debt inventory: record entry
+// into a converted legacy primary/unflip sink before its permit check. The
+// recorder observes sink entry independently of whether the transport gate
+// later refuses the write, and is deleted with the legacy branches.
+#[cfg(test)]
+thread_local! {
+    static LEGACY_SINK_ENTRIES: std::cell::RefCell<Vec<(
+        String,
+        crate::kms::render::resources::WriterClass,
+    )>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_legacy_sink_entry_for_tests(
+    device: &Device,
+    class: crate::kms::render::resources::WriterClass,
+) {
+    LEGACY_SINK_ENTRIES.with(|entries| {
+        entries
+            .borrow_mut()
+            .push((device.path().to_string(), class));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_legacy_sink_entries_for_tests() {
+    LEGACY_SINK_ENTRIES.with(|entries| entries.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_sink_entries_for_tests()
+-> Vec<(String, crate::kms::render::resources::WriterClass)> {
+    LEGACY_SINK_ENTRIES.with(|entries| entries.borrow().clone())
+}

@@ -1078,6 +1078,10 @@ struct SceneCompositorInner {
     cursor: Option<CursorEntry>,
     owner_offers: VecDeque<ComposedOffer>,
     owner_damage_transactions: HashMap<CommitKey, OwnerDamageTransaction>,
+    /// Per-output proof produced only when an owner damage member's repaint
+    /// is applied at HardwareComplete. The backend consumes these through
+    /// the owner-event seam; an invalidated member never enters this queue.
+    owner_return_proofs: Vec<(CommitKey, OutputKey)>,
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -1417,6 +1421,7 @@ impl SceneCompositor {
                 cursor: None,
                 owner_offers: VecDeque::new(),
                 owner_damage_transactions: HashMap::new(),
+                owner_return_proofs: Vec::new(),
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
@@ -1502,6 +1507,60 @@ impl SceneCompositor {
                 o.damage.invalidate();
             }
         }
+    }
+
+    /// Invalidate the composed scanout state and add full structural damage
+    /// for exactly the recorded outputs of an owner-route unflip. The legacy
+    /// return intentionally keeps using `invalidate_all_scanout_damage` and
+    /// `mark_scene_structure_dirty`; this operation is the device-scoped
+    /// owner counterpart.
+    pub(crate) fn invalidate_scanout_damage_for_outputs(
+        &mut self,
+        output_keys: &[OutputKey],
+        platform: &PlatformBackend,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let mut affected = Vec::new();
+        for (output_idx, output) in platform.outputs.iter().enumerate() {
+            if !output_keys.iter().any(|key| key == &output.key) {
+                continue;
+            }
+            let Some(state) = inner.outputs.get_mut(output_idx) else {
+                continue;
+            };
+            state.damage.invalidate();
+            state.scene_structure_damage.add(vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: state.output_extent,
+            });
+            affected.push(output_idx);
+        }
+        if !affected.is_empty() {
+            self.scene_structure_dirty = true;
+        }
+    }
+
+    /// Take the scene-produced repaint proofs for one owner commit. Proofs
+    /// are emitted only by `retire_owner_damage_member` after the applied
+    /// branch; a member invalidated because its generation cannot be
+    /// confirmed never appears here.
+    pub(crate) fn take_owner_return_proofs(&mut self, commit: CommitKey) -> Vec<OutputKey> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        let mut proofs = Vec::new();
+        let mut index = 0;
+        while index < inner.owner_return_proofs.len() {
+            if inner.owner_return_proofs[index].0 == commit {
+                let (_, output_key) = inner.owner_return_proofs.swap_remove(index);
+                proofs.push(output_key);
+            } else {
+                index += 1;
+            }
+        }
+        proofs
     }
 
     pub(crate) fn rebuild_outputs(&mut self, platform: &PlatformBackend) -> Result<(), SceneError> {
@@ -1711,6 +1770,43 @@ impl SceneCompositor {
             return Err(ResourceError::InvalidState);
         };
         service.with_scanout_read(managed, |allocation| {
+            allocation
+                .file_owned()
+                .and_then(|file_owned| file_owned.fb_handle())
+                .or(bo_fb_handle)
+        })
+    }
+
+    /// Resolve the framebuffer retained by the current managed owner buffer.
+    ///
+    /// Owner scanout BOs have moved their physical backing into the resource
+    /// service, so the pool husk is not a framebuffer lookup source after
+    /// adoption.  The scene's current buffer is the composed return target
+    /// while direct scanout is active.
+    pub(crate) fn owner_current_framebuffer(
+        &self,
+        output_idx: usize,
+        bo_fb_handle: Option<framebuffer::Handle>,
+        service: &mut ResourceService,
+    ) -> Result<Option<framebuffer::Handle>, ResourceError> {
+        let Some(state) = self
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+        else {
+            return Err(ResourceError::InvalidState);
+        };
+        let Some(index) = Self::owner_current_index(state) else {
+            return Ok(None);
+        };
+        let Some(current) = state.owner_buffers.get(index) else {
+            return Err(ResourceError::InvalidState);
+        };
+        let read_lease = service.reserve(
+            current.identity().managed_key,
+            crate::kms::render::resources::UseKind::Read,
+        )?;
+        service.with_scanout_read(&read_lease, |allocation| {
             allocation
                 .file_owned()
                 .and_then(|file_owned| file_owned.fb_handle())
@@ -2284,6 +2380,8 @@ impl SceneCompositor {
             return;
         };
         let Some(transaction) = inner.owner_damage_transactions.remove(&commit) else {
+            #[cfg(test)]
+            eprintln!("missing owner transaction for hardware commit={commit:?}");
             return;
         };
         for member in transaction.members {
@@ -2382,7 +2480,7 @@ impl SceneCompositor {
                 }
                 continue;
             }
-            retire_owner_damage_member(inner, output_idx, member, store, platform);
+            retire_owner_damage_member(inner, output_idx, commit, member, store, platform);
         }
     }
 
@@ -2391,6 +2489,18 @@ impl SceneCompositor {
         self.inner
             .as_ref()
             .map_or(0, |inner| inner.owner_damage_transactions.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_owner_damage_generation_for_tests(&mut self, commit: CommitKey) {
+        if let Some(transaction) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.owner_damage_transactions.get_mut(&commit))
+            && let Some(member) = transaction.members.first_mut()
+        {
+            member.generation = member.generation.saturating_add(1);
+        }
     }
 
     #[cfg(test)]
@@ -2520,6 +2630,17 @@ impl SceneCompositor {
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))
             .map(|state| (state.damage.owes_repaint(), state.damage.has_staged_frame()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scene_structure_damage_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<Vec<vk::Rect2D>> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map(|state| state.scene_structure_damage.rects().to_vec())
     }
 
     /// Test-only snapshot of the complete scanout-damage observables for one
@@ -3650,6 +3771,7 @@ impl SceneCompositor {
 fn retire_owner_damage_member(
     inner: &mut SceneCompositorInner,
     output_idx: usize,
+    commit: CommitKey,
     member: OwnerDamageMember,
     store: &mut DrawableStore,
     platform: &mut PlatformBackend,
@@ -3662,6 +3784,7 @@ fn retire_owner_damage_member(
     }
 
     let OwnerDamageMember {
+        output_key,
         generation,
         drawable_snapshots,
         submitted_output_damage,
@@ -3727,6 +3850,7 @@ fn retire_owner_damage_member(
     if actually_sw_composed && platform.cursor_plane_note_composed_retirement(output_idx) {
         force_cursor_retry_repaint(state);
     }
+    inner.owner_return_proofs.push((commit, output_key));
 }
 
 fn handle_scanout_render_completion_inner(
