@@ -51544,7 +51544,11 @@ mod tests {
 
         let width = backend.platform.fb_w;
         let height = backend.platform.fb_h;
-        seed_bordered_window(backend, target_xid, None, 0, 0, width, height, border_width);
+        // A test that presents several candidates from one window (successive
+        // Presents of the same app) reuses the target; seed it once.
+        if !backend.windows.contains_key(&target_xid) {
+            seed_bordered_window(backend, target_xid, None, 0, 0, width, height, border_width);
+        }
         // Upstream #163: an unredirected candidate is direct-eligible only
         // while its top-level is the frontmost mapped window on the root.
         // Project the seeded window the way `sync_top_level_order` would.
@@ -51828,10 +51832,11 @@ mod tests {
             .scene
             .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
         let device = backend.platform.primary_device().expect("device").key;
-        let owner_candidate =
-            c0_direct_eligibility_candidate(&mut backend, 0xC401, 0xC402, 0xC403, 0);
+        // Bordered first: only the frontmost top-level stays eligible (#163).
         let owner_bordered =
             c0_direct_eligibility_candidate(&mut backend, 0xC401, 0xC404, 0xC405, 1);
+        let owner_candidate =
+            c0_direct_eligibility_candidate(&mut backend, 0xC401, 0xC402, 0xC403, 0);
         let owner_stale = yserver_core::backend::PresentScanoutCandidate {
             crtc_epoch: owner_candidate.crtc_epoch.saturating_sub(1),
             ..owner_candidate
@@ -52518,9 +52523,9 @@ mod tests {
         let (first_candidate, first_event) =
             c0_conv_cii_try_candidate(&mut backend, 0xC521, 0xC522, 0xC523, 21);
         let (second_candidate, second_event) =
-            c0_conv_cii_try_candidate(&mut backend, 0xC531, 0xC532, 0xC533, 31);
+            c0_conv_cii_try_candidate(&mut backend, 0xC521, 0xC532, 0xC533, 31);
         let (third_candidate, third_event) =
-            c0_conv_cii_try_candidate(&mut backend, 0xC541, 0xC542, 0xC543, 41);
+            c0_conv_cii_try_candidate(&mut backend, 0xC521, 0xC542, 0xC543, 41);
         assert!(
             backend
                 .try_present_direct(first_candidate, first_event)
@@ -52619,7 +52624,7 @@ mod tests {
         let (first_candidate, first_event) =
             c0_conv_cii_try_candidate(&mut backend, 0xC551, 0xC552, 0xC553, 51);
         let (second_candidate, second_event) =
-            c0_conv_cii_try_candidate(&mut backend, 0xC561, 0xC562, 0xC563, 61);
+            c0_conv_cii_try_candidate(&mut backend, 0xC551, 0xC562, 0xC563, 61);
         assert!(
             backend
                 .try_present_direct(first_candidate, first_event)
@@ -57099,9 +57104,9 @@ mod tests {
         } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         let (first_candidate, first_event) =
-            c0_conv_cii_try_candidate(&mut backend, 0xc961, 0xc962, 0xc963, 961);
+            c0_conv_cii_try_candidate(&mut backend, 0xc951, 0xc962, 0xc963, 961);
         let (successor_candidate, successor_event) =
-            c0_conv_cii_try_candidate(&mut backend, 0xc971, 0xc972, 0xc973, 971);
+            c0_conv_cii_try_candidate(&mut backend, 0xc951, 0xc972, 0xc973, 971);
         let first_result = backend.try_present_direct(first_candidate, first_event);
         assert_eq!(
             crate::drm::legacy_sink_entries_for_tests().len(),
