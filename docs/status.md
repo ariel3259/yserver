@@ -33,6 +33,21 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-21 Phase C.0 stage 2c-iii, plan Ciii Task 6 F8 stop — production
+  direct-framebuffer ownership is missing:** the real direct producer reaches
+  `register_commit_dependencies`, but supplies `CommitResources` with an empty
+  allocation set. Its M1 framebuffer/GEM import remains strongly owned by the
+  probe cache, and `DirectScanoutProbeFramebuffer::into_managed` still has no
+  production caller. A same-source successor can therefore retain its storage
+  lease but cannot carry the same framebuffer `AllocationKey`; P3-3 is
+  structurally unreachable on every device. This reopens the Stage 2c-i item
+  that left production adoption and weak cache indexing for the later producer
+  conversion. Before Task 6 resumes, a focused spec and reviewed plan must
+  define incarnation-scoped adoption, stable physical identity, the
+  producer-to-record handoff, rollback/terminal ownership, bounded role use and
+  production-path evidence. No hardware command ran. Plan Ciii and stage 2c-iii
+  remain open; details and the required spec boundary are in the
+  [F8 finding](superpowers/findings/2026-09-21-stage-2c-iii-plan-ciii-task6-f8.md).
 - **2026-09-20 Phase C.0 stage 2c-iii, plan Ciii-identity accepted:** commit
   identity is now device-qualified, which is a repair of a one-device assumption
   of stages 2c-i and 2c-ii rather than unflip work. Each `DeviceCommitOwner`
