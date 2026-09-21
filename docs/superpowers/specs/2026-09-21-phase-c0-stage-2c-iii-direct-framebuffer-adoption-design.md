@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-iii — direct framebuffer adoption and retention
 
-**Status:** design, revision 2 (2026-09-21). Its three design sections (the
+**Status:** design, revision 3 (2026-09-21). Its three design sections (the
 ownership boundary, the handoff and ownership table, the evidence) were
 approved one by one with the user in brainstorming, together with the scope
 decision of section 1.1. Revision 2 incorporates codex round 1
@@ -10,8 +10,15 @@ identity is the service's `AllocationKey` behind a live-checked index that is
 removed when its position retires (B-1); the adoption transaction has an
 intermediate owner and a defined failure exit (B-2); managed source storage is
 a prerequisite, adopted in production at preparation (M-1, new section 2.5);
-the evidence covers every consume arm and seam exit (M-2). The implementation
-plan follows the next review.
+the evidence covers every consume arm and seam exit (M-2).
+Revision 3 incorporates codex round 2
+(`../findings/2026-09-21-stage-2c-iii-direct-fb-adoption-review-round2.md`:
+1 blocking, 2 major, all verified and accepted): a failed FB/GEM cleanup keeps a
+retry-capable owner (B-1, 2.6); **storage is not adopted at preparation** —
+the source is retained by the present pin the frame already holds and the
+index uses a store-side backing identity (M-1, 2.5 rewritten); the index is
+removed on the allocation's direct-lease count reaching zero, kept by one
+component (M-2, 2.3). The implementation plan follows the next review.
 
 **Why this document exists.** Plan Ciii's Task 6 stopped with an F8
 (`../findings/2026-09-21-stage-2c-iii-plan-ciii-task6-f8.md`): the real direct
@@ -94,22 +101,35 @@ and the prepared candidate holds an `AllocationLease` on it from then on. The
 cache entry becomes **`Managed`**: it stays as an index (so a later Present of
 the same source finds the adoption) and its `Drop` destroys nothing. The
 transaction's order, its intermediate owner and its two failure exits are
-fixed in 2.6; the source storage it needs is 2.5's.
+fixed in 2.6; the source retention it needs is 2.5's.
 
 **2.3. Stable physical identity (round-1 B-1).** The identity of a managed
 framebuffer **is the service's `AllocationKey`** — device, incarnation and
 generation (`resources/mod.rs:398`) — nothing else. The cache index maps
-`(source_id, source storage `AllocationKey`, topology generation)` to a
+`(source DrawableId, the source's backing serial, topology generation)` to a
 **live-checked token** of that allocation (a weak reference the service can
-refuse to upgrade), never to a strong owner. Lookup succeeds only if the token
-upgrades to a live allocation of the **current** incarnation; a mismatch, a
-failed upgrade or a different topology generation forces a fresh probe and
-import, which never aliases the previous one. The index entry is **removed**
-when the allocation's last direct role retires and on incarnation loss (2c-i:
-"remove the index when its position retires"); it never outlives the
-allocation. A second candidate whose lookup succeeds reuses the same allocation
-with a new lease. This is what makes P3-3 observable: the successor carries the
-same `AllocationKey` as the current commit.
+refuse to upgrade), never to a strong owner. The **backing serial** is a
+store-side identity of the drawable's storage that changes on every storage
+replacement (relayout, re-import, migration) and never repeats; if the store
+does not carry one today, the plan adds it to the drawable and bumps it at
+every site that replaces `storage`. Lookup succeeds only if the token upgrades
+to a live allocation of the **current** incarnation; a mismatch, a failed
+upgrade or a different topology generation forces a fresh probe and import,
+which never aliases the previous one.
+
+**Removal (round-2 M-2).** One component owns the allocation-correlated count:
+the commit consumer, which already sees every direct-role transition, keeps a
+count of live direct-role leases **per `AllocationKey`**. The index entry is
+removed on that count's `1 → 0` transition (the allocation's last direct role
+retired — 2c-i: "remove the index when its position retires"), on incarnation
+loss, and when the source drawable is dropped (the existing removal site). A
+`2 → 1` transition (a same-source successor terminalized while the current
+commit still scans the allocation) keeps the index, so the next same-source
+successor still reuses the current allocation. The capacity's role slots
+(`capacity.rs:29`) record no allocation identity and are not extended for
+this. A second candidate whose lookup succeeds reuses the same allocation with
+a new lease. This is what makes P3-3 observable: the successor carries the same
+`AllocationKey` as the current commit.
 
 **2.4. The cache is shared by both routes.** The probe runs before the fork, so
 Legacy sees the same entries. Invariants: a `Managed` entry serves no raw
@@ -119,20 +139,34 @@ were reached it fails closed. Evicting a `Managed` entry
 (`MAX_M1_PROBE_CACHE_ENTRIES`, `backend.rs:541`) removes the index and touches
 the allocation not at all.
 
-**2.5. Managed source storage is a prerequisite (round-1 M-1).**
-`into_managed` requires a non-optional source `AllocationLease`
-(`modeset.rs:1426`), and the index key of 2.3 needs the source storage's
-`AllocationKey`. Today `pin_direct_source` (`backend.rs:2521`) obtains a lease
-only when the drawable's backing is already `Managed`, and **no production path
-adopts storage** (`Storage::into_managed`, `store.rs:606`, has test callers
-only). So, on an Owner device, preparation first adopts the candidate's source
-storage into the service through that existing entry when it is not managed
-yet, and takes the source pin lease from it; framebuffer adoption follows and
-receives that lease. The storage generation of the key is the generation of
-exactly that lease's `AllocationKey`. If storage adoption fails, the candidate
-is rejected as `framebuffer_missing` is today, before any framebuffer
-transaction begins, and the drawable keeps its legacy backing. The fallback
-target's storage is adopted the same way. Legacy devices adopt nothing.
+**2.5. The source is retained by the frame's present pin; storage is not
+adopted (round-1 M-1, round-2 M-1).** `into_managed` today takes a
+non-optional source `AllocationLease` (`modeset.rs:1426`), but the
+`DirectFramebufferAllocation` it builds stores it as `Option`
+(`drm_cleanup.rs:548`). Adopting the source storage at preparation is **not**
+the answer: `Storage::into_managed` (`store.rs:606`) turns the drawable's
+backing `Managed`, and consumers that still dereference raw storage — the
+root extent lookup (`backend.rs:14005`), the direct-read/GetImage routing
+(`backend.rs:17814`) — panic on a `Managed` backing (`store.rs:132`). The
+managed-storage access adaptation is a separate item; this document records
+it as **open** (2c-i's managed storage contract, owed before the Owner route
+is production-active) and does not depend on it.
+
+Instead: the right that keeps the imported dma-buf alive while the framebuffer
+scans it out is the **present-source pin** the direct frame already holds by
+value from preparation to release (2c-iii §5.4, F13b-D1), the same right the
+Legacy route relies on today. The plan gives `into_managed` an entry that
+takes `Option<AllocationLease>`: `Some` when the source drawable's backing is
+already managed by this device's service (then the lease is the
+`share_storage_read` that `pin_direct_source`, `backend.rs:2521`, already
+takes), `None` otherwise. A `None` never weakens retention: the pin is
+released only by the ledger's release path, after the framebuffer lease. The
+fallback target is treated the same way. Legacy devices change nothing.
+
+**Multi-device.** The framebuffer allocation belongs to the service of the
+device the candidate's CRTC is on (2c-iii §6.2); the source drawable is
+device-agnostic and is only *pinned*, never adopted, so no other device's
+service is ever asked for a lease on it.
 
 **2.6. The adoption transaction (round-1 B-2).** `into_managed` registers the
 cleanup right in the registry **before** the service adopts the payload, and
@@ -151,11 +185,23 @@ fixed:
 
 If step 3 fails despite step 1, the returned payload is not dropped and the
 cache is **not** reconstructed as a strong owner (that would be two cleanup
-authorities): the payload is handed to the registry's own cleanup as its sole
-owner, which releases FB, GEM and right exactly once; the index is not written;
-the candidate is rejected; the next Present of that source re-probes. That
-failure is a service-level fault, so it also closes admission on the device,
-as a lock mismatch does (2c-ii §7).
+authorities). The payload is handed to the registry's cleanup, which releases
+FB, GEM and right exactly once on success; the index is not written; the
+candidate is rejected; the next Present of that source re-probes. That failure
+is a service-level fault, so it also closes admission on the device, as a lock
+mismatch does (2c-ii §7).
+
+**Cleanup itself is fallible (round-2 B-1).** `discharge_file_owned`
+(`drm_cleanup.rs:613`) puts the right back into the payload when `consume`
+fails — frozen family, `RMFB` or `GEM_CLOSE` error — and today nothing retains
+such a payload. So the registry gains a bounded **pending-cleanup owner**: a
+payload whose cleanup failed is retained there, with its right and its
+`Preparing` charge, until a later cleanup attempt succeeds (the registry's own
+R3 retry, resuming from `FramebufferRemoved`) or the existing teardown barrier
+takes ownership of the whole family. It is never dropped and never
+reconstructed as a cache owner; the capacity charge is released only with the
+payload. This is the 2c-i rule that uncertain cleanup retains its position
+while the transport closes.
 
 ## 3. Handoff and the ownership table
 
@@ -183,6 +229,7 @@ what permits FB/GEM cleanup:
 | Adoption refused before `into_managed` (2.6 step 1) | cache (strong) | cache (strong); candidate rejected, `Preparing` cancelled | as today |
 | Adoption | cache (strong) | service; cache = index; lease in `Preparing` | never while a lease exists |
 | Service adoption fails after `into_managed` (2.6 step 3) | payload (sole) | registry cleanup (sole), index absent, admission closed | the registry, exactly once |
+| Cleanup of that payload fails (`RMFB`/`GEM_CLOSE`/frozen) | registry cleanup | registry pending-cleanup owner, `Preparing` charge kept | a later successful retry, or the teardown barrier |
 | Successor replacement | lease in `Successor` | lease dropped (never-submitted path); the allocation persists if another lease holds it | the last lease release |
 | Capacity / `begin` / pre-IPC refusal | lease on the candidate | lease back on the candidate → `Desired`, exactly once | — |
 | Kernel rejection | commit's `allocations` | `ResourcesStillCurrent` returns the old; the new goes to `rejected` and its lease is released | lease release |
@@ -190,7 +237,8 @@ what permits FB/GEM cleanup:
 | Reuse (same-source successor) | same key in `Current` | the retained allocation registers **no** obligation (P3-3) | — |
 | `CompletionUnknown` / quarantine | commit | retained in quarantine, never released here | stage 3's teardown barrier |
 | Cache eviction | `Managed` index | index gone; allocation unchanged | — |
-| Last direct role retires / incarnation lost | live index | index removed; the allocation follows its own release | — |
+| Direct-lease count `1 → 0` / incarnation lost / source drawable dropped | live index | index removed; the allocation follows its own release | — |
+| Direct-lease count `2 → 1` (successor terminalized, current still scanning) | live index | index kept | — |
 | Topology change / device loss / teardown | live leases | new imports get a different key; live leases follow the existing fd-family barrier | `Superseded` by the barrier |
 
 **3.4. Cleanup exactly once.** A managed framebuffer is destroyed only when the
@@ -217,10 +265,12 @@ break its named test:
 | FB/GEM cleanup happens exactly once, by the registry | also destroy in the entry's `Drop` |
 | Legacy gets no handle from a `Managed` entry | serve the handle anyway |
 | Registry and service are installed together, same incarnation | install the service alone |
-| Source storage is adopted at preparation on an Owner device, and the pin lease comes from it (2.5) | skip storage adoption and pass an empty lease |
+| The framebuffer's source retention is the frame's present pin; storage is never adopted at preparation; a managed source passes its read lease (2.5) | release the pin before the framebuffer lease; adopt the storage at preparation (a raw-storage consumer must then panic in the test) |
+| The index key uses the backing serial: a relayout/re-import of the source changes it (2.3) | key by DrawableId alone |
 | The index holds a live-checked token; a stale or foreign-incarnation entry forces a fresh probe (2.3) | upgrade the token without checking the incarnation |
-| The index is removed when the last direct role retires (2.3) | keep the index past retirement |
+| The index is removed on the direct-lease count's `1 → 0` and kept on `2 → 1` (2.3) | remove on `2 → 1`; never remove |
 | Service adoption failure after `into_managed` releases exactly once through the registry and closes admission (2.6) | drop the returned payload; reconstruct the cache as strong owner |
+| A failed cleanup (forced `RMFB` and forced `GEM_CLOSE` failure, each) retains the payload in the pending-cleanup owner with its charge, and a later retry releases exactly once (2.6) | drop the payload on cleanup failure; release the `Preparing` charge before cleanup succeeds |
 | Both completion orders keep one lease owner: `HardwareComplete` before and after `CompletionRetired` (round-1 M-2) | discharge the framebuffer's obligation at `HardwareComplete` when no retirement recorded it |
 | `ResourcesStillCurrent` returns the framebuffer lease to current; `ResourcesReleased` releases it (M-2) | drop the lease on `ResourcesStillCurrent` |
 | Unknown / quarantine retains the lease, never releases it (M-2) | release it on `CompletionUnknown` |
@@ -237,8 +287,9 @@ to the registration helper substitutes for that route.
 
 One plan, five tasks, reviewed by codex before implementation and implemented by
 codex unsandboxed (the Vulkan fixture needs the GPU): (1) the registry beside
-the service; (2) managed source storage at preparation (2.5); (3) framebuffer
-adoption, the transaction of 2.6 and the live-checked index of 2.3; (4) the
+the service and its pending-cleanup owner; (2) the backing serial and the
+live-checked index with its count-driven removal (2.3); (3) framebuffer
+adoption with the optional source lease and the transaction of 2.6; (4) the
 handoff into the ledger and every row of section 3.3; (5) the tests of
 section 4.2.
 
