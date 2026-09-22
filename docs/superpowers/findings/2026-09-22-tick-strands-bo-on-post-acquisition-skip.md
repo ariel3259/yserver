@@ -1,14 +1,30 @@
 # The compose tick strands a scanout BO on any post-acquisition skip
 
-**Status:** confirmed on hardware 2026-09-22, during plan Cp task 8's
-cross-device run. Upstream code; **we own the fix too** (user, 2026-09-22:
-"si nos afecta, también es responsabilidad nuestra").
+**Status:** confirmed on hardware 2026-09-22 during plan Cp task 8's
+cross-device run. **RECLASSIFIED 2026-09-22 after the implementer F8'd on this
+document's own claim: the defect is OURS outright, not upstream's, and there is
+no upstream PR to send.** The original classification is kept below with the
+correction, because the mistake is instructive.
 
-**Where:** `crates/yserver/src/kms/render/scene.rs`, the composite tick.
-Blame: Jos Dehaes, commit `02bafec3` (2026-09-03, "damage-clipped repaint for
-non-composited desktops"). The tick is shared by every route — Legacy and
-Owner, shared and copied pools — so this is not C.0-specific and it affects
-production today.
+**Where:** the managed acquisition in `crates/yserver/src/kms/render/platform.rs`
+and the early returns of the composite tick in `scene.rs`.
+
+**The correction (implementer F8, verified by the coordinator).** This document
+first claimed the defect reaches production through the Legacy route, because
+the tick is shared. That is false. `acquire_scanout_bo`, the Legacy
+acquisition (`platform.rs:6423`), only *selects* a bo whose phase is `Free` and
+returns a token — **it does not transition the phase**. Legacy's transitions
+happen inside the render helpers, immediately before rendering
+(`scene.rs:10208` shared, `:10531` copied), so a Legacy skip cannot strand
+anything: the bo stays `Free` and the next tick takes it again.
+
+Only `acquire_managed_scanout_bo` transitions `Free -> Recording` at
+acquisition (`platform.rs:6744`), and that transition is **ours** — B-13, from
+stage 2c-i, whose comment says it exists so "legacy `acquire_scanout_bo` can
+[not] hand out the same index while this managed token is live". So we
+introduced a phase whose lifetime spans code paths that were never written to
+roll it back. Upstream's skip branches are unchanged and correct for their own
+route; there is nothing to file upstream.
 
 ## The defect
 
@@ -58,79 +74,58 @@ deterministic one.
 
 It also reaches production today through the Legacy route, independently of C.0.
 
-## Why we took responsibility, and the rule this sets for stages 3 and 4
+## Why this is ours, and what the criterion still gives stages 3 and 4
 
-The user's criterion (2026-09-22): **"si nos afecta, también es responsabilidad
-nuestra"** — upstream authorship decides who *wrote* a defect, not who must fix
-it. What decides ours is whether it touches what we are building. This one met
-three tests, and future cases should be judged by the same three:
+The user's criterion (2026-09-22) — **"si nos afecta, también es
+responsabilidad nuestra"** — was written here against three tests. This case
+now meets them differently than first recorded, and the difference is the
+lesson:
 
-1. **It bites our route now.** It stranded a destination on the Owner copied
-   route during the cross-device hardware run. Not hypothetical, observed.
-2. **It keeps biting after our own fix.** Our descriptor-slot leak made the
-   exhaustion certain; removing it makes the exhaustion occasional, and every
-   occasional exhaustion still strands a buffer permanently. Fixing only our
-   half would have converted a deterministic failure into an intermittent one —
-   strictly harder to diagnose, and easy to mistake for flakiness later.
-3. **It reaches production through the shared path.** The tick is common to
-   Legacy and Owner, so the defect ships today, independently of C.0.
+1. **It bites our route now.** Still true: it stranded a destination on the
+   Owner copied route during the cross-device hardware run.
+2. **It keeps biting after our own related fix.** Still true: the
+   descriptor-slot fix makes exhaustion occasional rather than certain, and
+   every occasional exhaustion still strands a buffer permanently — a
+   deterministic failure turned into an intermittent one.
+3. **~~It reaches production through the shared path.~~ FALSE.** Legacy never
+   transitions at acquisition, so Legacy cannot strand. This defect lives only
+   on the managed route.
 
-Contrast with the Legacy dormancy bug (`walked()`, Jos, `6e1ba09b`), which was
-left to upstream: it fails none of the three. It does not touch the converted
-routes, our work neither triggers nor masks it, and nothing we are building
-depends on it. That is the line.
+Test 3 was the one that made it look like upstream's problem to fix. With it
+gone, ownership is simpler, not harder: **the hazard is created by our own
+B-13 transition**, so the defect is ours by authorship as well as by reach, and
+the "addendum" framing does not apply — this is C.0 scope.
 
-**Why this matters for the rest of C.0.** Stages 3 and 4 convert lifecycle,
-modeset, DPMS, VT, topology, cursor and gamma — paths that are shared with the
-Legacy route and largely upstream-authored, far more so than the producers
-stage 2 converted. Defects of exactly this shape will surface again, and the
-default answer should not be re-argued each time:
-
-- a defect in upstream code that the conversion **reaches** is ours to fix,
-  in its own commit, portable upstream as its own PR, and named as an addendum
-  rather than as stage scope;
-- a defect in upstream code the conversion **does not reach** is reported with
-  its reproduction and left upstream;
-- the distinction is made on the three tests above, not on who wrote the file.
-
-The cost asymmetry is what justifies the default. Fixing an upstream defect we
-reach costs one small commit. Not fixing it costs an intermittent stall inside a
-route we are simultaneously rewriting, where every future failure has two
-candidate explanations instead of one — and stages 3 and 4 are where that
-ambiguity would be most expensive, because their failures are lifecycle
-failures: a device that will not light, a VT that will not come back.
+**What stages 3 and 4 should take from it.** The criterion stands for future
+cases, and so does the contrast with the Legacy dormancy bug (`walked()`, Jos,
+`6e1ba09b`), which meets none of the three and was rightly left upstream. But
+the process lesson is sharper than the rule: **this document asserted a
+mechanism across a code path it had not read, and the implementer caught it by
+refusing to code against an assumption that did not hold.** Stages 3 and 4
+convert lifecycle, modeset, DPMS, VT and topology — paths far more entangled
+with Legacy than stage 2's producers — so the temptation to reason "the tick is
+shared, therefore Legacy is affected" will recur constantly. Read the Legacy
+arm before asserting anything about it; being wrong in the safe direction
+(claiming upstream owns something we own) still costs a round trip and would
+have produced a filed issue that upstream would have had to reject.
 
 ## Disposition
 
-1. Fix it in this branch, covering **every** fallible return between acquisition
-   and render submission, not only `NoPool` — the sibling-site lesson this
-   session has already paid for twice.
-2. Keep it in its own commit so it can be sent upstream as its own PR, as was
-   done for the accel-profile width bug (#116) and the GLX defects (#118-#120).
-3. The upstream report carries this document's evidence block verbatim.
+1. Fix it in this branch, covering **every** fallible return between the
+   managed acquisition and render submission — the implementer enumerated
+   **twelve** such exits in `tick_one_output`, from audit-pipeline and
+   damage-audit errors through `NoPool`, the fence ticket, device and pool
+   lookups, to the copied source and destination lookups. The sibling-site
+   lesson this session has already paid for twice applies to all twelve.
+2. Use the helper that already exists: `cancel_scanout_bo_recording`
+   (`platform.rs:6987`), which the render-result failure path already calls
+   when GPU submission has not happened (`scene.rs:7260`). The acquisition's
+   temporary leases are dropped before these exits; its pool registration is
+   persistent and stays.
+3. **No upstream PR.** The correction above removes the reason for one.
 
-## Ready-to-file upstream issue text
+## Withdrawn: the upstream issue text
 
-> **The composite tick can strand a scanout BO when a step after acquisition
-> skips the frame**
->
-> `acquire_scanout_bo` / `acquire_managed_scanout_bo` transition the selected
-> destination from `Free` to `Recording` and the tick owns that transition
-> (B-13). Some fallible steps that run after it return early without restoring
-> the phase — the descriptor-pool exhaustion branch is the one we observed,
-> returning `Skipped(NoPool)` — while the fence-ticket failure path a few lines
-> below does release its own resource.
->
-> Because selection only ever accepts `Free` buffers, a destination left in
-> `Recording` is never chosen again and nothing else moves it: no owner buffer,
-> no completion waiter. A transient shortage therefore becomes a permanent
-> one-buffer-smaller pool.
->
-> Observed on a cross-device (PRIME) copied scanout route on real hardware: a
-> single `NoPool` skip stranded one of three destinations, after which 1441
-> consecutive ticks skipped with `NoBO` until the test deadline. The acquisition
-> and the skip were recorded with the same tick id.
->
-> Suggested fix: restore the acquired BO's phase on every fallible return
-> between acquisition and render submission, following the pattern the
-> fence-ticket path already uses for its own resource.
+An issue text was drafted here while the defect was believed to reach Legacy.
+It is withdrawn — Legacy does not transition at acquisition and has no defect
+to report. Kept only as the record of a claim this document made and corrected.

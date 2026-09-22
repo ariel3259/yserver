@@ -121,6 +121,18 @@ Cross-cutting bugs and followups that don't fit a stage live in
   A pipe-backed, non-GPU recorder test closes one sample for each transport.
   The hardware test was not rerun; the new per-boundary output is needed to
   confirm no other boundary is absent on that path.
+- **2026-09-22 composed Owner descriptor-pool slot leak fixed.** `Desired ->
+  Submitted` now preserves its descriptor slot, allowing the existing
+  `take_owner_composed_resources` admission path to return it after the render
+  completion drain. `CompositePoolRing::release` resets the descriptor pool,
+  invalidating its sets; the GPU compose fence has completed at this point and
+  KMS scans the resulting BO rather than using those sets. The deterministic
+  `c0_conv_cp_desired_to_submitted_preserves_descriptor_slot` test and the
+  four-frame Vulkan Owner fixture pass in debug and release. Replacing the
+  transition with the leak made frame four hit `NoPool`; moving release before
+  render completion failed while compose work still held the pool. The separate
+  `Skipped(NoPool)` rollback after `Free -> Recording` remains unmodified. The
+  coordinator still owns any hardware rerun.
 
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
