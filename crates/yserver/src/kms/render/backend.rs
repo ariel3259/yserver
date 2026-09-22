@@ -65153,4 +65153,609 @@ mod tests {
         c0_conv_cii_page_flip_direct_owner(&mut fixture.backend, device, 0, 1_100, 1, 100_000);
         assert_eq!(fixture.backend.core.top_level_order, vec![target_xid]);
     }
+
+    #[test]
+    #[ignore = "needs live DRM master and Vulkan ICD"]
+    fn c0_hw_ciii_owner_route_on_card1_drm() {
+        use std::{
+            collections::BTreeMap,
+            os::fd::{AsFd, AsRawFd},
+            path::PathBuf,
+            time::{Duration, Instant},
+        };
+
+        use crate::kms::{
+            executor::{ObservedOutcome, protocol::HostCallCorrelation},
+            render::resources::{DrmCleanupRegistry, ResourceService},
+        };
+
+        let card1 = PathBuf::from("/dev/dri/card1");
+        if let Err(error) = std::fs::metadata(&card1) {
+            eprintln!("environmental skip: /dev/dri/card1 is unavailable: {error}");
+            return;
+        }
+
+        // The live fixture chooses the primary node reported by Vulkan and
+        // takes master itself. Probe that choice before calling it so a card0
+        // selection can never modeset the wrong display.
+        let probe =
+            super::KmsBackend::for_tests_with_vk_live_scene_real_drm().unwrap_or_else(|error| {
+                panic!("card1 hardware test cannot initialize Vulkan/DRM: {error}")
+            });
+        // The live-scene fixture's device key is a placeholder (its test
+        // device is not the node Vulkan rendered on); the identity that
+        // `for_tests_with_live_kms` opens and takes master on is the primary
+        // Vulkan reports through VK_EXT_physical_device_drm, so preflight that.
+        let probe_key = probe
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .expect("Vulkan must report a primary DRM node for the card1 preflight");
+        let probe_path = super::card_path_for_key(probe_key).unwrap_or_else(|error| {
+            panic!("cannot map Vulkan primary {probe_key} to card1: {error}")
+        });
+        assert_eq!(
+            probe_path, card1,
+            "card1 hardware test would use {probe_path:?}; refusing to acquire master on another card"
+        );
+        drop(probe);
+
+        let mut fixture = super::KmsBackend::for_tests_with_live_kms().unwrap_or_else(|error| {
+            panic!(
+                "card1 hardware test could not acquire DRM master or build the live KMS fixture: {error}"
+            )
+        });
+        let backend = &mut fixture.backend;
+        backend.resource_cleanup_on_drop_for_tests = true;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("live KMS fixture has a primary device")
+            .key;
+        let device_rc = backend
+            .platform
+            .device_for_key(device)
+            .expect("live KMS fixture retained card1")
+            .device
+            .clone();
+        let actual_path = super::card_path_for_key(device).unwrap_or_else(|error| {
+            panic!("cannot map live KMS primary {device} to card1: {error}")
+        });
+        assert_eq!(
+            actual_path, card1,
+            "live KMS fixture selected {actual_path:?} after the card1 preflight"
+        );
+
+        // KmsIoExecutor inherits the master-held primary fd. The Owner gate,
+        // conductor, service, and registry below are the same production
+        // writer-coverage path as the real backend; only the old test fixture
+        // helper is replaced with this fd-inheriting executor.
+        let executor = crate::kms::executor::KmsIoExecutor::spawn(
+            device_rc.as_fd(),
+            crate::kms::owner::identity::IncarnationId::first(),
+        )
+        .unwrap_or_else(|error| panic!("cannot spawn card1 KMS helper: {error}"));
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+
+        let mut registry = DrmCleanupRegistry::new(device_rc, device, incarnation);
+        let mut service = ResourceService::new(device, incarnation);
+        for output_idx in 0..backend.platform.scanout_pools.len() {
+            let bo_count = backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .map_or(0, |scanout| scanout.display_pool().bos.len());
+            for bo_idx in 0..bo_count {
+                backend
+                    .platform
+                    .register_managed_scanout_bo(&mut service, &mut registry, output_idx, bo_idx)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "card1 writer-coverage adoption failed for output {output_idx} BO {bo_idx}: {error:?}"
+                        )
+                    });
+            }
+        }
+        backend.install_resource_service_with_registry(service, registry);
+        install_admission_owner_gate(backend, device);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+
+        let drm_fd = backend
+            .platform
+            .device_for_key(device)
+            .expect("card1 device")
+            .device
+            .as_fd()
+            .as_raw_fd();
+        let mut milestones: Vec<(crate::kms::owner::identity::CommitId, &'static str)> = Vec::new();
+        let accepted_fence_counts = Rc::new(RefCell::new(Vec::new()));
+        let accepted_fence_counts_for_drive = Rc::clone(&accepted_fence_counts);
+        {
+            let mut drive_until =
+                |backend: &mut super::KmsBackend,
+                 label: &str,
+                 done: &dyn Fn(&super::KmsBackend) -> bool| {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while Instant::now() < deadline {
+                        let now = Instant::now();
+                        let tick_events = backend.platform.tick_executors(now);
+                        backend.record_host_call_events(tick_events);
+                        let executor_events = backend.platform.drain_executor_events();
+                        backend.record_host_call_events(executor_events);
+                        for observation in backend.drained_host_call_events_for_tests() {
+                            let HostCallCorrelation::Atomic { commit, .. } =
+                                observation.correlation
+                            else {
+                                continue;
+                            };
+                            if !observation.late
+                                && let ObservedOutcome::Accepted { fence_count, .. } =
+                                    observation.kind
+                            {
+                                milestones.push((commit, "Accepted"));
+                                accepted_fence_counts_for_drive
+                                    .borrow_mut()
+                                    .push((commit, fence_count));
+                            }
+                        }
+
+                        if let Some(service) = backend.resource_service.as_mut() {
+                            service.service_completions(now).unwrap_or_else(|error| {
+                                panic!("{label}: service completion failed: {error:?}")
+                            });
+                        }
+                        for (device_key, events) in backend.platform.service_owner_completions(now)
+                        {
+                            for event in &events {
+                                match event {
+                                    crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                                        commit,
+                                    } => {
+                                        milestones.push((*commit, "HardwareComplete"));
+                                    }
+                                    crate::kms::owner::device::OwnerEvent::Presented {
+                                        commit,
+                                        ..
+                                    } => {
+                                        milestones.push((*commit, "Presented"));
+                                    }
+                                    crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                                        commit,
+                                        ..
+                                    } => {
+                                        milestones.push((*commit, "CompletionRetired"));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let event_debug = format!("{events:?}");
+                            assert!(
+                                backend.route_owner_event_batch(device_key, events, now),
+                                "{label}: owner completion batch was not consumed: {event_debug}"
+                            );
+                        }
+
+                        let (drm_events, drain_result) =
+                            backend.platform.drain_owner_events(drm_fd, now);
+                        if let Err(error) = drain_result {
+                            panic!("{label}: bounded DRM event drain failed: {error}");
+                        }
+                        let mut grouped = BTreeMap::<
+                            crate::platform::drm::DrmDeviceKey,
+                            Vec<
+                                crate::kms::owner::device::OwnerEvent<
+                                    crate::kms::render::resources::CommitResources,
+                                >,
+                            >,
+                        >::new();
+                        for (device_key, event) in drm_events {
+                            match &event {
+                                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                                    commit,
+                                } => {
+                                    milestones.push((*commit, "HardwareComplete"));
+                                }
+                                crate::kms::owner::device::OwnerEvent::Presented {
+                                    commit, ..
+                                } => {
+                                    milestones.push((*commit, "Presented"));
+                                }
+                                crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                                    commit,
+                                    ..
+                                } => {
+                                    milestones.push((*commit, "CompletionRetired"));
+                                }
+                                _ => {}
+                            }
+                            grouped.entry(device_key).or_default().push(event);
+                        }
+                        for (device_key, events) in grouped {
+                            let event_debug = format!("{events:?}");
+                            assert!(
+                                backend.route_owner_event_batch(device_key, events, now),
+                                "{label}: DRM owner event batch was not consumed: {event_debug}"
+                            );
+                        }
+                        backend.service_direct_framebuffer_edges(now, false);
+                        if done(backend) {
+                            return;
+                        }
+
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let timeout_ms = remaining.as_millis().clamp(1, 10) as libc::c_int;
+                        let mut poll_fd = libc::pollfd {
+                            fd: drm_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let poll_result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+                        if poll_result < 0
+                            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                        {
+                            panic!(
+                                "{label}: bounded DRM wait failed: {}",
+                                std::io::Error::last_os_error()
+                            );
+                        }
+                    }
+                    panic!("{label}: timed out after 15 seconds waiting for real Owner milestones");
+                };
+
+            // The direct target must carry real storage: the unflip's shadow
+            // materialization copies the direct source into this window's
+            // backing, and `seed_bordered_window`'s null test storage is a
+            // VK_NULL_HANDLE image there (found on card1, 2026-09-22). Use the
+            // production allocation and map so the backing is a real image.
+            let target_xid = 0xc0_1110;
+            let target_width = backend.platform.fb_w;
+            let target_height = backend.platform.fb_h;
+            backend.allocate_window_storage(
+                target_xid,
+                0,
+                0,
+                target_width,
+                target_height,
+                0,
+                24,
+                None,
+                None,
+            );
+            <super::KmsBackend as Backend>::map_subwindow(backend, None, target_xid)
+                .expect("map the direct target window");
+            backend.core.top_level_order = vec![target_xid];
+
+            let damage_history_before = backend.scene.damage_history_len_for_tests(0);
+            backend.scene.mark_scene_structure_damage_rect(
+                0,
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(target_width),
+                        height: u32::from(target_height),
+                    },
+                },
+            );
+            backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+            backend.platform.wait_idle_bounded();
+            backend.drain_scanout_render_completions_for_tests();
+            let composed_commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("composed owner record")
+                .commit_id();
+            let composed_key = match backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("composed owner record")
+                .ledger()
+            {
+                crate::kms::owner::ledger::LedgerState::Submitted(submitted) => submitted
+                    .new_resources()
+                    .first()
+                    .and_then(|resources| resources.allocations.first())
+                    .expect("composed managed allocation")
+                    .key(),
+                state => panic!("composed commit is not submitted: {state:?}"),
+            };
+            drive_until(backend, "composed frame", &|backend| {
+                backend.device_owner_for_tests(0).live_record().is_none()
+                    && backend
+                        .commit_consumer
+                        .current_resources
+                        .iter()
+                        .any(|resources| resources.direct_role.is_none())
+            });
+            assert!(
+                backend
+                    .scene
+                    .damage_state_for_tests(0)
+                    .is_some_and(|(_, staged)| !staged),
+                "composed HardwareComplete must apply and clear the staged damage"
+            );
+            assert!(
+                backend.scene.damage_history_len_for_tests(0) > damage_history_before,
+                "composed HardwareComplete must apply the damaged scene"
+            );
+
+            let mut first = owner_direct_candidate_with_real_import(backend, 201)
+                .expect("real Vulkan-rendered PRIME import and ADDFB2");
+            first.candidate.dst_window_xid = target_xid;
+            first.candidate.paint_dst_host_xid = target_xid;
+            first.candidate.completion_dst_host_xid = target_xid;
+            first.event.dst_host_xid = target_xid;
+            c0_conv_cii_prepare_owner_clock(
+                backend,
+                device,
+                0,
+                yserver_core::backend::PresentClockSample {
+                    msc: 201,
+                    ust: 201_000,
+                    source: yserver_core::backend::PresentClockSource::IdleSequence,
+                },
+            );
+            assert!(
+                backend
+                    .admission_offer_direct(
+                        device,
+                        first.source_id,
+                        first.candidate,
+                        first.event.clone()
+                    )
+                    .expect("first direct offer")
+            );
+            assert!(matches!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ));
+            let first_commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("first direct owner record")
+                .commit_id();
+            let first_key = match backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("first direct owner record")
+                .ledger()
+            {
+                crate::kms::owner::ledger::LedgerState::Submitted(submitted) => submitted
+                    .new_resources()
+                    .first()
+                    .and_then(|resources| resources.allocations.first())
+                    .expect("first direct framebuffer allocation")
+                    .key(),
+                state => panic!("first direct commit is not submitted: {state:?}"),
+            };
+            assert!(
+                backend
+                    .resource_service
+                    .as_ref()
+                    .expect("real resource service")
+                    .has_pending_obligations(&composed_key),
+                "displaced composed allocation must be registered before first direct completion"
+            );
+            drive_until(backend, "first direct frame", &|backend| {
+                backend.device_owner_for_tests(0).live_record().is_none()
+                    && backend.scanout_m2.current.as_ref().is_some_and(|frame| {
+                        frame.commit_id
+                            == Some(crate::kms::render::resources::CommitKey::new(
+                                device,
+                                first_commit,
+                            ))
+                    })
+            });
+            assert!(
+                accepted_fence_counts
+                    .borrow()
+                    .iter()
+                    .any(|(commit, count)| *commit == first_commit && *count > 0),
+                "first direct commit must have an Accepted out-fence"
+            );
+            assert!(
+                !backend
+                    .resource_service
+                    .as_ref()
+                    .expect("real resource service")
+                    .has_pending_obligations(&composed_key),
+                "first direct PriorBufferReleased must discharge the displaced composed allocation"
+            );
+            let (first_source_pin, first_fallback_pin) = {
+                let frame = backend
+                    .scanout_m2
+                    .current
+                    .as_ref()
+                    .expect("direct A current");
+                (frame.source_pin, frame.fallback_target_pin)
+            };
+
+            let mut second_candidate = first.candidate;
+            second_candidate.present_id = 202;
+            let mut second_event = first.event;
+            second_event.present_id = 202;
+            second_event.serial = 202;
+            assert!(
+                backend
+                    .admission_offer_direct(device, first.source_id, second_candidate, second_event)
+                    .expect("same-source direct offer")
+            );
+            let second_outcome = backend.admission_wake(device, false);
+            assert!(
+                matches!(
+                    second_outcome,
+                    crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+                ),
+                "same-source direct outcome: {second_outcome:?}, capacity={:?}",
+                backend.commit_consumer.capacity
+            );
+            let second_commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("same-source direct owner record")
+                .commit_id();
+            let second_key = match backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("same-source direct owner record")
+                .ledger()
+            {
+                crate::kms::owner::ledger::LedgerState::Submitted(submitted) => submitted
+                    .new_resources()
+                    .first()
+                    .and_then(|resources| resources.allocations.first())
+                    .expect("same-source direct framebuffer allocation")
+                    .key(),
+                state => panic!("same-source direct commit is not submitted: {state:?}"),
+            };
+            assert_eq!(
+                second_key, first_key,
+                "same source must reuse the first direct AllocationKey"
+            );
+            assert!(
+                !backend
+                    .resource_service
+                    .as_ref()
+                    .expect("real resource service")
+                    .has_pending_obligations(&first_key),
+                "retained same-source allocation must register no KmsRelease"
+            );
+            assert!(
+                backend
+                    .resource_service
+                    .as_ref()
+                    .expect("real resource service")
+                    .contains(&first_key),
+                "retained same-source allocation must remain live"
+            );
+            drive_until(backend, "same-source direct frame", &|backend| {
+                backend.device_owner_for_tests(0).live_record().is_none()
+                    && backend.scanout_m2.current.as_ref().is_some_and(|frame| {
+                        frame.commit_id
+                            == Some(crate::kms::render::resources::CommitKey::new(
+                                device,
+                                second_commit,
+                            ))
+                    })
+            });
+            assert!(
+                backend
+                    .resource_service
+                    .as_ref()
+                    .expect("real resource service")
+                    .contains(&first_key),
+                "the retained allocation must not be released by its same-source successor"
+            );
+            let idled = backend.drain_retired_present_idle_events();
+            assert!(
+                idled.iter().any(|event| event.present_id == 201),
+                "the first direct source must be released by the successor's PriorBufferReleased"
+            );
+            assert!(!backend.present_source_pins.contains_key(&first_source_pin));
+            assert!(
+                !backend
+                    .present_source_pins
+                    .contains_key(&first_fallback_pin)
+            );
+
+            backend.request_direct_unflip("c0_hw_ciii_unflip");
+            assert!(
+                backend.direct_unflip_shadow_ready(),
+                "unflip must materialize the retained composed shadow before dispatch"
+            );
+            backend.tick_maybe_composite_for_tests();
+            let unflip_commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("unflip owner record")
+                .commit_id();
+            assert!(
+                backend
+                    .resource_service
+                    .as_ref()
+                    .expect("real resource service")
+                    .has_pending_obligations(&first_key),
+                "unflip must register the displaced direct framebuffer for KmsRelease"
+            );
+            // The retirement routes on one loop iteration and the release
+            // (service_completions -> on_available -> lease drop -> the
+            // service step) lands on the next, exactly as `before_block`
+            // sequences them; the bounded wait covers both.
+            drive_until(backend, "unflip to composed", &|backend| {
+                backend.device_owner_for_tests(0).live_record().is_none()
+                    && backend.scanout_m2.current.is_none()
+                    && backend
+                        .commit_consumer
+                        .current_resources
+                        .iter()
+                        .any(|resources| resources.direct_role.is_none())
+                    && !backend
+                        .resource_service
+                        .as_ref()
+                        .expect("real resource service")
+                        .contains(&first_key)
+            });
+            assert!(
+                !backend
+                    .resource_service
+                    .as_ref()
+                    .expect("real resource service")
+                    .has_pending_obligations(&first_key),
+                "unflip HardwareComplete/PriorBufferReleased must discharge the direct framebuffer"
+            );
+            assert!(
+                !backend
+                    .resource_service
+                    .as_ref()
+                    .expect("real resource service")
+                    .contains(&first_key),
+                "unflip completion must release the direct framebuffer allocation"
+            );
+            let assert_order =
+                |commit: crate::kms::owner::identity::CommitId, label: &str, steps: &[&str]| {
+                    let mut previous = 0;
+                    for step in steps {
+                        let position = milestones
+                            .iter()
+                            .position(|(seen_commit, seen_step)| {
+                                *seen_commit == commit && *seen_step == *step
+                            })
+                            .unwrap_or_else(|| panic!("{label} is missing Owner milestone {step}"));
+                        assert!(
+                            position >= previous,
+                            "{label} Owner milestone {step} arrived out of order: {milestones:?}"
+                        );
+                        previous = position;
+                    }
+                };
+            let assert_not_presented = |commit: crate::kms::owner::identity::CommitId,
+                                        label: &str| {
+                assert!(
+                    !milestones
+                        .iter()
+                        .any(|(seen_commit, step)| *seen_commit == commit && *step == "Presented"),
+                    "{label} must not emit Owner milestone Presented: {milestones:?}"
+                );
+            };
+            let non_present_steps = ["Accepted", "HardwareComplete", "CompletionRetired"];
+            let present_steps = [
+                "Accepted",
+                "HardwareComplete",
+                "Presented",
+                "CompletionRetired",
+            ];
+            assert_order(composed_commit, "composed frame", &non_present_steps);
+            assert_not_presented(composed_commit, "composed frame");
+            assert_order(first_commit, "first direct frame", &present_steps);
+            assert_order(second_commit, "same-source direct frame", &present_steps);
+            assert_order(unflip_commit, "unflip frame", &non_present_steps);
+            assert_not_presented(unflip_commit, "unflip frame");
+        }
+    }
 }
