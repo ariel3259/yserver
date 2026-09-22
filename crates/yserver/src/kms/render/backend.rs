@@ -52153,6 +52153,183 @@ mod tests {
         assert!(!backend.platform.output_uses_owner_route(0));
     }
 
+    fn copied_owner_frame_after_a() -> (
+        OwnerLiveFixture,
+        usize,
+        crate::kms::render::resources::AllocationKey,
+        crate::kms::render::resources::AllocationKey,
+    ) {
+        let OwnerLiveFixture {
+            mut backend,
+            cleanup_calls,
+            cleanup_io,
+        } = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (bo_idx, _, rendering) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("copied Owner tick must retain a prepared generation");
+        assert!(
+            rendering,
+            "stage A must remain in Rendering before its wake"
+        );
+        let (source_key, destination_key) = match backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => (
+                pool.sources[bo_idx]
+                    .managed_key()
+                    .expect("copied source is managed"),
+                pool.destinations.bos[bo_idx]
+                    .managed_key()
+                    .expect("copied destination is managed"),
+            ),
+            _ => panic!("copied fixture must install a copied pool"),
+        };
+        (
+            OwnerLiveFixture {
+                backend,
+                cleanup_calls,
+                cleanup_io,
+            },
+            bo_idx,
+            source_key,
+            destination_key,
+        )
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_stage_a_source_is_managed_vulkan() {
+        let (mut fixture, bo_idx, source_key, _) = copied_owner_frame_after_a();
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&source_key),
+            "A's source Write obligation must exist before renderer submission"
+        );
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering)
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&source_key),
+            "the prepared B copy still retains the source through its read obligation"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_obligations_precede_the_copy_vulkan() {
+        let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&destination_key)
+        );
+        let receipt = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production copied submission must retain its receipt");
+        assert_eq!(receipt.1.0, source_key);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_batch_holds_both_obligations_vulkan() {
+        let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let ((receipt_destination, destination_obligation), (receipt_source, source_obligation)) =
+            fixture
+                .backend
+                .scene
+                .copied_receipt_for_tests(0, bo_idx)
+                .expect("copy receipt");
+        assert_eq!(receipt_destination, destination_key);
+        assert_eq!(receipt_source, source_key);
+        let service = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service");
+        assert!(service.has_pending_obligation(&destination_key, destination_obligation));
+        assert!(service.has_pending_obligation(&source_key, source_obligation));
+        let pending = service.pending_batches();
+        assert_eq!(pending.len(), 1, "the sink copy must register one B batch");
+        let gpu = pending[0]
+            .obligation
+            .as_ref()
+            .expect("B batch must carry a sink GPU obligation");
+        assert_eq!(
+            gpu.entries(),
+            &[(destination_key, destination_obligation)],
+            "the sink GPU obligation must own the destination Write entry"
+        );
+        let read = pending[0]
+            .read_obligation
+            .as_ref()
+            .expect("B batch must carry the source Read obligation");
+        assert_eq!(read.source_key(), source_key);
+        assert_eq!(read.source_obligation(), source_obligation);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_read_obligation_has_a_production_caller_vulkan() {
+        let (mut fixture, bo_idx, source_key, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, (receipt_source, source_obligation)) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production copy receipt");
+        assert_eq!(receipt_source, source_key);
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&source_key, source_obligation)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_paired_phase_excludes_the_source_vulkan() {
+        let (fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+        let phase = match fixture.backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+                pool.destinations.bos[bo_idx].state.phase
+            }
+            _ => panic!("copied fixture must install a copied pool"),
+        };
+        assert_eq!(
+            phase,
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "Owner membership is reached only after selection changed the paired BO from Free through Recording"
+        );
+    }
+
     #[test]
     fn c0_conv_cp_legacy_copied_route_unchanged() {
         let platform = PlatformBackend::for_tests();

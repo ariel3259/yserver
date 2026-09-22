@@ -84,6 +84,40 @@ pub(crate) fn spy_service() -> (ResourceService, AllocationLease, Rc<Cell<usize>
 }
 
 #[test]
+fn c0_conv_cp_failed_preparation_unwinds_completely() {
+    let drops = Rc::new(Cell::new(0));
+    let mut service = ResourceService::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        IncarnationId::first(),
+    );
+    let destination = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops),
+        }))
+        .unwrap();
+    let source = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops),
+        }))
+        .unwrap();
+    let destination_key = destination.key();
+    let source_key = source.key();
+    let source_blocker = service.reserve(source_key, UseKind::Write).unwrap();
+
+    assert_eq!(
+        super::gpu::prepare_copied_batch(&mut service, destination_key, source_key).unwrap_err(),
+        ResourceError::Busy,
+        "a refused source Read must fail the whole preparation"
+    );
+    drop(source_blocker);
+    assert!(!service.has_pending_obligations(&destination_key));
+    assert!(service.reserve(destination_key, UseKind::Write).is_ok());
+}
+
+#[test]
 fn c0_2ci_kms_release_does_not_complete_gpu_work() {
     let (mut service, held, drops) = spy_service();
     let key = held.key();

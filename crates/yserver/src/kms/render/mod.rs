@@ -12,6 +12,7 @@ pub(crate) mod batch_resource;
 pub mod completion_poller;
 pub(crate) mod composed_commit;
 pub(crate) mod composite_pool_ring;
+pub(crate) mod copied_owner;
 pub(crate) mod cursor;
 pub(crate) mod descriptor_pool_ring;
 pub(crate) mod direct_owner;

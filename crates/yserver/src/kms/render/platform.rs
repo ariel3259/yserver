@@ -656,10 +656,17 @@ pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 /// `sync_file` becomes readable.  The stable [`OutputKey`] and monotonic job
 /// id remain authoritative across output-vector rebuilds; raw fds and vector
 /// indices are deliberately not identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanoutRenderCompletionStage {
+    Render,
+    CopiedOwnerCopy,
+}
+
 struct PendingScanoutRenderCompletion {
     job_id: u64,
     output_key: OutputKey,
     bo_idx: usize,
+    stage: ScanoutRenderCompletionStage,
     /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
     /// It bypasses readiness polling but remains a real synchronization
     /// payload that the sink imports as raw -1.
@@ -672,6 +679,7 @@ pub(crate) struct ReadyScanoutRenderCompletion {
     pub(crate) job_id: u64,
     pub(crate) output_key: OutputKey,
     pub(crate) bo_idx: usize,
+    pub(crate) stage: ScanoutRenderCompletionStage,
     pub(crate) fd: Option<OwnedFd>,
 }
 
@@ -4919,6 +4927,7 @@ impl PlatformBackend {
         &mut self,
         output_key: OutputKey,
         bo_idx: usize,
+        stage: ScanoutRenderCompletionStage,
         fd: Option<OwnedFd>,
     ) -> io::Result<u64> {
         let job_id = self.next_scanout_render_job_id;
@@ -4935,6 +4944,7 @@ impl PlatformBackend {
                 job_id,
                 output_key,
                 bo_idx,
+                stage,
                 fd,
             });
         Ok(job_id)
@@ -4986,6 +4996,7 @@ impl PlatformBackend {
                 job_id: pending.job_id,
                 output_key: pending.output_key,
                 bo_idx: pending.bo_idx,
+                stage: pending.stage,
                 fd: pending.fd,
             });
         }
@@ -8718,7 +8729,12 @@ mod tests {
                 .expect("ready eventfd")
                 .into();
         platform
-            .register_scanout_render_completion(output_key, 1, Some(ready))
+            .register_scanout_render_completion(
+                output_key,
+                1,
+                ScanoutRenderCompletionStage::Render,
+                Some(ready),
+            )
             .expect("register pollable copied completion");
 
         platform
@@ -8746,10 +8762,20 @@ mod tests {
                 .expect("ready eventfd")
                 .into();
         let first_job = platform
-            .register_scanout_render_completion(output_key.clone(), 0, Some(blocked))
+            .register_scanout_render_completion(
+                output_key.clone(),
+                0,
+                ScanoutRenderCompletionStage::Render,
+                Some(blocked),
+            )
             .expect("register first job");
         let second_job = platform
-            .register_scanout_render_completion(output_key.clone(), 1, Some(ready))
+            .register_scanout_render_completion(
+                output_key.clone(),
+                1,
+                ScanoutRenderCompletionStage::Render,
+                Some(ready),
+            )
             .expect("register second job");
 
         let completions = platform.drain_scanout_render_completions();
@@ -8771,7 +8797,12 @@ mod tests {
         let mut platform = PlatformBackend::for_tests();
         let output_key = platform.outputs[0].key.clone();
         let job = platform
-            .register_scanout_render_completion(output_key.clone(), 2, None)
+            .register_scanout_render_completion(
+                output_key.clone(),
+                2,
+                ScanoutRenderCompletionStage::Render,
+                None,
+            )
             .expect("register Vulkan fd=-1 completion");
 
         let completions = platform.drain_scanout_render_completions();

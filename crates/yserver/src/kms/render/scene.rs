@@ -75,7 +75,10 @@ use yserver_protocol::x11::xfixes;
 
 use super::{
     owner_buffer::{OwnerBuffer, OwnerBufferIdentity, OwnerBufferState},
-    platform::{CrtcKey, FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
+    platform::{
+        CrtcKey, FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion,
+        ScanoutRenderCompletionStage,
+    },
     region::Region,
     resources::{AllocationKey, CommitKey, CoreRetirementBatch, ResourceError, ResourceService},
     scanout_damage::ScanoutDamage,
@@ -111,6 +114,7 @@ use crate::kms::{
 enum InFlightStage {
     WaitingForRenderCompletion { job_id: u64 },
     OwnerRenderWaiting { job_id: u64 },
+    OwnerCopyWaiting { job_id: u64 },
     OwnerDesired,
     OwnerSubmitted,
     KmsFlipPending,
@@ -125,6 +129,10 @@ impl InFlightStage {
         self == Self::OwnerRenderWaiting { job_id }
     }
 
+    fn matches_owner_copy_completion(self, job_id: u64) -> bool {
+        self == Self::OwnerCopyWaiting { job_id }
+    }
+
     fn is_kms_flip_pending(self) -> bool {
         self == Self::KmsFlipPending
     }
@@ -132,11 +140,14 @@ impl InFlightStage {
 
 fn copied_render_completion_matches(
     stage: InFlightStage,
+    completion_stage: ScanoutRenderCompletionStage,
     pending_bo_idx: usize,
     completion_job_id: u64,
     completion_bo_idx: usize,
 ) -> bool {
-    pending_bo_idx == completion_bo_idx && stage.matches_render_completion(completion_job_id)
+    completion_stage == ScanoutRenderCompletionStage::Render
+        && pending_bo_idx == completion_bo_idx
+        && stage.matches_render_completion(completion_job_id)
 }
 
 fn kms_retirement_matches(
@@ -237,6 +248,7 @@ struct PendingAck {
     /// this output.
     last_present_cursor_version_after_retire: Option<u64>,
     managed_batch: Option<CoreRetirementBatch>,
+    copied_receipt: Option<crate::kms::render::copied_owner::CopiedRetirementReceipt>,
 }
 
 /// Stage 5 Phase C — pure result of the cursor-plane strategy
@@ -2733,6 +2745,24 @@ impl SceneCompositor {
             .map_or(0, |state| state.pending_acks.len())
     }
 
+    #[cfg(test)]
+    pub(crate) fn copied_receipt_for_tests(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> Option<(
+        (AllocationKey, crate::kms::render::resources::ObligationId),
+        (AllocationKey, crate::kms::render::resources::ObligationId),
+    )> {
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        let buffer = state
+            .owner_buffers
+            .iter()
+            .find(|buffer| buffer.identity().bo_idx == bo_idx)?;
+        let receipt = buffer.pending_ack()?.copied_receipt.as_ref()?;
+        Some((receipt.destination, receipt.source))
+    }
+
     fn full_output_audit_area(&self) -> Vec<vk::Rect2D> {
         self.inner
             .as_ref()
@@ -3866,6 +3896,7 @@ fn handle_scanout_render_completion_inner(
         job_id,
         output_key,
         bo_idx,
+        stage: completion_stage,
         fd,
     } = completion;
     let Some(output_idx) = platform
@@ -3885,6 +3916,7 @@ fn handle_scanout_render_completion_inner(
         .position(|buffer| {
             buffer.identity().output_key == output_key
                 && buffer.identity().bo_idx == bo_idx
+                && completion_stage == ScanoutRenderCompletionStage::Render
                 && buffer
                     .pending_ack()
                     .is_some_and(|ack| ack.stage.matches_owner_render_completion(job_id))
@@ -3927,6 +3959,72 @@ fn handle_scanout_render_completion_inner(
         if prepared.state() != OwnerBufferState::Rendering {
             state.owner_buffers.insert(owner_buffer_index, prepared);
             return false;
+        }
+        if matches!(
+            platform.scanout_pools.get(output_idx),
+            Some(Some(OutputScanout::Copied(_)))
+        ) {
+            service.register_batch(batch);
+            if let Err(error) = service.service_completions(std::time::Instant::now()) {
+                log::warn!(
+                    "render Owner copied scanout: A completion service failed for generation {generation}: {error:?}"
+                );
+            }
+            let scanout = platform
+                .scanout_pools
+                .get_mut(output_idx)
+                .and_then(Option::take);
+            let copy_result = match scanout {
+                Some(OutputScanout::Copied(mut pool)) => {
+                    let result = crate::kms::render::copied_owner::
+                        prepare_owner_copy_after_render_completion(
+                            &mut pool,
+                            platform,
+                            output_key.clone(),
+                            bo_idx,
+                            fd,
+                            service,
+                        );
+                    platform.scanout_pools[output_idx] = Some(OutputScanout::Copied(pool));
+                    result
+                }
+                Some(other) => {
+                    platform.scanout_pools[output_idx] = Some(other);
+                    Err(PresentError::Io(io::Error::other(
+                        "copied Owner scanout disappeared during completion",
+                    )))
+                }
+                None => Err(PresentError::Io(io::Error::other(
+                    "copied Owner scanout disappeared during completion",
+                ))),
+            };
+            match copy_result {
+                Ok((receipt, copy_job_id)) => {
+                    if let Some(ack) = prepared.pending_ack_mut() {
+                        ack.stage = InFlightStage::OwnerCopyWaiting {
+                            job_id: copy_job_id,
+                        };
+                        ack.copied_receipt = Some(receipt);
+                    }
+                    state.owner_buffers.insert(owner_buffer_index, prepared);
+                    return true;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "render Owner copied scanout: sink preparation failed for generation {generation}: {error}"
+                    );
+                    let displaced = match prepared.into_displaced() {
+                        Ok(displaced) => displaced,
+                        Err(returned) => {
+                            state.owner_buffers.insert(owner_buffer_index, *returned);
+                            platform.renderer_failed = true;
+                            return false;
+                        }
+                    };
+                    state.owner_buffers.insert(owner_buffer_index, displaced);
+                    return true;
+                }
+            }
         }
         let managed = service.reserve(
             prepared.identity().managed_key,
@@ -3985,11 +4083,38 @@ fn handle_scanout_render_completion_inner(
         drop(fd);
         return true;
     }
+    if completion_stage == ScanoutRenderCompletionStage::CopiedOwnerCopy {
+        let expected = inner.outputs[output_idx]
+            .owner_buffers
+            .iter()
+            .any(|buffer| {
+                buffer.identity().output_key == output_key
+                    && buffer.identity().bo_idx == bo_idx
+                    && buffer
+                        .pending_ack()
+                        .is_some_and(|ack| ack.stage.matches_owner_copy_completion(job_id))
+            });
+        if expected {
+            // Task 2 deliberately stops here.  The sink wake is correlated
+            // and consumed by the existing drain, while Task 3 owns the
+            // receipt's promotion/offer decision.
+            drop(fd);
+            return true;
+        }
+    }
     let expected = inner
         .outputs
         .get(output_idx)
         .and_then(|state| state.pending_acks.front())
-        .is_some_and(|ack| copied_render_completion_matches(ack.stage, ack.bo_idx, job_id, bo_idx));
+        .is_some_and(|ack| {
+            copied_render_completion_matches(
+                ack.stage,
+                completion_stage,
+                ack.bo_idx,
+                job_id,
+                bo_idx,
+            )
+        });
     if !expected {
         log::warn!(
             "render copied scanout: stale completion job {job_id} for output \
@@ -6530,39 +6655,75 @@ fn tick_one_output(
             (result, bo.last_gpu_render_ns.take(), false, managed_batch)
         }
         OutputScanout::Copied(pool) => {
-            let source = pool.sources.get_mut(bo_idx).ok_or(SceneError::NoVk)?;
-            let destination_state = &mut pool
-                .destinations
-                .bos
-                .get_mut(bo_idx)
-                .ok_or(SceneError::NoVk)?
-                .state;
-            let result = submit_copied_scanout_render(
-                &inner.vk,
-                source,
-                destination_state,
-                &inner.pipeline,
-                descriptor_pool,
-                render_scene,
-                Repaint::Full(token_extent),
-                &[],
-                compose_ticket.fence(),
-                &mut gpu_submitted,
-                &overlay_ops,
-                xor_pipeline,
-                xor_layout,
-            );
-            let copied_prepare_failed = result
-                .as_ref()
-                .is_err_and(CopiedRenderSubmitError::requires_fail_stop);
-            (
-                result
-                    .map(Some)
-                    .map_err(CopiedRenderSubmitError::into_present),
-                source.last_gpu_render_ns.take(),
-                copied_prepare_failed,
-                None,
-            )
+            if owner_route {
+                let Some(service) = resource_service.as_deref_mut() else {
+                    return Err(SceneError::Present(PresentError::Io(io::Error::other(
+                        "Owner copied route lost its resource service before submit",
+                    ))));
+                };
+                let mut managed_batch = None;
+                let result = crate::kms::render::copied_owner::submit_owner_copied_scanout_frame(
+                    &inner.vk,
+                    pool,
+                    bo_idx,
+                    &inner.pipeline,
+                    descriptor_pool,
+                    render_scene,
+                    Repaint::Full(token_extent),
+                    &[],
+                    &compose_ticket,
+                    &mut gpu_submitted,
+                    &overlay_ops,
+                    xor_pipeline,
+                    xor_layout,
+                    service,
+                );
+                let previous_gpu_ns = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|(_, _, _, previous_gpu_ns)| *previous_gpu_ns);
+                let result = result.map(|(submitted, completion, batch, _)| {
+                    compose_complete =
+                        compose_submit_was_complete(submitted, render_scene.draws.len());
+                    managed_batch = Some(batch);
+                    Some(completion)
+                });
+                (result, previous_gpu_ns, false, managed_batch)
+            } else {
+                let source = pool.sources.get_mut(bo_idx).ok_or(SceneError::NoVk)?;
+                let destination_state = &mut pool
+                    .destinations
+                    .bos
+                    .get_mut(bo_idx)
+                    .ok_or(SceneError::NoVk)?
+                    .state;
+                let result = submit_copied_scanout_render(
+                    &inner.vk,
+                    source,
+                    destination_state,
+                    &inner.pipeline,
+                    descriptor_pool,
+                    render_scene,
+                    Repaint::Full(token_extent),
+                    &[],
+                    compose_ticket.fence(),
+                    &mut gpu_submitted,
+                    &overlay_ops,
+                    xor_pipeline,
+                    xor_layout,
+                );
+                let copied_prepare_failed = result
+                    .as_ref()
+                    .is_err_and(CopiedRenderSubmitError::requires_fail_stop);
+                (
+                    result
+                        .map(Some)
+                        .map_err(CopiedRenderSubmitError::into_present),
+                    source.last_gpu_render_ns.take(),
+                    copied_prepare_failed,
+                    None,
+                )
+            }
         }
     };
     if copied_prepare_failed {
@@ -6574,7 +6735,12 @@ fn tick_one_output(
     }
     let compose_result = match render_result {
         Ok(Some(completion)) => platform
-            .register_scanout_render_completion(output_key.clone(), bo_idx, completion)
+            .register_scanout_render_completion(
+                output_key.clone(),
+                bo_idx,
+                ScanoutRenderCompletionStage::Render,
+                completion,
+            )
             .map(|job_id| {
                 if owner_route {
                     InFlightStage::OwnerRenderWaiting { job_id }
@@ -6630,6 +6796,7 @@ fn tick_one_output(
                 last_present_cursor_rect_after_retire: built.new_cursor_rect,
                 last_present_cursor_version_after_retire: built.cursor_record_version,
                 managed_batch,
+                copied_receipt: None,
             };
             if owner_route {
                 let Some(managed_key) = owner_managed_key else {
@@ -7076,7 +7243,7 @@ fn cull_scene_to_region(scene: &CompositeScene, keep: &Region) -> CompositeScene
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Repaint {
+pub(crate) enum Repaint {
     /// Full-output redraw with `loadOp=CLEAR`. Fallback path.
     Full(vk::Extent2D),
     /// Damaged-region-only redraw with `loadOp=LOAD`. The
@@ -7090,7 +7257,7 @@ enum Repaint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ComposeSubmit {
+pub(crate) struct ComposeSubmit {
     descriptor_count: usize,
 }
 
@@ -9410,7 +9577,7 @@ fn project_onto_output(
 // handling stay identical to v1.
 // ────────────────────────────────────────────────────────────────
 
-trait ComposeRenderTarget {
+pub(crate) trait ComposeRenderTarget {
     fn image(&self) -> vk::Image;
     fn image_view(&self) -> vk::ImageView;
     fn command_buffer(&self) -> vk::CommandBuffer;
@@ -9435,7 +9602,7 @@ trait ComposeRenderTarget {
 }
 
 #[derive(Clone, Copy)]
-enum PostComposePreparation {
+pub(crate) enum PostComposePreparation {
     Shared,
     Copied(CopiedTransportPreparation),
 }
@@ -10085,7 +10252,7 @@ fn submit_copied_scanout_render(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_and_submit_render(
+pub(crate) fn record_and_submit_render(
     vk: &crate::kms::vk::device::VkContext,
     target: &mut impl ComposeRenderTarget,
     pipeline: &CompositorPipeline,
@@ -10523,9 +10690,34 @@ mod tests {
     #[test]
     fn copied_completion_requires_exact_job_and_paired_bo() {
         let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 41 };
-        assert!(copied_render_completion_matches(waiting, 2, 41, 2));
-        assert!(!copied_render_completion_matches(waiting, 2, 42, 2));
-        assert!(!copied_render_completion_matches(waiting, 2, 41, 1));
+        assert!(copied_render_completion_matches(
+            waiting,
+            ScanoutRenderCompletionStage::Render,
+            2,
+            41,
+            2,
+        ));
+        assert!(!copied_render_completion_matches(
+            waiting,
+            ScanoutRenderCompletionStage::CopiedOwnerCopy,
+            2,
+            41,
+            2,
+        ));
+        assert!(!copied_render_completion_matches(
+            waiting,
+            ScanoutRenderCompletionStage::Render,
+            2,
+            42,
+            2,
+        ));
+        assert!(!copied_render_completion_matches(
+            waiting,
+            ScanoutRenderCompletionStage::Render,
+            2,
+            41,
+            1,
+        ));
     }
 
     #[test]
@@ -10534,6 +10726,7 @@ mod tests {
         assert!(!kms_retirement_matches(waiting, 1, 1));
         assert!(!copied_render_completion_matches(
             InFlightStage::KmsFlipPending,
+            ScanoutRenderCompletionStage::Render,
             1,
             7,
             1,
@@ -10912,6 +11105,7 @@ mod tests {
                 last_present_cursor_rect_after_retire: None,
                 last_present_cursor_version_after_retire: None,
                 managed_batch: Some(batch),
+                copied_receipt: None,
             });
             slot
         };

@@ -13,8 +13,9 @@ use crate::kms::{
     vk::{
         device::VkContext,
         scanout::{
-            CopiedRenderSourceBacking, CopiedSourceOwnership, ExportSemaphoreReuseState,
-            RetainedSyncFile, ScanoutBoBacking, TransferResources, destroy_transfer_resources,
+            CopiedRenderSourceBacking, CopiedSourceOwnership, CopiedTransportPreparation,
+            ExportSemaphoreReuseState, RetainedSyncFile, ScanoutBoBacking, TransferResources,
+            destroy_transfer_resources,
         },
         target::{DrawableImage, ExportableImage},
     },
@@ -543,6 +544,182 @@ impl CopiedSourceAllocation {
             renderer_return_completion,
             ownership,
         }
+    }
+
+    pub(crate) fn image(&self) -> vk::Image {
+        self.render_target
+            .as_ref()
+            .expect("managed copied source has optimal render target")
+            .vk_image
+    }
+
+    pub(crate) fn image_view(&self) -> vk::ImageView {
+        self.render_target
+            .as_ref()
+            .expect("managed copied source has optimal render target")
+            .vk_image_view
+    }
+
+    pub(crate) fn imported_sink_image(&self) -> vk::Image {
+        self.imported_on_sink
+            .as_ref()
+            .expect("managed copied source has sink import")
+            .vk_image
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.render_target
+            .as_ref()
+            .expect("managed copied source has optimal render target")
+            .extent
+            .width
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        self.render_target
+            .as_ref()
+            .expect("managed copied source has optimal render target")
+            .extent
+            .height
+    }
+
+    pub(crate) fn command_buffer(&self) -> vk::CommandBuffer {
+        self.transfer.command_buffer
+    }
+
+    pub(crate) fn completion_semaphore(&self) -> vk::Semaphore {
+        self.completion_semaphore
+    }
+
+    pub(crate) fn timestamp_pool(&self) -> vk::QueryPool {
+        self.transfer.timestamp_pool
+    }
+
+    pub(crate) fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
+        self.last_gpu_render_ns = value;
+    }
+
+    pub(crate) fn prepare_renderer_acquire(&mut self) -> io::Result<()> {
+        match self.ownership {
+            CopiedSourceOwnership::RendererFirstUse | CopiedSourceOwnership::RendererDiscard => {
+                Ok(())
+            }
+            CopiedSourceOwnership::ForeignAwaitingRenderer => {
+                if self.renderer_return_completion.is_some()
+                    && self.renderer_wait_semaphore.is_some()
+                {
+                    return Err(io::Error::other(
+                        "managed copied source retained a new B completion before the prior A wait semaphore retired",
+                    ));
+                }
+                if let Some(completion) = self.renderer_return_completion.take() {
+                    let render_vk = self
+                        .render_vk
+                        .as_ref()
+                        .expect("managed copied source has renderer Vulkan context");
+                    let wait = crate::kms::vk::sync::import_optional_sync_file(
+                        render_vk,
+                        completion.into_optional(),
+                    )
+                    .map_err(|result| {
+                        crate::kms::vk::scanout::scanout_vk_error(
+                            "import copied sink completion on renderer",
+                            result,
+                        )
+                    })?;
+                    self.renderer_wait_semaphore = Some(wait);
+                } else if self.renderer_wait_semaphore.is_none() {
+                    return Err(io::Error::other(
+                        "managed copied source has no retained B completion for renderer acquire",
+                    ));
+                }
+                Ok(())
+            }
+            CopiedSourceOwnership::ForeignAwaitingSink => Err(io::Error::other(
+                "managed copied source cannot return to renderer before sink handoff",
+            )),
+            CopiedSourceOwnership::ForeignReturnPending => Err(io::Error::other(
+                "managed copied source B-to-A completion is not resolved",
+            )),
+        }
+    }
+
+    pub(crate) fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
+        self.renderer_wait_semaphore
+    }
+
+    pub(crate) fn transport_preparation(&self) -> io::Result<CopiedTransportPreparation> {
+        self.ownership.transport_preparation()
+    }
+
+    pub(crate) fn note_renderer_submit_succeeded(&mut self) {
+        self.ownership = CopiedSourceOwnership::ForeignAwaitingSink;
+        self.renderer_return_completion = None;
+    }
+
+    pub(crate) fn note_sink_submit_succeeded(&mut self) {
+        debug_assert_eq!(self.ownership, CopiedSourceOwnership::ForeignAwaitingSink);
+        self.ownership = CopiedSourceOwnership::ForeignReturnPending;
+    }
+
+    pub(crate) fn retain_sink_release_completion(&mut self, completion: Option<OwnedFd>) {
+        debug_assert_eq!(self.ownership, CopiedSourceOwnership::ForeignReturnPending);
+        self.renderer_return_completion = Some(RetainedSyncFile::from_optional(completion));
+        self.ownership = CopiedSourceOwnership::ForeignAwaitingRenderer;
+    }
+
+    pub(crate) fn release_sink_wait_semaphore(&mut self) {
+        if let Some(semaphore) = self.sink_wait_semaphore.take() {
+            let sink_vk = self
+                .sink_vk
+                .as_ref()
+                .expect("managed copied source has sink Vulkan context");
+            unsafe { sink_vk.device.destroy_semaphore(semaphore, None) };
+        }
+    }
+
+    pub(crate) fn export_render_completion(&mut self) -> Result<Option<OwnedFd>, vk::Result> {
+        let render_vk = self
+            .render_vk
+            .as_ref()
+            .expect("managed copied source has renderer Vulkan context");
+        self.completion_semaphore_reuse.begin_post_submit_export();
+        let info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(self.completion_semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let raw = unsafe { render_vk.external_semaphore_fd.get_semaphore_fd(&info)? };
+        let completion = crate::kms::vk::optional_sync_fd_from_vk(
+            raw,
+            "vkGetSemaphoreFdKHR(managed copied render SYNC_FD)",
+        )?;
+        self.completion_semaphore_reuse.finish_successful_export();
+        Ok(completion)
+    }
+
+    pub(crate) fn record_transport_copy(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        preparation: CopiedTransportPreparation,
+    ) {
+        let render_vk = self
+            .render_vk
+            .as_ref()
+            .expect("managed copied source has renderer Vulkan context");
+        let transport_image = self
+            .transport_on_renderer
+            .as_ref()
+            .expect("managed copied source has DMA-BUF transport")
+            .image;
+        crate::kms::vk::scanout::record_copied_transport_copy(
+            &render_vk.device,
+            render_vk.graphics_queue_family,
+            self.image(),
+            transport_image,
+            self.width(),
+            self.height(),
+            command_buffer,
+            preparation,
+        );
     }
 }
 
