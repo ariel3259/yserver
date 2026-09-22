@@ -58,6 +58,48 @@ deterministic one.
 
 It also reaches production today through the Legacy route, independently of C.0.
 
+## Why we took responsibility, and the rule this sets for stages 3 and 4
+
+The user's criterion (2026-09-22): **"si nos afecta, también es responsabilidad
+nuestra"** — upstream authorship decides who *wrote* a defect, not who must fix
+it. What decides ours is whether it touches what we are building. This one met
+three tests, and future cases should be judged by the same three:
+
+1. **It bites our route now.** It stranded a destination on the Owner copied
+   route during the cross-device hardware run. Not hypothetical, observed.
+2. **It keeps biting after our own fix.** Our descriptor-slot leak made the
+   exhaustion certain; removing it makes the exhaustion occasional, and every
+   occasional exhaustion still strands a buffer permanently. Fixing only our
+   half would have converted a deterministic failure into an intermittent one —
+   strictly harder to diagnose, and easy to mistake for flakiness later.
+3. **It reaches production through the shared path.** The tick is common to
+   Legacy and Owner, so the defect ships today, independently of C.0.
+
+Contrast with the Legacy dormancy bug (`walked()`, Jos, `6e1ba09b`), which was
+left to upstream: it fails none of the three. It does not touch the converted
+routes, our work neither triggers nor masks it, and nothing we are building
+depends on it. That is the line.
+
+**Why this matters for the rest of C.0.** Stages 3 and 4 convert lifecycle,
+modeset, DPMS, VT, topology, cursor and gamma — paths that are shared with the
+Legacy route and largely upstream-authored, far more so than the producers
+stage 2 converted. Defects of exactly this shape will surface again, and the
+default answer should not be re-argued each time:
+
+- a defect in upstream code that the conversion **reaches** is ours to fix,
+  in its own commit, portable upstream as its own PR, and named as an addendum
+  rather than as stage scope;
+- a defect in upstream code the conversion **does not reach** is reported with
+  its reproduction and left upstream;
+- the distinction is made on the three tests above, not on who wrote the file.
+
+The cost asymmetry is what justifies the default. Fixing an upstream defect we
+reach costs one small commit. Not fixing it costs an intermittent stall inside a
+route we are simultaneously rewriting, where every future failure has two
+candidate explanations instead of one — and stages 3 and 4 are where that
+ambiguity would be most expensive, because their failures are lifecycle
+failures: a device that will not light, a VT that will not come back.
+
 ## Disposition
 
 1. Fix it in this branch, covering **every** fallible return between acquisition
