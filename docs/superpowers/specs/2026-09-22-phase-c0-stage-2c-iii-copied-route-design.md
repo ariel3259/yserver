@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-iii — the copied scanout route
 
-**Status:** design, revision 2 (2026-09-22). Its sections were approved one by
+**Status:** design, revision 4 (2026-09-22). Its sections were approved one by
 one with the user in brainstorming, together with the three decisions recorded
 in section 2: the evidence level, the placement of the copy's completion wait,
 and the managed-storage access debt staying out of scope.
@@ -23,6 +23,16 @@ producer lease to move. Section 3.2 is rewritten from the sequence the code
 runs, and the copied route now follows `prepare_retirement_batch`'s established
 idiom — every obligation registered before any raw handle reaches the GPU, the
 whole attempt unwound on failure — instead of a transaction invented for it.
+Revision 4 incorporates codex round 3 (`../findings/2026-09-22-stage-2c-iii-copied-route-design-review-round3.md`,
+same instrument, 24 excerpts: 1 blocking, 3 major, 1 minor; the prior B-1 is
+audited as traded, M-1 and M-2 of round 1 as applied). All five verified: the
+offer had no correlated retirement receipt (B-1, new CP-2a); an uncertain
+dispatch cannot be carried by a ticketless batch, because quarantine takes its
+keys from the obligation the batch does not have (M-1, CP-4b rewritten onto
+`abandon_unsubmitted_batch`); the source's exclusion is the paired BO phase, not
+non-interleaving, so revision 3's mutation could not have failed (M-2, CP-4c
+rewritten); the cross-device criterion was paired with an exclusivity mutation
+that does not test it (M-3); and the status line still said revision 2 (m-1).
 
 This is the plan that plan Ciii's acceptance finding
 (`../findings/2026-09-22-stage-2c-iii-plan-ciii-accepted.md`, "Carried") records
@@ -138,6 +148,25 @@ exists to make the core loop run again; it is never the proof that the
 destination is readable. The two roles are separate and must not be merged into
 one mechanism.
 
+**CP-2a — the promotion consumes a correlated retirement receipt (round-3
+B-1).** "The service authorizes" is not a wake and not a call: it is one
+explicit answer about **this** generation's obligation. At CP-4a step 2 the
+generation keeps the receipt `(destination AllocationKey, ObligationId)`, and it
+may become `Desired` and be offered only when both hold:
+
+- `has_pending_obligation(destination_key, obligation_id)` is false
+  (`resources/mod.rs:290`) — that exact obligation retired, not merely some
+  obligation on some key;
+- `is_frozen(destination_key)` is false (`resources/mod.rs:911`) — it was not
+  quarantined on the way.
+
+Everything else is explicitly rejected as authority: `service_completions`
+returns generic keys and a service-wide error (`resources/mod.rs:359`), so
+neither its `Ok` nor its `Err` decides this generation, and the composed
+precedent — which logs a service failure and offers anyway (`scene.rs:3965`) —
+is **not** the shape to copy here. A readable fence with a pending or frozen
+obligation offers nothing.
+
 **CP-3 — the owner buffer state machine gains no state.** `Rendering`
 (`owner_buffer.rs:29`) already means "the producer chain has not finished
 writing this buffer", which is true during both stages. What discriminates them
@@ -198,24 +227,40 @@ attempt and drops every lease already taken, the way `cancel_pre_submit_batch`
 (`resources/gpu.rs:370`) does for a submission that provably never reached the
 GPU. Nothing is submitted and the generation is `Displaced`.
 
-**CP-4b — after submission, failure is dispositional, never unwound.** Once the
-copy has been handed to the GPU, no obligation is cancelled. A submission
-failure that provably never dispatched quiesces (`recover_copy_failure`) and
-cancels as above; an outcome that may have dispatched is registered as a batch
-with no ticket and `possibly_dispatched` set, which the existing model already
-treats as unrecoverable and quarantines (`resources/gpu.rs:223`) rather than
-making the allocations reusable.
+**CP-4b — a failed submission takes the established unwind, by its
+`gpu_submitted` answer (round-3 M-1).** Revision 3 said an uncertain dispatch
+registers a ticketless batch with `possibly_dispatched` set. That loses the
+destination: `quarantine_gpu_batch` collects the keys it freezes from the
+batch's `Option<GpuObligation>` and its read obligation
+(`resources/mod.rs:1563`), so a batch with no ticket freezes no destination key
+at all. The route therefore uses the path the project already has —
+`abandon_unsubmitted_batch` (`resources/gpu.rs:395`), which implements the 2c-i
+debt rule "unknown submission retains its reservation and closes the affected
+transport":
 
-**CP-4c — the source's exclusion between steps 1 and 3 is by non-interleaving,
-and it is stated rather than assumed.** Between A's write lease dropping and B's
-read lease being taken, the source has no live use. Steps 1 to 5 run in one
-synchronous step of the single-threaded core with no event-loop yield inside it,
-and the only actor that could take the source is a later tick's selection.
-This is exclusion by construction, not by overlapping leases: any restructuring
-that introduces a yield inside the step breaks it, and that is what the
-criterion in section 8.2 mutates. Non-interleaving is claimed **only** for
-reuse exclusion; it makes nothing atomic, which is why every fallible step
-above is ordered before the GPU work rather than after it.
+- **provably not dispatched:** cancel every prepared obligation, and close the
+  transport gate only if that cancel fails;
+- **may have dispatched:** close the transport gate and freeze the prepared
+  entries, both the destination and the source.
+
+Either way the generation is `Displaced` and the prepared entries are disposed
+of by key, never by the presence of a ticket.
+
+**CP-4c — the source is excluded by the paired BO phase, not by
+non-interleaving (round-3 M-2).** Between A's write lease dropping and B's read
+lease being taken the source has no live lease, and revision 3 claimed the core's
+lack of a yield is what keeps a later tick from taking it. That is not the
+mechanism the tree runs. Selection scans the **destination** pool for bos in
+`BoPhase::Free` (`platform.rs:6337`) and transitions the chosen one to
+`Recording` before returning the token (`platform.rs:6374`), precisely so that
+"the slot stays `Free` and legacy `acquire_scanout_bo` can hand out the same
+index" cannot happen. The source is selected by the same `bo_idx`, so while the
+destination is `Recording` — which it is from selection until the copy is
+submitted — no later tick can select that source at all. The authoritative
+exclusion is therefore the paired phase, and that is what section 8.2 mutates:
+skip or release the destination's `Recording` transition. No claim about
+event-loop scheduling is made or needed, and none of the fallible steps above
+rests on one.
 
 **CP-4d — this route is `ReadObligation`'s first production caller.**
 `ReadObligation::new` and `bind_read_obligation` are today driven only by
@@ -319,6 +364,15 @@ destination's own key, and then records its retirement**. Fence order, or the
 mere fact that the service was called, does not establish it. The exclusivity mutation of CP-8 runs on the same hardware under the
 same filter, as 2c-iii §6.4 requires of its own mutations.
 
+**CP-8's mutation does not test this criterion (round-3 M-3).** Forcing the
+legacy branch proves Owner/Legacy exclusivity, which is already its own
+criterion, and it can fail for route-gating reasons without the sink copy ever
+having been exercised. The hardware run therefore records the **distinct
+renderer and sink device identities** it actually used, and carries its own
+mutation: misroute the copy so it is not performed on the sink's device — or
+scan out the source instead of the destination — which must fail this criterion
+while leaving CP-8's untouched.
+
 If the forced-renderer configuration turns out not to be reachable on this
 machine, that is reported as an F8 stop with the evidence, not substituted by a
 fixture and not silently downgraded.
@@ -365,8 +419,9 @@ not by the first textual match.
 | Batch B holds a write obligation on the destination and a read obligation on the source (CP-4) | Register the batch without the read obligation; **and, separately, register it with no destination obligation, or with one keyed to another allocation** (round-1 M-2) |
 | Every obligation B needs is registered before the copy reaches the GPU (CP-4a) | Register the destination obligation after submission; register the source obligation after submission |
 | A failed preparation leaves no obligation and no lease behind (CP-4a) | Fail step 3 and keep the destination obligation; fail step 3 and keep its lease |
-| A submission that may have dispatched is quarantined, not cancelled (CP-4b) | Cancel the obligations on an uncertain dispatch; register the batch without `possibly_dispatched` |
-| The source is excluded from step 1 to step 3 by non-interleaving (CP-4c) | Put an event-loop yield between A's retirement and B's read reservation |
+| A failed submission is disposed of by its `gpu_submitted` answer, by key (CP-4b) | Cancel the prepared obligations on an uncertain dispatch; dispose of an uncertain dispatch through a ticketless batch, so no destination key is frozen; leave the transport gate open on an uncertain dispatch |
+| The source is excluded by the destination's paired `Recording` phase (CP-4c) | Skip the destination's `Recording` transition at selection; release it before the copy is submitted |
+| The promotion consumes this generation's own retirement receipt (CP-2a) | Promote on a readable fence while the obligation is still pending; promote while the destination key is frozen; promote on a successful `service_completions` that retired another key |
 | The read obligation is registered by the production path, not by a test (CP-4d) | Drive the criterion from a hand-built batch instead of the route |
 | A copy that submitted but could not register its completion wake offers nothing and keeps its batch (3.3) | Offer on generic availability after a failed wake registration; drop the batch |
 | The source is not reusable until B retires (CP-5) | Return the source to the renderer pool at A's completion |
@@ -378,7 +433,7 @@ not by the first textual match.
 | The destination retires under the ledger and every §4.2 gate (CP-9) | Release the pool slot at the ack; drop one gate |
 | The source is released by B's read obligation alone (CP-10) | Release the source at flip retirement |
 | A retained destination allocation registers no obligation and is not released (CP-11) | Register the retained allocation as if displaced |
-| The copied route works cross-device on real hardware (section 6) | The exclusivity mutation of CP-8, run on hardware under the same filter |
+| The copied route works cross-device on real hardware (section 6) | Misroute the copy off the sink's device, or scan out the source instead of the destination — CP-8's mutation does not test this (round-3 M-3) |
 
 ### 8.3. The plan and its process
 
@@ -412,3 +467,8 @@ section 6 with its mutation.
    allowed to stand in for. It may not stand in for section 6.
 4. Whether any site other than the readback of section 7 resolves a copied
    pool's managed key as absent. If one is found, it is reported, not repaired.
+5. Which production consumers other than tick selection can reserve a copied
+   pool's source allocation. CP-4c rests on the paired BO phase excluding a
+   later tick; the plan enumerates the rest and states, for each, why it cannot
+   take the source between A's retirement and B's read reservation. An
+   unenumerated consumer is an F8 stop, not an assumption.
