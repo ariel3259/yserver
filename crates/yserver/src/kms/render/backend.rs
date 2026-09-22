@@ -21792,6 +21792,21 @@ impl KmsBackend {
         now: std::time::Instant,
         service_already_ran: bool,
     ) {
+        // Direct-framebuffer zero edges are an Owner-route concern. A legacy
+        // device may still have a ResourceService for render bookkeeping, but
+        // must not run this plan's completion pass without an active
+        // admission conductor.
+        let Some(device) = self
+            .resource_service
+            .as_ref()
+            .map(|service| service.device())
+        else {
+            return;
+        };
+        if !self.admission_is_active(device) {
+            return;
+        }
+
         if !service_already_ran
             && let Some(service) = self.resource_service.as_mut()
             && let Err(error) = service.service_completions(now)
@@ -22285,20 +22300,29 @@ impl Backend for KmsBackend {
         let events = self.platform.tick_executors(std::time::Instant::now());
         self.record_host_call_events(events);
         let now = std::time::Instant::now();
+        // Pre-Cfb completion pass: runs on every device with a service,
+        // Legacy included (2c-i progress, M-16/6.1). The direct-framebuffer
+        // step below is Owner-only and must not absorb it.
+        if let Some(service) = self.resource_service.as_mut() {
+            let _ = service.service_completions(now);
+        }
         let owner_events = self.platform.service_owner_completions(now);
         for (device_key, events) in owner_events {
             self.route_owner_event_batch(device_key, events, now);
         }
-        self.service_direct_framebuffer_edges(now, false);
+        self.service_direct_framebuffer_edges(now, true);
     }
 
     fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
         let now = std::time::Instant::now();
+        if let Some(service) = self.resource_service.as_mut() {
+            let _ = service.service_completions(now);
+        }
         let owner_events = self.platform.service_owner_completions(now);
         for (device_key, events) in owner_events {
             self.route_owner_event_batch(device_key, events, now);
         }
-        self.service_direct_framebuffer_edges(now, false);
+        self.service_direct_framebuffer_edges(now, true);
     }
 
     fn on_executor_readable(&mut self, _state: &mut yserver_core::server::ServerState) {

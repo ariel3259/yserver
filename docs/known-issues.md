@@ -1091,6 +1091,22 @@ and `docs/superpowers/findings/2026-06-25-xkb-request-coverage-audit.md`.
       each stall; the depth-4 path itself is fast (verified offscreen
       under lavapipe) and unrelated.
 
+- [ ] **`device_lock` tests flake on "the last close releases it"
+      (~1 in 10 filtered runs, 2026-09-22).** Seen on
+      `dropping_a_device_lock_does_not_unlock_a_shared_description`,
+      `an_inheritable_lock_still_holds_and_still_releases_on_last_close`
+      and `the_lock_is_released_when_the_holder_dies`, all at the
+      assertion after the last drop. The three tests use distinct
+      device keys, so it is not sharing: two sibling tests in the same
+      module spawn a lock-holder child, and the `fork` duplicates every
+      open descriptor of the process — including the sibling tests'
+      `flock`ed lock files — until `exec` applies `CLOEXEC`. In that
+      window the lock is still held by the child and
+      `may_install_state` reports busy. Unchanged since `5f37e95e`;
+      independent of the C.0 work that surfaced it. Fix: serialise the
+      spawning tests against the in-process lock tests (a module
+      mutex), or lock with OFD `fcntl` locks that a child cannot hold.
+
 ## Archived: ynest-era (pre-rendering-rework, KMS-direct supersedes)
 
 yserver now runs KMS-direct (no host X server). The items below
