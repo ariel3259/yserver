@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-iii — direct framebuffer adoption and retention
 
-**Status:** design, revision 5 (2026-09-21). Its three design sections (the
+**Status:** design, revision 6 (2026-09-21). Its three design sections (the
 ownership boundary, the handoff and ownership table, the evidence) were
 approved one by one with the user in brainstorming, together with the scope
 decision of section 1.1. Revision 2 incorporates codex round 1
@@ -26,7 +26,7 @@ carries an incarnation-counted alias and a defined freeze/handoff disposition
 (B-1, 2.6); the direct-lease count lives at the lease boundary in the resource
 service, not in the commit consumer (M-1, 2.3); a rejected unflip restores
 `ExitRetirement → Current` (M-2, 3.3). Revision 5 adds 4.2a (the fixture
-note from plan Cfb's round 2). Plan: `../plans/2026-09-21-phase-c0-stage-2c-iii-plan-cfb-direct-framebuffer-adoption.md`.
+note from plan Cfb's round 2); revision 6 states the charge-by-origin rule in 2.6 (plan Cfb's round 3). Plan: `../plans/2026-09-21-phase-c0-stage-2c-iii-plan-cfb-direct-framebuffer-adoption.md`.
 
 **Why this document exists.** Plan Ciii's Task 6 stopped with an F8
 (`../findings/2026-09-21-stage-2c-iii-plan-ciii-task6-f8.md`): the real direct
@@ -230,8 +230,12 @@ certify closure while one exists. Its dispositions:
   issued), the device alias is dropped, the charge released, the entry gone.
 
 It is never dropped and never reconstructed as a cache owner; the charge is
-released only with the entry. This is the 2c-i rule that uncertain cleanup
-retains its position while the transport closes.
+released only with the entry. **The charge is the one the payload already
+held** (plan Cfb round 3, B-1): the `Preparing` charge when cleanup fails
+right after adoption; the allocation's final role (`OrdinaryRetirement` or
+`ExitRetirement`, its `finish_role` deferred) when cleanup fails after the
+roles completed. No entry ever reserves a new role. This is the 2c-i rule that
+uncertain cleanup retains its position while the transport closes.
 
 ## 3. Handoff and the ownership table
 
