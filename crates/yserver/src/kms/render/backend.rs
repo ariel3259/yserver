@@ -52217,6 +52217,54 @@ mod tests {
         }
     }
 
+    fn copied_owner_commit_for_tests() -> (
+        OwnerLiveFixture,
+        usize,
+        DrmDeviceKey,
+        crate::kms::owner::identity::CommitId,
+    ) {
+        let (mut fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+        let device = fixture.backend.platform.outputs[0].key.device_key;
+
+        // A's completion is the first wake. It submits B and leaves B's
+        // correlated destination obligation pending in the service.
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            fixture
+                .backend
+                .scene
+                .copied_receipt_for_tests(0, bo_idx)
+                .is_some(),
+            "the copied production path must retain B's receipt"
+        );
+
+        // B's sync_file is only the wake; retire the registered batch through
+        // the service before the second wake can promote the generation.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the copied destination obligation must retire");
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+
+        let commit = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("the copied offer must use the ordinary owner commit path")
+            .commit_id();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
+            "the conductor must consume the copied offer into Submitted"
+        );
+        (fixture, bo_idx, device, commit)
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cp_stage_a_source_is_managed_vulkan() {
@@ -52475,6 +52523,123 @@ mod tests {
             fixture.backend.scene.owner_state_for_tests(0, bo_idx),
             Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
             "B retirement promotes the copied generation and the normal offer path consumes it"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_commit_carries_no_input_fence_vulkan() {
+        let (fixture, _bo_idx, _device, _commit) = copied_owner_commit_for_tests();
+        let record = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("copied generation owner commit");
+        let request = record
+            .request_properties_for_tests()
+            .expect("the owner record retains the byte-only atomic request");
+        let crtc = u32::from(fixture.backend.platform.outputs[0].output.crtc);
+        let plane = u32::from(fixture.backend.platform.outputs[0].output.plane);
+
+        assert_eq!(request.objects, vec![crtc, plane]);
+        assert_eq!(
+            request.count_props,
+            vec![2, 2],
+            "the request has only ACTIVE/OUT_FENCE_PTR on the CRTC and FB_ID/CRTC_ID on the plane"
+        );
+        assert_eq!(
+            request.props,
+            vec![21, 22, 19, 20],
+            "the copied fence is discharged before the owner commit is built"
+        );
+        assert_eq!(request.values.len(), request.props.len());
+        assert_eq!(request.values[0], 1);
+        assert_eq!(request.values[3], u64::from(crtc));
+        assert_eq!(record.closure().present_event(), &[]);
+        // The request type contains no host→helper descriptor vector. The
+        // only fd-bearing part is the helper-produced out-fence slot above.
+        assert_eq!(record.closure().expected_completion(), &[crtc]);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_end_to_end_copied_frame_vulkan() {
+        let (mut fixture, bo_idx, device, commit) = copied_owner_commit_for_tests();
+        let history_before = fixture.backend.scene.damage_history_len_for_tests(0);
+
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
+            "render, copy and destination-obligation retirement reach the owner commit"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .scene
+                .owner_damage_transaction_count_for_tests(),
+            1,
+            "the copied offer installs the same owner damage transaction as composed"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "damage is not applied merely by dispatch"
+        );
+
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted { commit }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Accepted),
+            "Accepted advances the copied owner buffer"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| staged),
+            "Accepted stages the copied frame's captured damage"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .scene
+                .owner_damage_transaction_count_for_tests(),
+            1,
+            "Accepted does not consume the damage transaction"
+        );
+
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            fixture
+                .backend
+                .scene
+                .owner_damage_transaction_count_for_tests(),
+            0,
+            "HardwareComplete consumes the copied damage transaction"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "HardwareComplete applies the copied frame's damage"
+        );
+        assert!(
+            fixture.backend.scene.damage_history_len_for_tests(0) > history_before,
+            "HardwareComplete records the copied frame's applied damage"
         );
     }
 
