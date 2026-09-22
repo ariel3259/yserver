@@ -2415,6 +2415,8 @@ pub struct PlatformBackend {
     /// Always compiled (not cfg(test)) so integration-test pub wrappers
     /// on `KmsBackend` can reach it from the external test crate.
     force_next_submit_failure: bool,
+    #[cfg(test)]
+    reap_executors_on_drop_for_tests: bool,
 }
 
 fn build_render_device_inventory(
@@ -2670,6 +2672,14 @@ pub(crate) fn recompute_fb_extent_from(layouts: &[LayoutRect]) -> (u16, u16) {
 
 impl Drop for PlatformBackend {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.reap_executors_on_drop_for_tests {
+            for device in &mut self.devices {
+                if let Some(executor) = device.executor.as_mut() {
+                    crate::kms::executor::test_support::kill_and_reap(executor);
+                }
+            }
+        }
         if !self.initial_scanout_rollback_armed {
             return;
         }
@@ -3158,6 +3168,8 @@ impl PlatformBackend {
             submit_group,
             last_flush_outcome: None,
             force_next_submit_failure: false,
+            #[cfg(test)]
+            reap_executors_on_drop_for_tests: false,
         };
 
         let keys: Vec<crate::platform::drm::DrmDeviceKey> =
@@ -3296,6 +3308,8 @@ impl PlatformBackend {
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
             force_next_submit_failure: false,
+            #[cfg(test)]
+            reap_executors_on_drop_for_tests: false,
         };
 
         let keys: Vec<crate::platform::drm::DrmDeviceKey> =
@@ -10585,6 +10599,10 @@ mod tests {
     }
 
     impl PlatformBackend {
+        pub(crate) fn reap_executors_on_drop_for_tests(&mut self) {
+            self.reap_executors_on_drop_for_tests = true;
+        }
+
         pub(crate) fn platform_with_stub_executors_with_behaviour_for_tests(
             n: usize,
             behaviour: crate::kms::executor::test_support::StubBehaviour,

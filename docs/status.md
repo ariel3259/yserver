@@ -28,6 +28,29 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-09-22 Phase C.0 stage 2c-iii, plans Cfb and Ciii ACCEPTED — the
+  card1 run of spec §6.4 passes.** `c0_hw_ciii_owner_route_on_card1_drm`
+  (`a8dbaec7`) drives composed → direct → same-source direct → unflip on
+  card1 with DRM master through the real conductor, owner, service and
+  registry; T32/T33 fail it at P3-2/P3-3. The run found two production
+  defects on the Owner route that no hardware-free test had reached:
+  **F-T6-3** (`c233e5f1`) the dispatch reserved `OrdinaryRetirement` over a
+  composed current and the reservation leaked, so every direct offer after
+  the first retirement waited for ever; **F-T6-4** (`e29f09fd`)
+  `CommitResourceConsumer::on_available` had no production caller — retired
+  commits were never released; every "released" claim of Cfb/Ciii had gone
+  through a test-only call, now removed. Post-Cfb regression fixed in
+  `eafe06f4` (the service step is Owner-only; the two Legacy completion calls
+  restored). Hardware gate **359/359** at `e29f09fd`. Findings:
+  `docs/superpowers/findings/2026-09-22-stage-2c-iii-plan-cfb-accepted.md`,
+  `...plan-ciii-accepted.md`. Carried: the copied-route plan (§4.6), the Ci
+  F8 stops, Cfb §2.5 managed-storage access, coverage gaps T24 (direct
+  retirement fork) and T27 (two-device transport read), the `device_lock`
+  fork-window flake (`known-issues.md`). Fixture lessons: repeated real-DRM
+  Vulkan contexts poison the NVIDIA ICD; GPU tests are `#[ignore]` `_vulkan`;
+  `seed_bordered_window`'s null storage cannot be a copy target; a
+  hardware-free release claim must name its production caller.
+
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 

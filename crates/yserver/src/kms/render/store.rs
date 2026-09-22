@@ -999,6 +999,14 @@ pub(crate) struct Drawable {
     pub(crate) refcount: u32,
     pub(crate) scene_participating: bool,
     pub(crate) storage: Storage,
+    /// Monotonic identity of the storage currently attached to this
+    /// drawable.  A direct-scanout cache entry must never alias a later
+    /// storage incarnation of the same drawable id.
+    pub(crate) backing_serial: u64,
+    /// Set permanently when `backing_serial` cannot be advanced.  Owner
+    /// direct adoption then refuses this drawable rather than risking an
+    /// identity wrap.
+    pub(crate) backing_serial_exhausted: bool,
 
     /// I6a: latest render-completion ticket for which this
     /// drawable was a consumer (read or written) in flight. None
@@ -1323,6 +1331,12 @@ pub(crate) enum AllocError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageReplacementError {
+    UnknownDrawable,
+    BackingSerialExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetireDecision {
     /// Refcount > 0 after decref; storage stays.
     StillReferenced,
@@ -1471,6 +1485,8 @@ impl DrawableStore {
             refcount: 1,
             scene_participating,
             storage,
+            backing_serial: 0,
+            backing_serial_exhausted: false,
             last_render_ticket: None,
             presentation_damage: RegionSet::new(),
             presentation_damage_epoch: 0,
@@ -1482,6 +1498,79 @@ impl DrawableStore {
         self.entries.insert(id, drawable);
         self.by_xid.insert(xid, id);
         Ok(id)
+    }
+
+    pub(crate) fn backing_serial(&self, id: DrawableId) -> Option<u64> {
+        self.entries
+            .get(&id)
+            .map(|drawable| drawable.backing_serial)
+    }
+
+    pub(crate) fn owner_direct_adoption_allowed(&self, id: DrawableId) -> bool {
+        self.entries
+            .get(&id)
+            .is_some_and(|drawable| !drawable.backing_serial_exhausted)
+    }
+
+    /// Replace a drawable's storage and advance its physical-backing
+    /// identity in the same operation.  The checked increment happens
+    /// before the old storage is displaced, so exhaustion is fail-closed and
+    /// cannot leave a new storage with a reused serial.
+    pub(crate) fn replace_storage(
+        &mut self,
+        id: DrawableId,
+        storage: Storage,
+    ) -> Result<Storage, StorageReplacementError> {
+        let Some(drawable) = self.entries.get_mut(&id) else {
+            return Err(StorageReplacementError::UnknownDrawable);
+        };
+        let Some(next_serial) = drawable.backing_serial.checked_add(1) else {
+            drawable.backing_serial_exhausted = true;
+            return Err(StorageReplacementError::BackingSerialExhausted);
+        };
+        drawable.backing_serial = next_serial;
+        Ok(std::mem::replace(&mut drawable.storage, storage))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_storage_for_tests(
+        &mut self,
+        id: DrawableId,
+        storage: Storage,
+    ) -> Result<Storage, StorageReplacementError> {
+        self.replace_storage(id, storage)
+    }
+
+    /// Check the serial edge before an in-place storage transformation whose
+    /// swap is performed by a storage helper rather than this store.
+    pub(crate) fn can_replace_storage(&self, id: DrawableId) -> bool {
+        self.entries.get(&id).is_some_and(|drawable| {
+            !drawable.backing_serial_exhausted && drawable.backing_serial < u64::MAX
+        })
+    }
+
+    /// Record the successful in-place storage transformation after its
+    /// helper has installed the new backing.  The preflight above makes the
+    /// failure branch unreachable in normal single-threaded operation; it is
+    /// still handled without a panic if the state is inconsistent.
+    pub(crate) fn record_storage_replacement(&mut self, id: DrawableId) -> bool {
+        let Some(drawable) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        let Some(next_serial) = drawable.backing_serial.checked_add(1) else {
+            drawable.backing_serial_exhausted = true;
+            return false;
+        };
+        drawable.backing_serial = next_serial;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_backing_serial_for_tests(&mut self, id: DrawableId, serial: u64) {
+        if let Some(drawable) = self.entries.get_mut(&id) {
+            drawable.backing_serial = serial;
+            drawable.backing_serial_exhausted = false;
+        }
     }
 
     pub(crate) fn lookup(&self, xid: u32) -> Option<DrawableId> {
@@ -2500,6 +2589,35 @@ mod tests {
             !service.contains(&old_key),
             "releasing held_lease allows service to destroy old allocation"
         );
+    }
+
+    #[test]
+    fn c0_conv_cfb_backing_serial_changes_on_relayout() {
+        let mut store = DrawableStore::new();
+        let id = store
+            .allocate(0xc0fb, DrawableKind::Pixmap, 24, false, stub_storage())
+            .expect("allocate drawable");
+
+        assert_eq!(store.backing_serial(id), Some(0));
+        for replacement in 1..=3 {
+            assert!(store.replace_storage_for_tests(id, stub_storage()).is_ok());
+            assert_eq!(store.backing_serial(id), Some(replacement));
+        }
+        assert!(store.owner_direct_adoption_allowed(id));
+    }
+
+    #[test]
+    fn c0_conv_cfb_backing_serial_exhaustion_refuses_adoption() {
+        let mut store = DrawableStore::new();
+        let id = store
+            .allocate(0xc0fc, DrawableKind::Pixmap, 24, false, stub_storage())
+            .expect("allocate drawable");
+
+        store.force_backing_serial_for_tests(id, u64::MAX);
+        assert!(store.replace_storage_for_tests(id, stub_storage()).is_err());
+        assert_eq!(store.backing_serial(id), Some(u64::MAX));
+        assert!(!store.owner_direct_adoption_allowed(id));
+        assert!(!store.owner_direct_adoption_allowed(id));
     }
 
     /// xeyes resize regression with Picture refs: a Picture

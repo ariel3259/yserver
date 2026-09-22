@@ -23,7 +23,7 @@ pub(crate) mod tests;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    rc::Rc,
+    rc::{Rc, Weak},
     time::Instant,
 };
 
@@ -34,7 +34,9 @@ pub(crate) use availability::{
     can_destroy,
 };
 #[allow(unused_imports)]
-pub(crate) use capacity::{DirectCapacity, DirectRole, RoleReservation, RoleState};
+pub(crate) use capacity::{
+    DirectCapacity, DirectLeasePermit, DirectRole, RoleReservation, RoleState,
+};
 #[allow(unused_imports)]
 pub(crate) use commit::{
     CommitKey, CommitResourceConsumer, CommitResources, GroupMember, PresentRelease,
@@ -44,8 +46,8 @@ pub(crate) use commit::{
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
 #[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
-    CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
-    FamilyInventory, FileFamilyClosed, GemOwner, PoolHuskRegistration, RightState,
+    CleanupCharge, CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry,
+    DrmCleanupRight, FamilyInventory, FileFamilyClosed, GemOwner, PoolHuskRegistration, RightState,
 };
 #[allow(unused_imports)]
 use gpu::ValidatedGpuBatch;
@@ -94,6 +96,22 @@ pub(crate) enum AllocationPayload {
     Unused(std::convert::Infallible),
 }
 
+/// A non-owning identity for a managed direct-framebuffer allocation. The
+/// weak entry reference prevents the M1 cache from keeping the allocation
+/// alive; every upgrade revalidates the service incarnation and the exact
+/// entry identity before minting a new role-proof lease.
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedAllocationToken {
+    key: AllocationKey,
+    entry: Weak<AllocationEntry>,
+}
+
+impl ManagedAllocationToken {
+    pub(crate) fn key(&self) -> AllocationKey {
+        self.key
+    }
+}
+
 impl AllocationPayload {
     /// True when this payload still holds a counted alias of the DRM open
     /// file description that must go through the registry -- a real
@@ -135,6 +153,19 @@ impl AllocationPayload {
             AllocationPayload::Unused(never) => match *never {},
         }
     }
+
+    pub(crate) fn close_file_owned_after_family(&mut self) {
+        match self {
+            AllocationPayload::Scanout(alloc) => alloc.close_file_owned_after_family(),
+            AllocationPayload::DirectFramebuffer(alloc) => {
+                alloc.close_file_owned_after_family();
+            }
+            #[cfg(test)]
+            AllocationPayload::Spy(_) => {}
+            AllocationPayload::Storage(_) | AllocationPayload::CopiedSource(_) => {}
+            AllocationPayload::Unused(never) => match *never {},
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -148,6 +179,7 @@ pub(crate) struct ResourceService {
     exhausted: bool,
     entries: BTreeMap<AllocationKey, Rc<AllocationEntry>>,
     dirty_entries: Rc<RefCell<BTreeSet<AllocationKey>>>,
+    zero_edges: Rc<RefCell<BTreeSet<AllocationKey>>>,
     pending_batches: Vec<CoreRetirementBatch>,
     quarantined_batches: Vec<(CoreRetirementBatch, ResourceError)>,
     seat_active: bool,
@@ -155,6 +187,13 @@ pub(crate) struct ResourceService {
     serviced_elapsed: std::time::Duration,
     last_serviced: Option<Instant>,
     max_serviced_duration: std::time::Duration,
+    /// Identity of the service that may validate a direct framebuffer
+    /// permit. The permit keeps its own clone, so a permit for another
+    /// service cannot be replayed here.
+    direct_lease_binding: Rc<()>,
+    /// The direct-capacity instance paired with this service at installation.
+    /// A framebuffer lease must be proven by that exact capacity.
+    direct_capacity_binding: Option<Rc<()>>,
     /// Spec 4.2 (stage 2c-i debt): the transport an uncertain or unwindable
     /// GPU submission must close (2c-i design section 4). `None` in
     /// production, where no gate is installed (R8).
@@ -173,6 +212,7 @@ impl ResourceService {
             exhausted: false,
             entries: BTreeMap::new(),
             dirty_entries: Rc::new(RefCell::new(BTreeSet::new())),
+            zero_edges: Rc::new(RefCell::new(BTreeSet::new())),
             pending_batches: Vec::new(),
             quarantined_batches: Vec::new(),
             seat_active: true,
@@ -180,6 +220,8 @@ impl ResourceService {
             serviced_elapsed: std::time::Duration::ZERO,
             last_serviced: None,
             max_serviced_duration: std::time::Duration::from_secs(5),
+            direct_lease_binding: Rc::new(()),
+            direct_capacity_binding: None,
             transport_gate: None,
         }
     }
@@ -214,6 +256,23 @@ impl ResourceService {
 
     pub(crate) fn device(&self) -> DrmDeviceKey {
         self.device
+    }
+
+    pub(crate) fn bind_direct_capacity(
+        &mut self,
+        capacity: &DirectCapacity,
+    ) -> Result<(), ResourceError> {
+        if let Some(bound) = &self.direct_capacity_binding
+            && !capacity.binding_matches(bound)
+        {
+            return Err(ResourceError::InvalidState);
+        }
+        self.direct_capacity_binding = Some(capacity.binding_token());
+        Ok(())
+    }
+
+    pub(crate) fn direct_lease_binding(&self) -> Rc<()> {
+        Rc::clone(&self.direct_lease_binding)
     }
 
     pub(crate) fn contains(&self, key: &AllocationKey) -> bool {
@@ -369,6 +428,15 @@ impl ResourceService {
         &mut self,
         payload: AllocationPayload,
     ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
+        self.adopt_unchecked_with_kind(payload, UseKind::Retain)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn adopt_unchecked_with_kind(
+        &mut self,
+        payload: AllocationPayload,
+        use_kind: UseKind,
+    ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
         if self.exhausted {
             return Err((ResourceError::Exhausted, payload));
         }
@@ -406,16 +474,65 @@ impl ResourceService {
             .availability
             .borrow_mut()
             .live_uses
-            .insert(UseId(use_id), UseKind::Retain);
+            .insert(UseId(use_id), use_kind);
 
         self.entries.insert(key, Rc::clone(&entry));
 
         Ok(AllocationLease::new(
             entry,
             UseId(use_id),
-            UseKind::Retain,
+            use_kind,
             Rc::downgrade(&self.dirty_entries),
+            Rc::downgrade(&self.zero_edges),
         ))
+    }
+
+    pub(crate) fn check_direct_framebuffer_adoptability(
+        &self,
+        capacity: &DirectCapacity,
+        role: DirectRole,
+        permit: &DirectLeasePermit,
+    ) -> Result<(), ResourceError> {
+        if self.exhausted {
+            return Err(ResourceError::Exhausted);
+        }
+        if permit.service_binding_matches(&self.direct_lease_binding)
+            && self
+                .direct_capacity_binding
+                .as_ref()
+                .is_some_and(|bound| capacity.binding_matches(bound))
+            && capacity.accepts_direct_lease_permit(permit, self.device, self.incarnation, role)
+        {
+            Ok(())
+        } else {
+            Err(ResourceError::InvalidProof)
+        }
+    }
+
+    /// Adopt a framebuffer only through the role proof minted by the paired
+    /// direct capacity. Generic `adopt` remains available for other payloads,
+    /// but a direct framebuffer's live-use count must have a direct holder.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn adopt_direct_framebuffer(
+        &mut self,
+        payload: AllocationPayload,
+        registry: &mut DrmCleanupRegistry,
+        capacity: &DirectCapacity,
+        role: DirectRole,
+        permit: DirectLeasePermit,
+    ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
+        if !matches!(payload, AllocationPayload::DirectFramebuffer(_)) {
+            return Err((ResourceError::InvalidState, payload));
+        }
+        if self
+            .check_direct_framebuffer_adoptability(capacity, role, &permit)
+            .is_err()
+        {
+            return Err((ResourceError::InvalidProof, payload));
+        }
+        let lease = self.adopt_unchecked_with_kind(payload, UseKind::DirectFramebuffer)?;
+        registry.register_payload_alias(lease.key());
+        Ok(lease)
     }
 
     /// The only way to adopt a payload whose file-owned half is live (`adopt`
@@ -472,6 +589,176 @@ impl ResourceService {
         self.exhausted
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_next_generation(
+        device: DrmDeviceKey,
+        incarnation: IncarnationId,
+        next_generation: u64,
+    ) -> Self {
+        let mut service = Self::new(device, incarnation);
+        service.next_generation = next_generation;
+        service
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_generation_for_tests(&mut self, next_generation: u64) {
+        self.next_generation = next_generation;
+    }
+
+    pub(crate) fn direct_framebuffer_handle(
+        &self,
+        lease: &AllocationLease,
+    ) -> Result<::drm::control::framebuffer::Handle, ResourceError> {
+        if lease.kind() != UseKind::DirectFramebuffer {
+            return Err(ResourceError::InvalidProof);
+        }
+        let entry = self
+            .entries
+            .get(&lease.key())
+            .ok_or(ResourceError::Detached)?;
+        match entry.payload.borrow().as_ref() {
+            Some(AllocationPayload::DirectFramebuffer(allocation)) => Ok(allocation.fb_handle()),
+            _ => Err(ResourceError::InvalidState),
+        }
+    }
+
+    pub(crate) fn direct_framebuffer_is_last_lease(&self, lease: &AllocationLease) -> bool {
+        if lease.kind() != UseKind::DirectFramebuffer {
+            return false;
+        }
+        self.entries
+            .get(&lease.key())
+            .is_some_and(|entry| entry.live_use_count() == 1)
+    }
+
+    pub(crate) fn managed_allocation_token(
+        &self,
+        lease: &AllocationLease,
+    ) -> Result<ManagedAllocationToken, ResourceError> {
+        if lease.kind() != UseKind::DirectFramebuffer {
+            return Err(ResourceError::InvalidProof);
+        }
+        let key = lease.key();
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        if !Rc::ptr_eq(entry, &lease.entry)
+            || !matches!(
+                entry.payload.borrow().as_ref(),
+                Some(AllocationPayload::DirectFramebuffer(_))
+            )
+        {
+            return Err(ResourceError::Detached);
+        }
+        Ok(ManagedAllocationToken {
+            key,
+            entry: Rc::downgrade(entry),
+        })
+    }
+
+    /// Upgrade a cache token only when its exact entry is still present in
+    /// this service and the supplied role permit is current.
+    pub(crate) fn upgrade_managed_allocation(
+        &mut self,
+        token: &ManagedAllocationToken,
+        capacity: &DirectCapacity,
+        role: DirectRole,
+        permit: DirectLeasePermit,
+    ) -> Result<AllocationLease, ResourceError> {
+        if token.key.device != self.device || token.key.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        let token_entry = token.entry.upgrade().ok_or(ResourceError::Detached)?;
+        let entry = self
+            .entries
+            .get(&token.key)
+            .ok_or(ResourceError::Detached)?;
+        if !Rc::ptr_eq(entry, &token_entry)
+            || !matches!(
+                entry.payload.borrow().as_ref(),
+                Some(AllocationPayload::DirectFramebuffer(_))
+            )
+        {
+            return Err(ResourceError::Detached);
+        }
+        self.reserve_direct_framebuffer(capacity, token.key, role, permit)
+    }
+
+    /// The service owns the durable handoff. The backend is the only caller
+    /// that may take these staged edges.
+    pub(crate) fn take_zero_edges(&mut self) -> Vec<AllocationKey> {
+        std::mem::take(&mut *self.zero_edges.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
+    /// Revalidate and clean a direct framebuffer allocation after the backend
+    /// has removed its cache token. No earlier readiness result is trusted:
+    /// the live-use and obligation check and the transfer of the payload to
+    /// registry cleanup happen under this service's mutable borrow.
+    pub(crate) fn cleanup_direct_framebuffer(
+        &mut self,
+        key: AllocationKey,
+        registry: &mut DrmCleanupRegistry,
+    ) -> bool {
+        let mut charge = None;
+        self.cleanup_direct_framebuffer_with_charge(key, registry, &mut charge)
+    }
+
+    pub(crate) fn cleanup_direct_framebuffer_with_charge(
+        &mut self,
+        key: AllocationKey,
+        registry: &mut DrmCleanupRegistry,
+        charge: &mut Option<CleanupCharge>,
+    ) -> bool {
+        let Some(entry) = self.entries.get(&key).cloned() else {
+            return false;
+        };
+        if !can_destroy(&entry)
+            || !matches!(
+                entry.payload.borrow().as_ref(),
+                Some(AllocationPayload::DirectFramebuffer(_))
+            )
+        {
+            return false;
+        }
+
+        let mut payload = entry.payload.borrow_mut().take();
+        let Some(mut payload) = payload.take() else {
+            return false;
+        };
+        if !matches!(payload, AllocationPayload::DirectFramebuffer(_)) {
+            *entry.payload.borrow_mut() = Some(payload);
+            return false;
+        }
+        if payload.discharge_file_owned(registry).is_err() {
+            if let Some(role_charge) = charge.take() {
+                registry.unregister_payload_alias(key);
+                let removed = self.entries.remove(&key);
+                if removed.is_some() {
+                    registry.retain_pending_cleanup(payload, role_charge);
+                    return false;
+                }
+                *entry.payload.borrow_mut() = Some(payload);
+                *charge = Some(role_charge);
+            } else {
+                *entry.payload.borrow_mut() = Some(payload);
+                self.dirty_entries.borrow_mut().insert(key);
+            }
+            return false;
+        }
+
+        registry.unregister_payload_alias(key);
+        if let Some(removed) = self.entries.remove(&key) {
+            removed.take_payload();
+            if let Some(role_charge) = charge.take() {
+                role_charge.release();
+            }
+            true
+        } else {
+            *entry.payload.borrow_mut() = Some(payload);
+            false
+        }
+    }
+
     /// F2b-m1: real exhaustion only happens after `u64::MAX` generations/
     /// uses/obligations or a serviced-time expiry, neither reachable in a
     /// unit test. This forces the same flag directly so
@@ -495,6 +782,13 @@ impl ResourceService {
         }
 
         let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+
+        if matches!(
+            entry.payload.borrow().as_ref(),
+            Some(AllocationPayload::DirectFramebuffer(_))
+        ) {
+            return Err(ResourceError::InvalidState);
+        }
 
         let mut avail = entry.availability.borrow_mut();
         if avail.frozen {
@@ -523,6 +817,48 @@ impl ResourceService {
             UseId(use_id),
             usage,
             Rc::downgrade(&self.dirty_entries),
+            Rc::downgrade(&self.zero_edges),
+        ))
+    }
+
+    pub(crate) fn reserve_direct_framebuffer(
+        &mut self,
+        capacity: &DirectCapacity,
+        key: AllocationKey,
+        role: DirectRole,
+        permit: DirectLeasePermit,
+    ) -> Result<AllocationLease, ResourceError> {
+        if key.device != self.device || key.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        self.check_direct_framebuffer_adoptability(capacity, role, &permit)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        if !matches!(
+            entry.payload.borrow().as_ref(),
+            Some(AllocationPayload::DirectFramebuffer(_))
+        ) {
+            return Err(ResourceError::InvalidState);
+        }
+        let mut avail = entry.availability.borrow_mut();
+        if avail.frozen {
+            return Err(ResourceError::Frozen);
+        }
+        let use_id = self.next_use_id;
+        let next_use = use_id.checked_add(1).ok_or_else(|| {
+            self.exhausted = true;
+            ResourceError::Exhausted
+        })?;
+        self.next_use_id = next_use;
+        avail
+            .live_uses
+            .insert(UseId(use_id), UseKind::DirectFramebuffer);
+        drop(avail);
+        Ok(AllocationLease::new(
+            Rc::clone(entry),
+            UseId(use_id),
+            UseKind::DirectFramebuffer,
+            Rc::downgrade(&self.dirty_entries),
+            Rc::downgrade(&self.zero_edges),
         ))
     }
 
@@ -828,6 +1164,16 @@ impl ResourceService {
         for key in dirty_keys {
             if let Some(entry) = self.entries.get(&key) {
                 if can_destroy(entry) {
+                    if matches!(
+                        entry.payload.borrow().as_ref(),
+                        Some(AllocationPayload::DirectFramebuffer(_))
+                    ) {
+                        // Direct framebuffer destruction belongs exclusively
+                        // to the backend's staged-zero-edge step.
+                        self.dirty_entries.borrow_mut().insert(key);
+                        transitions.push(key);
+                        continue;
+                    }
                     // F2-M1: this path has no registry to discharge a live
                     // file-owned half through, so destroying the entry here
                     // would be exactly the undischarged drop B-2 closed for
@@ -869,12 +1215,23 @@ impl ResourceService {
         &mut self,
         registry: &mut DrmCleanupRegistry,
     ) -> Vec<AllocationKey> {
+        let _ = registry.retry_pending_cleanup();
         let dirty_keys: BTreeSet<AllocationKey> =
             std::mem::take(&mut *self.dirty_entries.borrow_mut());
         let mut transitions = Vec::new();
         for key in dirty_keys {
             if let Some(entry) = self.entries.get(&key) {
                 if can_destroy(entry) {
+                    if matches!(
+                        entry.payload.borrow().as_ref(),
+                        Some(AllocationPayload::DirectFramebuffer(_))
+                    ) {
+                        // The registry-aware readiness walk is not the
+                        // direct framebuffer consumer either.
+                        self.dirty_entries.borrow_mut().insert(key);
+                        transitions.push(key);
+                        continue;
+                    }
                     let discharge_result = {
                         let mut payload = entry.payload.borrow_mut();
                         match payload.as_mut() {

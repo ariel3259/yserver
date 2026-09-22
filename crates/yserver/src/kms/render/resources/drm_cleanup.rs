@@ -5,7 +5,11 @@ use drm::{
     control::{Device as ControlDevice, framebuffer},
 };
 
-use super::{AllocationKey, ResourceError, lease::AllocationLease};
+use super::{
+    AllocationKey, AllocationPayload, ResourceError,
+    capacity::{DirectRole, RoleReservation},
+    lease::AllocationLease,
+};
 use crate::{drm::Device, kms::owner::identity::IncarnationId, platform::drm::DrmDeviceKey};
 
 #[allow(dead_code)]
@@ -22,6 +26,7 @@ pub(crate) enum RightState {
     FramebufferRemoved,
     Discharged,
     Frozen,
+    Closed,
 }
 
 #[allow(dead_code)]
@@ -71,6 +76,39 @@ impl DrmCleanupRight {
     pub(crate) fn state(&self) -> RightState {
         self.state
     }
+
+    pub(crate) fn mark_closed(&mut self) {
+        self.state = RightState::Closed;
+    }
+}
+
+/// The role charge already held when a cleanup right became uncertain. The
+/// pending owner moves this value; it never reserves a replacement role.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum CleanupCharge {
+    Preparing(RoleReservation),
+    FinalRole(RoleReservation),
+}
+
+impl CleanupCharge {
+    pub(crate) fn role(&self) -> DirectRole {
+        match self {
+            Self::Preparing(slot) | Self::FinalRole(slot) => slot.role(),
+        }
+    }
+
+    pub(crate) fn release(self) {
+        match self {
+            Self::Preparing(slot) | Self::FinalRole(slot) => slot.release_after_cleanup(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingCleanupEntry {
+    payload: AllocationPayload,
+    charge: CleanupCharge,
 }
 
 #[allow(dead_code)]
@@ -189,6 +227,10 @@ pub(crate) struct DrmCleanupRegistry {
     /// `try_mint_file_family_closed` discharges and unregisters each in turn
     /// rather than waiting for it to drop on its own (R5).
     payload_alias_keys: BTreeSet<AllocationKey>,
+    /// Keyless payloads whose cleanup failed. These entries own the payload,
+    /// its device alias and the already-held role charge until R3 retry or
+    /// the incarnation's family-close handoff.
+    pending_cleanup: Vec<PendingCleanupEntry>,
     family_inventory: FamilyInventory,
     returned_descriptors: Vec<std::os::fd::OwnedFd>,
     /// Spec 4.1: set once pool-husk accounting can no longer be trusted --
@@ -207,7 +249,7 @@ impl std::fmt::Debug for DrmCleanupRegistry {
             .field("has_device", &self.device.is_some())
             .field("frozen", &self.frozen)
             .field("family_closed", &self.family_closed)
-            .field("payload_aliases", &self.payload_alias_keys.len())
+            .field("payload_aliases", &self.payload_aliases())
             .finish()
     }
 }
@@ -228,6 +270,7 @@ impl DrmCleanupRegistry {
             frozen: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
+            pending_cleanup: Vec::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
             husk_accounting_failed: Rc::new(Cell::new(false)),
@@ -247,6 +290,7 @@ impl DrmCleanupRegistry {
             frozen: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
+            pending_cleanup: Vec::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
             husk_accounting_failed: Rc::new(Cell::new(false)),
@@ -267,6 +311,7 @@ impl DrmCleanupRegistry {
             frozen: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
+            pending_cleanup: Vec::new(),
             family_inventory: FamilyInventory::default(),
             returned_descriptors: Vec::new(),
             husk_accounting_failed: Rc::new(Cell::new(false)),
@@ -320,17 +365,69 @@ impl DrmCleanupRegistry {
     }
 
     pub(crate) fn payload_aliases(&self) -> usize {
-        self.payload_alias_keys.len()
+        self.payload_alias_keys.len() + self.pending_cleanup.len()
+    }
+
+    pub(crate) fn pending_cleanup_entries(&self) -> usize {
+        self.pending_cleanup.len()
+    }
+
+    pub(crate) fn pending_cleanup_roles(&self) -> Vec<DirectRole> {
+        self.pending_cleanup
+            .iter()
+            .map(|entry| entry.charge.role())
+            .collect()
+    }
+
+    /// Transfers a payload and its existing charge into the keyless pending
+    /// owner. This operation is intentionally infallible for a payload that
+    /// came from the production adoption path: failing here would leave no
+    /// legal owner for the cleanup right.
+    pub(crate) fn retain_pending_cleanup(
+        &mut self,
+        payload: AllocationPayload,
+        charge: CleanupCharge,
+    ) {
+        self.pending_cleanup
+            .push(PendingCleanupEntry { payload, charge });
     }
 
     pub(crate) fn freeze_incarnation(&mut self) {
         self.frozen = true;
     }
 
+    /// R3: retry every pending payload while this incarnation is live. A
+    /// failed retry keeps the returned right in the same entry, so a partial
+    /// RMFB/GEM_CLOSE sequence resumes at the right state without a second
+    /// cleanup owner.
+    pub(crate) fn retry_pending_cleanup(&mut self) -> io::Result<usize> {
+        if self.frozen || self.family_closed {
+            return Ok(0);
+        }
+
+        let pending = std::mem::take(&mut self.pending_cleanup);
+        let mut retained = Vec::with_capacity(pending.len());
+        let mut released = 0;
+        for mut entry in pending {
+            match entry.payload.discharge_file_owned(self) {
+                Ok(()) => {
+                    entry.charge.release();
+                    released += 1;
+                }
+                Err(_) => retained.push(entry),
+            }
+        }
+        self.pending_cleanup = retained;
+        Ok(released)
+    }
+
     pub(crate) fn consume(
         &mut self,
         mut right: DrmCleanupRight,
     ) -> Result<(), (io::Error, DrmCleanupRight)> {
+        if right.state == RightState::Closed {
+            return Ok(());
+        }
         if self.frozen || right.state == RightState::Frozen {
             right.state = RightState::Frozen;
             return Err((io::Error::other("incarnation is frozen"), right));
@@ -338,10 +435,7 @@ impl DrmCleanupRegistry {
 
         if self.family_closed {
             return Err((
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "descriptor family is closed; ioctl prohibited",
-                ),
+                io::Error::new(io::ErrorKind::PermissionDenied, "file family is closed"),
                 right,
             ));
         }
@@ -518,6 +612,16 @@ impl DrmCleanupRegistry {
             self.payload_alias_keys.remove(&key);
         }
 
+        // Pending entries have already failed a live cleanup and the family
+        // is now closing. Their DRM objects died with the family, so mark the
+        // right closed without issuing a stale ioctl, release the original
+        // charge, and drop the now-safe payload.
+        let pending = std::mem::take(&mut self.pending_cleanup);
+        for mut entry in pending {
+            entry.payload.close_file_owned_after_family();
+            entry.charge.release();
+        }
+
         // Registry performs the description's last close
         self.device = None;
         self.family_closed = true;
@@ -625,5 +729,12 @@ impl DirectFramebufferAllocation {
         }
         self.device = None;
         Ok(())
+    }
+
+    pub(crate) fn close_file_owned_after_family(&mut self) {
+        if let Some(right) = self.right.as_mut() {
+            right.mark_closed();
+        }
+        self.device = None;
     }
 }

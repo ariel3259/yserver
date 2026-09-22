@@ -25,6 +25,7 @@ pub(crate) enum UseKind {
     Read,
     Write,
     Kms,
+    DirectFramebuffer,
 }
 
 #[allow(dead_code)]
@@ -114,7 +115,7 @@ impl EntryAvailability {
 
     pub(crate) fn is_compatible(&self, usage: UseKind) -> bool {
         match usage {
-            UseKind::Retain => true,
+            UseKind::Retain | UseKind::DirectFramebuffer => true,
             UseKind::Read => self.live_writers() == 0,
             UseKind::Kms => self.live_writers() == 0,
             UseKind::Write => {
