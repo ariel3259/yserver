@@ -10,7 +10,7 @@ REVIEW_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIEF="$REVIEW_DIR/brief.md"
 
 # --- The instrument. Changing any of these is a deliberate act; see README.md.
-MODEL="gpt-5.6-sol"
+MODEL="gpt-6-sol"
 EFFORT="xhigh"
 MODE="single pass"
 
