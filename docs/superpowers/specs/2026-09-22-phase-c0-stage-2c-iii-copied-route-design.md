@@ -1,9 +1,18 @@
 # Phase C.0 stage 2c-iii — the copied scanout route
 
-**Status:** design, revision 1 (2026-09-22). Its sections were approved one by
+**Status:** design, revision 2 (2026-09-22). Its sections were approved one by
 one with the user in brainstorming, together with the three decisions recorded
 in section 2: the evidence level, the placement of the copy's completion wait,
 and the managed-storage access debt staying out of scope.
+Revision 2 incorporates codex round 1
+(`../findings/2026-09-22-stage-2c-iii-copied-route-design-review-round1.md`,
+instrument `da807b70` with 24 excerpts: 1 blocking, 2 major, all three verified
+against the tree and accepted): the A-to-B ownership transition is named rather
+than assumed (B-1, section 3.2), a successful copy whose wake registration fails
+has a disposition (M-1, section 3.3), and the destination's write obligation has
+its own mutation and its own evidence (M-2, sections 6 and 8.2). While verifying
+B-1 the author found that `ReadObligation` had no production caller; section 3.2
+now says so and makes this route its first.
 
 This is the plan that plan Ciii's acceptance finding
 (`../findings/2026-09-22-stage-2c-iii-plan-ciii-accepted.md`, "Carried") records
@@ -133,12 +142,48 @@ not at A's. `Displaced` applies identically in both stages, with no new rule.
 registered for the sink copy carries a write `GpuObligation`
 (`resources/gpu.rs:30`) over the **destination** allocation — that obligation's
 retirement is what makes it readable — and a `ReadObligation`
-(`resources/gpu.rs:148`) over the **source** allocation. A's own batch retires
+(`resources/gpu.rs:91`) over the **source** allocation. A's own batch retires
 A's own leases and is never the authority that frees the source.
 
 The batch is device-agnostic by construction: `GpuObligation` carries its own
 `Arc<VkContext>` (`resources/gpu.rs:33`), so a batch produced on the sink device
 is as valid to the service as one produced on the renderer device.
+
+**CP-4a — the A-to-B transition moves leases; it never re-acquires them
+(round-1 B-1).** How ownership crosses the boundary is not left to the
+implementation, because the obvious orders are both wrong. The copied
+acquisition already holds **two `Write` leases** for the generation: the
+destination (`platform.rs:6347`) and the renderer source (`platform.rs:6355`).
+Re-reserving the source as `Read` for B while A's lease is live fails `Busy` —
+`is_compatible` refuses a read against a live writer
+(`resources/availability.rs:116`) — and dropping A's lease first opens an
+interval in which the source has no live use at all and the pool may hand the
+slot out. Therefore:
+
+1. The leases the producer already holds are **transferred by value** into B's
+   batch. `CoreRetirementBatch.leases` and `ReadObligation::new` both take
+   leases by value, so this is a move, not a new acquisition, and
+   `is_compatible` is never consulted on this path.
+2. The obligations are minted with `ResourceService::register`
+   (`resources/mod.rs:865`), which records a pending obligation on the entry and
+   does **not** consult `is_compatible`. Obligations and leases therefore move
+   independently, which is what makes this transition expressible at all.
+3. Submitting the copy, minting both obligations, moving both leases into the
+   batch and registering the batch are **one synchronous step with no event-loop
+   yield inside it**. There is no point at which the source is reachable by
+   another acquirer.
+4. Obligations are minted only after the copy submission has succeeded. Once it
+   has, the batch is registered with whatever it holds, so GPU work never leaves
+   leases orphaned outside the service.
+
+**CP-4b — this route is `ReadObligation`'s first production caller.**
+`ReadObligation::new` and `bind_read_obligation` are today driven only by
+`resources/guard_tests.rs:202`, `:221`, `:244` and `resources/tests.rs:1851`.
+Resting CP-5 on machinery that only tests call is the defect class plan Ciii's
+hardware run found as F-T6-4, so it is stated here rather than discovered later:
+the plan's evidence must show the production path registering the read
+obligation, and a test that calls it by hand does not satisfy any criterion of
+section 8.2.
 
 **CP-5 — the source outlives the copy.** While B has not retired, the source
 allocation cannot return to the renderer pool. A copied generation whose source
@@ -158,6 +203,14 @@ service.
   pending copy is value-owned, so cancelling it is dropping it; a batch already
   registered continues its normal course in the service to retirement or
   quarantine.
+- **The copy submits but its completion wake cannot be registered (round-1
+  M-1).** Registering a completion is fallible and its existing caller
+  propagates the failure (`scene.rs:6577`). B has already submitted here, so the
+  batch stays registered — its leases and obligations stand and the service's
+  own deadline path retires or quarantines it — the generation becomes
+  `Displaced`, any partial waiter state is removed, and **no offer is made**.
+  Generic availability is never an offer signal: only the correlated retirement
+  of this generation's destination obligation is.
 - **A newer generation supersedes.** Identical to composed: the in-flight copy is
   not aborted, its offer is discarded, and the buffer is `Displaced`.
 - **Deadline expiry and `renderer_failed`.** The batch's own serviced deadline
@@ -219,7 +272,10 @@ the connected output stay on `card1`/`HDMI-A-2`, which is a real
 With the real conductor, helper and producers, one run drives: a composed frame
 on the copied route — render, copy, offer, `Accepted`, `HardwareComplete`, damage
 applied — and proves that the destination was not offered before its obligation
-retired. The exclusivity mutation of CP-8 runs on the same hardware under the
+retired. Per round-1 M-2 that ordering claim is circular unless the evidence
+**first records that the destination's write obligation was registered under the
+destination's own key, and then records its retirement**. Fence order, or the
+mere fact that the service was called, does not establish it. The exclusivity mutation of CP-8 runs on the same hardware under the
 same filter, as 2c-iii §6.4 requires of its own mutations.
 
 If the forced-renderer configuration turns out not to be reachable on this
@@ -265,7 +321,10 @@ not by the first textual match.
 | The fence wakes and the service authorizes; neither substitutes for the other (CP-2) | Treat the copy's sync_file readability as proof of readability and skip the service |
 | The owner buffer reaches `Desired` at B's retirement, not A's (CP-3) | Promote to `Desired` when A completes |
 | A displaced generation behaves identically in either producer stage (CP-3) | Offer a generation displaced during the copy |
-| Batch B holds a write obligation on the destination and a read obligation on the source (CP-4) | Register the batch without the read obligation |
+| Batch B holds a write obligation on the destination and a read obligation on the source (CP-4) | Register the batch without the read obligation; **and, separately, register it with no destination obligation, or with one keyed to another allocation** (round-1 M-2) |
+| The transition moves the producer's leases and re-acquires nothing (CP-4a) | Re-reserve the source as `Read` for the batch; release the producer's source lease before the batch takes it |
+| The read obligation is registered by the production path, not by a test (CP-4b) | Drive the criterion from a hand-built batch instead of the route |
+| A copy that submitted but could not register its completion wake offers nothing and keeps its batch (3.3) | Offer on generic availability after a failed wake registration; drop the batch |
 | The source is not reusable until B retires (CP-5) | Return the source to the renderer pool at A's completion |
 | A failed copy submission offers nothing and discharges its leases through the service (3.3) | Offer after a failed copy; release its leases by hand |
 | Cancellation covers the copy wait with the same scope as A's (3.3) | Cancel only A's pending completions on output removal |
