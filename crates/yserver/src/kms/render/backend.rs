@@ -20897,15 +20897,20 @@ impl KmsBackend {
         }
 
         // 2. Reserve Preparing role before retaining / importing (8.3)
-        let prep_slot = self
-            .commit_consumer
-            .capacity
-            .reserve(crate::kms::render::resources::DirectRole::Preparing)?;
+        let mut prep_slot = Some(
+            self.commit_consumer
+                .capacity
+                .reserve(crate::kms::render::resources::DirectRole::Preparing)?,
+        );
 
         // 3. Resolve paint target and CRTC domain
         let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
         let Some(fallback_target) = paint_target else {
-            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            let _ = self.commit_consumer.capacity.cancel_reservation(
+                prep_slot
+                    .take()
+                    .ok_or(crate::kms::render::resources::ResourceError::InvalidState)?,
+            );
             self.request_direct_unflip("managed_prepare_paint_target_missing");
             return Ok(false);
         };
@@ -20913,7 +20918,11 @@ impl KmsBackend {
         let (completion_output_idx, _) = match self.present_crtc_output(candidate.crtc_id) {
             Some(pair) => pair,
             None => {
-                let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                let _ = self.commit_consumer.capacity.cancel_reservation(
+                    prep_slot
+                        .take()
+                        .ok_or(crate::kms::render::resources::ResourceError::InvalidState)?,
+                );
                 return Ok(false);
             }
         };
@@ -20934,7 +20943,9 @@ impl KmsBackend {
             // Proven failure: clean up candidate and cancel role, retaining existing successor
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
-            let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            if let Some(prep_slot) = prep_slot.take() {
+                let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            }
             self.request_direct_unflip("managed_prepare_framebuffer_missing");
             return Ok(false);
         }
@@ -20945,20 +20956,27 @@ impl KmsBackend {
         let owner_device = self.platform.outputs[completion_output_idx].key.device_key;
         let framebuffer_lease = if self.admission_is_active(owner_device) {
             match crate::kms::render::direct_owner::adopt_framebuffer(
-                self, source_id, source_pin, &prep_slot,
+                self,
+                source_id,
+                source_pin,
+                &mut prep_slot,
             ) {
                 Ok(Some(lease)) => Some(lease),
                 Ok(None) => {
                     <Self as Backend>::release_present_source(self, source_pin);
                     <Self as Backend>::release_present_source(self, fallback_target_pin);
-                    let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                    if let Some(prep_slot) = prep_slot.take() {
+                        let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                    }
                     self.request_direct_unflip("managed_prepare_framebuffer_adoption_refused");
                     return Ok(false);
                 }
                 Err(error) => {
                     <Self as Backend>::release_present_source(self, source_pin);
                     <Self as Backend>::release_present_source(self, fallback_target_pin);
-                    let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                    if let Some(prep_slot) = prep_slot.take() {
+                        let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                    }
                     self.request_direct_unflip("managed_prepare_framebuffer_adoption_failed");
                     return Err(error);
                 }
@@ -20981,7 +20999,8 @@ impl KmsBackend {
             self.discharge_bare_reservation(victim_role);
         }
 
-        let mut prep_slot = prep_slot;
+        let mut prep_slot =
+            prep_slot.ok_or(crate::kms::render::resources::ResourceError::InvalidState)?;
         if let Err(err) = self.commit_consumer.capacity.move_role(
             &mut prep_slot,
             crate::kms::render::resources::DirectRole::Successor,
@@ -51464,6 +51483,7 @@ mod tests {
     struct OwnerLiveFixture {
         backend: super::KmsBackend,
         cleanup_calls: Rc<RefCell<Vec<crate::kms::render::resources::tests::CleanupCall>>>,
+        cleanup_io: crate::kms::render::resources::tests::MockCleanupIo,
     }
 
     fn owner_live_fixture() -> Result<OwnerLiveFixture, std::io::Error> {
@@ -51557,11 +51577,12 @@ mod tests {
             .device
             .clone();
         let cleanup_calls = Rc::new(RefCell::new(Vec::new()));
+        let cleanup_io = MockCleanupIo::new(Rc::clone(&cleanup_calls));
         let mut registry = DrmCleanupRegistry::new_with_device_and_io(
             Rc::clone(&device),
             device_key,
             incarnation,
-            Box::new(MockCleanupIo::new(Rc::clone(&cleanup_calls))),
+            Box::new(cleanup_io.clone()),
         );
         let mut service = ResourceService::new(device_key, incarnation);
         for output_idx in 0..backend.platform.scanout_pools.len() {
@@ -51587,6 +51608,7 @@ mod tests {
             return Ok(OwnerLiveFixture {
                 backend,
                 cleanup_calls,
+                cleanup_io,
             });
         }
         let gate =
@@ -51600,6 +51622,7 @@ mod tests {
         Ok(OwnerLiveFixture {
             backend,
             cleanup_calls,
+            cleanup_io,
         })
     }
 
@@ -55474,6 +55497,7 @@ mod tests {
         let OwnerLiveFixture {
             mut backend,
             cleanup_calls,
+            cleanup_io,
         } = owner_live_fixture_with_three_outputs()
             .expect("environmental skip: no live Vulkan ICD available");
         let mut state = yserver_core::server::ServerState::new();
@@ -55515,6 +55539,7 @@ mod tests {
             OwnerLiveFixture {
                 backend,
                 cleanup_calls,
+                cleanup_io,
             },
             state,
             output_zero_window,
@@ -62805,6 +62830,161 @@ mod tests {
             2,
             "failed adoption must release the imported FB and GEM exactly once"
         );
+    }
+
+    fn c0_conv_cfb_clear_managed_fixture_pool(backend: &mut super::KmsBackend) {
+        let mut service = backend.resource_service.take().expect("service");
+        let mut registry = backend.drm_cleanup_registry.take().expect("registry");
+        for pool in &mut backend.platform.scanout_pools {
+            if let Some(pool) = pool.as_mut() {
+                pool.detach_managed_entries(Some(&mut registry));
+            }
+        }
+        service.service_ready_with_registry(&mut registry);
+        backend.resource_service = Some(service);
+        backend.drm_cleanup_registry = Some(registry);
+    }
+
+    #[test]
+    fn c0_conv_cfb_failed_cleanup_is_retained_and_retried() {
+        for fail_fb in [true, false] {
+            let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+            let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 20)
+                .expect("real PRIME import and ADDFB2");
+            c0_conv_cfb_clear_managed_fixture_pool(&mut fixture.backend);
+            let cleanup_before = fixture.cleanup_calls.borrow().len();
+            fixture
+                .backend
+                .resource_service
+                .as_mut()
+                .expect("resource service")
+                .force_next_generation_for_tests(u64::MAX);
+            fixture.cleanup_io.fail_fb.set(fail_fb);
+            fixture.cleanup_io.fail_gem.set(!fail_fb);
+
+            let result = fixture.backend.managed_prepare_direct_candidate(
+                prepared.source_id,
+                prepared.candidate,
+                prepared.event,
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                fixture
+                    .backend
+                    .drm_cleanup_registry()
+                    .expect("registry")
+                    .pending_cleanup_entries(),
+                1,
+                "a failed cleanup must retain the payload"
+            );
+            assert_eq!(
+                fixture
+                    .backend
+                    .drm_cleanup_registry()
+                    .expect("registry")
+                    .payload_aliases(),
+                1,
+                "a pending payload must count as one incarnation alias"
+            );
+            assert_eq!(
+                fixture
+                    .backend
+                    .drm_cleanup_registry()
+                    .expect("registry")
+                    .pending_cleanup_roles(),
+                vec![crate::kms::render::resources::DirectRole::Preparing]
+            );
+            assert_eq!(fixture.backend.commit_consumer.capacity.occupied(), 1);
+
+            fixture.cleanup_io.fail_fb.set(false);
+            fixture.cleanup_io.fail_gem.set(false);
+            let released = fixture
+                .backend
+                .drm_cleanup_registry
+                .as_mut()
+                .expect("registry")
+                .retry_pending_cleanup()
+                .expect("retry pending cleanup");
+            assert_eq!(released, 1);
+            assert_eq!(
+                fixture
+                    .backend
+                    .drm_cleanup_registry()
+                    .expect("registry")
+                    .pending_cleanup_entries(),
+                0
+            );
+            assert_eq!(
+                fixture
+                    .backend
+                    .drm_cleanup_registry()
+                    .expect("registry")
+                    .payload_aliases(),
+                0
+            );
+            assert_eq!(fixture.backend.commit_consumer.capacity.occupied(), 0);
+            assert_eq!(fixture.cleanup_calls.borrow().len(), cleanup_before + 3);
+        }
+    }
+
+    #[test]
+    fn c0_conv_cfb_pending_cleanup_follows_the_freeze() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 21)
+            .expect("real PRIME import and ADDFB2");
+        c0_conv_cfb_clear_managed_fixture_pool(&mut fixture.backend);
+        let cleanup_before = fixture.cleanup_calls.borrow().len();
+        fixture
+            .backend
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .force_next_generation_for_tests(u64::MAX);
+        fixture.cleanup_io.fail_fb.set(true);
+
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.cleanup_calls.borrow().len(), cleanup_before + 1);
+
+        let registry = fixture
+            .backend
+            .drm_cleanup_registry
+            .as_mut()
+            .expect("registry");
+        registry.freeze_incarnation();
+        assert_eq!(registry.retry_pending_cleanup().expect("frozen retry"), 0);
+        assert_eq!(
+            fixture.cleanup_calls.borrow().len(),
+            cleanup_before + 1,
+            "frozen entries are not retried"
+        );
+
+        registry.detach_fake_submitters();
+        registry.reap_fake_helper();
+        registry.close_fake_control();
+        let proof = registry
+            .try_mint_file_family_closed(|_, _| unreachable!("no keyed payload is pending"))
+            .expect("family closes by taking the pending entry");
+        assert!(registry.is_family_closed());
+        assert_eq!(registry.pending_cleanup_entries(), 0);
+        assert_eq!(registry.payload_aliases(), 0);
+        assert_eq!(fixture.backend.commit_consumer.capacity.occupied(), 0);
+        assert_eq!(
+            fixture.cleanup_calls.borrow().len(),
+            cleanup_before + 1,
+            "family close issues no stale ioctl"
+        );
+        registry
+            .retire_closed_family(proof)
+            .expect("retire family proof");
     }
 
     #[test]

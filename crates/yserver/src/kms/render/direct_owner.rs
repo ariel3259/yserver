@@ -19,8 +19,8 @@ use crate::{
                 ComposedPlane, composed_description, discover_composed_property_ids,
             },
             resources::{
-                AllocationLease, AllocationPayload, CommitResources, DirectRole, ResourceError,
-                RoleReservation,
+                AllocationLease, AllocationPayload, CleanupCharge, CommitResources, DirectRole,
+                ResourceError, RoleReservation,
             },
             store::DrawableId,
         },
@@ -153,7 +153,7 @@ pub(crate) fn adopt_framebuffer(
     backend: &mut KmsBackend,
     source_id: DrawableId,
     source_pin: u64,
-    preparing: &RoleReservation,
+    preparing: &mut Option<RoleReservation>,
 ) -> Result<Option<AllocationLease>, ResourceError> {
     let (device, incarnation, service_binding) = {
         let service = backend
@@ -167,7 +167,7 @@ pub(crate) fn adopt_framebuffer(
         )
     };
     let permit = backend.commit_consumer.capacity.mint_direct_lease_permit(
-        preparing,
+        preparing.as_ref().ok_or(ResourceError::InvalidState)?,
         device,
         incarnation,
         service_binding,
@@ -242,15 +242,12 @@ pub(crate) fn adopt_framebuffer(
                 .as_mut()
                 .ok_or(ResourceError::InvalidState)?;
             if let Err(cleanup_error) = payload.discharge_file_owned(cleanup) {
-                // Task 2 supplies the retry owner. Until then, preserve the
-                // sole payload owner and fail closed; never silently drop a
-                // right whose cleanup did not succeed.
                 log::error!(
                     "owner direct framebuffer adoption cleanup failed after service refusal: {cleanup_error}"
                 );
                 backend.commit_consumer.capacity.close_admission();
-                // Task 2 removes the forget.
-                std::mem::forget(payload);
+                let charge = preparing.take().ok_or(ResourceError::InvalidState)?;
+                cleanup.retain_pending_cleanup(payload, CleanupCharge::Preparing(charge));
                 return Err(ResourceError::InvalidState);
             }
             backend.commit_consumer.capacity.close_admission();

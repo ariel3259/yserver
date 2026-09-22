@@ -113,6 +113,17 @@ impl FileOwnedBacking {
             )),
         }
     }
+
+    pub(crate) fn close_after_family(mut self) {
+        self.right.mark_closed();
+        let Self {
+            right: _,
+            gbm_bo,
+            device,
+        } = self;
+        drop(gbm_bo);
+        drop(device);
+    }
 }
 
 /// Shared half of a managed scanout allocation. Independent of the DRM description;
@@ -271,6 +282,12 @@ impl ScanoutAllocation {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn close_file_owned_after_family(&mut self) {
+        if let Some(file_owned) = self.file_owned.take() {
+            file_owned.close_after_family();
+        }
     }
 
     /// Inverse of `from_scanout_bo_backing`, for the F2-M2 rollback when a

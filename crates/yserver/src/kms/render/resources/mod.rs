@@ -46,8 +46,8 @@ pub(crate) use commit::{
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
 #[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
-    CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
-    FamilyInventory, FileFamilyClosed, GemOwner, PoolHuskRegistration, RightState,
+    CleanupCharge, CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry,
+    DrmCleanupRight, FamilyInventory, FileFamilyClosed, GemOwner, PoolHuskRegistration, RightState,
 };
 #[allow(unused_imports)]
 use gpu::ValidatedGpuBatch;
@@ -134,6 +134,19 @@ impl AllocationPayload {
             #[cfg(test)]
             AllocationPayload::Spy(_) => Ok(()),
             AllocationPayload::Storage(_) | AllocationPayload::CopiedSource(_) => Ok(()),
+            AllocationPayload::Unused(never) => match *never {},
+        }
+    }
+
+    pub(crate) fn close_file_owned_after_family(&mut self) {
+        match self {
+            AllocationPayload::Scanout(alloc) => alloc.close_file_owned_after_family(),
+            AllocationPayload::DirectFramebuffer(alloc) => {
+                alloc.close_file_owned_after_family();
+            }
+            #[cfg(test)]
+            AllocationPayload::Spy(_) => {}
+            AllocationPayload::Storage(_) | AllocationPayload::CopiedSource(_) => {}
             AllocationPayload::Unused(never) => match *never {},
         }
     }
@@ -566,6 +579,11 @@ impl ResourceService {
         let mut service = Self::new(device, incarnation);
         service.next_generation = next_generation;
         service
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_generation_for_tests(&mut self, next_generation: u64) {
+        self.next_generation = next_generation;
     }
 
     pub(crate) fn direct_framebuffer_handle(
@@ -1029,6 +1047,7 @@ impl ResourceService {
         &mut self,
         registry: &mut DrmCleanupRegistry,
     ) -> Vec<AllocationKey> {
+        let _ = registry.retry_pending_cleanup();
         let dirty_keys: BTreeSet<AllocationKey> =
             std::mem::take(&mut *self.dirty_entries.borrow_mut());
         let mut transitions = Vec::new();

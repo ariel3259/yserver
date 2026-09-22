@@ -45,6 +45,7 @@ pub(crate) struct RoleReservation {
     pub(crate) closed: Rc<Cell<bool>>,
     pub(crate) discharged: bool,
     proof_state: Rc<DirectRoleProofState>,
+    role_state: Rc<Cell<RoleState>>,
 }
 
 #[derive(Debug)]
@@ -78,7 +79,9 @@ impl DirectLeasePermit {
         // would mask the serial check.  Refresh only this test copy so the
         // cancel/re-reserve case isolates the same-role serial invariant.
         self.state.role.set(self.role);
-        self.state.state.set(capacity.roles[self.role.index()]);
+        self.state
+            .state
+            .set(capacity.roles[self.role.index()].get());
     }
 }
 
@@ -94,6 +97,7 @@ impl RoleReservation {
                 role: Cell::new(role),
                 state: Cell::new(RoleState::Reserved(serial)),
             }),
+            role_state: Rc::new(Cell::new(RoleState::Reserved(serial))),
         }
     }
 
@@ -103,6 +107,15 @@ impl RoleReservation {
 
     pub(crate) fn serial(&self) -> u64 {
         self.serial
+    }
+
+    /// Release a role held by the pending-cleanup owner. The charge is a
+    /// transferred reservation, not a new reservation, so it can discharge
+    /// without access to the capacity value that originally issued it.
+    pub(crate) fn release_after_cleanup(mut self) {
+        self.role_state.set(RoleState::Vacant);
+        self.proof_state.state.set(RoleState::Vacant);
+        self.discharged = true;
     }
 }
 
@@ -135,7 +148,7 @@ impl fmt::Debug for RoleReservation {
 
 #[derive(Debug)]
 pub(crate) struct DirectCapacity {
-    roles: [RoleState; 6],
+    roles: [Rc<Cell<RoleState>>; 6],
     next_serial: u64,
     admission_closed: Rc<Cell<bool>>,
     identity: Rc<()>,
@@ -150,7 +163,7 @@ impl Default for DirectCapacity {
 impl DirectCapacity {
     pub(crate) fn new() -> Self {
         Self {
-            roles: [RoleState::Vacant; 6],
+            roles: std::array::from_fn(|_| Rc::new(Cell::new(RoleState::Vacant))),
             next_serial: 0,
             admission_closed: Rc::new(Cell::new(false)),
             identity: Rc::new(()),
@@ -168,18 +181,18 @@ impl DirectCapacity {
     pub(crate) fn occupied(&self) -> usize {
         self.roles
             .iter()
-            .filter(|s| !matches!(s, RoleState::Vacant))
+            .filter(|s| !matches!(s.get(), RoleState::Vacant))
             .count()
     }
 
     pub(crate) fn is_vacant(&self, role: DirectRole) -> bool {
-        self.roles[role.index()] == RoleState::Vacant
+        self.roles[role.index()].get() == RoleState::Vacant
     }
 
     pub(crate) fn can_enter_direct(&self) -> bool {
         !self.admission_closed.get()
-            && self.roles[DirectRole::OrdinaryRetirement.index()] == RoleState::Vacant
-            && self.roles[DirectRole::ExitRetirement.index()] == RoleState::Vacant
+            && self.roles[DirectRole::OrdinaryRetirement.index()].get() == RoleState::Vacant
+            && self.roles[DirectRole::ExitRetirement.index()].get() == RoleState::Vacant
     }
 
     pub(crate) fn reserve(&mut self, role: DirectRole) -> Result<RoleReservation, ResourceError> {
@@ -187,7 +200,7 @@ impl DirectCapacity {
             return Err(ResourceError::Busy);
         }
         let idx = role.index();
-        if self.roles[idx] != RoleState::Vacant {
+        if self.roles[idx].get() != RoleState::Vacant {
             return Err(ResourceError::Busy);
         }
         self.next_serial = self
@@ -195,7 +208,7 @@ impl DirectCapacity {
             .checked_add(1)
             .ok_or(ResourceError::Exhausted)?;
         let serial = self.next_serial;
-        self.roles[idx] = RoleState::Reserved(serial);
+        self.roles[idx].set(RoleState::Reserved(serial));
         Ok(RoleReservation {
             role,
             serial,
@@ -205,6 +218,7 @@ impl DirectCapacity {
                 role: Cell::new(role),
                 state: Cell::new(RoleState::Reserved(serial)),
             }),
+            role_state: Rc::clone(&self.roles[idx]),
         })
     }
 
@@ -219,13 +233,13 @@ impl DirectCapacity {
         service: Rc<()>,
     ) -> Result<DirectLeasePermit, ResourceError> {
         let idx = reservation.role.index();
-        if self.roles[idx] != RoleState::Reserved(reservation.serial)
-            && self.roles[idx] != RoleState::Occupied(reservation.serial)
+        if self.roles[idx].get() != RoleState::Reserved(reservation.serial)
+            && self.roles[idx].get() != RoleState::Occupied(reservation.serial)
         {
             return Err(ResourceError::InvalidState);
         }
         if reservation.proof_state.role.get() != reservation.role
-            || reservation.proof_state.state.get() != self.roles[idx]
+            || reservation.proof_state.state.get() != self.roles[idx].get()
         {
             return Err(ResourceError::InvalidState);
         }
@@ -257,7 +271,7 @@ impl DirectCapacity {
         }
         let state = permit.state.state.get();
         matches!(state, RoleState::Reserved(s) | RoleState::Occupied(s) if s == permit.serial)
-            && self.roles[role.index()] == state
+            && self.roles[role.index()].get() == state
     }
 
     pub(crate) fn binding_matches(&self, binding: &Rc<()>) -> bool {
@@ -275,8 +289,8 @@ impl DirectCapacity {
         mut value: CommitResources,
     ) -> Result<CommitResources, (ResourceError, RoleReservation, CommitResources)> {
         let idx = slot.role.index();
-        if self.roles[idx] == RoleState::Reserved(slot.serial) {
-            self.roles[idx] = RoleState::Occupied(slot.serial);
+        if self.roles[idx].get() == RoleState::Reserved(slot.serial) {
+            self.roles[idx].set(RoleState::Occupied(slot.serial));
             slot.proof_state.state.set(RoleState::Occupied(slot.serial));
             value.direct_role = Some(slot);
             Ok(value)
@@ -291,8 +305,8 @@ impl DirectCapacity {
         mut slot: RoleReservation,
     ) -> Result<(), (ResourceError, RoleReservation)> {
         let idx = slot.role.index();
-        if self.roles[idx] == RoleState::Reserved(slot.serial) {
-            self.roles[idx] = RoleState::Vacant;
+        if self.roles[idx].get() == RoleState::Reserved(slot.serial) {
+            self.roles[idx].set(RoleState::Vacant);
             slot.proof_state.state.set(RoleState::Vacant);
             slot.discharged = true;
             Ok(())
@@ -307,8 +321,8 @@ impl DirectCapacity {
         mut slot: RoleReservation,
     ) -> Result<(), (ResourceError, RoleReservation)> {
         let idx = slot.role.index();
-        if self.roles[idx] == RoleState::Occupied(slot.serial) {
-            self.roles[idx] = RoleState::Vacant;
+        if self.roles[idx].get() == RoleState::Occupied(slot.serial) {
+            self.roles[idx].set(RoleState::Vacant);
             slot.proof_state.state.set(RoleState::Vacant);
             slot.discharged = true;
             Ok(())
@@ -327,11 +341,11 @@ impl DirectCapacity {
             return Ok(());
         }
         let to_idx = to.index();
-        if self.roles[to_idx] != RoleState::Vacant {
+        if self.roles[to_idx].get() != RoleState::Vacant {
             return Err(ResourceError::Busy);
         }
         let from_idx = slot.role.index();
-        let state = match self.roles[from_idx] {
+        let state = match self.roles[from_idx].get() {
             RoleState::Reserved(s) if s == slot.serial => RoleState::Reserved(s),
             RoleState::Occupied(s) if s == slot.serial => RoleState::Occupied(s),
             _ => {
@@ -339,9 +353,10 @@ impl DirectCapacity {
                 return Err(ResourceError::InvalidState);
             }
         };
-        self.roles[from_idx] = RoleState::Vacant;
-        self.roles[to_idx] = state;
+        self.roles[from_idx].set(RoleState::Vacant);
+        self.roles[to_idx].set(state);
         slot.role = to;
+        slot.role_state = Rc::clone(&self.roles[to_idx]);
         slot.proof_state.role.set(to);
         Ok(())
     }
@@ -357,11 +372,11 @@ impl DirectCapacity {
         }
         let occ_idx = occupied.role.index();
         let res_idx = reserved.role.index();
-        let occ_valid = match self.roles[occ_idx] {
+        let occ_valid = match self.roles[occ_idx].get() {
             RoleState::Occupied(s) | RoleState::Reserved(s) => s == occupied.serial,
             RoleState::Vacant => false,
         };
-        let res_valid = match self.roles[res_idx] {
+        let res_valid = match self.roles[res_idx].get() {
             RoleState::Reserved(s) => s == reserved.serial,
             _ => false,
         };
@@ -369,10 +384,11 @@ impl DirectCapacity {
             self.close_admission();
             return Err((ResourceError::InvalidState, reserved));
         }
-        self.roles[occ_idx] = RoleState::Vacant;
-        self.roles[res_idx] = RoleState::Occupied(reserved.serial);
+        self.roles[occ_idx].set(RoleState::Vacant);
+        self.roles[res_idx].set(RoleState::Occupied(reserved.serial));
         occupied.role = reserved.role;
         occupied.serial = reserved.serial;
+        occupied.role_state = Rc::clone(&self.roles[res_idx]);
         occupied.proof_state.role.set(reserved.role);
         occupied
             .proof_state
