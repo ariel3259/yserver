@@ -52129,6 +52129,191 @@ mod tests {
         owner_live_fixture_with_output_count(1, false)
     }
 
+    fn assert_managed_recording_was_cancelled(
+        backend: &super::KmsBackend,
+        expected_pool_occupancy: (usize, usize),
+    ) -> (usize, crate::kms::render::resources::AllocationKey) {
+        let diagnostics = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("live Owner output has tick diagnostics");
+        let (bo_idx, key) = diagnostics
+            .acquired_destination
+            .expect("the forced early exit must follow managed destination acquisition");
+        let destination = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("Owner fixture retains its scanout pool")
+            .display_pool()
+            .bos
+            .get(bo_idx)
+            .expect("acquired destination remains registered in the persistent pool");
+        assert_eq!(destination.managed_key(), Some(key));
+        assert_eq!(
+            destination.state.phase,
+            crate::kms::vk::scanout::BoPhase::Free,
+            "an early exit before render submission must cancel Free -> Recording"
+        );
+        assert_eq!(
+            diagnostics.pool_occupancy, expected_pool_occupancy,
+            "no descriptor slot from the early exit may remain held"
+        );
+        assert!(
+            backend.scene.owner_prepared_for_tests(0).is_none(),
+            "a pre-submit exit must not install Owner buffer membership"
+        );
+        assert!(
+            !backend.scene.has_pending_page_flip(0),
+            "a pre-submit exit must not install a pending acknowledgement"
+        );
+        assert_eq!(
+            backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "a pre-submit exit must not leave a render-completion waiter"
+        );
+        let service = backend
+            .resource_service()
+            .expect("the successful managed acquisition requires its service");
+        assert!(
+            service.is_releasable(&key),
+            "the acquisition's temporary destination lease must be dropped"
+        );
+        assert!(
+            !service.has_pending_obligations(&key),
+            "no GPU obligation may be registered before render submission"
+        );
+        (bo_idx, key)
+    }
+
+    fn tick_managed_pre_submit_fixture(backend: &mut super::KmsBackend) {
+        assert!(backend.platform.output_uses_owner_route(0));
+        backend.scene.reset_tick_diagnostics_for_tests(0);
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_managed_rollback_on_audit_overlay_pipeline_error_vulkan() {
+        let mut fixture = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        let backend = &mut fixture.backend;
+        assert!(matches!(
+            backend.platform.scanout_pools[0].as_ref(),
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(_))
+        ));
+        assert!(backend.scene.root_overlay_toggle(
+            yserver_protocol::x11::ClientId(0xC0),
+            0x00ff_ffff,
+            &[ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 5, y: 5 },
+                extent: ash::vk::Extent2D {
+                    width: 20,
+                    height: 20,
+                },
+            }],
+        ));
+        backend.scene.force_tick_failure_for_tests(
+            crate::kms::render::scene::TickFailureForTests::AuditOverlayPipeline,
+        );
+
+        tick_managed_pre_submit_fixture(backend);
+
+        assert!(
+            !backend.scene.root_overlay.is_empty(),
+            "the fixture must take the non-empty XOR pipeline path"
+        );
+        assert_managed_recording_was_cancelled(backend, (0, 3));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_managed_rollback_on_damage_audit_error_vulkan() {
+        let mut fixture =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        assert!(matches!(
+            backend.platform.scanout_pools[0].as_ref(),
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(_))
+        ));
+        // `run_damage_audit` exits successfully without work on Copied
+        // outputs, so only the managed Shared route can reach this error site.
+        backend.scene.force_tick_failure_for_tests(
+            crate::kms::render::scene::TickFailureForTests::DamageAudit,
+        );
+
+        tick_managed_pre_submit_fixture(backend);
+
+        assert_managed_recording_was_cancelled(backend, (0, 3));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_managed_rollback_on_descriptor_no_pool_vulkan() {
+        let mut fixture = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        let backend = &mut fixture.backend;
+        assert!(matches!(
+            backend.platform.scanout_pools[0].as_ref(),
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(_))
+        ));
+        let held_slots = backend.scene.exhaust_descriptor_ring_for_tests(0);
+        assert_eq!(
+            held_slots.len(),
+            3,
+            "fixture must hold all descriptor slots before the managed tick"
+        );
+
+        tick_managed_pre_submit_fixture(backend);
+
+        let diagnostics = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("live Owner output has tick diagnostics");
+        assert_eq!(
+            diagnostics
+                .skip_counts
+                .iter()
+                .find(|(reason, _)| *reason == "NoPool")
+                .map(|(_, count)| *count),
+            Some(1),
+            "the test must force the descriptor-pool NoPool return"
+        );
+        assert_eq!(diagnostics.acquisition_skips.len(), 1);
+        assert_eq!(diagnostics.acquisition_skips[0].reason, "NoPool");
+        assert_managed_recording_was_cancelled(backend, (3, 3));
+        backend
+            .scene
+            .release_descriptor_slots_for_tests(0, &held_slots);
+        assert_eq!(
+            backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .expect("live Owner output has tick diagnostics")
+                .pool_occupancy,
+            (0, 3),
+            "release the test-owned slots after verifying NoPool preserves their baseline"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_managed_rollback_on_fence_ticket_error_vulkan() {
+        let mut fixture = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        let backend = &mut fixture.backend;
+        assert!(matches!(
+            backend.platform.scanout_pools[0].as_ref(),
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(_))
+        ));
+        backend.platform.fence_pool = None;
+
+        tick_managed_pre_submit_fixture(backend);
+
+        assert_managed_recording_was_cancelled(backend, (0, 3));
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cp_copied_fixture_builds_a_managed_output_vulkan() {
@@ -53306,6 +53491,91 @@ mod tests {
             &platform.outputs[0].key.device_key,
             crate::kms::render::resources::WriterClass::Primary
         ));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_four_composed_owner_frames_do_not_exhaust_descriptor_ring_vulkan() {
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        let mut previous_generation = 0;
+        backend.scene.reset_tick_diagnostics_for_tests(0);
+
+        for frame in 0..4 {
+            if frame != 0 {
+                reinstall_owner_executor_for_cir_test(&mut backend, device);
+            }
+
+            backend.scene.mark_scene_structure_dirty();
+            backend.test_skip_render_completion_drain = true;
+            let tick_result = backend.maybe_composite();
+            backend.test_skip_render_completion_drain = false;
+            tick_result.expect("the production compositor tick must succeed");
+            let diagnostics = backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .expect("live Owner output has tick diagnostics");
+            let Some((bo_idx, generation, waiting_for_render)) =
+                backend.scene.owner_prepared_for_tests(0)
+            else {
+                panic!(
+                    "composed Owner frame {frame} did not acquire a descriptor slot: \
+                     skip_counts={:?}, pool_occupancy={:?}",
+                    diagnostics.skip_counts, diagnostics.pool_occupancy
+                );
+            };
+            assert!(
+                generation > previous_generation,
+                "composed Owner frame {frame} did not produce a new generation: \
+                 previous={previous_generation}, current={generation}, \
+                 skip_counts={:?}, pool_occupancy={:?}",
+                diagnostics.skip_counts,
+                diagnostics.pool_occupancy
+            );
+            previous_generation = generation;
+            assert!(
+                waiting_for_render,
+                "frame {frame} remains Rendering until its GPU completion is drained"
+            );
+            assert!(
+                diagnostics.pool_occupancy.0 > 0,
+                "frame {frame} must retain its descriptor pool while compose work may use it"
+            );
+
+            backend.platform.wait_idle_bounded();
+            backend.drain_scanout_render_completions_for_tests();
+            assert_eq!(
+                owner_state_for_tests(&backend, bo_idx),
+                Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
+                "frame {frame} generation {generation} must reach admission"
+            );
+
+            let commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("composed Owner generation is dispatched")
+                .commit_id();
+            assert!(backend.route_owner_event_batch(
+                device,
+                vec![crate::kms::owner::device::OwnerEvent::Accepted { commit }],
+                std::time::Instant::now(),
+            ));
+            assert!(backend.route_owner_event_batch(
+                device,
+                vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+                std::time::Instant::now(),
+            ));
+            let completion = backend.complete_owner_for_tests(0);
+            assert!(
+                backend.route_owner_event_batch(device, completion, std::time::Instant::now(),)
+            );
+            assert_eq!(
+                owner_state_for_tests(&backend, bo_idx),
+                Some(crate::kms::render::owner_buffer::OwnerBufferState::Current),
+                "frame {frame} completes the composed Owner lifecycle"
+            );
+        }
     }
 
     #[test]
@@ -67756,10 +68026,15 @@ mod tests {
             )));
         }
 
-        let base =
+        let mut base =
             super::KmsBackend::for_tests_with_vk_live_scene_real_drm_using(Arc::clone(&sink_vk))?;
+        // The live-KMS helper replaces the engine after it installs the
+        // connector, but the initial root fill belongs to this sink-backed
+        // engine and its SubmitGroup. Drain it before handing the backend to
+        // that helper so no sink-owned fence survives the engine replacement.
+        base.engine.shutdown(&mut base.store, &mut base.platform);
         let mut fixture =
-            super::KmsBackend::for_tests_with_live_kms_from_backend(base, Some("HDMI-A-2"))?;
+            super::KmsBackend::for_tests_with_live_kms_from_backend(base, Some("HDMI-2"))?;
         let backend = &mut fixture.backend;
         let sink_id = backend
             .platform
@@ -67946,6 +68221,73 @@ mod tests {
         );
     }
 
+    fn print_copied_route_latency_snapshot(expected_frames_per_transport: usize) {
+        use crate::kms::render::platform::CopiedRouteTransport::{Legacy, Owner};
+
+        let snapshot = crate::kms::render::platform::copied_route_latency_snapshot_for_tests();
+        let incomplete = snapshot.insufficient
+            || !snapshot.pending_frames.is_empty()
+            || [Legacy, Owner].into_iter().any(|transport| {
+                snapshot
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.transport == transport)
+                    .count()
+                    != expected_frames_per_transport
+            });
+        let status = if incomplete { "partial" } else { "complete" };
+
+        for sample in &snapshot.samples {
+            println!(
+                "CP-LATENCY transport={:?} status={status} frame={} submission_delay_us={} expected_msc={} completion_msc={} missed_vblank={}",
+                sample.transport,
+                sample.frame,
+                sample.submission_delay_us,
+                sample.expected_msc,
+                sample.completion_msc,
+                sample.completion_msc > sample.expected_msc,
+            );
+        }
+        for transport in [Legacy, Owner] {
+            let samples = snapshot
+                .samples
+                .iter()
+                .filter(|sample| sample.transport == transport)
+                .collect::<Vec<_>>();
+            let missed = samples
+                .iter()
+                .filter(|sample| sample.completion_msc > sample.expected_msc)
+                .count();
+            let pending = snapshot
+                .pending_frames
+                .iter()
+                .filter(|pending| pending.transport == transport)
+                .count();
+            let unstarted =
+                expected_frames_per_transport.saturating_sub(samples.len().saturating_add(pending));
+            println!(
+                "CP-LATENCY-SUMMARY status={status} transport={transport:?} frames={}/{} missed_vblank={missed}/{} pending={} unstarted={} insufficient={}",
+                samples.len(),
+                expected_frames_per_transport,
+                samples.len(),
+                pending,
+                unstarted,
+                snapshot.insufficient,
+            );
+        }
+        for pending in &snapshot.pending_frames {
+            println!(
+                "CP-LATENCY-PENDING status={status} transport={:?} frame={} fence_signalled={} expected_msc_recorded={} commit_submitted={} completion_msc_recorded={}",
+                pending.transport,
+                pending.frame,
+                pending.fence_signalled,
+                pending.expected_msc_recorded,
+                pending.commit_submitted,
+                pending.completion_msc_recorded,
+            );
+        }
+    }
+
     fn run_copied_hardware_phase(backend: &mut super::KmsBackend, owner: bool) {
         use std::{
             collections::BTreeMap,
@@ -67976,10 +68318,23 @@ mod tests {
         const FRAMES: usize = 4;
 
         for frame in 0..FRAMES {
-            let damage_before = backend.scene.damage_history_len_for_tests(0);
+            if owner && frame == 3 {
+                backend.scene.reset_tick_diagnostics_for_tests(0);
+            }
+            let owner_generation_before = owner
+                .then(|| {
+                    backend
+                        .scene
+                        .owner_prepared_for_tests(0)
+                        .map(|(_, generation, _)| generation)
+                })
+                .flatten();
+            let damage_generation_before =
+                backend.scene.damage_history_latest_generation_for_tests(0);
             backend.scene.mark_scene_structure_dirty();
             backend.tick_maybe_composite_for_tests_without_render_completion_drain();
             let deadline = Instant::now() + Duration::from_secs(15);
+            let mut logged_owner_release_retry = false;
             while Instant::now() < deadline {
                 let current_msc = backend.platform.present_get_ust_msc(crtc_key).0;
                 crate::kms::render::platform::poll_copied_route_latency_for_tests(current_msc);
@@ -68012,7 +68367,7 @@ mod tests {
                         );
                         milestones.entry(commit).or_default().push("Accepted");
                         println!(
-                            "CP copied offer accepted after destination retirement commit={commit:?}"
+                            "CP copied owner helper Accepted observed after destination offer enqueue commit={commit:?}"
                         );
                     }
                 }
@@ -68022,6 +68377,12 @@ mod tests {
                     });
                 }
                 for (device_key, events) in backend.platform.service_owner_completions(now) {
+                    let hardware_complete_commit = events.iter().find_map(|event| match event {
+                        crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } => {
+                            Some(*commit)
+                        }
+                        _ => None,
+                    });
                     for event in &events {
                         match event {
                             crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } => {
@@ -68036,13 +68397,14 @@ mod tests {
                             crate::kms::owner::device::OwnerEvent::Presented {
                                 samples, ..
                             } => {
-                                let msc = samples.get(&u32::from(crtc)).map(|sample| sample.msc);
-                                if let Some(msc) = msc {
-                                    crate::kms::render::platform::record_copied_completion_msc_for_tests(
-                                        crate::kms::render::platform::CopiedRouteTransport::Owner,
-                                        msc,
-                                    );
-                                }
+                                let msc = samples
+                                    .get(&u32::from(crtc))
+                                    .or_else(|| {
+                                        (samples.len() == 1)
+                                            .then(|| samples.values().next())
+                                            .flatten()
+                                    })
+                                    .map(|sample| sample.msc);
                                 if let crate::kms::owner::device::OwnerEvent::Presented {
                                     commit,
                                     ..
@@ -68075,6 +68437,37 @@ mod tests {
                         backend.route_owner_event_batch(device_key, events, now),
                         "copied owner completion batch was not consumed: {event_debug}"
                     );
+                    // A composed commit emits HardwareComplete without
+                    // Presented. Snapshot the latest validated CRTC clock at
+                    // that hardware-completion boundary; CompletionRetired
+                    // follows for resource retirement and carries no clock.
+                    // If there is no routed sample, leave latency incomplete
+                    // and report that instead of manufacturing an MSC.
+                    if owner
+                        && let Some(commit) = hardware_complete_commit
+                        && crate::kms::render::platform::copied_route_latency_waiting_for_completion_for_tests(
+                            crate::kms::render::platform::CopiedRouteTransport::Owner,
+                        )
+                    {
+                        match backend
+                            .platform
+                            .present_get_completion_clock_if_known(crtc_key)
+                        {
+                            Some(sample) => {
+                                println!(
+                                    "CP copied completion_clock transport=Owner milestone=HardwareComplete commit={commit:?} crtc={crtc_key:?} msc={} ust={} source={:?}",
+                                    sample.msc, sample.ust, sample.source
+                                );
+                                crate::kms::render::platform::record_copied_completion_msc_for_tests(
+                                    crate::kms::render::platform::CopiedRouteTransport::Owner,
+                                    sample.msc,
+                                );
+                            }
+                            None => println!(
+                                "CP copied completion_clock unavailable transport=Owner milestone=HardwareComplete commit={commit:?} crtc={crtc_key:?} reason=no validated routed CRTC clock is available"
+                            ),
+                        }
+                    }
                 }
                 let (drm_events, drain_result) = backend.platform.drain_owner_events(drm_fd, now);
                 drain_result.unwrap_or_else(|error| panic!("copied DRM drain failed: {error}"));
@@ -68086,16 +68479,14 @@ mod tests {
                         >,
                     >,
                 >::new();
+                let mut legacy_completion_mscs = Vec::new();
                 for (device_key, event) in drm_events {
                     if let crate::kms::owner::device::OwnerEvent::LegacyPageFlip {
                         sequence, ..
                     } = &event
-                        && *sequence != 0
                     {
-                        crate::kms::render::platform::record_copied_completion_msc_for_tests(
-                            crate::kms::render::platform::CopiedRouteTransport::Legacy,
-                            u64::from(*sequence),
-                        );
+                        legacy_completion_mscs
+                            .push((*sequence != 0).then_some(u64::from(*sequence)));
                     }
                     grouped.entry(device_key).or_default().push(event);
                 }
@@ -68106,7 +68497,45 @@ mod tests {
                         "copied legacy completion batch was not consumed: {event_debug}"
                     );
                 }
+                if !owner {
+                    for msc in legacy_completion_mscs {
+                        let msc = msc.or_else(|| {
+                            backend
+                                .platform
+                                .present_get_completion_clock_if_known(crtc_key)
+                                .map(|sample| sample.msc)
+                        });
+                        if let Some(msc) = msc {
+                            crate::kms::render::platform::record_copied_completion_msc_for_tests(
+                                crate::kms::render::platform::CopiedRouteTransport::Legacy,
+                                msc,
+                            );
+                        }
+                    }
+                }
                 backend.drain_scanout_render_completions_for_tests();
+                if owner {
+                    let owner_frame_started = backend
+                        .scene
+                        .owner_prepared_for_tests(0)
+                        .is_some_and(|(_, generation, _)| {
+                            owner_generation_before.is_none_or(|before| generation > before)
+                        });
+                    if !owner_frame_started {
+                        if !logged_owner_release_retry {
+                            println!(
+                                "CP copied Owner harness retry: pumping scene release gates while frame {frame} has no new owner generation"
+                            );
+                            logged_owner_release_retry = true;
+                        }
+                        // Production revisits these gates on each compositor
+                        // tick. A live frame can become releasable only after
+                        // the resource and owner events above have been
+                        // serviced, so retry the production tick until this
+                        // frame acquires/submits one generation.
+                        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+                    }
+                }
                 if owner {
                     if let Some((bo_idx, _, true)) = backend.scene.owner_prepared_for_tests(0)
                         && let Some(((destination_key, obligation), _)) =
@@ -68137,11 +68566,11 @@ mod tests {
                                     .has_pending_obligation(&destination_key, obligation)
                             );
                             println!(
-                                "CP copied destination obligation registered key={destination_key:?} obligation={obligation:?}"
+                                "CP copied pending destination obligation observed key={destination_key:?} obligation={obligation:?}"
                             );
                             registered.push((destination_key, obligation));
                             println!(
-                                "CP copied destination offer bo_idx={bo_idx} key={destination_key:?} obligation={obligation:?}"
+                                "CP copied generation waiting on destination obligation bo_idx={bo_idx} state=Rendering key={destination_key:?} obligation={obligation:?}"
                             );
                         }
                     }
@@ -68154,16 +68583,19 @@ mod tests {
                             && !retired.contains(&(key, obligation))
                         {
                             retired.push((key, obligation));
-                            println!(
-                                "CP copied destination obligation retired key={key:?} obligation={obligation:?}"
-                            );
                         }
                     }
                 }
                 crate::kms::render::platform::poll_copied_route_latency_for_tests(
                     backend.platform.present_get_ust_msc(crtc_key).0,
                 );
-                if backend.scene.damage_history_len_for_tests(0) > damage_before
+                let damage_generation_advanced = backend
+                    .scene
+                    .damage_history_latest_generation_for_tests(0)
+                    .is_some_and(|after| {
+                        damage_generation_before.is_none_or(|before| after > before)
+                    });
+                if damage_generation_advanced
                     && backend.scene.pending_ack_count_for_tests(0) == 0
                     && backend
                         .scene
@@ -68189,10 +68621,18 @@ mod tests {
                     );
                 }
             }
-            assert!(
-                backend.scene.damage_history_len_for_tests(0) > damage_before,
-                "copied {owner} frame {frame} did not apply damage"
-            );
+            let damage_generation_after =
+                backend.scene.damage_history_latest_generation_for_tests(0);
+            let damage_applied = damage_generation_after
+                .is_some_and(|after| damage_generation_before.is_none_or(|before| after > before));
+            if !damage_applied {
+                // Preserve the timing samples already completed by this phase
+                // before the frame assertion unwinds the test.
+                print_copied_route_latency_snapshot(FRAMES);
+                panic!(
+                    "copied {owner} frame {frame} did not apply damage: latest generation before={damage_generation_before:?} after={damage_generation_after:?}"
+                );
+            }
             println!(
                 "CP copied damage_applied transport={} frame={frame}",
                 if owner { "Owner" } else { "Legacy" }
@@ -68209,25 +68649,16 @@ mod tests {
                 "every destination obligation must retire"
             );
             for steps in milestones.values() {
-                let required = [
-                    "Accepted",
-                    "HardwareComplete",
-                    "Presented",
-                    "CompletionRetired",
-                ];
-                let mut next = 0;
-                for step in steps {
-                    if *step == required[next] {
-                        next += 1;
-                        if next == required.len() {
-                            break;
-                        }
-                    }
-                }
+                // A composed commit intentionally has no `Presented`:
+                // design §3.3 and the exit criteria at
+                // docs/superpowers/specs/2026-09-19-phase-c0-stage-2c-iii-conversion-design.md:410 say "a composed commit carries no Present".
+                // A composited `Present` attached to the composed description
+                // is a mutation the design requires to fail.
+                let required = ["Accepted", "HardwareComplete", "CompletionRetired"];
                 assert_eq!(
-                    next,
-                    required.len(),
-                    "Owner copied milestones were not Accepted -> HardwareComplete -> Presented -> CompletionRetired: {steps:?}"
+                    steps.as_slice(),
+                    required.as_slice(),
+                    "Owner composed copied milestones must be Accepted -> HardwareComplete -> CompletionRetired, with no Presented: {steps:?}"
                 );
             }
         }
@@ -68240,6 +68671,7 @@ mod tests {
         run_copied_hardware_phase(&mut fixture.backend, false);
         install_copied_hardware_owner(&mut fixture.backend);
         run_copied_hardware_phase(&mut fixture.backend, true);
+        print_copied_route_latency_snapshot(4);
         let samples = crate::kms::render::platform::finish_copied_route_latency_for_tests()
             .unwrap_or_else(|error| panic!("copied latency evidence incomplete: {error}"));
         let legacy = samples
@@ -68264,28 +68696,6 @@ mod tests {
             4,
             "one latency sample is required per Owner copied frame"
         );
-        for sample in &samples {
-            println!(
-                "CP-LATENCY transport={:?} frame={} submission_delay_us={} expected_msc={} completion_msc={} missed_vblank={}",
-                sample.transport,
-                sample.frame,
-                sample.submission_delay_us,
-                sample.expected_msc,
-                sample.completion_msc,
-                sample.completion_msc > sample.expected_msc,
-            );
-        }
-        for (transport, samples) in [("Legacy", legacy), ("Owner", owner)] {
-            let missed = samples
-                .iter()
-                .filter(|sample| sample.completion_msc > sample.expected_msc)
-                .count();
-            println!(
-                "CP-LATENCY-SUMMARY transport={transport} frames={} missed_vblank={missed}/{}",
-                samples.len(),
-                samples.len(),
-            );
-        }
     }
 
     #[test]

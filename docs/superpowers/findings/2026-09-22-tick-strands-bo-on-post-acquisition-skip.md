@@ -1,10 +1,12 @@
 # The compose tick strands a scanout BO on any post-acquisition skip
 
 **Status:** confirmed on hardware 2026-09-22 during plan Cp task 8's
-cross-device run. **RECLASSIFIED 2026-09-22 after the implementer F8'd on this
-document's own claim: the defect is OURS outright, not upstream's, and there is
-no upstream PR to send.** The original classification is kept below with the
-correction, because the mistake is instructive.
+cross-device run. **FIXED in the 2026-09-22 C.0 follow-up.** The implementer
+F8'd on this document's original Legacy claim; coordinator verification
+confirmed that only managed acquisition transitions `Free -> Recording`, so
+the defect is ours and there is no upstream PR to send. The original
+classification is kept below with the correction, because the mistake is
+instructive.
 
 **Where:** the managed acquisition in `crates/yserver/src/kms/render/platform.rs`
 and the early returns of the composite tick in `scene.rs`.
@@ -109,20 +111,41 @@ arm before asserting anything about it; being wrong in the safe direction
 (claiming upstream owns something we own) still costs a round trip and would
 have produced a filed issue that upstream would have had to reject.
 
-## Disposition
+## Disposition and implementation
 
-1. Fix it in this branch, covering **every** fallible return between the
-   managed acquisition and render submission — the implementer enumerated
-   **twelve** such exits in `tick_one_output`, from audit-pipeline and
-   damage-audit errors through `NoPool`, the fence ticket, device and pool
-   lookups, to the copied source and destination lookups. The sibling-site
-   lesson this session has already paid for twice applies to all twelve.
-2. Use the helper that already exists: `cancel_scanout_bo_recording`
-   (`platform.rs:6987`), which the render-result failure path already calls
-   when GPU submission has not happened (`scene.rs:7260`). The acquisition's
-   temporary leases are dropped before these exits; its pool registration is
-   persistent and stays.
-3. **No upstream PR.** The correction above removes the reason for one.
+The managed destination is cancelled with the existing
+`cancel_scanout_bo_recording` helper at the four reachable pre-submit exits:
+the audit overlay pipeline error, damage-audit error, descriptor `NoPool`, and
+fence-ticket error. The fence-ticket branch also releases its already-acquired
+descriptor slot; that cleanup remains in place. The temporary acquisition
+leases have already been dropped, the pool registration stays installed, and
+the acquired scanout BO has not been submitted and has no completion waiter at
+these exits.
+
+The other eight enumerated sites do not need rollback code. The post-acquire
+DRM-device and scanout-pool lookups are guaranteed by the successful managed
+acquisition and no synchronous tick step replaces either. The shared BO index
+was selected from that same pool. The later XOR-cache lookup either is skipped
+with an empty overlay or hits the exact cache entry created by the earlier
+audit-pipeline lookup; if that earlier lookup fails, the tick has already
+returned. Both missing-service checks are unreachable because a successful
+managed acquisition required the still-present `Option` service. The copied
+source and destination lookups are only in the Legacy `else` arm; managed
+copied output takes the Owner arm instead.
+
+Tests, all named `c0_conv_cp_..._vulkan` and ignored with
+`needs live Vulkan ICD`, force each reachable site and assert the acquired
+destination returns to `Free`, its managed registration remains, the temporary
+lease is gone, and no Owner membership, page-flip, completion waiter, or extra
+descriptor slot remains. The pipeline, `NoPool`, and fence tests use the copied
+Owner fixture. The damage-audit error test uses the managed Shared fixture
+because the audit routine deliberately skips copied outputs. Four independent
+remove-the-rollback mutations, each compiled and run against its matching test,
+failed at `Recording` versus `Free` and were reverted.
+
+The requested debug/release build, formatting, clippy, C.0 filter, and full
+library test gate passed. No hardware `_drm` test, modeset, or DRM-master path
+was run. **No upstream PR.**
 
 ## Withdrawn: the upstream issue text
 

@@ -696,6 +696,23 @@ pub(crate) struct CopiedRouteLatencySample {
 }
 
 #[cfg(test)]
+pub(crate) struct CopiedRouteLatencySnapshot {
+    pub(crate) samples: Vec<CopiedRouteLatencySample>,
+    pub(crate) pending_frames: Vec<CopiedRouteLatencyPendingSnapshot>,
+    pub(crate) insufficient: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct CopiedRouteLatencyPendingSnapshot {
+    pub(crate) frame: usize,
+    pub(crate) transport: CopiedRouteTransport,
+    pub(crate) fence_signalled: bool,
+    pub(crate) expected_msc_recorded: bool,
+    pub(crate) commit_submitted: bool,
+    pub(crate) completion_msc_recorded: bool,
+}
+
+#[cfg(test)]
 struct CopiedRouteLatencyPending {
     frame: usize,
     transport: CopiedRouteTransport,
@@ -833,6 +850,42 @@ pub(crate) fn record_copied_completion_msc_for_tests(transport: CopiedRouteTrans
         pending.completion_msc = Some(msc);
         finish_copied_route_latency_samples(&mut state);
     });
+}
+
+#[cfg(test)]
+pub(crate) fn copied_route_latency_waiting_for_completion_for_tests(
+    transport: CopiedRouteTransport,
+) -> bool {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        state
+            .borrow()
+            .pending
+            .iter()
+            .any(|pending| pending.transport == transport && pending.completion_msc.is_none())
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn copied_route_latency_snapshot_for_tests() -> CopiedRouteLatencySnapshot {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let state = state.borrow();
+        CopiedRouteLatencySnapshot {
+            samples: state.samples.clone(),
+            pending_frames: state
+                .pending
+                .iter()
+                .map(|pending| CopiedRouteLatencyPendingSnapshot {
+                    frame: pending.frame,
+                    transport: pending.transport,
+                    fence_signalled: pending.signalled_at.is_some(),
+                    expected_msc_recorded: pending.expected_msc.is_some(),
+                    commit_submitted: pending.submitted_at.is_some(),
+                    completion_msc_recorded: pending.completion_msc.is_some(),
+                })
+                .collect(),
+            insufficient: state.insufficient,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -8515,6 +8568,58 @@ fn check_scanout_liveness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c0_conv_cp_latency_recorder_closes_after_fence_submission_and_completion() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        begin_copied_route_latency_for_tests();
+        let transports = [CopiedRouteTransport::Legacy, CopiedRouteTransport::Owner];
+        let mut reads = Vec::with_capacity(transports.len());
+        let mut writes = Vec::with_capacity(transports.len());
+        for transport in transports {
+            let mut pipe_fds = [-1; 2];
+            // SAFETY: `pipe2` writes two fresh owned descriptors to `pipe_fds`.
+            assert_eq!(
+                unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            // SAFETY: both descriptors were created successfully by `pipe2`.
+            let read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+            // SAFETY: both descriptors were created successfully by `pipe2`.
+            let write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+            record_copied_copy_fence_for_tests(transport, Some(&read));
+            reads.push(read);
+            writes.push(write);
+        }
+        for write in &writes {
+            let byte = 1u8;
+            // SAFETY: `write` is a valid live pipe descriptor and `byte` is readable.
+            assert_eq!(
+                unsafe { libc::write(write.as_raw_fd(), (&raw const byte).cast(), 1) },
+                1
+            );
+        }
+        poll_copied_route_latency_for_tests(20);
+        for (index, transport) in transports.into_iter().enumerate() {
+            record_copied_commit_submitted_for_tests(transport);
+            record_copied_completion_msc_for_tests(
+                transport,
+                u64::try_from(21 + index).expect("test MSC fits in u64"),
+            );
+        }
+
+        let snapshot = copied_route_latency_snapshot_for_tests();
+        assert!(!snapshot.insufficient);
+        assert!(snapshot.pending_frames.is_empty());
+        assert_eq!(snapshot.samples.len(), 2);
+        assert_eq!(snapshot.samples[0].expected_msc, 21);
+        assert_eq!(snapshot.samples[1].expected_msc, 21);
+        assert_eq!(snapshot.samples[0].completion_msc, 21);
+        assert_eq!(snapshot.samples[1].completion_msc, 22);
+        drop(reads);
+        drop(writes);
+    }
 
     /// [ID-1..3, CAP-1..4, COMMIT-2] Catches accepting a proof for another
     /// incarnation or allowing the consumed one-way handover to repeat.

@@ -568,6 +568,8 @@ struct OutputSceneState {
     /// no-skip→skip, skip→no-skip). Tracks the freeze-debug
     /// hypothesis that one of the early-return gates gets stuck.
     last_skip_reason: Option<TickSkipReason>,
+    #[cfg(test)]
+    tick_diagnostics_for_tests: TickDiagnosticsStateForTests,
     /// Step 3 — per-scanout-BO damage: what each BO is missing relative to the
     /// current scene. Fed and staged below while `pick_repaint_region` still
     /// returns `Repaint::Full`, so nothing on screen depends on it yet; step 4
@@ -913,6 +915,132 @@ enum TickSkipReason {
     NothingPending,
 }
 
+#[cfg(test)]
+impl TickSkipReason {
+    const ALL: [Self; 6] = [
+        Self::PendingAcks,
+        Self::RetryDeadline,
+        Self::EmptyDamage,
+        Self::NoBO,
+        Self::NoPool,
+        Self::NothingPending,
+    ];
+
+    const fn diagnostic_index(self) -> usize {
+        match self {
+            Self::PendingAcks => 0,
+            Self::RetryDeadline => 1,
+            Self::EmptyDamage => 2,
+            Self::NoBO => 3,
+            Self::NoPool => 4,
+            Self::NothingPending => 5,
+        }
+    }
+
+    const fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::PendingAcks => "PendingAcks",
+            Self::RetryDeadline => "RetryDeadline",
+            Self::EmptyDamage => "EmptyDamage",
+            Self::NoBO => "NoBO",
+            Self::NoPool => "NoPool",
+            Self::NothingPending => "NothingPending",
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TickAcquisitionSkipForTests {
+    pub(crate) tick: u64,
+    pub(crate) bo_idx: usize,
+    pub(crate) key: AllocationKey,
+    pub(crate) reason: &'static str,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TickDiagnosticsSnapshotForTests {
+    pub(crate) skip_counts: Vec<(&'static str, usize)>,
+    pub(crate) acquisition_skips: Vec<TickAcquisitionSkipForTests>,
+    pub(crate) acquired_destination: Option<(usize, AllocationKey)>,
+    pub(crate) pool_occupancy: (usize, usize),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickFailureForTests {
+    AuditOverlayPipeline,
+    DamageAudit,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TickDiagnosticsStateForTests {
+    collecting: bool,
+    tick: u64,
+    skip_counts: [usize; 6],
+    acquired_destination: Option<(usize, AllocationKey)>,
+    acquisition_skips: Vec<TickAcquisitionSkipForTests>,
+}
+
+#[cfg(test)]
+impl TickDiagnosticsStateForTests {
+    fn begin_tick(&mut self) {
+        if !self.collecting {
+            return;
+        }
+        self.tick = self.tick.saturating_add(1);
+        self.acquired_destination = None;
+    }
+
+    fn reset_window(&mut self) {
+        self.collecting = true;
+        self.skip_counts.fill(0);
+        self.acquisition_skips.clear();
+        self.acquired_destination = None;
+    }
+
+    fn record_acquisition(&mut self, bo_idx: usize, key: AllocationKey) {
+        if self.collecting {
+            self.acquired_destination = Some((bo_idx, key));
+        }
+    }
+
+    fn record_skip(&mut self, reason: TickSkipReason) {
+        if !self.collecting {
+            return;
+        }
+        let count = &mut self.skip_counts[reason.diagnostic_index()];
+        *count = count.saturating_add(1);
+        if let Some((bo_idx, key)) = self.acquired_destination {
+            self.acquisition_skips.push(TickAcquisitionSkipForTests {
+                tick: self.tick,
+                bo_idx,
+                key,
+                reason: reason.diagnostic_name(),
+            });
+        }
+    }
+
+    fn snapshot(&self, pool_occupancy: (usize, usize)) -> TickDiagnosticsSnapshotForTests {
+        TickDiagnosticsSnapshotForTests {
+            skip_counts: TickSkipReason::ALL
+                .into_iter()
+                .map(|reason| {
+                    (
+                        reason.diagnostic_name(),
+                        self.skip_counts[reason.diagnostic_index()],
+                    )
+                })
+                .collect(),
+            acquisition_skips: self.acquisition_skips.clone(),
+            acquired_destination: self.acquired_destination,
+            pool_occupancy,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum TickOutcome {
     Composed,
@@ -1094,6 +1222,20 @@ struct SceneCompositorInner {
     /// is applied at HardwareComplete. The backend consumes these through
     /// the owner-event seam; an invalidated member never enters this queue.
     owner_return_proofs: Vec<(CommitKey, OutputKey)>,
+    #[cfg(test)]
+    tick_failure_for_tests: Option<TickFailureForTests>,
+}
+
+#[cfg(test)]
+impl SceneCompositorInner {
+    fn take_tick_failure_for_tests(&mut self, failure: TickFailureForTests) -> bool {
+        if self.tick_failure_for_tests == Some(failure) {
+            self.tick_failure_for_tests = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -1434,6 +1576,8 @@ impl SceneCompositor {
                 owner_offers: VecDeque::new(),
                 owner_damage_transactions: HashMap::new(),
                 owner_return_proofs: Vec::new(),
+                #[cfg(test)]
+                tick_failure_for_tests: None,
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
@@ -1488,6 +1632,8 @@ impl SceneCompositor {
             last_present_cursor_version: None,
             force_show_retry_version: None,
             last_skip_reason: None,
+            #[cfg(test)]
+            tick_diagnostics_for_tests: TickDiagnosticsStateForTests::default(),
             // Sized from the *current* pool, exactly as `bo_depth` above is.
             // `rebuild_outputs` replaces every `OutputSceneState`, so this is
             // also how a pool that changed length or identity gets a correctly
@@ -2550,6 +2696,84 @@ impl SceneCompositor {
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))
             .map_or(0, |state| state.damage_history.entries.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn damage_history_latest_generation_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .and_then(|state| state.damage_history.entries.back())
+            .map(|(generation, _)| *generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_tick_diagnostics_for_tests(&mut self, output_idx: usize) {
+        if let Some(state) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+        {
+            state.tick_diagnostics_for_tests.reset_window();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tick_diagnostics_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<TickDiagnosticsSnapshotForTests> {
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        Some(
+            state
+                .tick_diagnostics_for_tests
+                .snapshot(state.pool_ring.occupancy_for_tests()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_tick_failure_for_tests(&mut self, failure: TickFailureForTests) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.tick_failure_for_tests = Some(failure);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_descriptor_ring_for_tests(&mut self, output_idx: usize) -> Vec<usize> {
+        let Some(ring) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+            .map(|output| &mut output.pool_ring)
+        else {
+            return Vec::new();
+        };
+        let mut acquired = Vec::new();
+        while let Some(slot) = ring.acquire() {
+            acquired.push(slot);
+        }
+        acquired
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_descriptor_slots_for_tests(
+        &mut self,
+        output_idx: usize,
+        slots: &[usize],
+    ) {
+        if let Some(ring) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+            .map(|output| &mut output.pool_ring)
+        {
+            for &slot in slots {
+                ring.release(slot);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -4163,6 +4387,11 @@ fn handle_scanout_render_completion_inner(
                 return true;
             }
 
+            #[cfg(test)]
+            println!(
+                "CP copied destination promotion gate passed key={destination_key:?} obligation={destination_obligation:?} pending=false frozen=false generation={generation}"
+            );
+
             let managed = match service.reserve(
                 prepared.identity().managed_key,
                 crate::kms::render::resources::UseKind::Retain,
@@ -4208,6 +4437,10 @@ fn handle_scanout_render_completion_inner(
                 crtc: u32::from(platform.outputs[output_idx].output.crtc),
                 generation,
             });
+            #[cfg(test)]
+            println!(
+                "CP copied destination offer enqueued key={destination_key:?} obligation={destination_obligation:?} generation={generation}"
+            );
             drop(fd);
             return true;
         }
@@ -5782,6 +6015,9 @@ fn record_tick_skip(
     reason: TickSkipReason,
     output_damage_rects: usize,
 ) {
+    #[cfg(test)]
+    state.tick_diagnostics_for_tests.record_skip(reason);
+
     if !tick_skip_log_enabled() {
         return;
     }
@@ -6028,6 +6264,11 @@ fn tick_one_output(
     pending_presentation: bool,
     mut resource_service: Option<&mut ResourceService>,
 ) -> Result<TickOutcome, SceneError> {
+    #[cfg(test)]
+    if let Some(state) = inner.outputs.get_mut(output_idx) {
+        state.tick_diagnostics_for_tests.begin_tick();
+    }
+
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
     //    `drmModeAtomicCommit` while the first hasn't fired
@@ -6439,6 +6680,12 @@ fn tick_one_output(
             match platform.acquire_managed_scanout_bo(service, crtc) {
                 Ok(token) => {
                     let managed_key = token.display.key();
+                    #[cfg(test)]
+                    if let Some(state) = inner.outputs.get_mut(output_idx) {
+                        state
+                            .tick_diagnostics_for_tests
+                            .record_acquisition(token.bo_idx, managed_key);
+                    }
                     // The acquisition lease protects the selected free buffer
                     // only through selection. The compose creates its own GPU
                     // obligation and write reservation below; retaining this
@@ -6612,7 +6859,27 @@ fn tick_one_output(
         u32::from(layout.width),
         u32::from(layout.height),
     ));
-    let (xor_pipeline, xor_layout) = audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
+    let xor_pipeline_result = {
+        #[cfg(test)]
+        if inner.take_tick_failure_for_tests(TickFailureForTests::AuditOverlayPipeline) {
+            Err(SceneError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))
+        } else {
+            audit_overlay_pipeline(inner, !overlay_ops.is_empty())
+        }
+        #[cfg(not(test))]
+        {
+            audit_overlay_pipeline(inner, !overlay_ops.is_empty())
+        }
+    };
+    let (xor_pipeline, xor_layout) = match xor_pipeline_result {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            if owner_managed_key.is_some() {
+                platform.cancel_scanout_bo_recording(output_idx, bo_idx);
+            }
+            return Err(error);
+        }
+    };
     let reference = audit_reference_scene(
         built.software_cursor_tail.is_some(),
         core,
@@ -6625,20 +6892,50 @@ fn tick_one_output(
         cow_host_xid,
         hw_can_run,
     );
-    run_damage_audit(
-        inner,
-        output_idx,
-        platform,
-        &built.scene,
-        reference.as_ref().map_or(&built.scene, |r| &r.scene),
-        &audit_sampled_pairs(store, &built.sampled_ids),
-        &output_damage,
-        None,
-        false,
-        &overlay_ops,
-        xor_pipeline,
-        xor_layout,
-    )?;
+    let damage_audit_result = {
+        #[cfg(test)]
+        if inner.take_tick_failure_for_tests(TickFailureForTests::DamageAudit) {
+            Err(SceneError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))
+        } else {
+            run_damage_audit(
+                inner,
+                output_idx,
+                platform,
+                &built.scene,
+                reference.as_ref().map_or(&built.scene, |r| &r.scene),
+                &audit_sampled_pairs(store, &built.sampled_ids),
+                &output_damage,
+                None,
+                false,
+                &overlay_ops,
+                xor_pipeline,
+                xor_layout,
+            )
+        }
+        #[cfg(not(test))]
+        {
+            run_damage_audit(
+                inner,
+                output_idx,
+                platform,
+                &built.scene,
+                reference.as_ref().map_or(&built.scene, |r| &r.scene),
+                &audit_sampled_pairs(store, &built.sampled_ids),
+                &output_damage,
+                None,
+                false,
+                &overlay_ops,
+                xor_pipeline,
+                xor_layout,
+            )
+        }
+    };
+    if let Err(error) = damage_audit_result {
+        if owner_managed_key.is_some() {
+            platform.cancel_scanout_bo_recording(output_idx, bo_idx);
+        }
+        return Err(error);
+    }
 
     // 6. Acquire descriptor-pool slot.
     let state = inner.outputs.get_mut(output_idx).expect("range");
@@ -6654,6 +6951,9 @@ fn tick_one_output(
                 TickSkipReason::NoPool,
                 output_damage.rects().len(),
             );
+            if owner_managed_key.is_some() {
+                platform.cancel_scanout_bo_recording(output_idx, bo_idx);
+            }
             return Ok(TickOutcome::Skipped(TickSkipReason::NoPool));
         }
     };
@@ -6666,6 +6966,9 @@ fn tick_one_output(
             inner.outputs[output_idx].pool_ring.release(slot);
             if vk_result_is_device_lost(error) {
                 platform.renderer_failed = true;
+            }
+            if owner_managed_key.is_some() {
+                platform.cancel_scanout_bo_recording(output_idx, bo_idx);
             }
             return Err(SceneError::Present(PresentError::Vk(error)));
         }

@@ -108,10 +108,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   the resource leak outcome. `bo_idx=1` is still `OnScreen` from the harness's
   Legacy phase, leaving two physical Owner candidates; after `bo_idx=2` is
   stranded, `bo_idx=0` cannot be released until a newer Owner frame becomes
-  current, and no free destination remains. This is a production F8 stop, not
+  current, and no free destination remains. This was a production F8 stop, not
   a harness-only starvation finding. No production fix was made under the
-  plan's F8 stop rule. The OwnerSubmitted hypothesis is ruled out; the precise
-  triggering early return remains unrecorded.
+  plan's F8 stop rule at that time. The C.0 follow-up later fixed the four
+  reachable managed pre-submit exits with `cancel_scanout_bo_recording`:
+  audit-pipeline error, damage-audit error, `NoPool`, and fence-ticket error.
+  Each has a `c0_conv_cp_..._vulkan` test and an independent compiled
+  remove-the-rollback mutation that fails at `Recording` versus `Free`. The
+  other enumerated exits were verified unreachable after managed acquisition
+  and received no rollback code. The OwnerSubmitted hypothesis is ruled out;
+  the fifth run's exact triggering early return remains unrecorded.
 - The same fifth run reported zero completed latency samples. The hardware
   harness only accepted a Legacy completion MSC when the raw sequence was
   nonzero and only accepted an Owner MSC when `Presented.samples` had an exact
@@ -131,8 +137,8 @@ Cross-cutting bugs and followups that don't fit a stage live in
   four-frame Vulkan Owner fixture pass in debug and release. Replacing the
   transition with the leak made frame four hit `NoPool`; moving release before
   render completion failed while compose work still held the pool. The separate
-  `Skipped(NoPool)` rollback after `Free -> Recording` remains unmodified. The
-  coordinator still owns any hardware rerun.
+  `Skipped(NoPool)` rollback after `Free -> Recording` is covered by the C.0
+  managed-acquisition fix above. The coordinator still owns any hardware rerun.
 
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
