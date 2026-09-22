@@ -1,6 +1,6 @@
 # Phase C.0 stage 2c-iii — the copied scanout route
 
-**Status:** design, revision 4 (2026-09-22). Its sections were approved one by
+**Status:** design, revision 5 (2026-09-22). Its sections were approved one by
 one with the user in brainstorming, together with the three decisions recorded
 in section 2: the evidence level, the placement of the copy's completion wait,
 and the managed-storage access debt staying out of scope.
@@ -33,6 +33,14 @@ keys from the obligation the batch does not have (M-1, CP-4b rewritten onto
 non-interleaving, so revision 3's mutation could not have failed (M-2, CP-4c
 rewritten); the cross-device criterion was paired with an exclusivity mutation
 that does not test it (M-3); and the status line still said revision 2 (m-1).
+Revision 5 incorporates the blocking finding of **plan Cp's review round 2**
+(`../findings/2026-09-22-stage-2c-iii-plan-cp-review-round2.md`), which reaches
+back into this document: revision 4's §3.2 described the compose stage from the
+**shared** arm and assumed the copied arm behaves the same. It does not. The
+copied arm renders with no resource service and no managed batch
+(`scene.rs:6532`, `submit_copied_scanout_render` at `scene.rs:10041`), so stage
+A's source is unowned by the service while A writes it. CP-4 now states that the
+Owner copied route converts **stage A as well**, and §8.2 carries its mutation.
 
 This is the plan that plan Ciii's acceptance finding
 (`../findings/2026-09-22-stage-2c-iii-plan-ciii-accepted.md`, "Carried") records
@@ -186,20 +194,34 @@ described a handoff that does not exist, so revision 3 starts from the tree:
   written at the site: holding one across the compose's own reservation "would
   make the service correctly report `Busy` for the same allocation"
   (`scene.rs:6194`-`6201`).
-- **Compose.** `prepare_retirement_batch` (`resources/gpu.rs:299`) reserves the
-  write lease and registers the GPU obligation for every allocation the
-  submission will touch **before the caller may hand any raw handle to the
-  GPU**, and a failure partway through releases everything already reserved for
-  that attempt, so no half-registered batch can survive.
+- **Compose, on the shared arm.** `prepare_retirement_batch`
+  (`resources/gpu.rs:299`) reserves the write lease and registers the GPU
+  obligation for every allocation the submission will touch **before the caller
+  may hand any raw handle to the GPU**, and a failure partway through releases
+  everything already reserved for that attempt, so no half-registered batch can
+  survive.
+- **Compose, on the copied arm — today unmanaged (plan round-2 B-1).** The
+  `OutputScanout::Copied` arm calls `submit_copied_scanout_render`
+  (`scene.rs:6532`; the function at `scene.rs:10041`), which takes a raw
+  `vk::Fence` and **no `ResourceService`** and returns no managed batch, while
+  the `Shared` arm beside it passes the service and receives one
+  (`scene.rs:6521`). On this route stage A therefore writes the source with no
+  lease and no obligation held against it.
 - **Completion.** The generation takes its `Retain` lease, the batch is
   registered and serviced, and its write lease drops with it
   (`resources/mod.rs:1560`).
 
 On the copied route A writes the **source**; the destination is written by B.
 
-**CP-4 — one holder at a time, and no lease crosses a batch.** A's batch owns
-the source write lease and the source GPU obligation and retires both when it is
-serviced. B's batch owns the destination write lease with its GPU obligation and
+**CP-4 — the Owner copied route converts stage A too, and no lease crosses a
+batch (plan round-2 B-1).** This route is not only a conversion of the copy: on
+an Owner device stage A's compose is prepared the way the shared arm already is,
+so that **the source is reserved `Write` and its GPU obligation registered
+before A's raw handles reach the GPU**. Without it the source is unowned by the
+service for the whole of A's write, and CP-4c's paired BO phase excludes only
+tick selection — it is not resource ownership and does not stop a service
+consumer. A's batch then owns the source write lease and the source GPU
+obligation and retires both when it is serviced. B's batch owns the destination write lease with its GPU obligation and
 the source read lease with its `ReadObligation` (`resources/gpu.rs:91`). No lease
 is shared between the two batches, taken out of a registered batch, or acquired
 while another holder is live.
@@ -417,6 +439,7 @@ not by the first textual match.
 | The owner buffer reaches `Desired` at B's retirement, not A's (CP-3) | Promote to `Desired` when A completes |
 | A displaced generation behaves identically in either producer stage (CP-3) | Offer a generation displaced during the copy |
 | Batch B holds a write obligation on the destination and a read obligation on the source (CP-4) | Register the batch without the read obligation; **and, separately, register it with no destination obligation, or with one keyed to another allocation** (round-1 M-2) |
+| Stage A's source write lease and obligation exist before A's handles reach the GPU (CP-4) | Register A's source obligation at A's completion instead of before its submission; leave stage A unmanaged on the Owner route |
 | Every obligation B needs is registered before the copy reaches the GPU (CP-4a) | Register the destination obligation after submission; register the source obligation after submission |
 | A failed preparation leaves no obligation and no lease behind (CP-4a) | Fail step 3 and keep the destination obligation; fail step 3 and keep its lease |
 | A failed submission is disposed of by its `gpu_submitted` answer, by key (CP-4b) | Cancel the prepared obligations on an uncertain dispatch; dispose of an uncertain dispatch through a ticketless batch, so no destination key is frozen; leave the transport gate open on an uncertain dispatch |
