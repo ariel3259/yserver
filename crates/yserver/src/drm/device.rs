@@ -37,11 +37,8 @@ impl Device {
     /// Hidden from rustdoc — for use by test fixtures only.
     #[doc(hidden)]
     pub fn for_tests() -> io::Result<Self> {
-        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
-        reader.set_nonblocking(true)?;
-        std::mem::forget(writer);
         Ok(Self {
-            file: std::fs::File::from(std::os::fd::OwnedFd::from(reader)),
+            file: File::open("/dev/null")?,
             path: "/dev/null".to_string(),
             master_ownership: MasterOwnership::None,
             atomic_client_cap_enabled: false,

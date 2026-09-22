@@ -234,7 +234,18 @@ pub(crate) fn adopt_framebuffer(
         )
     };
     match adopted {
-        Ok(lease) => Ok(Some(lease)),
+        Ok(lease) => {
+            let token = backend
+                .resource_service
+                .as_ref()
+                .ok_or(ResourceError::InvalidState)?
+                .managed_allocation_token(&lease)?;
+            if !backend.mark_scanout_m1_managed(source_id, token) {
+                backend.remove_owner_probe_entry(source_id);
+                return Err(ResourceError::InvalidState);
+            }
+            Ok(Some(lease))
+        }
         Err((error, mut payload)) => {
             backend.remove_owner_probe_entry(source_id);
             let cleanup = backend
@@ -253,6 +264,48 @@ pub(crate) fn adopt_framebuffer(
             backend.commit_consumer.capacity.close_admission();
             Err(error)
         }
+    }
+}
+
+/// Reuse a still-live managed allocation after validating a fresh Owner role
+/// permit. A detached or incarnation-mismatched token is reported as a miss
+/// so the caller can remove the stale index and run a fresh probe/import.
+pub(crate) fn reuse_framebuffer(
+    backend: &mut KmsBackend,
+    token: &crate::kms::render::resources::ManagedAllocationToken,
+    preparing: &RoleReservation,
+) -> Result<Option<AllocationLease>, ResourceError> {
+    let (device, incarnation, service_binding) = {
+        let service = backend
+            .resource_service
+            .as_ref()
+            .ok_or(ResourceError::InvalidState)?;
+        (
+            service.device(),
+            service.incarnation(),
+            service.direct_lease_binding(),
+        )
+    };
+    let permit = backend.commit_consumer.capacity.mint_direct_lease_permit(
+        preparing,
+        device,
+        incarnation,
+        service_binding,
+    )?;
+    let result = backend
+        .resource_service
+        .as_mut()
+        .ok_or(ResourceError::InvalidState)?
+        .upgrade_managed_allocation(
+            token,
+            &backend.commit_consumer.capacity,
+            DirectRole::Preparing,
+            permit,
+        );
+    match result {
+        Ok(lease) => Ok(Some(lease)),
+        Err(ResourceError::Detached | ResourceError::WrongIncarnation) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

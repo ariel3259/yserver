@@ -3698,6 +3698,14 @@ impl RenderEngine {
             }
         }
 
+        // The drawable id remains stable across this in-place promotion, so
+        // reserve the next backing incarnation before any work can displace
+        // the old storage. Exhaustion is permanent and fail-closed for the
+        // Owner direct-adoption path.
+        if !store.can_replace_storage(id) {
+            return Err(RenderError::Resource(ResourceError::Exhausted));
+        }
+
         // Submit-boundary (codex review): any open frame / parked submit
         // group may hold CBs that captured cached views of the OLD image
         // but have NOT been submitted to the queue yet. The copy below
@@ -3795,6 +3803,13 @@ impl RenderEngine {
                 }
             }
         };
+
+        if !store.record_storage_replacement(id) {
+            // The checked preflight above makes this unreachable in the
+            // single-threaded engine, but never continue with a backing whose
+            // identity could not be recorded.
+            return Err(RenderError::Resource(ResourceError::Exhausted));
+        }
 
         // (f) invalidate the view cache for this DrawableId.
         self.invalidate_drawable_views(id);

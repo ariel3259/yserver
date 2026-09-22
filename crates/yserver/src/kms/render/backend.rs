@@ -77,6 +77,85 @@ use crate::{
     platform::drm::{DrmDeviceKey, ModeIdentity},
 };
 
+#[cfg(test)]
+struct RealDrmTestSerial {
+    state: std::sync::Mutex<RealDrmTestSerialState>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct RealDrmTestSerialState {
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+}
+
+#[cfg(test)]
+static REAL_DRM_TEST_SERIAL: RealDrmTestSerial = RealDrmTestSerial {
+    state: std::sync::Mutex::new(RealDrmTestSerialState {
+        owner: None,
+        depth: 0,
+    }),
+    wake: std::sync::Condvar::new(),
+};
+
+/// A re-entrant process-wide guard for the shared real-DRM Vulkan test
+/// context. Re-entrancy is needed because a few tests intentionally keep two
+/// live fixtures at once; ownership remains exclusive between test threads.
+#[cfg(test)]
+struct RealDrmTestGuard;
+
+#[cfg(test)]
+impl RealDrmTestSerial {
+    fn acquire() -> RealDrmTestGuard {
+        let thread = std::thread::current().id();
+        let mut state = REAL_DRM_TEST_SERIAL
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match state.owner {
+                None => {
+                    state.owner = Some(thread);
+                    state.depth = 1;
+                    return RealDrmTestGuard;
+                }
+                Some(owner) if owner == thread => {
+                    state.depth = state.depth.saturating_add(1);
+                    return RealDrmTestGuard;
+                }
+                Some(_) => {
+                    state = REAL_DRM_TEST_SERIAL
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RealDrmTestGuard {
+    fn drop(&mut self) {
+        let thread = std::thread::current().id();
+        let mut state = REAL_DRM_TEST_SERIAL
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state.owner,
+            Some(thread),
+            "real-DRM Vulkan test guard dropped by a non-owner thread"
+        );
+        assert!(state.depth > 0, "real-DRM Vulkan test guard underflow");
+        state.depth -= 1;
+        if state.depth == 0 {
+            state.owner = None;
+            REAL_DRM_TEST_SERIAL.wake.notify_one();
+        }
+    }
+}
+
 /// Per-window geometry tracked by v2's scene assembler. Stage 2 plan
 /// Risk 3: a parallel `windows` map on `KmsBackend` (NOT on
 /// `KmsCore` — v1 doesn't need it). Stage 4 may collapse into
@@ -517,11 +596,21 @@ impl Default for ScanoutM0Telemetry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ScanoutM1IndexKey {
+    source_id: DrawableId,
+    backing_serial: u64,
+    topology_generation: u64,
+}
+
 struct ScanoutM1ProbeEntry {
     /// Retained solely for its FB/GEM lifetime until Owner adoption;
     /// `Drop` performs teardown only for a Legacy entry.
     _framebuffer: Option<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
     managed: bool,
+    probe_serial: Option<u64>,
+    index_key: Option<ScanoutM1IndexKey>,
+    token: Option<crate::kms::render::resources::ManagedAllocationToken>,
 }
 
 impl ScanoutM1ProbeEntry {
@@ -529,6 +618,9 @@ impl ScanoutM1ProbeEntry {
         Self {
             _framebuffer: None,
             managed: false,
+            probe_serial: None,
+            index_key: None,
+            token: None,
         }
     }
 
@@ -536,6 +628,9 @@ impl ScanoutM1ProbeEntry {
         Self {
             _framebuffer: Some(framebuffer),
             managed: false,
+            probe_serial: None,
+            index_key: None,
+            token: None,
         }
     }
 
@@ -563,6 +658,7 @@ struct ScanoutM1ProbeCache {
     topology_signature: u64,
     order: std::collections::VecDeque<DrawableId>,
     entries: HashMap<DrawableId, ScanoutM1ProbeEntry>,
+    index: HashMap<ScanoutM1IndexKey, crate::kms::render::resources::ManagedAllocationToken>,
 }
 
 impl ScanoutM1ProbeCache {
@@ -571,14 +667,27 @@ impl ScanoutM1ProbeCache {
             topology_signature: 0,
             order: std::collections::VecDeque::new(),
             entries: HashMap::new(),
+            index: HashMap::new(),
         }
     }
 
+    #[cfg(test)]
     fn insert(&mut self, id: DrawableId, entry: ScanoutM1ProbeEntry) {
+        self.insert_with_serial(id, None, entry);
+    }
+
+    fn insert_with_serial(
+        &mut self,
+        id: DrawableId,
+        probe_serial: Option<u64>,
+        mut entry: ScanoutM1ProbeEntry,
+    ) {
+        self.remove_index_for_source(id);
+        entry.probe_serial = probe_serial;
         if !self.entries.contains_key(&id) {
             while self.entries.len() >= MAX_M1_PROBE_CACHE_ENTRIES {
                 if let Some(oldest) = self.order.pop_front() {
-                    self.entries.remove(&oldest);
+                    self.remove(oldest);
                 } else {
                     break;
                 }
@@ -588,18 +697,81 @@ impl ScanoutM1ProbeCache {
         self.entries.insert(id, entry);
     }
 
+    fn mark_managed(
+        &mut self,
+        id: DrawableId,
+        key: ScanoutM1IndexKey,
+        token: crate::kms::render::resources::ManagedAllocationToken,
+    ) -> bool {
+        if !self.entries.contains_key(&id) {
+            return false;
+        }
+        self.remove_index_for_source(id);
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        entry.managed = true;
+        entry.probe_serial = Some(key.backing_serial);
+        entry.index_key = Some(key);
+        entry.token = Some(token.clone());
+        self.index.insert(key, token);
+        true
+    }
+
+    fn token(
+        &self,
+        key: ScanoutM1IndexKey,
+    ) -> Option<crate::kms::render::resources::ManagedAllocationToken> {
+        self.index.get(&key).cloned()
+    }
+
+    fn remove_index_for_source(&mut self, id: DrawableId) {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            self.index.retain(|key, _| key.source_id != id);
+            return;
+        };
+        if let Some(key) = entry.index_key.take() {
+            self.index.remove(&key);
+        }
+        entry.token = None;
+        self.index.retain(|key, _| key.source_id != id);
+    }
+
+    fn remove_index_for_allocation(
+        &mut self,
+        allocation: crate::kms::render::resources::AllocationKey,
+    ) {
+        let keys: Vec<_> = self
+            .index
+            .iter()
+            .filter_map(|(key, token)| (token.key() == allocation).then_some(*key))
+            .collect();
+        for key in keys {
+            self.index.remove(&key);
+            if let Some(entry) = self.entries.get_mut(&key.source_id)
+                && entry.index_key == Some(key)
+            {
+                entry.index_key = None;
+                entry.token = None;
+                entry.probe_serial = None;
+            }
+        }
+    }
+
     fn remove(&mut self, id: DrawableId) {
+        self.remove_index_for_source(id);
         self.entries.remove(&id);
     }
 
     fn clear(&mut self, reason: &'static str) {
-        if !self.entries.is_empty() {
+        if !self.entries.is_empty() || !self.index.is_empty() {
             log::debug!(
                 "scanout_m1: dropping {} cached probe framebuffer(s): {reason}",
                 self.entries.len()
             );
             self.entries.clear();
             self.order.clear();
+            self.index.clear();
         }
     }
 }
@@ -1544,6 +1716,8 @@ pub struct KmsBackend {
 
     #[cfg(test)]
     test_skip_render_completion_drain: bool,
+    #[cfg(test)]
+    resource_cleanup_on_drop_for_tests: bool,
 
     /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
     /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
@@ -1905,6 +2079,45 @@ pub struct KmsBackend {
     pub force_dispose_failure_crtc_for_tests: Option<u32>,
     #[doc(hidden)]
     pub legacy_dispositions_for_tests: Vec<LegacyEventDisposition>,
+
+    /// Serializes all test use of the shared real-DRM Vulkan context. The
+    /// guard is held by the backend, not just by fixture construction, so
+    /// ignored tests remain safe even if the harness runs them in parallel.
+    #[cfg(test)]
+    real_drm_test_guard: Option<RealDrmTestGuard>,
+}
+
+#[cfg(test)]
+impl Drop for KmsBackend {
+    fn drop(&mut self) {
+        if !self.resource_cleanup_on_drop_for_tests {
+            return;
+        }
+
+        self.engine.shutdown(&mut self.store, &mut self.platform);
+        self.platform.wait_idle_bounded();
+        self.scanout_m1.clear("test fixture teardown");
+        self.managed_terminalize_queued_direct_successor(None);
+        self.store.shutdown_destroy_all(&self.platform);
+        self.service_direct_framebuffer_edges(std::time::Instant::now(), false);
+
+        if let Some(registry) = self.drm_cleanup_registry.as_mut() {
+            for pool in &mut self.platform.scanout_pools {
+                if let Some(pool) = pool.as_mut() {
+                    pool.detach_managed_entries(Some(registry));
+                }
+            }
+        }
+
+        if let (Some(service), Some(registry)) = (
+            self.resource_service.as_mut(),
+            self.drm_cleanup_registry.as_mut(),
+        ) {
+            let _ = service.service_ready_with_registry(registry);
+        }
+
+        self.platform.scanout_pools.clear();
+    }
 }
 
 /// A test-only KMS backend whose DRM fd holds master for its whole lifetime.
@@ -3804,6 +4017,48 @@ impl KmsBackend {
         self.scanout_m1.remove(source_id);
     }
 
+    fn current_scanout_m1_index_key(&self, source_id: DrawableId) -> Option<ScanoutM1IndexKey> {
+        Some(ScanoutM1IndexKey {
+            source_id,
+            backing_serial: self.store.backing_serial(source_id)?,
+            topology_generation: self.scanout_m1.topology_signature,
+        })
+    }
+
+    pub(crate) fn scanout_m1_managed_token(
+        &self,
+        source_id: DrawableId,
+    ) -> Option<crate::kms::render::resources::ManagedAllocationToken> {
+        self.current_scanout_m1_index_key(source_id)
+            .and_then(|key| self.scanout_m1.token(key))
+    }
+
+    pub(crate) fn mark_scanout_m1_managed(
+        &mut self,
+        source_id: DrawableId,
+        token: crate::kms::render::resources::ManagedAllocationToken,
+    ) -> bool {
+        let Some(key) = self.current_scanout_m1_index_key(source_id) else {
+            return false;
+        };
+        self.scanout_m1.mark_managed(source_id, key, token)
+    }
+
+    pub(crate) fn remove_scanout_m1_index_for_allocation(
+        &mut self,
+        key: crate::kms::render::resources::AllocationKey,
+    ) {
+        self.scanout_m1.remove_index_for_allocation(key);
+    }
+
+    #[cfg(test)]
+    fn scanout_m1_has_index_for_tests(&self, source_id: DrawableId) -> bool {
+        self.scanout_m1
+            .index
+            .keys()
+            .any(|key| key.source_id == source_id)
+    }
+
     fn scanout_m1_topology_signature(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -3825,6 +4080,58 @@ impl KmsBackend {
             layout.output.picked.flags.hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    fn reimport_scanout_m1_framebuffer(&mut self, source_id: DrawableId) -> bool {
+        let Some((fourcc, modifier, offset, pitch, width, height, fd)) =
+            self.store.get(source_id).and_then(|drawable| {
+                let metadata = drawable.imported_dmabuf()?;
+                if metadata.implicit_layout || metadata.planes.len() != 1 {
+                    return None;
+                }
+                let plane = metadata.planes.first()?;
+                let fd = drawable
+                    .imported_drawable()?
+                    .imported_dma_buf_fd()?
+                    .try_clone_to_owned()
+                    .ok()?;
+                Some((
+                    metadata.fourcc,
+                    metadata.modifier,
+                    plane.offset,
+                    plane.pitch,
+                    metadata.width,
+                    metadata.height,
+                    fd,
+                ))
+            })
+        else {
+            return false;
+        };
+        let Some(primary) = self.platform.primary_device() else {
+            return false;
+        };
+        let Ok(framebuffer) = crate::drm::modeset::import_direct_scanout_framebuffer(
+            Rc::clone(&primary.device),
+            fd.as_fd(),
+            u32::from(width),
+            u32::from(height),
+            fourcc,
+            modifier,
+            offset,
+            pitch,
+        ) else {
+            return false;
+        };
+        let Some(backing_serial) = self.store.backing_serial(source_id) else {
+            return false;
+        };
+        self.scanout_m1.insert_with_serial(
+            source_id,
+            Some(backing_serial),
+            ScanoutM1ProbeEntry::accepted(framebuffer),
+        );
+        true
     }
 
     fn crtc_config_topology_signature(&self) -> u64 {
@@ -4189,8 +4496,19 @@ impl KmsBackend {
             self.scanout_m1.clear("output topology changed");
             self.scanout_m1.topology_signature = topology_signature;
         }
-        if self.scanout_m1.entries.contains_key(&source_id) {
+        let Some(backing_serial) = self.store.backing_serial(source_id) else {
             return;
+        };
+        if self
+            .scanout_m1
+            .entries
+            .get(&source_id)
+            .is_some_and(|entry| entry.probe_serial == Some(backing_serial))
+        {
+            return;
+        }
+        if self.scanout_m1.entries.contains_key(&source_id) {
+            self.scanout_m1.remove(source_id);
         }
 
         let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
@@ -4217,8 +4535,11 @@ impl KmsBackend {
                 root,
                 output_geometry,
             );
-            self.scanout_m1
-                .insert(source_id, ScanoutM1ProbeEntry::rejected());
+            self.scanout_m1.insert_with_serial(
+                source_id,
+                Some(backing_serial),
+                ScanoutM1ProbeEntry::rejected(),
+            );
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         }
@@ -4290,8 +4611,11 @@ impl KmsBackend {
                 width,
                 height,
             );
-            self.scanout_m1
-                .insert(source_id, ScanoutM1ProbeEntry::rejected());
+            self.scanout_m1.insert_with_serial(
+                source_id,
+                Some(backing_serial),
+                ScanoutM1ProbeEntry::rejected(),
+            );
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         }
@@ -4302,8 +4626,11 @@ impl KmsBackend {
                     "scanout_m1: source_id={} dma-buf dup failed: {error}",
                     source_id.as_u64()
                 );
-                self.scanout_m1
-                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                self.scanout_m1.insert_with_serial(
+                    source_id,
+                    Some(backing_serial),
+                    ScanoutM1ProbeEntry::rejected(),
+                );
                 self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
                 return;
             }
@@ -4321,8 +4648,11 @@ impl KmsBackend {
             })
             .collect();
         let Some(primary) = self.platform.primary_device() else {
-            self.scanout_m1
-                .insert(source_id, ScanoutM1ProbeEntry::rejected());
+            self.scanout_m1.insert_with_serial(
+                source_id,
+                Some(backing_serial),
+                ScanoutM1ProbeEntry::rejected(),
+            );
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         };
@@ -4351,8 +4681,11 @@ impl KmsBackend {
                     height,
                     output_geometry,
                 );
-                self.scanout_m1
-                    .insert(source_id, ScanoutM1ProbeEntry::accepted(framebuffer));
+                self.scanout_m1.insert_with_serial(
+                    source_id,
+                    Some(backing_serial),
+                    ScanoutM1ProbeEntry::accepted(framebuffer),
+                );
                 self.scanout_m0.m1_probe_pass = self.scanout_m0.m1_probe_pass.saturating_add(1);
             }
             Ok(crate::drm::modeset::DirectScanoutTestResult::Rejected(error)) => {
@@ -4361,8 +4694,11 @@ impl KmsBackend {
                     source_id.as_u64(),
                     candidate.src_host_xid,
                 );
-                self.scanout_m1
-                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                self.scanout_m1.insert_with_serial(
+                    source_id,
+                    Some(backing_serial),
+                    ScanoutM1ProbeEntry::rejected(),
+                );
                 self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             }
             Err(error) => {
@@ -4371,8 +4707,11 @@ impl KmsBackend {
                     source_id.as_u64(),
                     candidate.src_host_xid,
                 );
-                self.scanout_m1
-                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                self.scanout_m1.insert_with_serial(
+                    source_id,
+                    Some(backing_serial),
+                    ScanoutM1ProbeEntry::rejected(),
+                );
                 self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
             }
         }
@@ -6319,6 +6658,8 @@ impl KmsBackend {
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             #[cfg(test)]
             test_skip_render_completion_drain: false,
+            #[cfg(test)]
+            resource_cleanup_on_drop_for_tests: false,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -6390,6 +6731,8 @@ impl KmsBackend {
             legacy_handover_failed: std::collections::BTreeSet::new(),
             force_dispose_failure_crtc_for_tests: None,
             legacy_dispositions_for_tests: Vec::new(),
+            #[cfg(test)]
+            real_drm_test_guard: None,
         };
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
@@ -7109,7 +7452,30 @@ impl KmsBackend {
     pub fn for_tests_with_vk_live_scene_real_drm() -> Result<Self, io::Error> {
         use std::sync::Arc;
 
+        // The VkContext below is shared by every real-DRM fixture in this
+        // test binary. Hold the serial for the entire backend lifetime, not
+        // merely while this constructor runs; VkDevice use is not safe to
+        // overlap across the harness's test threads on the target driver.
+        #[cfg(test)]
+        let real_drm_test_guard = RealDrmTestSerial::acquire();
         let mut base = Self::for_tests_seed();
+        #[cfg(test)]
+        let vk = {
+            static SHARED_REAL_DRM_TEST_VK: std::sync::OnceLock<
+                Result<Arc<crate::kms::vk::device::VkContext>, String>,
+            > = std::sync::OnceLock::new();
+            match SHARED_REAL_DRM_TEST_VK.get_or_init(|| {
+                crate::kms::vk::device::VkContext::new().map_err(|error| format!("{error:?}"))
+            }) {
+                Ok(vk) => Arc::clone(vk),
+                Err(error) => {
+                    return Err(io::Error::other(format!(
+                        "render for_tests_with_vk_live_scene: VkContext: {error}"
+                    )));
+                }
+            }
+        };
+        #[cfg(not(test))]
         let vk = crate::kms::vk::device::VkContext::new().map_err(|e| {
             io::Error::other(format!(
                 "render for_tests_with_vk_live_scene: VkContext: {e:?}"
@@ -7217,6 +7583,10 @@ impl KmsBackend {
                     "render for_tests_with_vk_live_scene: SceneCompositor: {e:?}"
                 ))
             })?;
+        #[cfg(test)]
+        {
+            base.real_drm_test_guard = Some(real_drm_test_guard);
+        }
         base.init_root_storage();
         Ok(base)
     }
@@ -7596,6 +7966,8 @@ impl KmsBackend {
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             #[cfg(test)]
             test_skip_render_completion_drain: false,
+            #[cfg(test)]
+            resource_cleanup_on_drop_for_tests: false,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -7666,6 +8038,8 @@ impl KmsBackend {
             legacy_handover_failed: std::collections::BTreeSet::new(),
             force_dispose_failure_crtc_for_tests: None,
             legacy_dispositions_for_tests: Vec::new(),
+            #[cfg(test)]
+            real_drm_test_guard: None,
         };
         let live: Vec<_> = backend
             .platform
@@ -11232,6 +11606,7 @@ impl KmsBackend {
                 break;
             }
         }
+        self.service_direct_framebuffer_edges(std::time::Instant::now(), false);
         self.offer_scene_composed_generations();
     }
 
@@ -20931,13 +21306,71 @@ impl KmsBackend {
         let source_pin = self.pin_direct_source(source_id);
         let fallback_target_pin = self.pin_direct_source(fallback_target.backing_id());
 
-        // 4. Test/import FB from probe cache
-        let fb_ready = self
-            .scanout_m1
-            .entries
-            .get(&source_id)
-            .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .is_some();
+        // 4. Owner direct adoption is permanently refused after the source
+        // drawable's checked backing serial exhausts. This check applies to
+        // both reuse and fresh adoption.
+        let owner_device = self.platform.outputs[completion_output_idx].key.device_key;
+        if self.admission_is_active(owner_device)
+            && !self.store.owner_direct_adoption_allowed(source_id)
+        {
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            if let Some(prep_slot) = prep_slot.take() {
+                let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+            }
+            self.request_direct_unflip("managed_prepare_backing_serial_exhausted");
+            return Ok(false);
+        }
+
+        // An exact live token reuses the allocation. A stale token is only a
+        // cache miss: remove that source entry and import a new framebuffer
+        // through the same production import producer.
+        let mut framebuffer_lease = None;
+        if self.admission_is_active(owner_device)
+            && let Some(token) = self.scanout_m1_managed_token(source_id)
+        {
+            match crate::kms::render::direct_owner::reuse_framebuffer(
+                self,
+                &token,
+                prep_slot
+                    .as_ref()
+                    .ok_or(crate::kms::render::resources::ResourceError::InvalidState)?,
+            ) {
+                Ok(Some(lease)) => framebuffer_lease = Some(lease),
+                Ok(None) => {
+                    self.remove_owner_probe_entry(source_id);
+                    let _ = self.reimport_scanout_m1_framebuffer(source_id);
+                }
+                Err(error) => {
+                    <Self as Backend>::release_present_source(self, source_pin);
+                    <Self as Backend>::release_present_source(self, fallback_target_pin);
+                    if let Some(prep_slot) = prep_slot.take() {
+                        let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                    }
+                    self.request_direct_unflip("managed_prepare_framebuffer_reuse_refused");
+                    return Err(error);
+                }
+            }
+        }
+
+        if framebuffer_lease.is_none()
+            && self
+                .scanout_m1
+                .entries
+                .get(&source_id)
+                .is_some_and(|entry| entry.managed && entry.framebuffer().is_none())
+        {
+            self.remove_owner_probe_entry(source_id);
+            let _ = self.reimport_scanout_m1_framebuffer(source_id);
+        }
+
+        let fb_ready = framebuffer_lease.is_some()
+            || self
+                .scanout_m1
+                .entries
+                .get(&source_id)
+                .and_then(ScanoutM1ProbeEntry::framebuffer)
+                .is_some();
 
         if !fb_ready {
             // Proven failure: clean up candidate and cancel role, retaining existing successor
@@ -20953,15 +21386,14 @@ impl KmsBackend {
         // The existing fork is the only Owner/Legacy boundary. Legacy keeps
         // the M1 cache's strong raw owner; the Owner route adopts through its
         // dedicated module and carries the resulting lease with the frame.
-        let owner_device = self.platform.outputs[completion_output_idx].key.device_key;
-        let framebuffer_lease = if self.admission_is_active(owner_device) {
+        if framebuffer_lease.is_none() && self.admission_is_active(owner_device) {
             match crate::kms::render::direct_owner::adopt_framebuffer(
                 self,
                 source_id,
                 source_pin,
                 &mut prep_slot,
             ) {
-                Ok(Some(lease)) => Some(lease),
+                Ok(Some(lease)) => framebuffer_lease = Some(lease),
                 Ok(None) => {
                     <Self as Backend>::release_present_source(self, source_pin);
                     <Self as Backend>::release_present_source(self, fallback_target_pin);
@@ -20981,9 +21413,7 @@ impl KmsBackend {
                     return Err(error);
                 }
             }
-        } else {
-            None
-        };
+        }
 
         // 5. Successful validation: `Successor` is a single physical slot,
         // so an atomic replace must free it before the new reservation can
@@ -21373,6 +21803,42 @@ impl KmsBackend {
             }
         }
         true
+    }
+
+    /// Authoritative Phase-B consumer of the resource service's staged
+    /// direct-framebuffer zero edges. Callers either let this function run
+    /// Phase A (`service_already_ran == false`) or invoke it immediately
+    /// after a scene drain whose own service call already ran.
+    fn service_direct_framebuffer_edges(
+        &mut self,
+        now: std::time::Instant,
+        service_already_ran: bool,
+    ) {
+        if !service_already_ran
+            && let Some(service) = self.resource_service.as_mut()
+            && let Err(error) = service.service_completions(now)
+        {
+            log::warn!("direct framebuffer service completion failed: {error:?}");
+        }
+
+        let edges = self.resource_service.as_mut().map_or_else(
+            Vec::new,
+            crate::kms::render::resources::ResourceService::take_zero_edges,
+        );
+        for key in edges {
+            // The index is removed before the service is allowed to transfer
+            // the payload. A lease minted after the edge therefore cannot be
+            // hidden behind a still-live token, and the revalidation below
+            // refuses cleanup while that new lease is live.
+            self.remove_scanout_m1_index_for_allocation(key);
+            let Some(service) = self.resource_service.as_mut() else {
+                continue;
+            };
+            let Some(registry) = self.drm_cleanup_registry.as_mut() else {
+                continue;
+            };
+            let _ = service.cleanup_direct_framebuffer(key, registry);
+        }
     }
 }
 
@@ -21825,24 +22291,20 @@ impl Backend for KmsBackend {
         let events = self.platform.tick_executors(std::time::Instant::now());
         self.record_host_call_events(events);
         let now = std::time::Instant::now();
-        if let Some(service) = self.resource_service.as_mut() {
-            let _ = service.service_completions(now);
-        }
         let owner_events = self.platform.service_owner_completions(now);
         for (device_key, events) in owner_events {
             self.route_owner_event_batch(device_key, events, now);
         }
+        self.service_direct_framebuffer_edges(now, false);
     }
 
     fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
         let now = std::time::Instant::now();
-        if let Some(service) = self.resource_service.as_mut() {
-            let _ = service.service_completions(now);
-        }
         let owner_events = self.platform.service_owner_completions(now);
         for (device_key, events) in owner_events {
             self.route_owner_event_batch(device_key, events, now);
         }
+        self.service_direct_framebuffer_edges(now, false);
     }
 
     fn on_executor_readable(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -22153,6 +22615,7 @@ impl Backend for KmsBackend {
                 }
             }
         };
+        self.service_direct_framebuffer_edges(std::time::Instant::now(), false);
         self.offer_scene_composed_generations();
         self.drain_render_telemetry();
         // Phase A Task 3.5: drain SubmitGroup flush outcomes and
@@ -45950,13 +46413,7 @@ mod tests {
     #[test]
     fn xshmfence_handle_accessor_returns_arc_clone() {
         // Construct a backend without Vk (skip if test fixture needs it).
-        let mut b = match crate::kms::render::KmsBackend::for_tests_with_vk() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("skipping: no Vk: {e}");
-                return;
-            }
-        };
+        let mut b = crate::kms::render::KmsBackend::for_tests();
         // Manually inject an entry into the registry — bypass the
         // protocol path (DRI3 FenceFromFD) since constructing a real
         // xshmfence FD in a unit test is fragile.
@@ -51511,6 +51968,8 @@ mod tests {
         };
 
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        backend.platform.reap_executors_on_drop_for_tests();
+        backend.resource_cleanup_on_drop_for_tests = true;
         if output_count > 1 {
             let vk =
                 backend.platform.vk.as_ref().cloned().ok_or_else(|| {
@@ -51624,6 +52083,33 @@ mod tests {
             cleanup_calls,
             cleanup_io,
         })
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_owner_live_fixture_reaps_stub_helper_vulkan() {
+        let fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let helper_pid = fixture.backend.platform.devices[0]
+            .executor
+            .as_ref()
+            .expect("owner executor")
+            .child_pid();
+        drop(fixture);
+
+        let mut status = 0;
+        // A reaped child is no longer waitable by this process.  Before the
+        // fixture-owned teardown, KmsIoExecutor::Drop left its killed helper
+        // as a zombie, and waitpid returned the child pid here.
+        let result = unsafe { libc::waitpid(helper_pid, &mut status, libc::WNOHANG) };
+        assert_eq!(
+            result, -1,
+            "owner fixture left helper {helper_pid} waitable"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "waitpid for helper {helper_pid} failed for an unexpected reason"
+        );
     }
 
     fn reinstall_owner_executor_for_direct_test(backend: &mut super::KmsBackend) {
@@ -56855,7 +57341,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn c0_conv_ciii_unflip_dispatches_and_others_stay_unsupported() {
+    fn c0_conv_ciii_unflip_dispatches_and_others_stay_unsupported_vulkan() {
         use crate::kms::{owner::admission::Tier, render::admission::AdmissionOutcome};
 
         let mut backend =
@@ -57897,7 +58383,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn c0_conv_ciii_scoped_return_leaves_other_outputs_alone() {
+    fn c0_conv_ciii_scoped_return_leaves_other_outputs_alone_vulkan() {
         let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
         let backend = &mut fixture.backend;
         let device_b = test_device_key(91);
@@ -61871,7 +62357,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn c0_conv_ciii_id_foreign_milestones_leave_a_damage_transaction_alone() {
+    fn c0_conv_ciii_id_foreign_milestones_leave_a_damage_transaction_alone_vulkan() {
         use crate::kms::owner::{ledger::Submitted, record::TerminalState};
 
         let OwnerLiveFixture { mut backend, .. } =
@@ -62465,7 +62951,8 @@ mod tests {
     }
 
     #[test]
-    fn c0_conv_cfb_managed_entry_serves_no_legacy_handle() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_managed_entry_serves_no_legacy_handle_vulkan() {
         let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
         let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 1)
             .expect("real PRIME import and ADDFB2");
@@ -62779,7 +63266,8 @@ mod tests {
     }
 
     #[test]
-    fn c0_conv_cfb_service_adoption_failure_releases_once() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_service_adoption_failure_releases_once_vulkan() {
         let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
         let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 2)
             .expect("real PRIME import and ADDFB2");
@@ -62846,7 +63334,8 @@ mod tests {
     }
 
     #[test]
-    fn c0_conv_cfb_failed_cleanup_is_retained_and_retried() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_failed_cleanup_is_retained_and_retried_vulkan() {
         for fail_fb in [true, false] {
             let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
             let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 20)
@@ -62928,7 +63417,8 @@ mod tests {
     }
 
     #[test]
-    fn c0_conv_cfb_pending_cleanup_follows_the_freeze() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_pending_cleanup_follows_the_freeze_vulkan() {
         let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
         let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 21)
             .expect("real PRIME import and ADDFB2");
@@ -63098,5 +63588,510 @@ mod tests {
             Err(crate::kms::render::resources::ResourceError::InvalidState)
         ));
         fixture.backend.resource_service = Some(service);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_same_source_successor_reuses_the_key_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 30)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event.clone(),
+                )
+                .expect("first direct preparation")
+        );
+        let first_key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("first framebuffer lease")
+            .key();
+
+        let candidate = yserver_core::backend::PresentScanoutCandidate {
+            present_id: 31,
+            ..prepared.candidate
+        };
+        let mut event = prepared.event;
+        event.present_id = 31;
+        event.serial = 31;
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(prepared.source_id, candidate, event)
+                .expect("same-source successor preparation")
+        );
+        let second_key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("successor framebuffer lease")
+            .key();
+        assert_eq!(first_key, second_key);
+
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_relayout_or_topology_gives_a_new_key_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 32)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event.clone(),
+                )
+                .expect("first direct preparation")
+        );
+        let first_key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("first framebuffer lease")
+            .key();
+
+        fixture.backend.scanout_m1.topology_signature = fixture
+            .backend
+            .scanout_m1
+            .topology_signature
+            .wrapping_add(1);
+        let candidate = yserver_core::backend::PresentScanoutCandidate {
+            present_id: 33,
+            ..prepared.candidate
+        };
+        let mut event = prepared.event;
+        event.present_id = 33;
+        event.serial = 33;
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(prepared.source_id, candidate, event)
+                .expect("topology successor preparation")
+        );
+        let second_key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("successor framebuffer lease")
+            .key();
+        assert_ne!(first_key, second_key);
+
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_stale_token_forces_a_fresh_probe_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 34)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event.clone(),
+                )
+                .expect("first direct preparation")
+        );
+        let old_key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("first framebuffer lease")
+            .key();
+        assert!(
+            fixture
+                .backend
+                .scanout_m1_has_index_for_tests(prepared.source_id)
+        );
+
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        {
+            let service = fixture.backend.resource_service.as_mut().expect("service");
+            let registry = fixture
+                .backend
+                .drm_cleanup_registry
+                .as_mut()
+                .expect("registry");
+            assert!(service.cleanup_direct_framebuffer(old_key, registry));
+        }
+        assert!(
+            fixture
+                .backend
+                .scanout_m1_has_index_for_tests(prepared.source_id)
+        );
+
+        let mut event = prepared.event;
+        event.present_id = 35;
+        event.serial = 35;
+        let candidate = yserver_core::backend::PresentScanoutCandidate {
+            present_id: 35,
+            ..prepared.candidate
+        };
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(prepared.source_id, candidate, event)
+                .expect("stale token must recover through a fresh import")
+        );
+        let new_key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("fresh framebuffer lease")
+            .key();
+        assert_ne!(old_key, new_key);
+
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_index_removed_on_last_lease_drop_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 36)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("direct preparation")
+        );
+        let key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("framebuffer lease")
+            .key();
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        assert!(
+            fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert!(
+            !fixture
+                .backend
+                .scanout_m1_has_index_for_tests(prepared.source_id)
+        );
+        assert!(
+            !fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_index_kept_while_current_scans_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 37)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("direct preparation")
+        );
+        let key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("framebuffer lease")
+            .key();
+        let token = fixture
+            .backend
+            .scanout_m1_managed_token(prepared.source_id)
+            .expect("managed token");
+        let reservation = fixture
+            .backend
+            .commit_consumer
+            .capacity
+            .reserve(crate::kms::render::resources::DirectRole::Preparing)
+            .expect("second preparing role");
+        let second = crate::kms::render::direct_owner::reuse_framebuffer(
+            &mut fixture.backend,
+            &token,
+            &reservation,
+        )
+        .expect("reuse permit")
+        .expect("live token upgrade");
+        drop(second);
+        fixture
+            .backend
+            .commit_consumer
+            .capacity
+            .cancel_reservation(reservation)
+            .expect("cancel second preparing role");
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert!(
+            fixture
+                .backend
+                .scanout_m1_has_index_for_tests(prepared.source_id)
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_never_dispatched_allocation_reaches_zero_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 38)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("direct preparation")
+        );
+        let key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("framebuffer lease")
+            .key();
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert!(
+            !fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_eviction_leaves_a_live_allocation_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 39)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("direct preparation")
+        );
+        let key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("framebuffer lease")
+            .key();
+
+        for present_id in 40..=71 {
+            let _ = owner_direct_candidate_with_real_import(&mut fixture.backend, present_id)
+                .expect("real PRIME import for eviction");
+        }
+        assert!(
+            !fixture
+                .backend
+                .scanout_m1_has_index_for_tests(prepared.source_id)
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_service_step_removes_the_index_before_cleanup_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 72)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("direct preparation")
+        );
+        let key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("framebuffer lease")
+            .key();
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        assert!(
+            fixture
+                .backend
+                .scanout_m1_has_index_for_tests(prepared.source_id)
+        );
+        let token = fixture
+            .backend
+            .scanout_m1_managed_token(prepared.source_id)
+            .expect("staged edge retains the non-owning token until the backend step");
+        let reservation = fixture
+            .backend
+            .commit_consumer
+            .capacity
+            .reserve(crate::kms::render::resources::DirectRole::Preparing)
+            .expect("new preparing role");
+        let second = crate::kms::render::direct_owner::reuse_framebuffer(
+            &mut fixture.backend,
+            &token,
+            &reservation,
+        )
+        .expect("re-mint after zero edge")
+        .expect("staged token upgrades while allocation remains live");
+        let calls_before = fixture.cleanup_calls.borrow().len();
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert!(
+            !fixture
+                .backend
+                .scanout_m1_has_index_for_tests(prepared.source_id)
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+        assert_eq!(fixture.cleanup_calls.borrow().len(), calls_before);
+        drop(second);
+        fixture
+            .backend
+            .commit_consumer
+            .capacity
+            .cancel_reservation(reservation)
+            .expect("cancel revalidation role");
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert!(
+            !fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+        assert_eq!(
+            fixture.cleanup_calls.borrow().len(),
+            calls_before + 2,
+            "the backend service step owns the registry cleanup"
+        );
     }
 }
