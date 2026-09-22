@@ -110,6 +110,64 @@ Before acceptance, the coordinator adds: `cargo check --workspace` for Linux gli
 
 ---
 
+## Two defects the hardware run found (2026-09-22)
+
+Task 8's cross-device run stalled on its fourth Owner frame. Six runs and four
+diagnostics later the mechanism is fully proven, and it is **two independent
+defects**, one ours and one upstream's. Neither was introduced by this plan;
+both were found by it.
+
+**Evidence, from the sixth hardware run:**
+
+```text
+retry_skip_counts=[("PendingAcks",0), ("RetryDeadline",0), ("EmptyDamage",0),
+                   ("NoBO",1441), ("NoPool",1), ("NothingPending",0)]
+descriptor_pool_slots_in_use=3/3
+bo_idx=2 phase=Recording acquired_then_skipped_same_tick=true
+  acquisition_skip_events=[{ tick: 1, bo_idx: 2, generation: 5, reason: "NoPool" }]
+owner_progress=[(0, 7, Current, "OwnerSubmitted")]
+render_completion_waiters=[]
+```
+
+**Defect 1 — ours: the descriptor-pool slot is lost at admission.**
+`OwnerBuffer::into_submitted` (`owner_buffer.rs:317`) destructures `Desired`
+with `..`, which swallows its `descriptor_slot`, and builds a `Submitted`
+variant that **has no such field** (`owner_buffer.rs:66`). The intended release
+site, `take_owner_composed_resources` (`admission.rs:1561` into `scene.rs:1985`),
+then calls `take_descriptor_slot()` on a `Submitted` buffer and gets `None`, so
+the ring is never given the slot back. `CompletionRetired` releases no slot
+either (`scene.rs:2216`). **Every composed Owner frame therefore leaks one
+descriptor-pool slot.** With a three-slot ring, the fourth frame can never
+acquire one: exactly three Owner frames succeeded on hardware and the fourth
+did not, deterministically, not as a race.
+
+This is **our** code, from Ci-refactor (`39a68bac`, accepted 2026-09-19), and it
+is **not specific to the copied route** — it affects every composed Owner frame.
+Ci, Cii and Ciii did not catch it because no fixture runs four consecutive Owner
+composed frames. R8 keeps it out of production today; it would have surfaced at
+activation in stage 3 or 4.
+
+**Defect 2 — upstream's: a skip after acquisition strands the buffer.**
+`acquire_managed_scanout_bo` moves the destination `Free → Recording`
+(`platform.rs:6374`), and the `NoPool` branch (`scene.rs:6694`, now `:6853`)
+returns `Skipped(NoPool)` **without restoring that phase**, while the
+fence-ticket failure three lines below does release its own pool slot. Other
+fallible paths after acquisition lack rollback too. The blame is upstream's:
+Jos, commit `02bafec3`, 2026-09-03. Its effect here is to turn a transient pool
+shortage into a permanent stall — one `NoPool` stranded `bo_idx=2`, and the
+1441 following ticks all skipped with `NoBO`.
+
+**Relationship.** Defect 1 causes the exhaustion; defect 2 makes it
+irreversible. Fixing either alone improves matters; defect 1 must be fixed
+regardless, because it blocks the Owner route in production.
+
+**Disposition (user, 2026-09-22):** defect 1 is fixed in this branch and
+carries its own evidence. Defect 2 is reported upstream with the evidence
+above, as the Legacy dormancy bug was; whether we also patch it locally is a
+separate decision.
+
+---
+
 ### Task 1: A copied output that can enter `Owner`, and the fixture that builds one
 
 **Files:** `platform.rs` (`check_owner_eligibility` at `:3425`, `validate_owner_output_kinds` at `:90`, `OwnerEligibilityError` at `:75`), the Owner live fixture and the `c0_conv` fixture helpers; tests.
@@ -288,7 +346,7 @@ tests remain the proof of the shared-key predicate.
 **Files:** `backend.rs`, beside Ciii's `c0_hw_ciii_owner_route_on_card1_drm` (`backend.rs:65619`); no production change expected.
 
 **Invariants (spec §6).**
-- The run forces the renderer to the amdgpu iGPU (`card0`) while KMS and the connected output stay on `card1`/`HDMI-A-2`, and **records the two distinct device identities it used**. A run that cannot show two identities has not tested this criterion.
+- The run forces the renderer to the amdgpu iGPU (`card0`) while KMS and the connected output stay on `card1`/`HDMI-2`, and **records the two distinct device identities it used**. A run that cannot show two identities has not tested this criterion.
 - It drives render → copy → offer → `Accepted` → `HardwareComplete` → damage applied, and proves the destination was not offered before its obligation retired — by recording that obligation's registration **under the destination's own key** and then its retirement. Fence order does not establish it.
 - Its own mutations, on the same hardware under the same filter: misroute the copy off the sink's device (Q33), and scan out the source instead of the destination (Q34). CP-8's mutation tests a different criterion and does not substitute.
 - If the forced-renderer configuration is not reachable on this machine, that is an F8 stop with the evidence.
@@ -330,22 +388,117 @@ measured `helper_duration_ns` from the received `Accepted` event timestamp;
 the `Accepted` event is still printed as the protocol milestone. The hardware
 run uses one
 live fixture and one timing session: four Legacy copied frames, then four Owner
-copied frames on the same card1 master/HDMI-A-2 modeset. The output records
-`renderer_primary`/`renderer_node` and `sink_primary`/`sink_render`, then prints
-the destination obligation registration under its own destination key, its
-retirement, the `Accepted` milestone, and the `HardwareComplete`/`Presented`
-milestones before asserting applied damage.
+copied frames on the same card1 master/HDMI-2 modeset. The output records
+`renderer_primary`/`renderer_node` and `sink_primary`/`sink_render`. While the
+generation is still `Rendering`, the test observes the pending destination
+obligation under its own key and labels the generation as waiting, not offered.
+The copied completion handler then checks the same receipt and frozen state,
+emits the promotion-gate line after both checks pass, enqueues the real
+`ComposedOffer`, and emits that fact after insertion; the helper `Accepted`
+observation follows. Owner completion event lines are emitted from the event
+batch before that batch is synchronously passed to `route_owner_event_batch`,
+and all damage checks happen after routing.
+
+**Task 8 hardware follow-up (2026-09-22).** The first real-device run completed
+four Legacy frames and reached `Accepted`, `HardwareComplete`, and
+`CompletionRetired` for the first Owner commit, then failed the damage assertion.
+That assertion compared the length of `BufferAgeRing`, which is bounded to
+`scanout_bo_count + 1` (four entries for this three-buffer pool). The four
+Legacy frames had already filled it, so a successful Owner push evicted the
+oldest generation without increasing the length. The failure therefore did
+not establish whether the Owner damage transaction applied. The harness now
+compares the newest retired damage generation, which advances when the actual
+damage retirement path pushes even after the ring is full; the 15-second
+deadline and damage conditions are unchanged. The pre-retirement log names
+were corrected, and a separate test-only line records the real offer enqueue
+after the exact destination obligation check. This remains pending a coordinator
+hardware rerun; the first run is not a production F8 finding.
+
+**Task 8 third hardware follow-up (2026-09-22).** The coordinator's third real
+device run recorded renderer `226:0` / `renderD128`, sink `226:1` / `renderD129`,
+`Different`, and HDMI-2 at 1920x1080@60. Four Legacy frames applied damage.
+Owner frames 0–2 each passed the destination obligation, promotion gate, offer,
+`Accepted`, `HardwareComplete`, `CompletionRetired`, and damage checks. Owner
+frame 3 did not produce a newer damage generation within the existing 15-second
+deadline. This run exposed a harness gap: its wait loop serviced the resource
+service, Owner/DRM events, and render completions, but only called the compositor
+once at frame start. `retire_owner_current` applies the release gates from
+`tick_one_output`; if an allocation becomes releasable after that initial tick,
+the wait loop never asks the production tick to retry acquisition. The hardware
+test now retries that same tick while the current frame has not created a newer
+Owner generation. The frame count and deadline are unchanged. If frame 3 still
+times out, the test prints every destination BO's index and `BoPhase`, whether
+its managed allocation is releasable, and its Owner ledger state plus a
+`Current` flag. The third run suggested a harness release-gate gap, but did not
+capture the requested pool snapshot. The fourth-run evidence below shows that
+this pump did not explain the later post-acquisition stall.
+
+**Task 8 fourth hardware follow-up (2026-09-22).** The coordinator's fourth
+device run confirmed that Owner frame 3 selected `bo_idx=2` (`Recording`), so
+the stall is after acquisition. `bo_idx=1` remained `OnScreen` from Legacy and
+outside the Owner ledger. `acquire_managed_scanout_bo` selects only `Free`
+destinations, and the Owner path does not return that Legacy slot to `Free`, so
+the shared-session harness leaves two destinations for Owner transport. This
+reduces buffering but does not account for the selected frame failing to create
+an Owner generation.
+The timeout snapshot did not name the internal generation stage or show
+pending completion jobs/readiness, so it cannot distinguish an undrained stage A
+completion from a missing sink-copy submission, an undrained copy completion,
+or a later pool-state gate. This run therefore does not establish either a
+harness scheduling gap or a production F8 stall. The next timeout report adds
+the Owner generation and `InFlightStage`, registered render/copy completion
+jobs with readiness, and source plus destination releasability. No retry
+deadline or frame count changed.
+
+**Task 8 fifth hardware follow-up (2026-09-22).** The fifth snapshot closes the
+stage-location question: Owner frame 3 acquired `bo_idx=2` (`Recording`), but
+there was no Owner buffer entry and no render-completion waiter. The scene has
+no generation gate for a current ack at `OwnerSubmitted`; the early tick gate
+checks `pending_acks`, which do not contain Owner buffers. The explicit
+post-acquire no-render skip is the descriptor ring's `NoPool` branch: when all
+three pool slots are occupied, `tick_one_output` returns `Skipped(NoPool)`
+without cancelling the just-acquired destination. Other post-acquire fallible
+audit/fence-ticket paths likewise lack that rollback. The fifth diagnostic did
+not print the last skip reason or descriptor-ring occupancy, so `NoPool` is the
+identified code site and condition, not a proven observation of the triggering
+branch. The abandoned `Recording` destination is nevertheless a production
+resource leak. `bo_idx=1` is stale `OnScreen` state from the harness's shared
+Legacy-then-Owner session, reducing the Owner phase to two available pool
+members; once `bo_idx=2` is stranded, the current `bo_idx=0` cannot be released
+until a newer Owner frame is current and no free destination remains. This is
+an F8 production stop, not a harness-only starvation result. Per the F8 rule,
+no production change was made; the Task 8 hardware claim remains stopped.
+
+The same run's latency snapshot remained at zero samples. Completion-MSC
+capture was conditional on a nonzero raw Legacy sequence or an exact CRTC key
+in the Owner `Presented.samples` payload, even though the production router can
+provide the sequence fallback/routed clock after consuming those events. The
+test now records MSC after routing, using that clock fallback where the payload
+omits it, and its partial output names the four pending boundaries individually.
+A pipe-backed non-GPU test verifies that both transport samples close when
+their fence, submission and completion boundaries arrive. The hardware run was
+not repeated under this task's constraint, so its new boundary flags are the
+remaining evidence needed to verify the real path.
+
+The latency recorder now snapshots completed samples and pending frames before
+the per-frame damage assertion panics. It prints every available `CP-LATENCY`
+line and a `CP-LATENCY-SUMMARY status=partial` per transport, including
+collected/expected frame counts, before the failure message. A successful run
+prints the same evidence with `status=complete`; the final integrity checks
+still require four samples per transport.
 
 The coordinator runs it from tty2, with the user's approval, using exactly:
 
 ```bash
-cargo test -p yserver --lib c0_hw_cp_copied_route_cross_device_drm -- --exact --ignored --nocapture --test-threads=1
+cargo test -p yserver --lib kms::render::backend::tests::c0_hw_cp_copied_route_cross_device_drm -- --exact --ignored --nocapture --test-threads=1
 ```
 
-The latency evidence is printed as one `CP-LATENCY` line per frame with
-`transport`, `submission_delay_us`, `expected_msc`, `completion_msc`, and
-`missed_vblank`, followed by one `CP-LATENCY-SUMMARY` line per transport with
-`frames` and `missed_vblank=N/frames`. The measurement is test-only: it
+The latency evidence is printed as one `CP-LATENCY` line per collected frame
+with `transport`, `status`, `submission_delay_us`, `expected_msc`,
+`completion_msc`, and `missed_vblank`, followed by one
+`CP-LATENCY-SUMMARY` line per transport with `status`, collected/expected
+`frames`, `missed_vblank=N/collected`, and pending/unstarted counts. A failure
+before all four frames complete prints these rows with `status=partial`. The measurement is test-only: it
 duplicates the copy fence, polls it without changing production scheduling,
 timestamps the fence-signalled and commit-submitted boundaries, and takes the
 completion MSC from the Legacy flip event or Owner `Presented` sample.
