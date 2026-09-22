@@ -28,6 +28,14 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-09-22 Phase C.0 stage 2c-iii, plan Cfb complete:** the direct
+  framebuffer producer now has evidence for live adoption, same-source
+  allocation retention, displaced-allocation `KmsRelease` registration, and
+  late cleanup failure after kernel rejection. Ciii Task 6 is unblocked. The
+  managed-storage access adaptation remains open as specified by §2.5. Two
+  fixture lessons are recorded: repeated real-DRM Vulkan contexts poison the
+  NVIDIA ICD, and GPU tests must be `#[ignore]` tests with a `_vulkan` suffix.
+
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 

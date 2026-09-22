@@ -64742,4 +64742,391 @@ mod tests {
             .backend
             .service_direct_framebuffer_edges(std::time::Instant::now(), false);
     }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_late_cleanup_failure_after_rejection_keeps_the_role_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let (_old_commit, old_key) =
+            c0_conv_cfb_install_current_real_candidate(&mut fixture.backend, 95, 95_000);
+        let old = fixture.backend.commit_consumer.take_current();
+        let (rejected_commit, rejected_resources) =
+            c0_conv_cfb_dispatch_real_candidate(&mut fixture.backend, 96, 96_000);
+        let rejected_key = rejected_resources
+            .allocations
+            .first()
+            .expect("rejected direct allocation")
+            .key();
+        assert_ne!(
+            old_key, rejected_key,
+            "the rejected successor must displace A"
+        );
+        assert!(fixture.backend.route_owner_event_batch(
+            rejected_commit.device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::ResourcesReleased {
+                    commit: rejected_commit.commit,
+                    resources: vec![rejected_resources],
+                },
+                crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                    commit: rejected_commit.commit,
+                    resources: old,
+                },
+            ],
+            std::time::Instant::now(),
+        ));
+
+        let successor = owner_direct_candidate_with_real_import(&mut fixture.backend, 97)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    successor.source_id,
+                    successor.candidate,
+                    successor.event,
+                )
+                .expect("successor preparation")
+        );
+        let successor_key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("successor direct allocation")
+            .key();
+        let occupied_before_cleanup = fixture.backend.commit_consumer.capacity.occupied();
+        fixture.cleanup_io.fail_fb.set(true);
+
+        let mut service = fixture.backend.resource_service.take().expect("service");
+        fixture
+            .backend
+            .commit_consumer
+            .on_available(&[], &mut service)
+            .expect("rejected resource availability");
+        fixture.backend.resource_service = Some(service);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+
+        assert_eq!(
+            fixture
+                .backend
+                .drm_cleanup_registry
+                .as_ref()
+                .expect("registry")
+                .pending_cleanup_roles(),
+            vec![crate::kms::render::resources::DirectRole::Submitted]
+        );
+        assert_eq!(
+            fixture.backend.commit_consumer.capacity.occupied(),
+            occupied_before_cleanup,
+            "late cleanup must not finish Submitted or reserve a replacement role"
+        );
+        assert!(
+            !fixture
+                .backend
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::Submitted)
+        );
+        assert!(
+            fixture
+                .backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .and_then(|frame| frame.framebuffer_lease.as_ref())
+                .is_some_and(|lease| lease.key() == successor_key)
+        );
+        assert!(
+            !fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&rejected_key)
+        );
+
+        fixture.cleanup_io.fail_fb.set(false);
+        fixture
+            .backend
+            .drm_cleanup_registry
+            .as_mut()
+            .expect("registry")
+            .retry_pending_cleanup()
+            .expect("retry rejected cleanup");
+        assert!(
+            fixture
+                .backend
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::Submitted)
+        );
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_ciii_task6_shape_is_reachable_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let device = fixture
+            .backend
+            .platform
+            .primary_device()
+            .expect("device")
+            .key;
+        fixture.backend.scanout_m2.test_submit_direct_without_drm = true;
+        let target_xid = 0xc0fb_0f00;
+        let target_width = fixture.backend.platform.fb_w;
+        let target_height = fixture.backend.platform.fb_h;
+        seed_bordered_window(
+            &mut fixture.backend,
+            target_xid,
+            None,
+            0,
+            0,
+            target_width,
+            target_height,
+            0,
+        );
+        fixture.backend.core.top_level_order = vec![target_xid];
+
+        let mut first = owner_direct_candidate_with_real_import(&mut fixture.backend, 98)
+            .expect("real PRIME import and ADDFB2");
+        first.candidate.dst_window_xid = target_xid;
+        first.candidate.paint_dst_host_xid = target_xid;
+        first.candidate.completion_dst_host_xid = target_xid;
+        first.event.dst_host_xid = target_xid;
+        assert_eq!(
+            fixture.backend.core.top_level_order,
+            vec![target_xid],
+            "the direct target must start as the frontmost top-level (#163)"
+        );
+
+        assert!(
+            fixture.backend.commit_consumer.current_resources.is_empty(),
+            "the live fixture starts in its composed scene, before any direct ledger resource"
+        );
+        c0_conv_cii_prepare_owner_clock(
+            &mut fixture.backend,
+            device,
+            0,
+            yserver_core::backend::PresentClockSample {
+                msc: 100,
+                ust: 100_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
+        assert_eq!(
+            fixture.backend.core.top_level_order,
+            vec![target_xid],
+            "the composed predecessor must not change the frontmost target"
+        );
+
+        assert!(
+            fixture
+                .backend
+                .admission_offer_direct(
+                    device,
+                    first.source_id,
+                    first.candidate,
+                    first.event.clone(),
+                )
+                .expect("first direct offer")
+        );
+        let first_outcome = fixture.backend.admission_wake(device, false);
+        assert!(
+            matches!(
+                first_outcome,
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ),
+            "first direct outcome: {first_outcome:?}"
+        );
+        let first_commit = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first direct owner record")
+            .commit_id();
+        let first_key = match fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first direct owner record")
+            .ledger()
+        {
+            crate::kms::owner::ledger::LedgerState::Submitted(submitted) => {
+                assert_eq!(submitted.new_resources().len(), 1);
+                submitted.new_resources()[0].allocations[0].key()
+            }
+            state => panic!("first direct commit is not submitted: {state:?}"),
+        };
+        c0_conv_cii_accept_direct_owner_commit(&mut fixture.backend, device, first_commit);
+        c0_conv_cii_complete_direct_owner_hardware(&mut fixture.backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut fixture.backend, device, 0, 1_098, 1, 98_000);
+        reinstall_owner_executor_for_direct_test(&mut fixture.backend);
+        let first_members = fixture
+            .backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .find(|resources| {
+                resources.direct_role.as_ref().is_some_and(|role| {
+                    role.role() == crate::kms::render::resources::DirectRole::Current
+                })
+            })
+            .expect("direct A current resources")
+            .crtcs
+            .clone();
+        assert_eq!(
+            fixture.backend.core.top_level_order,
+            vec![target_xid],
+            "direct A must retain the frontmost target"
+        );
+
+        let mut second_candidate = first.candidate;
+        second_candidate.present_id = 99;
+        let mut second_event = first.event;
+        second_event.present_id = 99;
+        second_event.serial = 99;
+        assert!(
+            fixture
+                .backend
+                .admission_offer_direct(device, first.source_id, second_candidate, second_event)
+                .expect("same-source direct offer")
+        );
+        let second_outcome = fixture.backend.admission_wake(device, false);
+        assert!(
+            matches!(
+                second_outcome,
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ),
+            "same-source direct outcome: {second_outcome:?}, capacity={:?}",
+            fixture.backend.commit_consumer.capacity
+        );
+        let second_commit = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("same-source direct owner record")
+            .commit_id();
+        match fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("same-source direct owner record")
+            .ledger()
+        {
+            crate::kms::owner::ledger::LedgerState::Submitted(submitted) => {
+                assert_eq!(submitted.new_resources().len(), 1);
+                let new = &submitted.new_resources()[0];
+                assert_eq!(
+                    first_members, new.crtcs,
+                    "same GroupMember must be retained"
+                );
+                assert_eq!(new.allocations[0].key(), first_key);
+                assert!(
+                    !fixture
+                        .backend
+                        .resource_service
+                        .as_ref()
+                        .expect("service")
+                        .has_pending_obligations(&first_key),
+                    "retained same-source allocation must register no KmsRelease"
+                );
+            }
+            state => panic!("same-source direct commit is not submitted: {state:?}"),
+        }
+        c0_conv_cii_accept_direct_owner_commit(&mut fixture.backend, device, second_commit);
+        c0_conv_cii_complete_direct_owner_hardware(&mut fixture.backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut fixture.backend, device, 0, 1_099, 1, 99_000);
+        let mut service = fixture.backend.resource_service.take().expect("service");
+        fixture
+            .backend
+            .commit_consumer
+            .on_available(&[], &mut service)
+            .expect("first direct retirement availability");
+        fixture.backend.resource_service = Some(service);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        reinstall_owner_executor_for_direct_test(&mut fixture.backend);
+        assert_eq!(
+            fixture.backend.core.top_level_order,
+            vec![target_xid],
+            "direct A successor must retain the frontmost target"
+        );
+
+        let different = owner_direct_candidate_with_real_import(&mut fixture.backend, 100)
+            .expect("real PRIME import and ADDFB2");
+        let mut different_candidate = different.candidate;
+        different_candidate.dst_window_xid = target_xid;
+        different_candidate.paint_dst_host_xid = target_xid;
+        different_candidate.completion_dst_host_xid = target_xid;
+        let mut different_event = different.event;
+        different_event.dst_host_xid = target_xid;
+        assert!(
+            fixture
+                .backend
+                .admission_offer_direct(
+                    device,
+                    different.source_id,
+                    different_candidate,
+                    different_event,
+                )
+                .expect("different-source direct offer")
+        );
+        let different_outcome = fixture.backend.admission_wake(device, false);
+        assert!(
+            matches!(
+                different_outcome,
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ),
+            "different-source outcome: {different_outcome:?}, capacity={:?}",
+            fixture.backend.commit_consumer.capacity
+        );
+        let different_commit = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("different-source direct owner record")
+            .commit_id();
+        match fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("different-source direct owner record")
+            .ledger()
+        {
+            crate::kms::owner::ledger::LedgerState::Submitted(submitted) => {
+                assert_eq!(submitted.new_resources().len(), 1);
+                let new = &submitted.new_resources()[0];
+                assert_eq!(
+                    first_members, new.crtcs,
+                    "successor must cover the same member"
+                );
+                assert_ne!(first_key, new.allocations[0].key());
+                assert!(
+                    fixture
+                        .backend
+                        .resource_service
+                        .as_ref()
+                        .expect("service")
+                        .has_pending_obligations(&first_key)
+                );
+            }
+            state => panic!("different-source direct commit is not submitted: {state:?}"),
+        }
+        c0_conv_cii_accept_direct_owner_commit(&mut fixture.backend, device, different_commit);
+        c0_conv_cii_complete_direct_owner_hardware(&mut fixture.backend, device);
+        c0_conv_cii_page_flip_direct_owner(&mut fixture.backend, device, 0, 1_100, 1, 100_000);
+        assert_eq!(fixture.backend.core.top_level_order, vec![target_xid]);
+    }
 }
