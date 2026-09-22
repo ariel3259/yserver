@@ -2,6 +2,11 @@
 
 > **Implementer:** codex (model `gpt-5.6-luna`, reasoning effort `xhigh`), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters (`c0_conv_cp_`, `c0_conv_cfb_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_ci_`, `c0_conv_cir_`) with `--include-ignored`, never `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time. Stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code, stop and report it (F8); never silently substitute a test shape.
 
+**Revision 2 (2026-09-22)** — incorporates codex round 1 (`../findings/2026-09-22-stage-2c-iii-plan-cp-review-round1.md`: 0 blocking, 3 major, all three verified against the tree and accepted).
+- **M-1:** revision 1's Task 2 proved the promotion predicate before any production path could produce a receipt, and allowed an interim test seam to carry its evidence — the defect plan Ciii's round 1 found as its own M-1. **Tasks 2 and 3 are swapped**: the prepared copy (with its wake registration) lands first and produces the receipt; the promotion that consumes it runs its acceptance tests through that production path. The test-seam permission is removed.
+- **M-2:** the spec's §8.2 row "a failed copy submission offers nothing and discharges its leases through the service" was dropped when CP-4b was rewritten around `gpu_submitted`. Restored as its own criterion with Q36 and Q37, and Task 4 now states `Displaced` and no offer for **both** `gpu_submitted` outcomes.
+- **M-3:** cancellation has two distinct production operations and revision 1 named one. `cancel_scanout_render_completions_for_output` (`platform.rs:4968`) is per output; `clear_scanout_render_completions` (`platform.rs:4987`) clears the whole queue and has three callers — VT suspend (`platform.rs:6634`), `platform.rs:7664` and `scene.rs:3128`. Decision 11 now covers both, with Q38.
+
 **Revision 1 (2026-09-22).**
 
 **Goal:** Convert the copied composed producer (`submit_copied_scanout`, `platform.rs:6395`) to the Owner route, so that a device with a copied-route output can enter `Owner` at all. This is the item plan Ciii's acceptance carries as still owed to 2c-iii, and the first fixture in the project that builds a copied output — which is what turns Ci's validator-only R8 into an executable exclusivity case.
@@ -27,8 +32,8 @@ Items 1–7 come from the spec; 8–11 are this plan's.
 7. **Eligibility requires both halves managed** (CP-7); the refusal survives as `Unmanaged`. **Exclusivity is proven at the site** (CP-8), and the transport gate's refusal is not the observation.
 8. **Owner code in `copied_owner.rs`**, reached from one fork point in the copied completion handler (`scene.rs:3990`-`4002`). `submit_copied_scanout` keeps its Legacy body byte-for-byte.
 9. **Test names start with `c0_conv_cp_`**; Vulkan tests end in `_vulkan` with `#[ignore = "needs live Vulkan ICD"]` on the Owner live fixture; the hardware test is `c0_hw_cp_copied_route_cross_device_drm`. Mutations are `Q1`…
-10. **The sink's fence ticket** (spec §9.1): `submit_copy_with_fence` (`vk/scanout.rs:1817`) already takes a `vk::Fence`, used only by the probe. Task 3's first step is the implementer's decision on where a `FenceTicket` for the sink context comes from, written into the task report before the code.
-11. **The wake source** (spec §9.2): the copy's `sync_file` registers in the existing `CompletionPoller` or a sibling of it. Task 4's first step states which and why. CP-2 holds either way: whatever wakes, only the receipt promotes.
+10. **The sink's fence ticket** (spec §9.1): `submit_copy_with_fence` (`vk/scanout.rs:1817`) already takes a `vk::Fence`, used only by the probe. Task 2's first step is the implementer's decision on where a `FenceTicket` for the sink context comes from, written into the task report before the code.
+11. **The wake source, and both cancellation operations** (spec §9.2; round-1 M-3): the copy's `sync_file` registers in the existing `CompletionPoller` or a sibling of it. **Task 2's first step states which and why**, and the choice binds two teardown paths, not one: `cancel_scanout_render_completions_for_output` (`platform.rs:4968`) is per output, while `clear_scanout_render_completions` (`platform.rs:4987`) clears the whole queue and is what VT suspend (`platform.rs:6634`), `platform.rs:7664` and `scene.rs:3128` call. A sibling container must be reached by **both**; the existing poller must be shown to be the container both already clear. CP-2 holds either way: whatever wakes, only the receipt promotes.
 
 ## Limits stated
 
@@ -80,10 +85,11 @@ Before acceptance, the coordinator adds: `cargo check --workspace` for Linux gli
 | A failed preparation leaves no obligation and no lease behind (CP-4a) | `c0_conv_cp_failed_preparation_unwinds_completely` | Q12: fail the source step and keep the destination obligation; Q13: fail the source step and keep its lease |
 | Batch B holds the destination write obligation and the source read obligation (CP-4) | `c0_conv_cp_batch_holds_both_obligations_vulkan` | Q14: register the batch without the read obligation; Q15: register it with no destination obligation; Q16: key the destination obligation to another allocation |
 | A failed submission is disposed of by its `gpu_submitted` answer, by key (CP-4b) | `c0_conv_cp_unsent_submission_cancels`, `c0_conv_cp_uncertain_dispatch_freezes_and_closes_the_gate` | Q17: cancel the prepared obligations on an uncertain dispatch; Q18: dispose of an uncertain dispatch through a ticketless batch, so no destination key is frozen; Q19: leave the transport gate open on an uncertain dispatch |
+| A failed copy submission offers nothing and discharges its leases through the service, on either `gpu_submitted` answer (spec 3.3; round-1 M-2) | `c0_conv_cp_failed_submission_offers_nothing_vulkan` (both outcomes) | Q36: offer after a failed copy; Q37: release its leases by hand instead of through the service |
 | The source is excluded by the destination's paired `Recording` phase (CP-4c) | `c0_conv_cp_paired_phase_excludes_the_source_vulkan` | Q20: skip the destination's `Recording` transition at selection; Q21: release it before the copy is submitted |
 | The read obligation is registered by the production path (CP-4d) | `c0_conv_cp_read_obligation_has_a_production_caller_vulkan` | Q22: drive the criterion from a hand-built batch instead of the route |
 | A copy that submitted but could not register its wake offers nothing and keeps its batch (spec 3.3) | `c0_conv_cp_wake_registration_failure_displaces_vulkan` | Q23: offer on generic availability after a failed wake registration; Q24: drop the batch |
-| Cancellation covers the copy wait with the same scope as A's (spec 3.3) | `c0_conv_cp_output_removal_cancels_the_copy_wait_vulkan` | Q25: cancel only A's pending completions on output removal |
+| Cancellation covers the copy wait in **both** production operations (spec 3.3; round-1 M-3) | `c0_conv_cp_output_removal_cancels_the_copy_wait_vulkan`, `c0_conv_cp_whole_queue_clear_takes_the_copy_wait_vulkan` | Q25: cancel only A's pending completions on output removal; Q38: omit the copy wait from the whole-queue clear, then prove a stale completion survives a VT suspend |
 | No owner commit on this route carries an input fence, and no request carries a descriptor (CP-6) | `c0_conv_cp_commit_carries_no_input_fence_vulkan` | Q26: attach the copy fence to the commit request |
 | No legacy primary write is issued at the copied submit site on an Owner device (CP-8) | `c0_conv_cp_no_legacy_write_at_the_copied_site_vulkan` | Q27: force the legacy branch at that site — and the transport gate's refusal does not count as the observation |
 | The destination retires under the ledger and every §4.2 gate (CP-9) | `c0_conv_cp_destination_retires_under_the_ledger_vulkan` | Q28: release the pool slot at the ack; Q29: drop one gate |
@@ -114,17 +120,41 @@ Before acceptance, the coordinator adds: `cargo check --workspace` for Linux gli
 
 ---
 
-### Task 2: The receipt, and the promotion that consumes it
+### Task 2: The prepared copy, and its wake
 
-**Files:** `copied_owner.rs` (new), `scene.rs` (the fork point at the copied completion handler, `:3990`-`4002`), `owner_buffer.rs` if the waiting stage needs it; tests.
+**Files:** `copied_owner.rs` (new), `scene.rs` (the fork point in the copied completion handler, `:3990`-`4002`), `vk/scanout.rs` (`submit_copy_with_fence` at `:1817`), `platform.rs` (the completion registration at `:4891`), `resources/gpu.rs` if the preparation needs an entry beside `prepare_retirement_batch`; tests.
 
-**Interfaces produced:** the receipt type carried by a copied generation — at minimum the destination `AllocationKey` and the `ObligationId` — and the predicate that decides promotion. Tasks 3 to 6 fill in what produces the receipt; this task fixes what consumes it.
+**Interfaces produced:** the preparation entry every later task builds on. It takes the generation's destination and source keys and produces the batch, the two obligations, the registered wake, and **the receipt** — at minimum the destination `AllocationKey` and the `ObligationId` — which Task 3 consumes and Tasks 4 to 6 dispose of.
+
+**Three steps before any code, each reported:**
+1. **Decision 10** — where a `FenceTicket` for the sink context comes from.
+2. **Decision 11** — which container the copy's wake registers in, and how both cancellation operations reach it.
+3. **Spec §9.5** — enumerate every production consumer other than tick selection that can reserve a copied pool's source allocation, and state for each why it cannot take the source between A's retirement and B's read reservation. An unenumerated consumer is an F8 stop, not an assumption.
+
+**Invariants (CP-4, CP-4a, CP-4c, CP-4d).**
+- The order is fixed: A's batch registered and serviced (its source write lease drops with it) → destination `Write` reserved and its GPU obligation registered → source `Read` reserved and its read obligation registered → **then** the copy submitted → the batch built owning both leases and both obligations, ticket bound, registered → the wake registered.
+- A failure at either reservation step cancels every obligation already registered for the attempt and drops every lease already taken, as `cancel_pre_submit_batch` (`resources/gpu.rs:370`) does. Nothing is submitted; the generation is `Displaced`.
+- No lease is shared between A's batch and B's, taken out of a registered batch, or acquired while another holder is live.
+- The read obligation is registered **by this path**. It has no production caller today; this is it.
+- The source's exclusion while it has no lease is the destination's paired `Recording` phase (`platform.rs:6374`), not scheduling.
+- Nothing is offered in this task: a prepared generation stays `Rendering` until Task 3. That is the task's own observable, not a gap.
+
+**Named tests:** `c0_conv_cp_obligations_precede_the_copy_vulkan`, `c0_conv_cp_failed_preparation_unwinds_completely` (deterministic where the service can be made to refuse), `c0_conv_cp_batch_holds_both_obligations_vulkan`, `c0_conv_cp_read_obligation_has_a_production_caller_vulkan`, `c0_conv_cp_paired_phase_excludes_the_source_vulkan`.
+
+- [ ] Steps: the three reports; tests; red; implement; checks; stop dirty and report the fork point and the Owner function.
+
+---
+
+### Task 3: The receipt's consumer — promotion and the offer gate
+
+**Files:** `copied_owner.rs`, `scene.rs` (the promotion site), `owner_buffer.rs` if the waiting stage needs it; tests.
+
+**Interfaces consumed:** Task 2's receipt and its registered wake. **Every test in this task runs through Task 2's production preparation** — no injected receipt, no test seam (round-1 M-1).
 
 **Invariants (CP-1, CP-2, CP-2a, CP-3).**
 - A copied generation may become `Desired` and be offered only when `has_pending_obligation(destination_key, obligation_id)` is false **and** `is_frozen(destination_key)` is false.
 - Nothing else is authority. `service_completions` returns generic keys and a service-wide error (`resources/mod.rs:359`); neither its `Ok` nor its `Err` decides this generation. The composed precedent logs a service failure and offers anyway (`scene.rs:3965`) — **that shape is not copied here**, and a test must pin the difference.
 - The owner buffer gains no state: `Rendering` covers both producer stages and the waiting stage discriminates.
-- Until Task 3 exists, the receipt may be produced by the task's own test seam **only if** that seam is the same function the producer will call; a parallel test-only path is an F8.
 
 **Named tests:** `c0_conv_cp_offer_waits_for_the_destination_obligation_vulkan`, `c0_conv_cp_readable_fence_with_pending_obligation_offers_nothing_vulkan`, `c0_conv_cp_frozen_destination_offers_nothing_vulkan`, `c0_conv_cp_desired_at_copy_retirement_vulkan`, `c0_conv_cp_displaced_during_copy_offers_nothing_vulkan`.
 
@@ -132,46 +162,22 @@ Before acceptance, the coordinator adds: `cargo check --workspace` for Linux gli
 
 ---
 
-### Task 3: The prepared copy
+### Task 4: Failure after submission, and both cancellation paths
 
-**Files:** `copied_owner.rs`, `vk/scanout.rs` (`submit_copy_with_fence` at `:1817`), `resources/gpu.rs` if the preparation needs an entry beside `prepare_retirement_batch`; tests.
+**Files:** `copied_owner.rs`, `platform.rs` (`cancel_scanout_render_completions_for_output` at `:4968`, `clear_scanout_render_completions` at `:4987`), `vk/scanout.rs` (`recover_copy_failure` at `:2530`); tests.
 
-**Interfaces produced:** the preparation entry that Task 4's failure paths and Task 5's offer both build on: it takes the generation's destination and source keys and returns the batch, the two obligations and the receipt of Task 2.
-
-**First two steps, before any code, both reported:**
-1. **Decision 10** — where a `FenceTicket` for the sink context comes from.
-2. **Spec §9.5** — enumerate every production consumer other than tick selection that can reserve a copied pool's source allocation, and state for each why it cannot take the source between A's retirement and B's read reservation. An unenumerated consumer is an F8 stop, not an assumption.
-
-**Invariants (CP-4, CP-4a, CP-4c, CP-4d).**
-- The order is fixed: A's batch registered and serviced (its source write lease drops with it) → destination `Write` reserved and its GPU obligation registered → source `Read` reserved and its read obligation registered → **then** the copy submitted → the batch built owning both leases and both obligations, ticket bound, registered.
-- A failure at either reservation step cancels every obligation already registered for the attempt and drops every lease already taken, as `cancel_pre_submit_batch` (`resources/gpu.rs:370`) does. Nothing is submitted; the generation is `Displaced`.
-- No lease is shared between A's batch and B's, taken out of a registered batch, or acquired while another holder is live.
-- The read obligation is registered **by this path**. It has no production caller today; this is it.
-- The source's exclusion while it has no lease is the destination's paired `Recording` phase (`platform.rs:6374`), not scheduling.
-
-**Named tests:** `c0_conv_cp_obligations_precede_the_copy_vulkan`, `c0_conv_cp_failed_preparation_unwinds_completely` (deterministic where the service can be made to refuse), `c0_conv_cp_batch_holds_both_obligations_vulkan`, `c0_conv_cp_read_obligation_has_a_production_caller_vulkan`, `c0_conv_cp_paired_phase_excludes_the_source_vulkan`.
-
-- [ ] Steps: the two reports; tests; red; implement; checks; stop dirty and report.
-
----
-
-### Task 4: Failure after submission, and the wake
-
-**Files:** `copied_owner.rs`, `platform.rs` (the completion registration and cancellation entries at `:4891`, `:4968`), `vk/scanout.rs` (`recover_copy_failure` at `:2530`); tests.
-
-**Interfaces produced:** the disposition entry every later failure path calls, and the wake registration the offer depends on.
-
-**First step, before any code:** **decision 11** — whether the copy's `sync_file` registers in the existing `CompletionPoller` or a sibling, and why. Report it.
+**Interfaces produced:** the disposition entry every later failure path calls.
 
 **Invariants (CP-4b, spec 3.3).**
 - A submission failure is disposed of through `abandon_unsubmitted_batch` (`resources/gpu.rs:395`): provably not dispatched → cancel the prepared obligations, closing the transport gate only if the cancel fails; may have dispatched → close the gate and freeze the prepared entries, destination and source both. Never a ticketless batch: `quarantine_gpu_batch` takes the keys it freezes from the batch's obligation (`resources/mod.rs:1563`), so a batch without one freezes nothing.
+- **On either outcome the generation is `Displaced` and nothing is offered, and every lease is discharged through the service rather than by hand** (round-1 M-2). Disposing of the resources correctly and then promoting the generation anyway is the failure this criterion exists to catch.
 - A copy that submitted and then failed to register its wake keeps its batch registered, displaces the generation, removes partial waiter state and offers nothing. Generic availability is never an offer signal.
-- Output removal, device loss and VT release cancel the copy wait with the same scope as A's.
+- **Both cancellation operations take the copy wait** (round-1 M-3): the per-output cancellation (`platform.rs:4968`) and the whole-queue clear (`platform.rs:4987`) that VT suspend (`platform.rs:6634`), `platform.rs:7664` and `scene.rs:3128` call. A wait that survives a VT suspend can deliver a stale completion later; that is what Q38 forces.
 - A newer generation supersedes without aborting the copy in flight; its offer is discarded.
 
-**Named tests:** `c0_conv_cp_unsent_submission_cancels`, `c0_conv_cp_uncertain_dispatch_freezes_and_closes_the_gate`, `c0_conv_cp_wake_registration_failure_displaces_vulkan`, `c0_conv_cp_output_removal_cancels_the_copy_wait_vulkan`.
+**Named tests:** `c0_conv_cp_unsent_submission_cancels`, `c0_conv_cp_uncertain_dispatch_freezes_and_closes_the_gate`, `c0_conv_cp_failed_submission_offers_nothing_vulkan` (both `gpu_submitted` outcomes), `c0_conv_cp_wake_registration_failure_displaces_vulkan`, `c0_conv_cp_output_removal_cancels_the_copy_wait_vulkan`, `c0_conv_cp_whole_queue_clear_takes_the_copy_wait_vulkan`.
 
-- [ ] Steps: the report; tests; red; implement; checks; stop dirty and report.
+- [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
 ---
 
@@ -179,7 +185,7 @@ Before acceptance, the coordinator adds: `cargo check --workspace` for Linux gli
 
 **Files:** `copied_owner.rs`, `scene.rs` (the offer queue), `admission.rs` only if the conductor needs the copied producer named; tests.
 
-**Interfaces produced:** a copied generation that reaches the conductor as a `ComposedOffer` and a commit built for it.
+**Interfaces consumed:** the offer Task 3 gates and pushes. This task takes it from the conductor to a completed commit; it does not re-decide when an offer may exist.
 
 **Invariants (CP-1, CP-6, and 2c-ii's admission rules unchanged).**
 - The offer carries the same shape as the composed route's; the conductor learns nothing new about the route.
