@@ -13,6 +13,16 @@ has a disposition (M-1, section 3.3), and the destination's write obligation has
 its own mutation and its own evidence (M-2, sections 6 and 8.2). While verifying
 B-1 the author found that `ReadObligation` had no production caller; section 3.2
 now says so and makes this route its first.
+Revision 3 incorporates codex round 2
+(`../findings/2026-09-22-stage-2c-iii-copied-route-design-review-round2.md`,
+same instrument, 24 excerpts: 1 blocking, 0 major; M-1 and M-2 audited as
+applied). Round 2 carried B-1 forward as partial, and verifying it showed that
+revision 2's own premise was false: the acquisition leases protect selection
+only and are dropped there (`scene.rs:6194`-`6201`), so there was never a
+producer lease to move. Section 3.2 is rewritten from the sequence the code
+runs, and the copied route now follows `prepare_retirement_batch`'s established
+idiom — every obligation registered before any raw handle reaches the GPU, the
+whole attempt unwound on failure — instead of a transaction invented for it.
 
 This is the plan that plan Ciii's acceptance finding
 (`../findings/2026-09-22-stage-2c-iii-plan-ciii-accepted.md`, "Carried") records
@@ -136,59 +146,90 @@ is the producer stage the generation is waiting on, beside the existing
 the plan's choice. `into_desired` happens at B's retirement,
 not at A's. `Displaced` applies identically in both stages, with no new rule.
 
-### 3.2. Ownership while the copy is in flight
+### 3.2. Ownership across the two stages
 
-**CP-4 — batch B owns both halves for the duration of the copy.** The batch
-registered for the sink copy carries a write `GpuObligation`
-(`resources/gpu.rs:30`) over the **destination** allocation — that obligation's
-retirement is what makes it readable — and a `ReadObligation`
-(`resources/gpu.rs:91`) over the **source** allocation. A's own batch retires
-A's own leases and is never the authority that frees the source.
+**The sequence the code already runs, which this route extends.** Revision 2
+described a handoff that does not exist, so revision 3 starts from the tree:
+
+- **Selection.** `acquire_managed_scanout_bo` takes a lease on each half
+  (`platform.rs:6347` destination, `platform.rs:6355` source) and the caller
+  **drops them immediately**. They protect selection only, and the reason is
+  written at the site: holding one across the compose's own reservation "would
+  make the service correctly report `Busy` for the same allocation"
+  (`scene.rs:6194`-`6201`).
+- **Compose.** `prepare_retirement_batch` (`resources/gpu.rs:299`) reserves the
+  write lease and registers the GPU obligation for every allocation the
+  submission will touch **before the caller may hand any raw handle to the
+  GPU**, and a failure partway through releases everything already reserved for
+  that attempt, so no half-registered batch can survive.
+- **Completion.** The generation takes its `Retain` lease, the batch is
+  registered and serviced, and its write lease drops with it
+  (`resources/mod.rs:1560`).
+
+On the copied route A writes the **source**; the destination is written by B.
+
+**CP-4 — one holder at a time, and no lease crosses a batch.** A's batch owns
+the source write lease and the source GPU obligation and retires both when it is
+serviced. B's batch owns the destination write lease with its GPU obligation and
+the source read lease with its `ReadObligation` (`resources/gpu.rs:91`). No lease
+is shared between the two batches, taken out of a registered batch, or acquired
+while another holder is live.
 
 The batch is device-agnostic by construction: `GpuObligation` carries its own
 `Arc<VkContext>` (`resources/gpu.rs:33`), so a batch produced on the sink device
 is as valid to the service as one produced on the renderer device.
 
-**CP-4a — the A-to-B transition moves leases; it never re-acquires them
-(round-1 B-1).** How ownership crosses the boundary is not left to the
-implementation, because the obvious orders are both wrong. The copied
-acquisition already holds **two `Write` leases** for the generation: the
-destination (`platform.rs:6347`) and the renderer source (`platform.rs:6355`).
-Re-reserving the source as `Read` for B while A's lease is live fails `Busy` —
-`is_compatible` refuses a read against a live writer
-(`resources/availability.rs:116`) — and dropping A's lease first opens an
-interval in which the source has no live use at all and the pool may hand the
-slot out. Therefore:
+**CP-4a — B is prepared exactly as A is: obligations before GPU work, unwound
+as a whole (round-2 B-1).** At A's completion, in this order:
 
-1. The leases the producer already holds are **transferred by value** into B's
-   batch. `CoreRetirementBatch.leases` and `ReadObligation::new` both take
-   leases by value, so this is a move, not a new acquisition, and
-   `is_compatible` is never consulted on this path.
-2. The obligations are minted with `ResourceService::register`
-   (`resources/mod.rs:865`), which records a pending obligation on the entry and
-   does **not** consult `is_compatible`. Obligations and leases therefore move
-   independently, which is what makes this transition expressible at all.
-3. Submitting the copy, minting both obligations, moving both leases into the
-   batch and registering the batch are **one synchronous step with no event-loop
-   yield inside it**. There is no point at which the source is reachable by
-   another acquirer.
-4. Obligations are minted only after the copy submission has succeeded. Once it
-   has, the batch is registered with whatever it holds, so GPU work never leaves
-   leases orphaned outside the service.
+1. A's batch is registered and serviced; its source write lease drops with it.
+2. B reserves the destination `Write` and registers its GPU obligation. The
+   destination has no live holder — its selection lease was dropped at
+   selection and nothing else took one.
+3. B reserves the source `Read` and registers its read obligation. This is now
+   compatible: `Read` requires no live writer (`resources/availability.rs:116`)
+   and A's writer is gone.
+4. **Only then** is the copy submitted.
+5. The batch is built owning both leases and both obligations, its ticket is
+   bound, and it is registered with the service.
 
-**CP-4b — this route is `ReadObligation`'s first production caller.**
+A failure at step 2 or 3 cancels every obligation already registered for the
+attempt and drops every lease already taken, the way `cancel_pre_submit_batch`
+(`resources/gpu.rs:370`) does for a submission that provably never reached the
+GPU. Nothing is submitted and the generation is `Displaced`.
+
+**CP-4b — after submission, failure is dispositional, never unwound.** Once the
+copy has been handed to the GPU, no obligation is cancelled. A submission
+failure that provably never dispatched quiesces (`recover_copy_failure`) and
+cancels as above; an outcome that may have dispatched is registered as a batch
+with no ticket and `possibly_dispatched` set, which the existing model already
+treats as unrecoverable and quarantines (`resources/gpu.rs:223`) rather than
+making the allocations reusable.
+
+**CP-4c — the source's exclusion between steps 1 and 3 is by non-interleaving,
+and it is stated rather than assumed.** Between A's write lease dropping and B's
+read lease being taken, the source has no live use. Steps 1 to 5 run in one
+synchronous step of the single-threaded core with no event-loop yield inside it,
+and the only actor that could take the source is a later tick's selection.
+This is exclusion by construction, not by overlapping leases: any restructuring
+that introduces a yield inside the step breaks it, and that is what the
+criterion in section 8.2 mutates. Non-interleaving is claimed **only** for
+reuse exclusion; it makes nothing atomic, which is why every fallible step
+above is ordered before the GPU work rather than after it.
+
+**CP-4d — this route is `ReadObligation`'s first production caller.**
 `ReadObligation::new` and `bind_read_obligation` are today driven only by
 `resources/guard_tests.rs:202`, `:221`, `:244` and `resources/tests.rs:1851`.
 Resting CP-5 on machinery that only tests call is the defect class plan Ciii's
 hardware run found as F-T6-4, so it is stated here rather than discovered later:
 the plan's evidence must show the production path registering the read
-obligation, and a test that calls it by hand does not satisfy any criterion of
+obligation, and a test that calls it by hand satisfies no criterion of
 section 8.2.
 
-**CP-5 — the source outlives the copy.** While B has not retired, the source
-allocation cannot return to the renderer pool. A copied generation whose source
-was recycled before its copy retired is a defect of this route, not of the
-service.
+**CP-5 — the source outlives the copy.** From step 3 until B retires, the source
+allocation cannot be reserved for writing or returned to the renderer pool. A
+copied generation whose source was recycled before its copy retired is a defect
+of this route, not of the service.
 
 ### 3.3. Failure, cancellation and supersession
 
@@ -322,8 +363,11 @@ not by the first textual match.
 | The owner buffer reaches `Desired` at B's retirement, not A's (CP-3) | Promote to `Desired` when A completes |
 | A displaced generation behaves identically in either producer stage (CP-3) | Offer a generation displaced during the copy |
 | Batch B holds a write obligation on the destination and a read obligation on the source (CP-4) | Register the batch without the read obligation; **and, separately, register it with no destination obligation, or with one keyed to another allocation** (round-1 M-2) |
-| The transition moves the producer's leases and re-acquires nothing (CP-4a) | Re-reserve the source as `Read` for the batch; release the producer's source lease before the batch takes it |
-| The read obligation is registered by the production path, not by a test (CP-4b) | Drive the criterion from a hand-built batch instead of the route |
+| Every obligation B needs is registered before the copy reaches the GPU (CP-4a) | Register the destination obligation after submission; register the source obligation after submission |
+| A failed preparation leaves no obligation and no lease behind (CP-4a) | Fail step 3 and keep the destination obligation; fail step 3 and keep its lease |
+| A submission that may have dispatched is quarantined, not cancelled (CP-4b) | Cancel the obligations on an uncertain dispatch; register the batch without `possibly_dispatched` |
+| The source is excluded from step 1 to step 3 by non-interleaving (CP-4c) | Put an event-loop yield between A's retirement and B's read reservation |
+| The read obligation is registered by the production path, not by a test (CP-4d) | Drive the criterion from a hand-built batch instead of the route |
 | A copy that submitted but could not register its completion wake offers nothing and keeps its batch (3.3) | Offer on generic availability after a failed wake registration; drop the batch |
 | The source is not reusable until B retires (CP-5) | Return the source to the renderer pool at A's completion |
 | A failed copy submission offers nothing and discharges its leases through the service (3.3) | Offer after a failed copy; release its leases by hand |
