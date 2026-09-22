@@ -12,6 +12,7 @@ use crate::kms::render::{
         AllocationKey, ObligationId, ResourceService,
         availability::ResourceError,
         capacity::{DirectCapacity, DirectRole, RoleReservation},
+        drm_cleanup::CleanupCharge,
         lease::AllocationLease,
         present::{CompletionDisposition, PresentDisposition, PresentKey, ReleaseDisposition},
         storage::StorageLease,
@@ -155,6 +156,7 @@ pub struct CommitResourceConsumer {
     pub(crate) gate_handle: Option<TransportGateHandle>,
     pub(crate) released_presents: Vec<PresentRelease>,
     pub(crate) reserved_retirements: BTreeMap<CommitKey, RoleReservation>,
+    pub(crate) direct_cleanup_charges: BTreeMap<AllocationKey, CleanupCharge>,
 }
 
 impl CommitResourceConsumer {
@@ -224,6 +226,24 @@ impl CommitResourceConsumer {
         }
         self.rejected_resources = retained;
         matching
+    }
+
+    pub(crate) fn take_direct_cleanup_charge(
+        &mut self,
+        key: AllocationKey,
+    ) -> Option<CleanupCharge> {
+        self.direct_cleanup_charges.remove(&key)
+    }
+
+    pub(crate) fn restore_direct_cleanup_charge(
+        &mut self,
+        key: AllocationKey,
+        charge: CleanupCharge,
+    ) {
+        let previous = self.direct_cleanup_charges.insert(key, charge);
+        if previous.is_some() {
+            self.capacity.close_admission();
+        }
     }
 
     pub(crate) fn present_disposition(&self, key: &PresentKey) -> Option<PresentDisposition> {
@@ -365,6 +385,13 @@ impl CommitResourceConsumer {
                     let _ = self.capacity.cancel_reservation(reserved);
                 }
                 for res in &mut resources {
+                    if let Some(role) = res.direct_role.as_mut()
+                        && role.role() == DirectRole::ExitRetirement
+                        && let Err(error) = self.capacity.move_role(role, DirectRole::Current)
+                    {
+                        self.capacity.close_admission();
+                        return Err(error);
+                    }
                     for (key, obligation_id, _) in res.kms_obligations.drain(..) {
                         let _ = service.cancel(key, obligation_id);
                     }
@@ -457,23 +484,14 @@ impl CommitResourceConsumer {
 
         while let Some(mut res) = releasing_iter.next() {
             if is_resource_releasable(&res, service) {
-                if let Some(slot) = res.direct_role.take() {
+                if self.defer_final_direct_role(&mut res, service) {
+                    self.release_present(&mut res);
+                    drop(res);
+                } else if let Some(slot) = res.direct_role.take() {
                     match self.capacity.finish_role(slot) {
                         Ok(()) => {
                             freed_any = true;
-                            if let Some(present_rel) = res.present.take() {
-                                let pid = present_rel.event.present_id;
-                                for (k, disp) in &mut self.present_dispositions {
-                                    if k.present_id == pid
-                                        && res.commit_id.is_none_or(|c| {
-                                            k.device == c.device && k.commit == c.commit
-                                        })
-                                    {
-                                        disp.release = ReleaseDisposition::Released;
-                                    }
-                                }
-                                self.released_presents.push(present_rel);
-                            }
+                            self.release_present(&mut res);
                             drop(res);
                         }
                         Err((err, slot)) => {
@@ -486,19 +504,7 @@ impl CommitResourceConsumer {
                         }
                     }
                 } else {
-                    if let Some(present_rel) = res.present.take() {
-                        let pid = present_rel.event.present_id;
-                        for (k, disp) in &mut self.present_dispositions {
-                            if k.present_id == pid
-                                && res
-                                    .commit_id
-                                    .is_none_or(|c| k.device == c.device && k.commit == c.commit)
-                            {
-                                disp.release = ReleaseDisposition::Released;
-                            }
-                        }
-                        self.released_presents.push(present_rel);
-                    }
+                    self.release_present(&mut res);
                     drop(res);
                 }
             } else {
@@ -516,23 +522,14 @@ impl CommitResourceConsumer {
 
         while let Some(mut res) = rejected_iter.next() {
             if is_resource_releasable(&res, service) {
-                if let Some(slot) = res.direct_role.take() {
+                if self.defer_final_direct_role(&mut res, service) {
+                    self.release_present(&mut res);
+                    drop(res);
+                } else if let Some(slot) = res.direct_role.take() {
                     match self.capacity.finish_role(slot) {
                         Ok(()) => {
                             freed_any = true;
-                            if let Some(present_rel) = res.present.take() {
-                                let pid = present_rel.event.present_id;
-                                for (k, disp) in &mut self.present_dispositions {
-                                    if k.present_id == pid
-                                        && res.commit_id.is_none_or(|c| {
-                                            k.device == c.device && k.commit == c.commit
-                                        })
-                                    {
-                                        disp.release = ReleaseDisposition::Released;
-                                    }
-                                }
-                                self.released_presents.push(present_rel);
-                            }
+                            self.release_present(&mut res);
                             drop(res);
                         }
                         Err((err, slot)) => {
@@ -545,19 +542,7 @@ impl CommitResourceConsumer {
                         }
                     }
                 } else {
-                    if let Some(present_rel) = res.present.take() {
-                        let pid = present_rel.event.present_id;
-                        for (k, disp) in &mut self.present_dispositions {
-                            if k.present_id == pid
-                                && res
-                                    .commit_id
-                                    .is_none_or(|c| k.device == c.device && k.commit == c.commit)
-                            {
-                                disp.release = ReleaseDisposition::Released;
-                            }
-                        }
-                        self.released_presents.push(present_rel);
-                    }
+                    self.release_present(&mut res);
                     drop(res);
                 }
             } else {
@@ -573,6 +558,46 @@ impl CommitResourceConsumer {
             self.direct_admission_scheduled = true;
         }
         Ok(())
+    }
+
+    fn defer_final_direct_role(
+        &mut self,
+        res: &mut CommitResources,
+        service: &ResourceService,
+    ) -> bool {
+        let Some(key) = res.allocations.iter().find_map(|lease| {
+            service
+                .direct_framebuffer_is_last_lease(lease)
+                .then_some(lease.key())
+        }) else {
+            return false;
+        };
+        let Some(slot) = res.direct_role.take() else {
+            return false;
+        };
+        let previous = self
+            .direct_cleanup_charges
+            .insert(key, CleanupCharge::FinalRole(slot));
+        if previous.is_some() {
+            self.capacity.close_admission();
+        }
+        true
+    }
+
+    fn release_present(&mut self, res: &mut CommitResources) {
+        if let Some(present_rel) = res.present.take() {
+            let pid = present_rel.event.present_id;
+            for (key, disposition) in &mut self.present_dispositions {
+                if key.present_id == pid
+                    && res.commit_id.is_none_or(|commit| {
+                        key.device == commit.device && key.commit == commit.commit
+                    })
+                {
+                    disposition.release = ReleaseDisposition::Released;
+                }
+            }
+            self.released_presents.push(present_rel);
+        }
     }
 }
 

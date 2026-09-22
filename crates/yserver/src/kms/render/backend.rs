@@ -21148,29 +21148,7 @@ impl KmsBackend {
                 }
                 true
             }
-            crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
-                commit,
-                mut resources,
-            } => {
-                // An unflip moves the old Current role into ExitRetirement
-                // before begin. A pre-IPC refusal returns that old state as
-                // still current, so restore the capacity role before the
-                // shared consumer takes ownership of the vector.
-                for resource in &mut resources {
-                    if let Some(role) = resource.direct_role.as_mut()
-                        && role.role() == crate::kms::render::resources::DirectRole::ExitRetirement
-                        && self
-                            .commit_consumer
-                            .capacity
-                            .move_role(role, crate::kms::render::resources::DirectRole::Current)
-                            .is_err()
-                    {
-                        if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
-                            gate.force_close();
-                        }
-                        return false;
-                    }
-                }
+            crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent { commit, resources } => {
                 let commit_key = crate::kms::render::resources::CommitKey::new(device_key, commit);
                 let Some(service) = &mut self.resource_service else {
                     return false;
@@ -21837,7 +21815,23 @@ impl KmsBackend {
             let Some(registry) = self.drm_cleanup_registry.as_mut() else {
                 continue;
             };
-            let _ = service.cleanup_direct_framebuffer(key, registry);
+            let mut charge = self.commit_consumer.take_direct_cleanup_charge(key);
+            let had_charge = charge.is_some();
+            let cleaned =
+                service.cleanup_direct_framebuffer_with_charge(key, registry, &mut charge);
+            if let Some(charge) = charge {
+                self.commit_consumer
+                    .restore_direct_cleanup_charge(key, charge);
+            } else if cleaned && had_charge {
+                self.commit_consumer.direct_admission_scheduled = true;
+            }
+        }
+
+        if let Some(registry) = self.drm_cleanup_registry.as_mut()
+            && let Ok(released) = registry.retry_pending_cleanup()
+            && released > 0
+        {
+            self.commit_consumer.direct_admission_scheduled = true;
         }
     }
 }
@@ -64093,5 +64087,659 @@ mod tests {
             calls_before + 2,
             "the backend service step owns the registry cleanup"
         );
+    }
+
+    fn c0_conv_cfb_dispatch_real_candidate(
+        backend: &mut super::KmsBackend,
+        present_id: u32,
+        commit_number: u64,
+    ) -> (
+        crate::kms::render::resources::CommitKey,
+        crate::kms::render::resources::CommitResources,
+    ) {
+        let prepared = owner_direct_candidate_with_real_import(backend, present_id)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("managed preparation")
+        );
+        backend.managed_tag_queued_direct_successor(u64::from(present_id));
+        let device = backend.platform.primary_device().expect("device").key;
+        let commit = crate::kms::owner::identity::CommitId::for_tests(commit_number);
+        let commit_key = crate::kms::render::resources::CommitKey::new(device, commit);
+        let resources = backend
+            .managed_dispatch_direct_successor(commit_key)
+            .expect("managed dispatch")
+            .expect("direct successor");
+        (commit_key, resources)
+    }
+
+    fn c0_conv_cfb_install_current_real_candidate(
+        backend: &mut super::KmsBackend,
+        present_id: u32,
+        commit_number: u64,
+    ) -> (
+        crate::kms::render::resources::CommitKey,
+        crate::kms::render::resources::AllocationKey,
+    ) {
+        let (commit_key, resources) =
+            c0_conv_cfb_dispatch_real_candidate(backend, present_id, commit_number);
+        let key = resources
+            .allocations
+            .first()
+            .expect("direct framebuffer allocation")
+            .key();
+        let device = commit_key.device;
+        assert!(backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: commit_key.commit,
+                resources: crate::kms::owner::ledger::Submitted::new(Vec::new(), vec![resources])
+                    .accepted(),
+            }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .find_map(|resources| resources.direct_role.as_ref().map(|role| role.role())),
+            Some(crate::kms::render::resources::DirectRole::Current)
+        );
+        (commit_key, key)
+    }
+
+    fn c0_conv_cfb_service_available(backend: &mut super::KmsBackend) {
+        let current = backend.commit_consumer.take_current();
+        backend.commit_consumer.rejected_resources.extend(current);
+        c0_conv_cfb_service_rejected(backend);
+    }
+
+    fn c0_conv_cfb_service_rejected(backend: &mut super::KmsBackend) {
+        let mut service = backend.resource_service.take().expect("resource service");
+        backend
+            .commit_consumer
+            .on_available(&[], &mut service)
+            .expect("resource availability");
+        backend.resource_service = Some(service);
+        backend.service_direct_framebuffer_edges(std::time::Instant::now(), false);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_dispatch_carries_the_framebuffer_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let (commit_key, key) =
+            c0_conv_cfb_install_current_real_candidate(&mut fixture.backend, 80, 80_000);
+        let current = fixture
+            .backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .find(|resources| {
+                resources.direct_role.as_ref().is_some_and(|role| {
+                    role.role() == crate::kms::render::resources::DirectRole::Current
+                })
+            })
+            .expect("current direct resource");
+        assert_eq!(current.commit_id, Some(commit_key));
+        assert_eq!(current.allocations.len(), 1);
+        assert_eq!(current.allocations[0].key(), key);
+        assert_eq!(
+            current.allocations[0].kind(),
+            crate::kms::render::resources::UseKind::DirectFramebuffer,
+            "the lease remains a direct-framebuffer lease"
+        );
+        c0_conv_cfb_service_available(&mut fixture.backend);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_refusal_returns_the_lease_once_vulkan() {
+        use crate::kms::owner::{device::DispatchError, record::RefusalCause};
+
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let device = fixture
+            .backend
+            .platform
+            .primary_device()
+            .expect("device")
+            .key;
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 81)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .admission_offer_direct(
+                    device,
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("production direct offer")
+        );
+        let snapshot = fixture
+            .backend
+            .admission_snapshot(device, false)
+            .expect("owner snapshot");
+        let decision = fixture.backend.admission_conductors[&device]
+            .admission
+            .decide(&snapshot)
+            .expect("direct decision");
+        let token = fixture
+            .backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("conductor")
+            .admission
+            .lock(decision.clone(), &snapshot)
+            .expect("admission lock");
+        let prepared_dispatch = fixture
+            .backend
+            .managed_prepare_direct_dispatch()
+            .expect("managed dispatch preparation")
+            .expect("direct dispatch");
+        let commit = crate::kms::owner::identity::CommitId::for_tests(81_000);
+        let resources = prepared_dispatch.resources.with_commit_id(
+            crate::kms::render::resources::CommitKey::new(device, commit),
+        );
+        let key = resources.allocations[0].key();
+        let outcome = fixture.backend.admission_dispose_refusal_for_tests(
+            device,
+            token,
+            decision.admitted,
+            DispatchError::Refused {
+                cause: RefusalCause::Reaped,
+                events: vec![
+                    crate::kms::owner::device::OwnerEvent::ResourcesReleased {
+                        commit,
+                        resources: vec![resources],
+                    },
+                    crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                        commit,
+                        resources: Vec::new(),
+                    },
+                ],
+            },
+        );
+        assert!(matches!(
+            outcome,
+            crate::kms::render::admission::AdmissionOutcome::SendRefused(RefusalCause::Reaped)
+        ));
+        assert!(fixture.backend.scanout_m2.queued_successor.is_none());
+        assert_eq!(
+            fixture
+                .backend
+                .commit_consumer
+                .rejected_resources
+                .iter()
+                .filter(|resources| resources.allocations.iter().any(|lease| lease.key() == key))
+                .count(),
+            1,
+            "the refusal must return the framebuffer lease exactly once"
+        );
+        let service = fixture.backend.resource_service.as_ref().expect("service");
+        assert!(service.contains(&key));
+        c0_conv_cfb_service_available(&mut fixture.backend);
+        assert!(
+            !fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_completion_orders_keep_one_owner_vulkan() {
+        for hardware_first in [true, false] {
+            let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+            let (_old_commit, old_key) = c0_conv_cfb_install_current_real_candidate(
+                &mut fixture.backend,
+                if hardware_first { 82 } else { 83 },
+                if hardware_first { 82_000 } else { 83_000 },
+            );
+            let old = fixture.backend.commit_consumer.take_current();
+            let (new_commit, new_resources) = c0_conv_cfb_dispatch_real_candidate(
+                &mut fixture.backend,
+                if hardware_first { 84 } else { 85 },
+                if hardware_first { 84_000 } else { 85_000 },
+            );
+            if hardware_first {
+                assert!(fixture.backend.route_owner_event_batch(
+                    new_commit.device,
+                    vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                        commit: new_commit.commit,
+                    }],
+                    std::time::Instant::now(),
+                ));
+            }
+            assert!(fixture.backend.route_owner_event_batch(
+                new_commit.device,
+                vec![crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                    commit: new_commit.commit,
+                    resources: crate::kms::owner::ledger::Submitted::new(old, vec![new_resources])
+                        .accepted(),
+                }],
+                std::time::Instant::now(),
+            ));
+            if !hardware_first {
+                assert!(fixture.backend.route_owner_event_batch(
+                    new_commit.device,
+                    vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                        commit: new_commit.commit,
+                    }],
+                    std::time::Instant::now(),
+                ));
+            }
+            assert!(
+                fixture
+                    .backend
+                    .commit_consumer
+                    .releasing_resources
+                    .iter()
+                    .any(|resources| resources
+                        .allocations
+                        .iter()
+                        .any(|lease| lease.key() == old_key))
+            );
+            c0_conv_cfb_service_rejected(&mut fixture.backend);
+            assert!(
+                !fixture
+                    .backend
+                    .resource_service
+                    .as_ref()
+                    .expect("service")
+                    .contains(&old_key)
+            );
+            assert!(
+                fixture
+                    .backend
+                    .commit_consumer
+                    .current_resources
+                    .iter()
+                    .any(|resources| resources.commit_id == Some(new_commit))
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_rejection_returns_or_releases_the_lease_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let (_old_commit, old_key) =
+            c0_conv_cfb_install_current_real_candidate(&mut fixture.backend, 86, 86_000);
+        let old = fixture.backend.commit_consumer.take_current();
+        let (new_commit, new_resources) =
+            c0_conv_cfb_dispatch_real_candidate(&mut fixture.backend, 87, 87_000);
+        let new_key = new_resources.allocations[0].key();
+        assert!(fixture.backend.route_owner_event_batch(
+            new_commit.device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::ResourcesReleased {
+                    commit: new_commit.commit,
+                    resources: vec![new_resources],
+                },
+                crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                    commit: new_commit.commit,
+                    resources: old,
+                },
+            ],
+            std::time::Instant::now(),
+        ));
+        assert!(
+            fixture
+                .backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|resources| resources
+                    .allocations
+                    .iter()
+                    .any(|lease| lease.key() == old_key))
+        );
+        c0_conv_cfb_service_rejected(&mut fixture.backend);
+        assert!(
+            !fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&new_key)
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&old_key)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_unknown_retains_the_lease_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let (commit_key, key) =
+            c0_conv_cfb_install_current_real_candidate(&mut fixture.backend, 88, 88_000);
+        assert!(fixture.backend.route_owner_event_batch(
+            commit_key.device,
+            vec![crate::kms::owner::device::OwnerEvent::Quarantined {
+                commit: commit_key.commit,
+            }],
+            std::time::Instant::now(),
+        ));
+        assert!(
+            fixture
+                .backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|resources| resources.allocations.iter().any(|lease| lease.key() == key))
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .is_frozen(&key)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_undo_and_terminalize_return_once_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 89)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("managed preparation")
+        );
+        fixture.backend.managed_tag_queued_direct_successor(89);
+        let commit_key = crate::kms::render::resources::CommitKey::new(
+            fixture
+                .backend
+                .platform
+                .primary_device()
+                .expect("device")
+                .key,
+            crate::kms::owner::identity::CommitId::for_tests(89_000),
+        );
+        let prepared_dispatch = fixture
+            .backend
+            .managed_prepare_direct_dispatch()
+            .expect("managed dispatch preparation")
+            .expect("direct dispatch");
+        let key = prepared_dispatch.resources.allocations[0].key();
+        fixture
+            .backend
+            .managed_undo_direct_dispatch(prepared_dispatch)
+            .expect("dispatch undo");
+        assert_eq!(
+            fixture
+                .backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .and_then(|frame| frame.framebuffer_lease.as_ref())
+                .map(crate::kms::render::resources::AllocationLease::key),
+            Some(key)
+        );
+        assert!(
+            fixture
+                .backend
+                .managed_terminalize_queued_direct_successor(None)
+        );
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        let calls = fixture.cleanup_calls.borrow().len();
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert_eq!(fixture.cleanup_calls.borrow().len(), calls);
+        let _ = commit_key;
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_unflip_moves_the_lease_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let (_commit_key, key) =
+            c0_conv_cfb_install_current_real_candidate(&mut fixture.backend, 90, 90_000);
+        fixture
+            .backend
+            .managed_handle_direct_unflip("c0_conv_cfb_unflip")
+            .expect("unflip seam");
+        let resource = fixture
+            .backend
+            .commit_consumer
+            .releasing_resources
+            .last()
+            .expect("exit retirement resource");
+        assert_eq!(
+            resource.direct_role.as_ref().expect("exit role").role(),
+            crate::kms::render::resources::DirectRole::ExitRetirement
+        );
+        assert_eq!(resource.allocations[0].key(), key);
+        assert!(
+            !fixture
+                .backend
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_rejected_unflip_restores_current_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let (_commit_key, key) =
+            c0_conv_cfb_install_current_real_candidate(&mut fixture.backend, 91, 91_000);
+        fixture
+            .backend
+            .managed_handle_direct_unflip("c0_conv_cfb_rejected_unflip")
+            .expect("unflip seam");
+        let exit = fixture
+            .backend
+            .commit_consumer
+            .releasing_resources
+            .pop()
+            .expect("exit retirement resource");
+        let commit = exit.commit_id.expect("direct commit id").commit;
+        assert!(
+            fixture.backend.route_owner_event_batch(
+                fixture
+                    .backend
+                    .platform
+                    .primary_device()
+                    .expect("device")
+                    .key,
+                vec![
+                    crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                        commit,
+                        resources: vec![exit],
+                    }
+                ],
+                std::time::Instant::now(),
+            )
+        );
+        let current = fixture
+            .backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .find(|resources| resources.allocations.iter().any(|lease| lease.key() == key))
+            .expect("restored current resource");
+        assert_eq!(
+            current.direct_role.as_ref().expect("current role").role(),
+            crate::kms::render::resources::DirectRole::Current
+        );
+        assert!(
+            fixture
+                .backend
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement)
+        );
+        c0_conv_cfb_service_available(&mut fixture.backend);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_cleanup_exactly_once_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 92)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("managed preparation")
+        );
+        let key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("direct lease")
+            .key();
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert!(
+            !fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&key)
+        );
+        let calls = fixture.cleanup_calls.borrow().len();
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert_eq!(fixture.cleanup_calls.borrow().len(), calls);
+        assert_eq!(calls, 2, "registry owns the one RMFB/GEM cleanup");
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_late_cleanup_failure_keeps_the_final_role() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let (_commit_key, old_key) =
+            c0_conv_cfb_install_current_real_candidate(&mut fixture.backend, 93, 93_000);
+        fixture
+            .backend
+            .managed_handle_direct_unflip("c0_conv_cfb_late_cleanup")
+            .expect("unflip seam");
+        let new = owner_direct_candidate_with_real_import(&mut fixture.backend, 94)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(new.source_id, new.candidate, new.event,)
+                .expect("new preparing candidate")
+        );
+        let new_key = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("new candidate lease")
+            .key();
+        fixture.cleanup_io.fail_fb.set(true);
+        let mut service = fixture.backend.resource_service.take().expect("service");
+        fixture
+            .backend
+            .commit_consumer
+            .on_available(&[], &mut service)
+            .expect("release old role");
+        fixture.backend.resource_service = Some(service);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
+        assert_eq!(
+            fixture
+                .backend
+                .drm_cleanup_registry
+                .as_ref()
+                .expect("registry")
+                .pending_cleanup_roles(),
+            vec![crate::kms::render::resources::DirectRole::ExitRetirement]
+        );
+        assert!(
+            !fixture
+                .backend
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement)
+        );
+        assert!(
+            fixture
+                .backend
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .and_then(|frame| frame.framebuffer_lease.as_ref())
+                .is_some_and(|lease| lease.key() == new_key)
+        );
+        assert!(
+            !fixture
+                .backend
+                .resource_service
+                .as_ref()
+                .expect("service")
+                .contains(&old_key)
+        );
+
+        fixture.cleanup_io.fail_fb.set(false);
+        fixture
+            .backend
+            .drm_cleanup_registry
+            .as_mut()
+            .expect("registry")
+            .retry_pending_cleanup()
+            .expect("retry final-role cleanup");
+        assert!(
+            fixture
+                .backend
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement)
+        );
+        fixture
+            .backend
+            .managed_terminalize_queued_direct_successor(None);
+        fixture
+            .backend
+            .service_direct_framebuffer_edges(std::time::Instant::now(), false);
     }
 }

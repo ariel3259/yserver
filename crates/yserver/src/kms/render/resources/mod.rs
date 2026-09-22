@@ -622,6 +622,15 @@ impl ResourceService {
         }
     }
 
+    pub(crate) fn direct_framebuffer_is_last_lease(&self, lease: &AllocationLease) -> bool {
+        if lease.kind() != UseKind::DirectFramebuffer {
+            return false;
+        }
+        self.entries
+            .get(&lease.key())
+            .is_some_and(|entry| entry.live_use_count() == 1)
+    }
+
     pub(crate) fn managed_allocation_token(
         &self,
         lease: &AllocationLease,
@@ -690,6 +699,16 @@ impl ResourceService {
         key: AllocationKey,
         registry: &mut DrmCleanupRegistry,
     ) -> bool {
+        let mut charge = None;
+        self.cleanup_direct_framebuffer_with_charge(key, registry, &mut charge)
+    }
+
+    pub(crate) fn cleanup_direct_framebuffer_with_charge(
+        &mut self,
+        key: AllocationKey,
+        registry: &mut DrmCleanupRegistry,
+        charge: &mut Option<CleanupCharge>,
+    ) -> bool {
         let Some(entry) = self.entries.get(&key).cloned() else {
             return false;
         };
@@ -702,26 +721,40 @@ impl ResourceService {
             return false;
         }
 
-        let discharge_result = {
-            let mut payload = entry.payload.borrow_mut();
-            let Some(payload) = payload.as_mut() else {
-                return false;
-            };
-            if !matches!(payload, AllocationPayload::DirectFramebuffer(_)) {
-                return false;
-            }
-            payload.discharge_file_owned(registry)
+        let mut payload = entry.payload.borrow_mut().take();
+        let Some(mut payload) = payload.take() else {
+            return false;
         };
-        if discharge_result.is_err() {
-            self.dirty_entries.borrow_mut().insert(key);
+        if !matches!(payload, AllocationPayload::DirectFramebuffer(_)) {
+            *entry.payload.borrow_mut() = Some(payload);
+            return false;
+        }
+        if payload.discharge_file_owned(registry).is_err() {
+            if let Some(role_charge) = charge.take() {
+                registry.unregister_payload_alias(key);
+                let removed = self.entries.remove(&key);
+                if removed.is_some() {
+                    registry.retain_pending_cleanup(payload, role_charge);
+                    return false;
+                }
+                *entry.payload.borrow_mut() = Some(payload);
+                *charge = Some(role_charge);
+            } else {
+                *entry.payload.borrow_mut() = Some(payload);
+                self.dirty_entries.borrow_mut().insert(key);
+            }
             return false;
         }
 
         registry.unregister_payload_alias(key);
         if let Some(removed) = self.entries.remove(&key) {
             removed.take_payload();
+            if let Some(role_charge) = charge.take() {
+                role_charge.release();
+            }
             true
         } else {
+            *entry.payload.borrow_mut() = Some(payload);
             false
         }
     }

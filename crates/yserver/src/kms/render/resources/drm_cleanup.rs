@@ -98,7 +98,7 @@ impl CleanupCharge {
         }
     }
 
-    fn release(self) {
+    pub(crate) fn release(self) {
         match self {
             Self::Preparing(slot) | Self::FinalRole(slot) => slot.release_after_cleanup(),
         }
