@@ -249,6 +249,21 @@ receipt's gate is checked.
 
 **Named tests:** `c0_conv_cp_destination_retires_under_the_ledger_vulkan`, `c0_conv_cp_source_released_by_the_read_obligation_vulkan`, `c0_conv_cp_retained_destination_registers_nothing_vulkan`.
 
+**Task 6 reachability report / F8 (2026-09-22).** The Q32 state needed to
+discriminate an erroneous retained-destination registration — two live copied
+Owner generations for one member naming the same destination `AllocationKey` —
+is not reachable through the copied production entries. Selection transitions
+the destination to `Recording`, then the Owner route to `Owner`; a later
+selection accepts only `Free`, and the old generation reaches `Free` only after
+its owner-ledger retirement and resource-service release. Thus a second
+generation cannot share the allocation while the first generation is still in
+the ledger, which is exactly the interval in which
+`register_commit_dependencies` could distinguish retained from displaced.
+The named Vulkan test records this production exclusion (`bo_idx` differs)
+and does not claim to prove P3-3's retained branch. Q32 therefore has no
+reachable discriminator in this copied fixture; the existing commit-ledger
+tests remain the proof of the shared-key predicate.
+
 - [ ] Steps: tests; red; implement; checks; stop dirty and report.
 
 ---

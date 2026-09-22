@@ -1411,6 +1411,19 @@ impl ResourceService {
         Ok(f(source))
     }
 
+    #[cfg(test)]
+    pub(crate) fn copied_source_waits_for_tests(
+        &mut self,
+        key: AllocationKey,
+    ) -> Option<(bool, bool)> {
+        let lease = self.reserve(key, UseKind::Read).ok()?;
+        let waits = self
+            .with_copied_source(&lease, |source| source.waits_for_tests())
+            .ok();
+        drop(lease);
+        waits
+    }
+
     /// Borrow the copied source and sink destination payloads held by the
     /// two leases of one prepared sink copy.  A single method is required so
     /// both `RefCell` payload borrows coexist while the copy command is

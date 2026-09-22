@@ -52645,6 +52645,370 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_source_released_by_the_read_obligation_vulkan() {
+        let (mut pending_fixture, pending_bo_idx, pending_source_key, _) =
+            copied_owner_frame_after_a();
+
+        // A's completion is only the handoff into B. The source read debt and
+        // B's temporary sink wait must both still be live after that wake.
+        pending_fixture.backend.platform.wait_idle_bounded();
+        pending_fixture
+            .backend
+            .drain_scanout_render_completions_for_tests();
+        let (_, pending_source_obligation) = pending_fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, pending_bo_idx)
+            .expect("production B preparation must retain the source receipt")
+            .1;
+        assert!(
+            pending_fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&pending_source_key, pending_source_obligation),
+            "B's read obligation must hold the source after A retires"
+        );
+        let pending_waits_before_b = pending_fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .copied_source_waits_for_tests(pending_source_key)
+            .expect("managed copied source");
+        assert!(
+            pending_waits_before_b.0,
+            "the sink wait remains live while B's read obligation is pending"
+        );
+
+        // The copy wake can arrive before the resource-service ticket has
+        // retired. The release site is reached in that state, but CP-10 must
+        // leave the source synchronization payload untouched.
+        pending_fixture.backend.platform.wait_idle_bounded();
+        pending_fixture
+            .backend
+            .drain_scanout_render_completions_for_tests();
+        assert!(
+            pending_fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&pending_source_key, pending_source_obligation),
+            "B's source read obligation must still be pending when its wake is handled"
+        );
+        let waits_during_pending_b = pending_fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .copied_source_waits_for_tests(pending_source_key)
+            .expect("managed copied source");
+        assert_eq!(
+            waits_during_pending_b, pending_waits_before_b,
+            "a readable copy wake must not release source waits before B's read obligation retires"
+        );
+        drop(pending_fixture);
+
+        // Repeat the production route so the original proof can deliver B's
+        // existing wake after its real resource-service retirement.
+        let (mut fixture, bo_idx, source_key, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, source_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production B preparation must retain the source receipt")
+            .1;
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&source_key, source_obligation),
+            "B's read obligation must hold the source after A retires"
+        );
+        let waits_before_b = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .copied_source_waits_for_tests(source_key)
+            .expect("managed copied source");
+        assert!(
+            waits_before_b.0,
+            "the sink wait remains live while B's read obligation is pending"
+        );
+
+        // Retire B through the resource service, then deliver its existing
+        // sync-file wake. No Owner commit or flip is involved in this proof.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the real B fence must retire");
+        assert!(
+            !fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&source_key, source_obligation),
+            "the source read obligation must retire with B's batch"
+        );
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let waits_after_b = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .copied_source_waits_for_tests(source_key)
+            .expect("managed copied source");
+        assert!(
+            !waits_after_b.0 && !waits_after_b.1,
+            "B's retired read obligation, not an Owner ack or flip, releases source waits"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_destination_retires_under_the_ledger_vulkan() {
+        let (mut fixture, first_bo, device, first_commit) = copied_owner_commit_for_tests();
+        let first_key = match fixture.backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => pool.destinations.bos[first_bo]
+                .managed_key()
+                .expect("first destination is managed"),
+            _ => panic!("copied fixture must install a copied pool"),
+        };
+
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "the copied destination remains owner-held after B's ack"
+        );
+        fixture.backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: first_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: first_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+        let first_completion = fixture.backend.complete_owner_for_tests(0);
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            first_completion,
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Current),
+            "the first copied destination must become the ledger's Current resource"
+        );
+
+        // A second real copied generation displaces the first destination.
+        reinstall_owner_executor_for_cir_test(&mut fixture.backend, device);
+        fixture.backend.scene.mark_scene_structure_dirty();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, _, _) = fixture
+            .backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("second copied generation");
+        assert_ne!(first_bo, second_bo);
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("second B fence must retire");
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let second_commit = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("second copied generation must reach the owner")
+            .commit_id();
+
+        // Before the real completion, the old destination is still Current,
+        // still physically Owner, and its KmsRelease is outstanding.
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&first_key),
+            "the displacing owner commit must register KmsRelease for the old destination"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .kms_commit_for_tests(first_key)
+                .is_some(),
+            "the old destination's pending debt must specifically include KmsRelease"
+        );
+        let held_gpu = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .register(
+                first_key,
+                crate::kms::render::resources::ObligationKind::Gpu,
+            )
+            .expect("test GPU gate");
+        fixture.backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        fixture.backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Current),
+            "HardwareComplete is not the destination retirement gate"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "the destination pool slot must not release at the ack"
+        );
+
+        let second_completion = fixture.backend.complete_owner_for_tests(0);
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            second_completion,
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Releasing),
+            "CompletionRetired hands the old destination to retiring state"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&first_key),
+            "the independent GPU gate still holds the old destination"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .kms_commit_for_tests(first_key)
+                .is_none(),
+            "CompletionRetired discharges KmsRelease even while the GPU gate remains"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "the destination still waits for the scene release pass"
+        );
+
+        fixture.backend.scene.wake_for_damage();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Releasing),
+            "the GPU gate must still hold the old destination after CompletionRetired"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "the copied destination pool slot must wait for the GPU gate"
+        );
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .apply_validated_proof_for_tests(first_key, held_gpu)
+            .expect("retire the independent GPU gate");
+        fixture.backend.scene.wake_for_damage();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            None,
+            "the old destination leaves the owner ledger only after all gates"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Free,
+            "the copied destination pool slot releases after ledger retirement"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_retained_destination_registers_nothing_vulkan() {
+        // F8 witness for Q32/CP-11: production copied selection only enters a
+        // new generation through a destination in Free phase, while the old
+        // generation keeps that same destination in Owner phase until its
+        // ledger retirement. Therefore this entry point cannot create two
+        // live generations that share one destination AllocationKey.
+        let (mut fixture, first_bo, device, first_commit) = copied_owner_commit_for_tests();
+        fixture.backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: first_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: first_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+        let completion = fixture.backend.complete_owner_for_tests(0);
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            completion,
+            std::time::Instant::now(),
+        ));
+        reinstall_owner_executor_for_cir_test(&mut fixture.backend, device);
+        fixture.backend.scene.mark_scene_structure_dirty();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, _, _) = fixture
+            .backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("second copied generation");
+        assert_ne!(
+            first_bo, second_bo,
+            "the production selector excludes the current destination, so CP-11's retained state is unreachable"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cp_displaced_during_copy_offers_nothing_vulkan() {
         let (mut fixture, first_bo, _, _) = copied_owner_frame_after_a();
         fixture.backend.platform.wait_idle_bounded();

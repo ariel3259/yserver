@@ -4106,10 +4106,10 @@ fn handle_scanout_render_completion_inner(
             };
             let state = &mut inner.outputs[output_idx];
             let prepared = state.owner_buffers.remove(owner_buffer_index);
-            let Some((destination_key, destination_obligation)) = prepared
+            let Some(receipt) = prepared
                 .pending_ack()
                 .and_then(|ack| ack.copied_receipt.as_ref())
-                .map(|receipt| receipt.destination)
+                .map(|receipt| (receipt.destination, receipt.source))
             else {
                 log::error!(
                     "render Owner copied scanout: generation {} had no retirement receipt",
@@ -4120,6 +4120,7 @@ fn handle_scanout_render_completion_inner(
                 drop(fd);
                 return false;
             };
+            let ((destination_key, destination_obligation), source_receipt) = receipt;
             let generation = prepared.identity().generation;
 
             // The sync_file is only the wake.  Service the registered sink
@@ -4128,6 +4129,23 @@ fn handle_scanout_render_completion_inner(
             if let Err(error) = service.service_completions(std::time::Instant::now()) {
                 log::warn!(
                     "render Owner copied scanout: copy completion service failed for generation {generation}: {error:?}"
+                );
+            }
+
+            // B's read obligation is the source-release proof. It is
+            // independent of the destination promotion check below and also
+            // applies when this generation was displaced while B was in
+            // flight.
+            if let Some(OutputScanout::Copied(pool)) = platform
+                .scanout_pools
+                .get_mut(output_idx)
+                .and_then(Option::as_mut)
+            {
+                let _ = crate::kms::render::copied_owner::release_source_after_read_retirement(
+                    pool,
+                    service,
+                    bo_idx,
+                    source_receipt,
                 );
             }
 
@@ -4808,7 +4826,19 @@ fn retire_owner_current(
             && service.is_releasable(&prepared.identity().managed_key);
         if ready {
             let bo_idx = prepared.identity().bo_idx;
-            if platform.leave_owner_buffer(output_idx, bo_idx) {
+            let copied = matches!(
+                platform
+                    .scanout_pools
+                    .get(output_idx)
+                    .and_then(Option::as_ref),
+                Some(OutputScanout::Copied(_))
+            );
+            let released = if copied {
+                platform.leave_copied_owner_buffer_after_retirement(output_idx, bo_idx)
+            } else {
+                platform.leave_owner_buffer(output_idx, bo_idx)
+            };
+            if released {
                 if prepared.into_free().is_err() {
                     log::error!("render scene: owner releasing buffer {bo_idx} was not freeable");
                     platform.renderer_failed = true;

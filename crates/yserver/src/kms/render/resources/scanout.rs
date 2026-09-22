@@ -678,6 +678,23 @@ impl CopiedSourceAllocation {
         }
     }
 
+    pub(crate) fn release_completed_source(&mut self) {
+        self.release_sink_wait_semaphore();
+        if let Some(semaphore) = self.renderer_wait_semaphore.take()
+            && let Some(render_vk) = &self.render_vk
+        {
+            unsafe { render_vk.device.destroy_semaphore(semaphore, None) };
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waits_for_tests(&self) -> (bool, bool) {
+        (
+            self.sink_wait_semaphore.is_some(),
+            self.renderer_wait_semaphore.is_some(),
+        )
+    }
+
     /// Restore the managed source's ownership state after the sink queue has
     /// been proven idle for a failed copy.  The copied pool can repair its
     /// destination husk, but the source's synchronization state lives in this

@@ -3540,6 +3540,46 @@ impl PlatformBackend {
         bo.state.transition_to_free_after_owner()
     }
 
+    /// Release a copied destination after the Owner ledger has retired the
+    /// displaced commit and the resource service has reported the allocation
+    /// free. The copied ownership ledger observes this same boundary so the
+    /// next B submission can acquire the image from FOREIGN. The shared path
+    /// intentionally remains in `leave_owner_buffer`.
+    pub(crate) fn leave_copied_owner_buffer_after_retirement(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> bool {
+        let Some(scanout) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+        else {
+            return false;
+        };
+        let OutputScanout::Copied(pool) = scanout else {
+            return false;
+        };
+        if pool
+            .destinations
+            .bos
+            .get(bo_idx)
+            .is_none_or(|bo| bo.state.phase != BoPhase::Owner)
+        {
+            return false;
+        }
+        if let Err(error) = pool.note_kms_retired(bo_idx) {
+            log::error!(
+                "render copied Owner: destination {bo_idx} could not record KMS retirement: {error}"
+            );
+            self.renderer_failed = true;
+            return false;
+        }
+        pool.destinations.bos[bo_idx]
+            .state
+            .transition_to_free_after_owner()
+    }
+
     pub(crate) fn owner_bo_phase(
         &self,
         output_idx: usize,

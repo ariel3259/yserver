@@ -37,6 +37,32 @@ pub(crate) struct CopiedRetirementReceipt {
     pub(crate) source: (AllocationKey, ObligationId),
 }
 
+/// Release the source-side synchronization payload once B's exact read
+/// obligation has retired. The destination receipt is deliberately not an
+/// input here: CP-10 is a source/read rule, not a consequence of destination
+/// readiness or of the Owner event stream.
+pub(crate) fn release_source_after_read_retirement(
+    pool: &mut CopiedScanoutPool,
+    service: &mut ResourceService,
+    bo_idx: usize,
+    source: (AllocationKey, ObligationId),
+) -> bool {
+    if service.has_pending_obligation(&source.0, source.1) || service.is_frozen(&source.0) {
+        return false;
+    }
+    let Ok(lease) = service.reserve(source.0, super::resources::UseKind::Read) else {
+        return false;
+    };
+    let released = service
+        .with_copied_source(&lease, |source| source.release_completed_source())
+        .is_ok();
+    drop(lease);
+    if released {
+        pool.release_completed_source(bo_idx);
+    }
+    released
+}
+
 /// Dispose of a sink submission after its dispatch answer is known.  The
 /// service owns the cancel/freeze decision; this helper only performs the
 /// sink's established quiescence and repairs the managed source payload whose
