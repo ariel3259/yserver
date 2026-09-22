@@ -293,6 +293,28 @@ tests remain the proof of the shared-key predicate.
 - Its own mutations, on the same hardware under the same filter: misroute the copy off the sink's device (Q33), and scan out the source instead of the destination (Q34). CP-8's mutation tests a different criterion and does not substitute.
 - If the forced-renderer configuration is not reachable on this machine, that is an F8 stop with the evidence.
 
+**The submission-latency measurement (user, 2026-09-22).** The conversion
+moves the copy's wait from the kernel to userspace: the Legacy copied route
+hands the copy fence to the kernel as `IN_FENCE_FD` and queues the flip
+immediately, while the Owner route waits for that fence, services, offers and
+only then submits the commit. The flip therefore leaves at least one event-loop
+hop later. Nothing in this plan measured that, so this run does, on the one
+machine where both routes exist:
+
+- **submission delay** — from the copy fence observed signalled to the commit
+  submitted to the kernel, in microseconds, per frame;
+- **missed-vblank fraction** — over N frames, how many land on a later vblank
+  than the one they would have made, read from the completion MSCs.
+
+Both are measured for the copied route under `Legacy` and under `Owner`, same
+workload, same session. The criterion is fixed **before** the numbers are seen:
+if the submission delay is well under one vblank period and the missed-vblank
+fraction is indistinguishable between the routes, the trade is defended in the
+spec and the PR text. If either says otherwise, it is recorded as a measured
+limitation of C.0 and becomes an evidence-backed requirement for C.1 — namely
+that the producer-fence transfer C.0 §14 already projects must count the copied
+route among its consumers, which that section does not promise today.
+
 **The implementer writes the test; the coordinator runs it from tty2 with the user's approval**, as in Ciii Task 6. Nothing in this task may run a modeset, take DRM master or touch `_drm` filters inside the codex run.
 
 **Named test:** `c0_hw_cp_copied_route_cross_device_drm`.

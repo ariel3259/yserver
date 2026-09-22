@@ -53266,6 +53266,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_no_legacy_write_at_the_copied_site_vulkan() {
+        // The recorder is entered by submit_flip_with_fences before its
+        // transport-gate permit check. This observes entry into the legacy
+        // primary sink, not the gate's refusal.
+        crate::drm::clear_legacy_sink_entries_for_tests();
+        let (mut fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+
+        // A's production completion prepares and submits B. No legacy sink
+        // is involved in either Owner stage.
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            crate::drm::legacy_sink_entries_for_tests().is_empty(),
+            "stage A and the copied Owner B preparation must not enter the legacy sink"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .copied_receipt_for_tests(0, bo_idx)
+                .is_some(),
+            "the copied Owner producer must reach its production B preparation"
+        );
+
+        // B's real sink fence retires through the service, then its existing
+        // wake promotes the generation through the Owner conductor. The sink
+        // observation is checked before inspecting the resulting commit so a
+        // forced legacy branch fails specifically on the write-site evidence.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the copied destination obligation must retire");
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            crate::drm::legacy_sink_entries_for_tests().is_empty(),
+            "an Owner copied submit must not enter submit_copied_scanout's legacy primary sink"
+        );
+        assert!(
+            fixture
+                .backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .is_some(),
+            "the copied Owner offer must reach the Owner commit path"
+        );
+    }
+
     fn copied_source_vk_for_sink(
         sink_vk: &crate::kms::vk::device::VkContext,
     ) -> Result<std::sync::Arc<crate::kms::vk::device::VkContext>, std::io::Error> {
