@@ -52087,6 +52087,264 @@ mod tests {
         owner_live_fixture_with_output_count(1, false)
     }
 
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_copied_fixture_builds_a_managed_output_vulkan() {
+        let OwnerLiveFixture { mut backend, .. } = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        let scanout = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied fixture output has a scanout pool");
+        let crate::kms::vk::scanout::OutputScanout::Copied(pool) = scanout else {
+            panic!("copied fixture must install OutputScanout::Copied");
+        };
+        assert_eq!(pool.destinations.bos.len(), pool.sources.len());
+        assert!(!pool.destinations.bos.is_empty());
+        assert!(
+            pool.destinations
+                .bos
+                .iter()
+                .all(|bo| bo.managed_key().is_some()),
+            "every copied destination must be adopted"
+        );
+        assert!(
+            pool.sources
+                .iter()
+                .all(|source| source.managed_key().is_some()),
+            "every copied source must be adopted"
+        );
+        assert!(backend.platform.output_uses_owner_route(0));
+
+        // Exercise the same site that the Owner gate's check uses after one
+        // source half loses its adoption. The live fixture proves the route
+        // with both halves managed; this negative transition proves that the
+        // source half is not merely diagnostic.
+        let source_lease = {
+            let scanout = backend.platform.scanout_pools[0]
+                .as_mut()
+                .expect("copied fixture output has a scanout pool");
+            let crate::kms::vk::scanout::OutputScanout::Copied(pool) = scanout else {
+                panic!("copied fixture must install OutputScanout::Copied");
+            };
+            pool.sources[0]
+                .take_managed()
+                .expect("copied fixture source is adopted before the negative check")
+        };
+        drop(source_lease);
+        let device = backend.platform.outputs[0].key.device_key;
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("copied fixture owner")
+            .incarnation();
+        let error = backend
+            .platform
+            .try_install_transport_gate(crate::kms::render::resources::tests::owner_gate_for_tests(
+                device,
+                incarnation,
+            ))
+            .expect_err("an unmanaged copied source must refuse Owner eligibility");
+        assert!(matches!(
+            error,
+            crate::kms::render::platform::OwnerEligibilityError::UnmanagedScanoutPool {
+                output_idx: 0
+            }
+        ));
+        assert!(!backend.platform.output_uses_owner_route(0));
+    }
+
+    #[test]
+    fn c0_conv_cp_legacy_copied_route_unchanged() {
+        let platform = PlatformBackend::for_tests();
+        assert!(!platform.output_uses_owner_route(0));
+        assert!(platform.allows_legacy(
+            &platform.outputs[0].key.device_key,
+            crate::kms::render::resources::WriterClass::Primary
+        ));
+    }
+
+    fn copied_source_vk_for_sink(
+        sink_vk: &crate::kms::vk::device::VkContext,
+    ) -> Result<std::sync::Arc<crate::kms::vk::device::VkContext>, std::io::Error> {
+        static SHARED_COPIED_SOURCE_VK: std::sync::OnceLock<
+            Result<std::sync::Arc<crate::kms::vk::device::VkContext>, String>,
+        > = std::sync::OnceLock::new();
+        let result = SHARED_COPIED_SOURCE_VK.get_or_init(|| {
+            let sink_selector = sink_vk.device_selector();
+            let sink_primary = sink_vk
+                .selected_drm_identity
+                .and_then(|identity| identity.primary)
+                .ok_or_else(|| "sink Vulkan context has no primary DRM identity".to_owned())?;
+            let source = sink_vk
+                .drm_physical_devices
+                .iter()
+                .find(|device| device.selector != sink_selector)
+                .ok_or_else(|| {
+                    "no distinct Vulkan renderer is available for copied fixture".to_owned()
+                })?;
+            let render = source
+                .identity
+                .render
+                .ok_or_else(|| "copied fixture source has no render-node identity".to_owned())?;
+            crate::kms::vk::device::VkContext::new_for_render_device(Some(render), sink_primary)
+                .map_err(|error| format!("copied fixture source Vulkan context: {error}"))
+        });
+        result
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .map_err(|error| std::io::Error::other(error.clone()))
+    }
+
+    fn copied_owner_live_fixture() -> Result<OwnerLiveFixture, std::io::Error> {
+        use std::sync::Arc;
+
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        let sink_vk =
+            backend.platform.vk.as_ref().cloned().ok_or_else(|| {
+                std::io::Error::other("copied fixture has no sink Vulkan context")
+            })?;
+        let sink_primary = sink_vk
+            .selected_drm_identity
+            .and_then(|identity| identity.primary)
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "copied fixture requires sink_vk.selected_drm_identity.primary",
+                )
+            })?;
+        let source_vk = copied_source_vk_for_sink(&sink_vk)?;
+
+        // `init_root_storage` records its initial fill in the engine's open
+        // frame and leaves the platform SubmitGroup holding a fence from the
+        // sink VkDevice. Close and drain that frame while the sink context is
+        // still installed; otherwise replacing `engine` would leave the
+        // sink-owned fence to be submitted on the source queue below.
+        backend
+            .engine
+            .shutdown(&mut backend.store, &mut backend.platform);
+
+        // Release the sink-backed scene graph while the platform still names
+        // the sink context. The copied fixture then installs a source-backed
+        // renderer below, so later copied-route tasks can actually render A's
+        // source rather than merely inspect an adopted pool.
+        backend.engine = crate::kms::render::engine::RenderEngine::stub();
+        backend.scene = crate::kms::render::scene::SceneCompositor::stub();
+        backend.store = crate::kms::render::store::DrawableStore::new();
+
+        // The shared live fixture deliberately uses the placeholder 0:0 key.
+        // A copied fixture has a real sink endpoint, so replace that key before
+        // constructing the copied route. This is identity bookkeeping only; no
+        // modeset or DRM master operation is performed here.
+        backend.platform.devices[0].key = sink_primary;
+        backend.platform.outputs[0].key.device_key = sink_primary;
+        let sink_id = backend
+            .platform
+            .render_devices
+            .iter()
+            .find(|device| device.selector == sink_vk.device_selector())
+            .map(|device| device.id)
+            .ok_or_else(|| {
+                std::io::Error::other("copied fixture sink is not in renderer inventory")
+            })?;
+        backend
+            .platform
+            .attach_test_vk_context(Arc::clone(&source_vk));
+        backend.platform.ops_command_pool = Some(
+            crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&source_vk)).map_err(|error| {
+                std::io::Error::other(format!("copied fixture ops pool: {error:?}"))
+            })?,
+        );
+        backend.platform.fence_pool = Some(crate::kms::render::platform::FencePool::new(
+            Arc::clone(&source_vk),
+        ));
+        let source_render_id = source_vk
+            .selected_drm_identity
+            .and_then(|identity| identity.render)
+            .map(crate::kms::scanout_route::RenderDeviceId::DrmRender)
+            .unwrap_or(crate::kms::scanout_route::RenderDeviceId::UnverifiedFallback);
+        let route = crate::kms::scanout_route::ScanoutRoute::new(
+            source_render_id,
+            sink_primary,
+            crate::kms::scanout_route::RenderKmsRelationship::Different,
+        );
+        backend.platform.outputs[0].scanout_route = route;
+        let destination_route = crate::kms::scanout_route::ScanoutRoute::new(
+            sink_id,
+            sink_primary,
+            crate::kms::scanout_route::RenderKmsRelationship::Same,
+        );
+        let output = &backend.platform.outputs[0];
+        let kms_device = backend
+            .platform
+            .device_for_key(sink_primary)
+            .ok_or_else(|| std::io::Error::other("copied fixture sink KMS device disappeared"))?;
+        let plans = crate::kms::vk::scanout::CopiedScanoutPool::exact_allocation_plans(
+            &source_vk,
+            &sink_vk,
+            &kms_device.device,
+            u32::from(output.width),
+            &output.output.scanout_modifiers,
+        );
+        if plans.is_empty() {
+            return Err(std::io::Error::other(
+                "copied fixture has no exact cross-device allocation plan",
+            ));
+        }
+        let mut failures = Vec::new();
+        let mut copied_pool = None;
+        for plan in plans {
+            match crate::kms::vk::scanout::CopiedScanoutPool::allocate_exact(
+                Arc::clone(&source_vk),
+                Arc::clone(&sink_vk),
+                Rc::clone(&kms_device.device),
+                route,
+                destination_route,
+                u32::from(output.width),
+                u32::from(output.height),
+                3,
+                &output.output.scanout_modifiers,
+                plan,
+            ) {
+                Ok(pool) => {
+                    copied_pool = Some(pool);
+                    break;
+                }
+                Err(error) => failures.push(format!("{}: {error}", plan.describe())),
+            }
+        }
+        let copied_pool = copied_pool.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "every copied fixture allocation plan failed: {}",
+                failures.join("; ")
+            ))
+        })?;
+        let bo_count = copied_pool.destinations.bos.len();
+        backend.platform.scanout_pools[0] =
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(copied_pool));
+        backend.platform.bo_generations[0] = vec![Default::default(); bo_count];
+        backend.engine = crate::kms::render::engine::RenderEngine::new(&backend.platform)
+            .map_err(|error| std::io::Error::other(format!("copied fixture engine: {error:?}")))?;
+        backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform)
+            .map_err(|error| std::io::Error::other(format!("copied fixture scene: {error:?}")))?;
+        backend.store = crate::kms::render::store::DrawableStore::new();
+        backend.init_root_storage();
+        // The source-backed root fill also opens a frame. Close it here so
+        // the fixture reaches tests with no open frame and Drop exercises the
+        // normal engine.shutdown/drain path without needing a bypass flag.
+        backend
+            .engine
+            .close_open_frame(
+                &mut backend.store,
+                &mut backend.platform,
+                crate::kms::render::frame_builder::CloseReason::Timeout,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!("close copied fixture init frame: {error:?}"))
+            })?;
+        backend.platform.reap_executors_on_drop_for_tests();
+        backend.resource_cleanup_on_drop_for_tests = true;
+        finish_owner_live_fixture(backend, false)
+    }
+
     fn owner_live_fixture_with_three_outputs() -> Result<OwnerLiveFixture, std::io::Error> {
         owner_live_fixture_with_output_count(3, false)
     }
@@ -52101,12 +52359,6 @@ mod tests {
         output_count: usize,
         extra_missing_output: bool,
     ) -> Result<OwnerLiveFixture, std::io::Error> {
-        use std::{cell::RefCell, rc::Rc};
-
-        use crate::kms::render::resources::{
-            DrmCleanupRegistry, ResourceService, tests::MockCleanupIo,
-        };
-
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
         backend.platform.reap_executors_on_drop_for_tests();
         backend.resource_cleanup_on_drop_for_tests = true;
@@ -52135,6 +52387,18 @@ mod tests {
                     std::io::Error::other(format!("rebuild multi-output scene: {error:?}"))
                 })?;
         }
+        finish_owner_live_fixture(backend, extra_missing_output)
+    }
+
+    fn finish_owner_live_fixture(
+        mut backend: super::KmsBackend,
+        extra_missing_output: bool,
+    ) -> Result<OwnerLiveFixture, std::io::Error> {
+        use crate::kms::render::resources::{
+            DrmCleanupRegistry, ResourceService, tests::MockCleanupIo,
+        };
+        use std::{cell::RefCell, rc::Rc};
+
         // This fixture uses the synthetic KMS object ids from the existing
         // scene fixture while its scanout allocations use a real DRM fd.
         // The owner executor is a stub and never issues this description to
@@ -52163,7 +52427,7 @@ mod tests {
         let device_key = backend
             .platform
             .primary_device()
-            .ok_or_else(|| std::io::Error::other("live-scene fixture has no primary device"))?
+            .ok_or_else(|| std::io::Error::other("live-scene fixture has no live KMS device"))?
             .key;
         backend.platform.devices[0].executor = Some(executor);
         backend.platform.devices[0].owner = Some(

@@ -75,16 +75,61 @@ pub(crate) use crate::kms::scanout_route::RenderDeviceId;
 pub(crate) enum OwnerEligibilityError {
     NoOutputs,
     MissingScanoutPool { output_idx: usize },
-    CopiedScanoutRoute { output_idx: usize },
     UnmanagedScanoutPool { output_idx: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerOutputKind {
     SharedManaged,
-    Copied,
+    CopiedManaged,
     Unmanaged,
     Missing,
+}
+
+fn classify_copied_managed_status(
+    destinations: impl IntoIterator<Item = bool>,
+    sources: impl IntoIterator<Item = bool>,
+) -> OwnerOutputKind {
+    let (destination_count, destinations_managed) = destinations
+        .into_iter()
+        .fold((0usize, true), |(count, managed), is_managed| {
+            (count.saturating_add(1), managed && is_managed)
+        });
+    let (source_count, sources_managed) = sources
+        .into_iter()
+        .fold((0usize, true), |(count, managed), is_managed| {
+            (count.saturating_add(1), managed && is_managed)
+        });
+    if destination_count != 0
+        && destination_count == source_count
+        && destinations_managed
+        && sources_managed
+    {
+        OwnerOutputKind::CopiedManaged
+    } else {
+        OwnerOutputKind::Unmanaged
+    }
+}
+
+fn owner_output_kind(scanout: &OutputScanout) -> OwnerOutputKind {
+    match scanout {
+        OutputScanout::Shared(pool) => {
+            if pool.bos.is_empty() || pool.bos.iter().any(|bo| bo.managed_key().is_none()) {
+                OwnerOutputKind::Unmanaged
+            } else {
+                OwnerOutputKind::SharedManaged
+            }
+        }
+        OutputScanout::Copied(pool) => classify_copied_managed_status(
+            pool.destinations
+                .bos
+                .iter()
+                .map(|bo| bo.managed_key().is_some()),
+            pool.sources
+                .iter()
+                .map(|source| source.managed_key().is_some()),
+        ),
+    }
 }
 
 fn validate_owner_output_kinds(kinds: &[OwnerOutputKind]) -> Result<(), OwnerEligibilityError> {
@@ -93,10 +138,7 @@ fn validate_owner_output_kinds(kinds: &[OwnerOutputKind]) -> Result<(), OwnerEli
     }
     for (output_idx, kind) in kinds.iter().copied().enumerate() {
         match kind {
-            OwnerOutputKind::SharedManaged => {}
-            OwnerOutputKind::Copied => {
-                return Err(OwnerEligibilityError::CopiedScanoutRoute { output_idx });
-            }
+            OwnerOutputKind::SharedManaged | OwnerOutputKind::CopiedManaged => {}
             OwnerOutputKind::Unmanaged => {
                 return Err(OwnerEligibilityError::UnmanagedScanoutPool { output_idx });
             }
@@ -114,9 +156,6 @@ impl std::fmt::Display for OwnerEligibilityError {
             Self::NoOutputs => f.write_str("Owner requires at least one scanout output"),
             Self::MissingScanoutPool { output_idx } => {
                 write!(f, "Owner output {output_idx} has no scanout pool")
-            }
-            Self::CopiedScanoutRoute { output_idx } => {
-                write!(f, "Owner output {output_idx} uses the copied scanout route")
             }
             Self::UnmanagedScanoutPool { output_idx } => {
                 write!(f, "Owner output {output_idx} has an unmanaged scanout pool")
@@ -3407,8 +3446,8 @@ impl PlatformBackend {
     ///
     /// Legacy gates are used by the older fixture and recovery paths and do
     /// not need scanout ownership.  An Owner gate is different: the scene's
-    /// owner fork can only be safe when every output on this device has a
-    /// shared, already-adopted pool.  Keep the refusal at the establishment
+    /// owner fork can only be safe when every output on this device has an
+    /// eligible, already-adopted pool. Keep the refusal at the establishment
     /// boundary so a caller can observe it and the device remains implicitly
     /// Legacy (no gate is installed).
     pub(crate) fn try_install_transport_gate(
@@ -3437,16 +3476,7 @@ impl PlatformBackend {
                 kinds.push(OwnerOutputKind::Missing);
                 continue;
             };
-            if !matches!(scanout, OutputScanout::Shared(_)) {
-                kinds.push(OwnerOutputKind::Copied);
-                continue;
-            }
-            let pool = scanout.display_pool();
-            if pool.bos.is_empty() || pool.bos.iter().any(|bo| bo.managed_key().is_none()) {
-                kinds.push(OwnerOutputKind::Unmanaged);
-                continue;
-            }
-            kinds.push(OwnerOutputKind::SharedManaged);
+            kinds.push(owner_output_kind(scanout));
         }
         validate_owner_output_kinds(&kinds)
     }
@@ -3466,13 +3496,10 @@ impl PlatformBackend {
                         .get(output_idx)
                         .and_then(Option::as_ref)
                         .is_some_and(|scanout| {
-                            matches!(scanout, OutputScanout::Shared(_))
-                                && !scanout.display_pool().bos.is_empty()
-                                && scanout
-                                    .display_pool()
-                                    .bos
-                                    .iter()
-                                    .all(|bo| bo.managed_key().is_some())
+                            matches!(
+                                owner_output_kind(scanout),
+                                OwnerOutputKind::SharedManaged | OwnerOutputKind::CopiedManaged
+                            )
                         })
             })
     }
@@ -10307,26 +10334,32 @@ mod tests {
     }
 
     #[test]
-    fn owner_output_kind_validator_rejects_copied_route() {
-        let error = validate_owner_output_kinds(&[OwnerOutputKind::Copied])
-            .expect_err("copied route must not enter Owner");
-        assert!(matches!(
-            error,
-            OwnerEligibilityError::CopiedScanoutRoute { output_idx: 0 }
-        ));
+    fn c0_conv_cp_eligibility_requires_both_halves() {
+        assert_eq!(
+            classify_copied_managed_status([true], [true]),
+            OwnerOutputKind::CopiedManaged,
+            "a copied output with both pool halves adopted is Owner-eligible"
+        );
+        validate_owner_output_kinds(&[OwnerOutputKind::CopiedManaged])
+            .expect("a copied output with both managed halves may enter Owner");
     }
 
     #[test]
-    fn owner_output_kind_validator_rejects_one_bad_output_of_many() {
+    fn c0_conv_cp_unmanaged_source_keeps_the_device_legacy() {
+        assert_eq!(
+            classify_copied_managed_status([true], [false]),
+            OwnerOutputKind::Unmanaged,
+            "an unadopted source half keeps the copied output unmanaged"
+        );
         let error = validate_owner_output_kinds(&[
             OwnerOutputKind::SharedManaged,
-            OwnerOutputKind::Copied,
+            classify_copied_managed_status([true], [false]),
             OwnerOutputKind::SharedManaged,
         ])
-        .expect_err("one bad output must keep the whole device Legacy");
+        .expect_err("one copied output with an unmanaged source keeps the device Legacy");
         assert!(matches!(
             error,
-            OwnerEligibilityError::CopiedScanoutRoute { output_idx: 1 }
+            OwnerEligibilityError::UnmanagedScanoutPool { output_idx: 1 }
         ));
     }
 
