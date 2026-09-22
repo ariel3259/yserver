@@ -43,6 +43,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::os::fd::FromRawFd;
+
 use ash::vk;
 use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
 
@@ -671,6 +674,221 @@ struct PendingScanoutRenderCompletion {
     /// It bypasses readiness polling but remains a real synchronization
     /// payload that the sink imports as raw -1.
     fd: Option<OwnedFd>,
+}
+
+/// Test-only copied-route timing evidence.  The production path does not
+/// retain a copy-fence duplicate or timestamp any of these boundaries.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopiedRouteTransport {
+    Legacy,
+    Owner,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CopiedRouteLatencySample {
+    pub(crate) frame: usize,
+    pub(crate) transport: CopiedRouteTransport,
+    pub(crate) submission_delay_us: i128,
+    pub(crate) expected_msc: u64,
+    pub(crate) completion_msc: u64,
+}
+
+#[cfg(test)]
+struct CopiedRouteLatencyPending {
+    frame: usize,
+    transport: CopiedRouteTransport,
+    fence: Option<OwnedFd>,
+    signalled_at: Option<std::time::Instant>,
+    expected_msc: Option<u64>,
+    submitted_at: Option<std::time::Instant>,
+    completion_msc: Option<u64>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CopiedRouteLatencyState {
+    next_frame: usize,
+    pending: Vec<CopiedRouteLatencyPending>,
+    samples: Vec<CopiedRouteLatencySample>,
+    insufficient: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPIED_ROUTE_LATENCY: RefCell<CopiedRouteLatencyState> =
+        RefCell::new(CopiedRouteLatencyState::default());
+}
+
+#[cfg(test)]
+pub(crate) fn begin_copied_route_latency_for_tests() {
+    COPIED_ROUTE_LATENCY.with(|state| *state.borrow_mut() = CopiedRouteLatencyState::default());
+}
+
+#[cfg(test)]
+pub(crate) fn record_copied_copy_fence_for_tests(
+    transport: CopiedRouteTransport,
+    completion: Option<&OwnedFd>,
+) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        let fence = completion.and_then(|completion| {
+            let raw = unsafe { libc::dup(completion.as_raw_fd()) };
+            if raw < 0 {
+                state.insufficient = true;
+                None
+            } else {
+                // SAFETY: `dup` returned a fresh owned descriptor.
+                Some(unsafe { OwnedFd::from_raw_fd(raw) })
+            }
+        });
+        let frame = state.next_frame;
+        state.next_frame = state.next_frame.saturating_add(1);
+        state.pending.push(CopiedRouteLatencyPending {
+            frame,
+            transport,
+            fence,
+            signalled_at: completion.is_none().then(std::time::Instant::now),
+            expected_msc: None,
+            submitted_at: None,
+            completion_msc: None,
+        });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn poll_copied_route_latency_for_tests(current_msc: u64) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        let now = std::time::Instant::now();
+        let mut insufficient = false;
+        for pending in &mut state.pending {
+            if pending.signalled_at.is_none() {
+                let Some(fence) = pending.fence.as_ref() else {
+                    insufficient = true;
+                    continue;
+                };
+                let mut poll_fd = libc::pollfd {
+                    fd: fence.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+                if result < 0 {
+                    insufficient = true;
+                } else if result > 0
+                    && poll_fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0
+                {
+                    pending.signalled_at = Some(now);
+                }
+            }
+            if pending.signalled_at.is_some() && pending.expected_msc.is_none() {
+                pending.expected_msc = Some(current_msc.saturating_add(1));
+            }
+        }
+        state.insufficient |= insufficient;
+        finish_copied_route_latency_samples(&mut state);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_copied_commit_submitted_for_tests(transport: CopiedRouteTransport) {
+    record_copied_commit_submitted_at_for_tests(transport, std::time::Instant::now(), true);
+}
+
+#[cfg(test)]
+pub(crate) fn record_copied_commit_submitted_at_for_tests(
+    transport: CopiedRouteTransport,
+    submitted_at: std::time::Instant,
+    required: bool,
+) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(pending) = state
+            .pending
+            .iter_mut()
+            .find(|pending| pending.transport == transport && pending.submitted_at.is_none())
+        else {
+            state.insufficient |= required;
+            return;
+        };
+        pending.submitted_at = Some(submitted_at);
+        finish_copied_route_latency_samples(&mut state);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_copied_completion_msc_for_tests(transport: CopiedRouteTransport, msc: u64) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(pending) = state
+            .pending
+            .iter_mut()
+            .find(|pending| pending.transport == transport && pending.completion_msc.is_none())
+        else {
+            state.insufficient = true;
+            return;
+        };
+        pending.completion_msc = Some(msc);
+        finish_copied_route_latency_samples(&mut state);
+    });
+}
+
+#[cfg(test)]
+fn finish_copied_route_latency_samples(state: &mut CopiedRouteLatencyState) {
+    let mut completed = Vec::new();
+    for (index, pending) in state.pending.iter().enumerate() {
+        let Some(signalled_at) = pending.signalled_at else {
+            continue;
+        };
+        let Some(expected_msc) = pending.expected_msc else {
+            continue;
+        };
+        let Some(submitted_at) = pending.submitted_at else {
+            continue;
+        };
+        let Some(completion_msc) = pending.completion_msc else {
+            continue;
+        };
+        let signed_delay_us = if submitted_at >= signalled_at {
+            i128::try_from(submitted_at.duration_since(signalled_at).as_micros())
+                .unwrap_or(i128::MAX)
+        } else {
+            -i128::try_from(signalled_at.duration_since(submitted_at).as_micros())
+                .unwrap_or(i128::MAX)
+        };
+        state.samples.push(CopiedRouteLatencySample {
+            frame: pending.frame,
+            transport: pending.transport,
+            submission_delay_us: signed_delay_us,
+            expected_msc,
+            completion_msc,
+        });
+        completed.push(index);
+    }
+    for index in completed.into_iter().rev() {
+        state.pending.swap_remove(index);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn finish_copied_route_latency_for_tests()
+-> Result<Vec<CopiedRouteLatencySample>, String> {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        finish_copied_route_latency_samples(&mut state);
+        if state.insufficient {
+            return Err("copied-route latency recorder became insufficient".to_string());
+        }
+        if !state.pending.is_empty() {
+            return Err(format!(
+                "copied-route latency recorder has {} incomplete frame(s)",
+                state.pending.len()
+            ));
+        }
+        Ok(std::mem::take(&mut state.samples))
+    })
 }
 
 /// A completed source-render job ready for the sink-side copied-scanout
@@ -6557,6 +6775,11 @@ impl PlatformBackend {
                     return Err(error);
                 }
             };
+            #[cfg(test)]
+            crate::kms::render::platform::record_copied_copy_fence_for_tests(
+                crate::kms::render::platform::CopiedRouteTransport::Legacy,
+                copy_completion.as_ref(),
+            );
             let destination = copied
                 .destinations
                 .bos
@@ -6574,6 +6797,10 @@ impl PlatformBackend {
                 legacy_write_permitted,
             ) {
                 Ok(()) => {
+                    #[cfg(test)]
+                    crate::kms::render::platform::record_copied_commit_submitted_for_tests(
+                        crate::kms::render::platform::CopiedRouteTransport::Legacy,
+                    );
                     if let Some(fd) = destination.state.transition_to_pending(out_fence_fd) {
                         // SAFETY: transition_to_pending transfers the uniquely
                         // owned input-fence fd back to this caller.

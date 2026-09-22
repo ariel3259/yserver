@@ -417,6 +417,11 @@ pub(crate) fn prepare_owner_copy_after_render_completion(
             ));
         }
     };
+    #[cfg(test)]
+    crate::kms::render::platform::record_copied_copy_fence_for_tests(
+        crate::kms::render::platform::CopiedRouteTransport::Owner,
+        completion.as_ref(),
+    );
 
     batch.bind_ticket(GpuObligation::new(
         vec![destination_entry],

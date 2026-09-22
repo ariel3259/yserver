@@ -319,4 +319,98 @@ route among its consumers, which that section does not promise today.
 
 **Named test:** `c0_hw_cp_copied_route_cross_device_drm`.
 
+**Task 8 implementation report (2026-09-22).** The test is at
+`crates/yserver/src/kms/render/backend.rs:68278`, with the test-only latency
+collector in `crates/yserver/src/kms/render/platform.rs:679` and the two
+copy-fence hooks at `platform.rs:6770` and
+`crates/yserver/src/kms/render/copied_owner.rs:420`; the Legacy submission
+hook is at `platform.rs:6792`. For Owner, the test-only recorder timestamps
+the helper's atomic-ioctl submission boundary by subtracting the helper's
+measured `helper_duration_ns` from the received `Accepted` event timestamp;
+the `Accepted` event is still printed as the protocol milestone. The hardware
+run uses one
+live fixture and one timing session: four Legacy copied frames, then four Owner
+copied frames on the same card1 master/HDMI-A-2 modeset. The output records
+`renderer_primary`/`renderer_node` and `sink_primary`/`sink_render`, then prints
+the destination obligation registration under its own destination key, its
+retirement, the `Accepted` milestone, and the `HardwareComplete`/`Presented`
+milestones before asserting applied damage.
+
+The coordinator runs it from tty2, with the user's approval, using exactly:
+
+```bash
+cargo test -p yserver --lib c0_hw_cp_copied_route_cross_device_drm -- --exact --ignored --nocapture --test-threads=1
+```
+
+The latency evidence is printed as one `CP-LATENCY` line per frame with
+`transport`, `submission_delay_us`, `expected_msc`, `completion_msc`, and
+`missed_vblank`, followed by one `CP-LATENCY-SUMMARY` line per transport with
+`frames` and `missed_vblank=N/frames`. The measurement is test-only: it
+duplicates the copy fence, polls it without changing production scheduling,
+timestamps the fence-signalled and commit-submitted boundaries, and takes the
+completion MSC from the Legacy flip event or Owner `Presented` sample.
+
+The required mutations are replacements, not adjacent branches, and leave
+CP-8's forced-legacy mutation untouched:
+
+- **Q33 — misroute the copy off the sink device.** At
+  `crates/yserver/src/kms/vk/scanout.rs:2351-2353`, replace the production
+  queue-submit block
+
+  ```rust
+  self.sink_vk
+      .device
+      .queue_submit2(self.sink_vk.graphics_queue, &submits, fence)
+  ```
+
+  with
+
+  ```rust
+  source
+      .render_vk
+      .as_ref()
+      .expect("Q33: copied source has no renderer Vulkan context")
+      .device
+      .queue_submit2(
+          source
+              .render_vk
+              .as_ref()
+              .expect("Q33: copied source has no renderer Vulkan context")
+              .graphics_queue,
+          &submits,
+          fence,
+      )
+  ```
+
+  This replaces the sink-device queue decision in
+  `CopiedScanoutPool::submit_managed_copy_with_fence`; it must not be bolted
+  beside the real submission.
+
+- **Q34 — scan out the source instead of the destination.** At
+  `crates/yserver/src/kms/render/scene.rs:4166-4169`, replace
+
+  ```rust
+  let managed = match service.reserve(
+      prepared.identity().managed_key,
+      crate::kms::render::resources::UseKind::Retain,
+  ) {
+  ```
+
+  with
+
+  ```rust
+  let managed = match service.reserve(
+      source_receipt.0,
+      crate::kms::render::resources::UseKind::Retain,
+  ) {
+  ```
+
+  This replaces the Owner promotion's destination framebuffer identity with
+  the copied source receipt's allocation; it must not be added as a parallel
+  path.
+
+The implementation did not run this ignored hardware test, any `_drm` test,
+render acceptance, or an unfiltered ignored test. Hardware reachability/F8 is
+therefore intentionally left for the coordinator's approved tty2 run.
+
 - [ ] Steps: the test; the invocation and filter, written down; stop dirty and report. The coordinator runs it.
