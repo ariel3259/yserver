@@ -1631,6 +1631,15 @@ pub(crate) struct CopiedScanoutPool {
     copy_fence_pool: crate::kms::render::platform::FencePool,
     sink_vk: Arc<VkContext>,
     destination_ownership: Vec<CopiedDestinationOwnership>,
+    #[cfg(test)]
+    managed_copy_failure: Option<ManagedCopyFailureForTests>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedCopyFailureForTests {
+    BeforeQueueSubmit,
+    AfterQueueSubmit,
 }
 
 impl CopiedScanoutPool {
@@ -1816,6 +1825,8 @@ impl CopiedScanoutPool {
                         )),
                         sink_vk,
                         destination_ownership: vec![initial_destination_ownership; count],
+                        #[cfg(test)]
+                        managed_copy_failure: None,
                     };
                     return Err(partial_pool
                         .finish_disposable_probe(Err(error))
@@ -1833,7 +1844,17 @@ impl CopiedScanoutPool {
             copy_fence_pool: crate::kms::render::platform::FencePool::new(Arc::clone(&sink_vk)),
             sink_vk,
             destination_ownership: vec![initial_destination_ownership; count],
+            #[cfg(test)]
+            managed_copy_failure: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_managed_copy_failure_for_tests(
+        &mut self,
+        failure: ManagedCopyFailureForTests,
+    ) {
+        self.managed_copy_failure = Some(failure);
     }
 
     /// Submit B's copy after A's completion fd became readable. Readiness is
@@ -2141,7 +2162,10 @@ impl CopiedScanoutPool {
         fence: vk::Fence,
         source: &mut crate::kms::render::resources::scanout::CopiedSourceAllocation,
         destination: &mut crate::kms::render::resources::scanout::ScanoutAllocation,
-    ) -> io::Result<Option<OwnedFd>> {
+    ) -> Result<Option<OwnedFd>, ManagedCopySubmitError> {
+        let mut gpu_submitted = false;
+        #[cfg(test)]
+        let injected_failure = self.managed_copy_failure.take();
         let destination_bo = self
             .destinations
             .bos
@@ -2317,22 +2341,48 @@ impl CopiedScanoutPool {
                 .wait_semaphore_infos(&waits)
                 .command_buffer_infos(&commands)
                 .signal_semaphore_infos(&signals)];
+            #[cfg(test)]
+            if injected_failure == Some(ManagedCopyFailureForTests::BeforeQueueSubmit) {
+                return Err(ManagedCopySubmitError::new(
+                    io::Error::other("test-injected copied sink pre-submit failure"),
+                    false,
+                ));
+            }
             self.sink_vk
                 .device
                 .queue_submit2(self.sink_vk.graphics_queue, &submits, fence)
-                .map_err(|result| scanout_vk_error("submit copied sink transfer", result))?;
+                .map_err(|result| {
+                    ManagedCopySubmitError::new(
+                        scanout_vk_error("submit copied sink transfer", result),
+                        gpu_submitted,
+                    )
+                })?;
+            gpu_submitted = true;
+            #[cfg(test)]
+            if injected_failure == Some(ManagedCopyFailureForTests::AfterQueueSubmit) {
+                return Err(ManagedCopySubmitError::new(
+                    io::Error::other("test-injected copied sink post-submit failure"),
+                    true,
+                ));
+            }
         }
         source.note_sink_submit_succeeded();
         *destination_ownership = CopiedDestinationOwnership::ForeignPendingKmsFromSink;
-        let completion = destination_bo
-            .export_signaled_fd()
-            .map_err(|result| scanout_vk_error("export copied sink completion", result))?;
+        let completion = destination_bo.export_signaled_fd().map_err(|result| {
+            ManagedCopySubmitError::new(
+                scanout_vk_error("export copied sink completion", result),
+                gpu_submitted,
+            )
+        })?;
         let renderer_completion = completion
             .as_ref()
             .map(OwnedFd::try_clone)
             .transpose()
             .map_err(|error| {
-                scanout_io_context("retain copied sink completion for renderer acquire", error)
+                ManagedCopySubmitError::new(
+                    scanout_io_context("retain copied sink completion for renderer acquire", error),
+                    gpu_submitted,
+                )
             })?;
         source.retain_sink_release_completion(renderer_completion);
         Ok(completion)
@@ -4687,6 +4737,40 @@ struct ScanoutIoContext {
     context: String,
     #[source]
     source: io::Error,
+}
+
+/// The sink copy has the same submission boundary as renderer A: errors before
+/// `queue_submit2` are known pre-submit, while an error after it may leave the
+/// GPU owning the prepared source/destination pair.  Keep that answer beside
+/// the error so the resource service can take the established cancel-versus-
+/// freeze path by key.
+#[derive(Debug)]
+pub(crate) struct ManagedCopySubmitError {
+    error: io::Error,
+    gpu_submitted: bool,
+}
+
+impl ManagedCopySubmitError {
+    fn new(error: io::Error, gpu_submitted: bool) -> Self {
+        Self {
+            error,
+            gpu_submitted,
+        }
+    }
+
+    pub(crate) fn gpu_submitted(&self) -> bool {
+        self.gpu_submitted
+    }
+
+    pub(crate) fn into_io_error(self) -> io::Error {
+        self.error
+    }
+}
+
+impl From<io::Error> for ManagedCopySubmitError {
+    fn from(error: io::Error) -> Self {
+        Self::new(error, false)
+    }
 }
 
 /// Failure from a disposable GPU route probe.

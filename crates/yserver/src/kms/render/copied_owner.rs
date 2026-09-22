@@ -10,7 +10,10 @@ use ash::vk;
 
 use super::{
     platform::{FenceTicket, PlatformBackend, ScanoutRenderCompletionStage},
-    resources::{AllocationKey, CoreRetirementBatch, GpuObligation, ObligationId, ResourceService},
+    resources::{
+        AllocationKey, AllocationLease, CoreRetirementBatch, GpuObligation, ObligationId,
+        ResourceService,
+    },
     scene::{
         ComposeRenderTarget, ComposeSubmit, PostComposePreparation, Repaint,
         record_and_submit_render,
@@ -32,6 +35,48 @@ use crate::kms::{
 pub(crate) struct CopiedRetirementReceipt {
     pub(crate) destination: (AllocationKey, ObligationId),
     pub(crate) source: (AllocationKey, ObligationId),
+}
+
+/// Dispose of a sink submission after its dispatch answer is known.  The
+/// service owns the cancel/freeze decision; this helper only performs the
+/// sink's established quiescence and repairs the managed source payload whose
+/// synchronization state no longer lives in the pool husk.
+fn dispose_failed_sink_submission(
+    pool: &mut CopiedScanoutPool,
+    platform: &mut PlatformBackend,
+    service: &mut ResourceService,
+    bo_idx: usize,
+    source_lease: &AllocationLease,
+    entries: &[(AllocationKey, ObligationId)],
+    gpu_submitted: bool,
+    cause: PresentError,
+) -> PresentError {
+    let cause = match pool.recover_copy_failure(bo_idx) {
+        Ok(()) => match service.with_copied_source(source_lease, |source| {
+            source.recover_copy_failure_after_quiescence()
+        }) {
+            Ok(Ok(())) => cause,
+            Ok(Err(error)) => {
+                platform.renderer_failed = true;
+                PresentError::Io(io::Error::other(format!(
+                    "recover managed copied source after sink failure: {error}"
+                )))
+            }
+            Err(error) => {
+                platform.renderer_failed = true;
+                PresentError::Io(io::Error::other(format!(
+                    "borrow managed copied source during sink recovery: {error:?}"
+                )))
+            }
+        },
+        Err(error) => {
+            platform.renderer_failed = true;
+            PresentError::Io(io::Error::other(format!(
+                "recover copied sink after submission failure: {error}"
+            )))
+        }
+    };
+    super::scene::managed_submit_failure(service, entries, gpu_submitted, cause)
 }
 
 struct ManagedCopiedComposeTarget<'a> {
@@ -268,20 +313,25 @@ pub(crate) fn prepare_owner_copy_after_render_completion(
         .is_none_or(|bo| bo.state.phase != crate::kms::vk::scanout::BoPhase::Owner)
     {
         let entries = [destination_entry, source_entry];
-        let _ =
-            crate::kms::render::resources::gpu::abandon_unsubmitted_batch(service, &entries, false);
-        return Err(PresentError::Io(io::Error::other(
-            "copied Owner destination was released before its paired copy",
-        )));
+        return Err(super::scene::managed_submit_failure(
+            service,
+            &entries,
+            false,
+            PresentError::Io(io::Error::other(
+                "copied Owner destination was released before its paired copy",
+            )),
+        ));
     }
     let copy_ticket = match pool.acquire_copy_fence() {
         Ok(ticket) => ticket,
         Err(error) => {
             let entries = [destination_entry, source_entry];
-            let _ = crate::kms::render::resources::gpu::abandon_unsubmitted_batch(
-                service, &entries, false,
-            );
-            return Err(PresentError::Vk(error));
+            return Err(super::scene::managed_submit_failure(
+                service,
+                &entries,
+                false,
+                PresentError::Vk(error),
+            ));
         }
     };
     let destination_lease = &batch.leases()[0];
@@ -318,19 +368,27 @@ pub(crate) fn prepare_owner_copy_after_render_completion(
         Ok(Ok(completion)) => completion,
         Ok(Err(error)) => {
             let entries = [destination_entry, source_entry];
-            let _ = crate::kms::render::resources::gpu::abandon_unsubmitted_batch(
-                service, &entries, false,
-            );
-            return Err(PresentError::Io(error));
+            return Err(dispose_failed_sink_submission(
+                pool,
+                platform,
+                service,
+                bo_idx,
+                source_lease,
+                &entries,
+                error.gpu_submitted(),
+                PresentError::Io(error.into_io_error()),
+            ));
         }
         Err(error) => {
             let entries = [destination_entry, source_entry];
-            let _ = crate::kms::render::resources::gpu::abandon_unsubmitted_batch(
-                service, &entries, false,
-            );
-            return Err(PresentError::Io(io::Error::other(format!(
-                "borrow copied sink payloads: {error:?}"
-            ))));
+            return Err(super::scene::managed_submit_failure(
+                service,
+                &entries,
+                false,
+                PresentError::Io(io::Error::other(format!(
+                    "borrow copied sink payloads: {error:?}"
+                ))),
+            ));
         }
     };
 
@@ -340,14 +398,22 @@ pub(crate) fn prepare_owner_copy_after_render_completion(
         pool.sink_context(),
     ));
     service.register_batch(batch);
-    let job_id = platform
-        .register_scanout_render_completion(
-            output_key,
-            bo_idx,
-            ScanoutRenderCompletionStage::CopiedOwnerCopy,
-            completion,
-        )
-        .map_err(PresentError::Io)?;
+    let job_id = match platform.register_scanout_render_completion(
+        output_key,
+        bo_idx,
+        ScanoutRenderCompletionStage::CopiedOwnerCopy,
+        completion,
+    ) {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            // B has already been submitted and its batch is deliberately
+            // still rooted in the service.  register_scanout... either
+            // installs the whole waiter or leaves no partial queue entry;
+            // the generation is displaced by the caller and cannot offer on
+            // generic availability.
+            return Err(PresentError::Io(error));
+        }
+    };
     log::debug!("copied Owner B submission registered as completion job {job_id} for BO {bo_idx}");
     Ok((
         CopiedRetirementReceipt {

@@ -118,6 +118,123 @@ fn c0_conv_cp_failed_preparation_unwinds_completely() {
 }
 
 #[test]
+fn c0_conv_cp_unsent_submission_cancels() {
+    let (mut service, destination, destination_drops) = spy_service();
+    let source_drops = Rc::new(Cell::new(0));
+    let source = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&source_drops),
+        }))
+        .unwrap();
+    let destination_key = destination.key();
+    let source_key = source.key();
+    let destination_lease = service.reserve(destination_key, UseKind::Write).unwrap();
+    let source_lease = service.reserve(source_key, UseKind::Read).unwrap();
+    let destination_obligation = service
+        .register(destination_key, ObligationKind::Gpu)
+        .unwrap();
+    let source_obligation = service.register(source_key, ObligationKind::Read).unwrap();
+    let gate = TransportGate::for_tests(service.device(), service.incarnation());
+    let gate_handle = gate.handle();
+    service.set_transport_gate(gate_handle.clone()).unwrap();
+
+    super::gpu::abandon_unsubmitted_batch(
+        &mut service,
+        &[
+            (destination_key, destination_obligation),
+            (source_key, source_obligation),
+        ],
+        false,
+    )
+    .expect("a provably unsent copy cancels its prepared obligations");
+
+    assert!(
+        !gate_handle.is_closed(),
+        "successful cancel keeps the gate open"
+    );
+    assert!(!service.is_frozen(&destination_key));
+    assert!(!service.is_frozen(&source_key));
+    assert!(!service.has_pending_obligations(&destination_key));
+    assert!(!service.has_pending_obligations(&source_key));
+
+    drop(destination_lease);
+    drop(source_lease);
+    drop(destination);
+    drop(source);
+    service.service_ready();
+    assert_eq!(destination_drops.get(), 1);
+    assert_eq!(source_drops.get(), 1);
+}
+
+#[test]
+fn c0_conv_cp_uncertain_dispatch_freezes_and_closes_the_gate() {
+    let (mut service, destination, _destination_drops) = spy_service();
+    let source = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::new(Cell::new(0)),
+        }))
+        .unwrap();
+    let destination_key = destination.key();
+    let source_key = source.key();
+    let destination_lease = service.reserve(destination_key, UseKind::Write).unwrap();
+    let source_lease = service.reserve(source_key, UseKind::Read).unwrap();
+    let destination_obligation = service
+        .register(destination_key, ObligationKind::Gpu)
+        .unwrap();
+    let source_obligation = service.register(source_key, ObligationKind::Read).unwrap();
+    let gate = TransportGate::for_tests(service.device(), service.incarnation());
+    let gate_handle = gate.handle();
+    service.set_transport_gate(gate_handle.clone()).unwrap();
+
+    super::gpu::abandon_unsubmitted_batch(
+        &mut service,
+        &[
+            (destination_key, destination_obligation),
+            (source_key, source_obligation),
+        ],
+        true,
+    )
+    .expect("an uncertain copy freezes its prepared entries");
+
+    assert!(
+        gate_handle.is_closed(),
+        "uncertain dispatch closes the gate"
+    );
+    assert!(service.is_frozen(&destination_key));
+    assert!(service.is_frozen(&source_key));
+    assert!(service.has_pending_obligation(&destination_key, destination_obligation));
+    assert!(service.has_pending_obligation(&source_key, source_obligation));
+    assert!(!service.is_releasable(&destination_key));
+    assert!(!service.is_releasable(&source_key));
+
+    drop(destination_lease);
+    drop(source_lease);
+    drop(destination);
+    drop(source);
+
+    // A ticketless prepared batch has no destination key for
+    // quarantine_gpu_batch to discover.  Its read obligation still names the
+    // source, which is why the source freezes while the destination does not.
+    let (mut ticketless_service, ticketless_destination, _) = spy_service();
+    let ticketless_source = ticketless_service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::new(Cell::new(0)),
+        }))
+        .unwrap();
+    let ticketless_destination_key = ticketless_destination.key();
+    let ticketless_source_key = ticketless_source.key();
+    let (ticketless_batch, _, _) = super::gpu::prepare_copied_batch(
+        &mut ticketless_service,
+        ticketless_destination_key,
+        ticketless_source_key,
+    )
+    .unwrap();
+    ticketless_service.quarantine_gpu_batch(ticketless_batch, ResourceError::Frozen);
+    assert!(!ticketless_service.is_frozen(&ticketless_destination_key));
+    assert!(ticketless_service.is_frozen(&ticketless_source_key));
+}
+
+#[test]
 fn c0_2ci_kms_release_does_not_complete_gpu_work() {
     let (mut service, held, drops) = spy_service();
     let key = held.key();

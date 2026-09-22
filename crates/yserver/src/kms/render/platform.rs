@@ -5032,6 +5032,32 @@ impl PlatformBackend {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_scanout_render_completion_count_for_tests(&self) -> usize {
+        self.pending_scanout_render_completions.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_scanout_render_job_id_for_tests(&mut self, job_id: u64) {
+        self.next_scanout_render_job_id = job_id;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_copied_managed_copy_failure_for_tests(
+        &mut self,
+        output_idx: usize,
+        failure: crate::kms::vk::scanout::ManagedCopyFailureForTests,
+    ) -> bool {
+        self.scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(OutputScanout::copied_mut)
+            .map(|pool| {
+                pool.force_next_managed_copy_failure_for_tests(failure);
+            })
+            .is_some()
+    }
+
     fn drm_device_index_for_fd(&self, drm_fd: RawFd) -> Option<usize> {
         self.devices
             .iter()

@@ -678,6 +678,30 @@ impl CopiedSourceAllocation {
         }
     }
 
+    /// Restore the managed source's ownership state after the sink queue has
+    /// been proven idle for a failed copy.  The copied pool can repair its
+    /// destination husk, but the source's synchronization state lives in this
+    /// service payload after managed adoption and must be repaired here too.
+    pub(crate) fn recover_copy_failure_after_quiescence(&mut self) -> io::Result<()> {
+        self.release_sink_wait_semaphore();
+        match self.ownership {
+            CopiedSourceOwnership::ForeignAwaitingSink => {
+                self.renderer_return_completion = None;
+                self.ownership = CopiedSourceOwnership::RendererDiscard;
+                Ok(())
+            }
+            CopiedSourceOwnership::ForeignAwaitingRenderer => Ok(()),
+            CopiedSourceOwnership::ForeignReturnPending => {
+                self.renderer_return_completion = Some(RetainedSyncFile::AlreadySignalled);
+                self.ownership = CopiedSourceOwnership::ForeignAwaitingRenderer;
+                Ok(())
+            }
+            CopiedSourceOwnership::RendererFirstUse | CopiedSourceOwnership::RendererDiscard => {
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn export_render_completion(&mut self) -> Result<Option<OwnedFd>, vk::Result> {
         let render_vk = self
             .render_vk

@@ -52519,6 +52519,215 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_wake_registration_failure_displaces_vulkan() {
+        let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+        // A's waiter already owns the first job id.  Overflow is the real
+        // registration error path: B has submitted and its batch is rooted,
+        // but register_scanout_render_completion cannot install a partial
+        // waiter.
+        fixture
+            .backend
+            .platform
+            .set_next_scanout_render_job_id_for_tests(u64::MAX);
+        fixture.backend.platform.wait_idle_bounded();
+        let completions = fixture.backend.platform.drain_scanout_render_completions();
+        for completion in completions {
+            assert!(fixture.backend.scene.handle_scanout_render_completion(
+                completion,
+                &mut fixture.backend.platform,
+                fixture.backend.resource_service.as_mut(),
+            ));
+        }
+
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
+            "a submitted copy whose wake cannot register displaces its generation"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .take_owner_composed_offers()
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "failed wake registration leaves no partial waiter"
+        );
+        let service = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service");
+        assert_eq!(
+            service.pending_batches().len(),
+            1,
+            "B remains service-owned"
+        );
+        assert!(service.has_pending_obligations(&destination_key));
+        assert!(service.has_pending_obligations(&source_key));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_failed_submission_offers_nothing_vulkan() {
+        for failure in [
+            crate::kms::vk::scanout::ManagedCopyFailureForTests::BeforeQueueSubmit,
+            crate::kms::vk::scanout::ManagedCopyFailureForTests::AfterQueueSubmit,
+        ] {
+            let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+            assert!(
+                fixture
+                    .backend
+                    .platform
+                    .force_next_copied_managed_copy_failure_for_tests(0, failure)
+            );
+
+            fixture.backend.platform.wait_idle_bounded();
+            let completions = fixture.backend.platform.drain_scanout_render_completions();
+            for completion in completions {
+                assert!(fixture.backend.scene.handle_scanout_render_completion(
+                    completion,
+                    &mut fixture.backend.platform,
+                    fixture.backend.resource_service.as_mut(),
+                ));
+            }
+
+            assert_eq!(
+                fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+                Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
+                "both failed-submission answers displace the copy generation"
+            );
+            assert!(
+                fixture
+                    .backend
+                    .scene
+                    .take_owner_composed_offers()
+                    .is_empty()
+            );
+            assert_eq!(
+                fixture
+                    .backend
+                    .platform
+                    .pending_scanout_render_completion_count_for_tests(),
+                0,
+                "a failed submission never leaves a completion waiter"
+            );
+
+            let service = fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service");
+            assert!(service.pending_batches().is_empty());
+            match failure {
+                crate::kms::vk::scanout::ManagedCopyFailureForTests::BeforeQueueSubmit => {
+                    assert!(!service.is_frozen(&destination_key));
+                    assert!(!service.is_frozen(&source_key));
+                    assert!(!service.has_pending_obligations(&destination_key));
+                    assert!(!service.has_pending_obligations(&source_key));
+                }
+                crate::kms::vk::scanout::ManagedCopyFailureForTests::AfterQueueSubmit => {
+                    assert!(service.is_frozen(&destination_key));
+                    assert!(service.is_frozen(&source_key));
+                    assert!(service.has_pending_obligations(&destination_key));
+                    assert!(service.has_pending_obligations(&source_key));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_output_removal_cancels_the_copy_wait_vulkan() {
+        let (mut fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            1,
+            "A's wake was consumed and the B copy wait is now in the shared queue"
+        );
+        let output_key = fixture.backend.platform.outputs[0].key.clone();
+        fixture
+            .backend
+            .platform
+            .cancel_scanout_render_completions_for_output(&output_key);
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "per-output cancellation removes the copy wait as well as A waits"
+        );
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "cancelling the wait cannot offer the generation"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .take_owner_composed_offers()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_whole_queue_clear_takes_the_copy_wait_vulkan() {
+        let (mut fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            1,
+            "the production queue contains B's copy wait"
+        );
+
+        // Make B's sync_file readable before the whole-queue teardown.  If
+        // clear_scanout_render_completions omitted the copied stage, this
+        // stale completion would be delivered by the drain after the VT-style
+        // clear and would promote/offer the old generation.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture.backend.platform.clear_scanout_render_completions();
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "whole-queue clearing removes B's wait before suspend can return"
+        );
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "a cleared stale B wake cannot promote or offer"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .take_owner_composed_offers()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn c0_conv_cp_legacy_copied_route_unchanged() {
         let platform = PlatformBackend::for_tests();
         assert!(!platform.output_uses_owner_route(0));
