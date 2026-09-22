@@ -36,16 +36,13 @@ use super::{
     storage::{PixelIdentity, StorageBacking, StorageLease},
     tests::SpyAllocation,
 };
-use crate::{
-    kms::{
-        owner::identity::IncarnationId,
-        render::{
-            backend::KmsBackend,
-            store::{DrawableId, DrawableKind, Storage},
-            target::PaintTarget,
-        },
+use crate::kms::{
+    owner::identity::IncarnationId,
+    render::{
+        backend::KmsBackend,
+        store::{DrawableId, DrawableKind, Storage},
+        target::PaintTarget,
     },
-    platform::drm::DrmDeviceKey,
 };
 
 const CLIENT: u32 = 7;
@@ -137,13 +134,12 @@ fn seed_managed_pixmap(
 #[test]
 fn c0_2ci_reset_forced_teardown_keeps_gated_backing_and_late_proof_skips_reused_xid() {
     let mut backend = KmsBackend::for_tests();
-    backend.install_resource_service(ResourceService::new(
-        DrmDeviceKey {
-            major: 226,
-            minor: 0,
-        },
-        IncarnationId::first(),
-    ));
+    let device = backend
+        .platform
+        .primary_device()
+        .expect("primary device")
+        .key;
+    backend.install_resource_service(ResourceService::new(device, IncarnationId::first()));
 
     // Generation 1: a managed drawable with GPU work still pending.
     let mut state = ServerState::new();

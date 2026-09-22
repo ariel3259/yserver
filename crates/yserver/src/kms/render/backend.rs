@@ -518,23 +518,42 @@ impl Default for ScanoutM0Telemetry {
 }
 
 struct ScanoutM1ProbeEntry {
-    /// Retained solely for its FB/GEM lifetime; `Drop` performs teardown.
+    /// Retained solely for its FB/GEM lifetime until Owner adoption;
+    /// `Drop` performs teardown only for a Legacy entry.
     _framebuffer: Option<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
+    managed: bool,
 }
 
 impl ScanoutM1ProbeEntry {
     fn rejected() -> Self {
-        Self { _framebuffer: None }
+        Self {
+            _framebuffer: None,
+            managed: false,
+        }
     }
 
     fn accepted(framebuffer: crate::drm::modeset::DirectScanoutProbeFramebuffer) -> Self {
         Self {
             _framebuffer: Some(framebuffer),
+            managed: false,
         }
     }
 
     fn framebuffer(&self) -> Option<&crate::drm::modeset::DirectScanoutProbeFramebuffer> {
-        self._framebuffer.as_ref()
+        (!self.managed)
+            .then_some(self._framebuffer.as_ref())
+            .flatten()
+    }
+
+    fn take_framebuffer(&mut self) -> Option<crate::drm::modeset::DirectScanoutProbeFramebuffer> {
+        if self.managed {
+            return None;
+        }
+        let framebuffer = self._framebuffer.take();
+        if framebuffer.is_some() {
+            self.managed = true;
+        }
+        framebuffer
     }
 }
 
@@ -588,6 +607,9 @@ impl ScanoutM1ProbeCache {
 struct DirectPresentFrame {
     source_pin: u64,
     fallback_target_pin: u64,
+    /// Owner-route adoption's role-proof framebuffer lease. Legacy direct
+    /// frames leave this empty and continue to use the strong M1 cache.
+    framebuffer_lease: Option<crate::kms::render::resources::AllocationLease>,
     source_id: DrawableId,
     candidate: PresentScanoutCandidate,
     fallback_target: PaintTarget,
@@ -1517,6 +1539,7 @@ pub struct KmsBackend {
     pub(crate) admission_conductors:
         std::collections::BTreeMap<DrmDeviceKey, crate::kms::render::admission::AdmissionConductor>,
     pub(crate) resource_service: Option<crate::kms::render::resources::ResourceService>,
+    pub(crate) drm_cleanup_registry: Option<crate::kms::render::resources::DrmCleanupRegistry>,
     pub(crate) commit_consumer: crate::kms::render::resources::CommitResourceConsumer,
 
     #[cfg(test)]
@@ -2290,7 +2313,46 @@ impl KmsBackend {
         &mut self,
         service: crate::kms::render::resources::ResourceService,
     ) {
+        let device = self
+            .platform
+            .device_for_key(service.device())
+            .map(|entry| Rc::clone(&entry.device));
+        let Some(device) = device else {
+            log::error!(
+                "render: refusing to install resource service without its DRM device {}",
+                service.device()
+            );
+            self.commit_consumer.capacity.close_admission();
+            return;
+        };
+        let registry = crate::kms::render::resources::DrmCleanupRegistry::new(
+            device,
+            service.device(),
+            service.incarnation(),
+        );
+        self.install_resource_service_with_registry(service, registry);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn install_resource_service_with_registry(
+        &mut self,
+        mut service: crate::kms::render::resources::ResourceService,
+        registry: crate::kms::render::resources::DrmCleanupRegistry,
+    ) {
+        if registry.device_key() != service.device()
+            || registry.incarnation() != service.incarnation()
+            || service
+                .bind_direct_capacity(&self.commit_consumer.capacity)
+                .is_err()
+        {
+            log::error!(
+                "render: refusing mismatched ResourceService/DrmCleanupRegistry installation"
+            );
+            self.commit_consumer.capacity.close_admission();
+            return;
+        }
         self.resource_service = Some(service);
+        self.drm_cleanup_registry = Some(registry);
     }
 
     #[allow(dead_code)]
@@ -2298,6 +2360,13 @@ impl KmsBackend {
         &self,
     ) -> Option<&crate::kms::render::resources::ResourceService> {
         self.resource_service.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn drm_cleanup_registry(
+        &self,
+    ) -> Option<&crate::kms::render::resources::DrmCleanupRegistry> {
+        self.drm_cleanup_registry.as_ref()
     }
 
     /// F5a-M1: a clone of this backend's live direct-ownership cells, for
@@ -2593,8 +2662,13 @@ impl KmsBackend {
             .present_source_pins
             .get_mut(&fallback_target_pin)
             .and_then(|entry| entry.lease.take());
+        let framebuffer = self
+            .scanout_m2
+            .queued_successor
+            .as_mut()
+            .and_then(|frame| frame.framebuffer_lease.take());
         Ok(crate::kms::render::resources::CommitResources::new(
-            Vec::new(),
+            framebuffer.into_iter().collect(),
             source,
             fallback,
             None,
@@ -2634,6 +2708,17 @@ impl KmsBackend {
             && let Some(entry) = self.present_source_pins.get_mut(&fallback_target_pin)
         {
             entry.lease = Some(lease);
+        }
+        if resources.allocations.len() > 1 {
+            return Err(crate::kms::render::resources::ResourceError::InvalidState);
+        }
+        if let Some(lease) = resources.allocations.pop()
+            && let Some(frame) = self.scanout_m2.queued_successor.as_mut()
+        {
+            if frame.framebuffer_lease.is_some() {
+                return Err(crate::kms::render::resources::ResourceError::InvalidState);
+            }
+            frame.framebuffer_lease = Some(lease);
         }
         Ok(())
     }
@@ -2717,7 +2802,7 @@ impl KmsBackend {
             .entries
             .get(&frame.source_id)
             .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
+            .and_then(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
             .ok_or_else(|| io::Error::other("direct successor framebuffer disappeared"))?;
         let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
             .platform
@@ -3705,30 +3790,18 @@ impl KmsBackend {
         eligibility
     }
 
-    /// Return the producer frame named by an owner admission decision.
-    /// Keeping this lookup behind the backend preserves the direct frame's
-    /// ownership while letting the owner-route module build its description.
-    pub(crate) fn direct_successor_source_for_owner(
-        &self,
-        source_generation: u64,
-    ) -> Option<DrawableId> {
-        self.scanout_m2
-            .queued_successor
-            .as_ref()
-            .filter(|frame| frame.admission_source_generation == Some(source_generation))
-            .map(|frame| frame.source_id)
-    }
-
-    /// Resolve the imported framebuffer retained by the producer's M1 probe.
-    pub(crate) fn direct_source_framebuffer_for_owner(
-        &self,
+    pub(crate) fn take_owner_probe_framebuffer(
+        &mut self,
         source_id: DrawableId,
-    ) -> Option<::drm::control::framebuffer::Handle> {
+    ) -> Option<crate::drm::modeset::DirectScanoutProbeFramebuffer> {
         self.scanout_m1
             .entries
-            .get(&source_id)
-            .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
+            .get_mut(&source_id)
+            .and_then(ScanoutM1ProbeEntry::take_framebuffer)
+    }
+
+    pub(crate) fn remove_owner_probe_entry(&mut self, source_id: DrawableId) {
+        self.scanout_m1.remove(source_id);
     }
 
     fn scanout_m1_topology_signature(&self) -> u64 {
@@ -4253,7 +4326,7 @@ impl KmsBackend {
             self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
             return;
         };
-        let result = crate::drm::modeset::probe_direct_scanout_test_only(
+        let result = crate::drm::modeset::import_direct_scanout_framebuffer(
             Rc::clone(&primary.device),
             fd.as_fd(),
             u32::from(width),
@@ -4262,8 +4335,10 @@ impl KmsBackend {
             modifier,
             offset,
             pitch,
-            &plane_states,
-        );
+        )
+        .and_then(|framebuffer| {
+            crate::drm::modeset::validate_direct_scanout_test_only(framebuffer, &plane_states)
+        });
         match result {
             Ok(crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer)) => {
                 log::debug!(
@@ -6240,6 +6315,7 @@ impl KmsBackend {
             scanout_m2: ScanoutM2State::new(),
             admission_conductors: std::collections::BTreeMap::new(),
             resource_service: None,
+            drm_cleanup_registry: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             #[cfg(test)]
             test_skip_render_completion_drain: false,
@@ -7516,6 +7592,7 @@ impl KmsBackend {
             scanout_m2: ScanoutM2State::new(),
             admission_conductors: std::collections::BTreeMap::new(),
             resource_service: None,
+            drm_cleanup_registry: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             #[cfg(test)]
             test_skip_render_completion_drain: false,
@@ -20862,6 +20939,34 @@ impl KmsBackend {
             return Ok(false);
         }
 
+        // The existing fork is the only Owner/Legacy boundary. Legacy keeps
+        // the M1 cache's strong raw owner; the Owner route adopts through its
+        // dedicated module and carries the resulting lease with the frame.
+        let owner_device = self.platform.outputs[completion_output_idx].key.device_key;
+        let framebuffer_lease = if self.admission_is_active(owner_device) {
+            match crate::kms::render::direct_owner::adopt_framebuffer(
+                self, source_id, source_pin, &prep_slot,
+            ) {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
+                    <Self as Backend>::release_present_source(self, source_pin);
+                    <Self as Backend>::release_present_source(self, fallback_target_pin);
+                    let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                    self.request_direct_unflip("managed_prepare_framebuffer_adoption_refused");
+                    return Ok(false);
+                }
+                Err(error) => {
+                    <Self as Backend>::release_present_source(self, source_pin);
+                    <Self as Backend>::release_present_source(self, fallback_target_pin);
+                    let _ = self.commit_consumer.capacity.cancel_reservation(prep_slot);
+                    self.request_direct_unflip("managed_prepare_framebuffer_adoption_failed");
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
         // 5. Successful validation: `Successor` is a single physical slot,
         // so an atomic replace must free it before the new reservation can
         // move in. Discharge the victim's charge first -- it is still
@@ -20897,6 +21002,7 @@ impl KmsBackend {
         let frame = DirectPresentFrame {
             source_pin,
             fallback_target_pin,
+            framebuffer_lease,
             source_id,
             candidate,
             fallback_target,
@@ -22215,6 +22321,7 @@ impl Backend for KmsBackend {
         let mut frame = DirectPresentFrame {
             source_pin,
             fallback_target_pin,
+            framebuffer_lease: None,
             source_id,
             candidate,
             fallback_target,
@@ -30816,6 +30923,7 @@ mod tests {
         cell::RefCell,
         collections::{HashMap, VecDeque},
         io,
+        os::fd::AsFd,
         rc::Rc,
     };
     use yserver_core::{
@@ -32074,7 +32182,6 @@ mod tests {
                 AllocationPayload, CoreRetirementBatch, GpuObligation, ObligationKind,
                 ResourceService, tests::SpyAllocation,
             },
-            platform::drm::DrmDeviceKey,
             vt::state::VtState,
         };
         use std::{cell::Cell, rc::Rc};
@@ -32086,10 +32193,7 @@ mod tests {
         b.kms_outputs_active = false;
         b.scene.scene_structure_dirty = false;
 
-        let device = DrmDeviceKey {
-            major: 226,
-            minor: 0,
-        };
+        let device = b.platform.primary_device().expect("primary device").key;
         let incarnation = crate::kms::owner::identity::IncarnationId::first();
         let mut service = ResourceService::new(device, incarnation);
 
@@ -44937,6 +45041,7 @@ mod tests {
         b.scanout_m2.current = Some(super::DirectPresentFrame {
             source_pin,
             fallback_target_pin,
+            framebuffer_lease: None,
             source_id,
             candidate: PresentScanoutCandidate {
                 client_id: 1,
@@ -48158,6 +48263,7 @@ mod tests {
         let frame = super::DirectPresentFrame {
             source_pin,
             fallback_target_pin,
+            framebuffer_lease: None,
             source_id,
             candidate,
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
@@ -48759,6 +48865,7 @@ mod tests {
         b.scanout_m2.pending = Some(super::DirectPresentFrame {
             source_pin: 1,
             fallback_target_pin: 2,
+            framebuffer_lease: None,
             source_id,
             candidate,
             fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
@@ -51356,7 +51463,7 @@ mod tests {
 
     struct OwnerLiveFixture {
         backend: super::KmsBackend,
-        _registry: crate::kms::render::resources::DrmCleanupRegistry,
+        cleanup_calls: Rc<RefCell<Vec<crate::kms::render::resources::tests::CleanupCall>>>,
     }
 
     fn owner_live_fixture() -> Result<OwnerLiveFixture, std::io::Error> {
@@ -51454,7 +51561,7 @@ mod tests {
             Rc::clone(&device),
             device_key,
             incarnation,
-            Box::new(MockCleanupIo::new(cleanup_calls)),
+            Box::new(MockCleanupIo::new(Rc::clone(&cleanup_calls))),
         );
         let mut service = ResourceService::new(device_key, incarnation);
         for output_idx in 0..backend.platform.scanout_pools.len() {
@@ -51472,14 +51579,14 @@ mod tests {
                     })?;
             }
         }
-        backend.install_resource_service(service);
+        backend.install_resource_service_with_registry(service, registry);
         if extra_missing_output {
             backend
                 .platform
                 .append_test_output_without_scanout_pool("test-bad-output");
             return Ok(OwnerLiveFixture {
                 backend,
-                _registry: registry,
+                cleanup_calls,
             });
         }
         let gate =
@@ -51492,7 +51599,7 @@ mod tests {
         backend.install_admission_conductor_with_backend_composed_for_tests(device_key, source);
         Ok(OwnerLiveFixture {
             backend,
-            _registry: registry,
+            cleanup_calls,
         })
     }
 
@@ -51824,10 +51931,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_eligibility_matches_legacy_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         backend
             .scene
             .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
@@ -52431,10 +52536,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_legacy_direct_unchanged_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend
             .platform
             .primary_device()
@@ -52467,10 +52570,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_owner_direct_offers_instead_of_flipping_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend
             .platform
             .primary_device()
@@ -52510,10 +52611,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_displaced_successor_defers_its_skip_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend
             .platform
             .primary_device()
@@ -52611,10 +52710,8 @@ mod tests {
     fn c0_conv_cii_retirement_promotion_order_vulkan() {
         use crate::kms::render::admission::AdmissionTraceStep;
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend
             .platform
             .primary_device()
@@ -52870,10 +52967,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_direct_description_carries_present_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let (candidate, event) =
@@ -52923,11 +53018,9 @@ mod tests {
         use yserver_core::backend::{PresentClockSample, PresentClockSource};
 
         for hardware_complete_first in [false, true] {
-            let OwnerLiveFixture {
-                mut backend,
-                _registry,
-            } = owner_live_fixture_with_output_count(2, false)
-                .expect("environmental skip: no live Vulkan ICD available");
+            let OwnerLiveFixture { mut backend, .. } =
+                owner_live_fixture_with_output_count(2, false)
+                    .expect("environmental skip: no live Vulkan ICD available");
             let device = backend.platform.primary_device().expect("device").key;
             backend.scanout_m2.test_submit_direct_without_drm = true;
             let (candidate, event) =
@@ -53022,10 +53115,7 @@ mod tests {
     fn c0_conv_cii_direct_unknown_terminal_skips_vulkan() {
         use yserver_core::backend::{PresentClockSample, PresentClockSource};
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture_with_output_count(2, false)
+        let OwnerLiveFixture { mut backend, .. } = owner_live_fixture_with_output_count(2, false)
             .expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.scanout_m2.test_submit_direct_without_drm = true;
@@ -53081,10 +53171,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_direct_skip_without_history_is_unstamped_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let (candidate, event) =
@@ -53127,10 +53215,8 @@ mod tests {
     fn c0_conv_cii_stale_presented_does_not_move_the_clocks_vulkan() {
         use yserver_core::backend::{PresentClockSample, PresentClockSource};
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let prior = PresentClockSample {
@@ -53217,10 +53303,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_direct_carries_its_pins_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let (candidate, event) =
@@ -53290,10 +53374,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_direct_pins_released_only_by_the_ledger_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let (candidate, event) =
             c0_conv_cii_try_candidate(&mut backend, 0xc621, 0xc622, 0xc623, 121);
@@ -53379,10 +53461,8 @@ mod tests {
                 .expect("live output damage")
         }
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let before_owner = damage_signature(&backend);
         let (candidate, event) =
@@ -53398,10 +53478,8 @@ mod tests {
             "Owner direct entry must not invalidate or stage composed damage"
         );
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.admission_conductors.clear();
         install_admission_legacy_gate(&mut backend, device);
@@ -53435,10 +53513,8 @@ mod tests {
                 .expect("live output damage")
         }
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let before = damage_signature(&backend);
         let (candidate, event) =
@@ -53555,10 +53631,8 @@ mod tests {
     fn c0_conv_cii_primary_flip_does_not_retire_a_newer_cursor_vulkan() {
         use std::sync::Arc;
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let cursor = |version| crate::kms::render::scene::CursorEntry {
             id: crate::kms::render::store::DrawableId::for_tests(0xc900 + version),
@@ -53614,10 +53688,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_owner_tick_accumulates_damage_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let damage = ash::vk::Rect2D {
             offset: ash::vk::Offset2D { x: 17, y: 23 },
             extent: ash::vk::Extent2D {
@@ -53647,10 +53719,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_owner_tick_offers_instead_of_flipping_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         let crtc = u32::from(backend.platform.outputs[0].output.crtc);
         backend.scene.mark_scene_structure_dirty();
@@ -53752,10 +53822,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_submitted_generation_survives_the_next_tick_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
@@ -53807,10 +53875,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_ready_only_after_render_completion_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         let crtc = u32::from(backend.platform.outputs[0].output.crtc);
         backend.scene.mark_scene_structure_dirty();
@@ -53879,10 +53945,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_displaced_generation_acks_nothing_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
@@ -54014,11 +54078,9 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_owner_refused_for_one_bad_output_of_many_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture_with_extra_missing_output(true)
-            .expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture_with_extra_missing_output(true)
+                .expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         let incarnation = backend
             .platform
@@ -54150,10 +54212,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cir_owner_membership_agrees_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
 
         assert_owner_membership_agrees_for_tests(&backend, "initial");
@@ -54239,10 +54299,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cir_owner_state_sequence_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
 
         // Rendering → Submitted → Accepted → Current, then the next
@@ -54372,10 +54430,8 @@ mod tests {
 
         // A newer Rendering generation displaces an older one before
         // admission, and the pre-IPC refusal restores Desired.
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
         let (displaced_bo, _, _) = backend
@@ -54391,10 +54447,8 @@ mod tests {
             "Displaced",
         );
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
         let (desired_bo, _, _) = backend
@@ -54416,10 +54470,8 @@ mod tests {
             "pre-IPC refusal Desired",
         );
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
@@ -54455,10 +54507,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_transaction_installed_inside_the_closure_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         assert_eq!(
             backend.scene.owner_damage_transaction_count_for_tests(),
@@ -54480,10 +54530,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_stage_at_accepted_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         assert!(
             backend
@@ -54509,10 +54557,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_apply_at_hardware_complete_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         let snapshots = backend.scene.owner_damage_snapshot_count_for_tests(
             crate::kms::render::resources::CommitKey::new(device, commit),
@@ -54560,10 +54606,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_dispatched_retains_the_transaction_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         backend.route_owner_event_batch(
             device,
@@ -54583,10 +54627,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_rejection_closes_without_staging_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         let (bo_idx, _, _) = backend
             .scene
@@ -54622,10 +54664,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_unknown_invalidates_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         let (bo_idx, _, _) = backend
             .scene
@@ -54660,10 +54700,8 @@ mod tests {
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_invalidation_sources_invalidate_vulkan() {
         {
-            let OwnerLiveFixture {
-                mut backend,
-                _registry,
-            } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+            let OwnerLiveFixture { mut backend, .. } =
+                owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
             let (device, _commit) = owner_damage_commit_for_tests(&mut backend);
             let (bo_idx, _, _) = backend
                 .scene
@@ -54692,10 +54730,8 @@ mod tests {
             );
         }
         {
-            let OwnerLiveFixture {
-                mut backend,
-                _registry,
-            } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+            let OwnerLiveFixture { mut backend, .. } =
+                owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
             let (device, commit) = owner_damage_commit_for_tests(&mut backend);
             let (bo_idx, _, _) = backend
                 .scene
@@ -54726,10 +54762,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_stale_milestone_after_topology_change_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         let (bo_idx, _, _) = backend
             .scene
@@ -54766,10 +54800,8 @@ mod tests {
     fn c0_conv_ci_buffer_reuse_waits_for_every_gate_vulkan() {
         use crate::kms::render::resources::ObligationKind;
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
 
         backend.scene.mark_scene_structure_dirty();
@@ -54920,10 +54952,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_pre_ipc_refusal_returns_the_buffer_to_desired_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
 
         backend.scene.mark_scene_structure_dirty();
         backend.tick_maybe_composite_for_tests_without_render_completion_drain();
@@ -54956,10 +54986,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_new_paint_survives_the_ack_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, commit) = owner_damage_commit_for_tests(&mut backend);
         let drawable = backend
             .scene
@@ -54996,10 +55024,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_bundle_is_one_transaction_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture_with_three_outputs()
+        let OwnerLiveFixture { mut backend, .. } = owner_live_fixture_with_three_outputs()
             .expect("environmental skip: no live Vulkan ICD available");
         assert_eq!(
             backend.platform.outputs.len(),
@@ -55055,10 +55080,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_composited_present_completes_once_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let root = backend.core.window_id;
         let root_extent = (
             u32::from(backend.platform.fb_w),
@@ -55120,10 +55143,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ci_owed_repaint_wakes_without_new_paint_vulkan() {
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device, first_commit) = owner_damage_commit_for_tests(&mut backend);
         backend.route_owner_event_batch(
             device,
@@ -55196,10 +55217,8 @@ mod tests {
         use yserver_core::resources::ROOT_WINDOW;
         use yserver_protocol::x11::ResourceId;
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let mut state = yserver_core::server::ServerState::new();
         install_client_for_render(&mut state, 14);
         state
@@ -55268,10 +55287,7 @@ mod tests {
         use yserver_core::resources::ROOT_WINDOW;
         use yserver_protocol::x11::ResourceId;
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture_with_three_outputs()
+        let OwnerLiveFixture { mut backend, .. } = owner_live_fixture_with_three_outputs()
             .expect("environmental skip: no live Vulkan ICD available");
         assert_eq!(backend.platform.outputs.len(), 3);
 
@@ -55457,7 +55473,7 @@ mod tests {
 
         let OwnerLiveFixture {
             mut backend,
-            _registry,
+            cleanup_calls,
         } = owner_live_fixture_with_three_outputs()
             .expect("environmental skip: no live Vulkan ICD available");
         let mut state = yserver_core::server::ServerState::new();
@@ -55496,7 +55512,10 @@ mod tests {
             .fill_rectangle(None, output_one_window.as_raw(), 0x0000_62ff, 0, 0, 32, 32)
             .expect("paint output-one window");
         (
-            OwnerLiveFixture { backend, _registry },
+            OwnerLiveFixture {
+                backend,
+                cleanup_calls,
+            },
             state,
             output_zero_window,
             output_one_window,
@@ -55541,10 +55560,7 @@ mod tests {
     fn c0_conv_ci_two_outputs_permuted_completions_vulkan() {
         let run_separate_order = |first_output: usize, second_output: usize| {
             let (
-                OwnerLiveFixture {
-                    mut backend,
-                    _registry,
-                },
+                OwnerLiveFixture { mut backend, .. },
                 _state,
                 output_zero_window,
                 output_one_window,
@@ -56225,6 +56241,7 @@ mod tests {
     fn c0_adm_conductor_unflip_request_terminalizes_the_queued_frame() {
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
+        install_admission_resource_service(&mut backend);
         install_admission_owner_gate(&mut backend, device);
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
@@ -57049,10 +57066,8 @@ mod tests {
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_ciii_owner_device_issues_no_legacy_primary_write_vulkan() {
         crate::drm::clear_legacy_sink_entries_for_tests();
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.outputs[0].key.device_key;
         backend.scene.mark_scene_structure_damage_rect(
             0,
@@ -57083,10 +57098,8 @@ mod tests {
         c0_conv_ciii_complete_scene_commit(&mut backend, 0, device);
 
         crate::drm::clear_legacy_sink_entries_for_tests();
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (candidate, event) =
             c0_conv_cii_try_candidate(&mut backend, 0xc951, 0xc952, 0xc953, 951);
         let direct_result = backend.try_present_direct(candidate, event);
@@ -57098,10 +57111,8 @@ mod tests {
         assert!(direct_result.expect("owner direct offer"));
 
         crate::drm::clear_legacy_sink_entries_for_tests();
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
         let (first_candidate, first_event) =
             c0_conv_cii_try_candidate(&mut backend, 0xc951, 0xc962, 0xc963, 961);
@@ -58010,6 +58021,7 @@ mod tests {
 
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
+        install_admission_resource_service(&mut backend);
         install_admission_owner_gate(&mut backend, device);
         let (source, readiness, eligible) = AdmissionSourceFixture::new();
         AdmissionSourceFixture::set_readiness(
@@ -58050,6 +58062,7 @@ mod tests {
     fn c0_adm_conductor_direct_offer_replaces_frame_and_descriptor_together() {
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
+        install_admission_resource_service(&mut backend);
         install_admission_owner_gate(&mut backend, device);
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
@@ -58695,48 +58708,23 @@ mod tests {
     }
 
     #[test]
-    fn c0_adm_conductor_refusal_without_resource_service_closes_transport() {
-        use crate::kms::owner::{device::DispatchError, record::RefusalCause};
-
+    fn c0_adm_conductor_missing_resource_service_refuses_at_preparation() {
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
         install_admission_owner_gate(&mut backend, device);
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
         let (source_id, candidate, event) = admission_direct_candidate(&mut backend, 43);
-        assert!(
-            backend
-                .admission_offer_direct(device, source_id, candidate, event)
-                .expect("direct offer")
-        );
-
-        let snapshot = backend.admission_snapshot(device, false).expect("snapshot");
-        let decision = backend.admission_conductors[&device]
-            .admission
-            .decide(&snapshot)
-            .expect("direct decision");
-        let token = backend
-            .admission_conductors
-            .get_mut(&device)
-            .expect("conductor")
-            .admission
-            .lock(decision.clone(), &snapshot)
-            .expect("lock");
         assert!(matches!(
-            backend.admission_dispose_refusal_for_tests(
-                device,
-                token,
-                decision.admitted,
-                DispatchError::Refused {
-                    cause: RefusalCause::Reaped,
-                    events: Vec::new(),
-                },
-            ),
-            crate::kms::render::admission::AdmissionOutcome::TransportClosed
+            backend.admission_offer_direct(device, source_id, candidate, event),
+            Err(crate::kms::render::resources::ResourceError::InvalidState)
         ));
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert!(backend.scanout_m2.queued_successor_role.is_none());
+        assert_eq!(backend.commit_consumer.capacity.occupied(), 0);
         assert_eq!(
             backend.platform.transport_gate(&device).unwrap().state(),
-            crate::kms::render::resources::TransportState::Closed
+            crate::kms::render::resources::TransportState::Owner
         );
     }
 
@@ -59335,6 +59323,7 @@ mod tests {
     fn c0_adm_conductor_layout_change_withdraws_the_queued_successor() {
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
+        install_admission_resource_service(&mut backend);
         install_admission_owner_gate(&mut backend, device);
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
@@ -59388,6 +59377,7 @@ mod tests {
     fn c0_adm_conductor_layout_change_with_nothing_in_flight_publishes_the_skip() {
         let mut backend = super::KmsBackend::for_tests();
         let device = backend.platform.primary_device().unwrap().key;
+        install_admission_resource_service(&mut backend);
         install_admission_owner_gate(&mut backend, device);
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
@@ -61220,6 +61210,13 @@ mod tests {
         {
             let mut backend = backend_with_current_and_successor_for_admission_seam();
             let device = backend.platform.primary_device().unwrap().key;
+            admission_install_executor(
+                &mut backend,
+                crate::kms::executor::test_support::spawn_stub_helper(
+                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                )
+                .expect("direct executor"),
+            );
             let member = backend.commit_consumer.current_resources[0].crtcs[0];
             let current_role = backend.commit_consumer.current_resources[0]
                 .direct_role
@@ -61235,13 +61232,6 @@ mod tests {
                 .expect("resource service")
                 .freeze(old_key)
                 .expect("freeze old allocation");
-            admission_install_executor(
-                &mut backend,
-                crate::kms::executor::test_support::spawn_stub_helper(
-                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
-                )
-                .expect("direct executor"),
-            );
             install_admission_owner_gate(&mut backend, device);
             let (source, _, _) = AdmissionSourceFixture::new();
             backend.install_admission_conductor_for_tests(device, source);
@@ -61859,13 +61849,11 @@ mod tests {
     fn c0_conv_ciii_id_foreign_milestones_leave_a_damage_transaction_alone() {
         use crate::kms::owner::{ledger::Submitted, record::TerminalState};
 
-        let OwnerLiveFixture {
-            mut backend,
-            _registry,
-        } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let OwnerLiveFixture {
             backend: mut backend_b,
-            _registry: _registry_b,
+            ..
         } = owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let (device_a, commit_a) = owner_damage_commit_for_tests(&mut backend);
         let (device_b_live, commit_b) = owner_damage_commit_for_tests(&mut backend_b);
@@ -62333,5 +62321,602 @@ mod tests {
             !backend.direct_scanout_topology_eligible(),
             "a grouped direct unit must refuse outputs owned by different DRM devices"
         );
+    }
+
+    #[test]
+    fn c0_conv_cfb_registry_installed_with_the_service() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        let incarnation = IncarnationId::first();
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            device,
+            incarnation,
+        ));
+
+        let service = backend
+            .resource_service()
+            .expect("resource service installed");
+        let registry = backend
+            .drm_cleanup_registry()
+            .expect("cleanup registry installed with service");
+        assert_eq!(service.device(), device);
+        assert_eq!(service.incarnation(), incarnation);
+        assert_eq!(registry.device_key(), device);
+        assert_eq!(registry.incarnation(), incarnation);
+    }
+
+    #[test]
+    fn c0_conv_cfb_legacy_probe_cache_unchanged() {
+        use yserver_core::backend::PresentScanoutCandidate;
+
+        let mut backend = super::KmsBackend::for_tests();
+        let crtc_id = 0xc0fb;
+        bind_test_randr_crtc(&mut backend, 0, crtc_id);
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 1,
+            crtc_id,
+            crtc_epoch: backend.present_crtc_clock_epoch(crtc_id),
+            src_pixmap_xid: 0x100,
+            dst_window_xid: 0x200,
+            src_host_xid: 0x300,
+            paint_dst_host_xid: 0x400,
+            completion_dst_host_xid: 0x400,
+            src_width: 800,
+            src_height: 600,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let before = (
+            backend.scanout_m0.m1_probe_pass,
+            backend.scanout_m0.m1_probe_reject,
+            backend.scanout_m0.m1_probe_error,
+        );
+        backend.maybe_probe_scanout_m1(
+            Some(crate::kms::render::store::DrawableId::for_tests(0xc0fb)),
+            super::ScanoutM0Target::Other,
+            super::ScanoutM0Coverage::Output(0),
+            candidate,
+        );
+        assert!(backend.scanout_m1.entries.is_empty());
+        assert_eq!(
+            (
+                backend.scanout_m0.m1_probe_pass,
+                backend.scanout_m0.m1_probe_reject,
+                backend.scanout_m0.m1_probe_error,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn c0_conv_cfb_probe_split_keeps_legacy_probe_result() {
+        let device = Rc::new(crate::drm::Device::for_tests().expect("test DRM device"));
+        let invalid_fourcc = 0;
+        let fd = std::fs::File::open("/dev/null").expect("/dev/null");
+        let error = crate::drm::modeset::import_direct_scanout_framebuffer(
+            Rc::clone(&device),
+            fd.as_fd(),
+            1,
+            1,
+            invalid_fourcc,
+            0,
+            0,
+            4,
+        )
+        .err()
+        .expect("invalid fourcc must fail before PRIME import");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("unknown DRM fourcc"));
+
+        let wrapper_error = crate::drm::modeset::probe_direct_scanout_test_only(
+            device,
+            fd.as_fd(),
+            1,
+            1,
+            invalid_fourcc,
+            0,
+            0,
+            4,
+            &[],
+        )
+        .err()
+        .expect("the legacy wrapper must preserve its invalid-input result");
+        assert_eq!(wrapper_error.kind(), io::ErrorKind::Other);
+        assert!(
+            wrapper_error
+                .to_string()
+                .contains("empty plane transaction")
+        );
+    }
+
+    #[test]
+    fn c0_conv_cfb_managed_entry_serves_no_legacy_handle() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 1)
+            .expect("real PRIME import and ADDFB2");
+        let entry = fixture
+            .backend
+            .scanout_m1
+            .entries
+            .get_mut(&prepared.source_id)
+            .expect("production cache entry");
+        let framebuffer = entry
+            .take_framebuffer()
+            .expect("accepted entry owns the imported framebuffer");
+        assert!(entry.framebuffer().is_none());
+        assert!(framebuffer.handle().is_some());
+        drop(framebuffer);
+    }
+
+    struct OwnerDirectCandidate {
+        source_id: crate::kms::render::store::DrawableId,
+        candidate: yserver_core::backend::PresentScanoutCandidate,
+        event: yserver_core::backend::CompletedPresentEvent,
+    }
+
+    /// Build a real direct candidate up to (but not including) TEST_ONLY.
+    /// The source is a Vulkan-exported pixmap re-imported through the
+    /// production DRI3 path; the final cache insertion is the production M1
+    /// cache insertion, so no test fabricates a probe entry or a framebuffer.
+    fn owner_direct_candidate_with_real_import(
+        backend: &mut super::KmsBackend,
+        present_id: u32,
+    ) -> io::Result<OwnerDirectCandidate> {
+        use std::os::fd::AsFd;
+        use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
+
+        let width = backend.platform.fb_w;
+        let height = backend.platform.fb_h;
+        let exported = backend.create_pixmap(None, 24, width, height)?;
+        let exported_xid = exported.as_raw();
+        let dma_buf = backend.promote_and_export_pixmap_for_tests(exported_xid)?;
+        let source = backend.dri3_import_pixmap(
+            dma_buf.fd,
+            width,
+            height,
+            dma_buf.stride,
+            dma_buf.offset,
+            yserver_core::backend::Dri3ImportModifier::Explicit(dma_buf.modifier),
+            24,
+            32,
+        )?;
+        let source_xid = source.as_raw();
+        let source_id = backend
+            .store
+            .lookup(source_xid)
+            .ok_or_else(|| io::Error::other("real DRI3 import was not stored"))?;
+        let fallback = backend.create_pixmap(None, 24, width, height)?;
+        let fallback_xid = fallback.as_raw();
+        let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
+        bind_test_randr_crtc(backend, 0, crtc_id);
+        let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+
+        let (fourcc, modifier, offset, pitch, imported_fd) = {
+            let drawable = backend
+                .store
+                .get(source_id)
+                .ok_or_else(|| io::Error::other("real DRI3 drawable vanished"))?;
+            let metadata = drawable
+                .imported_dmabuf()
+                .ok_or_else(|| io::Error::other("real import has no dma-buf metadata"))?;
+            let plane = metadata
+                .planes
+                .first()
+                .ok_or_else(|| io::Error::other("real import has no plane metadata"))?;
+            let fd = drawable
+                .imported_drawable()
+                .and_then(|image| image.imported_dma_buf_fd())
+                .ok_or_else(|| io::Error::other("real import has no dma-buf fd"))?
+                .try_clone_to_owned()?;
+            (
+                metadata.fourcc,
+                metadata.modifier,
+                plane.offset,
+                plane.pitch,
+                fd,
+            )
+        };
+        let primary = backend
+            .platform
+            .primary_device()
+            .ok_or_else(|| io::Error::other("live fixture has no primary device"))?;
+        let framebuffer = crate::drm::modeset::import_direct_scanout_framebuffer(
+            Rc::clone(&primary.device),
+            imported_fd.as_fd(),
+            u32::from(width),
+            u32::from(height),
+            fourcc,
+            modifier,
+            offset,
+            pitch,
+        )?;
+        backend
+            .scanout_m1
+            .insert(source_id, super::ScanoutM1ProbeEntry::accepted(framebuffer));
+
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: u64::from(present_id),
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: source_xid,
+            dst_window_xid: 0,
+            src_host_xid: source_xid,
+            paint_dst_host_xid: fallback_xid,
+            completion_dst_host_xid: 0,
+            src_width: width,
+            src_height: height,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: present_id,
+            host_xid: source_xid,
+            dst_host_xid: 0,
+            options: 0,
+            present_id: u64::from(present_id),
+            window_generation: 1,
+            crtc_id,
+            crtc_epoch,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: 0,
+            emit_idle: false,
+        };
+        Ok(OwnerDirectCandidate {
+            source_id,
+            candidate,
+            event,
+        })
+    }
+
+    #[test]
+    fn c0_conv_cfb_permit_rejections() {
+        use crate::kms::render::resources::{
+            DirectCapacity, DirectRole, ResourceError, ResourceService,
+        };
+
+        let device = test_device_key(1);
+        let incarnation = IncarnationId::first();
+        let mut capacity = DirectCapacity::new();
+        let mut service = ResourceService::new(device, incarnation);
+        service
+            .bind_direct_capacity(&capacity)
+            .expect("pair service and capacity");
+        let reservation = capacity
+            .reserve(DirectRole::Preparing)
+            .expect("reserve preparing");
+        let permit = capacity
+            .mint_direct_lease_permit(
+                &reservation,
+                device,
+                incarnation,
+                service.direct_lease_binding(),
+            )
+            .expect("mint preparing permit");
+        assert!(
+            service
+                .check_direct_framebuffer_adoptability(&capacity, DirectRole::Preparing, &permit,)
+                .is_ok()
+        );
+        let foreign_device_permit = capacity
+            .mint_direct_lease_permit(
+                &reservation,
+                test_device_key(2),
+                incarnation,
+                service.direct_lease_binding(),
+            )
+            .expect("mint foreign-device permit");
+        assert_eq!(
+            service.check_direct_framebuffer_adoptability(
+                &capacity,
+                DirectRole::Preparing,
+                &foreign_device_permit,
+            ),
+            Err(ResourceError::InvalidProof)
+        );
+        let foreign_incarnation_permit = capacity
+            .mint_direct_lease_permit(
+                &reservation,
+                device,
+                IncarnationId::from_raw(2),
+                service.direct_lease_binding(),
+            )
+            .expect("mint foreign-incarnation permit");
+        assert_eq!(
+            service.check_direct_framebuffer_adoptability(
+                &capacity,
+                DirectRole::Preparing,
+                &foreign_incarnation_permit,
+            ),
+            Err(ResourceError::InvalidProof)
+        );
+        assert_eq!(
+            service.check_direct_framebuffer_adoptability(
+                &capacity,
+                DirectRole::Successor,
+                &permit,
+            ),
+            Err(ResourceError::InvalidProof)
+        );
+
+        let mut foreign_capacity = DirectCapacity::new();
+        let foreign_reservation = foreign_capacity
+            .reserve(DirectRole::Preparing)
+            .expect("reserve foreign preparing");
+        let foreign_permit = foreign_capacity
+            .mint_direct_lease_permit(
+                &foreign_reservation,
+                device,
+                incarnation,
+                service.direct_lease_binding(),
+            )
+            .expect("mint foreign permit");
+        assert_eq!(
+            service.check_direct_framebuffer_adoptability(
+                &capacity,
+                DirectRole::Preparing,
+                &foreign_permit,
+            ),
+            Err(ResourceError::InvalidProof)
+        );
+
+        let mut reservation = reservation;
+        capacity
+            .move_role(&mut reservation, DirectRole::Successor)
+            .expect("move reservation to invalidate stale permit");
+        assert_eq!(
+            service.check_direct_framebuffer_adoptability(
+                &capacity,
+                DirectRole::Preparing,
+                &permit,
+            ),
+            Err(ResourceError::InvalidProof)
+        );
+
+        let mut recycled_capacity = DirectCapacity::new();
+        let mut recycled_service = ResourceService::new(device, incarnation);
+        recycled_service
+            .bind_direct_capacity(&recycled_capacity)
+            .expect("pair recycled-proof service and capacity");
+        let recycled_reservation = recycled_capacity
+            .reserve(DirectRole::Preparing)
+            .expect("reserve recycled-proof role");
+        let recycled_permit = recycled_capacity
+            .mint_direct_lease_permit(
+                &recycled_reservation,
+                device,
+                incarnation,
+                recycled_service.direct_lease_binding(),
+            )
+            .expect("mint recycled-proof permit");
+        let recycled_serial = recycled_reservation.serial();
+        recycled_capacity
+            .cancel_reservation(recycled_reservation)
+            .expect("cancel recycled-proof reservation");
+        let replacement_reservation = recycled_capacity
+            .reserve(DirectRole::Preparing)
+            .expect("reserve preparing again with a new serial");
+        assert_ne!(recycled_serial, replacement_reservation.serial());
+        recycled_permit.refresh_state_for_test(&recycled_capacity);
+        assert_eq!(
+            recycled_service.check_direct_framebuffer_adoptability(
+                &recycled_capacity,
+                DirectRole::Preparing,
+                &recycled_permit,
+            ),
+            Err(ResourceError::InvalidProof)
+        );
+        drop(replacement_reservation);
+
+        let mut dropped_capacity = DirectCapacity::new();
+        let mut dropped_service = ResourceService::new(device, incarnation);
+        dropped_service
+            .bind_direct_capacity(&dropped_capacity)
+            .expect("pair dropped-proof service and capacity");
+        let dropped_reservation = dropped_capacity
+            .reserve(DirectRole::Preparing)
+            .expect("reserve dropped-proof role");
+        let dropped_permit = dropped_capacity
+            .mint_direct_lease_permit(
+                &dropped_reservation,
+                device,
+                incarnation,
+                dropped_service.direct_lease_binding(),
+            )
+            .expect("mint dropped-proof permit");
+        drop(dropped_reservation);
+        assert_eq!(
+            dropped_service.check_direct_framebuffer_adoptability(
+                &dropped_capacity,
+                DirectRole::Preparing,
+                &dropped_permit,
+            ),
+            Err(ResourceError::InvalidProof)
+        );
+    }
+
+    #[test]
+    fn c0_conv_cfb_service_adoption_failure_releases_once() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 2)
+            .expect("real PRIME import and ADDFB2");
+        let device = fixture
+            .backend
+            .platform
+            .primary_device()
+            .expect("device")
+            .key;
+        let incarnation = fixture
+            .backend
+            .resource_service()
+            .expect("resource service")
+            .incarnation();
+        let _old_service = fixture.backend.resource_service.take().expect("service");
+        let registry = fixture
+            .backend
+            .drm_cleanup_registry
+            .take()
+            .expect("registry");
+        let mut service =
+            crate::kms::render::resources::ResourceService::for_tests_with_next_generation(
+                device,
+                incarnation,
+                u64::MAX,
+            );
+        service
+            .bind_direct_capacity(&fixture.backend.commit_consumer.capacity)
+            .expect("pair seeded service");
+        fixture.backend.resource_service = Some(service);
+        fixture.backend.drm_cleanup_registry = Some(registry);
+        let result = fixture.backend.managed_prepare_direct_candidate(
+            prepared.source_id,
+            prepared.candidate,
+            prepared.event,
+        );
+        assert!(result.is_err());
+        assert!(
+            fixture
+                .backend
+                .commit_consumer
+                .capacity
+                .is_admission_closed()
+        );
+        assert!(fixture.backend.scanout_m1.entries.is_empty());
+        assert_eq!(
+            fixture.cleanup_calls.borrow().len(),
+            2,
+            "failed adoption must release the imported FB and GEM exactly once"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_real_import_candidate_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 3)
+            .expect("real PRIME import and ADDFB2");
+        let entry = fixture
+            .backend
+            .scanout_m1
+            .entries
+            .get(&prepared.source_id)
+            .expect("production cache entry");
+        assert!(entry.framebuffer().and_then(|fb| fb.handle()).is_some());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_pin_retains_the_source_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 4)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("managed preparation")
+        );
+        let frame = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .expect("prepared successor");
+        assert_eq!(
+            fixture.backend.present_source_pin_id(frame.source_pin),
+            Some(prepared.source_id)
+        );
+        assert!(
+            fixture
+                .backend
+                .present_source_pins
+                .contains_key(&frame.source_pin)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_storage_is_not_adopted_at_preparation_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 5)
+            .expect("real PRIME import and ADDFB2");
+        let before = fixture
+            .backend
+            .root_storage_extent()
+            .expect("root storage extent");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("managed preparation")
+        );
+        assert_eq!(fixture.backend.root_storage_extent(), Some(before));
+        assert!(
+            fixture
+                .backend
+                .store
+                .get(prepared.source_id)
+                .expect("source drawable")
+                .managed_lease()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cfb_only_direct_holders_lease_the_framebuffer_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let prepared = owner_direct_candidate_with_real_import(&mut fixture.backend, 6)
+            .expect("real PRIME import and ADDFB2");
+        assert!(
+            fixture
+                .backend
+                .managed_prepare_direct_candidate(
+                    prepared.source_id,
+                    prepared.candidate,
+                    prepared.event,
+                )
+                .expect("managed preparation")
+        );
+        let lease = fixture
+            .backend
+            .scanout_m2
+            .queued_successor
+            .as_ref()
+            .and_then(|frame| frame.framebuffer_lease.as_ref())
+            .expect("owner preparation carries direct framebuffer lease");
+        let key = lease.key();
+        let mut service = fixture.backend.resource_service.take().expect("service");
+        assert!(matches!(
+            service.reserve(key, crate::kms::render::resources::UseKind::Retain),
+            Err(crate::kms::render::resources::ResourceError::InvalidState)
+        ));
+        fixture.backend.resource_service = Some(service);
     }
 }

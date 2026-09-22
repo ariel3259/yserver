@@ -1,7 +1,13 @@
 #![allow(dead_code)]
 use std::{cell::Cell, fmt, rc::Rc};
 
-use crate::kms::render::resources::{availability::ResourceError, commit::CommitResources};
+use crate::{
+    kms::{
+        owner::identity::IncarnationId,
+        render::resources::{availability::ResourceError, commit::CommitResources},
+    },
+    platform::drm::DrmDeviceKey,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum DirectRole {
@@ -38,6 +44,42 @@ pub(crate) struct RoleReservation {
     pub(crate) serial: u64,
     pub(crate) closed: Rc<Cell<bool>>,
     pub(crate) discharged: bool,
+    proof_state: Rc<DirectRoleProofState>,
+}
+
+#[derive(Debug)]
+struct DirectRoleProofState {
+    role: Cell<DirectRole>,
+    state: Cell<RoleState>,
+}
+
+/// Opaque proof that a direct-capacity role is currently held by the
+/// capacity that issued it.  The resource service validates every field; a
+/// reservation by itself is deliberately not accepted as a lease proof.
+#[derive(Debug)]
+pub(crate) struct DirectLeasePermit {
+    capacity: Rc<()>,
+    service: Rc<()>,
+    device: DrmDeviceKey,
+    incarnation: IncarnationId,
+    role: DirectRole,
+    serial: u64,
+    state: Rc<DirectRoleProofState>,
+}
+
+impl DirectLeasePermit {
+    pub(crate) fn service_binding_matches(&self, binding: &Rc<()>) -> bool {
+        Rc::ptr_eq(&self.service, binding)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_state_for_test(&self, capacity: &DirectCapacity) {
+        // Cancellation normally makes the stale proof state Vacant, which
+        // would mask the serial check.  Refresh only this test copy so the
+        // cancel/re-reserve case isolates the same-role serial invariant.
+        self.state.role.set(self.role);
+        self.state.state.set(capacity.roles[self.role.index()]);
+    }
 }
 
 impl RoleReservation {
@@ -48,6 +90,10 @@ impl RoleReservation {
             serial,
             closed,
             discharged: false,
+            proof_state: Rc::new(DirectRoleProofState {
+                role: Cell::new(role),
+                state: Cell::new(RoleState::Reserved(serial)),
+            }),
         }
     }
 
@@ -63,6 +109,7 @@ impl RoleReservation {
 impl Drop for RoleReservation {
     fn drop(&mut self) {
         if !self.discharged {
+            self.proof_state.state.set(RoleState::Vacant);
             self.closed.set(true);
         }
     }
@@ -91,6 +138,7 @@ pub(crate) struct DirectCapacity {
     roles: [RoleState; 6],
     next_serial: u64,
     admission_closed: Rc<Cell<bool>>,
+    identity: Rc<()>,
 }
 
 impl Default for DirectCapacity {
@@ -105,6 +153,7 @@ impl DirectCapacity {
             roles: [RoleState::Vacant; 6],
             next_serial: 0,
             admission_closed: Rc::new(Cell::new(false)),
+            identity: Rc::new(()),
         }
     }
 
@@ -152,7 +201,71 @@ impl DirectCapacity {
             serial,
             closed: Rc::clone(&self.admission_closed),
             discharged: false,
+            proof_state: Rc::new(DirectRoleProofState {
+                role: Cell::new(role),
+                state: Cell::new(RoleState::Reserved(serial)),
+            }),
         })
+    }
+
+    /// Mint a proof for the exact role reservation.  The service binding is
+    /// supplied by the service that will verify the proof; keeping it in the
+    /// opaque value prevents a permit from being replayed at another service.
+    pub(crate) fn mint_direct_lease_permit(
+        &self,
+        reservation: &RoleReservation,
+        device: DrmDeviceKey,
+        incarnation: IncarnationId,
+        service: Rc<()>,
+    ) -> Result<DirectLeasePermit, ResourceError> {
+        let idx = reservation.role.index();
+        if self.roles[idx] != RoleState::Reserved(reservation.serial)
+            && self.roles[idx] != RoleState::Occupied(reservation.serial)
+        {
+            return Err(ResourceError::InvalidState);
+        }
+        if reservation.proof_state.role.get() != reservation.role
+            || reservation.proof_state.state.get() != self.roles[idx]
+        {
+            return Err(ResourceError::InvalidState);
+        }
+        Ok(DirectLeasePermit {
+            capacity: Rc::clone(&self.identity),
+            service,
+            device,
+            incarnation,
+            role: reservation.role,
+            serial: reservation.serial,
+            state: Rc::clone(&reservation.proof_state),
+        })
+    }
+
+    pub(crate) fn accepts_direct_lease_permit(
+        &self,
+        permit: &DirectLeasePermit,
+        device: DrmDeviceKey,
+        incarnation: IncarnationId,
+        role: DirectRole,
+    ) -> bool {
+        if !Rc::ptr_eq(&permit.capacity, &self.identity)
+            || permit.device != device
+            || permit.incarnation != incarnation
+            || permit.role != role
+            || permit.state.role.get() != role
+        {
+            return false;
+        }
+        let state = permit.state.state.get();
+        matches!(state, RoleState::Reserved(s) | RoleState::Occupied(s) if s == permit.serial)
+            && self.roles[role.index()] == state
+    }
+
+    pub(crate) fn binding_matches(&self, binding: &Rc<()>) -> bool {
+        Rc::ptr_eq(&self.identity, binding)
+    }
+
+    pub(crate) fn binding_token(&self) -> Rc<()> {
+        Rc::clone(&self.identity)
     }
 
     #[allow(clippy::result_large_err)]
@@ -164,6 +277,7 @@ impl DirectCapacity {
         let idx = slot.role.index();
         if self.roles[idx] == RoleState::Reserved(slot.serial) {
             self.roles[idx] = RoleState::Occupied(slot.serial);
+            slot.proof_state.state.set(RoleState::Occupied(slot.serial));
             value.direct_role = Some(slot);
             Ok(value)
         } else {
@@ -179,6 +293,7 @@ impl DirectCapacity {
         let idx = slot.role.index();
         if self.roles[idx] == RoleState::Reserved(slot.serial) {
             self.roles[idx] = RoleState::Vacant;
+            slot.proof_state.state.set(RoleState::Vacant);
             slot.discharged = true;
             Ok(())
         } else {
@@ -194,6 +309,7 @@ impl DirectCapacity {
         let idx = slot.role.index();
         if self.roles[idx] == RoleState::Occupied(slot.serial) {
             self.roles[idx] = RoleState::Vacant;
+            slot.proof_state.state.set(RoleState::Vacant);
             slot.discharged = true;
             Ok(())
         } else {
@@ -226,6 +342,7 @@ impl DirectCapacity {
         self.roles[from_idx] = RoleState::Vacant;
         self.roles[to_idx] = state;
         slot.role = to;
+        slot.proof_state.role.set(to);
         Ok(())
     }
 
@@ -256,6 +373,12 @@ impl DirectCapacity {
         self.roles[res_idx] = RoleState::Occupied(reserved.serial);
         occupied.role = reserved.role;
         occupied.serial = reserved.serial;
+        occupied.proof_state.role.set(reserved.role);
+        occupied
+            .proof_state
+            .state
+            .set(RoleState::Occupied(reserved.serial));
+        reserved.proof_state.state.set(RoleState::Vacant);
         reserved.discharged = true;
         Ok(())
     }

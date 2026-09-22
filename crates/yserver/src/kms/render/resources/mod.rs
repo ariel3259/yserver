@@ -34,7 +34,9 @@ pub(crate) use availability::{
     can_destroy,
 };
 #[allow(unused_imports)]
-pub(crate) use capacity::{DirectCapacity, DirectRole, RoleReservation, RoleState};
+pub(crate) use capacity::{
+    DirectCapacity, DirectLeasePermit, DirectRole, RoleReservation, RoleState,
+};
 #[allow(unused_imports)]
 pub(crate) use commit::{
     CommitKey, CommitResourceConsumer, CommitResources, GroupMember, PresentRelease,
@@ -155,6 +157,13 @@ pub(crate) struct ResourceService {
     serviced_elapsed: std::time::Duration,
     last_serviced: Option<Instant>,
     max_serviced_duration: std::time::Duration,
+    /// Identity of the service that may validate a direct framebuffer
+    /// permit. The permit keeps its own clone, so a permit for another
+    /// service cannot be replayed here.
+    direct_lease_binding: Rc<()>,
+    /// The direct-capacity instance paired with this service at installation.
+    /// A framebuffer lease must be proven by that exact capacity.
+    direct_capacity_binding: Option<Rc<()>>,
     /// Spec 4.2 (stage 2c-i debt): the transport an uncertain or unwindable
     /// GPU submission must close (2c-i design section 4). `None` in
     /// production, where no gate is installed (R8).
@@ -180,6 +189,8 @@ impl ResourceService {
             serviced_elapsed: std::time::Duration::ZERO,
             last_serviced: None,
             max_serviced_duration: std::time::Duration::from_secs(5),
+            direct_lease_binding: Rc::new(()),
+            direct_capacity_binding: None,
             transport_gate: None,
         }
     }
@@ -214,6 +225,23 @@ impl ResourceService {
 
     pub(crate) fn device(&self) -> DrmDeviceKey {
         self.device
+    }
+
+    pub(crate) fn bind_direct_capacity(
+        &mut self,
+        capacity: &DirectCapacity,
+    ) -> Result<(), ResourceError> {
+        if let Some(bound) = &self.direct_capacity_binding
+            && !capacity.binding_matches(bound)
+        {
+            return Err(ResourceError::InvalidState);
+        }
+        self.direct_capacity_binding = Some(capacity.binding_token());
+        Ok(())
+    }
+
+    pub(crate) fn direct_lease_binding(&self) -> Rc<()> {
+        Rc::clone(&self.direct_lease_binding)
     }
 
     pub(crate) fn contains(&self, key: &AllocationKey) -> bool {
@@ -369,6 +397,15 @@ impl ResourceService {
         &mut self,
         payload: AllocationPayload,
     ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
+        self.adopt_unchecked_with_kind(payload, UseKind::Retain)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn adopt_unchecked_with_kind(
+        &mut self,
+        payload: AllocationPayload,
+        use_kind: UseKind,
+    ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
         if self.exhausted {
             return Err((ResourceError::Exhausted, payload));
         }
@@ -406,16 +443,64 @@ impl ResourceService {
             .availability
             .borrow_mut()
             .live_uses
-            .insert(UseId(use_id), UseKind::Retain);
+            .insert(UseId(use_id), use_kind);
 
         self.entries.insert(key, Rc::clone(&entry));
 
         Ok(AllocationLease::new(
             entry,
             UseId(use_id),
-            UseKind::Retain,
+            use_kind,
             Rc::downgrade(&self.dirty_entries),
         ))
+    }
+
+    pub(crate) fn check_direct_framebuffer_adoptability(
+        &self,
+        capacity: &DirectCapacity,
+        role: DirectRole,
+        permit: &DirectLeasePermit,
+    ) -> Result<(), ResourceError> {
+        if self.exhausted {
+            return Err(ResourceError::Exhausted);
+        }
+        if permit.service_binding_matches(&self.direct_lease_binding)
+            && self
+                .direct_capacity_binding
+                .as_ref()
+                .is_some_and(|bound| capacity.binding_matches(bound))
+            && capacity.accepts_direct_lease_permit(permit, self.device, self.incarnation, role)
+        {
+            Ok(())
+        } else {
+            Err(ResourceError::InvalidProof)
+        }
+    }
+
+    /// Adopt a framebuffer only through the role proof minted by the paired
+    /// direct capacity. Generic `adopt` remains available for other payloads,
+    /// but a direct framebuffer's live-use count must have a direct holder.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn adopt_direct_framebuffer(
+        &mut self,
+        payload: AllocationPayload,
+        registry: &mut DrmCleanupRegistry,
+        capacity: &DirectCapacity,
+        role: DirectRole,
+        permit: DirectLeasePermit,
+    ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
+        if !matches!(payload, AllocationPayload::DirectFramebuffer(_)) {
+            return Err((ResourceError::InvalidState, payload));
+        }
+        if self
+            .check_direct_framebuffer_adoptability(capacity, role, &permit)
+            .is_err()
+        {
+            return Err((ResourceError::InvalidProof, payload));
+        }
+        let lease = self.adopt_unchecked_with_kind(payload, UseKind::DirectFramebuffer)?;
+        registry.register_payload_alias(lease.key());
+        Ok(lease)
     }
 
     /// The only way to adopt a payload whose file-owned half is live (`adopt`
@@ -472,6 +557,34 @@ impl ResourceService {
         self.exhausted
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_next_generation(
+        device: DrmDeviceKey,
+        incarnation: IncarnationId,
+        next_generation: u64,
+    ) -> Self {
+        let mut service = Self::new(device, incarnation);
+        service.next_generation = next_generation;
+        service
+    }
+
+    pub(crate) fn direct_framebuffer_handle(
+        &self,
+        lease: &AllocationLease,
+    ) -> Result<::drm::control::framebuffer::Handle, ResourceError> {
+        if lease.kind() != UseKind::DirectFramebuffer {
+            return Err(ResourceError::InvalidProof);
+        }
+        let entry = self
+            .entries
+            .get(&lease.key())
+            .ok_or(ResourceError::Detached)?;
+        match entry.payload.borrow().as_ref() {
+            Some(AllocationPayload::DirectFramebuffer(allocation)) => Ok(allocation.fb_handle()),
+            _ => Err(ResourceError::InvalidState),
+        }
+    }
+
     /// F2b-m1: real exhaustion only happens after `u64::MAX` generations/
     /// uses/obligations or a serviced-time expiry, neither reachable in a
     /// unit test. This forces the same flag directly so
@@ -495,6 +608,13 @@ impl ResourceService {
         }
 
         let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+
+        if matches!(
+            entry.payload.borrow().as_ref(),
+            Some(AllocationPayload::DirectFramebuffer(_))
+        ) {
+            return Err(ResourceError::InvalidState);
+        }
 
         let mut avail = entry.availability.borrow_mut();
         if avail.frozen {
@@ -522,6 +642,46 @@ impl ResourceService {
             Rc::clone(entry),
             UseId(use_id),
             usage,
+            Rc::downgrade(&self.dirty_entries),
+        ))
+    }
+
+    pub(crate) fn reserve_direct_framebuffer(
+        &mut self,
+        capacity: &DirectCapacity,
+        key: AllocationKey,
+        role: DirectRole,
+        permit: DirectLeasePermit,
+    ) -> Result<AllocationLease, ResourceError> {
+        if key.device != self.device || key.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        self.check_direct_framebuffer_adoptability(capacity, role, &permit)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        if !matches!(
+            entry.payload.borrow().as_ref(),
+            Some(AllocationPayload::DirectFramebuffer(_))
+        ) {
+            return Err(ResourceError::InvalidState);
+        }
+        let mut avail = entry.availability.borrow_mut();
+        if avail.frozen {
+            return Err(ResourceError::Frozen);
+        }
+        let use_id = self.next_use_id;
+        let next_use = use_id.checked_add(1).ok_or_else(|| {
+            self.exhausted = true;
+            ResourceError::Exhausted
+        })?;
+        self.next_use_id = next_use;
+        avail
+            .live_uses
+            .insert(UseId(use_id), UseKind::DirectFramebuffer);
+        drop(avail);
+        Ok(AllocationLease::new(
+            Rc::clone(entry),
+            UseId(use_id),
+            UseKind::DirectFramebuffer,
             Rc::downgrade(&self.dirty_entries),
         ))
     }

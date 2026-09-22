@@ -1773,29 +1773,33 @@ impl KmsBackend {
                 return AdmissionOutcome::PreparationRefused;
             }
         };
+        let (desc, context) = match crate::kms::render::direct_owner::description(
+            self,
+            device,
+            &decision,
+            &prepared.resources,
+        ) {
+            Ok(description) => description,
+            Err(error) => {
+                log::warn!("direct owner description refused: {error}");
+                return self.admission_handle_dispatch_failure(
+                    device,
+                    token,
+                    DispatchFailureRoute::Direct {
+                        retirement: prepared.retirement,
+                    },
+                    DispatchFailureResources::Refused {
+                        new: vec![prepared.resources],
+                    },
+                );
+            }
+        };
         let PreparedDirectDispatch {
             resources: prepared_resources,
             retirement,
         } = prepared;
         let mut resources = Some(prepared_resources);
         let mut retirement = retirement;
-        let (desc, context) =
-            match crate::kms::render::direct_owner::description(self, device, &decision) {
-                Ok(description) => description,
-                Err(error) => {
-                    log::warn!("direct owner description refused: {error}");
-                    return self.admission_handle_dispatch_failure(
-                        device,
-                        token,
-                        DispatchFailureRoute::Direct {
-                            retirement: retirement.take(),
-                        },
-                        DispatchFailureResources::Refused {
-                            new: resources.take().into_iter().collect(),
-                        },
-                    );
-                }
-            };
 
         let result = {
             let consumer = &mut self.commit_consumer;

@@ -1413,12 +1413,10 @@ pub(crate) struct DirectScanoutProbeFramebuffer {
 }
 
 impl DirectScanoutProbeFramebuffer {
-    pub(crate) fn handle(&self) -> framebuffer::Handle {
+    pub(crate) fn handle(&self) -> Option<framebuffer::Handle> {
         match &self.inner {
-            ProbeFbOwnership::Legacy { fb, .. } => *fb,
-            ProbeFbOwnership::Managed => {
-                panic!("DirectScanoutProbeFramebuffer already converted to managed")
-            }
+            ProbeFbOwnership::Legacy { fb, .. } => Some(*fb),
+            ProbeFbOwnership::Managed => None,
         }
     }
 
@@ -1426,8 +1424,8 @@ impl DirectScanoutProbeFramebuffer {
     pub(crate) fn into_managed(
         mut self,
         registry: &mut crate::kms::render::resources::DrmCleanupRegistry,
-        source_lease: crate::kms::render::resources::AllocationLease,
-    ) -> crate::kms::render::resources::DirectFramebufferAllocation {
+        source_lease: Option<crate::kms::render::resources::AllocationLease>,
+    ) -> Option<crate::kms::render::resources::DirectFramebufferAllocation> {
         let prev = std::mem::replace(&mut self.inner, ProbeFbOwnership::Managed);
         match prev {
             ProbeFbOwnership::Legacy { device, fb, gem } => {
@@ -1438,18 +1436,18 @@ impl DirectScanoutProbeFramebuffer {
                     gem_raw,
                     crate::kms::render::resources::GemOwner::Right,
                 );
-                crate::kms::render::resources::DirectFramebufferAllocation::new(
-                    right,
-                    Some(source_lease),
-                    fb,
-                    gem,
-                    crate::kms::render::resources::GemOwner::Right,
-                    Some(device),
+                Some(
+                    crate::kms::render::resources::DirectFramebufferAllocation::new(
+                        right,
+                        source_lease,
+                        fb,
+                        gem,
+                        crate::kms::render::resources::GemOwner::Right,
+                        Some(device),
+                    ),
                 )
             }
-            ProbeFbOwnership::Managed => {
-                panic!("DirectScanoutProbeFramebuffer already converted to managed")
-            }
+            ProbeFbOwnership::Managed => None,
         }
     }
 }
@@ -1512,11 +1510,11 @@ fn should_retry_direct_scanout_addfb_legacy(modifier: u64, error: &io::Error) ->
     modifier == u64::from(DrmModifier::Linear) && error.kind() == io::ErrorKind::InvalidInput
 }
 
-/// Import one client dma-buf and test the exact all-output primary-plane
-/// transaction. `TEST_ONLY` is the sole commit flag, so this cannot change
-/// live scanout or generate page-flip events.
+/// Import one client dma-buf into a KMS GEM handle and framebuffer. This is
+/// the master-free half of the M1 probe: PRIME import and ADDFB2 do not alter
+/// live scanout and do not require a modeset or DRM master.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn probe_direct_scanout_test_only(
+pub(crate) fn import_direct_scanout_framebuffer(
     device: Rc<Device>,
     dma_buf: BorrowedFd<'_>,
     width: u32,
@@ -1525,11 +1523,7 @@ pub(crate) fn probe_direct_scanout_test_only(
     modifier: u64,
     offset: u64,
     pitch: u32,
-    planes: &[DirectScanoutPlaneState<'_>],
-) -> io::Result<DirectScanoutTestResult> {
-    if planes.is_empty() {
-        return Err(io::Error::other("scanout M1: empty plane transaction"));
-    }
+) -> io::Result<DirectScanoutProbeFramebuffer> {
     let fourcc = DrmFourcc::try_from(fourcc_code).map_err(|_| {
         io::Error::other(format!(
             "scanout M1: unknown DRM fourcc 0x{fourcc_code:08x}"
@@ -1588,6 +1582,32 @@ pub(crate) fn probe_direct_scanout_test_only(
         }
     };
 
+    Ok(DirectScanoutProbeFramebuffer {
+        inner: ProbeFbOwnership::Legacy { device, fb, gem },
+    })
+}
+
+/// Validate an imported M1 framebuffer against the exact all-output
+/// primary-plane transaction. `TEST_ONLY` is the sole commit flag, so this
+/// cannot change live scanout or generate page-flip events. The framebuffer
+/// is consumed so a rejected validation owns and destroys its import exactly
+/// once.
+pub(crate) fn validate_direct_scanout_test_only(
+    framebuffer: DirectScanoutProbeFramebuffer,
+    planes: &[DirectScanoutPlaneState<'_>],
+) -> io::Result<DirectScanoutTestResult> {
+    if planes.is_empty() {
+        return Err(io::Error::other("scanout M1: empty plane transaction"));
+    }
+    let mut framebuffer = framebuffer;
+    let ProbeFbOwnership::Legacy { device, fb, gem } =
+        std::mem::replace(&mut framebuffer.inner, ProbeFbOwnership::Managed)
+    else {
+        return Err(io::Error::other(
+            "scanout M1: managed framebuffer cannot be validated",
+        ));
+    };
+
     let mut request = AtomicModeReq::new();
     for state in planes {
         let output = state.output;
@@ -1638,6 +1658,38 @@ pub(crate) fn probe_direct_scanout_test_only(
             )))
         }
     }
+}
+
+/// Import and validate an M1 framebuffer in one call. The two public halves
+/// above are also used by the no-master fixture, while this wrapper preserves
+/// the Legacy probe's existing result shape and ordering.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_direct_scanout_test_only(
+    device: Rc<Device>,
+    dma_buf: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    fourcc_code: u32,
+    modifier: u64,
+    offset: u64,
+    pitch: u32,
+    planes: &[DirectScanoutPlaneState<'_>],
+) -> io::Result<DirectScanoutTestResult> {
+    if planes.is_empty() {
+        return Err(io::Error::other("scanout M1: empty plane transaction"));
+    }
+    let framebuffer = import_direct_scanout_framebuffer(
+        device,
+        dma_buf,
+        width,
+        height,
+        fourcc_code,
+        modifier,
+        offset,
+        pitch,
+    )?;
+    validate_direct_scanout_test_only(framebuffer, planes)
 }
 
 /// Install an M1-proven client framebuffer on every affected primary plane.

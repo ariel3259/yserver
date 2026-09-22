@@ -18,7 +18,10 @@ use crate::{
             composed_commit::{
                 ComposedPlane, composed_description, discover_composed_property_ids,
             },
-            resources::{CommitResources, ResourceError},
+            resources::{
+                AllocationLease, AllocationPayload, CommitResources, DirectRole, ResourceError,
+                RoleReservation,
+            },
             store::DrawableId,
         },
     },
@@ -70,6 +73,7 @@ pub(crate) fn description(
     backend: &mut KmsBackend,
     device: DrmDeviceKey,
     decision: &AdmissionDecision,
+    prepared: &CommitResources,
 ) -> Result<
     (
         CommitDescription,
@@ -79,11 +83,16 @@ pub(crate) fn description(
 > {
     let successor = decision_direct_successor(decision)
         .ok_or_else(|| "direct owner description needs a direct primary".to_string())?;
-    let source_id = backend
-        .direct_successor_source_for_owner(successor.source_generation)
-        .ok_or_else(|| "direct owner successor frame is unavailable".to_string())?;
-    let framebuffer = backend
-        .direct_source_framebuffer_for_owner(source_id)
+    let framebuffer = prepared
+        .allocations
+        .iter()
+        .find_map(|lease| {
+            backend
+                .resource_service
+                .as_ref()?
+                .direct_framebuffer_handle(lease)
+                .ok()
+        })
         .ok_or_else(|| "direct owner framebuffer is unavailable".to_string())?;
 
     let output_indices = backend
@@ -133,6 +142,121 @@ pub(crate) fn description(
     let context =
         backend.direct_owner_completion_context(device, &description.present_consumers)?;
     Ok((description, context))
+}
+
+/// Adopt the accepted M1 framebuffer at the Owner preparation fork. The
+/// cache is converted from a raw-resource owner to a managed index only
+/// after service adoptability has been proven; once `into_managed` runs, the
+/// returned payload is the sole owner and every failure is discharged through
+/// the paired registry.
+pub(crate) fn adopt_framebuffer(
+    backend: &mut KmsBackend,
+    source_id: DrawableId,
+    source_pin: u64,
+    preparing: &RoleReservation,
+) -> Result<Option<AllocationLease>, ResourceError> {
+    let (device, incarnation, service_binding) = {
+        let service = backend
+            .resource_service
+            .as_ref()
+            .ok_or(ResourceError::InvalidState)?;
+        (
+            service.device(),
+            service.incarnation(),
+            service.direct_lease_binding(),
+        )
+    };
+    let permit = backend.commit_consumer.capacity.mint_direct_lease_permit(
+        preparing,
+        device,
+        incarnation,
+        service_binding,
+    )?;
+    {
+        let service = backend
+            .resource_service
+            .as_ref()
+            .ok_or(ResourceError::InvalidState)?;
+        if service
+            .check_direct_framebuffer_adoptability(
+                &backend.commit_consumer.capacity,
+                DirectRole::Preparing,
+                &permit,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+    }
+
+    let framebuffer = backend
+        .take_owner_probe_framebuffer(source_id)
+        .ok_or(ResourceError::InvalidState)?;
+    let source_key = backend
+        .present_source_pin_lease(source_pin)
+        .map(|storage| storage.allocation.key());
+    let source_lease = match source_key {
+        Some(key) => Some(
+            backend
+                .resource_service
+                .as_mut()
+                .ok_or(ResourceError::InvalidState)?
+                .reserve(key, crate::kms::render::resources::UseKind::Read)?,
+        ),
+        None => None,
+    };
+    let allocation = framebuffer
+        .into_managed(
+            backend
+                .drm_cleanup_registry
+                .as_mut()
+                .ok_or(ResourceError::InvalidState)?,
+            source_lease,
+        )
+        .ok_or(ResourceError::InvalidState)?;
+    let payload = AllocationPayload::DirectFramebuffer(allocation);
+
+    let adopted = {
+        let service = backend
+            .resource_service
+            .as_mut()
+            .ok_or(ResourceError::InvalidState)?;
+        let registry = backend
+            .drm_cleanup_registry
+            .as_mut()
+            .ok_or(ResourceError::InvalidState)?;
+        service.adopt_direct_framebuffer(
+            payload,
+            registry,
+            &backend.commit_consumer.capacity,
+            DirectRole::Preparing,
+            permit,
+        )
+    };
+    match adopted {
+        Ok(lease) => Ok(Some(lease)),
+        Err((error, mut payload)) => {
+            backend.remove_owner_probe_entry(source_id);
+            let cleanup = backend
+                .drm_cleanup_registry
+                .as_mut()
+                .ok_or(ResourceError::InvalidState)?;
+            if let Err(cleanup_error) = payload.discharge_file_owned(cleanup) {
+                // Task 2 supplies the retry owner. Until then, preserve the
+                // sole payload owner and fail closed; never silently drop a
+                // right whose cleanup did not succeed.
+                log::error!(
+                    "owner direct framebuffer adoption cleanup failed after service refusal: {cleanup_error}"
+                );
+                backend.commit_consumer.capacity.close_admission();
+                // Task 2 removes the forget.
+                std::mem::forget(payload);
+                return Err(ResourceError::InvalidState);
+            }
+            backend.commit_consumer.capacity.close_admission();
+            Err(error)
+        }
+    }
 }
 
 /// Move the producer-owned members and Present pin leases into a direct commit.

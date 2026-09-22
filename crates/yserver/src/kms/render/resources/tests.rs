@@ -854,7 +854,9 @@ fn c0_2ci_direct_probe_framebuffer_into_managed() {
         },
     };
 
-    let direct_alloc = probe_fb.into_managed(&mut registry, held);
+    let direct_alloc = probe_fb
+        .into_managed(&mut registry, Some(held))
+        .expect("legacy probe framebuffer converts once");
     assert_eq!(u32::from(direct_alloc.fb_handle()), 100);
     assert_eq!(u32::from(direct_alloc.gem_handle()), 101);
     assert_eq!(direct_alloc.gem_owner, GemOwner::Right);
