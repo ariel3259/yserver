@@ -21466,7 +21466,10 @@ impl KmsBackend {
         if self.scanout_m2.queued_successor_role.is_none() {
             return Ok(None);
         }
-        let displacing = !self.commit_consumer.current_resources.is_empty();
+        // Ordinary retirement belongs to a direct replacement. A composed
+        // current state can own resources without owning the Current direct
+        // role, and therefore has no direct allocation to retire here.
+        let displacing = !self.commit_consumer.capacity.is_vacant(DirectRole::Current);
         if displacing
             && !self
                 .commit_consumer
@@ -51341,6 +51344,110 @@ mod tests {
             b.commit_consumer
                 .capacity
                 .is_vacant(DirectRole::OrdinaryRetirement)
+        );
+    }
+
+    #[test]
+    fn c0_conv_ciii_direct_entry_over_composed_reserves_no_retirement() {
+        use crate::kms::render::resources::{CommitResources, DirectRole};
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().expect("test device").key;
+        let (source_id, candidate, event) =
+            managed_prepare_ready_candidate(&mut backend, 0xC3A1, 0xC3A2, 40, 1);
+        assert!(
+            backend
+                .managed_prepare_direct_candidate(source_id, candidate, event,)
+                .expect("prepare direct candidate")
+        );
+
+        // A composed current state owns resources but no direct-capacity role.
+        backend
+            .commit_consumer
+            .current_resources
+            .push(CommitResources::new(
+                Vec::new(),
+                None,
+                None,
+                None,
+                vec![task2_member(device, 1)],
+                Vec::new(),
+            ));
+        install_admission_owner_gate(&mut backend, device);
+
+        let prepared = backend
+            .managed_prepare_direct_dispatch()
+            .expect("managed dispatch preparation")
+            .expect("direct entry over composed state must dispatch");
+        assert!(
+            backend
+                .commit_consumer
+                .capacity
+                .is_vacant(DirectRole::OrdinaryRetirement),
+            "composed current resources must not reserve ordinary retirement"
+        );
+        backend
+            .managed_undo_direct_dispatch(prepared)
+            .expect("undo direct preparation");
+    }
+
+    #[test]
+    fn c0_conv_ciii_unconsumed_retirement_reservation_is_cancelled_at_retirement() {
+        use crate::kms::{
+            owner::{device::OwnerEvent, identity::CommitId, ledger::Submitted},
+            render::resources::{CommitResources, DirectRole, ResourceService},
+        };
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.primary_device().expect("test device").key;
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("test owner")
+            .incarnation();
+        backend.install_resource_service(ResourceService::new(device, incarnation));
+        let commit = CommitId::for_tests(93_003);
+        let commit_key = crate::kms::render::resources::CommitKey::new(device, commit);
+        let reservation = backend
+            .commit_consumer
+            .capacity
+            .reserve(DirectRole::OrdinaryRetirement)
+            .expect("ordinary retirement reservation");
+        backend
+            .commit_consumer
+            .prereserve_retirement(commit_key, reservation);
+
+        assert!(backend.route_owner_event_batch(
+            device,
+            vec![OwnerEvent::CompletionRetired {
+                commit,
+                resources: Submitted::new(
+                    vec![CommitResources::new(
+                        Vec::new(),
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    )],
+                    Vec::new(),
+                )
+                .accepted(),
+            }],
+            std::time::Instant::now(),
+        ));
+        assert!(
+            backend
+                .commit_consumer
+                .capacity
+                .is_vacant(DirectRole::OrdinaryRetirement),
+            "an unconsumed retirement reservation must be cancelled at retirement"
+        );
+        assert!(
+            !backend
+                .commit_consumer
+                .reserved_retirements
+                .contains_key(&commit_key)
         );
     }
 

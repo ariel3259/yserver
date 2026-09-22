@@ -358,6 +358,17 @@ impl CommitResourceConsumer {
                         }
                     }
                 }
+                // A pre-reserved ordinary retirement is only consumed by an
+                // old direct Current role. Defence in depth: if this commit's
+                // old state had no such role, cancel the unused reservation
+                // in the same retirement event so it cannot leak capacity.
+                if let Some(reserved) = self.reserved_retirements.remove(&commit_key)
+                    && let Err((err, recovered)) = self.capacity.cancel_reservation(reserved)
+                {
+                    self.reserved_retirements.insert(commit_key, recovered);
+                    self.capacity.close_admission();
+                    return Err(err);
+                }
                 if !hw_completed {
                     self.commit_members.insert(commit_key, members);
                 }
