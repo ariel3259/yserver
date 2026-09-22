@@ -52201,6 +52201,22 @@ mod tests {
         )
     }
 
+    fn wait_copied_sink_idle(backend: &super::KmsBackend) {
+        let sink_vk = match backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => pool.sink_context(),
+            _ => panic!("copied fixture must install a copied pool"),
+        };
+        unsafe {
+            sink_vk
+                .device
+                .device_wait_idle()
+                .expect("copied sink device idle");
+        }
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cp_stage_a_source_is_managed_vulkan() {
@@ -52327,6 +52343,178 @@ mod tests {
             phase,
             crate::kms::vk::scanout::BoPhase::Owner,
             "Owner membership is reached only after selection changed the paired BO from Free through Recording"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_offer_waits_for_the_destination_obligation_vulkan() {
+        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+
+        let (_, destination_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("A completion must prepare B through the production copied route")
+            .0;
+        let service = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service");
+        assert!(service.has_pending_obligation(&destination_key, destination_obligation));
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "a prepared copied generation remains Rendering while B's receipt is pending"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_readable_fence_with_pending_obligation_offers_nothing_vulkan() {
+        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, destination_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production B preparation must retain the receipt")
+            .0;
+
+        // The first drain only consumed A's already-registered wake.  The
+        // second drain consumes B's real sync_file wake while the service
+        // still owns the correlated obligation.
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "a readable copy fence is not itself permission to promote"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&destination_key, destination_obligation),
+            "the test must observe the pending receipt, not a generic completion"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_frozen_destination_offers_nothing_vulkan() {
+        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, destination_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production B preparation must retain the receipt")
+            .0;
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .freeze(destination_key)
+            .expect("freeze the receipt's destination");
+
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "a service failure/frozen destination must not be treated as an offer"
+        );
+        let service = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service");
+        assert!(service.is_frozen(&destination_key));
+        assert!(service.has_pending_obligation(&destination_key, destination_obligation));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_desired_at_copy_retirement_vulkan() {
+        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, destination_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production B preparation must retain the receipt")
+            .0;
+
+        // Retire the registered B batch through the resource service before
+        // delivering B's wake. The promotion still has to consume the
+        // receipt, rather than the generic completion result.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the real B fence must retire");
+        assert!(
+            !fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&destination_key, destination_obligation)
+        );
+
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
+            "B retirement promotes the copied generation and the normal offer path consumes it"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_displaced_during_copy_offers_nothing_vulkan() {
+        let (mut fixture, first_bo, _, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            fixture
+                .backend
+                .scene
+                .copied_receipt_for_tests(0, first_bo)
+                .is_some(),
+            "the first generation must reach B through the production preparation"
+        );
+
+        fixture.backend.scene.mark_scene_structure_dirty();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
+            "the first generation is displaced while its copy is in flight"
+        );
+
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the displaced generation's real B fence must retire");
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
+            "a displaced copied generation is never offered"
         );
     }
 

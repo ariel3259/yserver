@@ -4084,20 +4084,112 @@ fn handle_scanout_render_completion_inner(
         return true;
     }
     if completion_stage == ScanoutRenderCompletionStage::CopiedOwnerCopy {
-        let expected = inner.outputs[output_idx]
-            .owner_buffers
-            .iter()
-            .any(|buffer| {
-                buffer.identity().output_key == output_key
-                    && buffer.identity().bo_idx == bo_idx
-                    && buffer
-                        .pending_ack()
-                        .is_some_and(|ack| ack.stage.matches_owner_copy_completion(job_id))
+        let owner_buffer_index =
+            inner.outputs[output_idx]
+                .owner_buffers
+                .iter()
+                .position(|buffer| {
+                    buffer.identity().output_key == output_key
+                        && buffer.identity().bo_idx == bo_idx
+                        && buffer
+                            .pending_ack()
+                            .is_some_and(|ack| ack.stage.matches_owner_copy_completion(job_id))
+                });
+        if let Some(owner_buffer_index) = owner_buffer_index {
+            let Some(service) = resource_service else {
+                log::error!(
+                    "render Owner copied scanout: copy completion arrived without ResourceService"
+                );
+                platform.renderer_failed = true;
+                drop(fd);
+                return false;
+            };
+            let state = &mut inner.outputs[output_idx];
+            let prepared = state.owner_buffers.remove(owner_buffer_index);
+            let Some((destination_key, destination_obligation)) = prepared
+                .pending_ack()
+                .and_then(|ack| ack.copied_receipt.as_ref())
+                .map(|receipt| receipt.destination)
+            else {
+                log::error!(
+                    "render Owner copied scanout: generation {} had no retirement receipt",
+                    prepared.identity().generation
+                );
+                state.owner_buffers.insert(owner_buffer_index, prepared);
+                platform.renderer_failed = true;
+                drop(fd);
+                return false;
+            };
+            let generation = prepared.identity().generation;
+
+            // The sync_file is only the wake.  Service the registered sink
+            // batch for progress, but do not use its generic keys or its
+            // service-wide error as this generation's answer.
+            if let Err(error) = service.service_completions(std::time::Instant::now()) {
+                log::warn!(
+                    "render Owner copied scanout: copy completion service failed for generation {generation}: {error:?}"
+                );
+            }
+
+            if prepared.state() == OwnerBufferState::Displaced {
+                state.owner_buffers.insert(owner_buffer_index, prepared);
+                drop(fd);
+                return true;
+            }
+            if prepared.state() != OwnerBufferState::Rendering
+                || service.has_pending_obligation(&destination_key, destination_obligation)
+                || service.is_frozen(&destination_key)
+            {
+                state.owner_buffers.insert(owner_buffer_index, prepared);
+                drop(fd);
+                return true;
+            }
+
+            let managed = match service.reserve(
+                prepared.identity().managed_key,
+                crate::kms::render::resources::UseKind::Retain,
+            ) {
+                Ok(managed) => managed,
+                Err(error) => {
+                    log::error!(
+                        "render Owner copied scanout: could not retain generation {generation} after copy completion: {error:?}"
+                    );
+                    state.owner_buffers.insert(owner_buffer_index, prepared);
+                    platform.renderer_failed = true;
+                    drop(fd);
+                    return false;
+                }
+            };
+            let mut desired = match prepared.into_desired(managed) {
+                Ok(desired) => desired,
+                Err(returned) => {
+                    let (prepared, _managed) = *returned;
+                    state.owner_buffers.insert(owner_buffer_index, prepared);
+                    platform.renderer_failed = true;
+                    drop(fd);
+                    return false;
+                }
+            };
+            let Some(ack) = desired.pending_ack_mut() else {
+                state.owner_buffers.insert(owner_buffer_index, desired);
+                platform.renderer_failed = true;
+                drop(fd);
+                return false;
+            };
+            ack.stage = InFlightStage::OwnerDesired;
+            if let Err(desired) =
+                SceneCompositor::insert_existing_owner_buffer(state, desired, platform, output_idx)
+            {
+                state.owner_buffers.insert(owner_buffer_index, *desired);
+                platform.renderer_failed = true;
+                drop(fd);
+                return false;
+            }
+            inner.owner_offers.push_back(ComposedOffer {
+                device: output_key.device_key,
+                crtc: u32::from(platform.outputs[output_idx].output.crtc),
+                generation,
             });
-        if expected {
-            // Task 2 deliberately stops here.  The sink wake is correlated
-            // and consumed by the existing drain, while Task 3 owns the
-            // receipt's promotion/offer decision.
             drop(fd);
             return true;
         }

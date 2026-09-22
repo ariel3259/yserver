@@ -87,7 +87,7 @@ Before acceptance, the coordinator adds: `cargo check --workspace` for Linux gli
 | --- | --- | --- |
 | A copied output enters `Owner` only when both pool halves are managed (CP-7) | `c0_conv_cp_eligibility_requires_both_halves`, `c0_conv_cp_unmanaged_source_keeps_the_device_legacy` | Q1: accept a copied output whose sources are unadopted; Q2: check only the destination half |
 | A copied output can be built and driven at fixture level (§8.1) | `c0_conv_cp_copied_fixture_builds_a_managed_output_vulkan` | — (its absence is the F8 of Task 1) |
-| The offer follows the retirement of this generation's destination obligation (CP-1, CP-2a) | `c0_conv_cp_offer_waits_for_the_destination_obligation_vulkan`, `c0_conv_cp_readable_fence_with_pending_obligation_offers_nothing_vulkan`, `c0_conv_cp_frozen_destination_offers_nothing_vulkan` | Q3: offer at copy submission; Q4: offer at A's completion; Q5: promote on a readable fence while the obligation is pending; Q6: promote while the destination key is frozen; Q7: promote on a successful `service_completions` that retired another key |
+| The offer follows the retirement of this generation's destination obligation (CP-1, CP-2a) | `c0_conv_cp_offer_waits_for_the_destination_obligation_vulkan`, `c0_conv_cp_readable_fence_with_pending_obligation_offers_nothing_vulkan`, `c0_conv_cp_frozen_destination_offers_nothing_vulkan` | Q3: offer at copy submission; Q4: offer at A's completion; Q5: promote on a readable fence while the obligation is pending; **Q6: F8 — no production path reaches discharged-plus-frozen for this obligation, so the `is_frozen` half is defensive and has no reachable discriminator**; Q7: promote on a successful `service_completions` that retired another key |
 | A copied frame completes end to end at fixture level (§8.1) | `c0_conv_cp_end_to_end_copied_frame_vulkan` | Q35: apply the damage transaction at `Accepted` instead of `HardwareComplete` |
 | The owner buffer reaches `Desired` at the copy's retirement, not A's (CP-3) | `c0_conv_cp_desired_at_copy_retirement_vulkan` | Q8: promote when A completes |
 | A generation displaced during the copy behaves as one displaced during the render (CP-3) | `c0_conv_cp_displaced_during_copy_offers_nothing_vulkan` | Q9: offer a generation displaced during the copy |
@@ -164,6 +164,37 @@ Before acceptance, the coordinator adds: `cargo check --workspace` for Linux gli
 - A copied generation may become `Desired` and be offered only when `has_pending_obligation(destination_key, obligation_id)` is false **and** `is_frozen(destination_key)` is false.
 - Nothing else is authority. `service_completions` returns generic keys and a service-wide error (`resources/mod.rs:359`); neither its `Ok` nor its `Err` decides this generation. The composed precedent logs a service failure and offers anyway (`scene.rs:3965`) — **that shape is not copied here**, and a test must pin the difference.
 - The owner buffer gains no state: `Rendering` covers both producer stages and the waiting stage discriminates.
+
+**Task 3 reachability report / F8 (2026-09-22).** The state needed to
+discriminate Q6 — this generation's destination obligation discharged while
+that destination key is frozen — is not reachable through the copied-route
+production entries. `service_completions` sends a signalled batch through
+`validate_gpu_batch`, which rejects a frozen entry before removing its
+obligation; the rejected batch goes to `quarantine_gpu_batch`, which retains
+the batch and its obligations while freezing its keys. The other production
+freeze paths (`abandon_unsubmitted_batch`/`freeze_uncertain_batch`, failed
+read recording, and commit quarantine) also freeze without discharging the
+copied destination obligation. After the successful batch commit, the copied
+wake checks the receipt immediately; the destination is not in owner-commit
+resources before promotion. While B is pending, its destination `Write` lease
+also excludes another production read/write/KMS reservation for the same key,
+so no second production batch or commit can freeze that key in the gap.
+Therefore the `is_frozen` half of CP-2a is a defensive check with no reachable
+discriminator: Q6 cannot be proven as written and this plan records that fact
+instead of claiming the existing pending-obligation test proves it. The
+existing `c0_conv_cp_frozen_destination_offers_nothing_vulkan` test remains a
+valid frozen-plus-pending safety test and is not weakened.
+
+The Q3 and Q4 mutations have distinct code mechanisms. Q3 cannot create a
+valid offer at the sink copy submission because
+`prepare_owner_copy_after_render_completion` submits the copy and then only
+binds/registers B's batch, registers its wake, and returns the receipt; the
+generation is still `Rendering` with no `Desired` buffer to offer. Q4 cannot
+produce a valid offer at A's completion because that branch only prepares B,
+records the receipt, and changes the acknowledgement to
+`OwnerCopyWaiting`; it does not call `into_desired` or enqueue an offer. Those
+operations are reachable only from the later `CopiedOwnerCopy` wake after the
+receipt's gate is checked.
 
 **Named tests:** `c0_conv_cp_offer_waits_for_the_destination_obligation_vulkan`, `c0_conv_cp_readable_fence_with_pending_obligation_offers_nothing_vulkan`, `c0_conv_cp_frozen_destination_offers_nothing_vulkan`, `c0_conv_cp_desired_at_copy_retirement_vulkan`, `c0_conv_cp_displaced_during_copy_offers_nothing_vulkan`.
 
