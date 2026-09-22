@@ -161,10 +161,16 @@ shortage into a permanent stall — one `NoPool` stranded `bo_idx=2`, and the
 irreversible. Fixing either alone improves matters; defect 1 must be fixed
 regardless, because it blocks the Owner route in production.
 
-**Disposition (user, 2026-09-22):** defect 1 is fixed in this branch and
-carries its own evidence. Defect 2 is reported upstream with the evidence
-above, as the Legacy dormancy bug was; whether we also patch it locally is a
-separate decision.
+**Disposition (user, 2026-09-22):** **both are fixed in this branch**, in
+separate commits. Defect 1 is ours outright. Defect 2 is upstream's code, but
+the user's rule settles ownership — "si nos afecta, también es responsabilidad
+nuestra" — and it does affect us: it strands a buffer on our Owner copied route
+today, it will keep doing so occasionally after defect 1 is fixed, and it
+reaches production through the shared Legacy tick independently of C.0. Its fix
+must cover **every** fallible return between acquisition and render submission,
+not only `NoPool`, and stays in its own commit so it can go upstream as its own
+PR. Its full record and the ready-to-file issue text are in
+`../findings/2026-09-22-tick-strands-bo-on-post-acquisition-skip.md`.
 
 ---
 
