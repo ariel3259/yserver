@@ -724,6 +724,35 @@ impl KmsBackend {
         Ok(true)
     }
 
+    /// Observe the seat target from the existing VT paths. This is only a
+    /// prerequisite feed for Owner lifecycle work; the existing suspend and
+    /// resume code remains the sole Legacy VT executor in stage 3a.
+    pub(crate) fn lifecycle_observe_seat_target(
+        &mut self,
+        target: crate::kms::owner::lifecycle::SeatTarget,
+    ) {
+        let owner_devices = self.lifecycle_owner_devices();
+        for device in owner_devices.iter().copied() {
+            if let Err(error) = self.lifecycle_register_owner_device(device) {
+                log::error!("lifecycle seat observation registration for {device:?}: {error:?}");
+            }
+        }
+        let dispatches = match self.lifecycle_coordinator.observe_seat_target(target) {
+            Ok(dispatches) => dispatches,
+            Err(error) => {
+                log::error!("lifecycle seat observation failed: {error:?}");
+                return;
+            }
+        };
+        for dispatch in dispatches {
+            let requester = self.lifecycle_current_tag(dispatch.device);
+            self.lifecycle_queue_actions(dispatch.device, dispatch.actions, requester);
+        }
+        for device in owner_devices {
+            self.lifecycle_drain_driver(device);
+        }
+    }
+
     fn lifecycle_current_tag(&self, device: DrmDeviceKey) -> Option<TransitionTag<IncarnationId>> {
         self.lifecycle_coordinator
             .device(&device)

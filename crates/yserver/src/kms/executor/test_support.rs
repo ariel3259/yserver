@@ -43,6 +43,7 @@ pub enum StubBehaviour {
     },
     ReplyWithForeignCorrelation,
     RejectWithRepeatedly(i32),
+    AcceptLifecycleWithPendingFence,
     AcceptProbeWith(u64),
     RejectProbeWith(i32),
     AcceptQueueWith(u64),
@@ -85,6 +86,7 @@ impl StubBehaviour {
             }
             Self::ReplyWithForeignCorrelation => "reply-foreign-correlation".to_string(),
             Self::RejectWithRepeatedly(errno) => format!("reject-repeatedly:{errno}"),
+            Self::AcceptLifecycleWithPendingFence => "accept-lifecycle-pending-fence".to_string(),
             Self::AcceptProbeWith(seq) => format!("accept-probe:{seq}"),
             Self::RejectProbeWith(errno) => format!("reject-probe:{errno}"),
             Self::AcceptQueueWith(seq) => format!("accept-queue:{seq}"),
@@ -142,6 +144,8 @@ impl StubBehaviour {
                 .parse::<i32>()
                 .ok()
                 .map(Self::RejectWithRepeatedly)
+        } else if s == "accept-lifecycle-pending-fence" {
+            Some(Self::AcceptLifecycleWithPendingFence)
         } else if let Some(seq_str) = s.strip_prefix("accept-probe:") {
             seq_str.parse::<u64>().ok().map(Self::AcceptProbeWith)
         } else if let Some(errno_str) = s.strip_prefix("reject-probe:") {
@@ -602,6 +606,37 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                 let rep_frame = protocol::encode_reply(&reply);
                 transport::send_frame(&control, &rep_frame)?;
             }
+        }
+        StubBehaviour::AcceptLifecycleWithPendingFence => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            for request_index in 0..2 {
+                let received = transport::recv_frame(&control, &mut req_buf)?;
+                if received.len == 0 {
+                    return Ok(());
+                }
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                // The first request is final TEST_ONLY validation. The second
+                // is the real lifecycle commit and receives a descriptor that
+                // the backend test queries as Pending through its production
+                // fence-observation entry.
+                let (out_fence_mask, fence_count) =
+                    if request_index == 0 { (0, 0) } else { (1, 1) };
+                let rep = protocol::HostCallReply::Accepted {
+                    correlation: req.correlation(),
+                    helper_duration_ns: 1_000_000,
+                    out_fence_mask,
+                };
+                let rep_frame = protocol::encode_reply(&rep);
+                let dummy_files = (0..fence_count)
+                    .map(|_| std::fs::File::open("/dev/null"))
+                    .collect::<io::Result<Vec<_>>>()?;
+                let fence_refs: Vec<BorrowedFd<'_>> =
+                    dummy_files.iter().map(|file| file.as_fd()).collect();
+                transport::send_reply_with_fences(&control, &rep_frame, &fence_refs)?;
+            }
+            Ok(())
         }
         StubBehaviour::AcceptProbeWith(sequence) => {
             let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];

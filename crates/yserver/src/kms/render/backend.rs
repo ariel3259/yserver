@@ -1998,6 +1998,18 @@ pub struct KmsBackend {
     /// State machine for the suspend/resume cycle.
     /// Used by `scanout_allowed()` / `run_suspend`.
     vt_state: crate::vt::state::VtState,
+    /// Let VT lifecycle tests exercise the production state-machine loop
+    /// without probing connectors or issuing KMS operations.
+    #[cfg(test)]
+    vt_resume_succeeds_for_tests: bool,
+    /// Lifecycle state observed by the VT action loop before it commits
+    /// Resuming to Active.
+    #[cfg(test)]
+    vt_resume_lifecycle_observations_for_tests: Vec<(
+        DrmDeviceKey,
+        Option<crate::kms::owner::lifecycle::Disposition>,
+        bool,
+    )>,
     /// Coalesced counter-events for the state machine.
     /// Consumed by `drive_vt_event`.
     vt_pending: crate::vt::state::VtPending,
@@ -6881,6 +6893,10 @@ impl KmsBackend {
             // Direct mode: no on-core libinput; the core sender is installed
             // after the channel is created in `lib.rs`.
             vt_state: crate::vt::state::VtState::Active,
+            #[cfg(test)]
+            vt_resume_succeeds_for_tests: false,
+            #[cfg(test)]
+            vt_resume_lifecycle_observations_for_tests: Vec::new(),
             vt_pending: crate::vt::state::VtPending::default(),
             console_guard,
             vt_switching_armed: false,
@@ -8218,6 +8234,10 @@ impl KmsBackend {
             last_drained_fb_opens: 0,
             // Test fixtures always run in Direct mode.
             vt_state: crate::vt::state::VtState::Active,
+            #[cfg(test)]
+            vt_resume_succeeds_for_tests: false,
+            #[cfg(test)]
+            vt_resume_lifecycle_observations_for_tests: Vec::new(),
             vt_pending: crate::vt::state::VtPending::default(),
             console_guard: None,
             vt_switching_armed: false,
@@ -14066,6 +14086,7 @@ impl KmsBackend {
             self.core.down_keys.len(),
             self.core.button_mask,
         );
+        self.lifecycle_observe_seat_target(crate::kms::owner::lifecycle::SeatTarget::Released);
         // 3. Synthesize held-key / held-button releases.
         self.synthesize_held_releases(state);
 
@@ -14195,6 +14216,10 @@ impl KmsBackend {
             self.core.cursor_y,
             self.effective_cursor_xid,
         );
+        #[cfg(test)]
+        if self.vt_resume_succeeds_for_tests {
+            return true;
+        }
         // 2. Gather every device's connector state before mutating live
         // outputs. A failed probe is fatal on resume: applying only a prefix
         // would create a fabricated combined topology.
@@ -15071,6 +15096,30 @@ impl KmsBackend {
         self.prune_armed_targets_to_live_outputs();
     }
 
+    #[cfg(test)]
+    fn record_vt_resuming_lifecycle_for_tests(&mut self) {
+        use crate::kms::owner::lifecycle::DesiredField;
+
+        let observations = self
+            .lifecycle_drivers
+            .iter()
+            .map(|(device, driver)| {
+                let disposition = self
+                    .lifecycle_coordinator
+                    .device(device)
+                    .and_then(|arbiter| arbiter.desired().representative(DesiredField::Dpms))
+                    .and_then(|representative| representative.disposition);
+                (
+                    *device,
+                    disposition,
+                    driver.pending_topology_tags().is_empty(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.vt_resume_lifecycle_observations_for_tests
+            .extend(observations);
+    }
+
     /// Per-event state-machine driver. Extracted so both
     /// the real VT handlers and the test injection entry point
     /// (`inject_seat_event_for_test`) share the same logic.
@@ -15117,6 +15166,8 @@ impl KmsBackend {
                         // probe/discovery or unsafe direct-scanout recovery.
                         break;
                     }
+                    #[cfg(test)]
+                    self.record_vt_resuming_lifecycle_for_tests();
                     // `resume_complete` returns `BeginSuspend` (consuming
                     // `pending_disable`) for the no-blink boundary, else
                     // commits `Active`.
@@ -15127,6 +15178,9 @@ impl KmsBackend {
                     // Committed Active: scanout gate is open — post a
                     // full-damage repaint on all outputs.
                     self.scene.wake_for_damage();
+                    self.lifecycle_observe_seat_target(
+                        crate::kms::owner::lifecycle::SeatTarget::Owned,
+                    );
                     break;
                 }
                 VtAction::Nothing => {
@@ -59242,6 +59296,661 @@ mod tests {
             1,
             "the test keeps a resource batch pending while observing the clock"
         );
+    }
+
+    #[test]
+    fn c0_3aii_rejected_off_is_deferred_and_not_retried() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::lifecycle::{DesiredField, Disposition, Prerequisite},
+        };
+
+        let (mut attributable, device) =
+            lifecycle_dpms_backend(StubBehaviour::RejectWithRepeatedly(libc::EINVAL));
+        let previous_power = attributable
+            .owner_dpms_installed_active
+            .get(&device)
+            .copied()
+            .unwrap_or(true);
+        Backend::set_dpms_power(&mut attributable, 3).expect("DPMS off request");
+        wait_executor_readable_for_tests(&attributable, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut attributable, &mut ServerState::new());
+
+        let arbiter = attributable
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner lifecycle state");
+        let rejected = arbiter
+            .desired()
+            .representative(DesiredField::Dpms)
+            .expect("DPMS representative remains desired");
+        let generation = attributable
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .topology_generation();
+        assert_eq!(
+            rejected.disposition,
+            Some(Disposition::Deferred(Prerequisite::TopologyLatched(
+                generation
+            )))
+        );
+        assert_eq!(
+            arbiter.state(),
+            crate::kms::owner::lifecycle::DeviceLifecycleState::Ready
+        );
+        assert_eq!(
+            attributable.owner_dpms_installed_active.get(&device),
+            Some(&previous_power),
+            "a rejected off leaves the previously installed power authoritative"
+        );
+        assert!(
+            attributable
+                .device_owner_for_tests(0)
+                .tombstones()
+                .is_empty(),
+            "FailedBeforeSubmit creates no quarantine tombstone"
+        );
+        assert!(
+            attributable
+                .device_owner_for_tests(0)
+                .live_record()
+                .is_none(),
+            "the rejection did not create an accepted commit"
+        );
+        assert!(
+            attributable.lifecycle_drivers[&device]
+                .pending_topology_tags()
+                .is_empty(),
+            "the latched generation is not retried after its rejection"
+        );
+
+        let first_event = rejected.event_id;
+        Backend::set_dpms_power(&mut attributable, 0).expect("newer DPMS request");
+        let newer = attributable
+            .lifecycle_coordinator
+            .device(&device)
+            .unwrap()
+            .desired()
+            .representative(DesiredField::Dpms)
+            .expect("new request supersedes the rejected representative");
+        assert_ne!(newer.event_id, first_event);
+        assert_eq!(
+            newer.disposition,
+            Some(Disposition::Deferred(Prerequisite::TopologyLatched(
+                generation
+            )))
+        );
+        assert!(
+            attributable.lifecycle_drivers[&device]
+                .pending_topology_tags()
+                .is_empty(),
+            "the newer request also waits for a generation change"
+        );
+
+        let (mut non_attributable, non_attributable_device) =
+            lifecycle_dpms_backend(StubBehaviour::RejectWith(libc::EACCES));
+        let old_power = non_attributable
+            .owner_dpms_installed_active
+            .get(&non_attributable_device)
+            .copied()
+            .unwrap_or(true);
+        Backend::set_dpms_power(&mut non_attributable, 3).expect("DPMS off request");
+        wait_executor_readable_for_tests(&non_attributable, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut non_attributable, &mut ServerState::new());
+        let rejected = non_attributable
+            .lifecycle_coordinator
+            .device(&non_attributable_device)
+            .unwrap()
+            .desired()
+            .representative(DesiredField::Dpms)
+            .expect("non-attributable rejection remains desired");
+        assert_eq!(
+            rejected.disposition,
+            Some(Disposition::Deferred(Prerequisite::ReadinessClosed))
+        );
+        assert_eq!(
+            non_attributable
+                .owner_dpms_installed_active
+                .get(&non_attributable_device),
+            Some(&old_power)
+        );
+        assert!(
+            non_attributable
+                .device_owner_for_tests(0)
+                .tombstones()
+                .is_empty()
+        );
+        assert!(
+            non_attributable.lifecycle_drivers[&non_attributable_device]
+                .pending_topology_tags()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_lost_off_fence_poisons_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::{
+                fences::{FencePollSet, FenceQuery},
+                lifecycle::{DesiredField, DeviceLifecycleState, Disposition, Prerequisite},
+            },
+        };
+        use std::{
+            io,
+            os::fd::BorrowedFd,
+            time::{Duration, Instant},
+        };
+
+        struct PendingFence;
+        impl FenceQuery for PendingFence {
+            fn status(
+                &mut self,
+                _fd: BorrowedFd<'_>,
+            ) -> io::Result<crate::platform::sync_file::FenceStatus> {
+                Ok(crate::platform::sync_file::FenceStatus::Pending)
+            }
+        }
+        struct LateFence;
+        impl FenceQuery for LateFence {
+            fn status(
+                &mut self,
+                _fd: BorrowedFd<'_>,
+            ) -> io::Result<crate::platform::sync_file::FenceStatus> {
+                Ok(crate::platform::sync_file::FenceStatus::Success)
+            }
+        }
+        struct NoopPollSet;
+        impl FencePollSet for NoopPollSet {
+            fn register(&mut self, _fd: BorrowedFd<'_>, _token: u64) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn unregister(&mut self, _fd: BorrowedFd<'_>) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let device = backend.platform.primary_device().expect("Owner device").key;
+        c0_3aii_prepare_lifecycle_clock(&mut backend, device);
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::AcceptLifecycleWithPendingFence,
+        );
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS off request");
+
+        let mut state = ServerState::new();
+        for _ in 0..2 {
+            wait_executor_readable_for_tests(&backend, Duration::from_secs(5));
+            Backend::on_executor_readable(&mut backend, &mut state);
+            if backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .is_some_and(|record| record.milestones().accepted)
+            {
+                break;
+            }
+        }
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("real lifecycle commit after final TEST_ONLY");
+        assert!(record.milestones().accepted);
+        let commit = record.commit_id();
+        let accepted_at = record
+            .completion_state()
+            .accepted_at
+            .expect("accepted timestamp");
+        let deadline = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.completion_deadline())
+            .expect("required off-fence lifecycle deadline");
+        assert_eq!(
+            deadline.duration_since(accepted_at),
+            Duration::from_secs(30),
+            "without a measured lifecycle maximum, the off fence gets C.0's 30-second ceiling"
+        );
+
+        let pending_events = backend
+            .platform
+            .owner_for(device)
+            .expect("Owner")
+            .observe_fences(
+                &mut PendingFence,
+                &mut NoopPollSet,
+                accepted_at + Duration::from_millis(1),
+            );
+        assert!(
+            pending_events.is_empty(),
+            "the injected off fence is pending"
+        );
+        let timeout_events = backend
+            .platform
+            .owner_for(device)
+            .expect("Owner")
+            .tick_completion(deadline + Duration::from_nanos(1));
+        assert!(timeout_events.iter().any(|event| matches!(
+            event,
+            crate::kms::owner::device::OwnerEvent::MechanismFailed {
+                reason: crate::kms::owner::completion::MechanismFailure::HardwareTimeout
+            }
+        )));
+        assert!(backend.route_owner_event_batch(device, timeout_events, Instant::now()));
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .expect("lifecycle state")
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+        let representative = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .unwrap()
+            .desired()
+            .representative(DesiredField::Dpms)
+            .expect("unknown transition remains unresolved");
+        assert_eq!(
+            representative.disposition,
+            Some(Disposition::Deferred(Prerequisite::ReadinessClosed))
+        );
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("unknown record remains quarantined")
+                .commit_id(),
+            commit
+        );
+
+        let late_events = backend
+            .platform
+            .owner_for(device)
+            .expect("Owner")
+            .observe_fences(
+                &mut LateFence,
+                &mut NoopPollSet,
+                deadline + Duration::from_secs(1),
+            );
+        assert!(late_events.is_empty(), "a late fence cannot promote poison");
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn c0_3aii_poisoned_dpms_issues_no_commit() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour, owner::lifecycle::DeviceLifecycleState,
+        };
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .incarnation();
+        let unknown = backend
+            .platform
+            .owner_for(device)
+            .expect("Owner")
+            .report_stream_failure(incarnation, std::time::Instant::now());
+        assert!(backend.route_owner_event_batch(device, unknown, std::time::Instant::now()));
+        assert!(
+            backend
+                .platform
+                .owner_ref(device)
+                .expect("Owner")
+                .is_poisoned()
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+
+        let validations_before =
+            backend.lifecycle_drivers[&device].pending_topology_validation_commits_for_tests();
+        let topology_tags_before = backend.lifecycle_drivers[&device].pending_topology_tags();
+        let trace_before = backend.admission_trace_for_tests(device);
+        let transition_kind_before = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .map(|transition| transition.kind);
+        Backend::set_dpms_power(&mut backend, 3).expect("logical off while poisoned");
+        Backend::set_dpms_power(&mut backend, 0).expect("logical on while poisoned");
+
+        assert_eq!(
+            backend.lifecycle_drivers[&device].pending_topology_validation_commits_for_tests(),
+            validations_before,
+            "Poisoned DPMS does not enqueue another conductor validation"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].pending_topology_tags(),
+            topology_tags_before,
+            "Poisoned DPMS does not add a topology request"
+        );
+        assert_eq!(backend.admission_trace_for_tests(device), trace_before);
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .map(|transition| transition.kind),
+            transition_kind_before,
+            "Poisoned DPMS does not replace the existing recovery transition with DPMS"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+    }
+
+    #[test]
+    fn c0_3aii_dpms_while_seat_released_is_deferred() {
+        use crate::{
+            kms::owner::lifecycle::{DesiredField, Disposition, Prerequisite, SeatTarget},
+            vt::state::VtState,
+        };
+
+        let (mut backend, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        backend.vt_resume_succeeds_for_tests = true;
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        let mut state = ServerState::new();
+        backend.inject_seat_event_for_test(&mut state, false);
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        assert_eq!(
+            backend.lifecycle_coordinator.seat_target(),
+            Some(SeatTarget::Released),
+            "the production suspend path feeds seat release to the coordinator"
+        );
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS off while seat is released");
+        let representative = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner lifecycle state")
+            .desired()
+            .representative(DesiredField::Dpms)
+            .expect("deferred DPMS representative");
+        assert_eq!(
+            representative.disposition,
+            Some(Disposition::Deferred(Prerequisite::SeatReleased))
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_tags()
+                .is_empty()
+        );
+
+        backend.inject_seat_event_for_test(&mut state, true);
+        assert!(
+            !backend
+                .vt_resume_lifecycle_observations_for_tests
+                .is_empty(),
+            "the VT action loop records Owner lifecycle state while Resuming"
+        );
+        assert_eq!(
+            backend.vt_resume_lifecycle_observations_for_tests,
+            vec![(
+                device,
+                Some(Disposition::Deferred(Prerequisite::SeatReleased)),
+                true,
+            )],
+            "DPMS remains deferred and topology work stays queued until Active"
+        );
+        assert_eq!(backend.vt_state, VtState::Active);
+        assert!(backend.scanout_allowed());
+        assert_eq!(
+            backend.lifecycle_coordinator.seat_target(),
+            Some(SeatTarget::Owned),
+            "the production VT state-machine path feeds reacquisition after Active"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .desired()
+                .seat_target(),
+            Some(SeatTarget::Owned),
+            "the per-device prerequisite is updated with the global observation"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_validation_commits_for_tests()
+                .len(),
+            1,
+            "the deferred DPMS target starts exactly one topology validation after Active"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_tags()
+                .len(),
+            1
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_descriptions_for_tests()
+                .len(),
+            1
+        );
+        assert_eq!(
+            backend.platform.dpms_output_calls_for_tests,
+            Some(vec![(
+                false,
+                backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| output.key.clone())
+                    .collect()
+            )]),
+            "the VT fixture records the suspend operation without issuing a KMS ioctl"
+        );
+
+        let mut legacy = super::KmsBackend::for_tests();
+        make_vt_fixture_headless(&mut legacy);
+        let mut legacy_state = ServerState::new();
+        legacy.inject_seat_event_for_test(&mut legacy_state, false);
+        legacy.inject_seat_event_for_test(&mut legacy_state, true);
+        assert_eq!(legacy_state.dpms.power_level, 0);
+        assert_eq!(
+            legacy.lifecycle_coordinator.seat_target(),
+            Some(SeatTarget::Owned)
+        );
+        assert_eq!(legacy.lifecycle_coordinator.protocol_dpms_level(), 0);
+        assert!(legacy.lifecycle_drivers.is_empty());
+        assert!(!legacy.kms_outputs_active);
+        assert_eq!(legacy_state.dpms.power_level, 0);
+    }
+
+    #[test]
+    fn c0_3aii_seat_reacquire_waits_for_active() {
+        use crate::{
+            kms::owner::lifecycle::{DesiredField, Disposition, Prerequisite, SeatTarget},
+            vt::state::{VtPending, VtState},
+        };
+
+        let (mut backend, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        backend.vt_resume_succeeds_for_tests = true;
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        let mut state = ServerState::new();
+        backend.inject_seat_event_for_test(&mut state, false);
+        assert_eq!(backend.vt_state, VtState::Suspended);
+
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS off while seat is released");
+        let representative = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner lifecycle state")
+            .desired()
+            .representative(DesiredField::Dpms)
+            .expect("deferred DPMS representative");
+        assert_eq!(
+            representative.disposition,
+            Some(Disposition::Deferred(Prerequisite::SeatReleased))
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_tags()
+                .is_empty()
+        );
+
+        backend.vt_pending = VtPending {
+            pending_disable: true,
+            pending_enable: false,
+        };
+        backend.inject_seat_event_for_test(&mut state, true);
+
+        assert!(
+            !backend
+                .vt_resume_lifecycle_observations_for_tests
+                .is_empty(),
+            "the VT action loop records Owner lifecycle state while Resuming"
+        );
+        assert_eq!(
+            backend.vt_resume_lifecycle_observations_for_tests,
+            vec![(
+                device,
+                Some(Disposition::Deferred(Prerequisite::SeatReleased)),
+                true,
+            )],
+            "the immediate re-suspend does not dispatch topology work while Resuming"
+        );
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        assert!(!backend.scanout_allowed());
+        assert_eq!(
+            backend.lifecycle_coordinator.seat_target(),
+            Some(SeatTarget::Released),
+            "the immediate re-suspend leaves the seat prerequisite released"
+        );
+        let representative = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner lifecycle state")
+            .desired()
+            .representative(DesiredField::Dpms)
+            .expect("DPMS remains represented");
+        assert_eq!(
+            representative.disposition,
+            Some(Disposition::Deferred(Prerequisite::SeatReleased)),
+            "a resume that returns BeginSuspend does not advance DPMS convergence"
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_tags()
+                .is_empty()
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_validation_commits_for_tests()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_capability_stable_across_dpms_and_poison_vulkan() {
+        use crate::kms::{owner::lifecycle::DeviceLifecycleState, render::scene::CursorPlaneMode};
+
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let device = backend.platform.primary_device().expect("Owner device").key;
+        let discovered = backend
+            .platform
+            .discover_completion_caps(device)
+            .expect("read structural completion capability");
+        backend
+            .platform
+            .install_completion_caps(discovered)
+            .expect("install discovered structural capability for this incarnation");
+        backend.scene.test_set_cursor_mode(CursorPlaneMode::Hw);
+        let capability_before = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.completion_caps())
+            .expect("structural capability surface")
+            .clone();
+        let structural_before = capability_before.is_structurally_capable();
+        let cursor_mode_before = backend.scene.cursor_mode();
+        assert_eq!(cursor_mode_before, CursorPlaneMode::Hw);
+
+        for _ in 0..4 {
+            c0_3aii_apply_dpms_transition(&mut backend, device, 3);
+            c0_3aii_apply_dpms_transition(&mut backend, device, 0);
+            let capability_after = backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.completion_caps())
+                .expect("DPMS preserves structural capability");
+            assert_eq!(capability_after, &capability_before);
+            assert_eq!(
+                capability_after.is_structurally_capable(),
+                structural_before
+            );
+            assert_eq!(backend.scene.cursor_mode(), cursor_mode_before);
+        }
+
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .incarnation();
+        let unknown = backend
+            .platform
+            .owner_for(device)
+            .expect("Owner")
+            .report_stream_failure(incarnation, std::time::Instant::now());
+        assert!(backend.route_owner_event_batch(device, unknown, std::time::Instant::now()));
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.completion_caps()),
+            Some(&capability_before),
+            "incarnation poison closes readiness but preserves structural capability"
+        );
+        assert_eq!(backend.scene.cursor_mode(), cursor_mode_before);
     }
 
     fn c0_3aii_replace_owner_executor(
