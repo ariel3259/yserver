@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 9 (2026-09-23, coordinator)** — Task 8 F8 (before editing): the
+advertised capability C.0 §16.2 item 39 protects does not exist before stage
+4. Task 8's capability test now covers the structural completion capability
+and the scene's cursor plane mode, not the incarnation qualification;
+the advertised values are carried to stage 4.
+
 **Revision 8 (2026-09-23, coordinator)** — second Task 7 F8 (before
 editing): revision 7's "any served output powered" for composition would stop
 the scene on an off Owner device, contradicting design §3.5 and Task 5. Task 7
@@ -332,6 +338,19 @@ or an injected completion loss (C.0 §16.2 item 39).
 | `c0_3aii_poisoned_dpms_issues_no_commit` | `Poisoned` device, off then on: no topology request reaches the conductor | **D29** request the commit while `Poisoned` |
 | `c0_3aii_dpms_while_seat_released_is_deferred` | seat released (via the `run_suspend` feed), DPMS off: `Deferred(SeatReleased)`, no commit; on reacquire it converges | **D30** apply it while released |
 | `c0_3aii_capability_stable_across_dpms_and_poison_vulkan` | capability captured before, compared after four off/on cycles and after an injected completion loss | **D31** recompute capability on DPMS |
+
+**What "capability" means in 3a (revision 9, Task 8 F8).** The advertised
+values C.0 §6.2 names (`atomic_kms_pipeline_structurally_capable`,
+`atomic_kms_cursor_policy`) do not exist yet; the cursor policy arrives with
+stage 4. In 3a the test captures and compares the surfaces that exist: the
+device's structural completion capability (`CompletionCaps`, including
+`is_structurally_capable()`, `owner/qualification.rs`) and the scene's cursor
+plane mode (`Scene::cursor_mode()`). It does **not** pin the incarnation
+qualification (`CompletionQualification`): item 39 lets readiness close on
+poison. **D31** makes a DPMS completion or the completion loss change either
+surface (clear structural capability, or force the cursor plane mode to
+software). **Carried to stage 4:** when `atomic_kms_cursor_policy` and the
+advertised structural bit exist, stage 4 extends this test to them.
 
 ## Task 9 — the differential gate and the hardware test
 
