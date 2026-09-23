@@ -43,6 +43,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::os::fd::FromRawFd;
+
 use ash::vk;
 use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
 
@@ -75,16 +78,61 @@ pub(crate) use crate::kms::scanout_route::RenderDeviceId;
 pub(crate) enum OwnerEligibilityError {
     NoOutputs,
     MissingScanoutPool { output_idx: usize },
-    CopiedScanoutRoute { output_idx: usize },
     UnmanagedScanoutPool { output_idx: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerOutputKind {
     SharedManaged,
-    Copied,
+    CopiedManaged,
     Unmanaged,
     Missing,
+}
+
+fn classify_copied_managed_status(
+    destinations: impl IntoIterator<Item = bool>,
+    sources: impl IntoIterator<Item = bool>,
+) -> OwnerOutputKind {
+    let (destination_count, destinations_managed) = destinations
+        .into_iter()
+        .fold((0usize, true), |(count, managed), is_managed| {
+            (count.saturating_add(1), managed && is_managed)
+        });
+    let (source_count, sources_managed) = sources
+        .into_iter()
+        .fold((0usize, true), |(count, managed), is_managed| {
+            (count.saturating_add(1), managed && is_managed)
+        });
+    if destination_count != 0
+        && destination_count == source_count
+        && destinations_managed
+        && sources_managed
+    {
+        OwnerOutputKind::CopiedManaged
+    } else {
+        OwnerOutputKind::Unmanaged
+    }
+}
+
+fn owner_output_kind(scanout: &OutputScanout) -> OwnerOutputKind {
+    match scanout {
+        OutputScanout::Shared(pool) => {
+            if pool.bos.is_empty() || pool.bos.iter().any(|bo| bo.managed_key().is_none()) {
+                OwnerOutputKind::Unmanaged
+            } else {
+                OwnerOutputKind::SharedManaged
+            }
+        }
+        OutputScanout::Copied(pool) => classify_copied_managed_status(
+            pool.destinations
+                .bos
+                .iter()
+                .map(|bo| bo.managed_key().is_some()),
+            pool.sources
+                .iter()
+                .map(|source| source.managed_key().is_some()),
+        ),
+    }
 }
 
 fn validate_owner_output_kinds(kinds: &[OwnerOutputKind]) -> Result<(), OwnerEligibilityError> {
@@ -93,10 +141,7 @@ fn validate_owner_output_kinds(kinds: &[OwnerOutputKind]) -> Result<(), OwnerEli
     }
     for (output_idx, kind) in kinds.iter().copied().enumerate() {
         match kind {
-            OwnerOutputKind::SharedManaged => {}
-            OwnerOutputKind::Copied => {
-                return Err(OwnerEligibilityError::CopiedScanoutRoute { output_idx });
-            }
+            OwnerOutputKind::SharedManaged | OwnerOutputKind::CopiedManaged => {}
             OwnerOutputKind::Unmanaged => {
                 return Err(OwnerEligibilityError::UnmanagedScanoutPool { output_idx });
             }
@@ -114,9 +159,6 @@ impl std::fmt::Display for OwnerEligibilityError {
             Self::NoOutputs => f.write_str("Owner requires at least one scanout output"),
             Self::MissingScanoutPool { output_idx } => {
                 write!(f, "Owner output {output_idx} has no scanout pool")
-            }
-            Self::CopiedScanoutRoute { output_idx } => {
-                write!(f, "Owner output {output_idx} uses the copied scanout route")
             }
             Self::UnmanagedScanoutPool { output_idx } => {
                 write!(f, "Owner output {output_idx} has an unmanaged scanout pool")
@@ -617,14 +659,350 @@ pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 /// `sync_file` becomes readable.  The stable [`OutputKey`] and monotonic job
 /// id remain authoritative across output-vector rebuilds; raw fds and vector
 /// indices are deliberately not identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanoutRenderCompletionStage {
+    Render,
+    CopiedOwnerCopy,
+}
+
 struct PendingScanoutRenderCompletion {
     job_id: u64,
     output_key: OutputKey,
     bo_idx: usize,
+    stage: ScanoutRenderCompletionStage,
     /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
     /// It bypasses readiness polling but remains a real synchronization
     /// payload that the sink imports as raw -1.
     fd: Option<OwnedFd>,
+}
+
+/// Test-only copied-route timing evidence.  The production path does not
+/// retain a copy-fence duplicate or timestamp any of these boundaries.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopiedRouteTransport {
+    Legacy,
+    Owner,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CopiedRouteLatencySample {
+    pub(crate) frame: usize,
+    pub(crate) transport: CopiedRouteTransport,
+    pub(crate) submission_delay_us: i128,
+    pub(crate) expected_msc: Option<u64>,
+    pub(crate) completion_msc: Option<u64>,
+}
+
+#[cfg(test)]
+pub(crate) struct CopiedRouteLatencySnapshot {
+    pub(crate) samples: Vec<CopiedRouteLatencySample>,
+    pub(crate) pending_frames: Vec<CopiedRouteLatencyPendingSnapshot>,
+    pub(crate) insufficient: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct CopiedRouteLatencyPendingSnapshot {
+    pub(crate) frame: usize,
+    pub(crate) transport: CopiedRouteTransport,
+    pub(crate) fence_signalled: bool,
+    pub(crate) expected_msc_recorded: bool,
+    pub(crate) expected_msc_applicable: bool,
+    pub(crate) commit_submitted: bool,
+    pub(crate) completion_msc_recorded: bool,
+    pub(crate) completion_msc_applicable: bool,
+}
+
+#[cfg(test)]
+struct CopiedRouteLatencyPending {
+    frame: usize,
+    transport: CopiedRouteTransport,
+    fence: Option<OwnedFd>,
+    signalled_at: Option<std::time::Instant>,
+    expected_msc: Option<u64>,
+    submitted_at: Option<std::time::Instant>,
+    completion_msc: Option<u64>,
+    completion_recorded: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CopiedRouteLatencyState {
+    next_frame: usize,
+    pending: Vec<CopiedRouteLatencyPending>,
+    samples: Vec<CopiedRouteLatencySample>,
+    insufficient: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPIED_ROUTE_LATENCY: RefCell<CopiedRouteLatencyState> =
+        RefCell::new(CopiedRouteLatencyState::default());
+}
+
+#[cfg(test)]
+pub(crate) fn begin_copied_route_latency_for_tests() {
+    COPIED_ROUTE_LATENCY.with(|state| *state.borrow_mut() = CopiedRouteLatencyState::default());
+}
+
+#[cfg(test)]
+pub(crate) fn record_copied_copy_fence_for_tests(
+    transport: CopiedRouteTransport,
+    completion: Option<&OwnedFd>,
+) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        let fence = completion.and_then(|completion| {
+            let raw = unsafe { libc::dup(completion.as_raw_fd()) };
+            if raw < 0 {
+                state.insufficient = true;
+                None
+            } else {
+                // SAFETY: `dup` returned a fresh owned descriptor.
+                Some(unsafe { OwnedFd::from_raw_fd(raw) })
+            }
+        });
+        let frame = state.next_frame;
+        state.next_frame = state.next_frame.saturating_add(1);
+        state.pending.push(CopiedRouteLatencyPending {
+            frame,
+            transport,
+            fence,
+            signalled_at: completion.is_none().then(std::time::Instant::now),
+            expected_msc: None,
+            submitted_at: None,
+            completion_msc: None,
+            completion_recorded: false,
+        });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn copied_route_latency_fence_fds_for_tests() -> Vec<RawFd> {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        state
+            .borrow()
+            .pending
+            .iter()
+            .filter(|pending| pending.signalled_at.is_none())
+            .filter_map(|pending| pending.fence.as_ref().map(AsRawFd::as_raw_fd))
+            .collect()
+    })
+}
+
+/// Observe Legacy's copy fence from the hardware harness drain. The duplicated
+/// fence is also included in the harness's blocking poll set, so this samples
+/// readiness immediately after poll wakes instead of at the next DRM timeout.
+#[cfg(test)]
+pub(crate) fn drain_copied_route_latency_fences_for_tests(current_msc: u64) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        let mut insufficient = false;
+        for pending in &mut state.pending {
+            if pending.transport == CopiedRouteTransport::Legacy && pending.signalled_at.is_none() {
+                let Some(fence) = pending.fence.as_ref() else {
+                    insufficient = true;
+                    continue;
+                };
+                let mut poll_fd = libc::pollfd {
+                    fd: fence.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+                if result < 0 {
+                    insufficient = true;
+                } else if result > 0
+                    && poll_fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0
+                {
+                    pending.signalled_at = Some(std::time::Instant::now());
+                }
+            }
+            if pending.transport == CopiedRouteTransport::Legacy
+                && pending.signalled_at.is_some()
+                && pending.expected_msc.is_none()
+            {
+                pending.expected_msc = Some(current_msc.saturating_add(1));
+            }
+        }
+        state.insufficient |= insufficient;
+        finish_copied_route_latency_samples(&mut state);
+    });
+}
+
+/// The Owner completion queue has already detected this fence's readiness.
+/// Timestamp that event boundary rather than a later harness-loop iteration.
+#[cfg(test)]
+pub(crate) fn record_copied_route_fence_signalled_at_drain_for_tests(
+    transport: CopiedRouteTransport,
+) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(pending) = state
+            .pending
+            .iter_mut()
+            .find(|pending| pending.transport == transport && pending.signalled_at.is_none())
+        {
+            pending.signalled_at = Some(std::time::Instant::now());
+        } else if !state
+            .pending
+            .iter()
+            .any(|pending| pending.transport == transport)
+        {
+            state.insufficient = true;
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_copied_commit_submitted_for_tests(transport: CopiedRouteTransport) {
+    record_copied_commit_submitted_at_for_tests(transport, std::time::Instant::now(), true);
+}
+
+#[cfg(test)]
+pub(crate) fn record_copied_commit_submitted_at_for_tests(
+    transport: CopiedRouteTransport,
+    submitted_at: std::time::Instant,
+    required: bool,
+) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(pending) = state
+            .pending
+            .iter_mut()
+            .find(|pending| pending.transport == transport && pending.submitted_at.is_none())
+        else {
+            state.insufficient |= required;
+            return;
+        };
+        pending.submitted_at = Some(submitted_at);
+        finish_copied_route_latency_samples(&mut state);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_copied_completion_for_tests(
+    transport: CopiedRouteTransport,
+    msc: Option<u64>,
+) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(pending) = state
+            .pending
+            .iter_mut()
+            .find(|pending| pending.transport == transport && !pending.completion_recorded)
+        else {
+            state.insufficient = true;
+            return;
+        };
+        pending.completion_msc = msc;
+        pending.completion_recorded = true;
+        finish_copied_route_latency_samples(&mut state);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn copied_route_latency_waiting_for_completion_for_tests(
+    transport: CopiedRouteTransport,
+) -> bool {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        state
+            .borrow()
+            .pending
+            .iter()
+            .any(|pending| pending.transport == transport && !pending.completion_recorded)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn copied_route_latency_snapshot_for_tests() -> CopiedRouteLatencySnapshot {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let state = state.borrow();
+        CopiedRouteLatencySnapshot {
+            samples: state.samples.clone(),
+            pending_frames: state
+                .pending
+                .iter()
+                .map(|pending| CopiedRouteLatencyPendingSnapshot {
+                    frame: pending.frame,
+                    transport: pending.transport,
+                    fence_signalled: pending.signalled_at.is_some(),
+                    expected_msc_recorded: pending.expected_msc.is_some(),
+                    expected_msc_applicable: pending.transport == CopiedRouteTransport::Legacy,
+                    commit_submitted: pending.submitted_at.is_some(),
+                    completion_msc_recorded: pending.completion_recorded,
+                    completion_msc_applicable: pending.transport == CopiedRouteTransport::Legacy,
+                })
+                .collect(),
+            insufficient: state.insufficient,
+        }
+    })
+}
+
+#[cfg(test)]
+fn finish_copied_route_latency_samples(state: &mut CopiedRouteLatencyState) {
+    let mut completed = Vec::new();
+    for (index, pending) in state.pending.iter().enumerate() {
+        let Some(signalled_at) = pending.signalled_at else {
+            continue;
+        };
+        let Some(submitted_at) = pending.submitted_at else {
+            continue;
+        };
+        if !pending.completion_recorded {
+            continue;
+        }
+        let (expected_msc, completion_msc) = match pending.transport {
+            CopiedRouteTransport::Legacy => {
+                let Some(expected_msc) = pending.expected_msc else {
+                    continue;
+                };
+                let Some(completion_msc) = pending.completion_msc else {
+                    continue;
+                };
+                (Some(expected_msc), Some(completion_msc))
+            }
+            CopiedRouteTransport::Owner => (None, None),
+        };
+        let signed_delay_us = if submitted_at >= signalled_at {
+            i128::try_from(submitted_at.duration_since(signalled_at).as_micros())
+                .unwrap_or(i128::MAX)
+        } else {
+            -i128::try_from(signalled_at.duration_since(submitted_at).as_micros())
+                .unwrap_or(i128::MAX)
+        };
+        state.samples.push(CopiedRouteLatencySample {
+            frame: pending.frame,
+            transport: pending.transport,
+            submission_delay_us: signed_delay_us,
+            expected_msc,
+            completion_msc,
+        });
+        completed.push(index);
+    }
+    for index in completed.into_iter().rev() {
+        state.pending.swap_remove(index);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn finish_copied_route_latency_for_tests()
+-> Result<Vec<CopiedRouteLatencySample>, String> {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        finish_copied_route_latency_samples(&mut state);
+        if state.insufficient {
+            return Err("copied-route latency recorder became insufficient".to_string());
+        }
+        if !state.pending.is_empty() {
+            return Err(format!(
+                "copied-route latency recorder has {} incomplete frame(s)",
+                state.pending.len()
+            ));
+        }
+        Ok(std::mem::take(&mut state.samples))
+    })
 }
 
 /// A completed source-render job ready for the sink-side copied-scanout
@@ -633,6 +1011,7 @@ pub(crate) struct ReadyScanoutRenderCompletion {
     pub(crate) job_id: u64,
     pub(crate) output_key: OutputKey,
     pub(crate) bo_idx: usize,
+    pub(crate) stage: ScanoutRenderCompletionStage,
     pub(crate) fd: Option<OwnedFd>,
 }
 
@@ -3407,8 +3786,8 @@ impl PlatformBackend {
     ///
     /// Legacy gates are used by the older fixture and recovery paths and do
     /// not need scanout ownership.  An Owner gate is different: the scene's
-    /// owner fork can only be safe when every output on this device has a
-    /// shared, already-adopted pool.  Keep the refusal at the establishment
+    /// owner fork can only be safe when every output on this device has an
+    /// eligible, already-adopted pool. Keep the refusal at the establishment
     /// boundary so a caller can observe it and the device remains implicitly
     /// Legacy (no gate is installed).
     pub(crate) fn try_install_transport_gate(
@@ -3437,16 +3816,7 @@ impl PlatformBackend {
                 kinds.push(OwnerOutputKind::Missing);
                 continue;
             };
-            if !matches!(scanout, OutputScanout::Shared(_)) {
-                kinds.push(OwnerOutputKind::Copied);
-                continue;
-            }
-            let pool = scanout.display_pool();
-            if pool.bos.is_empty() || pool.bos.iter().any(|bo| bo.managed_key().is_none()) {
-                kinds.push(OwnerOutputKind::Unmanaged);
-                continue;
-            }
-            kinds.push(OwnerOutputKind::SharedManaged);
+            kinds.push(owner_output_kind(scanout));
         }
         validate_owner_output_kinds(&kinds)
     }
@@ -3466,13 +3836,10 @@ impl PlatformBackend {
                         .get(output_idx)
                         .and_then(Option::as_ref)
                         .is_some_and(|scanout| {
-                            matches!(scanout, OutputScanout::Shared(_))
-                                && !scanout.display_pool().bos.is_empty()
-                                && scanout
-                                    .display_pool()
-                                    .bos
-                                    .iter()
-                                    .all(|bo| bo.managed_key().is_some())
+                            matches!(
+                                owner_output_kind(scanout),
+                                OwnerOutputKind::SharedManaged | OwnerOutputKind::CopiedManaged
+                            )
                         })
             })
     }
@@ -3503,6 +3870,46 @@ impl PlatformBackend {
             return false;
         };
         bo.state.transition_to_free_after_owner()
+    }
+
+    /// Release a copied destination after the Owner ledger has retired the
+    /// displaced commit and the resource service has reported the allocation
+    /// free. The copied ownership ledger observes this same boundary so the
+    /// next B submission can acquire the image from FOREIGN. The shared path
+    /// intentionally remains in `leave_owner_buffer`.
+    pub(crate) fn leave_copied_owner_buffer_after_retirement(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> bool {
+        let Some(scanout) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+        else {
+            return false;
+        };
+        let OutputScanout::Copied(pool) = scanout else {
+            return false;
+        };
+        if pool
+            .destinations
+            .bos
+            .get(bo_idx)
+            .is_none_or(|bo| bo.state.phase != BoPhase::Owner)
+        {
+            return false;
+        }
+        if let Err(error) = pool.note_kms_retired(bo_idx) {
+            log::error!(
+                "render copied Owner: destination {bo_idx} could not record KMS retirement: {error}"
+            );
+            self.renderer_failed = true;
+            return false;
+        }
+        pool.destinations.bos[bo_idx]
+            .state
+            .transition_to_free_after_owner()
     }
 
     pub(crate) fn owner_bo_phase(
@@ -4892,6 +5299,7 @@ impl PlatformBackend {
         &mut self,
         output_key: OutputKey,
         bo_idx: usize,
+        stage: ScanoutRenderCompletionStage,
         fd: Option<OwnedFd>,
     ) -> io::Result<u64> {
         let job_id = self.next_scanout_render_job_id;
@@ -4908,6 +5316,7 @@ impl PlatformBackend {
                 job_id,
                 output_key,
                 bo_idx,
+                stage,
                 fd,
             });
         Ok(job_id)
@@ -4946,6 +5355,12 @@ impl PlatformBackend {
                 index += 1;
                 continue;
             }
+            #[cfg(test)]
+            if self.pending_scanout_render_completions[index].stage
+                == ScanoutRenderCompletionStage::CopiedOwnerCopy
+            {
+                record_copied_route_fence_signalled_at_drain_for_tests(CopiedRouteTransport::Owner);
+            }
             let pending = self
                 .pending_scanout_render_completions
                 .remove(index)
@@ -4959,6 +5374,7 @@ impl PlatformBackend {
                 job_id: pending.job_id,
                 output_key: pending.output_key,
                 bo_idx: pending.bo_idx,
+                stage: pending.stage,
                 fd: pending.fd,
             });
         }
@@ -4992,6 +5408,32 @@ impl PlatformBackend {
                 log::warn!("scanout render completion teardown unregister failed: {error}");
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_scanout_render_completion_count_for_tests(&self) -> usize {
+        self.pending_scanout_render_completions.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_scanout_render_job_id_for_tests(&mut self, job_id: u64) {
+        self.next_scanout_render_job_id = job_id;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_copied_managed_copy_failure_for_tests(
+        &mut self,
+        output_idx: usize,
+        failure: crate::kms::vk::scanout::ManagedCopyFailureForTests,
+    ) -> bool {
+        self.scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(OutputScanout::copied_mut)
+            .map(|pool| {
+                pool.force_next_managed_copy_failure_for_tests(failure);
+            })
+            .is_some()
     }
 
     fn drm_device_index_for_fd(&self, drm_fd: RawFd) -> Option<usize> {
@@ -6453,6 +6895,11 @@ impl PlatformBackend {
                     return Err(error);
                 }
             };
+            #[cfg(test)]
+            crate::kms::render::platform::record_copied_copy_fence_for_tests(
+                crate::kms::render::platform::CopiedRouteTransport::Legacy,
+                copy_completion.as_ref(),
+            );
             let destination = copied
                 .destinations
                 .bos
@@ -6470,6 +6917,10 @@ impl PlatformBackend {
                 legacy_write_permitted,
             ) {
                 Ok(()) => {
+                    #[cfg(test)]
+                    crate::kms::render::platform::record_copied_commit_submitted_for_tests(
+                        crate::kms::render::platform::CopiedRouteTransport::Legacy,
+                    );
                     if let Some(fd) = destination.state.transition_to_pending(out_fence_fd) {
                         // SAFETY: transition_to_pending transfers the uniquely
                         // owned input-fence fd back to this caller.
@@ -8185,6 +8636,68 @@ fn check_scanout_liveness(
 mod tests {
     use super::*;
 
+    #[test]
+    fn c0_conv_cp_latency_recorder_closes_after_fence_submission_and_completion() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        begin_copied_route_latency_for_tests();
+        let transports = [CopiedRouteTransport::Legacy, CopiedRouteTransport::Owner];
+        let mut reads = Vec::with_capacity(transports.len());
+        let mut writes = Vec::with_capacity(transports.len());
+        for transport in transports {
+            let mut pipe_fds = [-1; 2];
+            // SAFETY: `pipe2` writes two fresh owned descriptors to `pipe_fds`.
+            assert_eq!(
+                unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            // SAFETY: both descriptors were created successfully by `pipe2`.
+            let read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+            // SAFETY: both descriptors were created successfully by `pipe2`.
+            let write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+            record_copied_copy_fence_for_tests(transport, Some(&read));
+            reads.push(read);
+            writes.push(write);
+        }
+        assert_eq!(copied_route_latency_fence_fds_for_tests().len(), 2);
+        drain_copied_route_latency_fences_for_tests(20);
+        assert!(
+            copied_route_latency_snapshot_for_tests()
+                .pending_frames
+                .iter()
+                .all(|pending| !pending.fence_signalled)
+        );
+        for write in &writes {
+            let byte = 1u8;
+            // SAFETY: `write` is a valid live pipe descriptor and `byte` is readable.
+            assert_eq!(
+                unsafe { libc::write(write.as_raw_fd(), (&raw const byte).cast(), 1) },
+                1
+            );
+        }
+        drain_copied_route_latency_fences_for_tests(20);
+        record_copied_route_fence_signalled_at_drain_for_tests(CopiedRouteTransport::Owner);
+        for (index, transport) in transports.into_iter().enumerate() {
+            record_copied_commit_submitted_for_tests(transport);
+            record_copied_completion_for_tests(
+                transport,
+                (transport == CopiedRouteTransport::Legacy)
+                    .then(|| u64::try_from(21 + index).expect("test MSC fits in u64")),
+            );
+        }
+
+        let snapshot = copied_route_latency_snapshot_for_tests();
+        assert!(!snapshot.insufficient);
+        assert!(snapshot.pending_frames.is_empty());
+        assert_eq!(snapshot.samples.len(), 2);
+        assert_eq!(snapshot.samples[0].expected_msc, Some(21));
+        assert_eq!(snapshot.samples[1].expected_msc, None);
+        assert_eq!(snapshot.samples[0].completion_msc, Some(21));
+        assert_eq!(snapshot.samples[1].completion_msc, None);
+        drop(reads);
+        drop(writes);
+    }
+
     /// [ID-1..3, CAP-1..4, COMMIT-2] Catches accepting a proof for another
     /// incarnation or allowing the consumed one-way handover to repeat.
     #[test]
@@ -8691,7 +9204,12 @@ mod tests {
                 .expect("ready eventfd")
                 .into();
         platform
-            .register_scanout_render_completion(output_key, 1, Some(ready))
+            .register_scanout_render_completion(
+                output_key,
+                1,
+                ScanoutRenderCompletionStage::Render,
+                Some(ready),
+            )
             .expect("register pollable copied completion");
 
         platform
@@ -8719,10 +9237,20 @@ mod tests {
                 .expect("ready eventfd")
                 .into();
         let first_job = platform
-            .register_scanout_render_completion(output_key.clone(), 0, Some(blocked))
+            .register_scanout_render_completion(
+                output_key.clone(),
+                0,
+                ScanoutRenderCompletionStage::Render,
+                Some(blocked),
+            )
             .expect("register first job");
         let second_job = platform
-            .register_scanout_render_completion(output_key.clone(), 1, Some(ready))
+            .register_scanout_render_completion(
+                output_key.clone(),
+                1,
+                ScanoutRenderCompletionStage::Render,
+                Some(ready),
+            )
             .expect("register second job");
 
         let completions = platform.drain_scanout_render_completions();
@@ -8744,7 +9272,12 @@ mod tests {
         let mut platform = PlatformBackend::for_tests();
         let output_key = platform.outputs[0].key.clone();
         let job = platform
-            .register_scanout_render_completion(output_key.clone(), 2, None)
+            .register_scanout_render_completion(
+                output_key.clone(),
+                2,
+                ScanoutRenderCompletionStage::Render,
+                None,
+            )
             .expect("register Vulkan fd=-1 completion");
 
         let completions = platform.drain_scanout_render_completions();
@@ -10307,26 +10840,32 @@ mod tests {
     }
 
     #[test]
-    fn owner_output_kind_validator_rejects_copied_route() {
-        let error = validate_owner_output_kinds(&[OwnerOutputKind::Copied])
-            .expect_err("copied route must not enter Owner");
-        assert!(matches!(
-            error,
-            OwnerEligibilityError::CopiedScanoutRoute { output_idx: 0 }
-        ));
+    fn c0_conv_cp_eligibility_requires_both_halves() {
+        assert_eq!(
+            classify_copied_managed_status([true], [true]),
+            OwnerOutputKind::CopiedManaged,
+            "a copied output with both pool halves adopted is Owner-eligible"
+        );
+        validate_owner_output_kinds(&[OwnerOutputKind::CopiedManaged])
+            .expect("a copied output with both managed halves may enter Owner");
     }
 
     #[test]
-    fn owner_output_kind_validator_rejects_one_bad_output_of_many() {
+    fn c0_conv_cp_unmanaged_source_keeps_the_device_legacy() {
+        assert_eq!(
+            classify_copied_managed_status([true], [false]),
+            OwnerOutputKind::Unmanaged,
+            "an unadopted source half keeps the copied output unmanaged"
+        );
         let error = validate_owner_output_kinds(&[
             OwnerOutputKind::SharedManaged,
-            OwnerOutputKind::Copied,
+            classify_copied_managed_status([true], [false]),
             OwnerOutputKind::SharedManaged,
         ])
-        .expect_err("one bad output must keep the whole device Legacy");
+        .expect_err("one copied output with an unmanaged source keeps the device Legacy");
         assert!(matches!(
             error,
-            OwnerEligibilityError::CopiedScanoutRoute { output_idx: 1 }
+            OwnerEligibilityError::UnmanagedScanoutPool { output_idx: 1 }
         ));
     }
 

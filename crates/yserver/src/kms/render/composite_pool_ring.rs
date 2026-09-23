@@ -133,6 +133,11 @@ impl CompositePoolRing {
     pub fn pool_at(&self, slot: usize) -> vk::DescriptorPool {
         self.pools[slot]
     }
+
+    #[cfg(test)]
+    pub(crate) fn occupancy_for_tests(&self) -> (usize, usize) {
+        (self.tracker.slots_in_use(), self.pools.len())
+    }
 }
 
 impl Drop for CompositePoolRing {

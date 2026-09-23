@@ -342,6 +342,53 @@ pub(crate) fn prepare_retirement_batch(
     ))
 }
 
+/// Prepare the two allocations touched by the sink-side copied submission.
+/// The destination is written by the copy and the source is retained by the
+/// copy as a read.  Both reservations and both obligations are established
+/// before the caller may submit anything to Vulkan.
+pub(crate) type CopiedPreparedBatch = (
+    CoreRetirementBatch,
+    (AllocationKey, ObligationId),
+    (AllocationKey, ObligationId),
+);
+
+pub(crate) fn prepare_copied_batch(
+    service: &mut ResourceService,
+    destination_key: AllocationKey,
+    source_key: AllocationKey,
+) -> Result<CopiedPreparedBatch, ResourceError> {
+    let (mut batch, destination_entries) =
+        prepare_retirement_batch(service, &[destination_key], Vec::new())?;
+    let destination_entry = destination_entries
+        .first()
+        .copied()
+        .expect("one copied destination write produces one obligation");
+
+    let source_lease = match service.reserve(source_key, super::UseKind::Read) {
+        Ok(lease) => lease,
+        Err(error) => {
+            cancel_pre_submit_batch(service, &destination_entries)?;
+            return Err(error);
+        }
+    };
+    let source_obligation = match service.register(source_key, super::ObligationKind::Read) {
+        Ok(obligation) => obligation,
+        Err(error) => {
+            drop(source_lease);
+            cancel_pre_submit_batch(service, &destination_entries)?;
+            return Err(error);
+        }
+    };
+    batch.bind_read_obligation(ReadObligation::new(
+        source_lease,
+        source_obligation,
+        None,
+        None,
+    ));
+
+    Ok((batch, destination_entry, (source_key, source_obligation)))
+}
+
 fn cancel_prepared_entries(
     service: &mut ResourceService,
     entries: &[(AllocationKey, ObligationId)],

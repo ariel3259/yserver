@@ -1387,6 +1387,83 @@ impl ResourceService {
         Ok(res)
     }
 
+    /// Access an adopted copied source through the caller's already-held
+    /// `Read` or `Write` lease.  Copied sources are a distinct payload kind
+    /// from ordinary scanout destinations, so `with_scanout_read/write`
+    /// deliberately cannot expose them.
+    pub(crate) fn with_copied_source<T>(
+        &mut self,
+        lease: &AllocationLease,
+        f: impl FnOnce(&mut CopiedSourceAllocation) -> T,
+    ) -> Result<T, ResourceError> {
+        if !matches!(lease.kind(), UseKind::Read | UseKind::Write) {
+            return Err(ResourceError::InvalidProof);
+        }
+        let entry = self
+            .entries
+            .get(&lease.key())
+            .ok_or(ResourceError::Detached)?;
+        let mut payload = entry.payload.borrow_mut();
+        let source = match payload.as_mut() {
+            Some(AllocationPayload::CopiedSource(source)) => source,
+            _ => return Err(ResourceError::InvalidState),
+        };
+        Ok(f(source))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copied_source_waits_for_tests(
+        &mut self,
+        key: AllocationKey,
+    ) -> Option<(bool, bool)> {
+        let lease = self.reserve(key, UseKind::Read).ok()?;
+        let waits = self
+            .with_copied_source(&lease, |source| source.waits_for_tests())
+            .ok();
+        drop(lease);
+        waits
+    }
+
+    /// Borrow the copied source and sink destination payloads held by the
+    /// two leases of one prepared sink copy.  A single method is required so
+    /// both `RefCell` payload borrows coexist while the copy command is
+    /// recorded; nesting the one-payload helpers would borrow the service
+    /// mutably twice and cannot express this pair.
+    pub(crate) fn with_copied_source_and_scanout_write<T>(
+        &mut self,
+        source_lease: &AllocationLease,
+        destination_lease: &AllocationLease,
+        f: impl FnOnce(&mut CopiedSourceAllocation, &mut ScanoutAllocation) -> T,
+    ) -> Result<T, ResourceError> {
+        if !matches!(source_lease.kind(), UseKind::Read | UseKind::Write)
+            || destination_lease.kind() != UseKind::Write
+            || source_lease.key() == destination_lease.key()
+        {
+            return Err(ResourceError::InvalidProof);
+        }
+        let source_entry = self
+            .entries
+            .get(&source_lease.key())
+            .cloned()
+            .ok_or(ResourceError::Detached)?;
+        let destination_entry = self
+            .entries
+            .get(&destination_lease.key())
+            .cloned()
+            .ok_or(ResourceError::Detached)?;
+        let mut source_payload = source_entry.payload.borrow_mut();
+        let mut destination_payload = destination_entry.payload.borrow_mut();
+        let source = match source_payload.as_mut() {
+            Some(AllocationPayload::CopiedSource(source)) => source,
+            _ => return Err(ResourceError::InvalidState),
+        };
+        let destination = match destination_payload.as_mut() {
+            Some(AllocationPayload::Scanout(destination)) => destination,
+            _ => return Err(ResourceError::InvalidState),
+        };
+        Ok(f(source, destination))
+    }
+
     /// B-11: stamps `batch` with its own serviced-time deadline --
     /// `serviced_elapsed` (this service's cumulative *serviced* time, as of
     /// right now) plus `max_serviced_duration`, both with checked

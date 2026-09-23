@@ -7450,15 +7450,9 @@ impl KmsBackend {
     /// that exercise real `PRIME_FD_TO_HANDLE`/`ADDFB2`/`RMFB` ioctls.
     #[doc(hidden)]
     pub fn for_tests_with_vk_live_scene_real_drm() -> Result<Self, io::Error> {
+        #[cfg(test)]
         use std::sync::Arc;
 
-        // The VkContext below is shared by every real-DRM fixture in this
-        // test binary. Hold the serial for the entire backend lifetime, not
-        // merely while this constructor runs; VkDevice use is not safe to
-        // overlap across the harness's test threads on the target driver.
-        #[cfg(test)]
-        let real_drm_test_guard = RealDrmTestSerial::acquire();
-        let mut base = Self::for_tests_seed();
         #[cfg(test)]
         let vk = {
             static SHARED_REAL_DRM_TEST_VK: std::sync::OnceLock<
@@ -7481,6 +7475,23 @@ impl KmsBackend {
                 "render for_tests_with_vk_live_scene: VkContext: {e:?}"
             ))
         })?;
+        Self::for_tests_with_vk_live_scene_real_drm_using(vk)
+    }
+
+    /// Test-only variant that keeps the live-scene fixture's real DRM
+    /// allocation on the Vulkan context's selected primary while allowing a
+    /// hardware test to choose that context by an exact render-node identity.
+    fn for_tests_with_vk_live_scene_real_drm_using(
+        vk: std::sync::Arc<crate::kms::vk::device::VkContext>,
+    ) -> Result<Self, io::Error> {
+        use std::sync::Arc;
+
+        // Hold the real-DRM serial for the entire backend lifetime, not merely
+        // while this constructor runs; VkDevice use is not safe to overlap
+        // across the harness's test threads on the target driver.
+        #[cfg(test)]
+        let real_drm_test_guard = RealDrmTestSerial::acquire();
+        let mut base = Self::for_tests_seed();
         let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
             io::Error::other(format!(
                 "render for_tests_with_vk_live_scene: OpsCommandPool: {e:?}"
@@ -7601,6 +7612,15 @@ impl KmsBackend {
     /// any test framebuffer or the DRM fd is dropped.
     #[cfg(test)]
     pub fn for_tests_with_live_kms() -> Result<LiveKmsFixture, io::Error> {
+        let backend = Self::for_tests_with_vk_live_scene_real_drm()?;
+        Self::for_tests_with_live_kms_from_backend(backend, None)
+    }
+
+    #[cfg(test)]
+    fn for_tests_with_live_kms_from_backend(
+        mut backend: Self,
+        required_connector: Option<&str>,
+    ) -> Result<LiveKmsFixture, io::Error> {
         use std::{os::fd::AsRawFd, sync::Arc};
 
         use crate::kms::{
@@ -7610,7 +7630,6 @@ impl KmsBackend {
         use ::drm::{ClientCapability, Device as DrmDevice};
 
         let exclusive = acquire_live_kms_fixture_guard();
-        let mut backend = Self::for_tests_with_vk_live_scene_real_drm()?;
         let reported_primary = backend
             .platform
             .vk
@@ -7651,14 +7670,19 @@ impl KmsBackend {
             }
         }
 
-        let probe = crate::platform::drm::discover_outputs(&device)?
+        let Some(probe) = crate::platform::drm::discover_outputs(&device)?
             .into_iter()
-            .next()
-            .unwrap_or_else(|| {
-                panic!(
-                    "live-KMS fixture requires a connected DRM output with at least one mode; none was found"
-                )
-            });
+            .find(|probe| required_connector.is_none_or(|name| probe.connector_name == name))
+        else {
+            if let Some(connector) = required_connector {
+                return Err(io::Error::other(format!(
+                    "F8: live-KMS fixture requires connector {connector} with at least one mode"
+                )));
+            }
+            panic!(
+                "live-KMS fixture requires a connected DRM output with at least one mode; none was found"
+            );
+        };
         let preferred_mode = probe
             .modes
             .iter()
@@ -20462,6 +20486,24 @@ impl KmsBackend {
         let now = std::time::Instant::now();
         for (key, event) in events {
             log::debug!("kms executor host call event on {key}: {event:?}");
+            #[cfg(test)]
+            if let crate::kms::executor::HostCallEvent::Outcome {
+                outcome:
+                    crate::kms::executor::HostCallOutcome::Accepted {
+                        helper_duration_ns, ..
+                    },
+                ..
+            } = &event
+            {
+                let submitted_at = now
+                    .checked_sub(std::time::Duration::from_nanos(*helper_duration_ns))
+                    .unwrap_or(now);
+                crate::kms::render::platform::record_copied_commit_submitted_at_for_tests(
+                    crate::kms::render::platform::CopiedRouteTransport::Owner,
+                    submitted_at,
+                    false,
+                );
+            }
             self.host_call_events_for_tests
                 .lock()
                 .unwrap()
@@ -52087,6 +52129,1690 @@ mod tests {
         owner_live_fixture_with_output_count(1, false)
     }
 
+    fn assert_managed_recording_was_cancelled(
+        backend: &super::KmsBackend,
+        expected_pool_occupancy: (usize, usize),
+    ) -> (usize, crate::kms::render::resources::AllocationKey) {
+        let diagnostics = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("live Owner output has tick diagnostics");
+        let (bo_idx, key) = diagnostics
+            .acquired_destination
+            .expect("the forced early exit must follow managed destination acquisition");
+        let destination = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("Owner fixture retains its scanout pool")
+            .display_pool()
+            .bos
+            .get(bo_idx)
+            .expect("acquired destination remains registered in the persistent pool");
+        assert_eq!(destination.managed_key(), Some(key));
+        assert_eq!(
+            destination.state.phase,
+            crate::kms::vk::scanout::BoPhase::Free,
+            "an early exit before render submission must cancel Free -> Recording"
+        );
+        assert_eq!(
+            diagnostics.pool_occupancy, expected_pool_occupancy,
+            "no descriptor slot from the early exit may remain held"
+        );
+        assert!(
+            backend.scene.owner_prepared_for_tests(0).is_none(),
+            "a pre-submit exit must not install Owner buffer membership"
+        );
+        assert!(
+            !backend.scene.has_pending_page_flip(0),
+            "a pre-submit exit must not install a pending acknowledgement"
+        );
+        assert_eq!(
+            backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "a pre-submit exit must not leave a render-completion waiter"
+        );
+        let service = backend
+            .resource_service()
+            .expect("the successful managed acquisition requires its service");
+        assert!(
+            service.is_releasable(&key),
+            "the acquisition's temporary destination lease must be dropped"
+        );
+        assert!(
+            !service.has_pending_obligations(&key),
+            "no GPU obligation may be registered before render submission"
+        );
+        (bo_idx, key)
+    }
+
+    fn tick_managed_pre_submit_fixture(backend: &mut super::KmsBackend) {
+        assert!(backend.platform.output_uses_owner_route(0));
+        backend.scene.reset_tick_diagnostics_for_tests(0);
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_managed_rollback_on_audit_overlay_pipeline_error_vulkan() {
+        let mut fixture = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        let backend = &mut fixture.backend;
+        assert!(matches!(
+            backend.platform.scanout_pools[0].as_ref(),
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(_))
+        ));
+        assert!(backend.scene.root_overlay_toggle(
+            yserver_protocol::x11::ClientId(0xC0),
+            0x00ff_ffff,
+            &[ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 5, y: 5 },
+                extent: ash::vk::Extent2D {
+                    width: 20,
+                    height: 20,
+                },
+            }],
+        ));
+        backend.scene.force_tick_failure_for_tests(
+            crate::kms::render::scene::TickFailureForTests::AuditOverlayPipeline,
+        );
+
+        tick_managed_pre_submit_fixture(backend);
+
+        assert!(
+            !backend.scene.root_overlay.is_empty(),
+            "the fixture must take the non-empty XOR pipeline path"
+        );
+        assert_managed_recording_was_cancelled(backend, (0, 3));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_managed_rollback_on_damage_audit_error_vulkan() {
+        let mut fixture =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        assert!(matches!(
+            backend.platform.scanout_pools[0].as_ref(),
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(_))
+        ));
+        // `run_damage_audit` exits successfully without work on Copied
+        // outputs, so only the managed Shared route can reach this error site.
+        backend.scene.force_tick_failure_for_tests(
+            crate::kms::render::scene::TickFailureForTests::DamageAudit,
+        );
+
+        tick_managed_pre_submit_fixture(backend);
+
+        assert_managed_recording_was_cancelled(backend, (0, 3));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_managed_rollback_on_descriptor_no_pool_vulkan() {
+        let mut fixture = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        let backend = &mut fixture.backend;
+        assert!(matches!(
+            backend.platform.scanout_pools[0].as_ref(),
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(_))
+        ));
+        let held_slots = backend.scene.exhaust_descriptor_ring_for_tests(0);
+        assert_eq!(
+            held_slots.len(),
+            3,
+            "fixture must hold all descriptor slots before the managed tick"
+        );
+
+        tick_managed_pre_submit_fixture(backend);
+
+        let diagnostics = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("live Owner output has tick diagnostics");
+        assert_eq!(
+            diagnostics
+                .skip_counts
+                .iter()
+                .find(|(reason, _)| *reason == "NoPool")
+                .map(|(_, count)| *count),
+            Some(1),
+            "the test must force the descriptor-pool NoPool return"
+        );
+        assert_eq!(diagnostics.acquisition_skips.len(), 1);
+        assert_eq!(diagnostics.acquisition_skips[0].reason, "NoPool");
+        assert_managed_recording_was_cancelled(backend, (3, 3));
+        backend
+            .scene
+            .release_descriptor_slots_for_tests(0, &held_slots);
+        assert_eq!(
+            backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .expect("live Owner output has tick diagnostics")
+                .pool_occupancy,
+            (0, 3),
+            "release the test-owned slots after verifying NoPool preserves their baseline"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_managed_rollback_on_fence_ticket_error_vulkan() {
+        let mut fixture = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        let backend = &mut fixture.backend;
+        assert!(matches!(
+            backend.platform.scanout_pools[0].as_ref(),
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(_))
+        ));
+        backend.platform.fence_pool = None;
+
+        tick_managed_pre_submit_fixture(backend);
+
+        assert_managed_recording_was_cancelled(backend, (0, 3));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_copied_fixture_builds_a_managed_output_vulkan() {
+        let OwnerLiveFixture { mut backend, .. } = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        let scanout = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied fixture output has a scanout pool");
+        let crate::kms::vk::scanout::OutputScanout::Copied(pool) = scanout else {
+            panic!("copied fixture must install OutputScanout::Copied");
+        };
+        assert_eq!(pool.destinations.bos.len(), pool.sources.len());
+        assert!(!pool.destinations.bos.is_empty());
+        assert!(
+            pool.destinations
+                .bos
+                .iter()
+                .all(|bo| bo.managed_key().is_some()),
+            "every copied destination must be adopted"
+        );
+        assert!(
+            pool.sources
+                .iter()
+                .all(|source| source.managed_key().is_some()),
+            "every copied source must be adopted"
+        );
+        assert!(backend.platform.output_uses_owner_route(0));
+
+        // Exercise the same site that the Owner gate's check uses after one
+        // source half loses its adoption. The live fixture proves the route
+        // with both halves managed; this negative transition proves that the
+        // source half is not merely diagnostic.
+        let source_lease = {
+            let scanout = backend.platform.scanout_pools[0]
+                .as_mut()
+                .expect("copied fixture output has a scanout pool");
+            let crate::kms::vk::scanout::OutputScanout::Copied(pool) = scanout else {
+                panic!("copied fixture must install OutputScanout::Copied");
+            };
+            pool.sources[0]
+                .take_managed()
+                .expect("copied fixture source is adopted before the negative check")
+        };
+        drop(source_lease);
+        let device = backend.platform.outputs[0].key.device_key;
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("copied fixture owner")
+            .incarnation();
+        let error = backend
+            .platform
+            .try_install_transport_gate(crate::kms::render::resources::tests::owner_gate_for_tests(
+                device,
+                incarnation,
+            ))
+            .expect_err("an unmanaged copied source must refuse Owner eligibility");
+        assert!(matches!(
+            error,
+            crate::kms::render::platform::OwnerEligibilityError::UnmanagedScanoutPool {
+                output_idx: 0
+            }
+        ));
+        assert!(!backend.platform.output_uses_owner_route(0));
+    }
+
+    fn copied_owner_frame_after_a() -> (
+        OwnerLiveFixture,
+        usize,
+        crate::kms::render::resources::AllocationKey,
+        crate::kms::render::resources::AllocationKey,
+    ) {
+        let OwnerLiveFixture {
+            mut backend,
+            cleanup_calls,
+            cleanup_io,
+        } = copied_owner_live_fixture()
+            .expect("environmental skip: no copied-route Vulkan fixture available");
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (bo_idx, _, rendering) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("copied Owner tick must retain a prepared generation");
+        assert!(
+            rendering,
+            "stage A must remain in Rendering before its wake"
+        );
+        let (source_key, destination_key) = match backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => (
+                pool.sources[bo_idx]
+                    .managed_key()
+                    .expect("copied source is managed"),
+                pool.destinations.bos[bo_idx]
+                    .managed_key()
+                    .expect("copied destination is managed"),
+            ),
+            _ => panic!("copied fixture must install a copied pool"),
+        };
+        (
+            OwnerLiveFixture {
+                backend,
+                cleanup_calls,
+                cleanup_io,
+            },
+            bo_idx,
+            source_key,
+            destination_key,
+        )
+    }
+
+    fn wait_copied_sink_idle(backend: &super::KmsBackend) {
+        let sink_vk = match backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => pool.sink_context(),
+            _ => panic!("copied fixture must install a copied pool"),
+        };
+        unsafe {
+            sink_vk
+                .device
+                .device_wait_idle()
+                .expect("copied sink device idle");
+        }
+    }
+
+    fn copied_owner_commit_for_tests() -> (
+        OwnerLiveFixture,
+        usize,
+        DrmDeviceKey,
+        crate::kms::owner::identity::CommitId,
+    ) {
+        let (mut fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+        let device = fixture.backend.platform.outputs[0].key.device_key;
+
+        // A's completion is the first wake. It submits B and leaves B's
+        // correlated destination obligation pending in the service.
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            fixture
+                .backend
+                .scene
+                .copied_receipt_for_tests(0, bo_idx)
+                .is_some(),
+            "the copied production path must retain B's receipt"
+        );
+
+        // B's sync_file is only the wake; retire the registered batch through
+        // the service before the second wake can promote the generation.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the copied destination obligation must retire");
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+
+        let commit = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("the copied offer must use the ordinary owner commit path")
+            .commit_id();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
+            "the conductor must consume the copied offer into Submitted"
+        );
+        (fixture, bo_idx, device, commit)
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_stage_a_source_is_managed_vulkan() {
+        let (mut fixture, bo_idx, source_key, _) = copied_owner_frame_after_a();
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&source_key),
+            "A's source Write obligation must exist before renderer submission"
+        );
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering)
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&source_key),
+            "the prepared B copy still retains the source through its read obligation"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_obligations_precede_the_copy_vulkan() {
+        let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&destination_key)
+        );
+        let receipt = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production copied submission must retain its receipt");
+        assert_eq!(receipt.1.0, source_key);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_batch_holds_both_obligations_vulkan() {
+        let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let ((receipt_destination, destination_obligation), (receipt_source, source_obligation)) =
+            fixture
+                .backend
+                .scene
+                .copied_receipt_for_tests(0, bo_idx)
+                .expect("copy receipt");
+        assert_eq!(receipt_destination, destination_key);
+        assert_eq!(receipt_source, source_key);
+        let service = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service");
+        assert!(service.has_pending_obligation(&destination_key, destination_obligation));
+        assert!(service.has_pending_obligation(&source_key, source_obligation));
+        let pending = service.pending_batches();
+        assert_eq!(pending.len(), 1, "the sink copy must register one B batch");
+        let gpu = pending[0]
+            .obligation
+            .as_ref()
+            .expect("B batch must carry a sink GPU obligation");
+        assert_eq!(
+            gpu.entries(),
+            &[(destination_key, destination_obligation)],
+            "the sink GPU obligation must own the destination Write entry"
+        );
+        let read = pending[0]
+            .read_obligation
+            .as_ref()
+            .expect("B batch must carry the source Read obligation");
+        assert_eq!(read.source_key(), source_key);
+        assert_eq!(read.source_obligation(), source_obligation);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_read_obligation_has_a_production_caller_vulkan() {
+        let (mut fixture, bo_idx, source_key, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, (receipt_source, source_obligation)) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production copy receipt");
+        assert_eq!(receipt_source, source_key);
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&source_key, source_obligation)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_paired_phase_excludes_the_source_vulkan() {
+        let (fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+        let phase = match fixture.backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+                pool.destinations.bos[bo_idx].state.phase
+            }
+            _ => panic!("copied fixture must install a copied pool"),
+        };
+        assert_eq!(
+            phase,
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "Owner membership is reached only after selection changed the paired BO from Free through Recording"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_offer_waits_for_the_destination_obligation_vulkan() {
+        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+
+        let (_, destination_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("A completion must prepare B through the production copied route")
+            .0;
+        let service = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service");
+        assert!(service.has_pending_obligation(&destination_key, destination_obligation));
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "a prepared copied generation remains Rendering while B's receipt is pending"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_readable_fence_with_pending_obligation_offers_nothing_vulkan() {
+        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, destination_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production B preparation must retain the receipt")
+            .0;
+
+        // The first drain only consumed A's already-registered wake.  The
+        // second drain consumes B's real sync_file wake while the service
+        // still owns the correlated obligation.
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "a readable copy fence is not itself permission to promote"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&destination_key, destination_obligation),
+            "the test must observe the pending receipt, not a generic completion"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_frozen_destination_offers_nothing_vulkan() {
+        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, destination_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production B preparation must retain the receipt")
+            .0;
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .freeze(destination_key)
+            .expect("freeze the receipt's destination");
+
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "a service failure/frozen destination must not be treated as an offer"
+        );
+        let service = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service");
+        assert!(service.is_frozen(&destination_key));
+        assert!(service.has_pending_obligation(&destination_key, destination_obligation));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_desired_at_copy_retirement_vulkan() {
+        let (mut fixture, bo_idx, _, destination_key) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, destination_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production B preparation must retain the receipt")
+            .0;
+
+        // Retire the registered B batch through the resource service before
+        // delivering B's wake. The promotion still has to consume the
+        // receipt, rather than the generic completion result.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the real B fence must retire");
+        assert!(
+            !fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&destination_key, destination_obligation)
+        );
+
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
+            "B retirement promotes the copied generation and the normal offer path consumes it"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_commit_carries_no_input_fence_vulkan() {
+        let (fixture, _bo_idx, _device, _commit) = copied_owner_commit_for_tests();
+        let record = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("copied generation owner commit");
+        let request = record
+            .request_properties_for_tests()
+            .expect("the owner record retains the byte-only atomic request");
+        let crtc = u32::from(fixture.backend.platform.outputs[0].output.crtc);
+        let plane = u32::from(fixture.backend.platform.outputs[0].output.plane);
+
+        assert_eq!(request.objects, vec![crtc, plane]);
+        assert_eq!(
+            request.count_props,
+            vec![2, 2],
+            "the request has only ACTIVE/OUT_FENCE_PTR on the CRTC and FB_ID/CRTC_ID on the plane"
+        );
+        assert_eq!(
+            request.props,
+            vec![21, 22, 19, 20],
+            "the copied fence is discharged before the owner commit is built"
+        );
+        assert_eq!(request.values.len(), request.props.len());
+        assert_eq!(request.values[0], 1);
+        assert_eq!(request.values[3], u64::from(crtc));
+        assert_eq!(record.closure().present_event(), &[]);
+        // The request type contains no host→helper descriptor vector. The
+        // only fd-bearing part is the helper-produced out-fence slot above.
+        assert_eq!(record.closure().expected_completion(), &[crtc]);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_end_to_end_copied_frame_vulkan() {
+        let (mut fixture, bo_idx, device, commit) = copied_owner_commit_for_tests();
+        let history_before = fixture.backend.scene.damage_history_len_for_tests(0);
+
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
+            "render, copy and destination-obligation retirement reach the owner commit"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .scene
+                .owner_damage_transaction_count_for_tests(),
+            1,
+            "the copied offer installs the same owner damage transaction as composed"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "damage is not applied merely by dispatch"
+        );
+
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted { commit }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Accepted),
+            "Accepted advances the copied owner buffer"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| staged),
+            "Accepted stages the copied frame's captured damage"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .scene
+                .owner_damage_transaction_count_for_tests(),
+            1,
+            "Accepted does not consume the damage transaction"
+        );
+
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            fixture
+                .backend
+                .scene
+                .owner_damage_transaction_count_for_tests(),
+            0,
+            "HardwareComplete consumes the copied damage transaction"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .damage_state_for_tests(0)
+                .is_some_and(|(_, staged)| !staged),
+            "HardwareComplete applies the copied frame's damage"
+        );
+        assert!(
+            fixture.backend.scene.damage_history_len_for_tests(0) > history_before,
+            "HardwareComplete records the copied frame's applied damage"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_source_released_by_the_read_obligation_vulkan() {
+        let (mut pending_fixture, pending_bo_idx, pending_source_key, _) =
+            copied_owner_frame_after_a();
+
+        // A's completion is only the handoff into B. The source read debt and
+        // B's temporary sink wait must both still be live after that wake.
+        pending_fixture.backend.platform.wait_idle_bounded();
+        pending_fixture
+            .backend
+            .drain_scanout_render_completions_for_tests();
+        let (_, pending_source_obligation) = pending_fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, pending_bo_idx)
+            .expect("production B preparation must retain the source receipt")
+            .1;
+        assert!(
+            pending_fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&pending_source_key, pending_source_obligation),
+            "B's read obligation must hold the source after A retires"
+        );
+        let pending_waits_before_b = pending_fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .copied_source_waits_for_tests(pending_source_key)
+            .expect("managed copied source");
+        assert!(
+            pending_waits_before_b.0,
+            "the sink wait remains live while B's read obligation is pending"
+        );
+
+        // The copy wake can arrive before the resource-service ticket has
+        // retired. The release site is reached in that state, but CP-10 must
+        // leave the source synchronization payload untouched.
+        pending_fixture.backend.platform.wait_idle_bounded();
+        pending_fixture
+            .backend
+            .drain_scanout_render_completions_for_tests();
+        assert!(
+            pending_fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&pending_source_key, pending_source_obligation),
+            "B's source read obligation must still be pending when its wake is handled"
+        );
+        let waits_during_pending_b = pending_fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .copied_source_waits_for_tests(pending_source_key)
+            .expect("managed copied source");
+        assert_eq!(
+            waits_during_pending_b, pending_waits_before_b,
+            "a readable copy wake must not release source waits before B's read obligation retires"
+        );
+        drop(pending_fixture);
+
+        // Repeat the production route so the original proof can deliver B's
+        // existing wake after its real resource-service retirement.
+        let (mut fixture, bo_idx, source_key, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let (_, source_obligation) = fixture
+            .backend
+            .scene
+            .copied_receipt_for_tests(0, bo_idx)
+            .expect("production B preparation must retain the source receipt")
+            .1;
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&source_key, source_obligation),
+            "B's read obligation must hold the source after A retires"
+        );
+        let waits_before_b = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .copied_source_waits_for_tests(source_key)
+            .expect("managed copied source");
+        assert!(
+            waits_before_b.0,
+            "the sink wait remains live while B's read obligation is pending"
+        );
+
+        // Retire B through the resource service, then deliver its existing
+        // sync-file wake. No Owner commit or flip is involved in this proof.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the real B fence must retire");
+        assert!(
+            !fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligation(&source_key, source_obligation),
+            "the source read obligation must retire with B's batch"
+        );
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let waits_after_b = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .copied_source_waits_for_tests(source_key)
+            .expect("managed copied source");
+        assert!(
+            !waits_after_b.0 && !waits_after_b.1,
+            "B's retired read obligation, not an Owner ack or flip, releases source waits"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_destination_retires_under_the_ledger_vulkan() {
+        let (mut fixture, first_bo, device, first_commit) = copied_owner_commit_for_tests();
+        let first_key = match fixture.backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => pool.destinations.bos[first_bo]
+                .managed_key()
+                .expect("first destination is managed"),
+            _ => panic!("copied fixture must install a copied pool"),
+        };
+
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "the copied destination remains owner-held after B's ack"
+        );
+        fixture.backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: first_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: first_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+        let first_completion = fixture.backend.complete_owner_for_tests(0);
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            first_completion,
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Current),
+            "the first copied destination must become the ledger's Current resource"
+        );
+
+        // A second real copied generation displaces the first destination.
+        reinstall_owner_executor_for_cir_test(&mut fixture.backend, device);
+        fixture.backend.scene.mark_scene_structure_dirty();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, _, _) = fixture
+            .backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("second copied generation");
+        assert_ne!(first_bo, second_bo);
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("second B fence must retire");
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        let second_commit = fixture
+            .backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("second copied generation must reach the owner")
+            .commit_id();
+
+        // Before the real completion, the old destination is still Current,
+        // still physically Owner, and its KmsRelease is outstanding.
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&first_key),
+            "the displacing owner commit must register KmsRelease for the old destination"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .kms_commit_for_tests(first_key)
+                .is_some(),
+            "the old destination's pending debt must specifically include KmsRelease"
+        );
+        let held_gpu = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .register(
+                first_key,
+                crate::kms::render::resources::ObligationKind::Gpu,
+            )
+            .expect("test GPU gate");
+        fixture.backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        fixture.backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                commit: second_commit,
+            }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Current),
+            "HardwareComplete is not the destination retirement gate"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "the destination pool slot must not release at the ack"
+        );
+
+        let second_completion = fixture.backend.complete_owner_for_tests(0);
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            second_completion,
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Releasing),
+            "CompletionRetired hands the old destination to retiring state"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .has_pending_obligations(&first_key),
+            "the independent GPU gate still holds the old destination"
+        );
+        assert!(
+            fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service")
+                .kms_commit_for_tests(first_key)
+                .is_none(),
+            "CompletionRetired discharges KmsRelease even while the GPU gate remains"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "the destination still waits for the scene release pass"
+        );
+
+        fixture.backend.scene.wake_for_damage();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Releasing),
+            "the GPU gate must still hold the old destination after CompletionRetired"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Owner,
+            "the copied destination pool slot must wait for the GPU gate"
+        );
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .apply_validated_proof_for_tests(first_key, held_gpu)
+            .expect("retire the independent GPU gate");
+        fixture.backend.scene.wake_for_damage();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            None,
+            "the old destination leaves the owner ledger only after all gates"
+        );
+        assert_eq!(
+            owner_bo_phase_for_tests(&fixture.backend, first_bo),
+            crate::kms::vk::scanout::BoPhase::Free,
+            "the copied destination pool slot releases after ledger retirement"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_retained_destination_registers_nothing_vulkan() {
+        // F8 witness for Q32/CP-11: production copied selection only enters a
+        // new generation through a destination in Free phase, while the old
+        // generation keeps that same destination in Owner phase until its
+        // ledger retirement. Therefore this entry point cannot create two
+        // live generations that share one destination AllocationKey.
+        let (mut fixture, first_bo, device, first_commit) = copied_owner_commit_for_tests();
+        fixture.backend.route_owner_event_batch(
+            device,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted {
+                    commit: first_commit,
+                },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete {
+                    commit: first_commit,
+                },
+            ],
+            std::time::Instant::now(),
+        );
+        let completion = fixture.backend.complete_owner_for_tests(0);
+        assert!(fixture.backend.route_owner_event_batch(
+            device,
+            completion,
+            std::time::Instant::now(),
+        ));
+        reinstall_owner_executor_for_cir_test(&mut fixture.backend, device);
+        fixture.backend.scene.mark_scene_structure_dirty();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (second_bo, _, _) = fixture
+            .backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("second copied generation");
+        assert_ne!(
+            first_bo, second_bo,
+            "the production selector excludes the current destination, so CP-11's retained state is unreachable"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_displaced_during_copy_offers_nothing_vulkan() {
+        let (mut fixture, first_bo, _, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            fixture
+                .backend
+                .scene
+                .copied_receipt_for_tests(0, first_bo)
+                .is_some(),
+            "the first generation must reach B through the production preparation"
+        );
+
+        fixture.backend.scene.mark_scene_structure_dirty();
+        fixture
+            .backend
+            .tick_maybe_composite_for_tests_without_render_completion_drain();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
+            "the first generation is displaced while its copy is in flight"
+        );
+
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the displaced generation's real B fence must retire");
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, first_bo),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
+            "a displaced copied generation is never offered"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_wake_registration_failure_displaces_vulkan() {
+        let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+        // A's waiter already owns the first job id.  Overflow is the real
+        // registration error path: B has submitted and its batch is rooted,
+        // but register_scanout_render_completion cannot install a partial
+        // waiter.
+        fixture
+            .backend
+            .platform
+            .set_next_scanout_render_job_id_for_tests(u64::MAX);
+        fixture.backend.platform.wait_idle_bounded();
+        let completions = fixture.backend.platform.drain_scanout_render_completions();
+        for completion in completions {
+            assert!(fixture.backend.scene.handle_scanout_render_completion(
+                completion,
+                &mut fixture.backend.platform,
+                fixture.backend.resource_service.as_mut(),
+            ));
+        }
+
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
+            "a submitted copy whose wake cannot register displaces its generation"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .take_owner_composed_offers()
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "failed wake registration leaves no partial waiter"
+        );
+        let service = fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service");
+        assert_eq!(
+            service.pending_batches().len(),
+            1,
+            "B remains service-owned"
+        );
+        assert!(service.has_pending_obligations(&destination_key));
+        assert!(service.has_pending_obligations(&source_key));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_failed_submission_offers_nothing_vulkan() {
+        for failure in [
+            crate::kms::vk::scanout::ManagedCopyFailureForTests::BeforeQueueSubmit,
+            crate::kms::vk::scanout::ManagedCopyFailureForTests::AfterQueueSubmit,
+        ] {
+            let (mut fixture, bo_idx, source_key, destination_key) = copied_owner_frame_after_a();
+            assert!(
+                fixture
+                    .backend
+                    .platform
+                    .force_next_copied_managed_copy_failure_for_tests(0, failure)
+            );
+
+            fixture.backend.platform.wait_idle_bounded();
+            let completions = fixture.backend.platform.drain_scanout_render_completions();
+            for completion in completions {
+                assert!(fixture.backend.scene.handle_scanout_render_completion(
+                    completion,
+                    &mut fixture.backend.platform,
+                    fixture.backend.resource_service.as_mut(),
+                ));
+            }
+
+            assert_eq!(
+                fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+                Some(crate::kms::render::owner_buffer::OwnerBufferState::Displaced),
+                "both failed-submission answers displace the copy generation"
+            );
+            assert!(
+                fixture
+                    .backend
+                    .scene
+                    .take_owner_composed_offers()
+                    .is_empty()
+            );
+            assert_eq!(
+                fixture
+                    .backend
+                    .platform
+                    .pending_scanout_render_completion_count_for_tests(),
+                0,
+                "a failed submission never leaves a completion waiter"
+            );
+
+            let service = fixture
+                .backend
+                .resource_service_mut()
+                .expect("resource service");
+            assert!(service.pending_batches().is_empty());
+            match failure {
+                crate::kms::vk::scanout::ManagedCopyFailureForTests::BeforeQueueSubmit => {
+                    assert!(!service.is_frozen(&destination_key));
+                    assert!(!service.is_frozen(&source_key));
+                    assert!(!service.has_pending_obligations(&destination_key));
+                    assert!(!service.has_pending_obligations(&source_key));
+                }
+                crate::kms::vk::scanout::ManagedCopyFailureForTests::AfterQueueSubmit => {
+                    assert!(service.is_frozen(&destination_key));
+                    assert!(service.is_frozen(&source_key));
+                    assert!(service.has_pending_obligations(&destination_key));
+                    assert!(service.has_pending_obligations(&source_key));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_output_removal_cancels_the_copy_wait_vulkan() {
+        let (mut fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            1,
+            "A's wake was consumed and the B copy wait is now in the shared queue"
+        );
+        let output_key = fixture.backend.platform.outputs[0].key.clone();
+        fixture
+            .backend
+            .platform
+            .cancel_scanout_render_completions_for_output(&output_key);
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "per-output cancellation removes the copy wait as well as A waits"
+        );
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "cancelling the wait cannot offer the generation"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .take_owner_composed_offers()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_whole_queue_clear_takes_the_copy_wait_vulkan() {
+        let (mut fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            1,
+            "the production queue contains B's copy wait"
+        );
+
+        // Make B's sync_file readable before the whole-queue teardown.  If
+        // clear_scanout_render_completions omitted the copied stage, this
+        // stale completion would be delivered by the drain after the VT-style
+        // clear and would promote/offer the old generation.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture.backend.platform.clear_scanout_render_completions();
+        assert_eq!(
+            fixture
+                .backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "whole-queue clearing removes B's wait before suspend can return"
+        );
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            fixture.backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
+            "a cleared stale B wake cannot promote or offer"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .take_owner_composed_offers()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn c0_conv_cp_legacy_copied_route_unchanged() {
+        let platform = PlatformBackend::for_tests();
+        assert!(!platform.output_uses_owner_route(0));
+        assert!(platform.allows_legacy(
+            &platform.outputs[0].key.device_key,
+            crate::kms::render::resources::WriterClass::Primary
+        ));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_four_composed_owner_frames_do_not_exhaust_descriptor_ring_vulkan() {
+        let OwnerLiveFixture { mut backend, .. } =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        let mut previous_generation = 0;
+        backend.scene.reset_tick_diagnostics_for_tests(0);
+
+        for frame in 0..4 {
+            if frame != 0 {
+                reinstall_owner_executor_for_cir_test(&mut backend, device);
+            }
+
+            backend.scene.mark_scene_structure_dirty();
+            backend.test_skip_render_completion_drain = true;
+            let tick_result = backend.maybe_composite();
+            backend.test_skip_render_completion_drain = false;
+            tick_result.expect("the production compositor tick must succeed");
+            let diagnostics = backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .expect("live Owner output has tick diagnostics");
+            let Some((bo_idx, generation, waiting_for_render)) =
+                backend.scene.owner_prepared_for_tests(0)
+            else {
+                panic!(
+                    "composed Owner frame {frame} did not acquire a descriptor slot: \
+                     skip_counts={:?}, pool_occupancy={:?}",
+                    diagnostics.skip_counts, diagnostics.pool_occupancy
+                );
+            };
+            assert!(
+                generation > previous_generation,
+                "composed Owner frame {frame} did not produce a new generation: \
+                 previous={previous_generation}, current={generation}, \
+                 skip_counts={:?}, pool_occupancy={:?}",
+                diagnostics.skip_counts,
+                diagnostics.pool_occupancy
+            );
+            previous_generation = generation;
+            assert!(
+                waiting_for_render,
+                "frame {frame} remains Rendering until its GPU completion is drained"
+            );
+            assert!(
+                diagnostics.pool_occupancy.0 > 0,
+                "frame {frame} must retain its descriptor pool while compose work may use it"
+            );
+
+            backend.platform.wait_idle_bounded();
+            backend.drain_scanout_render_completions_for_tests();
+            assert_eq!(
+                owner_state_for_tests(&backend, bo_idx),
+                Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted),
+                "frame {frame} generation {generation} must reach admission"
+            );
+
+            let commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("composed Owner generation is dispatched")
+                .commit_id();
+            assert!(backend.route_owner_event_batch(
+                device,
+                vec![crate::kms::owner::device::OwnerEvent::Accepted { commit }],
+                std::time::Instant::now(),
+            ));
+            assert!(backend.route_owner_event_batch(
+                device,
+                vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+                std::time::Instant::now(),
+            ));
+            let completion = backend.complete_owner_for_tests(0);
+            assert!(
+                backend.route_owner_event_batch(device, completion, std::time::Instant::now(),)
+            );
+            assert_eq!(
+                owner_state_for_tests(&backend, bo_idx),
+                Some(crate::kms::render::owner_buffer::OwnerBufferState::Current),
+                "frame {frame} completes the composed Owner lifecycle"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_cp_no_legacy_write_at_the_copied_site_vulkan() {
+        // The recorder is entered by submit_flip_with_fences before its
+        // transport-gate permit check. This observes entry into the legacy
+        // primary sink, not the gate's refusal.
+        crate::drm::clear_legacy_sink_entries_for_tests();
+        let (mut fixture, bo_idx, _, _) = copied_owner_frame_after_a();
+
+        // A's production completion prepares and submits B. No legacy sink
+        // is involved in either Owner stage.
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            crate::drm::legacy_sink_entries_for_tests().is_empty(),
+            "stage A and the copied Owner B preparation must not enter the legacy sink"
+        );
+        assert!(
+            fixture
+                .backend
+                .scene
+                .copied_receipt_for_tests(0, bo_idx)
+                .is_some(),
+            "the copied Owner producer must reach its production B preparation"
+        );
+
+        // B's real sink fence retires through the service, then its existing
+        // wake promotes the generation through the Owner conductor. The sink
+        // observation is checked before inspecting the resulting commit so a
+        // forced legacy branch fails specifically on the write-site evidence.
+        wait_copied_sink_idle(&fixture.backend);
+        fixture
+            .backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("the copied destination obligation must retire");
+        fixture.backend.platform.wait_idle_bounded();
+        fixture.backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            crate::drm::legacy_sink_entries_for_tests().is_empty(),
+            "an Owner copied submit must not enter submit_copied_scanout's legacy primary sink"
+        );
+        assert!(
+            fixture
+                .backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .is_some(),
+            "the copied Owner offer must reach the Owner commit path"
+        );
+    }
+
+    fn copied_source_vk_for_sink(
+        sink_vk: &crate::kms::vk::device::VkContext,
+    ) -> Result<std::sync::Arc<crate::kms::vk::device::VkContext>, std::io::Error> {
+        static SHARED_COPIED_SOURCE_VK: std::sync::OnceLock<
+            Result<std::sync::Arc<crate::kms::vk::device::VkContext>, String>,
+        > = std::sync::OnceLock::new();
+        let result = SHARED_COPIED_SOURCE_VK.get_or_init(|| {
+            let sink_selector = sink_vk.device_selector();
+            let sink_primary = sink_vk
+                .selected_drm_identity
+                .and_then(|identity| identity.primary)
+                .ok_or_else(|| "sink Vulkan context has no primary DRM identity".to_owned())?;
+            let source = sink_vk
+                .drm_physical_devices
+                .iter()
+                .find(|device| device.selector != sink_selector)
+                .ok_or_else(|| {
+                    "no distinct Vulkan renderer is available for copied fixture".to_owned()
+                })?;
+            let render = source
+                .identity
+                .render
+                .ok_or_else(|| "copied fixture source has no render-node identity".to_owned())?;
+            crate::kms::vk::device::VkContext::new_for_render_device(Some(render), sink_primary)
+                .map_err(|error| format!("copied fixture source Vulkan context: {error}"))
+        });
+        result
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .map_err(|error| std::io::Error::other(error.clone()))
+    }
+
+    fn copied_owner_live_fixture() -> Result<OwnerLiveFixture, std::io::Error> {
+        use std::sync::Arc;
+
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        let sink_vk =
+            backend.platform.vk.as_ref().cloned().ok_or_else(|| {
+                std::io::Error::other("copied fixture has no sink Vulkan context")
+            })?;
+        let sink_primary = sink_vk
+            .selected_drm_identity
+            .and_then(|identity| identity.primary)
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "copied fixture requires sink_vk.selected_drm_identity.primary",
+                )
+            })?;
+        let source_vk = copied_source_vk_for_sink(&sink_vk)?;
+
+        // `init_root_storage` records its initial fill in the engine's open
+        // frame and leaves the platform SubmitGroup holding a fence from the
+        // sink VkDevice. Close and drain that frame while the sink context is
+        // still installed; otherwise replacing `engine` would leave the
+        // sink-owned fence to be submitted on the source queue below.
+        backend
+            .engine
+            .shutdown(&mut backend.store, &mut backend.platform);
+
+        // Release the sink-backed scene graph while the platform still names
+        // the sink context. The copied fixture then installs a source-backed
+        // renderer below, so later copied-route tasks can actually render A's
+        // source rather than merely inspect an adopted pool.
+        backend.engine = crate::kms::render::engine::RenderEngine::stub();
+        backend.scene = crate::kms::render::scene::SceneCompositor::stub();
+        backend.store = crate::kms::render::store::DrawableStore::new();
+
+        // The shared live fixture deliberately uses the placeholder 0:0 key.
+        // A copied fixture has a real sink endpoint, so replace that key before
+        // constructing the copied route. This is identity bookkeeping only; no
+        // modeset or DRM master operation is performed here.
+        backend.platform.devices[0].key = sink_primary;
+        backend.platform.outputs[0].key.device_key = sink_primary;
+        let sink_id = backend
+            .platform
+            .render_devices
+            .iter()
+            .find(|device| device.selector == sink_vk.device_selector())
+            .map(|device| device.id)
+            .ok_or_else(|| {
+                std::io::Error::other("copied fixture sink is not in renderer inventory")
+            })?;
+        backend
+            .platform
+            .attach_test_vk_context(Arc::clone(&source_vk));
+        backend.platform.ops_command_pool = Some(
+            crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&source_vk)).map_err(|error| {
+                std::io::Error::other(format!("copied fixture ops pool: {error:?}"))
+            })?,
+        );
+        backend.platform.fence_pool = Some(crate::kms::render::platform::FencePool::new(
+            Arc::clone(&source_vk),
+        ));
+        let source_render_id = source_vk
+            .selected_drm_identity
+            .and_then(|identity| identity.render)
+            .map(crate::kms::scanout_route::RenderDeviceId::DrmRender)
+            .unwrap_or(crate::kms::scanout_route::RenderDeviceId::UnverifiedFallback);
+        let route = crate::kms::scanout_route::ScanoutRoute::new(
+            source_render_id,
+            sink_primary,
+            crate::kms::scanout_route::RenderKmsRelationship::Different,
+        );
+        backend.platform.outputs[0].scanout_route = route;
+        let destination_route = crate::kms::scanout_route::ScanoutRoute::new(
+            sink_id,
+            sink_primary,
+            crate::kms::scanout_route::RenderKmsRelationship::Same,
+        );
+        let output = &backend.platform.outputs[0];
+        let kms_device = backend
+            .platform
+            .device_for_key(sink_primary)
+            .ok_or_else(|| std::io::Error::other("copied fixture sink KMS device disappeared"))?;
+        let plans = crate::kms::vk::scanout::CopiedScanoutPool::exact_allocation_plans(
+            &source_vk,
+            &sink_vk,
+            &kms_device.device,
+            u32::from(output.width),
+            &output.output.scanout_modifiers,
+        );
+        if plans.is_empty() {
+            return Err(std::io::Error::other(
+                "copied fixture has no exact cross-device allocation plan",
+            ));
+        }
+        let mut failures = Vec::new();
+        let mut copied_pool = None;
+        for plan in plans {
+            match crate::kms::vk::scanout::CopiedScanoutPool::allocate_exact(
+                Arc::clone(&source_vk),
+                Arc::clone(&sink_vk),
+                Rc::clone(&kms_device.device),
+                route,
+                destination_route,
+                u32::from(output.width),
+                u32::from(output.height),
+                3,
+                &output.output.scanout_modifiers,
+                plan,
+            ) {
+                Ok(pool) => {
+                    copied_pool = Some(pool);
+                    break;
+                }
+                Err(error) => failures.push(format!("{}: {error}", plan.describe())),
+            }
+        }
+        let copied_pool = copied_pool.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "every copied fixture allocation plan failed: {}",
+                failures.join("; ")
+            ))
+        })?;
+        let bo_count = copied_pool.destinations.bos.len();
+        backend.platform.scanout_pools[0] =
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(copied_pool));
+        backend.platform.bo_generations[0] = vec![Default::default(); bo_count];
+        backend.engine = crate::kms::render::engine::RenderEngine::new(&backend.platform)
+            .map_err(|error| std::io::Error::other(format!("copied fixture engine: {error:?}")))?;
+        backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform)
+            .map_err(|error| std::io::Error::other(format!("copied fixture scene: {error:?}")))?;
+        backend.store = crate::kms::render::store::DrawableStore::new();
+        backend.init_root_storage();
+        // The source-backed root fill also opens a frame. Close it here so
+        // the fixture reaches tests with no open frame and Drop exercises the
+        // normal engine.shutdown/drain path without needing a bypass flag.
+        backend
+            .engine
+            .close_open_frame(
+                &mut backend.store,
+                &mut backend.platform,
+                crate::kms::render::frame_builder::CloseReason::Timeout,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!("close copied fixture init frame: {error:?}"))
+            })?;
+        backend.platform.reap_executors_on_drop_for_tests();
+        backend.resource_cleanup_on_drop_for_tests = true;
+        finish_owner_live_fixture(backend, false)
+    }
+
     fn owner_live_fixture_with_three_outputs() -> Result<OwnerLiveFixture, std::io::Error> {
         owner_live_fixture_with_output_count(3, false)
     }
@@ -52101,12 +53827,6 @@ mod tests {
         output_count: usize,
         extra_missing_output: bool,
     ) -> Result<OwnerLiveFixture, std::io::Error> {
-        use std::{cell::RefCell, rc::Rc};
-
-        use crate::kms::render::resources::{
-            DrmCleanupRegistry, ResourceService, tests::MockCleanupIo,
-        };
-
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
         backend.platform.reap_executors_on_drop_for_tests();
         backend.resource_cleanup_on_drop_for_tests = true;
@@ -52135,6 +53855,18 @@ mod tests {
                     std::io::Error::other(format!("rebuild multi-output scene: {error:?}"))
                 })?;
         }
+        finish_owner_live_fixture(backend, extra_missing_output)
+    }
+
+    fn finish_owner_live_fixture(
+        mut backend: super::KmsBackend,
+        extra_missing_output: bool,
+    ) -> Result<OwnerLiveFixture, std::io::Error> {
+        use crate::kms::render::resources::{
+            DrmCleanupRegistry, ResourceService, tests::MockCleanupIo,
+        };
+        use std::{cell::RefCell, rc::Rc};
+
         // This fixture uses the synthetic KMS object ids from the existing
         // scene fixture while its scanout allocations use a real DRM fd.
         // The owner executor is a stub and never issues this description to
@@ -52163,7 +53895,7 @@ mod tests {
         let device_key = backend
             .platform
             .primary_device()
-            .ok_or_else(|| std::io::Error::other("live-scene fixture has no primary device"))?
+            .ok_or_else(|| std::io::Error::other("live-scene fixture has no live KMS device"))?
             .key;
         backend.platform.devices[0].executor = Some(executor);
         backend.platform.devices[0].owner = Some(
@@ -65851,12 +67583,28 @@ mod tests {
 
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         let timeout_ms = remaining.as_millis().clamp(1, 10) as libc::c_int;
-                        let mut poll_fd = libc::pollfd {
+                        let helper_fd = backend
+                            .platform
+                            .device_for_key(device)
+                            .and_then(|device| device.executor.as_ref())
+                            .and_then(|executor| executor.control_fd())
+                            .map(|fd| fd.as_raw_fd());
+                        let mut poll_fds = vec![libc::pollfd {
                             fd: drm_fd,
                             events: libc::POLLIN,
                             revents: 0,
-                        };
-                        let poll_result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+                        }];
+                        if let Some(helper_fd) = helper_fd {
+                            poll_fds.push(libc::pollfd {
+                                fd: helper_fd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            });
+                        }
+                        let poll_count = libc::nfds_t::try_from(poll_fds.len())
+                            .expect("hardware wait descriptor count fits nfds_t");
+                        let poll_result =
+                            unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_count, timeout_ms) };
                         if poll_result < 0
                             && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
                         {
@@ -66217,5 +67965,808 @@ mod tests {
             assert_order(unflip_commit, "unflip frame", &non_present_steps);
             assert_not_presented(unflip_commit, "unflip frame");
         }
+    }
+
+    fn hardware_drm_key(path: &str) -> Result<crate::platform::drm::DrmDeviceKey, std::io::Error> {
+        use std::os::fd::AsFd;
+
+        let device = crate::drm::Device::open(path)?;
+        crate::platform::drm::primary_device_key_from_fd(device.as_fd())
+    }
+
+    fn copied_cross_device_live_fixture() -> Result<super::LiveKmsFixture, std::io::Error> {
+        use std::{path::Path, rc::Rc, sync::Arc};
+
+        let sink_primary = hardware_drm_key("/dev/dri/card1").map_err(|error| {
+            std::io::Error::other(format!(
+                "F8: cannot open the required KMS sink /dev/dri/card1: {error}"
+            ))
+        })?;
+        let sink_render = crate::platform::drm::render_node_for_primary(sink_primary)?
+            .ok_or_else(|| std::io::Error::other("F8: card1 has no DRM render node"))?;
+        let sink_vk = crate::kms::vk::device::VkContext::new_for_render_device(
+            Some(sink_render.key),
+            sink_primary,
+        )
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "F8: cannot initialize the card1 sink Vulkan context: {error:?}"
+            ))
+        })?;
+
+        let renderer_primary = hardware_drm_key("/dev/dri/card0").map_err(|error| {
+            std::io::Error::other(format!(
+                "F8: cannot open the required amdgpu renderer /dev/dri/card0: {error}"
+            ))
+        })?;
+        let renderer_node = crate::platform::drm::render_node_for_primary(renderer_primary)?
+            .ok_or_else(|| std::io::Error::other("F8: card0 has no DRM render node"))?;
+        if renderer_node.path != Path::new("/dev/dri/renderD128") {
+            return Err(std::io::Error::other(format!(
+                "F8: /dev/dri/card0 resolves to {}, not the required /dev/dri/renderD128",
+                renderer_node.path.display()
+            )));
+        }
+        let renderer_vk = crate::kms::vk::device::VkContext::new_for_render_device(
+            Some(renderer_node.key),
+            sink_primary,
+        )
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "F8: cannot initialize the forced renderer /dev/dri/renderD128: {error:?}"
+            ))
+        })?;
+        let selected_identity = renderer_vk
+            .selected_drm_identity
+            .ok_or_else(|| std::io::Error::other("F8: forced renderer has no DRM identity"))?;
+        if selected_identity.primary != Some(renderer_primary)
+            || selected_identity.render != Some(renderer_node.key)
+        {
+            return Err(std::io::Error::other(format!(
+                "F8: forced renderer identity is primary={:?}, render={:?}, expected primary={}, render={}",
+                selected_identity.primary,
+                selected_identity.render,
+                renderer_primary,
+                renderer_node.key
+            )));
+        }
+        let sink_identity = sink_vk
+            .selected_drm_identity
+            .ok_or_else(|| std::io::Error::other("F8: sink Vulkan context has no DRM identity"))?;
+        if sink_identity.primary != Some(sink_primary)
+            || sink_identity.render != Some(sink_render.key)
+        {
+            return Err(std::io::Error::other(format!(
+                "F8: sink Vulkan identity is primary={:?}, render={:?}, expected primary={}, render={}",
+                sink_identity.primary, sink_identity.render, sink_primary, sink_render.key
+            )));
+        }
+
+        let mut base =
+            super::KmsBackend::for_tests_with_vk_live_scene_real_drm_using(Arc::clone(&sink_vk))?;
+        // The live-KMS helper replaces the engine after it installs the
+        // connector, but the initial root fill belongs to this sink-backed
+        // engine and its SubmitGroup. Drain it before handing the backend to
+        // that helper so no sink-owned fence survives the engine replacement.
+        base.engine.shutdown(&mut base.store, &mut base.platform);
+        let mut fixture =
+            super::KmsBackend::for_tests_with_live_kms_from_backend(base, Some("HDMI-2"))?;
+        let backend = &mut fixture.backend;
+        let sink_id = backend
+            .platform
+            .render_devices
+            .iter()
+            .find(|device| device.selector == sink_vk.device_selector())
+            .map(|device| device.id)
+            .ok_or_else(|| {
+                std::io::Error::other("F8: card1 sink is absent from renderer inventory")
+            })?;
+
+        // The initial live-KMS helper has already modeset the connected sink.
+        // Retain its snapshot/master guards while replacing the synthetic
+        // scene graph and pool with the real two-device copied route.
+        backend
+            .engine
+            .shutdown(&mut backend.store, &mut backend.platform);
+        backend.engine = crate::kms::render::engine::RenderEngine::stub();
+        backend.scene = crate::kms::render::scene::SceneCompositor::stub();
+        backend.store = crate::kms::render::store::DrawableStore::new();
+
+        backend
+            .platform
+            .attach_test_vk_context(Arc::clone(&renderer_vk));
+        backend.platform.ops_command_pool = Some(
+            crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&renderer_vk)).map_err(
+                |error| std::io::Error::other(format!("copied hardware ops pool: {error:?}")),
+            )?,
+        );
+        backend.platform.fence_pool = Some(crate::kms::render::platform::FencePool::new(
+            Arc::clone(&renderer_vk),
+        ));
+
+        let renderer_id = crate::kms::scanout_route::RenderDeviceId::DrmRender(renderer_node.key);
+        let route = crate::kms::scanout_route::ScanoutRoute::new(
+            renderer_id,
+            sink_primary,
+            crate::kms::scanout_route::RenderKmsRelationship::Different,
+        );
+        let destination_route = crate::kms::scanout_route::ScanoutRoute::new(
+            sink_id,
+            sink_primary,
+            crate::kms::scanout_route::RenderKmsRelationship::Same,
+        );
+        backend.platform.outputs[0].scanout_route = route;
+        let (width, height, modifiers) = {
+            let output = &backend.platform.outputs[0];
+            (
+                u32::from(output.width),
+                u32::from(output.height),
+                output.output.scanout_modifiers.clone(),
+            )
+        };
+        let kms_device = backend
+            .platform
+            .device_for_key(sink_primary)
+            .ok_or_else(|| std::io::Error::other("F8: card1 KMS device disappeared"))?
+            .device
+            .clone();
+        let plans = crate::kms::vk::scanout::CopiedScanoutPool::exact_allocation_plans(
+            &renderer_vk,
+            &sink_vk,
+            &kms_device,
+            width,
+            &modifiers,
+        );
+        if plans.is_empty() {
+            return Err(std::io::Error::other(
+                "F8: forced renderer/sink pair produced no exact copied allocation plan",
+            ));
+        }
+        let mut failures = Vec::new();
+        let mut copied_pool = None;
+        for plan in plans {
+            match crate::kms::vk::scanout::CopiedScanoutPool::allocate_exact(
+                Arc::clone(&renderer_vk),
+                Arc::clone(&sink_vk),
+                Rc::clone(&kms_device),
+                route,
+                destination_route,
+                width,
+                height,
+                3,
+                &modifiers,
+                plan,
+            ) {
+                Ok(pool) => {
+                    copied_pool = Some(pool);
+                    break;
+                }
+                Err(error) => failures.push(format!("{}: {error}", plan.describe())),
+            }
+        }
+        let copied_pool = copied_pool.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "F8: every exact copied allocation plan failed: {}",
+                failures.join("; ")
+            ))
+        })?;
+        let bo_count = copied_pool.destinations.bos.len();
+        backend.platform.scanout_pools[0] =
+            Some(crate::kms::vk::scanout::OutputScanout::Copied(copied_pool));
+        backend.platform.bo_generations[0] = vec![Default::default(); bo_count];
+        backend.engine = crate::kms::render::engine::RenderEngine::new(&backend.platform)
+            .map_err(|error| std::io::Error::other(format!("copied hardware engine: {error:?}")))?;
+        backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform)
+            .map_err(|error| std::io::Error::other(format!("copied hardware scene: {error:?}")))?;
+        backend.store = crate::kms::render::store::DrawableStore::new();
+        backend.init_root_storage();
+        backend
+            .engine
+            .close_open_frame(
+                &mut backend.store,
+                &mut backend.platform,
+                crate::kms::render::frame_builder::CloseReason::Timeout,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!("close copied hardware init frame: {error:?}"))
+            })?;
+        backend.platform.reap_executors_on_drop_for_tests();
+        backend.resource_cleanup_on_drop_for_tests = true;
+
+        assert_eq!(
+            backend.platform.outputs[0].scanout_route.relationship,
+            crate::kms::scanout_route::RenderKmsRelationship::Different
+        );
+        println!(
+            "CP-CROSS-DEVICE identities renderer_primary={} renderer_node={} sink_primary={} sink_render={} sink_connector={} relationship=Different",
+            renderer_primary,
+            renderer_node.path.display(),
+            sink_primary,
+            sink_render.path.display(),
+            backend.platform.outputs[0].output.connector_name,
+        );
+        Ok(fixture)
+    }
+
+    fn install_copied_hardware_owner(backend: &mut super::KmsBackend) {
+        use std::{os::fd::AsFd, rc::Rc};
+
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("copied hardware has a KMS device")
+            .key;
+        let device_rc = backend
+            .platform
+            .device_for_key(device)
+            .expect("copied hardware KMS device")
+            .device
+            .clone();
+        let executor = crate::kms::executor::KmsIoExecutor::spawn(
+            device_rc.as_fd(),
+            crate::kms::owner::identity::IncarnationId::first(),
+        )
+        .expect("copied hardware KMS helper");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        let mut registry = crate::kms::render::resources::DrmCleanupRegistry::new(
+            Rc::clone(&device_rc),
+            device,
+            incarnation,
+        );
+        let mut service = crate::kms::render::resources::ResourceService::new(device, incarnation);
+        for output_idx in 0..backend.platform.scanout_pools.len() {
+            let bo_count = backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .map_or(0, |scanout| scanout.display_pool().bos.len());
+            for bo_idx in 0..bo_count {
+                backend
+                    .platform
+                    .register_managed_scanout_bo(&mut service, &mut registry, output_idx, bo_idx)
+                    .expect("adopt copied hardware scanout allocation");
+            }
+        }
+        backend.install_resource_service_with_registry(service, registry);
+        install_admission_owner_gate(backend, device);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+    }
+
+    fn print_copied_route_latency_snapshot(expected_frames_per_transport: usize) {
+        use crate::kms::render::platform::CopiedRouteTransport::{Legacy, Owner};
+
+        let snapshot = crate::kms::render::platform::copied_route_latency_snapshot_for_tests();
+        let incomplete = snapshot.insufficient
+            || !snapshot.pending_frames.is_empty()
+            || [Legacy, Owner].into_iter().any(|transport| {
+                snapshot
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.transport == transport)
+                    .count()
+                    != expected_frames_per_transport
+            });
+        let status = if incomplete { "partial" } else { "complete" };
+
+        for sample in &snapshot.samples {
+            let expected_msc = sample
+                .expected_msc
+                .map_or_else(|| "NA".to_string(), |msc| msc.to_string());
+            let completion_msc = sample
+                .completion_msc
+                .map_or_else(|| "NA".to_string(), |msc| msc.to_string());
+            let missed_vblank = sample.completion_msc.zip(sample.expected_msc).map_or_else(
+                || "NA".to_string(),
+                |(completion, expected)| (completion > expected).to_string(),
+            );
+            println!(
+                "CP-LATENCY transport={:?} status={status} frame={} submission_delay_us={} expected_msc={} completion_msc={} missed_vblank={}",
+                sample.transport,
+                sample.frame,
+                sample.submission_delay_us,
+                expected_msc,
+                completion_msc,
+                missed_vblank,
+            );
+        }
+        for transport in [Legacy, Owner] {
+            let samples = snapshot
+                .samples
+                .iter()
+                .filter(|sample| sample.transport == transport)
+                .collect::<Vec<_>>();
+            let missed = samples
+                .iter()
+                .filter(|sample| {
+                    sample
+                        .completion_msc
+                        .zip(sample.expected_msc)
+                        .is_some_and(|(completion, expected)| completion > expected)
+                })
+                .count();
+            let vblank_comparable = samples
+                .iter()
+                .filter(|sample| sample.expected_msc.is_some() && sample.completion_msc.is_some())
+                .count();
+            let missed_vblank = if transport == Legacy {
+                format!("{missed}/{vblank_comparable}")
+            } else {
+                "NA".to_string()
+            };
+            let pending = snapshot
+                .pending_frames
+                .iter()
+                .filter(|pending| pending.transport == transport)
+                .count();
+            let unstarted =
+                expected_frames_per_transport.saturating_sub(samples.len().saturating_add(pending));
+            println!(
+                "CP-LATENCY-SUMMARY status={status} transport={transport:?} frames={}/{} missed_vblank={missed_vblank} vblank_comparable={vblank_comparable}/{} pending={} unstarted={} insufficient={}",
+                samples.len(),
+                expected_frames_per_transport,
+                expected_frames_per_transport,
+                pending,
+                unstarted,
+                snapshot.insufficient,
+            );
+        }
+        for pending in &snapshot.pending_frames {
+            println!(
+                "CP-LATENCY-PENDING status={status} transport={:?} frame={} fence_signalled={} expected_msc_applicable={} expected_msc_recorded={} commit_submitted={} completion_msc_applicable={} completion_msc_recorded={}",
+                pending.transport,
+                pending.frame,
+                pending.fence_signalled,
+                pending.expected_msc_applicable,
+                pending.expected_msc_recorded,
+                pending.commit_submitted,
+                pending.completion_msc_applicable,
+                pending.completion_msc_recorded,
+            );
+        }
+    }
+
+    fn run_copied_hardware_phase(backend: &mut super::KmsBackend, owner: bool) {
+        use std::{
+            collections::BTreeMap,
+            os::fd::{AsFd, AsRawFd},
+            time::{Duration, Instant},
+        };
+
+        let device = backend.platform.primary_device().expect("KMS device").key;
+        let crtc = backend.platform.outputs[0].output.crtc;
+        let crtc_key = crate::kms::render::platform::CrtcKey::new(device, crtc);
+        let drm_fd = backend
+            .platform
+            .device_for_key(device)
+            .expect("KMS device")
+            .device
+            .as_fd()
+            .as_raw_fd();
+        let mut registered = Vec::<(
+            crate::kms::render::resources::AllocationKey,
+            crate::kms::render::resources::ObligationId,
+        )>::new();
+        let mut retired = Vec::<(
+            crate::kms::render::resources::AllocationKey,
+            crate::kms::render::resources::ObligationId,
+        )>::new();
+        let mut milestones =
+            BTreeMap::<crate::kms::owner::identity::CommitId, Vec<&'static str>>::new();
+        const FRAMES: usize = 4;
+
+        for frame in 0..FRAMES {
+            if owner && frame == 3 {
+                backend.scene.reset_tick_diagnostics_for_tests(0);
+            }
+            let owner_generation_before = owner
+                .then(|| {
+                    backend
+                        .scene
+                        .owner_prepared_for_tests(0)
+                        .map(|(_, generation, _)| generation)
+                })
+                .flatten();
+            let damage_generation_before =
+                backend.scene.damage_history_latest_generation_for_tests(0);
+            backend.scene.mark_scene_structure_dirty();
+            backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut logged_owner_release_retry = false;
+            while Instant::now() < deadline {
+                let now = Instant::now();
+                let tick_events = backend.platform.tick_executors(now);
+                backend.record_host_call_events(tick_events);
+                let executor_events = backend.platform.drain_executor_events();
+                backend.record_host_call_events(executor_events);
+                for observation in backend.drained_host_call_events_for_tests() {
+                    let crate::kms::executor::protocol::HostCallCorrelation::Atomic {
+                        commit, ..
+                    } = observation.correlation
+                    else {
+                        continue;
+                    };
+                    if !observation.late
+                        && matches!(
+                            observation.kind,
+                            crate::kms::executor::ObservedOutcome::Accepted { .. }
+                        )
+                    {
+                        assert!(
+                            owner,
+                            "Legacy copied phase unexpectedly used Owner admission"
+                        );
+                        assert!(
+                            registered.iter().all(|(key, obligation)| {
+                                retired.contains(&(*key, *obligation))
+                            })
+                        );
+                        milestones.entry(commit).or_default().push("Accepted");
+                        println!(
+                            "CP copied owner helper Accepted observed after destination offer enqueue commit={commit:?}"
+                        );
+                    }
+                }
+                if let Some(service) = backend.resource_service.as_mut() {
+                    service.service_completions(now).unwrap_or_else(|error| {
+                        panic!("copied {owner} service completion failed: {error:?}")
+                    });
+                }
+                for (device_key, events) in backend.platform.service_owner_completions(now) {
+                    let hardware_complete_commit = events.iter().find_map(|event| match event {
+                        crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } => {
+                            Some(*commit)
+                        }
+                        _ => None,
+                    });
+                    for event in &events {
+                        match event {
+                            crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } => {
+                                milestones
+                                    .entry(*commit)
+                                    .or_default()
+                                    .push("HardwareComplete");
+                                println!(
+                                    "CP copied milestone=HardwareComplete transport=Owner commit={commit:?}"
+                                );
+                            }
+                            crate::kms::owner::device::OwnerEvent::Presented {
+                                samples, ..
+                            } => {
+                                let msc = samples
+                                    .get(&u32::from(crtc))
+                                    .or_else(|| {
+                                        (samples.len() == 1)
+                                            .then(|| samples.values().next())
+                                            .flatten()
+                                    })
+                                    .map(|sample| sample.msc);
+                                if let crate::kms::owner::device::OwnerEvent::Presented {
+                                    commit,
+                                    ..
+                                } = event
+                                {
+                                    milestones.entry(*commit).or_default().push("Presented");
+                                    println!(
+                                        "CP copied milestone=Presented transport=Owner commit={commit:?} msc={}",
+                                        msc.unwrap_or(0)
+                                    );
+                                }
+                            }
+                            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                                commit,
+                                ..
+                            } => {
+                                milestones
+                                    .entry(*commit)
+                                    .or_default()
+                                    .push("CompletionRetired");
+                                println!(
+                                    "CP copied milestone=CompletionRetired transport=Owner commit={commit:?}"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    let event_debug = format!("{events:?}");
+                    assert!(
+                        backend.route_owner_event_batch(device_key, events, now),
+                        "copied owner completion batch was not consumed: {event_debug}"
+                    );
+                    // A composed commit emits HardwareComplete without
+                    // Presented. Snapshot the latest validated CRTC clock for
+                    // diagnostics only: it is not correlated to this commit.
+                    // CompletionRetired follows for resource retirement and
+                    // carries no clock, so close the latency sample at
+                    // HardwareComplete with no per-commit MSC.
+                    if owner
+                        && let Some(commit) = hardware_complete_commit
+                        && crate::kms::render::platform::copied_route_latency_waiting_for_completion_for_tests(
+                            crate::kms::render::platform::CopiedRouteTransport::Owner,
+                        )
+                    {
+                        match backend
+                            .platform
+                            .present_get_completion_clock_if_known(crtc_key)
+                        {
+                            Some(sample) => {
+                                println!(
+                                    "CP copied completion_clock transport=Owner milestone=HardwareComplete commit={commit:?} crtc={crtc_key:?} msc={} ust={} source={:?} correlated_to_commit=false",
+                                    sample.msc, sample.ust, sample.source
+                                );
+                            }
+                            None => println!(
+                                "CP copied completion_clock unavailable transport=Owner milestone=HardwareComplete commit={commit:?} crtc={crtc_key:?} correlated_to_commit=false reason=no validated routed CRTC clock is available"
+                            ),
+                        }
+                        crate::kms::render::platform::record_copied_completion_for_tests(
+                            crate::kms::render::platform::CopiedRouteTransport::Owner,
+                            None,
+                        );
+                    }
+                }
+                let (drm_events, drain_result) = backend.platform.drain_owner_events(drm_fd, now);
+                drain_result.unwrap_or_else(|error| panic!("copied DRM drain failed: {error}"));
+                let mut grouped = BTreeMap::<
+                    crate::platform::drm::DrmDeviceKey,
+                    Vec<
+                        crate::kms::owner::device::OwnerEvent<
+                            crate::kms::render::resources::CommitResources,
+                        >,
+                    >,
+                >::new();
+                let mut legacy_completion_mscs = Vec::new();
+                for (device_key, event) in drm_events {
+                    if let crate::kms::owner::device::OwnerEvent::LegacyPageFlip {
+                        sequence, ..
+                    } = &event
+                    {
+                        legacy_completion_mscs
+                            .push((*sequence != 0).then_some(u64::from(*sequence)));
+                    }
+                    grouped.entry(device_key).or_default().push(event);
+                }
+                for (device_key, events) in grouped {
+                    let event_debug = format!("{events:?}");
+                    assert!(
+                        backend.route_owner_event_batch(device_key, events, now),
+                        "copied legacy completion batch was not consumed: {event_debug}"
+                    );
+                }
+                if !owner {
+                    for msc in legacy_completion_mscs {
+                        let msc = msc.or_else(|| {
+                            backend
+                                .platform
+                                .present_get_completion_clock_if_known(crtc_key)
+                                .map(|sample| sample.msc)
+                        });
+                        if let Some(msc) = msc {
+                            crate::kms::render::platform::record_copied_completion_for_tests(
+                                crate::kms::render::platform::CopiedRouteTransport::Legacy,
+                                Some(msc),
+                            );
+                        }
+                    }
+                }
+                backend.drain_scanout_render_completions_for_tests();
+                if owner {
+                    // The copied completion drain promotes the ready Owner
+                    // generation. Tick immediately so submission follows the
+                    // readiness drain without sleeping on the DRM fd.
+                    backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+                }
+                crate::kms::render::platform::drain_copied_route_latency_fences_for_tests(
+                    backend.platform.present_get_ust_msc(crtc_key).0,
+                );
+                if owner {
+                    let owner_frame_started = backend
+                        .scene
+                        .owner_prepared_for_tests(0)
+                        .is_some_and(|(_, generation, _)| {
+                            owner_generation_before.is_none_or(|before| generation > before)
+                        });
+                    if !owner_frame_started && !logged_owner_release_retry {
+                        println!(
+                            "CP copied Owner harness retry: pumping scene release gates while frame {frame} has no new owner generation"
+                        );
+                        logged_owner_release_retry = true;
+                    }
+                }
+                if owner {
+                    if let Some((bo_idx, _, true)) = backend.scene.owner_prepared_for_tests(0)
+                        && let Some(((destination_key, obligation), _)) =
+                            backend.scene.copied_receipt_for_tests(0, bo_idx)
+                    {
+                        let pool_destination_key = match backend.platform.scanout_pools[0]
+                            .as_ref()
+                            .expect("copied pool")
+                        {
+                            crate::kms::vk::scanout::OutputScanout::Copied(pool) => pool
+                                .destinations
+                                .bos
+                                .get(bo_idx)
+                                .and_then(|bo| bo.managed_key())
+                                .expect("managed copied destination"),
+                            _ => panic!("copied hardware pool changed kind"),
+                        };
+                        assert_eq!(
+                            destination_key, pool_destination_key,
+                            "the receipt must use the destination allocation's own key"
+                        );
+                        if !registered.contains(&(destination_key, obligation)) {
+                            assert!(
+                                backend
+                                    .resource_service
+                                    .as_ref()
+                                    .expect("Owner resource service")
+                                    .has_pending_obligation(&destination_key, obligation)
+                            );
+                            println!(
+                                "CP copied pending destination obligation observed key={destination_key:?} obligation={obligation:?}"
+                            );
+                            registered.push((destination_key, obligation));
+                            println!(
+                                "CP copied generation waiting on destination obligation bo_idx={bo_idx} state=Rendering key={destination_key:?} obligation={obligation:?}"
+                            );
+                        }
+                    }
+                    let service = backend
+                        .resource_service
+                        .as_ref()
+                        .expect("Owner resource service");
+                    for (key, obligation) in registered.iter().copied() {
+                        if !service.has_pending_obligation(&key, obligation)
+                            && !retired.contains(&(key, obligation))
+                        {
+                            retired.push((key, obligation));
+                        }
+                    }
+                }
+                let damage_generation_advanced = backend
+                    .scene
+                    .damage_history_latest_generation_for_tests(0)
+                    .is_some_and(|after| {
+                        damage_generation_before.is_none_or(|before| after > before)
+                    });
+                if damage_generation_advanced
+                    && backend.scene.pending_ack_count_for_tests(0) == 0
+                    && backend
+                        .scene
+                        .damage_state_for_tests(0)
+                        .is_some_and(|(_, staged)| !staged)
+                {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let timeout_ms = remaining.as_millis().clamp(1, 10) as libc::c_int;
+                let fence_fds =
+                    crate::kms::render::platform::copied_route_latency_fence_fds_for_tests();
+                let mut poll_fds = Vec::with_capacity(1 + fence_fds.len());
+                poll_fds.push(libc::pollfd {
+                    fd: drm_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                poll_fds.extend(fence_fds.into_iter().map(|fd| libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }));
+                if owner
+                    && let Some(helper_fd) = backend
+                        .platform
+                        .device_for_key(device)
+                        .and_then(|device| device.executor.as_ref())
+                        .and_then(|executor| executor.control_fd())
+                        .map(|fd| fd.as_raw_fd())
+                {
+                    poll_fds.push(libc::pollfd {
+                        fd: helper_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+                let poll_count = libc::nfds_t::try_from(poll_fds.len())
+                    .expect("copied-route poll descriptor count fits nfds_t");
+                let poll_result =
+                    unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_count, timeout_ms) };
+                if poll_result < 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                {
+                    panic!(
+                        "copied DRM wait failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                crate::kms::render::platform::drain_copied_route_latency_fences_for_tests(
+                    backend.platform.present_get_ust_msc(crtc_key).0,
+                );
+            }
+            let damage_generation_after =
+                backend.scene.damage_history_latest_generation_for_tests(0);
+            let damage_applied = damage_generation_after
+                .is_some_and(|after| damage_generation_before.is_none_or(|before| after > before));
+            if !damage_applied {
+                // Preserve the timing samples already completed by this phase
+                // before the frame assertion unwinds the test.
+                print_copied_route_latency_snapshot(FRAMES);
+                panic!(
+                    "copied {owner} frame {frame} did not apply damage: latest generation before={damage_generation_before:?} after={damage_generation_after:?}"
+                );
+            }
+            println!(
+                "CP copied damage_applied transport={} frame={frame}",
+                if owner { "Owner" } else { "Legacy" }
+            );
+        }
+        if owner {
+            assert!(
+                !registered.is_empty(),
+                "Owner run recorded no destination obligation"
+            );
+            assert_eq!(
+                registered.len(),
+                retired.len(),
+                "every destination obligation must retire"
+            );
+            for steps in milestones.values() {
+                // A composed commit intentionally has no `Presented`:
+                // design §3.3 and the exit criteria at
+                // docs/superpowers/specs/2026-09-19-phase-c0-stage-2c-iii-conversion-design.md:410 say "a composed commit carries no Present".
+                // A composited `Present` attached to the composed description
+                // is a mutation the design requires to fail.
+                let required = ["Accepted", "HardwareComplete", "CompletionRetired"];
+                assert_eq!(
+                    steps.as_slice(),
+                    required.as_slice(),
+                    "Owner composed copied milestones must be Accepted -> HardwareComplete -> CompletionRetired, with no Presented: {steps:?}"
+                );
+            }
+        }
+    }
+
+    fn run_copied_route_cross_device_hardware_test() {
+        let mut fixture = copied_cross_device_live_fixture()
+            .unwrap_or_else(|error| panic!("F8 copied cross-device fixture unavailable: {error}"));
+        crate::kms::render::platform::begin_copied_route_latency_for_tests();
+        run_copied_hardware_phase(&mut fixture.backend, false);
+        install_copied_hardware_owner(&mut fixture.backend);
+        run_copied_hardware_phase(&mut fixture.backend, true);
+        print_copied_route_latency_snapshot(4);
+        let samples = crate::kms::render::platform::finish_copied_route_latency_for_tests()
+            .unwrap_or_else(|error| panic!("copied latency evidence incomplete: {error}"));
+        let legacy = samples
+            .iter()
+            .filter(|sample| {
+                sample.transport == crate::kms::render::platform::CopiedRouteTransport::Legacy
+            })
+            .collect::<Vec<_>>();
+        let owner = samples
+            .iter()
+            .filter(|sample| {
+                sample.transport == crate::kms::render::platform::CopiedRouteTransport::Owner
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            legacy.len(),
+            4,
+            "one latency sample is required per Legacy copied frame"
+        );
+        assert_eq!(
+            owner.len(),
+            4,
+            "one latency sample is required per Owner copied frame"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live DRM master and Vulkan ICD"]
+    fn c0_hw_cp_copied_route_cross_device_drm() {
+        run_copied_route_cross_device_hardware_test();
     }
 }

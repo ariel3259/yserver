@@ -75,7 +75,10 @@ use yserver_protocol::x11::xfixes;
 
 use super::{
     owner_buffer::{OwnerBuffer, OwnerBufferIdentity, OwnerBufferState},
-    platform::{CrtcKey, FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
+    platform::{
+        CrtcKey, FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion,
+        ScanoutRenderCompletionStage,
+    },
     region::Region,
     resources::{AllocationKey, CommitKey, CoreRetirementBatch, ResourceError, ResourceService},
     scanout_damage::ScanoutDamage,
@@ -111,6 +114,7 @@ use crate::kms::{
 enum InFlightStage {
     WaitingForRenderCompletion { job_id: u64 },
     OwnerRenderWaiting { job_id: u64 },
+    OwnerCopyWaiting { job_id: u64 },
     OwnerDesired,
     OwnerSubmitted,
     KmsFlipPending,
@@ -125,6 +129,10 @@ impl InFlightStage {
         self == Self::OwnerRenderWaiting { job_id }
     }
 
+    fn matches_owner_copy_completion(self, job_id: u64) -> bool {
+        self == Self::OwnerCopyWaiting { job_id }
+    }
+
     fn is_kms_flip_pending(self) -> bool {
         self == Self::KmsFlipPending
     }
@@ -132,11 +140,14 @@ impl InFlightStage {
 
 fn copied_render_completion_matches(
     stage: InFlightStage,
+    completion_stage: ScanoutRenderCompletionStage,
     pending_bo_idx: usize,
     completion_job_id: u64,
     completion_bo_idx: usize,
 ) -> bool {
-    pending_bo_idx == completion_bo_idx && stage.matches_render_completion(completion_job_id)
+    completion_stage == ScanoutRenderCompletionStage::Render
+        && pending_bo_idx == completion_bo_idx
+        && stage.matches_render_completion(completion_job_id)
 }
 
 fn kms_retirement_matches(
@@ -237,6 +248,7 @@ struct PendingAck {
     /// this output.
     last_present_cursor_version_after_retire: Option<u64>,
     managed_batch: Option<CoreRetirementBatch>,
+    copied_receipt: Option<crate::kms::render::copied_owner::CopiedRetirementReceipt>,
 }
 
 /// Stage 5 Phase C — pure result of the cursor-plane strategy
@@ -556,6 +568,8 @@ struct OutputSceneState {
     /// no-skip→skip, skip→no-skip). Tracks the freeze-debug
     /// hypothesis that one of the early-return gates gets stuck.
     last_skip_reason: Option<TickSkipReason>,
+    #[cfg(test)]
+    tick_diagnostics_for_tests: TickDiagnosticsStateForTests,
     /// Step 3 — per-scanout-BO damage: what each BO is missing relative to the
     /// current scene. Fed and staged below while `pick_repaint_region` still
     /// returns `Repaint::Full`, so nothing on screen depends on it yet; step 4
@@ -901,6 +915,132 @@ enum TickSkipReason {
     NothingPending,
 }
 
+#[cfg(test)]
+impl TickSkipReason {
+    const ALL: [Self; 6] = [
+        Self::PendingAcks,
+        Self::RetryDeadline,
+        Self::EmptyDamage,
+        Self::NoBO,
+        Self::NoPool,
+        Self::NothingPending,
+    ];
+
+    const fn diagnostic_index(self) -> usize {
+        match self {
+            Self::PendingAcks => 0,
+            Self::RetryDeadline => 1,
+            Self::EmptyDamage => 2,
+            Self::NoBO => 3,
+            Self::NoPool => 4,
+            Self::NothingPending => 5,
+        }
+    }
+
+    const fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::PendingAcks => "PendingAcks",
+            Self::RetryDeadline => "RetryDeadline",
+            Self::EmptyDamage => "EmptyDamage",
+            Self::NoBO => "NoBO",
+            Self::NoPool => "NoPool",
+            Self::NothingPending => "NothingPending",
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TickAcquisitionSkipForTests {
+    pub(crate) tick: u64,
+    pub(crate) bo_idx: usize,
+    pub(crate) key: AllocationKey,
+    pub(crate) reason: &'static str,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TickDiagnosticsSnapshotForTests {
+    pub(crate) skip_counts: Vec<(&'static str, usize)>,
+    pub(crate) acquisition_skips: Vec<TickAcquisitionSkipForTests>,
+    pub(crate) acquired_destination: Option<(usize, AllocationKey)>,
+    pub(crate) pool_occupancy: (usize, usize),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickFailureForTests {
+    AuditOverlayPipeline,
+    DamageAudit,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TickDiagnosticsStateForTests {
+    collecting: bool,
+    tick: u64,
+    skip_counts: [usize; 6],
+    acquired_destination: Option<(usize, AllocationKey)>,
+    acquisition_skips: Vec<TickAcquisitionSkipForTests>,
+}
+
+#[cfg(test)]
+impl TickDiagnosticsStateForTests {
+    fn begin_tick(&mut self) {
+        if !self.collecting {
+            return;
+        }
+        self.tick = self.tick.saturating_add(1);
+        self.acquired_destination = None;
+    }
+
+    fn reset_window(&mut self) {
+        self.collecting = true;
+        self.skip_counts.fill(0);
+        self.acquisition_skips.clear();
+        self.acquired_destination = None;
+    }
+
+    fn record_acquisition(&mut self, bo_idx: usize, key: AllocationKey) {
+        if self.collecting {
+            self.acquired_destination = Some((bo_idx, key));
+        }
+    }
+
+    fn record_skip(&mut self, reason: TickSkipReason) {
+        if !self.collecting {
+            return;
+        }
+        let count = &mut self.skip_counts[reason.diagnostic_index()];
+        *count = count.saturating_add(1);
+        if let Some((bo_idx, key)) = self.acquired_destination {
+            self.acquisition_skips.push(TickAcquisitionSkipForTests {
+                tick: self.tick,
+                bo_idx,
+                key,
+                reason: reason.diagnostic_name(),
+            });
+        }
+    }
+
+    fn snapshot(&self, pool_occupancy: (usize, usize)) -> TickDiagnosticsSnapshotForTests {
+        TickDiagnosticsSnapshotForTests {
+            skip_counts: TickSkipReason::ALL
+                .into_iter()
+                .map(|reason| {
+                    (
+                        reason.diagnostic_name(),
+                        self.skip_counts[reason.diagnostic_index()],
+                    )
+                })
+                .collect(),
+            acquisition_skips: self.acquisition_skips.clone(),
+            acquired_destination: self.acquired_destination,
+            pool_occupancy,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum TickOutcome {
     Composed,
@@ -1082,6 +1222,20 @@ struct SceneCompositorInner {
     /// is applied at HardwareComplete. The backend consumes these through
     /// the owner-event seam; an invalidated member never enters this queue.
     owner_return_proofs: Vec<(CommitKey, OutputKey)>,
+    #[cfg(test)]
+    tick_failure_for_tests: Option<TickFailureForTests>,
+}
+
+#[cfg(test)]
+impl SceneCompositorInner {
+    fn take_tick_failure_for_tests(&mut self, failure: TickFailureForTests) -> bool {
+        if self.tick_failure_for_tests == Some(failure) {
+            self.tick_failure_for_tests = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -1422,6 +1576,8 @@ impl SceneCompositor {
                 owner_offers: VecDeque::new(),
                 owner_damage_transactions: HashMap::new(),
                 owner_return_proofs: Vec::new(),
+                #[cfg(test)]
+                tick_failure_for_tests: None,
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
@@ -1476,6 +1632,8 @@ impl SceneCompositor {
             last_present_cursor_version: None,
             force_show_retry_version: None,
             last_skip_reason: None,
+            #[cfg(test)]
+            tick_diagnostics_for_tests: TickDiagnosticsStateForTests::default(),
             // Sized from the *current* pool, exactly as `bo_depth` above is.
             // `rebuild_outputs` replaces every `OutputSceneState`, so this is
             // also how a pool that changed length or identity gets a correctly
@@ -2541,6 +2699,84 @@ impl SceneCompositor {
     }
 
     #[cfg(test)]
+    pub(crate) fn damage_history_latest_generation_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .and_then(|state| state.damage_history.entries.back())
+            .map(|(generation, _)| *generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_tick_diagnostics_for_tests(&mut self, output_idx: usize) {
+        if let Some(state) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+        {
+            state.tick_diagnostics_for_tests.reset_window();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tick_diagnostics_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<TickDiagnosticsSnapshotForTests> {
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        Some(
+            state
+                .tick_diagnostics_for_tests
+                .snapshot(state.pool_ring.occupancy_for_tests()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_tick_failure_for_tests(&mut self, failure: TickFailureForTests) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.tick_failure_for_tests = Some(failure);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_descriptor_ring_for_tests(&mut self, output_idx: usize) -> Vec<usize> {
+        let Some(ring) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+            .map(|output| &mut output.pool_ring)
+        else {
+            return Vec::new();
+        };
+        let mut acquired = Vec::new();
+        while let Some(slot) = ring.acquire() {
+            acquired.push(slot);
+        }
+        acquired
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_descriptor_slots_for_tests(
+        &mut self,
+        output_idx: usize,
+        slots: &[usize],
+    ) {
+        if let Some(ring) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+            .map(|output| &mut output.pool_ring)
+        {
+            for &slot in slots {
+                ring.release(slot);
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn owner_prepared_for_tests(&self, output_idx: usize) -> Option<(usize, u64, bool)> {
         let state = self.inner.as_ref()?.outputs.get(output_idx)?;
         let prepared = state
@@ -2731,6 +2967,24 @@ impl SceneCompositor {
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))
             .map_or(0, |state| state.pending_acks.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copied_receipt_for_tests(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> Option<(
+        (AllocationKey, crate::kms::render::resources::ObligationId),
+        (AllocationKey, crate::kms::render::resources::ObligationId),
+    )> {
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        let buffer = state
+            .owner_buffers
+            .iter()
+            .find(|buffer| buffer.identity().bo_idx == bo_idx)?;
+        let receipt = buffer.pending_ack()?.copied_receipt.as_ref()?;
+        Some((receipt.destination, receipt.source))
     }
 
     fn full_output_audit_area(&self) -> Vec<vk::Rect2D> {
@@ -3866,6 +4120,7 @@ fn handle_scanout_render_completion_inner(
         job_id,
         output_key,
         bo_idx,
+        stage: completion_stage,
         fd,
     } = completion;
     let Some(output_idx) = platform
@@ -3885,6 +4140,7 @@ fn handle_scanout_render_completion_inner(
         .position(|buffer| {
             buffer.identity().output_key == output_key
                 && buffer.identity().bo_idx == bo_idx
+                && completion_stage == ScanoutRenderCompletionStage::Render
                 && buffer
                     .pending_ack()
                     .is_some_and(|ack| ack.stage.matches_owner_render_completion(job_id))
@@ -3927,6 +4183,72 @@ fn handle_scanout_render_completion_inner(
         if prepared.state() != OwnerBufferState::Rendering {
             state.owner_buffers.insert(owner_buffer_index, prepared);
             return false;
+        }
+        if matches!(
+            platform.scanout_pools.get(output_idx),
+            Some(Some(OutputScanout::Copied(_)))
+        ) {
+            service.register_batch(batch);
+            if let Err(error) = service.service_completions(std::time::Instant::now()) {
+                log::warn!(
+                    "render Owner copied scanout: A completion service failed for generation {generation}: {error:?}"
+                );
+            }
+            let scanout = platform
+                .scanout_pools
+                .get_mut(output_idx)
+                .and_then(Option::take);
+            let copy_result = match scanout {
+                Some(OutputScanout::Copied(mut pool)) => {
+                    let result = crate::kms::render::copied_owner::
+                        prepare_owner_copy_after_render_completion(
+                            &mut pool,
+                            platform,
+                            output_key.clone(),
+                            bo_idx,
+                            fd,
+                            service,
+                        );
+                    platform.scanout_pools[output_idx] = Some(OutputScanout::Copied(pool));
+                    result
+                }
+                Some(other) => {
+                    platform.scanout_pools[output_idx] = Some(other);
+                    Err(PresentError::Io(io::Error::other(
+                        "copied Owner scanout disappeared during completion",
+                    )))
+                }
+                None => Err(PresentError::Io(io::Error::other(
+                    "copied Owner scanout disappeared during completion",
+                ))),
+            };
+            match copy_result {
+                Ok((receipt, copy_job_id)) => {
+                    if let Some(ack) = prepared.pending_ack_mut() {
+                        ack.stage = InFlightStage::OwnerCopyWaiting {
+                            job_id: copy_job_id,
+                        };
+                        ack.copied_receipt = Some(receipt);
+                    }
+                    state.owner_buffers.insert(owner_buffer_index, prepared);
+                    return true;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "render Owner copied scanout: sink preparation failed for generation {generation}: {error}"
+                    );
+                    let displaced = match prepared.into_displaced() {
+                        Ok(displaced) => displaced,
+                        Err(returned) => {
+                            state.owner_buffers.insert(owner_buffer_index, *returned);
+                            platform.renderer_failed = true;
+                            return false;
+                        }
+                    };
+                    state.owner_buffers.insert(owner_buffer_index, displaced);
+                    return true;
+                }
+            }
         }
         let managed = service.reserve(
             prepared.identity().managed_key,
@@ -3985,11 +4307,157 @@ fn handle_scanout_render_completion_inner(
         drop(fd);
         return true;
     }
+    if completion_stage == ScanoutRenderCompletionStage::CopiedOwnerCopy {
+        let owner_buffer_index =
+            inner.outputs[output_idx]
+                .owner_buffers
+                .iter()
+                .position(|buffer| {
+                    buffer.identity().output_key == output_key
+                        && buffer.identity().bo_idx == bo_idx
+                        && buffer
+                            .pending_ack()
+                            .is_some_and(|ack| ack.stage.matches_owner_copy_completion(job_id))
+                });
+        if let Some(owner_buffer_index) = owner_buffer_index {
+            let Some(service) = resource_service else {
+                log::error!(
+                    "render Owner copied scanout: copy completion arrived without ResourceService"
+                );
+                platform.renderer_failed = true;
+                drop(fd);
+                return false;
+            };
+            let state = &mut inner.outputs[output_idx];
+            let prepared = state.owner_buffers.remove(owner_buffer_index);
+            let Some(receipt) = prepared
+                .pending_ack()
+                .and_then(|ack| ack.copied_receipt.as_ref())
+                .map(|receipt| (receipt.destination, receipt.source))
+            else {
+                log::error!(
+                    "render Owner copied scanout: generation {} had no retirement receipt",
+                    prepared.identity().generation
+                );
+                state.owner_buffers.insert(owner_buffer_index, prepared);
+                platform.renderer_failed = true;
+                drop(fd);
+                return false;
+            };
+            let ((destination_key, destination_obligation), source_receipt) = receipt;
+            let generation = prepared.identity().generation;
+
+            // The sync_file is only the wake.  Service the registered sink
+            // batch for progress, but do not use its generic keys or its
+            // service-wide error as this generation's answer.
+            if let Err(error) = service.service_completions(std::time::Instant::now()) {
+                log::warn!(
+                    "render Owner copied scanout: copy completion service failed for generation {generation}: {error:?}"
+                );
+            }
+
+            // B's read obligation is the source-release proof. It is
+            // independent of the destination promotion check below and also
+            // applies when this generation was displaced while B was in
+            // flight.
+            if let Some(OutputScanout::Copied(pool)) = platform
+                .scanout_pools
+                .get_mut(output_idx)
+                .and_then(Option::as_mut)
+            {
+                let _ = crate::kms::render::copied_owner::release_source_after_read_retirement(
+                    pool,
+                    service,
+                    bo_idx,
+                    source_receipt,
+                );
+            }
+
+            if prepared.state() == OwnerBufferState::Displaced {
+                state.owner_buffers.insert(owner_buffer_index, prepared);
+                drop(fd);
+                return true;
+            }
+            if prepared.state() != OwnerBufferState::Rendering
+                || service.has_pending_obligation(&destination_key, destination_obligation)
+                || service.is_frozen(&destination_key)
+            {
+                state.owner_buffers.insert(owner_buffer_index, prepared);
+                drop(fd);
+                return true;
+            }
+
+            #[cfg(test)]
+            println!(
+                "CP copied destination promotion gate passed key={destination_key:?} obligation={destination_obligation:?} pending=false frozen=false generation={generation}"
+            );
+
+            let managed = match service.reserve(
+                prepared.identity().managed_key,
+                crate::kms::render::resources::UseKind::Retain,
+            ) {
+                Ok(managed) => managed,
+                Err(error) => {
+                    log::error!(
+                        "render Owner copied scanout: could not retain generation {generation} after copy completion: {error:?}"
+                    );
+                    state.owner_buffers.insert(owner_buffer_index, prepared);
+                    platform.renderer_failed = true;
+                    drop(fd);
+                    return false;
+                }
+            };
+            let mut desired = match prepared.into_desired(managed) {
+                Ok(desired) => desired,
+                Err(returned) => {
+                    let (prepared, _managed) = *returned;
+                    state.owner_buffers.insert(owner_buffer_index, prepared);
+                    platform.renderer_failed = true;
+                    drop(fd);
+                    return false;
+                }
+            };
+            let Some(ack) = desired.pending_ack_mut() else {
+                state.owner_buffers.insert(owner_buffer_index, desired);
+                platform.renderer_failed = true;
+                drop(fd);
+                return false;
+            };
+            ack.stage = InFlightStage::OwnerDesired;
+            if let Err(desired) =
+                SceneCompositor::insert_existing_owner_buffer(state, desired, platform, output_idx)
+            {
+                state.owner_buffers.insert(owner_buffer_index, *desired);
+                platform.renderer_failed = true;
+                drop(fd);
+                return false;
+            }
+            inner.owner_offers.push_back(ComposedOffer {
+                device: output_key.device_key,
+                crtc: u32::from(platform.outputs[output_idx].output.crtc),
+                generation,
+            });
+            #[cfg(test)]
+            println!(
+                "CP copied destination offer enqueued key={destination_key:?} obligation={destination_obligation:?} generation={generation}"
+            );
+            drop(fd);
+            return true;
+        }
+    }
     let expected = inner
         .outputs
         .get(output_idx)
         .and_then(|state| state.pending_acks.front())
-        .is_some_and(|ack| copied_render_completion_matches(ack.stage, ack.bo_idx, job_id, bo_idx));
+        .is_some_and(|ack| {
+            copied_render_completion_matches(
+                ack.stage,
+                completion_stage,
+                ack.bo_idx,
+                job_id,
+                bo_idx,
+            )
+        });
     if !expected {
         log::warn!(
             "render copied scanout: stale completion job {job_id} for output \
@@ -4591,7 +5059,19 @@ fn retire_owner_current(
             && service.is_releasable(&prepared.identity().managed_key);
         if ready {
             let bo_idx = prepared.identity().bo_idx;
-            if platform.leave_owner_buffer(output_idx, bo_idx) {
+            let copied = matches!(
+                platform
+                    .scanout_pools
+                    .get(output_idx)
+                    .and_then(Option::as_ref),
+                Some(OutputScanout::Copied(_))
+            );
+            let released = if copied {
+                platform.leave_copied_owner_buffer_after_retirement(output_idx, bo_idx)
+            } else {
+                platform.leave_owner_buffer(output_idx, bo_idx)
+            };
+            if released {
                 if prepared.into_free().is_err() {
                     log::error!("render scene: owner releasing buffer {bo_idx} was not freeable");
                     platform.renderer_failed = true;
@@ -5535,6 +6015,9 @@ fn record_tick_skip(
     reason: TickSkipReason,
     output_damage_rects: usize,
 ) {
+    #[cfg(test)]
+    state.tick_diagnostics_for_tests.record_skip(reason);
+
     if !tick_skip_log_enabled() {
         return;
     }
@@ -5781,6 +6264,11 @@ fn tick_one_output(
     pending_presentation: bool,
     mut resource_service: Option<&mut ResourceService>,
 ) -> Result<TickOutcome, SceneError> {
+    #[cfg(test)]
+    if let Some(state) = inner.outputs.get_mut(output_idx) {
+        state.tick_diagnostics_for_tests.begin_tick();
+    }
+
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
     //    `drmModeAtomicCommit` while the first hasn't fired
@@ -6192,6 +6680,12 @@ fn tick_one_output(
             match platform.acquire_managed_scanout_bo(service, crtc) {
                 Ok(token) => {
                     let managed_key = token.display.key();
+                    #[cfg(test)]
+                    if let Some(state) = inner.outputs.get_mut(output_idx) {
+                        state
+                            .tick_diagnostics_for_tests
+                            .record_acquisition(token.bo_idx, managed_key);
+                    }
                     // The acquisition lease protects the selected free buffer
                     // only through selection. The compose creates its own GPU
                     // obligation and write reservation below; retaining this
@@ -6365,7 +6859,27 @@ fn tick_one_output(
         u32::from(layout.width),
         u32::from(layout.height),
     ));
-    let (xor_pipeline, xor_layout) = audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
+    let xor_pipeline_result = {
+        #[cfg(test)]
+        if inner.take_tick_failure_for_tests(TickFailureForTests::AuditOverlayPipeline) {
+            Err(SceneError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))
+        } else {
+            audit_overlay_pipeline(inner, !overlay_ops.is_empty())
+        }
+        #[cfg(not(test))]
+        {
+            audit_overlay_pipeline(inner, !overlay_ops.is_empty())
+        }
+    };
+    let (xor_pipeline, xor_layout) = match xor_pipeline_result {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            if owner_managed_key.is_some() {
+                platform.cancel_scanout_bo_recording(output_idx, bo_idx);
+            }
+            return Err(error);
+        }
+    };
     let reference = audit_reference_scene(
         built.software_cursor_tail.is_some(),
         core,
@@ -6378,20 +6892,50 @@ fn tick_one_output(
         cow_host_xid,
         hw_can_run,
     );
-    run_damage_audit(
-        inner,
-        output_idx,
-        platform,
-        &built.scene,
-        reference.as_ref().map_or(&built.scene, |r| &r.scene),
-        &audit_sampled_pairs(store, &built.sampled_ids),
-        &output_damage,
-        None,
-        false,
-        &overlay_ops,
-        xor_pipeline,
-        xor_layout,
-    )?;
+    let damage_audit_result = {
+        #[cfg(test)]
+        if inner.take_tick_failure_for_tests(TickFailureForTests::DamageAudit) {
+            Err(SceneError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))
+        } else {
+            run_damage_audit(
+                inner,
+                output_idx,
+                platform,
+                &built.scene,
+                reference.as_ref().map_or(&built.scene, |r| &r.scene),
+                &audit_sampled_pairs(store, &built.sampled_ids),
+                &output_damage,
+                None,
+                false,
+                &overlay_ops,
+                xor_pipeline,
+                xor_layout,
+            )
+        }
+        #[cfg(not(test))]
+        {
+            run_damage_audit(
+                inner,
+                output_idx,
+                platform,
+                &built.scene,
+                reference.as_ref().map_or(&built.scene, |r| &r.scene),
+                &audit_sampled_pairs(store, &built.sampled_ids),
+                &output_damage,
+                None,
+                false,
+                &overlay_ops,
+                xor_pipeline,
+                xor_layout,
+            )
+        }
+    };
+    if let Err(error) = damage_audit_result {
+        if owner_managed_key.is_some() {
+            platform.cancel_scanout_bo_recording(output_idx, bo_idx);
+        }
+        return Err(error);
+    }
 
     // 6. Acquire descriptor-pool slot.
     let state = inner.outputs.get_mut(output_idx).expect("range");
@@ -6407,6 +6951,9 @@ fn tick_one_output(
                 TickSkipReason::NoPool,
                 output_damage.rects().len(),
             );
+            if owner_managed_key.is_some() {
+                platform.cancel_scanout_bo_recording(output_idx, bo_idx);
+            }
             return Ok(TickOutcome::Skipped(TickSkipReason::NoPool));
         }
     };
@@ -6419,6 +6966,9 @@ fn tick_one_output(
             inner.outputs[output_idx].pool_ring.release(slot);
             if vk_result_is_device_lost(error) {
                 platform.renderer_failed = true;
+            }
+            if owner_managed_key.is_some() {
+                platform.cancel_scanout_bo_recording(output_idx, bo_idx);
             }
             return Err(SceneError::Present(PresentError::Vk(error)));
         }
@@ -6530,39 +7080,75 @@ fn tick_one_output(
             (result, bo.last_gpu_render_ns.take(), false, managed_batch)
         }
         OutputScanout::Copied(pool) => {
-            let source = pool.sources.get_mut(bo_idx).ok_or(SceneError::NoVk)?;
-            let destination_state = &mut pool
-                .destinations
-                .bos
-                .get_mut(bo_idx)
-                .ok_or(SceneError::NoVk)?
-                .state;
-            let result = submit_copied_scanout_render(
-                &inner.vk,
-                source,
-                destination_state,
-                &inner.pipeline,
-                descriptor_pool,
-                render_scene,
-                Repaint::Full(token_extent),
-                &[],
-                compose_ticket.fence(),
-                &mut gpu_submitted,
-                &overlay_ops,
-                xor_pipeline,
-                xor_layout,
-            );
-            let copied_prepare_failed = result
-                .as_ref()
-                .is_err_and(CopiedRenderSubmitError::requires_fail_stop);
-            (
-                result
-                    .map(Some)
-                    .map_err(CopiedRenderSubmitError::into_present),
-                source.last_gpu_render_ns.take(),
-                copied_prepare_failed,
-                None,
-            )
+            if owner_route {
+                let Some(service) = resource_service.as_deref_mut() else {
+                    return Err(SceneError::Present(PresentError::Io(io::Error::other(
+                        "Owner copied route lost its resource service before submit",
+                    ))));
+                };
+                let mut managed_batch = None;
+                let result = crate::kms::render::copied_owner::submit_owner_copied_scanout_frame(
+                    &inner.vk,
+                    pool,
+                    bo_idx,
+                    &inner.pipeline,
+                    descriptor_pool,
+                    render_scene,
+                    Repaint::Full(token_extent),
+                    &[],
+                    &compose_ticket,
+                    &mut gpu_submitted,
+                    &overlay_ops,
+                    xor_pipeline,
+                    xor_layout,
+                    service,
+                );
+                let previous_gpu_ns = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|(_, _, _, previous_gpu_ns)| *previous_gpu_ns);
+                let result = result.map(|(submitted, completion, batch, _)| {
+                    compose_complete =
+                        compose_submit_was_complete(submitted, render_scene.draws.len());
+                    managed_batch = Some(batch);
+                    Some(completion)
+                });
+                (result, previous_gpu_ns, false, managed_batch)
+            } else {
+                let source = pool.sources.get_mut(bo_idx).ok_or(SceneError::NoVk)?;
+                let destination_state = &mut pool
+                    .destinations
+                    .bos
+                    .get_mut(bo_idx)
+                    .ok_or(SceneError::NoVk)?
+                    .state;
+                let result = submit_copied_scanout_render(
+                    &inner.vk,
+                    source,
+                    destination_state,
+                    &inner.pipeline,
+                    descriptor_pool,
+                    render_scene,
+                    Repaint::Full(token_extent),
+                    &[],
+                    compose_ticket.fence(),
+                    &mut gpu_submitted,
+                    &overlay_ops,
+                    xor_pipeline,
+                    xor_layout,
+                );
+                let copied_prepare_failed = result
+                    .as_ref()
+                    .is_err_and(CopiedRenderSubmitError::requires_fail_stop);
+                (
+                    result
+                        .map(Some)
+                        .map_err(CopiedRenderSubmitError::into_present),
+                    source.last_gpu_render_ns.take(),
+                    copied_prepare_failed,
+                    None,
+                )
+            }
         }
     };
     if copied_prepare_failed {
@@ -6574,7 +7160,12 @@ fn tick_one_output(
     }
     let compose_result = match render_result {
         Ok(Some(completion)) => platform
-            .register_scanout_render_completion(output_key.clone(), bo_idx, completion)
+            .register_scanout_render_completion(
+                output_key.clone(),
+                bo_idx,
+                ScanoutRenderCompletionStage::Render,
+                completion,
+            )
             .map(|job_id| {
                 if owner_route {
                     InFlightStage::OwnerRenderWaiting { job_id }
@@ -6630,6 +7221,7 @@ fn tick_one_output(
                 last_present_cursor_rect_after_retire: built.new_cursor_rect,
                 last_present_cursor_version_after_retire: built.cursor_record_version,
                 managed_batch,
+                copied_receipt: None,
             };
             if owner_route {
                 let Some(managed_key) = owner_managed_key else {
@@ -7076,7 +7668,7 @@ fn cull_scene_to_region(scene: &CompositeScene, keep: &Region) -> CompositeScene
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Repaint {
+pub(crate) enum Repaint {
     /// Full-output redraw with `loadOp=CLEAR`. Fallback path.
     Full(vk::Extent2D),
     /// Damaged-region-only redraw with `loadOp=LOAD`. The
@@ -7090,7 +7682,7 @@ enum Repaint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ComposeSubmit {
+pub(crate) struct ComposeSubmit {
     descriptor_count: usize,
 }
 
@@ -9410,7 +10002,7 @@ fn project_onto_output(
 // handling stay identical to v1.
 // ────────────────────────────────────────────────────────────────
 
-trait ComposeRenderTarget {
+pub(crate) trait ComposeRenderTarget {
     fn image(&self) -> vk::Image;
     fn image_view(&self) -> vk::ImageView;
     fn command_buffer(&self) -> vk::CommandBuffer;
@@ -9435,7 +10027,7 @@ trait ComposeRenderTarget {
 }
 
 #[derive(Clone, Copy)]
-enum PostComposePreparation {
+pub(crate) enum PostComposePreparation {
     Shared,
     Copied(CopiedTransportPreparation),
 }
@@ -10085,7 +10677,7 @@ fn submit_copied_scanout_render(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_and_submit_render(
+pub(crate) fn record_and_submit_render(
     vk: &crate::kms::vk::device::VkContext,
     target: &mut impl ComposeRenderTarget,
     pipeline: &CompositorPipeline,
@@ -10523,9 +11115,34 @@ mod tests {
     #[test]
     fn copied_completion_requires_exact_job_and_paired_bo() {
         let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 41 };
-        assert!(copied_render_completion_matches(waiting, 2, 41, 2));
-        assert!(!copied_render_completion_matches(waiting, 2, 42, 2));
-        assert!(!copied_render_completion_matches(waiting, 2, 41, 1));
+        assert!(copied_render_completion_matches(
+            waiting,
+            ScanoutRenderCompletionStage::Render,
+            2,
+            41,
+            2,
+        ));
+        assert!(!copied_render_completion_matches(
+            waiting,
+            ScanoutRenderCompletionStage::CopiedOwnerCopy,
+            2,
+            41,
+            2,
+        ));
+        assert!(!copied_render_completion_matches(
+            waiting,
+            ScanoutRenderCompletionStage::Render,
+            2,
+            42,
+            2,
+        ));
+        assert!(!copied_render_completion_matches(
+            waiting,
+            ScanoutRenderCompletionStage::Render,
+            2,
+            41,
+            1,
+        ));
     }
 
     #[test]
@@ -10534,6 +11151,7 @@ mod tests {
         assert!(!kms_retirement_matches(waiting, 1, 1));
         assert!(!copied_render_completion_matches(
             InFlightStage::KmsFlipPending,
+            ScanoutRenderCompletionStage::Render,
             1,
             7,
             1,
@@ -10912,6 +11530,7 @@ mod tests {
                 last_present_cursor_rect_after_retire: None,
                 last_present_cursor_version_after_retire: None,
                 managed_batch: Some(batch),
+                copied_receipt: None,
             });
             slot
         };

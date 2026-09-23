@@ -67,6 +67,7 @@ pub(crate) enum OwnerBuffer<P> {
         identity: OwnerBufferIdentity,
         pending_ack: P,
         commit_id: CommitId,
+        descriptor_slot: Option<usize>,
     },
     Accepted {
         identity: OwnerBufferIdentity,
@@ -186,9 +187,11 @@ impl<P> OwnerBuffer<P> {
             }
             | Self::Displaced {
                 descriptor_slot, ..
+            }
+            | Self::Submitted {
+                descriptor_slot, ..
             } => descriptor_slot.take(),
-            Self::Submitted { .. }
-            | Self::Accepted { .. }
+            Self::Accepted { .. }
             | Self::Current { .. }
             | Self::Releasing { .. }
             | Self::Quarantined { .. } => None,
@@ -238,8 +241,10 @@ impl<P> OwnerBuffer<P> {
             Self::Displaced {
                 descriptor_slot, ..
             } => *descriptor_slot,
-            Self::Submitted { .. }
-            | Self::Accepted { .. }
+            Self::Submitted {
+                descriptor_slot, ..
+            } => *descriptor_slot,
+            Self::Accepted { .. }
             | Self::Current { .. }
             | Self::Releasing { .. }
             | Self::Quarantined { .. } => None,
@@ -323,12 +328,13 @@ impl<P> OwnerBuffer<P> {
                 identity,
                 pending_ack,
                 allocation_lease,
-                ..
+                descriptor_slot,
             } => Ok((
                 Self::Submitted {
                     identity,
                     pending_ack,
                     commit_id,
+                    descriptor_slot,
                 },
                 allocation_lease,
             )),
@@ -364,6 +370,7 @@ impl<P> OwnerBuffer<P> {
                 identity,
                 pending_ack,
                 commit_id,
+                ..
             } => Ok(Self::Accepted {
                 identity,
                 pending_ack,
@@ -561,32 +568,35 @@ mod tests {
                     .expect("Rendering must enter Displaced")
             }
             OwnerBufferState::Submitted => {
-                let (submitted, returned_lease) = rendering
+                let (mut submitted, returned_lease) = rendering
                     .into_desired(held)
                     .expect("Rendering must enter Desired")
                     .into_submitted(commit)
                     .expect("Desired must enter Submitted");
                 drop(returned_lease);
+                assert_eq!(submitted.take_descriptor_slot(), Some(20));
                 submitted
             }
             OwnerBufferState::Accepted => {
-                let (submitted, returned_lease) = rendering
+                let (mut submitted, returned_lease) = rendering
                     .into_desired(held)
                     .expect("Rendering must enter Desired")
                     .into_submitted(commit)
                     .expect("Desired must enter Submitted");
                 drop(returned_lease);
+                assert_eq!(submitted.take_descriptor_slot(), Some(20));
                 submitted
                     .into_accepted()
                     .expect("Submitted must enter Accepted")
             }
             OwnerBufferState::Current => {
-                let (submitted, returned_lease) = rendering
+                let (mut submitted, returned_lease) = rendering
                     .into_desired(held)
                     .expect("Rendering must enter Desired")
                     .into_submitted(commit)
                     .expect("Desired must enter Submitted");
                 drop(returned_lease);
+                assert_eq!(submitted.take_descriptor_slot(), Some(20));
                 submitted
                     .into_accepted()
                     .expect("Submitted must enter Accepted")
@@ -594,12 +604,13 @@ mod tests {
                     .expect("Accepted must enter Current")
             }
             OwnerBufferState::Releasing => {
-                let (submitted, returned_lease) = rendering
+                let (mut submitted, returned_lease) = rendering
                     .into_desired(held)
                     .expect("Rendering must enter Desired")
                     .into_submitted(commit)
                     .expect("Desired must enter Submitted");
                 drop(returned_lease);
+                assert_eq!(submitted.take_descriptor_slot(), Some(20));
                 submitted
                     .into_accepted()
                     .expect("Submitted must enter Accepted")
@@ -609,12 +620,13 @@ mod tests {
                     .expect("Current must enter Releasing")
             }
             OwnerBufferState::Quarantined => {
-                let (submitted, returned_lease) = rendering
+                let (mut submitted, returned_lease) = rendering
                     .into_desired(held)
                     .expect("Rendering must enter Desired")
                     .into_submitted(commit)
                     .expect("Desired must enter Submitted");
                 drop(returned_lease);
+                assert_eq!(submitted.take_descriptor_slot(), Some(20));
                 submitted
                     .into_quarantined()
                     .expect("Submitted must enter Quarantined")
@@ -680,12 +692,14 @@ mod tests {
         assert!(desired.owns_allocation_lease());
         assert_identity(&desired, &expected);
 
-        let (submitted, returned_lease) = desired
+        let (mut submitted, returned_lease) = desired
             .into_submitted(commit)
             .expect("Desired must enter Submitted and return its lease");
         assert_eq!(submitted.state(), OwnerBufferState::Submitted);
         assert_eq!(submitted.commit_id(), Some(commit));
         assert!(!submitted.owns_allocation_lease());
+        assert_eq!(submitted.descriptor_slot(), Some(9));
+        assert_eq!(submitted.take_descriptor_slot(), Some(9));
         assert_identity(&submitted, &expected);
 
         let accepted = submitted
@@ -724,16 +738,19 @@ mod tests {
         assert_eq!(freed, expected);
         drop(returned_lease);
 
-        let accepted = OwnerBuffer::rendering(expected.clone(), pending_ack(&drops), 9)
-            .into_desired(
-                service
-                    .reserve(key, UseKind::Retain)
-                    .expect("test allocation remains available"),
-            )
-            .expect("Rendering must enter Desired")
-            .into_submitted(commit)
-            .expect("Desired must enter Submitted")
-            .0
+        let (mut submitted, returned_lease) =
+            OwnerBuffer::rendering(expected.clone(), pending_ack(&drops), 9)
+                .into_desired(
+                    service
+                        .reserve(key, UseKind::Retain)
+                        .expect("test allocation remains available"),
+                )
+                .expect("Rendering must enter Desired")
+                .into_submitted(commit)
+                .expect("Desired must enter Submitted");
+        assert_eq!(submitted.take_descriptor_slot(), Some(9));
+        drop(returned_lease);
+        let accepted = submitted
             .into_accepted()
             .expect("Submitted must enter Accepted");
         let quarantined = accepted
@@ -776,9 +793,10 @@ mod tests {
         let desired = OwnerBuffer::rendering(expected.clone(), pending_ack(&drops), 12)
             .into_desired(lease)
             .expect("Rendering must enter Desired");
-        let (submitted, returned_lease) = desired
+        let (mut submitted, returned_lease) = desired
             .into_submitted(commit)
             .expect("Desired must enter Submitted");
+        assert_eq!(submitted.take_descriptor_slot(), Some(12));
         let desired = submitted
             .into_desired_after_refusal(returned_lease)
             .expect("pre-IPC refusal must restore Desired");
@@ -794,12 +812,14 @@ mod tests {
         let lease = service
             .reserve(key, UseKind::Retain)
             .expect("test allocation remains available");
-        let submitted = OwnerBuffer::rendering(expected.clone(), pending_ack(&drops), 13)
-            .into_desired(lease)
-            .expect("Rendering must enter Desired")
-            .into_submitted(commit)
-            .expect("Desired must enter Submitted")
-            .0;
+        let (mut submitted, returned_lease) =
+            OwnerBuffer::rendering(expected.clone(), pending_ack(&drops), 13)
+                .into_desired(lease)
+                .expect("Rendering must enter Desired")
+                .into_submitted(commit)
+                .expect("Desired must enter Submitted");
+        assert_eq!(submitted.take_descriptor_slot(), Some(13));
+        drop(returned_lease);
         let displaced = submitted
             .into_displaced()
             .expect("a post-IPC rejection must displace Submitted");
@@ -938,12 +958,14 @@ mod tests {
         let expected = identity(key, 9, 5);
         let commit = CommitId::for_tests(13);
 
-        let submitted = OwnerBuffer::rendering(expected.clone(), pending_ack(&drops), 31)
-            .into_desired(held)
-            .expect("Rendering must enter Desired")
-            .into_submitted(commit)
-            .expect("Desired must enter Submitted")
-            .0;
+        let (mut submitted, managed) =
+            OwnerBuffer::rendering(expected.clone(), pending_ack(&drops), 31)
+                .into_desired(held)
+                .expect("Rendering must enter Desired")
+                .into_submitted(commit)
+                .expect("Desired must enter Submitted");
+        assert_eq!(submitted.take_descriptor_slot(), Some(31));
+        drop(managed);
         assert_eq!(submitted.state(), OwnerBufferState::Submitted);
         assert!(submitted.has_pending_ack());
         assert!(!submitted.owns_allocation_lease());
@@ -960,5 +982,35 @@ mod tests {
         assert_eq!(quarantined.descriptor_slot(), None);
         assert_eq!(quarantined.commit_id(), None);
         assert_eq!(drops.get(), 1, "quarantine must drop PendingAck");
+    }
+
+    #[test]
+    fn c0_conv_cp_desired_to_submitted_preserves_descriptor_slot() {
+        let (_service, held, drops) = resources::tests::spy_service();
+        let expected = identity(held.key(), 10, 4);
+        let commit = CommitId::for_tests(14);
+
+        let desired = OwnerBuffer::rendering(expected, pending_ack(&drops), 31)
+            .into_desired(held)
+            .expect("Rendering must enter Desired");
+        assert_eq!(desired.descriptor_slot(), Some(31));
+
+        let (mut submitted, managed) = desired
+            .into_submitted(commit)
+            .expect("Desired must enter Submitted");
+        assert_eq!(submitted.state(), OwnerBufferState::Submitted);
+        assert_eq!(
+            submitted.descriptor_slot(),
+            Some(31),
+            "the admission release site must still be able to take the slot"
+        );
+        assert_eq!(
+            submitted.take_descriptor_slot(),
+            Some(31),
+            "the slot reaches the admission release site"
+        );
+        assert_eq!(submitted.take_descriptor_slot(), None);
+        assert_eq!(submitted.commit_id(), Some(commit));
+        drop(managed);
     }
 }

@@ -50,6 +50,95 @@ Cross-cutting bugs and followups that don't fit a stage live in
   Vulkan contexts poison the NVIDIA ICD; GPU tests are `#[ignore]` `_vulkan`;
   `seed_bordered_window`'s null storage cannot be a copy target; a
   hardware-free release claim must name its production caller.
+- **2026-09-22 copied-route Task 8 hardware rerun pending.** The first real
+  card1 run reached Owner `HardwareComplete` and `CompletionRetired`, then hit
+  a harness false negative: four Legacy frames filled the four-entry damage
+  history ring, so its bounded length could not increase on the first Owner
+  retirement. The harness now compares the latest retired generation and logs
+  the actual copied offer enqueue after the destination obligation check. The
+  run did not prove whether Owner damage applied; the coordinator's hardware
+  rerun is required to close that assertion.
+- **2026-09-22 copied-route Task 8 third hardware run: harness release-gate
+  pump was incomplete.** The run recorded both device identities, four Legacy
+  frames, and the complete Owner chain for frames 0–2 (`Accepted`,
+  `HardwareComplete`, `CompletionRetired`, damage applied); Owner frame 3 did
+  not apply damage within the existing 15-second deadline. The harness pumped
+  resource and completion events while waiting but called the compositor only
+  once at frame start. Production releases copied Owner buffers from
+  `retire_owner_current` during `tick_one_output`, after the managed batch is
+  gone and the allocation is releasable. If those gates become ready during
+  the wait, the harness did not revisit them. It now retries the production
+  tick while the current frame has not created a new Owner generation, without
+  changing the four-frame assertion or deadline. On a repeated timeout it
+  prints each destination's index, `BoPhase`, allocation releasability, and
+  Owner ledger state/current flag. The third run therefore identifies a
+  harness gap; a coordinator rerun with the new snapshot is still needed to
+  rule out a separate production release defect. The fourth-run snapshot below
+  shows that this pump did not explain the later post-acquisition stall.
+- **2026-09-22 copied-route Task 8 fourth hardware run: selection succeeded,
+  later Owner stage unresolved.** The frame-3 snapshot shows `bo_idx=2` in
+  `Recording`, so the frame acquired a destination; it was not blocked on a
+  Free slot. `bo_idx=1` remains `OnScreen` from Legacy and is outside the Owner
+  ledger. `acquire_managed_scanout_bo` only selects `Free` destinations, and
+  the Owner path does not return that Legacy slot to `Free`; the shared-session
+  harness therefore leaves two destinations for Owner transport. That pool
+  history reduces buffering but does not explain why the selected frame never
+  creates an Owner generation. The snapshot did not include the internal
+  `OwnerBuffer` stage or pending render-completion wake, so it cannot establish
+  whether stage A completed, whether sink copy B was submitted, or whether B's
+  completion drained. This is not enough evidence to label the frame a
+  production stall or an F8 stop. The next timeout diagnostic now prints the
+  Owner generation/stage, pending render/copy completion job and readiness,
+  and paired source/destination releasability. Latency samples and summaries
+  are emitted before a failed damage assertion, with `status=partial` and
+  per-transport collected/expected counts when incomplete.
+
+- **2026-09-22 copied-route Task 8 fifth hardware run: F8 production resource
+  leak.** Owner frame 3 acquired `bo_idx=2` (`Recording`) but had no Owner
+  buffer entry and no render-completion waiter. `tick_one_output` has no gate
+  that refuses a new generation while the current Owner ack is
+  `OwnerSubmitted`; its early output gate checks only `pending_acks`, and Owner
+  buffers are separate. The exact ordinary no-render return after acquisition
+  is the descriptor-ring `NoPool` branch (`scene.rs:6694-6706`): when all three
+  descriptor slots are in use it returns `Skipped(NoPool)` without calling
+  `cancel_scanout_bo_recording`. The post-acquire audit and fence-ticket error
+  paths also escape without resetting the selected BO. The frame-3 snapshot
+  does not include the last skip reason or ring occupancy, so it does not prove
+  `NoPool` was the fifth-run trigger; it does prove the BO was abandoned and
+  the resource leak outcome. `bo_idx=1` is still `OnScreen` from the harness's
+  Legacy phase, leaving two physical Owner candidates; after `bo_idx=2` is
+  stranded, `bo_idx=0` cannot be released until a newer Owner frame becomes
+  current, and no free destination remains. This was a production F8 stop, not
+  a harness-only starvation finding. No production fix was made under the
+  plan's F8 stop rule at that time. The C.0 follow-up later fixed the four
+  reachable managed pre-submit exits with `cancel_scanout_bo_recording`:
+  audit-pipeline error, damage-audit error, `NoPool`, and fence-ticket error.
+  Each has a `c0_conv_cp_..._vulkan` test and an independent compiled
+  remove-the-rollback mutation that fails at `Recording` versus `Free`. The
+  other enumerated exits were verified unreachable after managed acquisition
+  and received no rollback code. The OwnerSubmitted hypothesis is ruled out;
+  the fifth run's exact triggering early return remains unrecorded.
+- The same fifth run reported zero completed latency samples. The hardware
+  harness only accepted a Legacy completion MSC when the raw sequence was
+  nonzero and only accepted an Owner MSC when `Presented.samples` had an exact
+  CRTC entry. Completion now records after event routing, using the Legacy
+  sequence fallback or the routed Owner clock when the event payload omits its
+  sample. Partial summaries now list each pending frame's four boundary flags.
+  A pipe-backed, non-GPU recorder test closes one sample for each transport.
+  The hardware test was not rerun; the new per-boundary output is needed to
+  confirm no other boundary is absent on that path.
+- **2026-09-22 composed Owner descriptor-pool slot leak fixed.** `Desired ->
+  Submitted` now preserves its descriptor slot, allowing the existing
+  `take_owner_composed_resources` admission path to return it after the render
+  completion drain. `CompositePoolRing::release` resets the descriptor pool,
+  invalidating its sets; the GPU compose fence has completed at this point and
+  KMS scans the resulting BO rather than using those sets. The deterministic
+  `c0_conv_cp_desired_to_submitted_preserves_descriptor_slot` test and the
+  four-frame Vulkan Owner fixture pass in debug and release. Replacing the
+  transition with the leak made frame four hit `NoPool`; moving release before
+  render completion failed while compose work still held the pool. The separate
+  `Skipped(NoPool)` rollback after `Free -> Recording` is covered by the C.0
+  managed-acquisition fix above. The coordinator still owns any hardware rerun.
 
 The repository-wide code-quality and technical-debt review from 2026-07-26
 lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
