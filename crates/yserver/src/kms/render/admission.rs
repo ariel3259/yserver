@@ -360,6 +360,14 @@ impl LifecycleDriver {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_topology_descriptions_for_tests(&self) -> Vec<&CommitDescription> {
+        self.pending_topology_validations
+            .values()
+            .map(|pending| &pending.description)
+            .collect()
+    }
+
     pub(crate) fn has_inflight_topology(&self) -> bool {
         !self.pending_topology_validations.is_empty() || !self.topology_commits.is_empty()
     }
@@ -1024,6 +1032,19 @@ impl KmsBackend {
         &mut self,
         device: DrmDeviceKey,
     ) -> Result<CommitDescription, String> {
+        let target = crate::kms::owner::lifecycle::dpms_target_for_level(
+            self.lifecycle_coordinator.protocol_dpms_level(),
+        )
+        .ok_or_else(|| "lifecycle DPMS level is invalid".to_string())?;
+        let projected_outputs = self
+            .lifecycle_coordinator
+            .device(&device)
+            .ok_or_else(|| "lifecycle device has no output projection".to_string())?
+            .desired()
+            .dpms_targets()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let device_entry = self
             .platform
             .devices
@@ -1034,7 +1055,9 @@ impl KmsBackend {
             .platform
             .outputs
             .iter()
-            .filter(|output| output.key.device_key == device)
+            .filter(|output| {
+                output.key.device_key == device && projected_outputs.contains(&output.key)
+            })
             .collect::<Vec<_>>();
         if outputs.is_empty() {
             return Err("lifecycle device has no protocol outputs".to_string());
@@ -1044,8 +1067,9 @@ impl KmsBackend {
             .map(
                 |output| crate::kms::render::composed_commit::ComposedPlane {
                     output: &output.output,
-                    // Property discovery ignores the framebuffer. Task 3 replaces
-                    // this placeholder with the retained scanout state.
+                    // Property discovery ignores the framebuffer. The DPMS
+                    // description below leaves all primary-plane properties
+                    // untouched, retaining whichever buffer is currently bound.
                     framebuffer: ::drm::control::from_u32(1).expect("nonzero fixture handle"),
                 },
             )
@@ -1057,23 +1081,23 @@ impl KmsBackend {
         )
         .map_err(|error| format!("lifecycle property discovery: {error}"))?;
 
-        // This is the smallest request accepted by the current Owner fast
-        // update path: an ACTIVE=1 no-op on each current CRTC. Task 3 must
-        // replace it with the ACTIVE toggle and LifecycleInstallRestore class.
+        // DPMS changes only CRTC power. Omitting connector and plane objects
+        // retains MODE_ID, routing, and each primary plane's FB_ID/CRTC_ID.
         let mut objects = Vec::with_capacity(outputs.len());
         let mut crtc_state = Vec::with_capacity(outputs.len());
         for output in outputs {
             let crtc_id = u32::from(output.output.crtc);
+            let new_active = target == crate::kms::owner::lifecycle::DpmsTarget::On;
             objects.push(crate::kms::owner::closure::SerializedObject {
                 object: crtc_id,
                 kind: crate::kms::owner::closure::ObjectKind::Crtc,
                 old_crtc_id: None,
-                props: vec![(property_ids.active, 1)],
+                props: vec![(property_ids.active, u64::from(new_active))],
             });
             crtc_state.push(crate::kms::owner::closure::CrtcPower {
                 crtc_id,
-                old_active: true,
-                new_active: true,
+                old_active: !new_active,
+                new_active,
             });
         }
         Ok(CommitDescription {
@@ -1134,7 +1158,11 @@ impl KmsBackend {
                 self.admission_abort(device, token);
                 return AdmissionOutcome::BeginRefused;
             };
-            match owner.begin_validation(&description) {
+            match owner.begin_validation_with_options(
+                &description,
+                crate::kms::executor::HostCallClass::SeatActiveValidation,
+                true,
+            ) {
                 Ok(commit) => commit,
                 Err(_error) => {
                     self.admission_abort(device, token);
@@ -1363,9 +1391,37 @@ impl KmsBackend {
                 }
                 return;
             };
-            match owner.begin_validated(
+            let expected_crtcs = pending
+                .description
+                .crtc_state
+                .iter()
+                .filter(|state| state.old_active || state.new_active)
+                .map(|state| state.crtc_id)
+                .collect::<Vec<_>>();
+            let clocks = expected_crtcs
+                .iter()
+                .filter_map(|&crtc| {
+                    owner
+                        .clock_key_for_hardware_crtc(crtc)
+                        .map(|key| (crtc, key))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mode_periods = expected_crtcs
+                .iter()
+                .map(|&crtc| (crtc, None))
+                .collect::<BTreeMap<_, _>>();
+            let completion_context = crate::kms::owner::completion::CompletionContext {
+                class: crate::kms::owner::completion::CompletionClass::LifecycleInstallRestore,
+                host_class: crate::kms::executor::HostCallClass::SeatActiveNonblock,
+                allow_modeset: true,
+                clocks,
+                mode_periods,
+                lifecycle_observed_max: None,
+            };
+            match owner.begin_validated_with_context(
                 &pending.description,
                 crate::kms::owner::ledger::Submitted::new(Vec::new(), Vec::new()),
+                completion_context,
             ) {
                 Ok((commit, _events)) => commit,
                 Err(_error) => {

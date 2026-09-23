@@ -31134,9 +31134,8 @@ impl Backend for KmsBackend {
     }
 
     fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {
-        // Owner devices use the staged coordinator/driver path. The temporary
-        // topology description currently dispatches an ACTIVE=1 no-op; Task 3
-        // replaces that description with ACTIVE toggles and LifecycleInstallRestore.
+        // Owner devices use the staged coordinator/driver path, which submits
+        // one ACTIVE-only DPMS transition with lifecycle completion evidence.
         if self.lifecycle_set_dpms_power(level)? {
             return Ok(());
         }
@@ -58411,7 +58410,20 @@ mod tests {
     fn lifecycle_dpms_backend(
         behaviour: crate::kms::executor::test_support::StubBehaviour,
     ) -> (super::KmsBackend, DrmDeviceKey) {
+        lifecycle_dpms_backend_with_output_count(behaviour, 1)
+    }
+
+    fn lifecycle_dpms_backend_with_output_count(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+        output_count: usize,
+    ) -> (super::KmsBackend, DrmDeviceKey) {
         let mut backend = super::KmsBackend::for_tests();
+        for index in 1..output_count {
+            push_test_output(
+                &mut backend,
+                u32::try_from(index + 1).expect("test CRTC id"),
+            );
+        }
         seed_direct_owner_description_properties_for_tests(&mut backend);
         let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
             .expect("spawn lifecycle stub executor");
@@ -58422,6 +58434,9 @@ mod tests {
             .expect("fixture device")
             .key;
         install_admission_owner_gate(&mut backend, device);
+        for output_idx in 1..output_count {
+            c0_conv_cii_install_owner_clock(&mut backend, device, output_idx, 1000);
+        }
         (backend, device)
     }
 
@@ -58485,6 +58500,211 @@ mod tests {
                 .live_record()
                 .is_some_and(|record| record.milestones().dispatched)
         );
+    }
+
+    #[test]
+    fn c0_3aii_dpms_off_is_active_only() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut off_backend, off_device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        Backend::set_dpms_power(&mut off_backend, 3).expect("DPMS off request");
+        let off = off_backend
+            .lifecycle_drivers
+            .get(&off_device)
+            .expect("Owner lifecycle driver")
+            .pending_topology_descriptions_for_tests()
+            .into_iter()
+            .next()
+            .expect("off TEST_ONLY description");
+        let crtc = u32::from(off_backend.platform.outputs[0].output.crtc);
+        assert_eq!(
+            off.objects.len(),
+            1,
+            "DPMS leaves connector and plane state out"
+        );
+        assert_eq!(off.objects[0].object, crtc);
+        assert_eq!(
+            off.objects[0].kind,
+            crate::kms::owner::closure::ObjectKind::Crtc
+        );
+        assert_eq!(off.objects[0].props, vec![(off.property_ids.active, 0)]);
+        assert_eq!(
+            off.crtc_state,
+            vec![crate::kms::owner::closure::CrtcPower {
+                crtc_id: crtc,
+                old_active: true,
+                new_active: false,
+            }]
+        );
+        let off_closure = crate::kms::owner::closure::AtomicCrtcClosure::compute(
+            &off.objects,
+            &off.crtc_state,
+            &off.property_ids,
+            false,
+            &[],
+        )
+        .expect("valid off closure");
+        assert_eq!(off_closure.expected_completion(), &[crtc]);
+
+        let (mut on_backend, on_device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        Backend::set_dpms_power(&mut on_backend, 0).expect("DPMS on request");
+        let on = on_backend
+            .lifecycle_drivers
+            .get(&on_device)
+            .expect("Owner lifecycle driver")
+            .pending_topology_descriptions_for_tests()
+            .into_iter()
+            .next()
+            .expect("on TEST_ONLY description");
+        let on_crtc = u32::from(on_backend.platform.outputs[0].output.crtc);
+        assert_eq!(on.objects.len(), 1);
+        assert_eq!(on.objects[0].object, on_crtc);
+        assert_eq!(on.objects[0].props, vec![(on.property_ids.active, 1)]);
+    }
+
+    #[test]
+    fn c0_3aii_combined_rejection_has_no_per_output_fallback() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device) =
+            lifecycle_dpms_backend_with_output_count(StubBehaviour::RejectWith(libc::EINVAL), 2);
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS off request");
+        let tag = lifecycle_test_tag(&backend, device);
+        let description = backend
+            .lifecycle_drivers
+            .get(&device)
+            .expect("Owner lifecycle driver")
+            .pending_topology_descriptions_for_tests()
+            .into_iter()
+            .next()
+            .expect("combined off TEST_ONLY description");
+        assert_eq!(description.crtc_state.len(), 2);
+        assert_eq!(description.objects.len(), 2);
+
+        wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+
+        let driver = backend.lifecycle_drivers.get(&device).expect("driver");
+        let (validation_sends, live_sends, ..) = driver.topology_test_stats();
+        assert_eq!(validation_sends, vec![tag], "one combined validation only");
+        assert!(
+            live_sends.is_empty(),
+            "rejected combined request was not submitted"
+        );
+        assert!(driver.pending_topology_tags().is_empty());
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    fn c0_3aii_lifecycle_deadline_bootstrap() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            owner::deadlines::lifecycle_hardware,
+        };
+
+        assert_eq!(
+            lifecycle_hardware(None),
+            Ok(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            lifecycle_hardware(Some(std::time::Duration::from_secs(10))),
+            Ok(std::time::Duration::from_secs(12))
+        );
+        assert_eq!(
+            lifecycle_hardware(Some(std::time::Duration::from_secs(28))),
+            Ok(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            lifecycle_hardware(Some(std::time::Duration::from_secs(29))),
+            Err(crate::kms::owner::deadlines::DeadlineError::LifecycleUnvalidated)
+        );
+
+        let (mut backend, device) =
+            lifecycle_dpms_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }));
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS off request");
+        wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("unmeasured lifecycle commit dispatches");
+        assert_eq!(record.completion_context().lifecycle_observed_max, None);
+        assert_eq!(
+            record.closure().expected_completion(),
+            &[u32::from(backend.platform.outputs[0].output.crtc)]
+        );
+        assert!(backend.lifecycle_drivers.contains_key(&device));
+    }
+
+    #[test]
+    fn c0_3aii_dpms_commit_uses_the_lifecycle_class() {
+        use crate::kms::{
+            executor::{
+                HostCallClass,
+                test_support::{ScriptedReply, StubBehaviour},
+            },
+            owner::completion::CompletionClass,
+        };
+
+        let (mut backend, _device) =
+            lifecycle_dpms_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }));
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS off request");
+        wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("lifecycle commit dispatched after TEST_ONLY");
+        let context = record.completion_context();
+        assert_eq!(context.class, CompletionClass::LifecycleInstallRestore);
+        assert_eq!(context.host_class, HostCallClass::SeatActiveNonblock);
+        assert!(context.allow_modeset);
+        assert!(context.lifecycle_observed_max.is_none());
+        assert!(record.closure().kernel_event().is_empty());
+        assert!(record.completion_state().present_deadlines.is_empty());
+        assert!(!record.milestones().hardware_complete);
+        assert!(!record.milestones().presented);
+        let flags = record
+            .request_flags_for_tests()
+            .expect("live request flags");
+        assert_ne!(
+            flags & crate::kms::executor::protocol::DRM_MODE_ATOMIC_ALLOW_MODESET,
+            0
+        );
+        assert_ne!(
+            flags & crate::kms::executor::protocol::DRM_MODE_ATOMIC_NONBLOCK,
+            0
+        );
+        assert_eq!(
+            flags & crate::kms::executor::protocol::DRM_MODE_ATOMIC_TEST_ONLY,
+            0
+        );
+        let properties = record
+            .request_properties_for_tests()
+            .expect("built lifecycle request properties");
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let object_index = properties
+            .objects
+            .iter()
+            .position(|object| *object == crtc)
+            .expect("CRTC object");
+        let start = properties.count_props[..object_index]
+            .iter()
+            .map(|count| *count as usize)
+            .sum::<usize>();
+        let end = start + properties.count_props[object_index] as usize;
+        assert_eq!(properties.objects, vec![crtc]);
+        assert_eq!(properties.props[start..end], [21, 22]);
+        assert_eq!(properties.values[start..end], [0, u64::MAX]);
+        assert_eq!(record.closure().expected_completion(), &[crtc]);
     }
 
     #[test]

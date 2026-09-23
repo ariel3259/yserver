@@ -35,7 +35,11 @@ pub fn primary_event(period: Option<Duration>) -> Result<Duration, DeadlineError
 }
 
 pub fn lifecycle_hardware(observed: Option<Duration>) -> Result<Duration, DeadlineError> {
-    let observed = observed.ok_or(DeadlineError::LifecycleUnvalidated)?;
+    let Some(observed) = observed else {
+        // This bootstrap ceiling is not a cohort measurement and is never
+        // copied into persistent lifecycle calibration.
+        return Ok(Duration::from_secs(30));
+    };
     if observed > Duration::from_secs(28) {
         return Err(DeadlineError::LifecycleUnvalidated);
     }
@@ -69,9 +73,12 @@ mod tests {
             primary_event(Some(Duration::from_secs(1))),
             Ok(Duration::from_millis(500))
         );
+        // C.0 §10.3's revision 4 Bootstrap paragraph changed the authority:
+        // an unmeasured cohort uses the bounded 30-second ceiling.
+        assert_eq!(lifecycle_hardware(None), Ok(Duration::from_secs(30)));
         assert_eq!(
-            lifecycle_hardware(None),
-            Err(DeadlineError::LifecycleUnvalidated)
+            lifecycle_hardware(Some(Duration::from_secs(10))),
+            Ok(Duration::from_secs(12))
         );
         assert_eq!(
             lifecycle_hardware(Some(Duration::from_secs(28))),

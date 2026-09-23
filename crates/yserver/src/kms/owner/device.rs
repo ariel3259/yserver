@@ -1334,6 +1334,7 @@ impl<R> DeviceCommitOwner<R> {
         }
         if context.class == CompletionClass::LifecycleInstallRestore {
             match context.lifecycle_observed_max {
+                None => {}
                 Some(d) if d <= std::time::Duration::from_secs(28) => {}
                 _ => return Err(DispatchError::LifecycleUnvalidated),
             }

@@ -25,7 +25,7 @@ pub use recovery::{
     IncidentOrigin, IncidentResolution, IncidentSeed, LogicalUnknownActions, PhysicalBarriers,
     PhysicalUnknownOutcome, RecoveryAttemptBudget, RecoveryAttemptTrigger, RecoveryFate,
     RecoveryIdAllocator, RecoveryIncident, RecoveryIncidentState, RecoveryResolution,
-    RecoveryWinner, TableFOutcome, TableUOutcome, table_f, table_u,
+    RecoveryWinner, TableFOutcome, TableUOutcome, dpms_target_for_level, table_f, table_u,
 };
 pub use values::{
     DeviceLifecycleState, Disposition, InvalidationReason, LifecycleEventId, LifecycleKind,

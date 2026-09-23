@@ -178,6 +178,8 @@ pub struct CommitRecord<R> {
     pending_request: Option<(HostCallRequest, SubmittingProof)>,
     #[cfg(test)]
     request_properties: Option<AtomicPropertyList>,
+    #[cfg(test)]
+    request_flags: Option<u32>,
     out_fence_slots: Vec<OutFenceSlot>,
     state: RecordState,
 }
@@ -216,6 +218,8 @@ impl<R> CommitRecord<R> {
             pending_request: None,
             #[cfg(test)]
             request_properties: None,
+            #[cfg(test)]
+            request_flags: None,
             out_fence_slots: Vec::new(),
             state: RecordState::Submitting,
         }
@@ -255,6 +259,7 @@ impl<R> CommitRecord<R> {
             #[cfg(test)]
             {
                 self.request_properties = Some(atomic.properties.clone());
+                self.request_flags = Some(atomic.flags);
             }
         }
         self.pending_request = Some((req, proof));
@@ -263,6 +268,11 @@ impl<R> CommitRecord<R> {
     #[cfg(test)]
     pub fn request_properties_for_tests(&self) -> Option<&AtomicPropertyList> {
         self.request_properties.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn request_flags_for_tests(&self) -> Option<u32> {
+        self.request_flags
     }
 
     pub(super) fn adopt_returned_fences(&mut self, mask: u32, fences: Vec<OwnedFd>) {

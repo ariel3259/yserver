@@ -5,7 +5,7 @@ use super::{
     DpmsTarget, IncidentOrigin, IncidentSeed, LifecycleDesired, LifecycleEpochId, LifecycleEventId,
     LifecycleKind, LifecycleTransitionId, OutputProjection, Prerequisite, RecoveryAttemptTrigger,
     RecoveryFate, RecoveryIncident, RecoveryResolution, RecoveryWinner, TableFOutcome,
-    TableUOutcome, TransitionTag, WorkTag, table_f, table_u,
+    TableUOutcome, TransitionTag, WorkTag, dpms_target_for_level, table_f, table_u,
 };
 
 /// Commit progress known by the arbiter. A submitted request cannot be
@@ -647,11 +647,8 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
     }
 
     fn current_dpms_target(&self) -> DpmsTarget {
-        if self.desired.protocol_dpms_level() == 0 {
-            DpmsTarget::On
-        } else {
-            DpmsTarget::Off
-        }
+        dpms_target_for_level(self.desired.protocol_dpms_level())
+            .expect("DPMS levels are validated by the coordinator")
     }
 
     fn classify_prerequisite(
