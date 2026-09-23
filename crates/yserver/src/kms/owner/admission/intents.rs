@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{AdmissionError, CrtcId};
-use crate::kms::owner::admission::bound::MaintenanceBound;
+use crate::kms::owner::{
+    admission::bound::MaintenanceBound, identity::IncarnationId, lifecycle::TransitionTag,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MaintenanceClass {
@@ -76,7 +78,7 @@ pub struct Admission {
     pub(super) composed: BTreeMap<CrtcId, ComposedIntent>,
     pub(super) direct: Option<QueuedDirect>,
     pub(super) unflip: Option<UnflipBarrier>,
-    pub(super) topology: Option<u64>,
+    pub(super) topology: Option<TransitionTag<IncarnationId>>,
     pub(super) maintenance_slots: BTreeMap<MaintenanceKey, MaintenanceIntent>,
     pub(super) maintenance_current: BTreeMap<MaintenanceKey, u64>,
     pub(super) maintenance_submitted: BTreeMap<MaintenanceKey, SubmittedMaintenance>,
@@ -177,17 +179,26 @@ impl Admission {
         Ok(self.direct.take().map(|queued| queued.successor))
     }
 
-    pub fn request_topology(&mut self, generation: u64) -> Result<(), AdmissionError> {
-        if let Some(queued) = self.topology
-            && generation <= queued
-        {
-            return Err(AdmissionError::StaleGeneration {
-                queued,
-                offered: generation,
-            });
-        }
-        self.topology = Some(generation);
+    /// Queue lifecycle topology work under the exact transition that owns it.
+    /// A new transition replaces the old pre-submit intent immediately; the
+    /// lifecycle driver validates the tag again at both executor boundaries.
+    pub fn request_topology(
+        &mut self,
+        tag: TransitionTag<IncarnationId>,
+    ) -> Result<(), AdmissionError> {
+        self.topology = Some(tag);
         Ok(())
+    }
+
+    /// Withdraw only the matching pre-submit lifecycle intent. A stale
+    /// cancellation must not erase a newer transition's queued topology work.
+    pub fn cancel_topology(&mut self, tag: TransitionTag<IncarnationId>) -> bool {
+        if self.topology == Some(tag) {
+            self.topology = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Queue the latest desired maintenance generation for an identity.
@@ -373,7 +384,7 @@ impl Admission {
         self.unflip.as_ref()
     }
 
-    pub fn topology(&self) -> Option<u64> {
+    pub fn topology(&self) -> Option<TransitionTag<IncarnationId>> {
         self.topology
     }
 

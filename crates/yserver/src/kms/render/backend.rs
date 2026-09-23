@@ -1710,6 +1710,12 @@ pub struct KmsBackend {
     #[allow(dead_code)]
     pub(crate) admission_conductors:
         std::collections::BTreeMap<DrmDeviceKey, crate::kms::render::admission::AdmissionConductor>,
+    /// Global lifecycle snapshot and one run-to-completion effect queue per
+    /// Owner transport. Legacy devices are never registered here.
+    pub(crate) lifecycle_coordinator:
+        crate::kms::owner::lifecycle::LifecycleCoordinator<DrmDeviceKey, OutputKey, IncarnationId>,
+    pub(crate) lifecycle_drivers:
+        std::collections::BTreeMap<DrmDeviceKey, crate::kms::render::admission::LifecycleDriver>,
     pub(crate) resource_service: Option<crate::kms::render::resources::ResourceService>,
     pub(crate) drm_cleanup_registry: Option<crate::kms::render::resources::DrmCleanupRegistry>,
     pub(crate) commit_consumer: crate::kms::render::resources::CommitResourceConsumer,
@@ -6686,6 +6692,8 @@ impl KmsBackend {
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             admission_conductors: std::collections::BTreeMap::new(),
+            lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
+            lifecycle_drivers: std::collections::BTreeMap::new(),
             resource_service: None,
             drm_cleanup_registry: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
@@ -8020,6 +8028,8 @@ impl KmsBackend {
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             admission_conductors: std::collections::BTreeMap::new(),
+            lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
+            lifecycle_drivers: std::collections::BTreeMap::new(),
             resource_service: None,
             drm_cleanup_registry: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
@@ -20557,6 +20567,10 @@ impl KmsBackend {
                     .get(&device)
                     .is_some_and(|conductor| !conductor.receipts.is_empty())
                 || self
+                    .lifecycle_drivers
+                    .get(&device)
+                    .is_some_and(|driver| driver.has_inflight_topology())
+                || self
                     .platform
                     .owner_ref(device)
                     .is_some_and(|owner| owner.live_record().is_some()))
@@ -20889,6 +20903,7 @@ impl KmsBackend {
         >,
         now: std::time::Instant,
     ) -> bool {
+        self.lifecycle_begin_owner_event_batch(device_key);
         let has_retirement = events.iter().any(|event| {
             matches!(
                 event,
@@ -20951,8 +20966,27 @@ impl KmsBackend {
 
         let mut consumed = true;
         for event in events {
-            consumed &= self.route_owner_event(device_key, event, now);
+            if self.lifecycle_before_owner_event(device_key, &event) {
+                continue;
+            }
+            let lifecycle_milestone = match &event {
+                crate::kms::owner::device::OwnerEvent::Accepted { commit } => {
+                    Some(crate::kms::render::admission::LifecycleOwnerMilestone::Accepted(*commit))
+                }
+                crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => Some(
+                    crate::kms::render::admission::LifecycleOwnerMilestone::Terminal(
+                        *commit, *terminal,
+                    ),
+                ),
+                _ => None,
+            };
+            let event_consumed = self.route_owner_event(device_key, event, now);
+            consumed &= event_consumed;
+            // Queue topology results only after CommitConsumer has adopted or
+            // quarantined the event's resource disposition.
+            self.lifecycle_after_owner_event(device_key, lifecycle_milestone, event_consumed);
         }
+        self.lifecycle_end_owner_event_batch(device_key);
 
         let recovery_stopped = self
             .admission_conductors
@@ -20962,7 +20996,16 @@ impl KmsBackend {
             .platform
             .owner_ref(device_key)
             .is_some_and(|owner| owner.slot().occupant().is_none());
-        if wake_eligible && self.admission_is_active(device_key) && !recovery_stopped && slot_free {
+        let lifecycle_draining = self
+            .lifecycle_drivers
+            .get(&device_key)
+            .is_some_and(|driver| driver.draining);
+        if wake_eligible
+            && !lifecycle_draining
+            && self.admission_is_active(device_key)
+            && !recovery_stopped
+            && slot_free
+        {
             if has_retirement {
                 crate::kms::render::direct_owner::retirement_wake(self, device_key);
             } else {
@@ -21138,12 +21181,14 @@ impl KmsBackend {
             }
             crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal } => {
                 let commit_key = crate::kms::render::resources::CommitKey::new(device_key, commit);
+                let resource_terminal =
+                    self.lifecycle_resource_terminal_state(device_key, commit, terminal);
                 let completion_unknown = matches!(
-                    terminal,
+                    resource_terminal,
                     crate::kms::owner::record::TerminalState::CompletionUnknown(_)
                 );
                 let never_dispatched = matches!(
-                    terminal,
+                    resource_terminal,
                     crate::kms::owner::record::TerminalState::FailedBeforeSubmit(
                         crate::kms::owner::record::FailureCause::NeverDispatched(_)
                     )
@@ -21151,7 +21196,7 @@ impl KmsBackend {
                 let admission_handled = if never_dispatched {
                     true
                 } else if self
-                    .admission_handle_terminal(device_key, commit, terminal)
+                    .admission_handle_terminal(device_key, commit, resource_terminal)
                     .is_err()
                 {
                     if let Some(gate) = self.platform.transport_gate_mut(&device_key) {
@@ -21169,7 +21214,10 @@ impl KmsBackend {
                         .commit_consumer
                         .consume(
                             commit_key,
-                            crate::kms::owner::device::OwnerEvent::Terminal { commit, terminal },
+                            crate::kms::owner::device::OwnerEvent::Terminal {
+                                commit,
+                                terminal: resource_terminal,
+                            },
                             service,
                         )
                         .is_ok();
@@ -21264,6 +21312,19 @@ impl KmsBackend {
                 true
             }
             crate::kms::owner::device::OwnerEvent::MechanismFailed { reason } => {
+                let owner_transport =
+                    self.platform
+                        .transport_gate(&device_key)
+                        .is_some_and(|gate| {
+                            gate.state() == crate::kms::render::resources::TransportState::Owner
+                        });
+                if owner_transport {
+                    self.lifecycle_owner_mechanism_failed(device_key);
+                    if reason == crate::kms::owner::completion::MechanismFailure::FencePollError {
+                        self.platform.owner_completion_detached = true;
+                    }
+                    return true;
+                }
                 if let Some(owner) = self.platform.owner_for(device_key) {
                     self.legacy_handover_failed.insert(owner.incarnation());
                 }
@@ -31073,6 +31134,12 @@ impl Backend for KmsBackend {
     }
 
     fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {
+        // Owner devices use the staged coordinator/driver path. The temporary
+        // topology description currently dispatches an ACTIVE=1 no-op; Task 3
+        // replaces that description with ACTIVE toggles and LifecycleInstallRestore.
+        if self.lifecycle_set_dpms_power(level)? {
+            return Ok(());
+        }
         // Levels 1/2/3 collapse to "outputs off"; only 0 is "on".
         let want_active = level == 0;
         // Every path below issues a modeset/atomic commit, which requires DRM
@@ -58341,6 +58408,578 @@ mod tests {
         backend
     }
 
+    fn lifecycle_dpms_backend(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> (super::KmsBackend, DrmDeviceKey) {
+        let mut backend = super::KmsBackend::for_tests();
+        seed_direct_owner_description_properties_for_tests(&mut backend);
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
+            .expect("spawn lifecycle stub executor");
+        admission_install_executor(&mut backend, executor);
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("fixture device")
+            .key;
+        install_admission_owner_gate(&mut backend, device);
+        (backend, device)
+    }
+
+    fn lifecycle_test_tag(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::lifecycle::TransitionTag<IncarnationId> {
+        backend
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition_tag())
+            .expect("current lifecycle transition")
+    }
+
+    #[test]
+    fn c0_3aii_dpms_requests_topology_on_an_idle_device() {
+        let (mut backend, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS request");
+
+        let tag = lifecycle_test_tag(&backend, device);
+        let conductor = backend
+            .admission_conductors
+            .get(&device)
+            .expect("Owner conductor");
+        assert_eq!(conductor.admission.topology(), Some(tag));
+        assert!(conductor.admission.is_locked());
+        assert_eq!(
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .expect("Owner lifecycle driver")
+                .pending_topology_tags(),
+            vec![tag]
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    fn c0_3aii_dpms_dispatches_on_an_idle_device() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (mut backend, device) =
+            lifecycle_dpms_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }));
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS request");
+        let tag = lifecycle_test_tag(&backend, device);
+        wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+
+        let driver = backend.lifecycle_drivers.get(&device).expect("driver");
+        let (validation_sends, live_sends, ..) = driver.topology_test_stats();
+        assert_eq!(validation_sends, vec![tag]);
+        assert_eq!(live_sends, vec![tag]);
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .is_some_and(|record| record.milestones().dispatched)
+        );
+    }
+
+    #[test]
+    fn c0_3aii_legacy_device_has_no_arbiter() {
+        use crate::vt::state::VtState;
+
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("fixture device")
+            .key;
+        install_admission_legacy_gate(&mut backend, device);
+        backend.vt_state = VtState::Suspended;
+        Backend::set_dpms_power(&mut backend, 3).expect("suspended Legacy DPMS no-op");
+
+        assert!(backend.lifecycle_coordinator.device(&device).is_none());
+        assert!(!backend.lifecycle_drivers.contains_key(&device));
+        assert!(backend.kms_outputs_active);
+        assert_eq!(
+            backend.platform.transport_gate(&device).unwrap().state(),
+            crate::kms::render::resources::TransportState::Legacy
+        );
+    }
+
+    #[test]
+    fn c0_3aii_owner_mechanism_failure_poisons_and_keeps_running() {
+        use crate::kms::owner::{completion::MechanismFailure, lifecycle::DeviceLifecycleState};
+
+        let (mut owner_backend, owner_device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().expect("core channel");
+        owner_backend.input_sender = Some(sender);
+        assert!(owner_backend.route_owner_event_batch(
+            owner_device,
+            vec![crate::kms::owner::device::OwnerEvent::MechanismFailed {
+                reason: MechanismFailure::HostCallUnknown,
+            }],
+            std::time::Instant::now(),
+        ));
+        assert_eq!(
+            owner_backend
+                .lifecycle_coordinator
+                .device(&owner_device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+        assert!(
+            owner_backend
+                .admission_conductors
+                .get(&owner_device)
+                .unwrap()
+                .lifecycle_admission_closed
+        );
+        assert!(
+            !owner_backend.legacy_handover_failed.contains(
+                &owner_backend
+                    .platform
+                    .owner_ref(owner_device)
+                    .unwrap()
+                    .incarnation()
+            )
+        );
+        assert!(receiver.try_recv_all().next().is_none());
+
+        let mut legacy_backend = super::KmsBackend::for_tests();
+        let legacy_device = legacy_backend.platform.primary_device().unwrap().key;
+        install_admission_legacy_gate(&mut legacy_backend, legacy_device);
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().expect("core channel");
+        legacy_backend.input_sender = Some(sender);
+        assert!(legacy_backend.route_owner_event_batch(
+            legacy_device,
+            vec![crate::kms::owner::device::OwnerEvent::MechanismFailed {
+                reason: MechanismFailure::HostCallUnknown,
+            }],
+            std::time::Instant::now(),
+        ));
+        assert!(
+            legacy_backend.legacy_handover_failed.contains(
+                &legacy_backend
+                    .platform
+                    .owner_ref(legacy_device)
+                    .unwrap()
+                    .incarnation()
+            )
+        );
+        assert!(
+            receiver
+                .try_recv_all()
+                .any(|message| matches!(message, Message::Shutdown))
+        );
+    }
+
+    #[test]
+    fn c0_3aii_driver_returns_receipts_with_their_own_tag() {
+        use crate::kms::owner::lifecycle::{
+            ArbiterInput, LifecycleReceipt, LifecycleReceiptResult,
+        };
+
+        let (mut backend, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        backend.lifecycle_drivers.insert(
+            device,
+            crate::kms::render::admission::LifecycleDriver::new(),
+        );
+        backend.lifecycle_drivers.get_mut(&device).unwrap().draining = true;
+        Backend::set_dpms_power(&mut backend, 3).expect("first DPMS request");
+        let old_tag = lifecycle_test_tag(&backend, device);
+        assert!(
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .unwrap()
+                .recorded_receipts()
+                .is_empty()
+        );
+
+        Backend::set_dpms_power(&mut backend, 0).expect("superseding DPMS request");
+        let new_tag = lifecycle_test_tag(&backend, device);
+        assert_ne!(old_tag, new_tag);
+        backend.lifecycle_drivers.get_mut(&device).unwrap().draining = false;
+        assert!(backend.route_owner_event_batch(device, Vec::new(), std::time::Instant::now(),));
+        let late_receipts = backend.lifecycle_drivers[&device].recorded_receipts();
+        assert!(
+            late_receipts.iter().any(|(tag, _, _)| *tag == old_tag),
+            "late first-transition receipts keep their requester tag: {late_receipts:?}"
+        );
+        backend.lifecycle_inject_input_for_tests(
+            device,
+            ArbiterInput::Receipt {
+                tag: old_tag,
+                receipt: LifecycleReceipt::AdmissionClosed,
+                result: LifecycleReceiptResult::Succeeded,
+            },
+        );
+        assert!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .unwrap()
+                .lifecycle_admission_closed
+        );
+        assert_eq!(lifecycle_test_tag(&backend, device), new_tag);
+        assert!(
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .unwrap()
+                .stale_receipts
+                > 0
+        );
+    }
+
+    #[test]
+    fn c0_3aii_synchronous_refusal_does_not_reenter_the_driver() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::LifecycleTopologyTestHook,
+        };
+
+        let (mut backend, device) =
+            lifecycle_dpms_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }));
+        backend.lifecycle_drivers.insert(
+            device,
+            crate::kms::render::admission::LifecycleDriver::new(),
+        );
+        backend.lifecycle_drivers.get_mut(&device).unwrap().hook =
+            Some(LifecycleTopologyTestHook::ReapExecutorBeforeLiveDispatch);
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS request");
+        wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+
+        let driver = backend.lifecycle_drivers.get(&device).unwrap();
+        let (drain_entries, queued, applied_inputs, _) = driver.run_to_completion_test_stats();
+        assert_eq!(
+            drain_entries, 3,
+            "one projection drain and the two outer owner-event drains; the nested refusal adds none"
+        );
+        assert!(queued >= 1);
+        assert!(
+            applied_inputs >= 5,
+            "the outer FIFO drains all receipts and refusal"
+        );
+        assert!(!driver.draining);
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+    }
+
+    #[test]
+    fn c0_3aii_stale_topology_never_reaches_test_only() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::LifecycleTopologyTestHook,
+        };
+
+        let (mut before_test, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        before_test.lifecycle_drivers.insert(
+            device,
+            crate::kms::render::admission::LifecycleDriver::new(),
+        );
+        before_test.lifecycle_drivers.get_mut(&device).unwrap().hook =
+            Some(LifecycleTopologyTestHook::SupersedeBeforeTestOnly);
+        Backend::set_dpms_power(&mut before_test, 3).expect("first DPMS request");
+        let driver = before_test.lifecycle_drivers.get(&device).unwrap();
+        let (validation_sends, live_sends, stale_before_test, _, _) = driver.topology_test_stats();
+        let current = lifecycle_test_tag(&before_test, device);
+        assert_eq!(stale_before_test, 1);
+        assert!(live_sends.is_empty());
+        assert_eq!(
+            validation_sends,
+            vec![current],
+            "only the winning tag reaches TEST_ONLY"
+        );
+
+        let (mut before_live, device) =
+            lifecycle_dpms_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }));
+        before_live.lifecycle_drivers.insert(
+            device,
+            crate::kms::render::admission::LifecycleDriver::new(),
+        );
+        before_live.lifecycle_drivers.get_mut(&device).unwrap().hook =
+            Some(LifecycleTopologyTestHook::SupersedeBeforeLiveDispatch);
+        Backend::set_dpms_power(&mut before_live, 3).expect("first DPMS request");
+        wait_executor_readable_for_tests(&before_live, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut before_live, &mut ServerState::new());
+        let driver = before_live.lifecycle_drivers.get(&device).unwrap();
+        let (validation_sends, live_sends, _, stale_before_live, _) = driver.topology_test_stats();
+        assert_eq!(stale_before_live, 1);
+        assert_eq!(
+            validation_sends.len(),
+            2,
+            "winner may validate after stale off is cancelled"
+        );
+        assert!(
+            live_sends.is_empty(),
+            "stale off never reaches the live executor call"
+        );
+    }
+
+    #[test]
+    fn c0_3aii_winner_waits_for_a_delayed_executor_call() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::AcceptAfter(
+            std::time::Duration::from_millis(500),
+        ));
+        Backend::set_dpms_power(&mut backend, 3).expect("first DPMS request");
+        let old_tag = lifecycle_test_tag(&backend, device);
+        assert_eq!(
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .unwrap()
+                .pending_topology_tags(),
+            vec![old_tag]
+        );
+        Backend::set_dpms_power(&mut backend, 0).expect("winning DPMS request");
+        let new_tag = lifecycle_test_tag(&backend, device);
+        assert_ne!(old_tag, new_tag);
+        assert_eq!(
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .unwrap()
+                .pending_topology_tags(),
+            vec![old_tag],
+            "the in-flight validation remains owned by the old call"
+        );
+        assert!(
+            backend.admission_conductors[&device].admission.is_locked(),
+            "the old executor call retains the admission slot until its result returns"
+        );
+        assert!(
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .unwrap()
+                .topology_test_stats()
+                .1
+                .is_empty()
+        );
+
+        wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let driver = backend.lifecycle_drivers.get(&device).unwrap();
+        let (validation_sends, _, _, _, stale_results) = driver.topology_test_stats();
+        assert_eq!(
+            validation_sends,
+            vec![old_tag, new_tag],
+            "winner is submitted only after old TEST_ONLY resolves"
+        );
+        assert!(
+            driver.pending_topology_tags().is_empty()
+                || driver.pending_topology_tags() == vec![new_tag],
+            "the winner may remain pending or be synchronously refused by the single-reply stub"
+        );
+        assert_eq!(
+            stale_results, 1,
+            "the old result crossed the boundary as stale"
+        );
+    }
+
+    #[test]
+    fn c0_3aii_result_boundary_rows() {
+        use crate::kms::owner::{
+            device::OwnerEvent,
+            lifecycle::DeviceLifecycleState,
+            record::{FailureCause, TerminalState, UnknownCause},
+        };
+
+        fn route_terminal(
+            backend: &mut super::KmsBackend,
+            device: DrmDeviceKey,
+            commit: crate::kms::owner::identity::CommitId,
+            tag: crate::kms::owner::lifecycle::TransitionTag<IncarnationId>,
+            terminal: TerminalState,
+            accepted: bool,
+        ) {
+            backend
+                .lifecycle_drivers
+                .get_mut(&device)
+                .unwrap()
+                .track_topology_commit_for_tests(commit, tag);
+            let mut events = Vec::new();
+            if accepted {
+                events.push(OwnerEvent::Accepted { commit });
+            }
+            events.push(OwnerEvent::Terminal { commit, terminal });
+            assert!(backend.route_owner_event_batch(device, events, std::time::Instant::now()));
+        }
+
+        let current_success = || {
+            let (mut backend, device) = lifecycle_dpms_backend(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            );
+            Backend::set_dpms_power(&mut backend, 3).expect("DPMS request");
+            let tag = lifecycle_test_tag(&backend, device);
+            route_terminal(
+                &mut backend,
+                device,
+                crate::kms::owner::identity::CommitId::for_tests(100_001),
+                tag,
+                TerminalState::Completed,
+                true,
+            );
+            assert_eq!(
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .unwrap()
+                    .state(),
+                DeviceLifecycleState::Ready
+            );
+        };
+        current_success();
+
+        let (mut current_rejection, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        Backend::set_dpms_power(&mut current_rejection, 3).expect("DPMS request");
+        let tag = lifecycle_test_tag(&current_rejection, device);
+        route_terminal(
+            &mut current_rejection,
+            device,
+            crate::kms::owner::identity::CommitId::for_tests(100_002),
+            tag,
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected {
+                errno: libc::EINVAL,
+            }),
+            false,
+        );
+        assert_eq!(
+            current_rejection
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Ready
+        );
+
+        let (mut current_unknown, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        Backend::set_dpms_power(&mut current_unknown, 3).expect("DPMS request");
+        let tag = lifecycle_test_tag(&current_unknown, device);
+        route_terminal(
+            &mut current_unknown,
+            device,
+            crate::kms::owner::identity::CommitId::for_tests(100_003),
+            tag,
+            TerminalState::CompletionUnknown(UnknownCause::ContradictoryEvidence),
+            true,
+        );
+        assert_eq!(
+            current_unknown
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+
+        let (mut stale_success, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        Backend::set_dpms_power(&mut stale_success, 3).expect("old DPMS request");
+        let stale_tag = lifecycle_test_tag(&stale_success, device);
+        Backend::set_dpms_power(&mut stale_success, 0).expect("newer DPMS request");
+        let winner_tag = lifecycle_test_tag(&stale_success, device);
+        assert_ne!(stale_tag, winner_tag);
+        let stale_commit = crate::kms::owner::identity::CommitId::for_tests(100_004);
+        stale_success
+            .lifecycle_drivers
+            .get_mut(&device)
+            .unwrap()
+            .track_topology_commit_for_tests(stale_commit, stale_tag);
+        assert_eq!(
+            stale_success.lifecycle_resource_terminal_state(
+                device,
+                stale_commit,
+                TerminalState::Completed
+            ),
+            TerminalState::CompletionUnknown(UnknownCause::ContradictoryEvidence),
+            "stale success is quarantined at the resource boundary"
+        );
+        route_terminal(
+            &mut stale_success,
+            device,
+            stale_commit,
+            stale_tag,
+            TerminalState::Completed,
+            true,
+        );
+        assert_eq!(
+            stale_success
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition_tag()),
+            Some(winner_tag),
+            "the stale success did not apply the winning transition"
+        );
+
+        let (mut stale_rejection, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        Backend::set_dpms_power(&mut stale_rejection, 3).expect("old DPMS request");
+        let stale_tag = lifecycle_test_tag(&stale_rejection, device);
+        Backend::set_dpms_power(&mut stale_rejection, 0).expect("newer DPMS request");
+        let commit = crate::kms::owner::identity::CommitId::for_tests(100_005);
+        route_terminal(
+            &mut stale_rejection,
+            device,
+            commit,
+            stale_tag,
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected {
+                errno: libc::EINVAL,
+            }),
+            false,
+        );
+        assert_ne!(
+            stale_rejection
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned,
+            "a stale explicit rejection stays never-submitted cleanup"
+        );
+
+        let (mut stale_unknown, device) =
+            lifecycle_dpms_backend(crate::kms::executor::test_support::StubBehaviour::NeverReply);
+        Backend::set_dpms_power(&mut stale_unknown, 3).expect("old DPMS request");
+        let stale_tag = lifecycle_test_tag(&stale_unknown, device);
+        Backend::set_dpms_power(&mut stale_unknown, 0).expect("newer DPMS request");
+        route_terminal(
+            &mut stale_unknown,
+            device,
+            crate::kms::owner::identity::CommitId::for_tests(100_006),
+            stale_tag,
+            TerminalState::CompletionUnknown(UnknownCause::ContradictoryEvidence),
+            true,
+        );
+        assert_eq!(
+            stale_unknown
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned,
+            "stale absent/invalid evidence is acceptance-unknown"
+        );
+    }
+
     fn admission_install_executor(
         backend: &mut super::KmsBackend,
         executor: crate::kms::executor::KmsIoExecutor,
@@ -59653,16 +60292,28 @@ mod tests {
         install_admission_owner_gate(&mut topology, topology_device);
         let (source, _, _) = AdmissionSourceFixture::new();
         topology.install_admission_conductor_for_tests(topology_device, source);
-        topology
-            .admission_conductors
-            .get_mut(&topology_device)
-            .expect("conductor")
-            .admission
-            .request_topology(1)
-            .expect("topology request");
-        assert_eq!(
-            topology.admission_wake(topology_device, false),
-            AdmissionOutcome::Unsupported(Tier::Topology)
+        assert!(
+            topology
+                .lifecycle_set_dpms_power(3)
+                .expect("Owner DPMS projection")
+        );
+        let transition_tag = topology
+            .lifecycle_coordinator
+            .device(&topology_device)
+            .and_then(|arbiter| arbiter.transition_tag())
+            .expect("coordinator-owned transition tag");
+        let driver = topology
+            .lifecycle_drivers
+            .get(&topology_device)
+            .expect("Owner lifecycle driver");
+        assert_eq!(driver.pending_topology_tags(), vec![transition_tag]);
+        assert!(
+            topology
+                .admission_conductors
+                .get(&topology_device)
+                .expect("conductor")
+                .admission
+                .is_locked()
         );
         assert!(topology.device_owner_for_tests(0).live_record().is_none());
 
