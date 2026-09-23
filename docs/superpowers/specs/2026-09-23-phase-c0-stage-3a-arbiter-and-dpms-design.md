@@ -1,8 +1,9 @@
 # Phase C.0 stage 3a — the lifecycle arbiter and global DPMS
 
-**Status:** Revision 3 (codex rounds
-[1](../findings/2026-09-23-stage-3a-design-review-round1.md) and
-[2](../findings/2026-09-23-stage-3a-design-review-round2.md)), written by
+**Status:** Revision 4 (codex rounds
+[1](../findings/2026-09-23-stage-3a-design-review-round1.md),
+[2](../findings/2026-09-23-stage-3a-design-review-round2.md) and
+[3](../findings/2026-09-23-stage-3a-design-review-round3.md)), written by
 the coordinator on 2026-09-23 under the user's instruction to continue the
 stage 3 specs. The decisions marked
 **(coordinator decision)** were taken without a brainstorming exchange and
@@ -183,32 +184,33 @@ not assumed (C.0 §10.1: no advance claim about a driver not run).
   **powered off**: primary work on an off CRTC is not admissible, and composed
   offers for it wait with a new reason, `OutputPoweredOff`. The scene keeps
   running off screen.
-- **Direct scanout exits before off** *(rev 2, round-1 M-1; rev 3, round-2
-  B-2 and M-1)*. If a direct ownership unit is current on any CRTC of the
-  transition, the DPMS-off transition has two phases, each its own commit
-  with its own deadline (C.0 §10.3 gives per-commit bounds, never one
-  combined bound):
-  1. **A transition-owned unflip.** The Ciii Owner unflip (direct shadow
-     materialized, composed return commit) is issued **by the driver as part
-     of the transition**, tagged with the transition's `TransitionTag`, and
-     admitted as the one exception to the §6.4 `Quiescing` closure. Ordinary
-     primary admission stays closed, so no unrelated frame enters; the
-     ordinary entry point `admission_request_unflip`
-     (`render/admission.rs:723`) is not used for it. A `Submitting` or
-     accepted predecessor drains or terminalizes under §10 first (§9.2).
-  2. **The `ACTIVE=0` commit**, built as soon as the unflip's commit is
-     `Completed` — the composed buffer canonically installed as current. It
-     does **not** wait for `PriorBufferReleased`: C.0 §10.2 lets that
-     milestone arrive later and keeps it out of the submission slot, so
-     waiting for it would leave the off without a bound. The client buffer and
-     its source pin stay in the existing BO/resource retirement ledger until
-     their release proof arrives, exactly as after any unflip.
-  A client buffer is therefore never what an off CRTC holds. If the unflip
-  fails, the DPMS transition fails with it under section 3.7, before any
-  power change.
-- The buffer bound to an off CRTC's primary plane — always a composed buffer
-  after the rule above — **stays current**: it is referenced by KMS state and
-  is not released or reused while off.
+- **Direct scanout stays current through off** *(rev 4 — replaces the
+  two-phase off of revisions 2–3; round-1 M-1, round-2 B-2/M-1, round-3
+  B-1)*. Revisions 2–3 ran an Owner unflip before `ACTIVE=0`. Round 3 showed
+  that unflip can wait without bound: it is ready only when exit retirement is
+  vacant, a composed return is established and the direct shadow is
+  materialized (`render/admission.rs:1007`), and a missing composed return is
+  a waiting state, not a failure, so no deadline covers it. An `ACTIVE`-only
+  off does not need it. The plane keeps its framebuffer, so the buffer current
+  at off — composed **or a direct client buffer** — stays current and bound:
+  - a direct buffer is kept alive by its existing direct lease: Cfb §3.4 — a
+    managed framebuffer is destroyed only when the service reports it
+    releasable and no lease holds it, and a dropped source drawable leaves the
+    allocation to follow its own release. A client that destroys its window
+    while off therefore leaves the pinned buffer in place until a later commit
+    replaces it;
+  - while off, the off CRTCs are ineligible for direct scanout and no direct
+    successor is admissible (`OutputPoweredOff`), so a client's Presents take
+    the composed path;
+  - after on is `Applied`, the device's ordinary admission resumes; a direct
+    unit that is no longer eligible (or whose source is gone) returns to
+    composed through the **ordinary** Ciii unflip, under normal admission,
+    with every Ciii readiness precondition and its own bounds.
+  The off is thus a single commit, bounded by its own deadline (section 3.6),
+  and depends on no composition. No transition-owned unflip and no exception
+  to the §6.4 `Quiescing` closure exist.
+- The buffer bound to an off CRTC's primary plane **stays current**: it is
+  referenced by KMS state and is not released or reused while off.
 - After on is `Applied`, readiness reopens and the next composed frame
   replaces the retained buffer through ordinary admission; the scene is marked
   for a full frame, the Owner counterpart of Legacy's
@@ -314,8 +316,10 @@ fixture with `kms_outputs_active` forced to the wrong value behaves the same.
 DPMS has no reply and no event; `DPMSInfo` reports the protocol level. The
 3a differential therefore compares, on a Legacy fixture and an Owner fixture,
 the script off → `DPMSInfo` → on → `DPMSInfo` × 4, standby, suspend, off while
-off, and a request while the seat is released: the core's bytes to the client
-must be identical, and the backend state must show each device's outputs in
+off, and a request while the seat is released: the core's bytes to the
+requesting client **and to a second, listening connection** (rev 4, round-3
+m-1: DPMS has no event, so any byte to the listener is a defect) must be
+identical, and the backend state must show each device's outputs in
 the projected power state (Owner) or `kms_outputs_active` (Legacy). The
 2026-09-22 Legacy golden's DPMS steps (24–45) are the reference for what a
 real client sees.
@@ -339,23 +343,23 @@ each row of the section 3.6 table; the three failure edges of 3.7 including
 device) where DPMS reaches both and neither exits; `Deferred` while the seat
 is released and its resolution on reacquire; the projection refresh of the
 umbrella's rev-2 M-2 rule when an output appears after a global off; the
-retained buffer is the same object before off and after on; and the section
-3.8 invariant. Added in revision 2: a rejected off (attributable and not) —
+retained buffer is the same object before off and after on — composed and
+direct; and the section 3.8 invariant. Added in revision 2: a rejected off (attributable and not) —
 the protocol request is never `Applied`, the target stays `Deferred` with the
 right prerequisite, no retry under the same generation, and a newer request
-supersedes it; off with a **direct** client buffer current — the unflip runs
-first, the client buffer is released only by the unflip's retirement, the
-client may destroy its window while off, and on shows the composed buffer; a
+supersedes it; off with a **direct** client buffer current (rev 4) — no unflip
+runs before off, the client buffer stays bound and pinned, the client destroys
+its window while off and the allocation survives until replaced, no direct
+successor is admitted while off, and after on the ordinary unflip returns to
+composed; a
 mixed server with a pending resource batch and a rejected Owner off — the
 serviced-time clock keeps running; and a Legacy off on a mixed server leaving
 the Owner device's scanout state untouched. Added in revision 3: supersession
 while the topology work is still queued (the stale entry never reaches final
 `TEST_ONLY` or dispatch) and while an earlier executor call is delayed (the
 winner does not dispatch until that call returns or is reaped, and the stale
-result is quarantined); the transition-owned unflip admitted while ordinary
-primary admission stays closed, behind an accepted predecessor that must
-drain; the off commit built after the unflip completes while
-`PriorBufferReleased` is still pending; an injected missing and an injected
+result is quarantined); an off behind an accepted primary predecessor that
+must drain first; an injected missing and an injected
 late off fence (expiry at the lifecycle deadline → `CompletionUnknown` →
 `Poisoned`, and a late fence after it never promotes); and **capability
 stability** (C.0 §16.2 item 39): the advertised cursor/primary capability is
@@ -372,6 +376,17 @@ again after each on — the fourth cycle as well as the first. If NVIDIA rejects
 result: the transition must fail as section 3.7 says, and the finding decides
 whether section 3.4's shape needs a driver-specific alternative.
 
+### 5.3.1. The second device *(rev 4, round-3 M-1)*
+
+C.0 §16.3 asks every available device — here the Raphael iGPU (`amdgpu`) as
+well as the RTX 5060 Ti — for the real off-fence loop and the bounded delivery
+check. 3a's hardware gate is card1 only; the iGPU's DPMS delivery belongs to
+C.0's **final-tip bounded delivery check** (stage 5, §18), which needs a
+monitor on the iGPU. If none is connected there, that device is reported as
+unexercised by exact identity, as §16.3 requires, never claimed. A
+completion-safety failure observed on either device is classified under C.0's
+release disposition rules, not waived.
+
 ### 5.4. Mutations the plan must name (criteria, not edits)
 
 The plan attaches one to each invariant; at minimum: the legacy loop again
@@ -383,13 +398,12 @@ promoted; the retained buffer released while off; a composed offer admitted
 on an off CRTC; the representative marked `Applied` before every projection
 retired; a DPMS request while `Poisoned` issuing a KMS mutation; a rejected
 representative counted toward `Applied`; a latched generation retried;
-`ACTIVE=0` built while a direct unit is still current; the serviced-time clock
+the serviced-time clock
 paused by a Legacy off while an Owner output is lit; `drain_all` or
 `reset_scanout_bos_for_suspend` reaching an Owner device; a superseded
-topology entry reaching final `TEST_ONLY`; the off commit waiting for
-`PriorBufferReleased`; the transition-owned unflip admitted through the
-ordinary entry point, or ordinary primary work admitted with it; the off
-commit timed by the fast primary clamp; the advertised capability changing
+topology entry reaching final `TEST_ONLY`; an unflip made a precondition of
+the off; the direct allocation released while its CRTC is off; a direct
+successor admitted on an off CRTC; the off commit timed by the fast primary clamp; the advertised capability changing
 across DPMS or poison.
 
 ## 6. Out of scope
