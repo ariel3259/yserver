@@ -28,6 +28,12 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-09-23 Phase C.0 stage 3a-i (the pure lifecycle arbiter) ACCEPTED**
+  at `64d0bd68`: identities, `REC-5` desired snapshot, the two recovery tables
+  (C.0 §10 by active row and `REC-6`), the per-device arbiter and the
+  coordinator, all pure and with no production caller until plan 3a-ii.
+  `c0_3a_` 37, `--lib` 1998/0/226. Finding:
+  `docs/superpowers/findings/2026-09-23-stage-3a-i-plan-accepted.md`.
 - **2026-09-23 Phase C.0 stage 2c-iii direct-entry addendum ACCEPTED**
   (coordinator re-ran the gate and mutations A1 and A3 by line; both caught). Initial direct eligibility on an active
   Owner conductor now waits until every output has a composed return, using the
