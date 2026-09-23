@@ -1,3 +1,13 @@
+# Stage 3a-ii plan — codex review, round 2
+
+**Target:** revision 3 (`e95966ee`, anchors re-pointed after merge `a232d2af`). **Result:** 0 blocking, 2 major, 0 minor; coverage INCOMPLETE (24/24; the full §3.4 commit shape, the §3.8 read inventory, the deadline bootstrap and the merged COW/timestamp behaviour not assessed). Trend: r1 2B 4M, r2 0B 2M. Incorporation: all six round-1 findings APPLIED.
+
+**Reviewer:** `codex exec --sandbox read-only`, single pass; instrument `docs/superpowers/review/` @ `0245f96b`; `gpt-6-sol` `xhigh`; `codex-cli 0.155.1`.
+
+**Author verification (2026-09-23):** both CONFIRMED — a pre-IPC refusal calls `route_owner_event_batch` synchronously (`render/admission.rs:2279`), so a driver kicked inside `set_dpms_power` could re-enter itself (M-1); the core emits `DPMSInfoNotify` to subscribed clients (`yserver-core/src/core_loop/process_request.rs:8933`), which the 3a design §4 and the umbrella's table had denied — they are corrected in the same commit as plan revision 4 (M-2). The Legacy golden's "DPMS emits no RANDR event" stays true: its listener selected only RANDR.
+
+---
+
 ## Verdict
 
 **0 blocking, 2 major, 0 minor.**  
