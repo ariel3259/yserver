@@ -2,6 +2,11 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 6 (2026-09-23)** — a second Task 1 F8 (again before editing):
+the queued intent Task 1 must tag is typed by Task 2. The dependency is
+mutual, so Tasks 1 and 2 become **one implementation unit**; eight units in
+all.
+
 **Revision 5 (2026-09-23)** — Task 1 F8 from the implementer (stopped before
 editing): two Task 1 tests needed the conductor's `Admitted::Topology` dispatch
 arm, which is Task 2's. Task 1 proves the kick up to the queued topology
@@ -67,6 +72,12 @@ i.e. in fixtures, until stage 5.
    enumeration.
 
 ## Task 1 — the driver and the coordinator in the backend
+
+> **Tasks 1 and 2 are one implementation unit** *(rev 6, second Task 1 F8)*:
+> the driver's topology request needs Task 2's typed `Tier::Topology`, and
+> Task 2's freshness check needs the driver's current transition. They are
+> dispatched, gated and committed together, with every test and mutation of
+> both tables. The two headings stay only to keep the tests grouped.
 
 **Deliver:** the backend owns one `LifecycleCoordinator` and, per Owner
 device, the device's arbiter; the driver applies every arbiter action for that
