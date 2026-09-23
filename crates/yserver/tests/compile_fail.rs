@@ -98,6 +98,7 @@ fn recovery_id_cannot_be_derived_from_transition_id() {
         .arg("--extern")
         .arg(format!("yserver={}", yserver_lib.display()))
         .arg(&test_file)
+        .current_dir(deps_dir)
         .output()
         .expect("execute rustc");
 
