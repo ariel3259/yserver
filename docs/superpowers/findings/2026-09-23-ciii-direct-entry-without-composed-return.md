@@ -54,3 +54,14 @@ established at entry and case (b) keeps it). Evidence: a fixture that offers
 direct entry on an Owner output with no composed `Current` and sees it wait,
 then admitted once a composed frame retires; mutation: remove the check and
 the fixture must fail.
+
+## Recorded, not changed: `has_current_direct` is device-blind
+
+Found by the addendum plan's review (round 1 B-1, round 2 M-2):
+`has_current_direct` (`render/admission.rs:2368`) scans every device's current
+resources. Latent, not reachable today — direct is eligible only when every
+output is on the primary device (`direct_scanout_topology_eligible`,
+`backend.rs:3877`) — and it also guards `ordinary_retirement`, one capacity role
+shared by all devices (`resources/capacity.rs:188`), so a per-device scoping is
+not a local fix. Whichever stage first makes direct scanout multi-device must
+revisit it.
