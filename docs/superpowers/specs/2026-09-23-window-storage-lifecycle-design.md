@@ -46,7 +46,11 @@ A fixes (1). Option 2 fixes (2). A comes first and is built so that 2 changes
 ### Rule
 
 A window owns storage iff it is **viewable** (mapped, and every ancestor
-mapped) and InputOutput. Root always; the COW while claimed.
+mapped) and InputOutput. Two exemptions, outside the lifecycle entirely:
+the **root** (always owns storage) and the **Composite overlay window**
+(owns storage from claim to release, whatever its map state). The
+lifecycle code must skip both xids, so no generic root-child or unmap path
+can release them.
 
 - CreateWindow allocates nothing (windows are created unmapped).
 - The window becoming viewable allocates at its current size + border, fills
@@ -54,14 +58,25 @@ mapped) and InputOutput. Root always; the COW while claimed.
 - The window becoming unviewable drops the window's reference to its storage.
 - Resize / border change of an unviewable window only updates geometry.
 
+### Viewability delta: one transition set, computed in core
+
 Viewability changes are subtree events: unmapping a frame makes its whole
 mapped subtree unviewable; mapping it makes every descendant whose path is
-fully mapped viewable. `collect_viewable_bg_paint_targets`
-(`backend.rs:5086`) already computes the latter for the map-time bg paint;
-the unmap side needs the mirror walk. Hook both to viewability transitions,
-not to the MapWindow/UnmapWindow of one xid — ReparentWindow of a mapped
-window (unmap → reparent → map in X) and an ancestor's map/unmap must go
-through the same path.
+fully mapped viewable. Core already promotes/demotes descendants' map state
+on map, unmap and reparent (`resources.rs`, e.g. `reparent_window` at
+`:1687`) but discards that list; the backend and the redirect hooks see
+only the window the request named.
+
+Core's resources layer returns a
+`ViewabilityDelta { became_viewable: Vec<Window>, became_unviewable: Vec<Window> }`
+from every operation that can change viewability (MapWindow,
+MapSubwindows, UnmapWindow, UnmapSubwindows, ReparentWindow, DestroyWindow
+of a mapped window, client disconnect). Core then drives, for every member:
+storage release/allocation, redirect-backing unrealize/realize, Picture
+rebinding, and the map-time background paint. The backend never infers a
+subtree itself; `window_viewable` / `collect_viewable_bg_paint_targets`
+(`backend.rs:5066`, `:5086`) become consumers of the delta, not a second
+source of truth.
 
 ### Why content loss is legal and mostly already handled
 
@@ -73,8 +88,14 @@ honours them. So A removes storage nobody was allowed to rely on.
 
 Visible change: a **background None** window currently shows its old pixels
 on remap; after A its fresh storage has undefined contents. Xorg shows
-whatever was underneath (the parent's pixels). Seed a bg-None window's new
-storage from the parent's current pixels to match.
+whatever was on screen underneath: the parent *and* any lower overlapping
+siblings. A seeds a bg-None window from the parent's current pixels only,
+reusing the existing seeding path (`seed_backing_from_parent`,
+`backend.rs:7669`), which already defers the IncludeInferiors-equivalent
+case. **Accepted deviation:** pixels from lower overlapping siblings are
+missing from the seed. The client repaints on the Expose it gets anyway; a
+composed-underlay seed is a later refinement if the difference is visible
+in practice.
 
 ### One resolver for "which image does this window draw into"
 
@@ -83,6 +104,19 @@ All paths must get the image through `resolve_paint_target`
 redirected ancestor's backing. A unviewable window resolves to `None`.
 **`None` means "clipped away", never an error or a warning.** Option 2 later
 changes only this function (child → top-level's image at an offset).
+
+`None` from the backend is necessary but not sufficient: a backend call
+that "succeeds" as a no-op must not let core report results as if pixels
+moved. Core decides the protocol-visible outcome from viewability itself:
+
+- **CopyArea / CopyPlane from an unviewable source window:** the whole
+  source region is unavailable, so with graphics-exposures set, core sends
+  GraphicsExpose for the corresponding destination area, never NoExpose.
+- **Any request drawing to an unviewable destination:** no damage is
+  recorded and no DamageNotify is sent.
+- **PresentPixmap to an unviewable window:** no copy, no damage, no direct
+  scanout, and the normal idle and complete events (CompleteModeCopy), as
+  Xorg does.
 
 Paths that currently assume a window has storage and must accept `None`
 (from a source survey; verify each):
@@ -93,7 +127,7 @@ Paths that currently assume a window has storage and must accept `None`
 | CopyArea / CopyPlane with an unviewable **source** (`process_request.rs:26869`, no viewability check) | reads the leaf | no copy; GraphicsExpose for the source area if the GC asks for it |
 | CopyArea with an unviewable **destination** | writes the leaf | no-op |
 | Present copy path into an unviewable window (`process_request.rs:10543-10556`) | writes the leaf | Xorg accepts it (not BadMatch): the copy goes through a GC validated against the empty clip, writes nothing, and still delivers the normal idle/complete events with CompleteModeCopy. Under A: bypass direct scanout, no copy and no damage when the resolver returns `None`, complete normally |
-| Render Picture on a window (`apply_pending_picture_refs`, `backend.rs:9208`, increfs the leaf) | holds the leaf | `pending_picture_drawable_refs` already tolerates storage that appears later; must also tolerate it disappearing |
+| Render Picture on a window (`render_create_picture`, `backend.rs:24307`; `apply_pending_picture_refs`, `:9208`) | increfs the window's leaf | **lifetime conflict:** that reference would keep the leaf alive past unmap. A window Picture holds no store reference; it resolves its window at each use, yields no target while the window is hidden (the op is clipped away), and binds to the new leaf when the window is realized |
 | GetImage | BadMatch when unviewable (`process_request.rs:26045-26061`) | unchanged |
 | Redirect seed / restore (`restore_leaves_from_backing`, `backend.rs:3920`) | reads/writes leaves; planner skips unmapped subtrees (test `backend.rs:39011`) | must skip windows without storage |
 | Direct scanout / pinned frames referencing the drawable (`direct_frame_references_host_drawable`) | unflip requested on unmap | unchanged; storage release goes through the store's fence-deferred decref (`store.rs:1062-1136`), so a pinned image outlives the window's reference |
@@ -104,7 +138,16 @@ Paths that currently assume a window has storage and must accept `None`
 
 A redirected window's redirect backing follows the same rule, as in Xorg:
 allocated when the window is (redirected and) viewable, released when it
-becomes unviewable. The backing is released by dropping the window's
+becomes unviewable.
+
+**Unrealize is not UnredirectWindow.** Today's teardown
+(`teardown_redirect_for_window`, `process_disconnect.rs:598`) releases the
+backing *and* restores the window's scene participation, which is right
+for UnredirectWindow and wrong for an unmapped, manually redirected
+window. Under A, becoming unviewable drops only the backing: the redirect
+intent (mode, owning client) stays recorded and the window stays out of
+the scene. Becoming viewable again allocates a fresh backing for the
+existing redirect. UnredirectWindow keeps using the full teardown. The backing is released by dropping the window's
 reference; a `NameWindowPixmap` alias keeps its own (`name_window_pixmap`,
 `backend.rs:21264`, and the `alias_registry`), so compositors keep their
 pixmap across the unmap exactly as on Xorg. Verified: NameWindowPixmap
@@ -132,8 +175,13 @@ before adding any hysteresis.
   visible set; switch back → returns.
 - xts A/B (Xlib4 + Xlib9, zero PASS→FAIL): map/unmap/expose/background
   tests exercise exactly these paths.
+- Core tests for the delta: map/unmap/reparent/destroy of a frame yields
+  the exact descendant sets; a CopyArea from an unviewable source yields
+  GraphicsExpose, not NoExpose; drawing to an unviewable window records no
+  damage; Present to one completes with no copy.
 - Unit tests at the backend level: storage absent after unmap of an
-  ancestor; present after map; drawing to an unviewable window is a no-op
+  ancestor; present after map; a window Picture yields no target while
+  hidden and rebinds after remap; drawing to an unviewable window is a no-op
   without damage; CopyArea from an unviewable source copies nothing.
 - HW smoke on Cinnamon (Muffin, direct scanout) and awesome + picom (named
   pixmaps, fade-out).
@@ -143,8 +191,9 @@ before adding any hysteresis.
 - A path that dereferences a missing storage and warns or panics — the table
   above is the checklist; grep every `store.lookup(host_xid)` in window paths.
 - bg-None remap seeding wrong (flash of garbage instead of parent pixels).
-- Named-pixmap lifetime: if an alias does not hold a real reference,
-  releasing the backing breaks picom's fade-out.
+- A viewability transition that bypasses the delta (a path that changes map
+  state or the tree without going through resources) leaves storage out of
+  step with viewability. The delta must be the only source.
 
 ## Option 2 (outline): storage per top-level only
 
