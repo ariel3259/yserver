@@ -264,7 +264,7 @@ them.
   every one of them comes from a confirmed finding, and each is an acceptance
   criterion of the 3b spec:
 
-  1. **Parity with Legacy and Xorg in what a client sees.** Reply status,
+  1. **Parity with Legacy in what a client sees.** Reply status,
      reply timestamp, `lastSetTime` and `lastConfigTime` effects, and the
      presence and order of change notifications match Legacy for the same
      request — including the **idempotent request** already installed
@@ -344,9 +344,14 @@ behavior, so a client can break. The surfaces:
 | VT switch | today clients see nothing (mirrors Xorg `xf86Events.c:358`); must stay so | 3c |
 | Hotplug | `GetScreenResources` contents and timing relative to events | 3c |
 
-Xorg is the **protocol oracle**, not the design: what clients expect is what
-Xorg does, but its per-output `xf86DPMSSet` loop is the model C.0 forbids, and
-neither Xorg nor wlroots has an isolated asynchronous executor.
+**The client contract is parity with Legacy** — yserver as it is before C.0 —
+not with Xorg *(user decision, 2026-09-23)*. C.0 changes how KMS is driven, not
+what clients see; where Legacy differs from Xorg, the differential carries that
+difference over unchanged, and deciding whether to align it is outside C.0.
+Xorg is cited in this document only to explain why a rule is **not** added (for
+example `lastSetTime`'s lack of a monotonicity check), never as a target to
+match. Its per-output `xf86DPMSSet` loop is the model C.0 forbids, and neither
+Xorg nor wlroots has an isolated asynchronous executor.
 
 **Timing rule.** RANDR events and the `RRSetCrtcConfig` reply are emitted only
 when the transition reaches `Applied` — never at submission. A rejected or
