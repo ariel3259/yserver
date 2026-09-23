@@ -330,6 +330,11 @@ inside `cargo test` fixtures.
    before any diff. xev and xrandr are separate connections, so their relative
    order proves nothing; same-connection reply/event order is covered by layer
    1's protocol-order gate and by MATE in layer 3.
+   The golden is evidence, not source: it is kept **outside the repository**
+   and never enters the C.0 PR (user decision, 2026-09-22). The RANDR/DPMS part
+   was captured on 2026-09-22 at `cbc7eb32`; the VT and hotplug part is
+   captured by the user from a real console, because a session without a
+   controlling tty cannot arm VT switching.
 3. **Real clients against the Owner, in stage 5.** The layer-2 battery rerun
    and diffed against the golden (only the named exceptions may differ), plus:
    **MATE** (`mate-settings-daemon`'s xrandr plugin and the display settings
