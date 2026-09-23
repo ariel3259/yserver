@@ -691,8 +691,8 @@ pub(crate) struct CopiedRouteLatencySample {
     pub(crate) frame: usize,
     pub(crate) transport: CopiedRouteTransport,
     pub(crate) submission_delay_us: i128,
-    pub(crate) expected_msc: u64,
-    pub(crate) completion_msc: u64,
+    pub(crate) expected_msc: Option<u64>,
+    pub(crate) completion_msc: Option<u64>,
 }
 
 #[cfg(test)]
@@ -708,8 +708,10 @@ pub(crate) struct CopiedRouteLatencyPendingSnapshot {
     pub(crate) transport: CopiedRouteTransport,
     pub(crate) fence_signalled: bool,
     pub(crate) expected_msc_recorded: bool,
+    pub(crate) expected_msc_applicable: bool,
     pub(crate) commit_submitted: bool,
     pub(crate) completion_msc_recorded: bool,
+    pub(crate) completion_msc_applicable: bool,
 }
 
 #[cfg(test)]
@@ -721,6 +723,7 @@ struct CopiedRouteLatencyPending {
     expected_msc: Option<u64>,
     submitted_at: Option<std::time::Instant>,
     completion_msc: Option<u64>,
+    completion_recorded: bool,
 }
 
 #[cfg(test)]
@@ -770,18 +773,34 @@ pub(crate) fn record_copied_copy_fence_for_tests(
             expected_msc: None,
             submitted_at: None,
             completion_msc: None,
+            completion_recorded: false,
         });
     });
 }
 
 #[cfg(test)]
-pub(crate) fn poll_copied_route_latency_for_tests(current_msc: u64) {
+pub(crate) fn copied_route_latency_fence_fds_for_tests() -> Vec<RawFd> {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        state
+            .borrow()
+            .pending
+            .iter()
+            .filter(|pending| pending.signalled_at.is_none())
+            .filter_map(|pending| pending.fence.as_ref().map(AsRawFd::as_raw_fd))
+            .collect()
+    })
+}
+
+/// Observe Legacy's copy fence from the hardware harness drain. The duplicated
+/// fence is also included in the harness's blocking poll set, so this samples
+/// readiness immediately after poll wakes instead of at the next DRM timeout.
+#[cfg(test)]
+pub(crate) fn drain_copied_route_latency_fences_for_tests(current_msc: u64) {
     COPIED_ROUTE_LATENCY.with(|state| {
         let mut state = state.borrow_mut();
-        let now = std::time::Instant::now();
         let mut insufficient = false;
         for pending in &mut state.pending {
-            if pending.signalled_at.is_none() {
+            if pending.transport == CopiedRouteTransport::Legacy && pending.signalled_at.is_none() {
                 let Some(fence) = pending.fence.as_ref() else {
                     insufficient = true;
                     continue;
@@ -797,15 +816,42 @@ pub(crate) fn poll_copied_route_latency_for_tests(current_msc: u64) {
                 } else if result > 0
                     && poll_fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0
                 {
-                    pending.signalled_at = Some(now);
+                    pending.signalled_at = Some(std::time::Instant::now());
                 }
             }
-            if pending.signalled_at.is_some() && pending.expected_msc.is_none() {
+            if pending.transport == CopiedRouteTransport::Legacy
+                && pending.signalled_at.is_some()
+                && pending.expected_msc.is_none()
+            {
                 pending.expected_msc = Some(current_msc.saturating_add(1));
             }
         }
         state.insufficient |= insufficient;
         finish_copied_route_latency_samples(&mut state);
+    });
+}
+
+/// The Owner completion queue has already detected this fence's readiness.
+/// Timestamp that event boundary rather than a later harness-loop iteration.
+#[cfg(test)]
+pub(crate) fn record_copied_route_fence_signalled_at_drain_for_tests(
+    transport: CopiedRouteTransport,
+) {
+    COPIED_ROUTE_LATENCY.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(pending) = state
+            .pending
+            .iter_mut()
+            .find(|pending| pending.transport == transport && pending.signalled_at.is_none())
+        {
+            pending.signalled_at = Some(std::time::Instant::now());
+        } else if !state
+            .pending
+            .iter()
+            .any(|pending| pending.transport == transport)
+        {
+            state.insufficient = true;
+        }
     });
 }
 
@@ -836,18 +882,22 @@ pub(crate) fn record_copied_commit_submitted_at_for_tests(
 }
 
 #[cfg(test)]
-pub(crate) fn record_copied_completion_msc_for_tests(transport: CopiedRouteTransport, msc: u64) {
+pub(crate) fn record_copied_completion_for_tests(
+    transport: CopiedRouteTransport,
+    msc: Option<u64>,
+) {
     COPIED_ROUTE_LATENCY.with(|state| {
         let mut state = state.borrow_mut();
         let Some(pending) = state
             .pending
             .iter_mut()
-            .find(|pending| pending.transport == transport && pending.completion_msc.is_none())
+            .find(|pending| pending.transport == transport && !pending.completion_recorded)
         else {
             state.insufficient = true;
             return;
         };
-        pending.completion_msc = Some(msc);
+        pending.completion_msc = msc;
+        pending.completion_recorded = true;
         finish_copied_route_latency_samples(&mut state);
     });
 }
@@ -861,7 +911,7 @@ pub(crate) fn copied_route_latency_waiting_for_completion_for_tests(
             .borrow()
             .pending
             .iter()
-            .any(|pending| pending.transport == transport && pending.completion_msc.is_none())
+            .any(|pending| pending.transport == transport && !pending.completion_recorded)
     })
 }
 
@@ -879,8 +929,10 @@ pub(crate) fn copied_route_latency_snapshot_for_tests() -> CopiedRouteLatencySna
                     transport: pending.transport,
                     fence_signalled: pending.signalled_at.is_some(),
                     expected_msc_recorded: pending.expected_msc.is_some(),
+                    expected_msc_applicable: pending.transport == CopiedRouteTransport::Legacy,
                     commit_submitted: pending.submitted_at.is_some(),
-                    completion_msc_recorded: pending.completion_msc.is_some(),
+                    completion_msc_recorded: pending.completion_recorded,
+                    completion_msc_applicable: pending.transport == CopiedRouteTransport::Legacy,
                 })
                 .collect(),
             insufficient: state.insufficient,
@@ -895,14 +947,23 @@ fn finish_copied_route_latency_samples(state: &mut CopiedRouteLatencyState) {
         let Some(signalled_at) = pending.signalled_at else {
             continue;
         };
-        let Some(expected_msc) = pending.expected_msc else {
-            continue;
-        };
         let Some(submitted_at) = pending.submitted_at else {
             continue;
         };
-        let Some(completion_msc) = pending.completion_msc else {
+        if !pending.completion_recorded {
             continue;
+        }
+        let (expected_msc, completion_msc) = match pending.transport {
+            CopiedRouteTransport::Legacy => {
+                let Some(expected_msc) = pending.expected_msc else {
+                    continue;
+                };
+                let Some(completion_msc) = pending.completion_msc else {
+                    continue;
+                };
+                (Some(expected_msc), Some(completion_msc))
+            }
+            CopiedRouteTransport::Owner => (None, None),
         };
         let signed_delay_us = if submitted_at >= signalled_at {
             i128::try_from(submitted_at.duration_since(signalled_at).as_micros())
@@ -5294,6 +5355,12 @@ impl PlatformBackend {
                 index += 1;
                 continue;
             }
+            #[cfg(test)]
+            if self.pending_scanout_render_completions[index].stage
+                == ScanoutRenderCompletionStage::CopiedOwnerCopy
+            {
+                record_copied_route_fence_signalled_at_drain_for_tests(CopiedRouteTransport::Owner);
+            }
             let pending = self
                 .pending_scanout_render_completions
                 .remove(index)
@@ -8592,6 +8659,14 @@ mod tests {
             reads.push(read);
             writes.push(write);
         }
+        assert_eq!(copied_route_latency_fence_fds_for_tests().len(), 2);
+        drain_copied_route_latency_fences_for_tests(20);
+        assert!(
+            copied_route_latency_snapshot_for_tests()
+                .pending_frames
+                .iter()
+                .all(|pending| !pending.fence_signalled)
+        );
         for write in &writes {
             let byte = 1u8;
             // SAFETY: `write` is a valid live pipe descriptor and `byte` is readable.
@@ -8600,12 +8675,14 @@ mod tests {
                 1
             );
         }
-        poll_copied_route_latency_for_tests(20);
+        drain_copied_route_latency_fences_for_tests(20);
+        record_copied_route_fence_signalled_at_drain_for_tests(CopiedRouteTransport::Owner);
         for (index, transport) in transports.into_iter().enumerate() {
             record_copied_commit_submitted_for_tests(transport);
-            record_copied_completion_msc_for_tests(
+            record_copied_completion_for_tests(
                 transport,
-                u64::try_from(21 + index).expect("test MSC fits in u64"),
+                (transport == CopiedRouteTransport::Legacy)
+                    .then(|| u64::try_from(21 + index).expect("test MSC fits in u64")),
             );
         }
 
@@ -8613,10 +8690,10 @@ mod tests {
         assert!(!snapshot.insufficient);
         assert!(snapshot.pending_frames.is_empty());
         assert_eq!(snapshot.samples.len(), 2);
-        assert_eq!(snapshot.samples[0].expected_msc, 21);
-        assert_eq!(snapshot.samples[1].expected_msc, 21);
-        assert_eq!(snapshot.samples[0].completion_msc, 21);
-        assert_eq!(snapshot.samples[1].completion_msc, 22);
+        assert_eq!(snapshot.samples[0].expected_msc, Some(21));
+        assert_eq!(snapshot.samples[1].expected_msc, None);
+        assert_eq!(snapshot.samples[0].completion_msc, Some(21));
+        assert_eq!(snapshot.samples[1].completion_msc, None);
         drop(reads);
         drop(writes);
     }

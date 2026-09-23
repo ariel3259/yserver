@@ -67583,12 +67583,28 @@ mod tests {
 
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         let timeout_ms = remaining.as_millis().clamp(1, 10) as libc::c_int;
-                        let mut poll_fd = libc::pollfd {
+                        let helper_fd = backend
+                            .platform
+                            .device_for_key(device)
+                            .and_then(|device| device.executor.as_ref())
+                            .and_then(|executor| executor.control_fd())
+                            .map(|fd| fd.as_raw_fd());
+                        let mut poll_fds = vec![libc::pollfd {
                             fd: drm_fd,
                             events: libc::POLLIN,
                             revents: 0,
-                        };
-                        let poll_result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+                        }];
+                        if let Some(helper_fd) = helper_fd {
+                            poll_fds.push(libc::pollfd {
+                                fd: helper_fd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            });
+                        }
+                        let poll_count = libc::nfds_t::try_from(poll_fds.len())
+                            .expect("hardware wait descriptor count fits nfds_t");
+                        let poll_result =
+                            unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_count, timeout_ms) };
                         if poll_result < 0
                             && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
                         {
@@ -68238,14 +68254,24 @@ mod tests {
         let status = if incomplete { "partial" } else { "complete" };
 
         for sample in &snapshot.samples {
+            let expected_msc = sample
+                .expected_msc
+                .map_or_else(|| "NA".to_string(), |msc| msc.to_string());
+            let completion_msc = sample
+                .completion_msc
+                .map_or_else(|| "NA".to_string(), |msc| msc.to_string());
+            let missed_vblank = sample.completion_msc.zip(sample.expected_msc).map_or_else(
+                || "NA".to_string(),
+                |(completion, expected)| (completion > expected).to_string(),
+            );
             println!(
                 "CP-LATENCY transport={:?} status={status} frame={} submission_delay_us={} expected_msc={} completion_msc={} missed_vblank={}",
                 sample.transport,
                 sample.frame,
                 sample.submission_delay_us,
-                sample.expected_msc,
-                sample.completion_msc,
-                sample.completion_msc > sample.expected_msc,
+                expected_msc,
+                completion_msc,
+                missed_vblank,
             );
         }
         for transport in [Legacy, Owner] {
@@ -68256,8 +68282,22 @@ mod tests {
                 .collect::<Vec<_>>();
             let missed = samples
                 .iter()
-                .filter(|sample| sample.completion_msc > sample.expected_msc)
+                .filter(|sample| {
+                    sample
+                        .completion_msc
+                        .zip(sample.expected_msc)
+                        .is_some_and(|(completion, expected)| completion > expected)
+                })
                 .count();
+            let vblank_comparable = samples
+                .iter()
+                .filter(|sample| sample.expected_msc.is_some() && sample.completion_msc.is_some())
+                .count();
+            let missed_vblank = if transport == Legacy {
+                format!("{missed}/{vblank_comparable}")
+            } else {
+                "NA".to_string()
+            };
             let pending = snapshot
                 .pending_frames
                 .iter()
@@ -68266,10 +68306,10 @@ mod tests {
             let unstarted =
                 expected_frames_per_transport.saturating_sub(samples.len().saturating_add(pending));
             println!(
-                "CP-LATENCY-SUMMARY status={status} transport={transport:?} frames={}/{} missed_vblank={missed}/{} pending={} unstarted={} insufficient={}",
+                "CP-LATENCY-SUMMARY status={status} transport={transport:?} frames={}/{} missed_vblank={missed_vblank} vblank_comparable={vblank_comparable}/{} pending={} unstarted={} insufficient={}",
                 samples.len(),
                 expected_frames_per_transport,
-                samples.len(),
+                expected_frames_per_transport,
                 pending,
                 unstarted,
                 snapshot.insufficient,
@@ -68277,12 +68317,14 @@ mod tests {
         }
         for pending in &snapshot.pending_frames {
             println!(
-                "CP-LATENCY-PENDING status={status} transport={:?} frame={} fence_signalled={} expected_msc_recorded={} commit_submitted={} completion_msc_recorded={}",
+                "CP-LATENCY-PENDING status={status} transport={:?} frame={} fence_signalled={} expected_msc_applicable={} expected_msc_recorded={} commit_submitted={} completion_msc_applicable={} completion_msc_recorded={}",
                 pending.transport,
                 pending.frame,
                 pending.fence_signalled,
+                pending.expected_msc_applicable,
                 pending.expected_msc_recorded,
                 pending.commit_submitted,
+                pending.completion_msc_applicable,
                 pending.completion_msc_recorded,
             );
         }
@@ -68336,8 +68378,6 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut logged_owner_release_retry = false;
             while Instant::now() < deadline {
-                let current_msc = backend.platform.present_get_ust_msc(crtc_key).0;
-                crate::kms::render::platform::poll_copied_route_latency_for_tests(current_msc);
                 let now = Instant::now();
                 let tick_events = backend.platform.tick_executors(now);
                 backend.record_host_call_events(tick_events);
@@ -68438,11 +68478,11 @@ mod tests {
                         "copied owner completion batch was not consumed: {event_debug}"
                     );
                     // A composed commit emits HardwareComplete without
-                    // Presented. Snapshot the latest validated CRTC clock at
-                    // that hardware-completion boundary; CompletionRetired
-                    // follows for resource retirement and carries no clock.
-                    // If there is no routed sample, leave latency incomplete
-                    // and report that instead of manufacturing an MSC.
+                    // Presented. Snapshot the latest validated CRTC clock for
+                    // diagnostics only: it is not correlated to this commit.
+                    // CompletionRetired follows for resource retirement and
+                    // carries no clock, so close the latency sample at
+                    // HardwareComplete with no per-commit MSC.
                     if owner
                         && let Some(commit) = hardware_complete_commit
                         && crate::kms::render::platform::copied_route_latency_waiting_for_completion_for_tests(
@@ -68455,18 +68495,18 @@ mod tests {
                         {
                             Some(sample) => {
                                 println!(
-                                    "CP copied completion_clock transport=Owner milestone=HardwareComplete commit={commit:?} crtc={crtc_key:?} msc={} ust={} source={:?}",
+                                    "CP copied completion_clock transport=Owner milestone=HardwareComplete commit={commit:?} crtc={crtc_key:?} msc={} ust={} source={:?} correlated_to_commit=false",
                                     sample.msc, sample.ust, sample.source
-                                );
-                                crate::kms::render::platform::record_copied_completion_msc_for_tests(
-                                    crate::kms::render::platform::CopiedRouteTransport::Owner,
-                                    sample.msc,
                                 );
                             }
                             None => println!(
-                                "CP copied completion_clock unavailable transport=Owner milestone=HardwareComplete commit={commit:?} crtc={crtc_key:?} reason=no validated routed CRTC clock is available"
+                                "CP copied completion_clock unavailable transport=Owner milestone=HardwareComplete commit={commit:?} crtc={crtc_key:?} correlated_to_commit=false reason=no validated routed CRTC clock is available"
                             ),
                         }
+                        crate::kms::render::platform::record_copied_completion_for_tests(
+                            crate::kms::render::platform::CopiedRouteTransport::Owner,
+                            None,
+                        );
                     }
                 }
                 let (drm_events, drain_result) = backend.platform.drain_owner_events(drm_fd, now);
@@ -68506,14 +68546,23 @@ mod tests {
                                 .map(|sample| sample.msc)
                         });
                         if let Some(msc) = msc {
-                            crate::kms::render::platform::record_copied_completion_msc_for_tests(
+                            crate::kms::render::platform::record_copied_completion_for_tests(
                                 crate::kms::render::platform::CopiedRouteTransport::Legacy,
-                                msc,
+                                Some(msc),
                             );
                         }
                     }
                 }
                 backend.drain_scanout_render_completions_for_tests();
+                if owner {
+                    // The copied completion drain promotes the ready Owner
+                    // generation. Tick immediately so submission follows the
+                    // readiness drain without sleeping on the DRM fd.
+                    backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+                }
+                crate::kms::render::platform::drain_copied_route_latency_fences_for_tests(
+                    backend.platform.present_get_ust_msc(crtc_key).0,
+                );
                 if owner {
                     let owner_frame_started = backend
                         .scene
@@ -68521,19 +68570,11 @@ mod tests {
                         .is_some_and(|(_, generation, _)| {
                             owner_generation_before.is_none_or(|before| generation > before)
                         });
-                    if !owner_frame_started {
-                        if !logged_owner_release_retry {
-                            println!(
-                                "CP copied Owner harness retry: pumping scene release gates while frame {frame} has no new owner generation"
-                            );
-                            logged_owner_release_retry = true;
-                        }
-                        // Production revisits these gates on each compositor
-                        // tick. A live frame can become releasable only after
-                        // the resource and owner events above have been
-                        // serviced, so retry the production tick until this
-                        // frame acquires/submits one generation.
-                        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+                    if !owner_frame_started && !logged_owner_release_retry {
+                        println!(
+                            "CP copied Owner harness retry: pumping scene release gates while frame {frame} has no new owner generation"
+                        );
+                        logged_owner_release_retry = true;
                     }
                 }
                 if owner {
@@ -68586,9 +68627,6 @@ mod tests {
                         }
                     }
                 }
-                crate::kms::render::platform::poll_copied_route_latency_for_tests(
-                    backend.platform.present_get_ust_msc(crtc_key).0,
-                );
                 let damage_generation_advanced = backend
                     .scene
                     .damage_history_latest_generation_for_tests(0)
@@ -68606,12 +68644,37 @@ mod tests {
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let timeout_ms = remaining.as_millis().clamp(1, 10) as libc::c_int;
-                let mut poll_fd = libc::pollfd {
+                let fence_fds =
+                    crate::kms::render::platform::copied_route_latency_fence_fds_for_tests();
+                let mut poll_fds = Vec::with_capacity(1 + fence_fds.len());
+                poll_fds.push(libc::pollfd {
                     fd: drm_fd,
                     events: libc::POLLIN,
                     revents: 0,
-                };
-                let poll_result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+                });
+                poll_fds.extend(fence_fds.into_iter().map(|fd| libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }));
+                if owner
+                    && let Some(helper_fd) = backend
+                        .platform
+                        .device_for_key(device)
+                        .and_then(|device| device.executor.as_ref())
+                        .and_then(|executor| executor.control_fd())
+                        .map(|fd| fd.as_raw_fd())
+                {
+                    poll_fds.push(libc::pollfd {
+                        fd: helper_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+                let poll_count = libc::nfds_t::try_from(poll_fds.len())
+                    .expect("copied-route poll descriptor count fits nfds_t");
+                let poll_result =
+                    unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_count, timeout_ms) };
                 if poll_result < 0
                     && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
                 {
@@ -68620,6 +68683,9 @@ mod tests {
                         std::io::Error::last_os_error()
                     );
                 }
+                crate::kms::render::platform::drain_copied_route_latency_fences_for_tests(
+                    backend.platform.present_get_ust_msc(crtc_key).0,
+                );
             }
             let damage_generation_after =
                 backend.scene.damage_history_latest_generation_for_tests(0);
