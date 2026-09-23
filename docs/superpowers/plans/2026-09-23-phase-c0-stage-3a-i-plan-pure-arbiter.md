@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); this plan needs **no GPU and no `#[ignore]` test** — run none of them, never `_drm`, never `render_acceptance`, never an unfiltered `--ignored`; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape.
 
+**Revision 5 (2026-09-23)** — codex round 4
+(`../findings/2026-09-23-stage-3a-i-plan-review-round4.md`: 1 blocking,
+1 major; every round-3 finding applied): the reported loss event of a
+teardown row with no incident ends `Invalidated` by that row (B-1); a
+coordinator → arbiter → Table U handoff test covers every active row (M-1).
+
 **Revision 4 (2026-09-23)** — codex round 3
 (`../findings/2026-09-23-stage-3a-i-plan-review-round3.md`: 3 blocking, 1
 major, all verified): a receipt proves only the transfer its own transition
@@ -211,6 +217,15 @@ state) returning a typed outcome.
   target is off** (Table F's DPMS row defers it "on `dpms_target = On`"); with
   the target on it is active and its attempt proceeds after reap
   (round-3 B-3).
+- **U-1a** *(rev 5, round-4 B-1)* **The reported event always ends.** The
+  loss's own event id (U-3) reaches exactly one terminal disposition in every
+  row: normal live → it is the new incident's representative; `DPMS` and a
+  rebuild with no incident → the same; an existing incident →
+  `AbsorbedByEvent(its representative)`; `VTRelease`, `DeviceRemoved`,
+  `Shutdown` with **no** incident → `Invalidated(VTRelease)`,
+  `Invalidated(DeviceRemoved)`, `Invalidated(Shutdown)` respectively, recorded
+  before the row completes, and no recovery intent is left for later
+  convergence (a later `VTAcquire` allocates a fresh id only under Table F).
 - **U-2** Every row's outcome says separately what is **logical** (immediate:
   seat release, withdrawal, protocol terminalization) and what is **physical**
   (waits: reap, fd-family close, fresh install). Task 4 uses that split.
@@ -249,7 +264,7 @@ state) returning a typed outcome.
 | `c0_3a_recovery_matrix_is_total` | every winning kind × an active incident (and × `RecoveryFailed`): the exact outcome of F-1 (item 67) | **T23** transfer the incident on `IdentityChangingHotplug`; **T24** let DPMS allocate a fresh id |
 | `c0_3a_no_double_fate` | every row of both tables: never both invalidated and transferred, at most one id allocated | **T25** allocate a fresh id and also transfer the old one on `VTAcquire` |
 | `c0_3a_first_loss_creates_one_incident` | no incident; a loss during normal live operation reported with a coordinator-allocated event id E: exactly one `RecoveryId`, representative E; then a second loss (id E2) and three normal-recovery events: same `RecoveryId`, each `AbsorbedByEvent(E)` exactly | **T31** allocate a new id on the second loss; **T40** create the incident with no representative |
-| `c0_3a_unknown_during_teardown_follows_the_active_row` | an ordinary commit becomes unknown while `VTRelease`, `DeviceRemoved` and `Shutdown` are each active: each follows its own row — no incident, logical obligations at once | **T45** treat an ordinary-work loss as normal live operation during `VTRelease` |
+| `c0_3a_unknown_during_teardown_follows_the_active_row` | an ordinary commit becomes unknown while `VTRelease`, `DeviceRemoved` and `Shutdown` are each active: each follows its own row — no incident, logical obligations at once, and the reported event ends exactly `Invalidated(VTRelease)`, `Invalidated(DeviceRemoved)`, `Invalidated(Shutdown)` before the row completes (U-1a) | **T45** treat an ordinary-work loss as normal live operation during `VTRelease`; **T48** leave the reported event without a disposition when no incident exists |
 | `c0_3a_first_loss_during_dpms_on_is_not_paused` | no incident; a DPMS-on commit becomes unknown: the incident is created, **active** (target on), and its attempt is authorized after reap; the same during DPMS-off: created **paused** | **T46** pause every incident created during a DPMS transition |
 | `c0_3a_first_loss_during_rebuild_is_normal_live` | no incident; a same-identity rebuild's commit becomes unknown: one incident via the coordinator's event id, attempt after reap, rebuild terminalized with no id of its own | **T47** give the rebuild a `RecoveryId` of its own |
 | `c0_3a_dpms_on_resumes_the_paused_incident` | an incident, DPMS off (paused), the device poisoned, DPMS on applied logically: the same id resumes with the same remaining budget, no id allocated, no KMS action, the DPMS representative still `Deferred(ReadinessClosed)` | **T41** keep the incident paused until a KMS installation; **T42** reset the attempt budget on resume |
@@ -362,6 +377,7 @@ and the aggregation of the protocol DPMS request.
 | `c0_3a_protocol_applied_only_when_every_device_applied` | device A applied, B rejected (`Deferred`), C removed-output invalidation: not `Applied`; then B applied: `Applied` | **T28** count any terminal disposition toward `Applied` |
 | `c0_3a_shutdown_is_monotonic` | shutdown, then any event: still requested | **T29** let a seat event clear it |
 | `c0_3a_loss_report_gets_a_coordinator_event_id` | the driver reports a loss on device A: the coordinator allocates exactly one event id, only A's arbiter receives it, and it becomes the incident's representative | **T44** let the device arbiter mint the event id itself |
+| `c0_3a_loss_reaches_table_u_through_the_arbiter` | *(rev 5, round-4 M-1)* for **every** Table U row (generated): the loss is reported to the coordinator, projected to the device's arbiter while that row is active, and the arbiter's resulting actions, incident fate and event disposition equal Table U's for that row — the handoff, not the table alone | **T49** project the loss as a plain lower-priority `NormalRecovery` event that waits behind the active row instead of entering Table U |
 | `c0_3a_devices_converge_independently` | a slow device and a fast one under the same epoch: the fast one's arbiter state is final before the slow one's | **T30** make projection wait for every device before any applies |
 
 ## Gate (every task)
