@@ -2,6 +2,17 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); this plan needs **no GPU and no `#[ignore]` test** — run none of them, never `_drm`, never `render_acceptance`, never an unfiltered `--ignored`; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape.
 
+**Revision 2 (2026-09-23)** — incorporates codex round 1
+(`../findings/2026-09-23-stage-3a-i-plan-review-round1.md`: 2 blocking, 4
+major, 1 minor, coverage complete; all verified against C.0 and accepted).
+**B-1** supersession advances the winner only after the safety actions are
+acknowledged (R4-2a); **B-2** the first completion loss creates the incident
+(R6-0); **M-1** the `REC-6` matrix is now Task 3 and the arbiter Task 4, so the
+arbiter is built on the final matrix; **M-2** a mixed-arrival ledger test;
+**M-3** ordinary work's tag has no transition id, with evidence; **M-4** DPMS
+while `Poisoned` stays `Deferred(ReadinessClosed)`, never `Applied`; **m-1** a
+replaced `Deferred` representative ends as `SupersededBy`.
+
 **Revision 1 (2026-09-23, coordinator).**
 
 **Goal:** The lifecycle decision layer of stage 3, as **pure code**: its
@@ -81,8 +92,11 @@ device absent, and the two stage 3a failure prerequisites
 `TopologyLatched(generation)` and `ReadinessClosed`; `DeviceLifecycleState`
 — the nine §6.4 states, `Recovering` carrying its `RecoveryId`; `RecoveryId`
 — its own counter, with **no** conversion from or to `LifecycleTransitionId`;
-`TransitionTag` — incarnation, `LifecycleEpochId`, `LifecycleTransitionId`
-(the incarnation as an opaque value supplied by the caller, decision 2).
+`WorkTag` — incarnation, `LifecycleEpochId`, and an **optional**
+`LifecycleTransitionId`: `Some` for transition-owned work, `None` for ordinary
+`Ready` work (C.0 item 65; the existing owner record already carries an
+optional transition id) — the incarnation as an opaque value supplied by the
+caller, decision 2. `TransitionTag` is the `Some` case.
 
 **Tests:**
 
@@ -119,7 +133,9 @@ disposition ledger for the device's representatives.
   incident.
 - **R5-3** Every event id reaches **exactly one** terminal disposition, which
   is then immutable; `Deferred` is the only nonterminal one and must later
-  become `Applied`, an `AbsorbedBy*`, or `Invalidated`.
+  become `Applied`, an `AbsorbedBy*`, `Invalidated`, or — when a newer
+  generation of the same field replaces it — `SupersededBy(newer)` (C.0's
+  typed latest-wins rule, which applies to a deferred representative too).
 - **R5-4** A DPMS projection replaces every current per-output target in the
   same epoch; a newly discovered output inherits the current global level
   before any installation (umbrella rev-2 M-2); removing an output invalidates
@@ -132,10 +148,49 @@ disposition ledger for the device's representatives.
 | `c0_3a_equal_kind_coalescing_table` | for **every** kind, two events of that kind: the representative and the displaced id's disposition match R5-2 (C.0 item 64) | **T5** make DPMS coalesce by `AbsorbedByEvent` instead of `SupersededBy`; **T6** keep the older topology epoch |
 | `c0_3a_storm_stays_bounded` | 10 000 events of mixed kinds: retained representatives never exceed the field count, and every displaced id is terminal | **T7** retain displaced representatives in a list |
 | `c0_3a_terminal_disposition_is_immutable` | every terminal disposition, then an attempt to assign another: refused, the first stays | **T8** allow overwriting a terminal disposition |
-| `c0_3a_deferred_reaches_one_terminal` | a `Deferred(SeatReleased)` target, then seat acquired / shutdown / newer generation: each path ends in exactly one terminal disposition | **T9** leave the representative `Deferred` after the prerequisite returns |
+| `c0_3a_deferred_reaches_one_terminal` | a `Deferred(SeatReleased)` target, then seat acquired / shutdown / newer generation: each path ends in exactly one terminal disposition, asserted **exactly** — `Applied`, `Invalidated(Shutdown)`, `SupersededBy(newer)` respectively | **T9** leave the representative `Deferred` after the prerequisite returns |
 | `c0_3a_projection_follows_the_output_domain` | global off, then an output is added (inherits off before install), then another is removed (only its projection invalidated, once) (item 66) | **T10** add the new output with target on; **T11** invalidate every projection on one removal |
 
-## Task 3 — the arbiter: `REC-4` precedence, supersession, convergence, epoch
+## Task 3 — `REC-6`: the recovery-fate matrix and `REC-1` accounting
+
+**Deliver:** the incident record (its `RecoveryId`, its one-attempt budget, its
+state) and the function that, for a winning kind and an active incident,
+returns the matrix outcome.
+
+**Invariants (C.0 `REC-6` table, lines ~918–935, and `REC-1`):**
+- **R6-0** *(rev 2, B-2)* **Creation.** A completion loss (or any
+  `CompletionUnknown` trigger of C.0 §10's table) during normal operation on a
+  device with **no** incident creates **exactly one** incident: this task's
+  incident module owns the per-device `RecoveryId` allocator and exposes the
+  creation input; Task 4's arbiter calls it on completion loss and never
+  allocates an id itself. The incident is attached to the device's
+  `LifecycleDesired`. A second loss while that
+  incident exists, and every later normal-recovery event, is absorbed by it
+  (`AbsorbedByEvent` of its representative) and allocates nothing.
+- **R6-1** Exactly the table: `Shutdown`, `DeviceRemoved`, `VTRelease` →
+  `Invalidated` with that reason; `DeviceAddedOrReplaced`, `VTAcquire`,
+  `AdministrativeReprobe`, `IdentityChangingHotplug` → old incident invalidated
+  by that boundary and **at most one fresh** `RecoveryId` if recovery is still
+  required; same-identity `TopologyRebuild` → the **same** incident and its
+  remaining budget transferred; `DPMS` → paused (off defers it on
+  `dpms_target = On`, on resumes it), never consumed, cloned or revived;
+  `NormalRecovery` → continued, equal events absorbed.
+- **R6-2** No path both invalidates and transfers an id, allocates two ids,
+  lets DPMS revive `RecoveryFailed`, or spends an attempt twice (item 67).
+- **R6-3** `REC-1`: one automatic attempt per incident; any failure or
+  unknown during it → `RecoveryFailed`; timers, DPMS, client traffic and
+  queued intents cannot create another attempt.
+
+**Tests:**
+
+| Test | Scenario | Must fail under |
+| --- | --- | --- |
+| `c0_3a_recovery_matrix_is_total` | every winning kind × an active incident (and × `RecoveryFailed`): the exact outcome of R6-1 (item 67) | **T23** transfer the incident on `IdentityChangingHotplug`; **T24** let DPMS allocate a fresh id |
+| `c0_3a_no_double_fate` | every row: the outcome is never both invalidated and transferred, and at most one id is allocated | **T25** allocate a fresh id and also transfer the old one on `VTAcquire` |
+| `c0_3a_first_loss_creates_one_incident` | no incident; a completion loss: exactly one `RecoveryId`; then a second loss and three normal-recovery events: same id, all absorbed | **T31** allocate a new id on the second loss |
+| `c0_3a_one_attempt_per_incident` | an attempt fails, then DPMS on, a timer, and repeated normal-recovery events: no second attempt, state `RecoveryFailed` | **T26** let DPMS-on resume a `RecoveryFailed` incident |
+
+## Task 4 — the arbiter: `REC-4` precedence, supersession, convergence, epoch
 
 **Deliver:** the per-device arbiter: the §6.4 state, at most one
 `LifecycleTransition { id, kind, phase }`, the transition-id allocator (the
@@ -149,6 +204,16 @@ the lifecycle epoch.
   each Present's terminalization once, and transfer quarantine to the winner.
   A transition whose commit is `Submitting` or accepted is **never** cancelled
   as never-submitted: the action is "await its terminal state".
+- **R4-2a** *(rev 2, B-1)* **The winner waits for the safety acknowledgments.**
+  Supersession enters a pending phase: the winner emits no action that
+  advances it (no final `TEST_ONLY`, no fd opening, no installation, no
+  topology request) until the driver has acknowledged, as inputs, admission
+  closed, pre-submit work cancelled, each Present terminalized, and quarantine
+  transferred. A **failed** safety acknowledgment is treated like a completion
+  loss (R4-6: `Poisoned`, incident per R6-0), never skipped; a delayed one
+  keeps the winner pending. Until the loser's terminal state and these
+  acknowledgments, the displaced transition can neither open nor publish
+  (C.0 item 57).
 - **R4-3** An equal event coalesces per `REC-5`; a lower event only updates
   `LifecycleDesired` and cannot start work until the active transition is
   terminal.
@@ -172,7 +237,11 @@ the lifecycle epoch.
   loss → §6.4 `Poisoned`, admission closed, transition terminal, `REC-6`
   outcome recorded; stale-tag results never change installed state.
 - **R4-7** While `Poisoned`, a DPMS change updates only logical power state:
-  no action requests a KMS mutation (C.0 §10 lifecycle table, DPMS row).
+  no action requests a KMS mutation (C.0 §10 lifecycle table, DPMS row). Its
+  projection is **not retired**, so the representative is
+  `Deferred(ReadinessClosed)` — never `Applied` — until a recovery installs
+  and converges it (3d), or it is superseded by a newer DPMS generation or
+  invalidated by shutdown, device removal or output removal *(rev 2, M-4)*.
 
 **Tests:**
 
@@ -180,41 +249,15 @@ the lifecycle epoch.
 | --- | --- | --- |
 | `c0_3a_every_pair_elects_by_precedence` | for **every ordered pair** of kinds (active, arriving): supersede iff arriving is higher; coalesce iff equal; else desired-only (items 57, 63) | **T12** supersede on equal kinds; **T13** let a lower kind supersede |
 | `c0_3a_never_two_transitions` | every pair above, then every third kind: the arbiter never holds two | **T14** start the winner before the loser's terminal action |
+| `c0_3a_winner_waits_for_safety_acks` | removal supersedes a pre-submit DPMS: no advancing action until all four acknowledgments arrive; with one acknowledgment delayed the winner stays pending; with one failed the device is `Poisoned` and the winner does not advance | **T32** let the winner advance after admission closure alone; **T33** ignore a failed quarantine-transfer acknowledgment |
 | `c0_3a_submitted_is_never_cancelled_as_never_submitted` | supersession of a transition whose commit is accepted: the action is "await terminal", never "cancel" | **T15** emit cancel for an accepted commit |
 | `c0_3a_convergence_selects_the_highest_unsatisfied` | for every subset of unsatisfied fields (with prerequisites present and absent), after terminalization: exactly one next transition of the highest kind, or `Deferred` with the right prerequisite (item 66) | **T16** pick the first unsatisfied field in declaration order |
+| `c0_3a_mixed_arrivals_keep_every_lower_field` | during an active `VTRelease`, arrivals of administrative reprobe, two topology generations and two DPMS generations in every order: after it terminalizes, the exact ledger (which ids are `SupersededBy` which, which remain representatives) and the exact sequence of successive winners match C.0 (item 63) | **T34** drop the reprobe field when a topology event arrives |
 | `c0_3a_added_and_acquire_converge_in_either_order` | `DeviceAddedOrReplaced` and `VTAcquire` arriving in both orders both converge, all representatives terminal (item 66) | **T17** drop the seat prerequisite of `DeviceAddedOrReplaced` |
 | `c0_3a_epoch_bumps_once_and_before_invalidation` | clean drain (no bump), N coalesced events (one bump), forced abandonment (bump emitted before the invalidation action) (item 65) | **T18** bump per coalesced event; **T19** invalidate before bumping |
+| `c0_3a_ordinary_work_is_tagged_without_a_transition` | ordinary work issued while `Ready` carries the current epoch and `None`; after a lifecycle arrival bumps the epoch, a delayed reply of that ordinary work is stale and cannot promote (item 65) | **T35** tag ordinary work with the last transition's id; **T36** accept the delayed ordinary reply across the bump |
 | `c0_3a_outcomes_map_to_dispositions` | every row of R4-6 for a DPMS transition, including a rejection that is never counted `Applied` and a stale success that never promotes | **T20** mark a rejected representative `Applied`; **T21** promote on a stale tag |
-| `c0_3a_poisoned_dpms_is_logical_only` | `Poisoned` device, DPMS off then on: no KMS-mutation action | **T22** emit the DPMS commit request while `Poisoned` |
-
-## Task 4 — `REC-6`: the recovery-fate matrix and `REC-1` accounting
-
-**Deliver:** the incident record (its `RecoveryId`, its one-attempt budget, its
-state) and the function that, for a winning kind and an active incident,
-returns the matrix outcome.
-
-**Invariants (C.0 `REC-6` table, lines ~918–935, and `REC-1`):**
-- **R6-1** Exactly the table: `Shutdown`, `DeviceRemoved`, `VTRelease` →
-  `Invalidated` with that reason; `DeviceAddedOrReplaced`, `VTAcquire`,
-  `AdministrativeReprobe`, `IdentityChangingHotplug` → old incident invalidated
-  by that boundary and **at most one fresh** `RecoveryId` if recovery is still
-  required; same-identity `TopologyRebuild` → the **same** incident and its
-  remaining budget transferred; `DPMS` → paused (off defers it on
-  `dpms_target = On`, on resumes it), never consumed, cloned or revived;
-  `NormalRecovery` → continued, equal events absorbed.
-- **R6-2** No path both invalidates and transfers an id, allocates two ids,
-  lets DPMS revive `RecoveryFailed`, or spends an attempt twice (item 67).
-- **R6-3** `REC-1`: one automatic attempt per incident; any failure or
-  unknown during it → `RecoveryFailed`; timers, DPMS, client traffic and
-  queued intents cannot create another attempt.
-
-**Tests:**
-
-| Test | Scenario | Must fail under |
-| --- | --- | --- |
-| `c0_3a_recovery_matrix_is_total` | every winning kind × an active incident (and × `RecoveryFailed`): the exact outcome of R6-1 (item 67) | **T23** transfer the incident on `IdentityChangingHotplug`; **T24** let DPMS allocate a fresh id |
-| `c0_3a_no_double_fate` | every row: the outcome is never both invalidated and transferred, and at most one id is allocated | **T25** allocate a fresh id and also transfer the old one on `VTAcquire` |
-| `c0_3a_one_attempt_per_incident` | an attempt fails, then DPMS on, a timer, and repeated normal-recovery events: no second attempt, state `RecoveryFailed` | **T26** let DPMS-on resume a `RecoveryFailed` incident |
+| `c0_3a_poisoned_dpms_is_logical_only` | `Poisoned` device, DPMS off then on: no KMS-mutation action, and the representative is `Deferred(ReadinessClosed)`, so the coordinator does not count it `Applied` | **T22** emit the DPMS commit request while `Poisoned`; **T37** mark the representative `Applied` |
 
 ## Task 5 — the coordinator
 
