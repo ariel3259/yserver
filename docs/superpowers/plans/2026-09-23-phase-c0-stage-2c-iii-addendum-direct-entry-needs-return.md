@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only the filters `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` with `--include-ignored`, never `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the invariant, the named tests with the scenario each must exercise, and the mutations each must catch. Stop with the tree dirty when done. **Do not ask for approval inside a run** — if something this plan states does not hold in the code, stop and report it (F8); never silently substitute a test shape or weaken an existing assertion.
 
+**Revision 4 (2026-09-23)** — codex round 3
+(`../findings/2026-09-23-ciii-addendum-plan-review-round3.md`: 0 blocking,
+2 major; every round-2 finding APPLIED): the gate runs each permitted
+`#[ignore]` family by its own filter (M-1), and failing to build the
+two-output intermediate state is an F8 stop, not an optional omission (M-2).
+
 **Revision 3 (2026-09-23) — rewritten, not patched.** Codex round 2
 (`../findings/2026-09-23-ciii-addendum-plan-review-round2.md`: 1 blocking,
 3 major, all verified) showed every revision-2 change traded: a gate in
@@ -116,19 +122,21 @@ report):
   and `refused_present_composes_then_enters_vulkan` fail.
 - **A2** — apply the check to successors too: `successor_eligibility_ignores_the_return` fails.
 - **A3** — evaluate the predicate on the first output only:
-  `every_output_needs_its_return_vulkan` fails. If no fixture can put two
-  outputs on one device, or production entries cannot produce the
-  first-established/second-absent state, that test is reported **not
-  written, with the reason**, and **I-1's every-output clause is recorded as
-  unproved** in the report — never counted as passing evidence, never proved
-  with a fake device.
+    `every_output_needs_its_return_vulkan` fails. The every-output clause is an
+  exit criterion: if no fixture can put two outputs on one device, or
+  production entries cannot produce the first-established/second-absent
+  state, **stop and report it as an F8** — the task is not complete without
+  this proof, and it is never proved with a fake device.
 - **A4** — apply the check without the active-conductor condition:
   `legacy_eligibility_unchanged` fails.
 
 **Gate:** `cargo +nightly fmt`; `cargo clippy --all-targets -- -D warnings` in
 default, `--features tcp-transport` and `--features xdmcp`;
-`cargo test -p yserver --lib c0_conv_ -- --include-ignored` and `c0_adm`
-(debug); `cargo test -p yserver --lib` (debug). Report exact counts.
+one `cargo test -p yserver --lib <filter> -- --include-ignored` per permitted
+family — `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`,
+`c0_adm` — and never a broader ignored filter; then `cargo test -p yserver
+--lib` without `--include-ignored` (debug). Report exact counts per
+command.
 
 ## Limits
 
