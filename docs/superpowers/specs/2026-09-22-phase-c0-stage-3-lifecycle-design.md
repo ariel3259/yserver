@@ -1,7 +1,8 @@
 # Phase C.0 stage 3 — lifecycle, modeset, DPMS, VT and topology
 
-**Status:** Umbrella design, **revision 2** (codex round 1:
-[findings](../findings/2026-09-22-stage-3-umbrella-design-review-round1.md)).
+**Status:** Umbrella design, **revision 3** (codex rounds
+[1](../findings/2026-09-22-stage-3-umbrella-design-review-round1.md) and
+[2](../findings/2026-09-22-stage-3-umbrella-design-review-round2.md)).
 Sections 1–4 approved section by section by the
 user on 2026-09-22 (brainstorming session). It fixes the decomposition, the
 shared contracts, the client-visible contract and the evidence regime of
@@ -198,18 +199,34 @@ them.
 - DPMS-off requires old-active out-fence evidence (C.0 §16.2 item 45).
 - A DPMS target arriving while the seat is released is `Deferred`, not
   dropped (C.0 §16.3, lifecycle hardware list).
-- **The failure entry edge is executed in 3a, not deferred** *(rev 2, round-1
-  B-1)*. No live lifecycle commit exists without it. A DPMS transition whose
-  commit is rejected, loses completion evidence or breaches its deadline goes
-  through the device owner's existing poison (`DeviceCommitOwner::is_poisoned`
-  closes admission; `CompletionUnknown` records are quarantined by the 2b
-  ledger), and the driver then: terminalizes the transition, moves the §6.4
-  state to `Poisoned`, records the `REC-6` outcome for any incident, gives
-  every affected event id its disposition, and retains the quarantine under the
-  device. What 3d adds is the **exit** from `Poisoned` — the sole `REC-1`
-  recovery attempt, `RecoveryFailed`, `ExecutorStalled` and teardown. Between
-  3a and 3d a poisoned Owner device simply stays closed; that window exists
-  only in fixtures, because production is `Legacy` until stage 5.
+- **The failure edges are executed in 3a, not deferred** *(rev 2, round-1
+  B-1; rev 3, round-2 B-1)*. No live lifecycle commit exists without them, and
+  they are two distinct outcomes, as C.0 §10 makes them:
+  - **Explicit rejection** — the ioctl result proves it, or cancellation
+    happened before IPC dispatch: `FailedBeforeSubmit`. Nothing submitted
+    became current, the previous state stays authoritative, unreferenced new
+    resources are released, and the transition ends with the classified result
+    (retry, topology-scoped latch for an `EINVAL`/`EOPNOTSUPP` attributable to
+    one object combination, or readiness closure). **No incarnation poison,
+    no quarantine.**
+  - **Completion loss or mechanism breach** — missing, invalid or error
+    out-fence, completion deadline, event contradiction, or acceptance that
+    cannot be disproved: `CompletionUnknown`. The device owner's existing
+    poison closes admission (`DeviceCommitOwner::is_poisoned`) and the 2b
+    ledger quarantines the record; the driver then terminalizes the
+    transition, moves the §6.4 state to `Poisoned`, records the `REC-6`
+    outcome for any incident, gives every affected event id its disposition,
+    and retains the quarantine under the device.
+  The production route must actually reach that handler: today an owner
+  `MechanismFailed` event calls `request_exit()` (`backend.rs:21183`), which
+  would end the server instead of leaving the device in `Poisoned`. On an
+  Owner device 3a replaces that exit with the driver's `Poisoned` entry (C.0
+  §10: "the core may remain responsive … no new scanout/Present state is
+  accepted"); the 3a spec states what the Legacy-handover failure case keeps.
+  What 3d adds is the **exit** from `Poisoned` — the sole `REC-1` recovery
+  attempt, `RecoveryFailed`, `ExecutorStalled` and teardown. Between 3a and 3d
+  a poisoned Owner device stays closed; that window exists only in fixtures,
+  because production is `Legacy` until stage 5.
 - **Projections follow topology** *(rev 2, round-1 M-2)*. Any installation of a
   topology — here, and in 3b and 3c — first refreshes each stable output's
   `dpms_target` from the coordinator's current global level and epoch, so a
@@ -244,6 +261,39 @@ them.
   a requester that is still waiting. A requester's disconnect cancels its reply,
   never an accepted transition or its broadcast. This touches `yserver-core`'s
   continuation and is part of 3b's scope.
+- **Every disposition resolves the parked request** *(rev 3, round-2 M-1)*.
+  Today a parked request leaves the core's table only on a ready wake or a
+  cancellation (`core_loop/run.rs:1055`), so a transition that never reaches
+  `Applied` would park its client forever. Every terminal `REC-5` disposition
+  of the request's event id wakes it, and a still-connected requester gets:
+
+  | Disposition of the request's transition | Reply | Publication |
+  | --- | --- | --- |
+  | `Applied` | `Success` | this transition's result |
+  | `AbsorbedByTransition(winner)` (the winner installed the same target) | `Success` | the winner's, once, at the winner's `Applied` |
+  | `SupersededBy`, `Invalidated`, `AbsorbedByEvent` of a different target | `Failed` | none from this transition |
+  | `FailedBeforeSubmit` (explicit rejection) | `Failed` | none; previous state authoritative |
+  | `CompletionUnknown` / accepted-stale | `Failed` | none from this transition; the device's withdrawal or recovery publishes later |
+
+  A stale result never publishes the displaced transition: publication is
+  decided at the section 2.4 result-disposition boundary, which already
+  refuses to promote it. `Deferred(prerequisite)` is not terminal; the 3b spec
+  names what a requester sees while its modeset is deferred behind a released
+  VT, and that behavior must match Legacy's (measured by the user's VT golden
+  capture), never an indefinite park without a bound.
+- **Publication order is protocol order** *(rev 3, round-2 M-2)*. The core
+  captures `set_time` at dispatch (`process_request.rs:4657`) and a successful
+  completion writes it as `lastSetTime` (`rebuild_randr_state`,
+  `backend.rs:10652`). With per-device commits (C.0 §13), device A's earlier
+  request can complete after device B's later one and would move `lastSetTime`
+  backward. The core therefore publishes RANDR outcomes **in dispatch order**:
+  a completion whose predecessor request (on any device) has not yet reached a
+  terminal disposition waits, *for publication only*, until it has. Hardware
+  work is never serialized across devices by this rule. This reproduces Legacy,
+  whose synchronous path publishes in dispatch order by construction;
+  `lastConfigTime` keeps its separate rule (bumped only by configuration
+  changes, never by a CRTC set). The protocol-order gate includes two devices
+  completing in reverse order.
 - Topology epochs invalidate earlier queued intents (C.0 §9.2, §13).
 - Exit: `modeset` coverage proven. Hardware: a RANDR mode change and an
   output disable/enable, × 4.
@@ -291,7 +341,9 @@ neither Xorg nor wlroots has an isolated asynchronous executor.
 
 **Timing rule.** RANDR events and the `RRSetCrtcConfig` reply are emitted only
 when the transition reaches `Applied` — never at submission. A rejected or
-acceptance-unknown transition answers `Failed`. Any other behavior that differs
+acceptance-unknown transition answers `Failed`; the full mapping from every
+disposition to reply and publication is the table in 3b, and publication
+follows dispatch order across devices (3b). Any other behavior that differs
 from Legacy is written into the sub-stage spec as a named exception with its
 justification.
 
@@ -318,7 +370,11 @@ inside `cargo test` fixtures.
      connection are compared — the reply, its status, and the RANDR events on
      the requester's connection and on a second, listening connection, in
      order. The script includes a requester that disconnects while parked
-     (section 3b's publication rule: the listener still receives the events).
+     (section 3b's publication rule: the listener still receives the events),
+   a request whose transition is superseded (it is answered `Failed` and
+   nothing of it is published), and two requests on two devices completing in
+   reverse order (published in dispatch order, `lastSetTime` never moving
+   backward).
    Identical, except for the named exceptions. `randr.rs` validation stays
    upstream of the backend and is not touched.
 2. **Legacy golden, captured before 3a is implemented.** The current
