@@ -364,6 +364,11 @@ impl LifecycleDriver {
     }
 
     #[cfg(test)]
+    pub(crate) fn pending_topology_validation_commits_for_tests(&self) -> Vec<CommitId> {
+        self.pending_topology_validations.keys().copied().collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn pending_topology_descriptions_for_tests(&self) -> Vec<&CommitDescription> {
         self.pending_topology_validations
             .values()
@@ -860,6 +865,14 @@ impl KmsBackend {
                     }
                     if let Some(owner) = self.platform.owner_for(device) {
                         let _ = owner.update_lifecycle_context(work_tag.lifecycle_epoch, None);
+                    }
+                    if self.owner_outputs_powered_on(device)
+                        && self.lifecycle_coordinator.protocol_dpms_level() == 0
+                    {
+                        self.scene.wake_for_devices(
+                            &self.platform,
+                            &std::collections::HashSet::from([device]),
+                        );
                     }
                 }
             }
@@ -1870,6 +1883,16 @@ impl KmsBackend {
             })
     }
 
+    /// Owner DPMS changes every CRTC in a device's projection together. Until
+    /// the corresponding lifecycle commit completes, the last acknowledged
+    /// physical state remains authoritative for ordinary admission.
+    pub(crate) fn owner_outputs_powered_on(&self, device: DrmDeviceKey) -> bool {
+        self.owner_dpms_installed_active
+            .get(&device)
+            .copied()
+            .unwrap_or(true)
+    }
+
     pub(crate) fn install_admission_conductor(
         &mut self,
         device: DrmDeviceKey,
@@ -2360,6 +2383,7 @@ impl KmsBackend {
             .commit_consumer
             .capacity
             .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement);
+        let outputs_powered_on = self.owner_outputs_powered_on(device);
         let backend_composed = self
             .admission_conductors
             .get(&device)
@@ -2428,7 +2452,9 @@ impl KmsBackend {
             for (&crtc, &generation) in &conductor.composed {
                 snapshot.report(
                     IntentKey::Composed { crtc, generation },
-                    if backend_composed {
+                    if !outputs_powered_on {
+                        Readiness::Waiting(WaitReason::OutputPoweredOff)
+                    } else if backend_composed {
                         backend_composed_readiness
                             .get(&(crtc, generation))
                             .copied()
@@ -2499,7 +2525,9 @@ impl KmsBackend {
             }
 
             if conductor.admission.unflip().is_some() {
-                let readiness = if !exit_retirement_vacant {
+                let readiness = if !outputs_powered_on {
+                    Readiness::Waiting(WaitReason::OutputPoweredOff)
+                } else if !exit_retirement_vacant {
                     Readiness::Waiting(WaitReason::ExitRetirementOccupied)
                 } else if !composed_return_established {
                     Readiness::Waiting(WaitReason::ComposedReturnNotEstablished)

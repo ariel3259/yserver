@@ -4092,6 +4092,15 @@ impl KmsBackend {
         {
             eligibility.eligible = false;
         }
+        if self
+            .present_crtc_key(candidate.crtc_id)
+            .map(|key| key.device_key)
+            .is_some_and(|device| {
+                self.admission_is_active(device) && !self.owner_outputs_powered_on(device)
+            })
+        {
+            eligibility.eligible = false;
+        }
         eligibility
     }
 
@@ -59097,6 +59106,656 @@ mod tests {
             1,
             "the test keeps a resource batch pending while observing the clock"
         );
+    }
+
+    fn c0_3aii_replace_owner_executor(
+        backend: &mut super::KmsBackend,
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) {
+        if let Some(executor) = backend.platform.devices[0].executor.as_mut() {
+            crate::kms::executor::test_support::kill_and_reap(executor);
+        }
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(behaviour)
+                .expect("replace Owner test executor"),
+        );
+    }
+
+    fn c0_3aii_apply_dpms_transition(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        level: u8,
+    ) -> crate::kms::owner::identity::CommitId {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        c0_3aii_prepare_lifecycle_clock(backend, device);
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        Backend::set_dpms_power(backend, level).expect("Owner DPMS request");
+        wait_executor_readable_for_tests(backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("validated DPMS topology must dispatch");
+        let commit = record.commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        c0_3aii_replace_owner_executor(backend, StubBehaviour::NeverReply);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now(),));
+
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device).copied(),
+            Some(level == 0),
+            "Owner power state changes only after routed completion"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .expect("Owner lifecycle arbiter")
+                .state(),
+            crate::kms::owner::lifecycle::DeviceLifecycleState::Ready,
+            "applied DPMS returns the Owner device to Ready"
+        );
+        commit
+    }
+
+    fn c0_3aii_prepare_lifecycle_clock(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("Owner lifecycle output");
+        let crtc_key = CrtcKey::for_output(&backend.platform.outputs[output_idx]);
+        let hardware_crtc = u32::from(crtc_key.crtc);
+        let (lifecycle, topology_generation, old_key, old_clock_current) = {
+            let owner = backend.platform.owner_ref(device).expect("Owner device");
+            let (lifecycle, topology_generation) = owner.clock_context();
+            let old_key = owner.clock_key_for_hardware_crtc(hardware_crtc);
+            let old_clock_current = old_key.is_some_and(|key| {
+                owner.clock(key).is_some_and(|clock| {
+                    clock.lifecycle_epoch == lifecycle
+                        && clock.topology_generation == topology_generation
+                })
+            });
+            (lifecycle, topology_generation, old_key, old_clock_current)
+        };
+        let clock_key = match old_key {
+            Some(key) if old_clock_current => key,
+            Some(key) => {
+                let next_epoch = crate::kms::owner::identity::ClockEpochId::from_raw(
+                    key.epoch
+                        .get()
+                        .checked_add(1)
+                        .expect("clock epoch exhausted"),
+                );
+                let events = backend
+                    .platform
+                    .owner_for(device)
+                    .expect("Owner device")
+                    .invalidate_clock(key);
+                if !events.is_empty() {
+                    assert!(backend.route_owner_event_batch(
+                        device,
+                        events,
+                        std::time::Instant::now(),
+                    ));
+                }
+                let key = crate::kms::owner::clock::ClockKey {
+                    hardware_crtc,
+                    epoch: next_epoch,
+                };
+                backend
+                    .platform
+                    .owner_for(device)
+                    .expect("Owner device")
+                    .install_clock(key, lifecycle, topology_generation)
+                    .expect("install lifecycle completion clock");
+                key
+            }
+            None => {
+                let key = crate::kms::owner::clock::ClockKey {
+                    hardware_crtc,
+                    epoch: backend.clock_epoch_for_crtc_key(crtc_key),
+                };
+                backend
+                    .platform
+                    .owner_for(device)
+                    .expect("Owner device")
+                    .install_clock(key, lifecycle, topology_generation)
+                    .expect("install lifecycle completion clock");
+                key
+            }
+        };
+        backend
+            .platform
+            .owner_for(device)
+            .expect("Owner device")
+            .clock_mut(clock_key)
+            .expect("lifecycle completion clock")
+            .install_reference(1_000);
+        backend.platform.record_completion_clock(
+            crtc_key,
+            yserver_core::backend::PresentClockSample {
+                msc: 1_000,
+                ust: 1_000_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
+    }
+
+    fn c0_3aii_compose_from_scene(backend: &mut super::KmsBackend, output_idx: usize) {
+        backend.scene.mark_scene_structure_damage_rect(
+            output_idx,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: 19,
+                    height: 23,
+                },
+            },
+        );
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+    }
+
+    fn c0_3aii_owner_current_framebuffer(
+        backend: &mut super::KmsBackend,
+        output_idx: usize,
+    ) -> Option<::drm::control::framebuffer::Handle> {
+        backend
+            .scene
+            .owner_current_framebuffer(
+                output_idx,
+                None,
+                backend.resource_service.as_mut().expect("resource service"),
+            )
+            .expect("read current Owner framebuffer")
+    }
+
+    fn c0_3aii_current_composed_allocation(
+        backend: &super::KmsBackend,
+    ) -> crate::kms::render::resources::AllocationKey {
+        backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .find(|resources| resources.direct_role.is_none())
+            .and_then(|resources| resources.allocations.first())
+            .expect("current composed Owner allocation")
+            .key()
+    }
+
+    fn c0_3aii_current_direct_allocation(
+        backend: &super::KmsBackend,
+    ) -> crate::kms::render::resources::AllocationKey {
+        backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .find(|resources| {
+                resources.direct_role.as_ref().is_some_and(|role| {
+                    role.role() == crate::kms::render::resources::DirectRole::Current
+                })
+            })
+            .and_then(|resources| resources.allocations.first())
+            .expect("current direct Owner allocation")
+            .key()
+    }
+
+    fn c0_3aii_accept_and_complete_live_record(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) {
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("Owner live record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        c0_3aii_replace_owner_executor(
+            backend,
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+        );
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now(),));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_off_waits_for_the_accepted_predecessor_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("Owner device").key;
+        let output_idx = 0;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let predecessor = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("production composed offer dispatches")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, predecessor);
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("accepted composed predecessor")
+                .milestones()
+                .accepted
+        );
+
+        let admission_trace_before = backend.admission_trace_for_tests(device);
+        Backend::set_dpms_power(backend, 3).expect("queue DPMS off behind predecessor");
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("predecessor remains current")
+                .commit_id(),
+            predecessor,
+            "DPMS must not replace an accepted composed Owner record"
+        );
+        assert!(
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .expect("Owner lifecycle driver")
+                .pending_topology_validation_commits_for_tests()
+                .is_empty(),
+            "off cannot run TEST_ONLY before predecessor terminalization"
+        );
+        assert_eq!(
+            backend.admission_trace_for_tests(device),
+            admission_trace_before,
+            "the lifecycle closure must not enter admission while the predecessor is accepted"
+        );
+
+        c0_3aii_prepare_lifecycle_clock(backend, device);
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::Scripted(
+                crate::kms::executor::test_support::ScriptedReply::Accepted { mask: 0, fds: 0 },
+            ),
+        );
+        let predecessor_completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(
+            device,
+            predecessor_completion,
+            std::time::Instant::now(),
+        ));
+        wait_executor_readable_for_tests(backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+        let off = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("off topology dispatch follows predecessor retirement")
+            .commit_id();
+        assert_ne!(off, predecessor);
+        c0_3aii_accept_and_complete_live_record(backend, device);
+        assert!(!backend.owner_outputs_powered_on(device));
+        assert!(
+            backend
+                .scene
+                .owner_current_framebuffer(
+                    output_idx,
+                    None,
+                    backend.resource_service.as_mut().expect("resource service")
+                )
+                .expect("retained current buffer")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_composed_waits_while_off_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("Owner device").key;
+        c0_conv_ciii_establish_composed_return(backend, device);
+        c0_3aii_apply_dpms_transition(backend, device, 3);
+
+        c0_3aii_compose_from_scene(backend, 0);
+        assert!(
+            backend.device_owner_for_tests(0).live_record().is_none(),
+            "a composed offer must not dispatch while its CRTC is off"
+        );
+        let (&crtc, &generation) = backend
+            .admission_conductors
+            .get(&device)
+            .expect("Owner conductor")
+            .composed
+            .iter()
+            .next()
+            .expect("offscreen scene compose must offer a generation");
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .expect("off Owner snapshot")
+                .readiness(IntentKey::Composed { crtc, generation }),
+            Some(Readiness::Waiting(WaitReason::OutputPoweredOff))
+        );
+        c0_3aii_apply_dpms_transition(backend, device, 0);
+        let full = backend
+            .scene
+            .scene_structure_damage_for_tests(0)
+            .expect("scene structure damage after on");
+        assert!(
+            full.iter().any(|rect| {
+                rect.offset == ash::vk::Offset2D::default()
+                    && rect.extent.width == u32::from(backend.platform.outputs[0].width)
+                    && rect.extent.height == u32::from(backend.platform.outputs[0].height)
+            }),
+            "applied on marks the Owner scene for a full frame"
+        );
+
+        c0_3aii_compose_from_scene(backend, 0);
+        let composed = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("ordinary composed admission reopens after on");
+        assert!(composed.closure().expected_completion().contains(&crtc));
+        c0_3aii_accept_and_complete_live_record(backend, device);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_retained_buffer_survives_off_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("Owner device").key;
+        c0_conv_ciii_establish_composed_return(backend, device);
+        let framebuffer =
+            c0_3aii_owner_current_framebuffer(backend, 0).expect("composed return framebuffer");
+        let allocation = c0_3aii_current_composed_allocation(backend);
+        assert!(backend.resource_service().unwrap().contains(&allocation));
+
+        c0_3aii_apply_dpms_transition(backend, device, 3);
+        assert_eq!(
+            c0_3aii_owner_current_framebuffer(backend, 0),
+            Some(framebuffer)
+        );
+        assert!(backend.resource_service().unwrap().contains(&allocation));
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|resources| resources
+                    .allocations
+                    .iter()
+                    .any(|lease| lease.key() == allocation))
+        );
+
+        c0_3aii_apply_dpms_transition(backend, device, 0);
+        assert_eq!(
+            c0_3aii_owner_current_framebuffer(backend, 0),
+            Some(framebuffer)
+        );
+        assert!(backend.resource_service().unwrap().contains(&allocation));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_direct_stays_pinned_through_off_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("Owner device").key;
+        let successor = c0_conv_ciii_add_enter_direct_and_retire(backend, device, 1_300)
+            .expect("production direct scanout entry");
+        let direct_allocation = c0_3aii_current_direct_allocation(backend);
+        let current_target = backend
+            .scanout_m2
+            .current
+            .as_ref()
+            .expect("direct frame current")
+            .candidate
+            .paint_dst_host_xid;
+
+        c0_3aii_apply_dpms_transition(backend, device, 3);
+        assert!(
+            backend.scanout_m2.current.is_some(),
+            "DPMS off keeps direct current"
+        );
+        assert!(
+            !backend.scanout_m2.unflip_requested,
+            "DPMS off does not unflip first"
+        );
+        assert!(
+            backend
+                .resource_service()
+                .unwrap()
+                .contains(&direct_allocation)
+        );
+        assert!(
+            !backend
+                .direct_present_eligibility(successor.candidate)
+                .eligible
+        );
+        assert!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .unwrap()
+                .admission
+                .direct()
+                .is_none(),
+            "an off CRTC admits no direct successor"
+        );
+
+        backend
+            .destroy_subwindow(None, current_target)
+            .expect("destroy source window while direct framebuffer is off");
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(backend.scanout_m2.current.is_some());
+        assert!(
+            backend
+                .resource_service()
+                .unwrap()
+                .contains(&direct_allocation)
+        );
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|resources| resources
+                    .allocations
+                    .iter()
+                    .any(|lease| lease.key() == direct_allocation))
+        );
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .unwrap()
+                .readiness(IntentKey::Unflip),
+            Some(Readiness::Waiting(WaitReason::OutputPoweredOff))
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+
+        c0_3aii_apply_dpms_transition(backend, device, 0);
+        assert!(backend.direct_unflip_shadow_ready());
+        assert!(
+            backend.scanout_m2.owner_unflip_return.is_some(),
+            "post-on replacement uses ordinary Ciii unflip"
+        );
+        assert!(backend.scanout_m2.current.is_some());
+        let unflip_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("ordinary Ciii unflip record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, unflip_commit);
+        c0_conv_cii_complete_direct_owner_hardware(backend, device);
+        assert!(backend.scanout_m2.current.is_none());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_destroy_while_off_equals_destroy_while_lit_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        fn scenario(off: bool, first_present_id: u32) -> (bool, bool, bool, bool) {
+            let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+            let backend = &mut fixture.backend;
+            let device = backend.platform.primary_device().expect("Owner device").key;
+            c0_conv_ciii_establish_composed_return(backend, device);
+            let composed_framebuffer =
+                c0_3aii_owner_current_framebuffer(backend, 0).expect("retained composed return");
+            c0_conv_ciii_add_enter_direct_and_retire(backend, device, first_present_id)
+                .expect("production direct scanout entry");
+            assert!(
+                !backend.scanout_m2.unflip_requested,
+                "off={off} entry stays direct"
+            );
+            let target = backend
+                .scanout_m2
+                .current
+                .as_ref()
+                .expect("direct frame current")
+                .candidate
+                .paint_dst_host_xid;
+            if off {
+                c0_3aii_apply_dpms_transition(backend, device, 3);
+                assert_eq!(
+                    c0_3aii_owner_current_framebuffer(backend, 0),
+                    Some(composed_framebuffer)
+                );
+            }
+            backend
+                .destroy_subwindow(None, target)
+                .expect("destroy the current direct source window");
+            assert!(backend.scanout_m2.unflip_requested, "off={off}");
+            if off {
+                assert!(
+                    backend
+                        .admission_conductors
+                        .get(&device)
+                        .unwrap()
+                        .admission
+                        .unflip()
+                        .is_some(),
+                    "off retains the ordinary Ciii intent"
+                );
+                assert_eq!(
+                    backend
+                        .admission_snapshot(device, false)
+                        .unwrap()
+                        .readiness(IntentKey::Unflip),
+                    Some(Readiness::Waiting(WaitReason::OutputPoweredOff))
+                );
+                assert!(
+                    backend
+                        .commit_consumer
+                        .capacity
+                        .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement)
+                );
+                assert!(backend.composed_return_established(device));
+                assert!(backend.direct_unflip_shadow_ready());
+                c0_3aii_apply_dpms_transition(backend, device, 0);
+            } else {
+                assert!(
+                    backend.scanout_m2.owner_unflip_return.is_some(),
+                    "lit destruction immediately decides the ordinary unflip"
+                );
+            }
+            assert!(
+                backend.scanout_m2.owner_unflip_return.is_some(),
+                "both paths dispatch the ordinary Ciii unflip"
+            );
+            let exit_retirement_vacant = backend
+                .commit_consumer
+                .capacity
+                .is_vacant(crate::kms::render::resources::DirectRole::ExitRetirement);
+            let composed_return = backend.composed_return_established(device);
+            let shadow_ready = backend.direct_unflip_shadow_ready();
+            assert!(!exit_retirement_vacant && composed_return && shadow_ready);
+            let unflip_commit = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("ordinary Ciii unflip record")
+                .commit_id();
+            c0_conv_cii_accept_direct_owner_commit(backend, device, unflip_commit);
+            c0_conv_cii_complete_direct_owner_hardware(backend, device);
+            let returned_to_composed =
+                backend.scanout_m2.current.is_none() && backend.composed_return_established(device);
+            (
+                exit_retirement_vacant,
+                composed_return,
+                shadow_ready,
+                returned_to_composed,
+            )
+        }
+
+        let off = scenario(true, 1_500);
+        let lit = scenario(false, 1_700);
+        assert_eq!(
+            off, lit,
+            "destroying while off preserves Ciii unflip readiness and outcome"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_unflip_requested_while_off_is_kept_vulkan() {
+        use crate::kms::owner::admission::{IntentKey, Readiness, WaitReason};
+
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("Owner device").key;
+        c0_conv_ciii_add_enter_direct_and_retire(backend, device, 1_900)
+            .expect("production direct scanout entry");
+        c0_3aii_apply_dpms_transition(backend, device, 3);
+
+        backend.request_direct_unflip("c0_3aii_unflip_requested_while_off");
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .unwrap()
+                .admission
+                .unflip()
+                .is_some(),
+            "off keeps the ordinary Ciii unflip intent"
+        );
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .unwrap()
+                .readiness(IntentKey::Unflip),
+            Some(Readiness::Waiting(WaitReason::OutputPoweredOff))
+        );
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+
+        c0_3aii_apply_dpms_transition(backend, device, 0);
+        assert!(
+            backend.scanout_m2.owner_unflip_return.is_some(),
+            "on decides the retained intent through ordinary Ciii admission"
+        );
+        let unflip_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("ordinary Ciii unflip record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, unflip_commit);
+        c0_conv_cii_complete_direct_owner_hardware(backend, device);
+        assert!(backend.scanout_m2.current.is_none());
     }
 
     fn lifecycle_test_tag(

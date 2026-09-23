@@ -30,6 +30,7 @@ pub enum WaitReason {
     ComposedReturnNotEstablished,
     UnflipShadowNotMaterialized,
     NotDirectEligible,
+    OutputPoweredOff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
