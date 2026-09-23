@@ -69,14 +69,33 @@ only the window the request named.
 
 Core's resources layer returns a
 `ViewabilityDelta { became_viewable: Vec<Window>, became_unviewable: Vec<Window> }`
-from every operation that can change viewability (MapWindow,
-MapSubwindows, UnmapWindow, UnmapSubwindows, ReparentWindow, DestroyWindow
-of a mapped window, client disconnect). Core then drives, for every member:
+from every operation that changes viewability while the windows survive
+(MapWindow, MapSubwindows, UnmapWindow, UnmapSubwindows, ReparentWindow).
+Destruction is **not** a viewability transition; it has its own path
+(below). Core then drives, for every member:
 storage release/allocation, redirect-backing unrealize/realize, Picture
 rebinding, and the map-time background paint. The backend never infers a
 subtree itself; `window_viewable` / `collect_viewable_bg_paint_targets`
 (`backend.rs:5066`, `:5086`) become consumers of the delta, not a second
 source of truth.
+
+### Destruction is a separate path
+
+DestroyWindow, DestroySubwindows and client-disconnect teardown do not go
+through `ViewabilityDelta`. On unmap a window Picture stays valid and
+rebinds on remap; on destruction Xorg frees every Picture attached to the
+window, including Pictures owned by other clients (`PictureDestroyWindow`,
+`render/picture.c:67`). Treating destroy as "became unviewable" would leave
+dead Pictures valid or let them resurrect onto a reused xid.
+
+Core takes a destruction snapshot of the doomed subtree **before** any
+window record is removed, capturing each window's host handles, and then,
+for every window in it:
+
+- releases the window's storage and its redirect backing;
+- removes the redirect intent (full teardown, as UnredirectWindow);
+- frees every window-backed Picture resource and its backend record,
+  whichever client owns it, rather than parking it for a possible remap.
 
 ### Why content loss is legal and mostly already handled
 
@@ -179,6 +198,10 @@ before adding any hysteresis.
   the exact descendant sets; a CopyArea from an unviewable source yields
   GraphicsExpose, not NoExpose; drawing to an unviewable window records no
   damage; Present to one completes with no copy.
+- Cross-client destruction: client B creates a Picture on client A's
+  window; destroying A's window (and, separately, disconnecting A) makes
+  B's Picture invalid (BadPicture on use), and a new window reusing the
+  host storage does not revive it.
 - Unit tests at the backend level: storage absent after unmap of an
   ancestor; present after map; a window Picture yields no target while
   hidden and rebinds after remap; drawing to an unviewable window is a no-op
