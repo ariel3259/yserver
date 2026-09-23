@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 8 (2026-09-23, coordinator)** — second Task 7 F8 (before
+editing): revision 7's "any served output powered" for composition would stop
+the scene on an off Owner device, contradicting design §3.5 and Task 5. Task 7
+now routes each gate separately (composition stays Legacy's guard, the scene
+wakeup must not spin on `OutputPoweredOff`, cursor animation uses any
+powered output, direct/M1/M0 use the candidate device).
+
 **Revision 7 (2026-09-23, coordinator)** — Task 7 F8 (before editing): four
 `kms_outputs_active` reads on the CRTC-config/topology-requery path run on
 Owner but are consumed only after the Owner gate's refusal; the plan did not
@@ -282,9 +289,27 @@ on Owner routes the read to the device's installed power in the same change.
 Every other Owner-reachable read (direct eligibility, the M1 probe and M0
 observation, the cursor animation tick and deadline, `next_wakeup`,
 `maybe_composite`, the Owner branch of `present_scanout_blackout`) is routed
-and gets its D26 mutation. A backend-wide gate (cursor tick, wakeups,
-composition) asks whether any served output is powered: Legacy outputs by
-`kms_outputs_active`, Owner outputs by installed power.
+and gets its D26 mutation. *(Revision 8, second Task 7 F8: revision 7 said a
+backend-wide gate asks "any served output powered"; for composition that
+contradicts design §3.5 — the scene keeps running off screen — and Task 5's
+committed `c0_3aii_composed_waits_while_off_vulkan`.)* The routing per gate:
+
+- **Composition** (`maybe_composite`'s DPMS early return) is Legacy's EINVAL
+  guard and stays Legacy's: it returns early only when **no Owner output is
+  served** and `kms_outputs_active` is false. With any Owner output served,
+  the scene ticks and an off Owner output's frames wait in admission
+  (`OutputPoweredOff`, Task 5). A mixed Legacy+Owner server exists only in
+  fixtures (stage 5 flips every device at once); the report states what a
+  mixed server with its Legacy outputs off does.
+- **Scene wakeup** (`next_wakeup`'s scene deadline) follows the composition
+  gate, and must not spin: a composed generation waiting on
+  `OutputPoweredOff` never yields an immediate (`now`) scene deadline; the
+  relight (Task 5's output reconciliation) is what wakes it. The test asserts
+  this with every Owner output off and a generation waiting.
+- **Cursor animation** (tick and deadline): any served output powered —
+  Legacy outputs by `kms_outputs_active`, Owner outputs by installed power.
+- **Direct eligibility, M1 probe, M0 observation**: the candidate CRTC's
+  device power.
 
 ## Task 8 — failure edges and the seat
 
