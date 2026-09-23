@@ -2,6 +2,10 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 3 (2026-09-23)** — anchors re-pointed after the upstream merge
+`a232d2af` (joske/master `14f5df87`), which shifted `render/backend.rs` by 80–120
+lines; Task 1 names the second `MechanismFailed` site (the Legacy drain route).
+
 **Revision 2 (2026-09-23)** — incorporates codex round 1
 (`../findings/2026-09-23-stage-3a-ii-plan-review-round1.md`: 2 blocking, 4
 major, all verified): the driver is kicked by the projection itself (B-1);
@@ -36,7 +40,7 @@ i.e. in fixtures, until stage 5.
 1. **The driver** lives in the backend beside `admission_conductors`, one per
    Owner device, and is the only code that applies arbiter actions and feeds
    acknowledged outcomes back (umbrella §2.3.1). It runs at the owner-event
-   routing site (`route_owner_event_batch`, `render/backend.rs:20801`). The
+   routing site (`route_owner_event_batch`, `render/backend.rs:20884`). The
    coordinator is a backend field. A Legacy device has neither.
 2. **Test names start with `c0_3aii_`**; Vulkan tests end in `_vulkan` with
    `#[ignore = "needs live Vulkan ICD"]` on the Owner live fixture
@@ -59,11 +63,13 @@ arbiter input. **The driver is kicked by the projection itself** *(rev 2,
 B-1)*: when the coordinator projects an event into an Owner device's arbiter,
 the resulting actions are applied in the same call (or on a wake the same
 call schedules), and every receipt re-enters the arbiter as it is produced —
-a DPMS request never waits for an unrelated owner event to be routed. `MechanismFailed` on an Owner device (`render/backend.rs:21183`, today
+a DPMS request never waits for an unrelated owner event to be routed. `MechanismFailed` on an Owner device (`render/backend.rs:21266`, today
 `request_exit()`) is reported to the coordinator as a completion loss (C-5)
-and enters `Poisoned` through Table U; the branch recording a failed Legacy
-handover (`legacy_handover_failed`) keeps its behavior for a device that is
-not `Owner`, and the two are distinguished **by the device's transport**.
+and enters `Poisoned` through Table U; the branch recording a failed Legacy handover (`legacy_handover_failed`)
+keeps its behavior for a device that is not `Owner`, and the two are
+distinguished **by the device's transport**. The **second** `MechanismFailed`
+site, in `dispose_legacy_drain_event` (`render/backend.rs:20776`), is the Legacy
+drain route and keeps its exit unchanged *(rev 3)*.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
@@ -77,8 +83,8 @@ not `Owner`, and the two are distinguished **by the device's transport**.
 **Deliver:** `Admission::request_topology` and `Tier::Topology` carry the
 `TransitionTag` instead of a bare `u64` (`admission/intents.rs:180`,
 `admission/decide.rs:451`). The conductor's `Admitted::Topology` arm
-(`render/admission.rs:2019`, today `Unsupported`) dispatches through a new
-path modelled on `admission_dispatch_unflip` (`:1130`). **Before the final
+(`render/admission.rs:2041`, today `Unsupported`) dispatches through a new
+path modelled on `admission_dispatch_unflip` (`:1152`). **Before the final
 `TEST_ONLY` and again before executor dispatch** it compares the tag with the
 device's current incarnation, epoch and transition; a stale entry is cancelled
 as never-submitted and reported to the arbiter. A supersession removes the
@@ -111,7 +117,7 @@ The commit's completion class is `LifecycleInstallRestore` with the 2 s
 this plan):** C.0 §10.3's Bootstrap paragraph requires that, with no measured
 `LifecycleCompletionObservedMax`, the lifecycle hardware deadline is the 30 s
 ceiling. Today the owner **refuses to dispatch** any lifecycle-class commit
-without a measurement (`owner/device.rs:1313`,
+without a measurement (`owner/device.rs:1312`,
 `DispatchError::LifecycleUnvalidated`), and `deadlines::lifecycle_hardware`
 returns `LifecycleUnvalidated` for `None` (`owner/deadlines.rs:37`, whose unit
 test asserts exactly that). Both follow the pre-amendment text. Implement the
@@ -133,13 +139,13 @@ twice, arbiter once) into one function used by all three.
 
 ## Task 4 — the transport fork of `set_dpms_power`
 
-**Deliver (3a design §3.3):** `set_dpms_power` (`render/backend.rs:30965`)
+**Deliver (3a design §3.3):** `set_dpms_power` (`render/backend.rs:31075`)
 splits per device. Legacy devices keep today's code **restricted to Legacy
 devices**: the loop of `dpms_set_outputs_active` (`render/platform.rs:8184`)
 iterates only their outputs, and every other server-wide step of the off and
 on paths is inventoried by the implementer and either scoped to Legacy devices
 or proven harmless to an Owner device — at least `scene.drain_all`,
-`platform.reset_scanout_bos_for_suspend()` (`render/backend.rs:31087`–`31090`),
+`platform.reset_scanout_bos_for_suspend()` (`render/backend.rs:31198`–`31200`),
 vblank-target clearing, cursor re-arm, gamma reapply, `wake_for_damage`.
 Owner devices go to the coordinator (projection, idempotence from the
 arbiter's targets, never `kms_outputs_active`). **A new output inherits
@@ -149,7 +155,7 @@ it; today's discovery/registration path), the coordinator's current level and
 epoch are projected onto it **before** any installation can light it, and a
 removed output's projection is invalidated exactly once. Executed hotplug is
 3c's; the hook and its test are 3a's. **The resource service's
-serviced-time clock** (`set_seat_active`, `render/backend.rs:31099`,
+serviced-time clock** (`set_seat_active`, `render/backend.rs:31214`,
 `resources/mod.rs:319`) runs while any served output of any device is lit.
 
 | Test | Scenario | Must fail under |
@@ -222,8 +228,8 @@ representative is `Deferred(TopologyLatched(gen))` for an attributable
 `EINVAL`/`EOPNOTSUPP` or `Deferred(ReadinessClosed)` otherwise, never retried
 under the same generation; a completion loss enters `Poisoned` through Table
 U; while `Poisoned` a DPMS change is logical only. The seat target is fed
-read-only from `run_suspend`/`run_resume` (`render/backend.rs:13762`,
-`:13890`) into the coordinator; a DPMS request while the seat is released is
+read-only from `run_suspend`/`run_resume` (`render/backend.rs:13845`,
+`:13973`) into the coordinator; a DPMS request while the seat is released is
 `Deferred(SeatReleased)` and converges on reacquire. Capability stability:
 the advertised cursor/primary capability does not change across DPMS cycles
 or an injected completion loss (C.0 §16.2 item 39).
@@ -248,7 +254,7 @@ or an injected completion loss (C.0 §16.2 item 39).
   second, listening connection** — identical; DPMS has no event, so any byte to
   the listener is a defect.
 - **The hardware test** `c0_hw_3a_dpms_owner_on_card1_drm`, beside
-  `c0_hw_ciii_owner_route_on_card1_drm` (`render/backend.rs:67829`) with the
+  `c0_hw_ciii_owner_route_on_card1_drm` (`render/backend.rs:67990`) with the
   same conventions, **written and compiled, never run by the implementer**:
   off/on × 4 on card1, each off's out-fence observed signalled with no later
   vblank, the retained buffer unchanged, composed frames admitted again after
