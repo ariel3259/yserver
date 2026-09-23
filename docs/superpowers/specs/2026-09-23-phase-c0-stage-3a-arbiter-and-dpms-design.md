@@ -1,7 +1,8 @@
 # Phase C.0 stage 3a — the lifecycle arbiter and global DPMS
 
-**Status:** Revision 2 (codex round 1:
-[findings](../findings/2026-09-23-stage-3a-design-review-round1.md)), written by
+**Status:** Revision 3 (codex rounds
+[1](../findings/2026-09-23-stage-3a-design-review-round1.md) and
+[2](../findings/2026-09-23-stage-3a-design-review-round2.md)), written by
 the coordinator on 2026-09-23 under the user's instruction to continue the
 stage 3 specs. The decisions marked
 **(coordinator decision)** were taken without a brainstorming exchange and
@@ -182,18 +183,29 @@ not assumed (C.0 §10.1: no advance claim about a driver not run).
   **powered off**: primary work on an off CRTC is not admissible, and composed
   offers for it wait with a new reason, `OutputPoweredOff`. The scene keeps
   running off screen.
-- **Direct scanout exits before off** *(rev 2, round-1 M-1)*. If a direct
-  ownership unit is current on any CRTC of the transition, the DPMS-off
-  transition's first phase is the Owner unflip of stage 2c-iii (Ciii): the
-  direct shadow is materialized, the composed return commit is admitted and
-  retires, and the client buffer and its source pin are released by the
-  unflip's own retirement rules (C.0 §10.2: only after the replacement's
-  dependency proves the prior buffer unused). Only then is the `ACTIVE=0`
-  commit built. This reuses the proven Legacy order — shadow first, direct
-  stopped after (`backend.rs:31057`, `:31084`) — through Owner machinery, and it
-  means a client buffer is never what an off CRTC holds. If the unflip fails,
-  the DPMS transition fails with it under section 3.7, before any power
-  change.
+- **Direct scanout exits before off** *(rev 2, round-1 M-1; rev 3, round-2
+  B-2 and M-1)*. If a direct ownership unit is current on any CRTC of the
+  transition, the DPMS-off transition has two phases, each its own commit
+  with its own deadline (C.0 §10.3 gives per-commit bounds, never one
+  combined bound):
+  1. **A transition-owned unflip.** The Ciii Owner unflip (direct shadow
+     materialized, composed return commit) is issued **by the driver as part
+     of the transition**, tagged with the transition's `TransitionTag`, and
+     admitted as the one exception to the §6.4 `Quiescing` closure. Ordinary
+     primary admission stays closed, so no unrelated frame enters; the
+     ordinary entry point `admission_request_unflip`
+     (`render/admission.rs:723`) is not used for it. A `Submitting` or
+     accepted predecessor drains or terminalizes under §10 first (§9.2).
+  2. **The `ACTIVE=0` commit**, built as soon as the unflip's commit is
+     `Completed` — the composed buffer canonically installed as current. It
+     does **not** wait for `PriorBufferReleased`: C.0 §10.2 lets that
+     milestone arrive later and keeps it out of the submission slot, so
+     waiting for it would leave the off without a bound. The client buffer and
+     its source pin stay in the existing BO/resource retirement ledger until
+     their release proof arrives, exactly as after any unflip.
+  A client buffer is therefore never what an off CRTC holds. If the unflip
+  fails, the DPMS transition fails with it under section 3.7, before any
+  power change.
 - The buffer bound to an off CRTC's primary plane — always a composed buffer
   after the rule above — **stays current**: it is referenced by KMS state and
   is not released or reused while off.
@@ -216,7 +228,28 @@ The driver (umbrella §2.3.1) receives the arbiter's actions and applies them
 at the owner-event routing site. For DPMS it: closes admission, requests
 `Tier::Topology` with the transition tag, and — in the conductor's new
 `Admitted::Topology` arm, modelled on `admission_dispatch_unflip` — builds the
-section 3.4 description and dispatches. Every terminal state crosses the
+section 3.4 description and dispatches.
+
+**Freshness is checked before submission too** *(rev 3, round-2 B-1)*. A
+result-side check cannot undo a physical off. C.0 `REC-4`: "no transition may
+… run final `TEST_ONLY`, or install state unless its id and lifecycle epoch
+are still current", and §16.2 item 9: stale DPMS generations cannot submit.
+So the conductor's `Admitted::Topology` arm compares the queued tag with the
+device's current incarnation, epoch and transition **immediately before the
+final `TEST_ONLY` and again immediately before executor dispatch**; a stale
+entry is cancelled as never-submitted and reported to the arbiter as such. A
+supersession also removes the queued `Tier::Topology` entry at once. Once a
+commit is `Submitting` or accepted it is never cancelled as never-submitted;
+its result goes through the boundary below.
+
+**Deadline class** *(rev 3, round-2 M-2)*. The `ACTIVE=0` and `ACTIVE=1`
+commits are §9.2 class-1 topology work, so they use C.0 §10.3's lifecycle
+hardware-completion deadline — the 30 s bootstrap value, since no cohort
+measurement exists — never the fast primary clamp, which could poison a
+healthy but slow link retrain. The host-call watchdog is the 2 s seat-active
+`NONBLOCK` one. The acceptance milestone is `HardwareComplete` from the
+old-active CRTCs' out-fences; there is no Present and no page-event timer.
+Expiry is `CompletionUnknown` (section 3.7). Every terminal state crosses the
 result boundary (umbrella §2.4) before it reaches the arbiter:
 
 | Result at the boundary | Arbiter input |
@@ -315,7 +348,19 @@ first, the client buffer is released only by the unflip's retirement, the
 client may destroy its window while off, and on shows the composed buffer; a
 mixed server with a pending resource batch and a rejected Owner off — the
 serviced-time clock keeps running; and a Legacy off on a mixed server leaving
-the Owner device's scanout state untouched.
+the Owner device's scanout state untouched. Added in revision 3: supersession
+while the topology work is still queued (the stale entry never reaches final
+`TEST_ONLY` or dispatch) and while an earlier executor call is delayed (the
+winner does not dispatch until that call returns or is reaped, and the stale
+result is quarantined); the transition-owned unflip admitted while ordinary
+primary admission stays closed, behind an accepted predecessor that must
+drain; the off commit built after the unflip completes while
+`PriorBufferReleased` is still pending; an injected missing and an injected
+late off fence (expiry at the lifecycle deadline → `CompletionUnknown` →
+`Poisoned`, and a late fence after it never promotes); and **capability
+stability** (C.0 §16.2 item 39): the advertised cursor/primary capability is
+captured before and compared after four Owner off/on cycles and after an
+injected completion loss.
 
 ### 5.3. Hardware (user approval, tty, GPU free)
 
@@ -340,7 +385,12 @@ retired; a DPMS request while `Poisoned` issuing a KMS mutation; a rejected
 representative counted toward `Applied`; a latched generation retried;
 `ACTIVE=0` built while a direct unit is still current; the serviced-time clock
 paused by a Legacy off while an Owner output is lit; `drain_all` or
-`reset_scanout_bos_for_suspend` reaching an Owner device.
+`reset_scanout_bos_for_suspend` reaching an Owner device; a superseded
+topology entry reaching final `TEST_ONLY`; the off commit waiting for
+`PriorBufferReleased`; the transition-owned unflip admitted through the
+ordinary entry point, or ordinary primary work admitted with it; the off
+commit timed by the fast primary clamp; the advertised capability changing
+across DPMS or poison.
 
 ## 6. Out of scope
 
