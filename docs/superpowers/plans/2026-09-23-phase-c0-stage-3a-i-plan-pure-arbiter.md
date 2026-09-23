@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); this plan needs **no GPU and no `#[ignore]` test** — run none of them, never `_drm`, never `render_acceptance`, never an unfiltered `--ignored`; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape.
 
+**Revision 8 (2026-09-23)** — Task 5 F8 from the implementer (stopped
+before editing): Task 4's arbiter has no input for the outcome of a recovery
+attempt, so no path drives an incident's representative to its U-1b outcome.
+Task 5 adds that input (C-6); it extends Task 4's arbiter by one input type
+and is the only change to a committed task.
+
 **Revision 7 (2026-09-23)** — Task 3 F8 from the implementer (stopped
 before editing): C.0's `REC-6` table covers only an **active** incident, and a
 boundary row of Table U has no "without incident" case. F-4 defines the fate
@@ -424,6 +430,17 @@ and the aggregation of the protocol DPMS request.
   (kind `NormalRecovery`) and projects it to that device's arbiter, which
   hands it to Task 3's Table U. Task 3's tests supply the id directly; this
   task proves the coordinator is the only allocator on that path.
+- **C-6** *(rev 8, Task 5 F8)* **The arbiter learns a recovery attempt's
+  outcome.** Task 5 extends Task 4's arbiter with one input, tagged with the
+  attempt's transition: attempt **started** (only when Table U/F authorized it
+  after reap — the arbiter refuses one that was not authorized) → §6.4
+  `Recovering(id)`; **qualified** (a real install qualified) → `Ready`, the
+  incident consumed through Task 3's `RecoveryIncident::resolve`, its
+  representative `Applied(that transition)`; **failed or unknown** →
+  `RecoveryFailed`, the representative `Invalidated(RecoveryFailed)`. A stale
+  tag changes nothing. A boundary's fresh id (F-4) resolves the same way but
+  has no representative to settle. Executing the attempt is 3d's; this is the
+  decision input only.
 
 **Tests:**
 
@@ -434,6 +451,7 @@ and the aggregation of the protocol DPMS request.
 | `c0_3a_shutdown_is_monotonic` | shutdown, then any event: still requested | **T29** let a seat event clear it |
 | `c0_3a_loss_report_gets_a_coordinator_event_id` | the driver reports a loss on device A: the coordinator allocates exactly one event id, only A's arbiter receives it, and it becomes the incident's representative | **T44** let the device arbiter mint the event id itself |
 | `c0_3a_loss_reaches_table_u_through_the_arbiter` | *(rev 5, round-4 M-1)* for **every** Table U row (generated): the loss is reported to the coordinator, projected to the device's arbiter while that row is active, and the arbiter's resulting actions, incident fate and event disposition equal Table U's for that row — the handoff, not the table alone; for rows that create an incident, the representative's disposition is then driven to each U-1b outcome and asserted | **T49** project the loss as a plain lower-priority `NormalRecovery` event that waits behind the active row instead of entering Table U |
+| `c0_3a_recovery_outcome_settles_the_incident` | (C-6) an incident from a normal-live loss, attempt started then qualified: `Recovering(id)` then `Ready`, representative `Applied`; a second run failed: `RecoveryFailed`, representative `Invalidated(RecoveryFailed)`; an attempt start the tables did not authorize is refused; a stale-tagged outcome changes nothing; a boundary's fresh id resolves with no representative | **T53** leave the representative pending after a qualified attempt; **T54** accept an unauthorized attempt start; **T55** apply a stale-tagged outcome |
 | `c0_3a_devices_converge_independently` | a slow device and a fast one under the same epoch: the fast one's arbiter state is final before the slow one's | **T30** make projection wait for every device before any applies |
 
 ## Gate (every task)
