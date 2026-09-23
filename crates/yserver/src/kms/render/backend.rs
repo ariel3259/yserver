@@ -1718,6 +1718,8 @@ pub struct KmsBackend {
     test_skip_render_completion_drain: bool,
     #[cfg(test)]
     resource_cleanup_on_drop_for_tests: bool,
+    #[cfg(test)]
+    pub(crate) composed_return_test_override: Option<bool>,
 
     /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
     /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
@@ -3915,7 +3917,7 @@ impl KmsBackend {
     /// belonging to the candidate's CRTC domain; an unresolved CRTC has no
     /// domain and therefore reports generation zero while remaining refused.
     pub(crate) fn direct_present_eligibility(
-        &self,
+        &mut self,
         candidate: PresentScanoutCandidate,
     ) -> DirectEligibility {
         let source_id = self.store.lookup(candidate.src_host_xid);
@@ -3970,13 +3972,21 @@ impl KmsBackend {
         eligibility.authoritative_root = authoritative_root;
         eligibility.source_id = source_id;
         eligibility.paint_target = paint_target;
+        if self
+            .present_crtc_key(candidate.crtc_id)
+            .map(|key| key.device_key)
+            .and_then(|device| self.direct_entry_composed_return_established(device))
+            == Some(false)
+        {
+            eligibility.eligible = false;
+        }
         eligibility
     }
 
     /// Evaluate the frame named by an admission direct successor. A missing
     /// or mismatched frame is a closed refusal; it cannot authorize a wake.
     pub(crate) fn direct_successor_eligibility(
-        &self,
+        &mut self,
         device: DrmDeviceKey,
         source_generation: u64,
     ) -> DirectEligibility {
@@ -3984,17 +3994,18 @@ impl KmsBackend {
             .admission_conductors
             .get(&device)
             .map_or(0, |conductor| conductor.layout_generation);
-        let Some(frame) = self
+        let Some(candidate) = self
             .scanout_m2
             .queued_successor
             .as_ref()
             .filter(|frame| frame.admission_source_generation == Some(source_generation))
+            .map(|frame| frame.candidate)
         else {
             return DirectEligibility::refused(layout_generation);
         };
-        let mut eligibility = self.direct_present_eligibility(frame.candidate);
+        let mut eligibility = self.direct_present_eligibility(candidate);
         if self
-            .present_crtc_key(frame.candidate.crtc_id)
+            .present_crtc_key(candidate.crtc_id)
             .is_none_or(|key| key.device_key != device)
         {
             eligibility.eligible = false;
@@ -6660,6 +6671,8 @@ impl KmsBackend {
             test_skip_render_completion_drain: false,
             #[cfg(test)]
             resource_cleanup_on_drop_for_tests: false,
+            #[cfg(test)]
+            composed_return_test_override: None,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -7992,6 +8005,8 @@ impl KmsBackend {
             test_skip_render_completion_drain: false,
             #[cfg(test)]
             resource_cleanup_on_drop_for_tests: false,
+            #[cfg(test)]
+            composed_return_test_override: None,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -53827,7 +53842,27 @@ mod tests {
         output_count: usize,
         extra_missing_output: bool,
     ) -> Result<OwnerLiveFixture, std::io::Error> {
+        owner_live_fixture_with_selected_identity(output_count, extra_missing_output)
+    }
+
+    fn owner_live_fixture_with_selected_identity(
+        output_count: usize,
+        extra_missing_output: bool,
+    ) -> Result<OwnerLiveFixture, std::io::Error> {
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        let device = backend
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "live Owner fixture requires vk.selected_drm_identity.primary",
+                )
+            })?;
+        backend.platform.devices[0].key = device;
+        backend.platform.outputs[0].key.device_key = device;
         backend.platform.reap_executors_on_drop_for_tests();
         backend.resource_cleanup_on_drop_for_tests = true;
         if output_count > 1 {
@@ -54238,24 +54273,24 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs live Vulkan ICD"]
     fn c0_conv_cii_eligibility_is_one_predicate() {
-        let mut backend = super::KmsBackend::for_tests();
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
         backend
             .scene
             .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
         let device = backend.platform.primary_device().expect("device").key;
-        install_admission_owner_gate(&mut backend, device);
-        let (source, _, _) = AdmissionSourceFixture::new();
-        backend.install_admission_conductor_for_tests(device, source);
+        c0_conv_ciii_establish_composed_return(backend, device);
 
         // Seed the bordered window first: upstream #163 keeps only the
         // frontmost mapped top-level direct-eligible, and the unbordered
         // candidate is the one that must stay eligible here.
-        let bordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC314, 0xC315, 1);
-        let unbordered = c0_direct_eligibility_candidate(&mut backend, 0xC311, 0xC312, 0xC313, 0);
+        let bordered = c0_direct_eligibility_candidate(backend, 0xC311, 0xC314, 0xC315, 1);
+        let unbordered = c0_direct_eligibility_candidate(backend, 0xC311, 0xC312, 0xC313, 0);
 
         assert!(
-            c0_direct_pure_eligibility(&backend, &unbordered),
+            c0_direct_pure_eligibility(backend, &unbordered),
             "the baseline candidate must pass the pure scanout gates"
         );
         assert!(
@@ -54288,7 +54323,7 @@ mod tests {
             ..unbordered
         };
         assert!(
-            c0_direct_pure_eligibility(&backend, &stale),
+            c0_direct_pure_eligibility(backend, &stale),
             "the stale candidate must pass every pure scanout gate"
         );
         assert!(
@@ -54304,9 +54339,56 @@ mod tests {
             crtc_id: 0xC3FF,
             ..unbordered
         };
-        assert!(c0_direct_pure_eligibility(&backend, &unknown));
+        assert!(c0_direct_pure_eligibility(backend, &unknown));
         assert!(!backend.direct_present_crtc_eligible(unknown.crtc_id, unknown.crtc_epoch));
         assert!(!backend.direct_present_eligibility(unknown).eligible);
+    }
+
+    #[test]
+    fn c0_conv_ciii_add_entry_refused_without_a_composed_return() {
+        let mut backend = super::KmsBackend::for_tests();
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let device = backend.platform.primary_device().expect("device").key;
+        install_admission_owner_gate(&mut backend, device);
+        backend
+            .install_admission_conductor_for_tests(device, AdmissionSourceFixture::new_source().0);
+        let candidate = c0_direct_eligibility_candidate(&mut backend, 0xCA11, 0xCA12, 0xCA13, 0);
+
+        assert!(c0_direct_pure_eligibility(&backend, &candidate));
+        assert!(backend.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch));
+        assert!(!backend.composed_return_established(device));
+        let eligibility = backend.direct_present_eligibility(candidate);
+        assert!(
+            !eligibility.eligible,
+            "an Owner entry candidate without a composed return must be refused"
+        );
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+        assert!(backend.scanout_m2.queued_successor_role.is_none());
+    }
+
+    #[test]
+    fn c0_conv_ciii_add_legacy_eligibility_unchanged() {
+        let mut backend = super::KmsBackend::for_tests();
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let candidate = c0_direct_eligibility_candidate(&mut backend, 0xCA21, 0xCA22, 0xCA23, 0);
+        assert!(backend.admission_conductors.is_empty());
+
+        backend.composed_return_test_override = Some(true);
+        let with_return = backend.direct_present_eligibility(candidate).eligible;
+        backend.composed_return_test_override = Some(false);
+        let without_return = backend.direct_present_eligibility(candidate).eligible;
+        backend.composed_return_test_override = None;
+
+        assert!(with_return);
+        assert_eq!(
+            without_return, with_return,
+            "Legacy direct eligibility must not consult Owner composed-return state"
+        );
     }
 
     #[test]
@@ -54318,6 +54400,7 @@ mod tests {
             .scene
             .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
         let device = backend.platform.primary_device().expect("device").key;
+        c0_conv_ciii_establish_composed_return(&mut backend, device);
         // Bordered first: only the frontmost top-level stays eligible (#163).
         let owner_bordered =
             c0_direct_eligibility_candidate(&mut backend, 0xC401, 0xC404, 0xC405, 1);
@@ -54843,6 +54926,17 @@ mod tests {
     ) {
         use yserver_core::backend::{CompletedPresentEvent, PresentWake};
 
+        let owner_device = backend
+            .platform
+            .primary_device()
+            .expect("primary device")
+            .key;
+        if backend.admission_is_active(owner_device)
+            && !backend.composed_return_established(owner_device)
+        {
+            c0_conv_ciii_establish_composed_return(backend, owner_device);
+        }
+
         let candidate =
             c0_direct_eligibility_candidate(backend, crtc_id, target_xid, source_xid, 0);
         let candidate = yserver_core::backend::PresentScanoutCandidate {
@@ -55098,6 +55192,7 @@ mod tests {
             .primary_device()
             .expect("primary device")
             .key;
+        let composed_commit = c0_conv_ciii_establish_composed_return(&mut backend, device);
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let (first_candidate, first_event) =
             c0_conv_cii_try_candidate(&mut backend, 0xC551, 0xC552, 0xC553, 51);
@@ -55132,6 +55227,13 @@ mod tests {
         assert_eq!(
             backend.admission_trace_for_tests(device),
             vec![
+                AdmissionTraceStep::Decided,
+                AdmissionTraceStep::Dispatched(composed_commit),
+                AdmissionTraceStep::Consumed(composed_commit),
+                AdmissionTraceStep::Enqueued {
+                    completions: Vec::new(),
+                    skips: Vec::new(),
+                },
                 AdmissionTraceStep::Decided,
                 AdmissionTraceStep::Dispatched(first_commit),
                 AdmissionTraceStep::Consumed(first_commit),
@@ -55844,6 +55946,8 @@ mod tests {
 
         let OwnerLiveFixture { mut backend, .. } =
             owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let owner_device = backend.platform.primary_device().expect("device").key;
+        c0_conv_ciii_establish_composed_return(&mut backend, owner_device);
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let before_owner = damage_signature(&backend);
         let (candidate, event) =
@@ -55862,6 +55966,7 @@ mod tests {
         let OwnerLiveFixture { mut backend, .. } =
             owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
         let device = backend.platform.primary_device().expect("device").key;
+        c0_conv_ciii_establish_composed_return(&mut backend, device);
         backend.admission_conductors.clear();
         install_admission_legacy_gate(&mut backend, device);
         backend.scanout_m2.test_submit_direct_without_drm = true;
@@ -55896,6 +56001,8 @@ mod tests {
 
         let OwnerLiveFixture { mut backend, .. } =
             owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let device = backend.platform.primary_device().expect("device").key;
+        c0_conv_ciii_establish_composed_return(&mut backend, device);
         backend.scanout_m2.test_submit_direct_without_drm = true;
         let before = damage_signature(&backend);
         let (candidate, event) =
@@ -59051,6 +59158,152 @@ mod tests {
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
         Ok(backend)
+    }
+
+    fn c0_conv_ciii_compose_and_retire_output(
+        backend: &mut super::KmsBackend,
+        output_idx: usize,
+        expected_crtcs: &[u32],
+    ) -> crate::kms::owner::identity::CommitId {
+        let device = backend.platform.outputs[output_idx].key.device_key;
+        backend.scene.mark_scene_structure_damage_rect(
+            output_idx,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: 19,
+                    height: 23,
+                },
+            },
+        );
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("production scene compose must dispatch an Owner commit");
+        let mut actual_crtcs = record.closure().expected_completion().to_vec();
+        let mut expected_crtcs = expected_crtcs.to_vec();
+        actual_crtcs.sort_unstable();
+        expected_crtcs.sort_unstable();
+        assert_eq!(
+            actual_crtcs, expected_crtcs,
+            "the production composed commit must cover exactly its intended outputs"
+        );
+        let commit = record.commit_id();
+        assert!(backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted { commit }],
+            std::time::Instant::now(),
+        ));
+        assert!(backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+            std::time::Instant::now(),
+        ));
+        let device_index = backend
+            .platform
+            .devices
+            .iter()
+            .position(|entry| entry.key == device)
+            .expect("composed device index");
+        let completion = backend.complete_owner_for_tests(device_index);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now(),));
+        reinstall_owner_executor_for_direct_test(backend);
+        commit
+    }
+
+    fn c0_conv_ciii_establish_composed_return(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::identity::CommitId {
+        assert!(!backend.composed_return_established(device));
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("composed output");
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<Vec<_>>();
+        backend.scene.mark_scene_structure_dirty();
+        let commit = c0_conv_ciii_compose_and_retire_output(backend, output_idx, &crtcs);
+        assert!(backend.composed_return_established(device));
+        commit
+    }
+
+    fn c0_conv_ciii_add_enter_direct_and_retire(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        first_present_id: u32,
+    ) -> io::Result<OwnerDirectCandidate> {
+        if !backend.composed_return_established(device) {
+            c0_conv_ciii_establish_composed_return(backend, device);
+        }
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        let prepared = owner_root_direct_candidate_with_real_import(backend, first_present_id)?;
+        let output_idx = backend
+            .present_crtc_output(prepared.candidate.crtc_id)
+            .map(|(output_idx, _)| output_idx)
+            .expect("direct candidate output");
+        c0_conv_cii_prepare_owner_clock(
+            backend,
+            device,
+            output_idx,
+            yserver_core::backend::PresentClockSample {
+                msc: 1_000,
+                ust: 1_000_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
+
+        for attempt in 1..=super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+            let present_id = first_present_id + u32::from(attempt);
+            let candidate = yserver_core::backend::PresentScanoutCandidate {
+                present_id: u64::from(present_id),
+                ..prepared.candidate
+            };
+            let mut event = prepared.event.clone();
+            event.present_id = u64::from(present_id);
+            event.serial = present_id;
+            assert_eq!(
+                backend
+                    .try_present_direct(candidate, event)
+                    .expect("direct Present through production eligibility"),
+                attempt == super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION,
+                "direct entry must wait for the unchanged root probation"
+            );
+        }
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("probation-complete direct Present must dispatch")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        reinstall_owner_executor_for_direct_test(backend);
+        c0_conv_cii_complete_direct_owner_hardware(backend, device);
+        c0_conv_cii_page_flip_direct_owner(backend, device, output_idx, 1_001, 1, 1_000);
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(
+                    |resources| resources.direct_role.as_ref().is_some_and(|role| {
+                        role.role() == crate::kms::render::resources::DirectRole::Current
+                    })
+                ),
+            "the direct frame must become current through routed Owner milestones"
+        );
+        owner_root_direct_candidate_with_real_import(backend, first_present_id + 100)
     }
 
     fn c0_conv_ciii_mark_retained_composed(backend: &mut super::KmsBackend) {
@@ -64969,6 +65222,231 @@ mod tests {
             candidate,
             event,
         })
+    }
+
+    fn owner_root_direct_candidate_with_real_import(
+        backend: &mut super::KmsBackend,
+        present_id: u32,
+    ) -> io::Result<OwnerDirectCandidate> {
+        let mut prepared = owner_direct_candidate_with_real_import(backend, present_id)?;
+        let width = backend.platform.fb_w;
+        let height = backend.platform.fb_h;
+        let target_xid = backend
+            .create_subwindow(
+                None,
+                yserver_core::backend::WindowHandle::from_raw(backend.core.window_id)
+                    .expect("root window handle"),
+                0,
+                0,
+                width,
+                height,
+                0,
+                yserver_core::host_x11::HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )?
+            .as_raw();
+        backend
+            .map_subwindow(None, target_xid)
+            .expect("map production root candidate window");
+        if !backend.core.top_level_order.contains(&target_xid) {
+            backend.core.top_level_order.push(target_xid);
+        }
+        prepared.candidate.dst_window_xid = target_xid;
+        prepared.candidate.paint_dst_host_xid = target_xid;
+        prepared.candidate.completion_dst_host_xid = target_xid;
+        prepared.event.dst_host_xid = target_xid;
+        Ok(prepared)
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_add_successor_eligibility_ignores_the_return() {
+        let mut fixture = owner_live_fixture_with_selected_identity(1, false)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("device").key;
+        let vk_device = backend
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .expect("live Vulkan identity");
+        assert_eq!(device, vk_device);
+
+        let successor = c0_conv_ciii_add_enter_direct_and_retire(backend, device, 210)
+            .expect("production direct entry fixture");
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(
+                    |resources| resources.direct_role.as_ref().is_some_and(|role| {
+                        role.role() == crate::kms::render::resources::DirectRole::Current
+                    })
+                )
+        );
+        backend.composed_return_test_override = Some(false);
+        assert!(!backend.composed_return_established(device));
+        assert!(
+            backend
+                .direct_present_eligibility(successor.candidate)
+                .eligible,
+            "a direct successor stays eligible while a direct unit is current"
+        );
+        backend.composed_return_test_override = None;
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_add_refused_present_composes_then_enters_vulkan() {
+        let mut fixture = owner_live_fixture_with_selected_identity(1, false)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("device").key;
+        let vk_device = backend
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .expect("live Vulkan identity");
+        assert_eq!(device, vk_device);
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+
+        let prepared = owner_root_direct_candidate_with_real_import(backend, 230)
+            .expect("production DRI3 import and direct framebuffer");
+        assert!(c0_direct_pure_eligibility(backend, &prepared.candidate));
+        assert!(backend.direct_present_crtc_eligible(
+            prepared.candidate.crtc_id,
+            prepared.candidate.crtc_epoch
+        ));
+        assert!(!backend.composed_return_established(device));
+        assert!(
+            !backend
+                .direct_present_eligibility(prepared.candidate)
+                .eligible,
+            "the valid direct candidate waits until its output has a composed return"
+        );
+        assert!(
+            !backend
+                .try_present_direct(prepared.candidate, prepared.event.clone())
+                .expect("refused Owner direct Present"),
+            "the first Present must take the composed route"
+        );
+        assert!(backend.scanout_m2.pending.is_none());
+        assert!(backend.scanout_m2.queued_successor.is_none());
+
+        c0_conv_ciii_establish_composed_return(backend, device);
+        assert!(backend.composed_return_established(device));
+        let output_idx = backend
+            .present_crtc_output(prepared.candidate.crtc_id)
+            .map(|(output_idx, _)| output_idx)
+            .expect("direct candidate output");
+        c0_conv_cii_prepare_owner_clock(
+            backend,
+            device,
+            output_idx,
+            yserver_core::backend::PresentClockSample {
+                msc: 1_100,
+                ust: 1_100_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
+        for attempt in 1..=super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+            let present_id = 230 + u32::from(attempt);
+            let candidate = yserver_core::backend::PresentScanoutCandidate {
+                present_id: u64::from(present_id),
+                ..prepared.candidate
+            };
+            let mut event = prepared.event.clone();
+            event.present_id = u64::from(present_id);
+            event.serial = present_id;
+            assert_eq!(
+                backend
+                    .try_present_direct(candidate, event)
+                    .expect("direct Present after composed retirement"),
+                attempt == super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION,
+                "entry remains behind the existing probation"
+            );
+        }
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        assert!(backend.scanout_m2.pending.is_some());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_conv_ciii_add_every_output_needs_its_return_vulkan() {
+        let mut fixture = owner_live_fixture_with_selected_identity(2, false)
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("device").key;
+        let vk_device = backend
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .expect("live Vulkan identity");
+        assert_eq!(device, vk_device);
+        assert_eq!(backend.platform.outputs.len(), 2);
+        assert!(
+            backend
+                .platform
+                .outputs
+                .iter()
+                .all(|output| output.key.device_key == device)
+        );
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+
+        let crtc_a = u32::from(backend.platform.outputs[0].output.crtc);
+        let crtc_b = u32::from(backend.platform.outputs[1].output.crtc);
+        let matching_clock = backend.platform.outputs[0].output.picked.clock_khz;
+        let matching_refresh = backend.platform.outputs[0].output.picked.vrefresh;
+        backend.platform.outputs[1].output.picked.clock_khz = matching_clock.saturating_add(1);
+        backend.platform.outputs[1].output.picked.vrefresh = matching_refresh.saturating_add(1);
+        assert!(!super::effective_refresh_matches(
+            &backend.platform.outputs[0].output.picked,
+            &backend.platform.outputs[1].output.picked,
+        ));
+
+        c0_conv_ciii_compose_and_retire_output(backend, 0, &[crtc_a]);
+        assert!(!backend.composed_return_established(device));
+        let candidate = owner_root_direct_candidate_with_real_import(backend, 240)
+            .expect("production DRI3 import and direct framebuffer");
+        backend.platform.outputs[1].output.picked.clock_khz = matching_clock;
+        backend.platform.outputs[1].output.picked.vrefresh = matching_refresh;
+        assert!(backend.direct_scanout_topology_eligible());
+        assert!(c0_direct_pure_eligibility(backend, &candidate.candidate));
+        assert!(backend.direct_present_crtc_eligible(
+            candidate.candidate.crtc_id,
+            candidate.candidate.crtc_epoch
+        ));
+        assert!(
+            !backend
+                .direct_present_eligibility(candidate.candidate)
+                .eligible,
+            "the first output's return cannot stand in for the second output's return"
+        );
+
+        backend.platform.outputs[1].output.picked.clock_khz = matching_clock.saturating_add(1);
+        backend.platform.outputs[1].output.picked.vrefresh = matching_refresh.saturating_add(1);
+        c0_conv_ciii_compose_and_retire_output(backend, 1, &[crtc_b]);
+        backend.platform.outputs[1].output.picked.clock_khz = matching_clock;
+        backend.platform.outputs[1].output.picked.vrefresh = matching_refresh;
+        assert!(backend.composed_return_established(device));
+        assert!(backend.direct_scanout_topology_eligible());
+        assert!(
+            backend
+                .direct_present_eligibility(candidate.candidate)
+                .eligible
+        );
     }
 
     #[test]

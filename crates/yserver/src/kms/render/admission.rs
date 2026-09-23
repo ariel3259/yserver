@@ -841,36 +841,7 @@ impl KmsBackend {
             .admission_conductors
             .get(&device)
             .is_some_and(|conductor| conductor.backend_composed);
-        let composed_return_established = self
-            .platform
-            .outputs
-            .iter()
-            .enumerate()
-            .filter(|(_, output)| output.key.device_key == device)
-            .all(|(output_idx, _)| {
-                if backend_composed {
-                    let bo_fb_handle = self
-                        .platform
-                        .scanout_pools
-                        .get(output_idx)
-                        .and_then(Option::as_ref)
-                        .and_then(|scanout| scanout.display_pool().bos.first())
-                        .and_then(|bo| bo.fb_handle);
-                    self.resource_service
-                        .as_mut()
-                        .and_then(|service| {
-                            self.scene
-                                .owner_current_framebuffer(output_idx, bo_fb_handle, service)
-                                .ok()
-                        })
-                        .flatten()
-                        .is_some()
-                } else {
-                    self.platform
-                        .retained_composed_framebuffer(output_idx)
-                        .is_some()
-                }
-            });
+        let composed_return_established = self.composed_return_established(device);
         let composed_intents = self
             .admission_conductors
             .get(&device)
@@ -900,13 +871,13 @@ impl KmsBackend {
         } else {
             BTreeSet::new()
         };
-        let direct_eligibility = self
+        let direct_source_generation = self
             .admission_conductors
             .get(&device)
             .and_then(|conductor| conductor.admission.direct())
-            .map(|direct| {
-                self.direct_successor_eligibility(device, direct.successor.source_generation)
-            });
+            .map(|direct| direct.successor.source_generation);
+        let direct_eligibility = direct_source_generation
+            .map(|generation| self.direct_successor_eligibility(device, generation));
         let mut invalidate = None;
         let snapshot = {
             let conductor = self
@@ -1036,6 +1007,57 @@ impl KmsBackend {
             }
         }
         Some(snapshot)
+    }
+
+    /// Whether every output owned by this device has a composed framebuffer
+    /// retained as the return target for a direct unflip.
+    pub(crate) fn composed_return_established(&mut self, device: DrmDeviceKey) -> bool {
+        #[cfg(test)]
+        if let Some(override_result) = self.composed_return_test_override {
+            return override_result;
+        }
+
+        let backend_composed = self
+            .admission_conductors
+            .get(&device)
+            .is_some_and(|conductor| conductor.backend_composed);
+        self.platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| output.key.device_key == device)
+            .all(|(output_idx, _)| {
+                if backend_composed {
+                    let bo_fb_handle = self
+                        .platform
+                        .scanout_pools
+                        .get(output_idx)
+                        .and_then(Option::as_ref)
+                        .and_then(|scanout| scanout.display_pool().bos.first())
+                        .and_then(|bo| bo.fb_handle);
+                    self.resource_service
+                        .as_mut()
+                        .and_then(|service| {
+                            self.scene
+                                .owner_current_framebuffer(output_idx, bo_fb_handle, service)
+                                .ok()
+                        })
+                        .flatten()
+                        .is_some()
+                } else {
+                    self.platform
+                        .retained_composed_framebuffer(output_idx)
+                        .is_some()
+                }
+            })
+    }
+
+    pub(crate) fn direct_entry_composed_return_established(
+        &mut self,
+        device: DrmDeviceKey,
+    ) -> Option<bool> {
+        (self.admission_is_active(device) && !has_current_direct(self))
+            .then(|| self.composed_return_established(device))
     }
 
     /// Perform one complete admission transaction. The decider remains pure

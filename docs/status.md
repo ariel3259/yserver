@@ -28,6 +28,15 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-09-23 Phase C.0 stage 2c-iii direct-entry addendum ACCEPTED**
+  (coordinator re-ran the gate and mutations A1 and A3 by line; both caught). Initial direct eligibility on an active
+  Owner conductor now waits until every output has a composed return, using the
+  same predicate as unflip readiness. Current direct successors and Legacy
+  eligibility remain unchanged. Existing Owner direct-entry fixtures establish
+  their return through production composition and routed Owner retirement; the
+  addendum's five tests pass in debug and release. The permitted C.0 filters
+  and non-ignored yserver library tests pass, as do the three all-targets
+  clippy configurations. No hardware or modeset run was performed.
 - **2026-09-22 Phase C.0 stage 2c-iii, plans Cfb and Ciii ACCEPTED — the
   card1 run of spec §6.4 passes.** `c0_hw_ciii_owner_route_on_card1_drm`
   (`a8dbaec7`) drives composed → direct → same-source direct → unflip on
