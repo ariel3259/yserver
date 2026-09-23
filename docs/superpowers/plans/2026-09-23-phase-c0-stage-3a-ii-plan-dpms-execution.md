@@ -2,6 +2,27 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 9 (2026-09-23, coordinator)** — Task 8 F8 (before editing): the
+advertised capability C.0 §16.2 item 39 protects does not exist before stage
+4. Task 8's capability test now covers the structural completion capability
+and the scene's cursor plane mode, not the incarnation qualification;
+the advertised values are carried to stage 4.
+
+**Revision 8 (2026-09-23, coordinator)** — second Task 7 F8 (before
+editing): revision 7's "any served output powered" for composition would stop
+the scene on an off Owner device, contradicting design §3.5 and Task 5. Task 7
+now routes each gate separately (composition stays Legacy's guard, the scene
+wakeup must not spin on `OutputPoweredOff`, cursor animation uses any
+powered output, direct/M1/M0 use the candidate device).
+
+**Revision 7 (2026-09-23, coordinator)** — Task 7 F8 (before editing): four
+`kms_outputs_active` reads on the CRTC-config/topology-requery path run on
+Owner but are consumed only after the Owner gate's refusal; the plan did not
+say whether they count. Classified as value-dead in 3a, carried to 3b/3c
+(Task 7, "Value-dead on Owner in 3a"). Task 6's mutation D40 (a not-ready
+entry closing its window's blackout flush) was added on review for Legacy
+parity; the driver re-entry mutation in Task 2 keeps its own label.
+
 **Revision 6 (2026-09-23)** — a second Task 1 F8 (again before editing):
 the queued intent Task 1 must tag is typed by Task 2. The dependency is
 mutual, so Tasks 1 and 2 become **one implementation unit**; eight units in
@@ -259,6 +280,43 @@ with file:line and the decision for each.
 | --- | --- | --- |
 | `c0_3aii_owner_ignores_kms_outputs_active_vulkan` | an Owner fixture with `kms_outputs_active` forced to the wrong value in each state (off/on): composition, wakeups, eligibility and blackout behave as the arbiter's power state says | **D26** restore each inventoried Owner-reachable read in turn — one mutation per read, each caught by this test (the report lists them); a read no test catches is an F8 |
 
+**Value-dead on Owner in 3a (revision 7, Task 7 F8).** Four reads run on
+an Owner device but their value is consumed only after the Legacy writer
+step that the Owner transport gate refuses: `teardown_direct_before_topology_requery`
+(`relight`, used only if the Legacy disable succeeds),
+`crtc_config_topology_signature`, `enqueue_prepared_crtc_config_probe`
+(`was_active`) and `apply_crtc_config` (all consumed after
+`quiesce_before_topology_mutation`). Client modesets and topology requeries
+as executed Owner transitions are 3b/3c, so these four **stay as they are**
+in 3a, are listed in the inventory as "Owner-reachable, value-dead: consumed
+after the Owner refusal", and get no D26 mutation. **Carried to 3b/3c:**
+whichever sub-stage first lets one of these paths proceed past the refusal
+on Owner routes the read to the device's installed power in the same change.
+Every other Owner-reachable read (direct eligibility, the M1 probe and M0
+observation, the cursor animation tick and deadline, `next_wakeup`,
+`maybe_composite`, the Owner branch of `present_scanout_blackout`) is routed
+and gets its D26 mutation. *(Revision 8, second Task 7 F8: revision 7 said a
+backend-wide gate asks "any served output powered"; for composition that
+contradicts design §3.5 — the scene keeps running off screen — and Task 5's
+committed `c0_3aii_composed_waits_while_off_vulkan`.)* The routing per gate:
+
+- **Composition** (`maybe_composite`'s DPMS early return) is Legacy's EINVAL
+  guard and stays Legacy's: it returns early only when **no Owner output is
+  served** and `kms_outputs_active` is false. With any Owner output served,
+  the scene ticks and an off Owner output's frames wait in admission
+  (`OutputPoweredOff`, Task 5). A mixed Legacy+Owner server exists only in
+  fixtures (stage 5 flips every device at once); the report states what a
+  mixed server with its Legacy outputs off does.
+- **Scene wakeup** (`next_wakeup`'s scene deadline) follows the composition
+  gate, and must not spin: a composed generation waiting on
+  `OutputPoweredOff` never yields an immediate (`now`) scene deadline; the
+  relight (Task 5's output reconciliation) is what wakes it. The test asserts
+  this with every Owner output off and a generation waiting.
+- **Cursor animation** (tick and deadline): any served output powered —
+  Legacy outputs by `kms_outputs_active`, Owner outputs by installed power.
+- **Direct eligibility, M1 probe, M0 observation**: the candidate CRTC's
+  device power.
+
 ## Task 8 — failure edges and the seat
 
 **Deliver (3a design §3.7, §3.3):** a rejected DPMS (`FailedBeforeSubmit`)
@@ -280,6 +338,19 @@ or an injected completion loss (C.0 §16.2 item 39).
 | `c0_3aii_poisoned_dpms_issues_no_commit` | `Poisoned` device, off then on: no topology request reaches the conductor | **D29** request the commit while `Poisoned` |
 | `c0_3aii_dpms_while_seat_released_is_deferred` | seat released (via the `run_suspend` feed), DPMS off: `Deferred(SeatReleased)`, no commit; on reacquire it converges | **D30** apply it while released |
 | `c0_3aii_capability_stable_across_dpms_and_poison_vulkan` | capability captured before, compared after four off/on cycles and after an injected completion loss | **D31** recompute capability on DPMS |
+
+**What "capability" means in 3a (revision 9, Task 8 F8).** The advertised
+values C.0 §6.2 names (`atomic_kms_pipeline_structurally_capable`,
+`atomic_kms_cursor_policy`) do not exist yet; the cursor policy arrives with
+stage 4. In 3a the test captures and compares the surfaces that exist: the
+device's structural completion capability (`CompletionCaps`, including
+`is_structurally_capable()`, `owner/qualification.rs`) and the scene's cursor
+plane mode (`Scene::cursor_mode()`). It does **not** pin the incarnation
+qualification (`CompletionQualification`): item 39 lets readiness close on
+poison. **D31** makes a DPMS completion or the completion loss change either
+surface (clear structural capability, or force the cursor plane mode to
+software). **Carried to stage 4:** when `atomic_kms_cursor_policy` and the
+advertised structural bit exist, stage 4 extends this test to them.
 
 ## Task 9 — the differential gate and the hardware test
 

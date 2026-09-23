@@ -13,7 +13,8 @@ pub use arbiter::{
     RecoveryAttemptOutcome,
 };
 pub use coordinator::{
-    CoordinatorDispatch, CoordinatorError, CoordinatorOutputAddition, LifecycleCoordinator,
+    CoordinatorActionDispatch, CoordinatorDispatch, CoordinatorError, CoordinatorOutputAddition,
+    LifecycleCoordinator,
 };
 pub use desired::{
     DesiredField, DesiredIntent, DispositionChange, LifecycleDesired, OutputProjection,

@@ -10286,8 +10286,8 @@ pub(crate) fn execute_parked_present_ids(
 /// hoisted above `maybe_composite`, so an entry executed here is visible
 /// to THIS iteration's compose.
 pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &mut dyn Backend) {
-    // Sampled up front (not just inside the blackout branch below): an
-    // empty `present_pending_exec` must NOT short-circuit past the
+    // Sample target CRTCs up front (not just inside the blackout branch
+    // below): an empty `present_pending_exec` must NOT short-circuit past the
     // blackout flush, or DPMS-off with a display that never accumulates
     // a msc-parked entry (flips keep retiring normally, so every arrival
     // classifies ExecuteNow and the store stays empty) would leave
@@ -10296,8 +10296,15 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
     // `fire_all_present_completions_now` — they'd park forever. The
     // sweep inside that call still early-returns on an empty queue, so
     // this costs nothing on the common (non-blackout) empty-store path.
-    let blackout = backend.present_scanout_blackout();
-    if state.present_pending_exec.is_empty() && !blackout {
+    let has_blackout = state
+        .present_pending_exec
+        .values()
+        .any(|entry| backend.present_scanout_blackout(entry.pending.crtc_id))
+        || state
+            .present_pending_complete
+            .iter()
+            .any(|entry| backend.present_scanout_blackout(entry.event.crtc_id));
+    if state.present_pending_exec.is_empty() && !has_blackout {
         return;
     }
     let mut domains: Vec<(u32, u64)> = state
@@ -10376,18 +10383,37 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
     // fence, a condition blackout does nothing to resolve, and forcing
     // that copy would read whatever partial content the producer has
     // written so far.
-    if blackout {
+    if has_blackout {
+        // Walk Present ids in order. A producer-waiting entry stays parked
+        // but does not close the blackout flush: the due pass above already
+        // allows a later ready entry to overtake it. A ready entry on a lit
+        // CRTC does close the flush, preserving the per-window blackout
+        // ordering boundary.
+        let mut stopped_windows = HashSet::new();
         let blackout_ids: Vec<u64> = state
             .present_pending_exec
             .iter()
-            .filter(|(_, e)| e.source_ready)
-            .map(|(&pid, _)| pid)
+            .filter_map(|(&pid, entry)| {
+                let window = entry.pending.request.window();
+                if stopped_windows.contains(&window) {
+                    return None;
+                }
+                if !entry.source_ready {
+                    return None;
+                }
+                if backend.present_scanout_blackout(entry.pending.crtc_id) {
+                    Some(pid)
+                } else {
+                    stopped_windows.insert(window);
+                    None
+                }
+            })
             .collect();
         execute_parked_present_ids(state, backend, &blackout_ids, "blackout");
 
-        // Both halves flush together: parked completions deliver too,
-        // ignoring the due check entirely (a frozen clock would
-        // otherwise never satisfy it — round-4 F1c). Stamped with the
+        // Parked completions on blacked-out CRTCs deliver too, bypassing
+        // their due checks (a frozen clock would otherwise never satisfy
+        // them — round-4 F1c). Stamped with the
         // COMPLETION clock, not the general clock used for scheduling
         // above — stamping/gate-release keeps its existing
         // completion-clock provenance (spec "Loop-order and clock
@@ -12408,11 +12434,11 @@ pub(crate) fn fire_due_present_completions_for_domain(
     fire_present_completions_sweep(state, backend, false);
 }
 
-/// Blackout flush (spec Lifecycle §"DPMS-off / VT-away blackout"; Task 7):
-/// deliver every parked completion NOW, ignoring the msc-due check —
-/// `present_scanout_blackout()` means no flips and no sequence samples
-/// will ever arrive, so the clock is frozen and would never otherwise
-/// satisfy `fire_due_present_completions`'s due test (round-4 F1c). The
+/// Blackout flush (spec Lifecycle §"DPMS-off / VT-away blackout"; Task 6):
+/// deliver parked completions on blacked-out CRTCs NOW, ignoring their
+/// msc-due checks — `present_scanout_blackout(crtc_id)` means no flips and
+/// no sequence samples will ever arrive for that CRTC, so its clock is frozen
+/// and would never otherwise satisfy the due test (round-4 F1c). The
 /// per-window hold-back (`blocked`) still applies unmodified: an
 /// outstanding GPU fence in `present_complete_gate` is not something a
 /// dark display can force to retire early.
@@ -12436,7 +12462,11 @@ pub(crate) fn fire_all_present_completions_now(state: &mut ServerState, backend:
     fire_present_completions_sweep(state, backend, true);
 }
 
-fn fire_present_completions_sweep(state: &mut ServerState, backend: &mut dyn Backend, force: bool) {
+fn fire_present_completions_sweep(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    blackout_flush: bool,
+) {
     if state.present_pending_complete.is_empty() {
         return;
     }
@@ -12508,13 +12538,13 @@ fn fire_present_completions_sweep(state: &mut ServerState, backend: &mut dyn Bac
             let stamp_clock = p.event.completion_clock.unwrap_or(due_clock);
             let epoch_current =
                 backend.present_crtc_clock_epoch(p.event.crtc_id) == p.event.crtc_epoch;
+            let blackout = blackout_flush && backend.present_scanout_blackout(p.event.crtc_id);
             // Due when msc has reached/passed the target (wrap-safe): NOT
-            // (target after msc) — or unconditionally due when `force`
-            // (blackout flush) bypasses the clock test entirely. An epoch
-            // mismatch also fails open: its raw target belongs to a counter
-            // that no longer backs this RANDR XID and must never be compared
-            // against the replacement epoch.
-            let due = force
+            // (target after msc) — or unconditionally due when this entry's
+            // CRTC is blacked out. An epoch mismatch also fails open: its raw
+            // target belongs to a counter that no longer backs this RANDR XID
+            // and must never be compared against the replacement epoch.
+            let due = blackout
                 || !epoch_current
                 || (due_clock.msc > 0
                     && !crate::present_scheduler::msc_is_after(
@@ -44922,6 +44952,7 @@ mod tests {
     fn fire_present_completions_sweep_cancels_sequence_consumers() {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
+        backend.present_scanout_blackout = true;
         const ID1: u64 = 301;
         const ID2: u64 = 302;
 
@@ -46809,6 +46840,426 @@ mod tests {
             "and the queue drains: the held-back completion delivers in the same pass"
         );
         assert_eq!(backend.signalled_present_wakes, vec![QUEUED_ID]);
+    }
+
+    #[test]
+    fn c0_3aii_blackout_is_per_crtc() {
+        use yserver_protocol::x11::present as x11present;
+
+        const LIT_CRTC: u32 = 0x6101;
+        const OFF_CRTC: u32 = 0x6102;
+        const LIT_EXEC_WINDOW: u32 = 0x0040_6101;
+        const OFF_EXEC_WINDOW: u32 = 0x0040_6102;
+        const LIT_COMPLETE_WINDOW: u32 = 0x0040_6121;
+        const OFF_COMPLETE_WINDOW: u32 = 0x0040_6122;
+        const LIT_PIXMAP: u32 = 0x0040_6111;
+        const OFF_PIXMAP: u32 = 0x0040_6112;
+        const LIT_EXEC_ID: u64 = 6101;
+        const OFF_EXEC_ID: u64 = 6102;
+        const LIT_COMPLETE_ID: u64 = 6201;
+        const OFF_COMPLETE_ID: u64 = 6202;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_flip_in_flight = true;
+        backend.present_absolute_vblank_arm_supported = true;
+        backend.present_display_idle = false;
+        backend
+            .present_scanout_blackout_by_crtc
+            .insert(OFF_CRTC, true);
+
+        let mut lit_exec =
+            present_pending_entry_with(LIT_EXEC_ID, LIT_EXEC_WINDOW, LIT_PIXMAP, Some(5_000), true);
+        lit_exec.pending.crtc_id = LIT_CRTC;
+        let mut off_exec =
+            present_pending_entry_with(OFF_EXEC_ID, OFF_EXEC_WINDOW, OFF_PIXMAP, Some(5_000), true);
+        off_exec.pending.crtc_id = OFF_CRTC;
+        state.present_pending_exec.insert(LIT_EXEC_ID, lit_exec);
+        state.present_pending_exec.insert(OFF_EXEC_ID, off_exec);
+
+        let mut lit_complete = due_pending_complete(
+            LIT_COMPLETE_WINDOW,
+            LIT_COMPLETE_ID,
+            5_000,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        );
+        lit_complete.event.crtc_id = LIT_CRTC;
+        let mut off_complete = due_pending_complete(
+            OFF_COMPLETE_WINDOW,
+            OFF_COMPLETE_ID,
+            5_000,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        );
+        off_complete.event.crtc_id = OFF_CRTC;
+        state
+            .present_pending_complete
+            .extend([lit_complete, off_complete]);
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: OFF_PIXMAP,
+                    ..
+                }
+            )),
+            "a future-target execution on the off CRTC is forced"
+        );
+        assert!(
+            backend.calls().iter().all(|call| !matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: LIT_PIXMAP,
+                    ..
+                }
+            )),
+            "a future-target execution on the lit CRTC keeps its MSC timing"
+        );
+        assert!(state.present_pending_exec.contains_key(&LIT_EXEC_ID));
+        assert!(!state.present_pending_exec.contains_key(&OFF_EXEC_ID));
+        assert_eq!(state.present_pending_complete.len(), 1);
+        assert_eq!(
+            state.present_pending_complete[0].event.present_id, LIT_COMPLETE_ID,
+            "the lit CRTC completion keeps its MSC timing"
+        );
+        assert_eq!(backend.signalled_present_wakes, vec![OFF_COMPLETE_ID]);
+    }
+
+    #[test]
+    fn c0_3aii_blackout_flushes_a_completion_only_queue() {
+        use crate::backend::PresentClockSample;
+        use yserver_protocol::x11::{ClientByteOrder, SequenceNumber, present as x11present};
+
+        const OFF_CRTC: u32 = 0x6201;
+        const WINDOW: u32 = 0x0000_6201;
+        const EID: u32 = 0x0010_6201;
+        const PRESENT_ID: u64 = 6201;
+        const CLOCK_MSC: u64 = 77;
+        const CLOCK_UST: u64 = 0x1234;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_present_selection(
+            &mut state,
+            &mut peer,
+            EID,
+            WINDOW,
+            x11present::EVENT_MASK_COMPLETE_NOTIFY | x11present::EVENT_MASK_IDLE_NOTIFY,
+        );
+        let mut backend = RecordingBackend::new();
+        backend
+            .present_scanout_blackout_by_crtc
+            .insert(OFF_CRTC, true);
+
+        assert!(state.present_pending_exec.is_empty());
+        let mut completion = due_pending_complete(
+            WINDOW,
+            PRESENT_ID,
+            5_000,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        );
+        completion.event.crtc_id = OFF_CRTC;
+        completion.event.host_xid = 0x0000_6202;
+        completion.event.completion_clock = Some(PresentClockSample {
+            msc: CLOCK_MSC,
+            ust: CLOCK_UST,
+            source: crate::backend::PresentClockSource::Immediate,
+        });
+        state.present_pending_complete.push(completion);
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        assert!(state.present_pending_complete.is_empty());
+        assert_eq!(backend.signalled_present_wakes, vec![PRESENT_ID]);
+        let bytes = read_all_available(&mut peer);
+        let idle = x11present::encode_idle_notify(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0),
+            145,
+            EID,
+            WINDOW,
+            1,
+            0x0000_6202,
+            0,
+        );
+        let complete = x11present::encode_complete_notify(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0),
+            145,
+            EID,
+            WINDOW,
+            1,
+            x11present::COMPLETE_KIND_PIXMAP,
+            x11present::COMPLETE_MODE_COPY,
+            CLOCK_UST,
+            CLOCK_MSC,
+        );
+        assert_eq!(bytes, [idle, complete].concat());
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(read_all_available(&mut peer).is_empty());
+        assert_eq!(backend.signalled_present_wakes, vec![PRESENT_ID]);
+    }
+
+    #[test]
+    fn c0_3aii_blackout_keeps_window_order() {
+        use yserver_protocol::x11::present as x11present;
+
+        const LIT_CRTC: u32 = 0x6301;
+        const OFF_CRTC: u32 = 0x6302;
+        const WINDOW_HOST_XID: u32 = 0x0040_6301;
+        const PIXMAP_1: u32 = 0x0040_6311;
+        const PIXMAP_2: u32 = 0x0040_6312;
+        const FIRST_EXEC_ID: u64 = 6301;
+        const LATER_EXEC_ID: u64 = 6302;
+        const FIRST_COMPLETE_ID: u64 = 6311;
+        const LATER_COMPLETE_ID: u64 = 6312;
+
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_flip_in_flight = true;
+        backend.present_absolute_vblank_arm_supported = true;
+        backend.present_display_idle = false;
+        backend
+            .present_scanout_blackout_by_crtc
+            .insert(OFF_CRTC, true);
+
+        let mut exec_state = ServerState::new();
+        let mut first_exec =
+            present_pending_entry_with(FIRST_EXEC_ID, WINDOW_HOST_XID, PIXMAP_1, Some(5_000), true);
+        first_exec.pending.crtc_id = LIT_CRTC;
+        let mut later_exec =
+            present_pending_entry_with(LATER_EXEC_ID, WINDOW_HOST_XID, PIXMAP_2, Some(5_000), true);
+        later_exec.pending.crtc_id = OFF_CRTC;
+        exec_state
+            .present_pending_exec
+            .insert(FIRST_EXEC_ID, first_exec);
+        exec_state
+            .present_pending_exec
+            .insert(LATER_EXEC_ID, later_exec);
+
+        drain_due_present_pending_exec(&mut exec_state, &mut backend);
+
+        assert_eq!(exec_state.present_pending_exec.len(), 2);
+        assert!(backend.calls().iter().all(|call| !matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: PIXMAP_2,
+                ..
+            }
+        )));
+
+        let mut completion_state = ServerState::new();
+        let mut first_complete = due_pending_complete(
+            WINDOW_HOST_XID,
+            FIRST_COMPLETE_ID,
+            5_000,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        );
+        first_complete.event.crtc_id = LIT_CRTC;
+        first_complete.event.completion_clock = Some(crate::backend::PresentClockSample {
+            msc: 100,
+            ust: 0x1000,
+            source: crate::backend::PresentClockSource::Immediate,
+        });
+        let mut later_complete = due_pending_complete(
+            WINDOW_HOST_XID,
+            LATER_COMPLETE_ID,
+            5_000,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        );
+        later_complete.event.crtc_id = OFF_CRTC;
+        later_complete.event.completion_clock = first_complete.event.completion_clock;
+        completion_state
+            .present_pending_complete
+            .extend([first_complete, later_complete]);
+
+        drain_due_present_pending_exec(&mut completion_state, &mut backend);
+
+        assert_eq!(completion_state.present_pending_complete.len(), 2);
+        assert!(backend.signalled_present_wakes.is_empty());
+    }
+
+    #[test]
+    fn c0_3aii_blackout_never_forces_a_waiting_source() {
+        use yserver_protocol::x11::present as x11present;
+
+        const OFF_CRTC: u32 = 0x6401;
+        const WINDOW_HOST_XID: u32 = 0x0040_6401;
+        const PIXMAP_HOST_XID: u32 = 0x0040_6411;
+        const BLOCKER_ID: u64 = 6401;
+        const COMPLETION_ID: u64 = 6402;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_absolute_vblank_arm_supported = true;
+        backend.present_display_idle = false;
+        backend
+            .present_scanout_blackout_by_crtc
+            .insert(OFF_CRTC, true);
+
+        let mut blocker = present_pending_entry_with(
+            BLOCKER_ID,
+            WINDOW_HOST_XID,
+            PIXMAP_HOST_XID,
+            Some(5_000),
+            false,
+        );
+        blocker.pending.crtc_id = OFF_CRTC;
+        state.present_pending_exec.insert(BLOCKER_ID, blocker);
+        let mut completion = due_pending_complete(
+            WINDOW_HOST_XID,
+            COMPLETION_ID,
+            5_000,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        );
+        completion.event.crtc_id = OFF_CRTC;
+        state.present_pending_complete.push(completion);
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        assert!(state.present_pending_exec.contains_key(&BLOCKER_ID));
+        assert_eq!(state.present_pending_complete.len(), 1);
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. }))
+        );
+        assert!(backend.signalled_present_wakes.is_empty());
+        assert!(backend.released_present_sources.is_empty());
+    }
+
+    #[test]
+    fn c0_3aii_legacy_blackout_keeps_overtaking_a_waiting_source() {
+        const OFF_CRTC: u32 = 0x6451;
+        const WINDOW_HOST_XID: u32 = 0x0040_6451;
+        const WAITING_PIXMAP: u32 = 0x0040_6452;
+        const READY_PIXMAP: u32 = 0x0040_6453;
+        const WAITING_ID: u64 = 6451;
+        const READY_ID: u64 = 6452;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_flip_in_flight = true;
+        backend.present_absolute_vblank_arm_supported = true;
+        backend.present_display_idle = false;
+        // The scalar models Legacy's all-or-nothing blackout answer.
+        backend.present_scanout_blackout = true;
+
+        let mut waiting = present_pending_entry_with(
+            WAITING_ID,
+            WINDOW_HOST_XID,
+            WAITING_PIXMAP,
+            Some(5_000),
+            false,
+        );
+        waiting.pending.crtc_id = OFF_CRTC;
+        let mut ready =
+            present_pending_entry_with(READY_ID, WINDOW_HOST_XID, READY_PIXMAP, Some(5_000), true);
+        ready.pending.crtc_id = OFF_CRTC;
+        state.present_pending_exec.insert(WAITING_ID, waiting);
+        state.present_pending_exec.insert(READY_ID, ready);
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        assert!(state.present_pending_exec.contains_key(&WAITING_ID));
+        assert!(!state.present_pending_exec.contains_key(&READY_ID));
+        assert!(backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: READY_PIXMAP,
+                ..
+            }
+        )));
+        assert!(backend.calls().iter().all(|call| !matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: WAITING_PIXMAP,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn c0_3aii_legacy_blackout_unchanged() {
+        use crate::backend::PresentClockSample;
+        use yserver_protocol::x11::{ClientByteOrder, SequenceNumber, present as x11present};
+
+        const WINDOW: u32 = 0x0000_6501;
+        const EID: u32 = 0x0010_6501;
+        const PRESENT_ID: u64 = 6501;
+        const CLOCK_MSC: u64 = 100;
+        const CLOCK_UST: u64 = 0x2000;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_present_selection(
+            &mut state,
+            &mut peer,
+            EID,
+            WINDOW,
+            x11present::EVENT_MASK_COMPLETE_NOTIFY | x11present::EVENT_MASK_IDLE_NOTIFY,
+        );
+        let mut backend = RecordingBackend::new();
+        // RecordingBackend's scalar models Legacy's all-or-nothing answer.
+        backend.present_scanout_blackout = true;
+
+        let mut completion = due_pending_complete(
+            WINDOW,
+            PRESENT_ID,
+            5_000,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        );
+        completion.event.crtc_id = 0x6501;
+        completion.event.host_xid = 0x6502;
+        completion.event.completion_clock = Some(PresentClockSample {
+            msc: CLOCK_MSC,
+            ust: CLOCK_UST,
+            source: crate::backend::PresentClockSource::Immediate,
+        });
+        state.present_pending_complete.push(completion);
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        let bytes = read_all_available(&mut peer);
+        let idle = x11present::encode_idle_notify(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0),
+            145,
+            EID,
+            WINDOW,
+            1,
+            0x6502,
+            0,
+        );
+        let complete = x11present::encode_complete_notify(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0),
+            145,
+            EID,
+            WINDOW,
+            1,
+            x11present::COMPLETE_KIND_PIXMAP,
+            x11present::COMPLETE_MODE_COPY,
+            CLOCK_UST,
+            CLOCK_MSC,
+        );
+        assert_eq!(bytes, [idle, complete].concat());
+        assert_eq!(backend.signalled_present_wakes, vec![PRESENT_ID]);
+        assert!(state.present_pending_complete.is_empty());
     }
 
     /// (vi) Arm failure / `Ok(0)`: entries execute immediately in the

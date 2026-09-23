@@ -152,6 +152,13 @@ pub enum ArbiterInput<I> {
         outcome: RecoveryAttemptOutcome,
     },
     DeviceStateChanged(DeviceLifecycleState),
+    /// A read-only seat ownership observation from the existing VT path.
+    /// It updates the external prerequisite and retries bounded convergence,
+    /// without projecting a VT release/acquire transition of its own.
+    SeatTargetObserved {
+        target: super::SeatTarget,
+        epoch: u64,
+    },
     /// The 3d fd-family barrier discharged a quarantine fence left by a
     /// failed or late safety receipt.
     FdFamilyBarrierCleared {
@@ -307,6 +314,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         self.desired.add_protocol_output(output)
     }
 
+    pub(crate) fn observe_seat_target(&mut self, target: super::SeatTarget, epoch: u64) {
+        self.desired.observe_seat_target(target, epoch);
+    }
+
     /// Remove one stable protocol output projection from this device.
     pub fn remove_protocol_output(&mut self, output: &O) -> Option<super::OutputProjectionRemoval> {
         self.desired.remove_protocol_output(output)
@@ -356,6 +367,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                     actions.push(LifecycleAction::ReopenAdmission(self.current_work_tag()));
                 }
                 actions
+            }
+            ArbiterInput::SeatTargetObserved { target, epoch } => {
+                self.desired.observe_seat_target(target, epoch);
+                self.converge()
             }
             ArbiterInput::FdFamilyBarrierCleared { tag } => {
                 if !self.is_current_transition_tag(&tag) {

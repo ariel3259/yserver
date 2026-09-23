@@ -225,6 +225,14 @@ impl<O: Ord> LifecycleDesired<O> {
         self.seat_epoch
     }
 
+    /// Update the observed seat prerequisite without creating a VT lifecycle
+    /// representative. Stage 3a consumes the existing VT path as a read-only
+    /// feed; stages 3b/3c own VT transition execution.
+    pub(crate) fn observe_seat_target(&mut self, target: SeatTarget, epoch: u64) {
+        self.seat_target = Some(target);
+        self.seat_epoch = Some(epoch);
+    }
+
     pub const fn administrative_reprobe_epoch(&self) -> Option<u64> {
         self.administrative_reprobe_epoch
     }

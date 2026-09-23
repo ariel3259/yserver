@@ -1081,9 +1081,10 @@ pub trait Backend {
         let _ = crtc_epoch;
         self.arm_present_absolute_vblank(crtc_id, &legacy_targets)
     }
-    /// Display cannot scan out at all (VT-away OR DPMS-off). Gates the
-    /// blackout flush. Default false.
-    fn present_scanout_blackout(&self) -> bool {
+    /// Whether the target CRTC cannot scan out (VT-away OR DPMS-off).
+    /// Gates blackout handling for Presents targeting this CRTC. Default
+    /// false.
+    fn present_scanout_blackout(&self, _crtc_id: u32) -> bool {
         false
     }
     /// Pin a present source drawable by xid; resolves the xid ONCE and

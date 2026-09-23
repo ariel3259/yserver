@@ -432,9 +432,12 @@ pub struct RecordingBackend {
     /// Default `false` matches the trait default.
     pub present_absolute_vblank_arm_supported: bool,
     pub present_absolute_vblank_arm_supported_by_crtc: std::collections::HashMap<u32, bool>,
-    /// Task 7: canned return for `present_scanout_blackout`. Default
-    /// `false` matches the trait default.
+    /// Canned all-or-nothing blackout answer for targets without an explicit
+    /// per-CRTC override. Default `false` matches the trait default.
     pub present_scanout_blackout: bool,
+    /// Per-CRTC blackout overrides; missing CRTCs retain the scalar
+    /// all-or-nothing answer above.
+    pub present_scanout_blackout_by_crtc: std::collections::HashMap<u32, bool>,
     /// Controls what `arm_present_absolute_vblank` returns. `None`
     /// (default) mimics a real always-succeeds arm: covers every target
     /// it's given. `Some(Ok(n))` / `Some(Err(kind))` let a test pin the
@@ -569,6 +572,7 @@ impl RecordingBackend {
             present_absolute_vblank_arm_supported: false,
             present_absolute_vblank_arm_supported_by_crtc: std::collections::HashMap::new(),
             present_scanout_blackout: false,
+            present_scanout_blackout_by_crtc: std::collections::HashMap::new(),
             arm_present_absolute_vblank_result: None,
             armed_absolute_vblank_targets: Vec::new(),
             armed_absolute_vblank_crtcs: Vec::new(),
@@ -974,8 +978,11 @@ impl Backend for RecordingBackend {
         self.arm_present_absolute_vblank(crtc_id, &legacy_targets)
     }
 
-    fn present_scanout_blackout(&self) -> bool {
-        self.present_scanout_blackout
+    fn present_scanout_blackout(&self, crtc_id: u32) -> bool {
+        self.present_scanout_blackout_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_scanout_blackout)
     }
 
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {

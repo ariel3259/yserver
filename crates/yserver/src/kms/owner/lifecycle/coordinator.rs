@@ -16,6 +16,14 @@ pub struct CoordinatorDispatch<D, I> {
     pub actions: Vec<LifecycleAction<I>>,
 }
 
+/// Actions caused by an external prerequisite observation that has no
+/// lifecycle event identity of its own.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CoordinatorActionDispatch<D, I> {
+    pub device: D,
+    pub actions: Vec<LifecycleAction<I>>,
+}
+
 /// New output target plus any device synchronization event needed to inherit
 /// the coordinator's current global DPMS state.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -59,6 +67,7 @@ pub struct LifecycleCoordinator<D, O, I> {
     shutdown_requested: bool,
     seat_target: Option<SeatTarget>,
     seat_epoch: u64,
+    seat_target_from_read_only_feed: bool,
     protocol_dpms_level: u8,
     dpms_epoch: u64,
     next_event_id: Option<LifecycleEventId>,
@@ -78,6 +87,7 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
             shutdown_requested: false,
             seat_target: None,
             seat_epoch: 0,
+            seat_target_from_read_only_feed: false,
             protocol_dpms_level: 0,
             dpms_epoch: 0,
             next_event_id: Some(LifecycleEventId::first()),
@@ -132,13 +142,21 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
         if self.shutdown_requested {
             result.push(self.project_with_new_id(key, DesiredIntent::Shutdown)?);
         } else if let Some(target) = self.seat_target {
-            result.push(self.project_with_new_id(
-                key,
-                DesiredIntent::Seat {
-                    target,
-                    epoch: self.seat_epoch,
-                },
-            )?);
+            if self.seat_target_from_read_only_feed {
+                self.devices
+                    .get_mut(&key)
+                    .expect("device was inserted")
+                    .arbiter
+                    .observe_seat_target(target, self.seat_epoch);
+            } else {
+                result.push(self.project_with_new_id(
+                    key,
+                    DesiredIntent::Seat {
+                        target,
+                        epoch: self.seat_epoch,
+                    },
+                )?);
+            }
         }
         Ok(result)
     }
@@ -289,6 +307,7 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
         let event_ids = self.reserve_event_ids(keys.len())?;
         self.seat_target = Some(target);
         self.seat_epoch = epoch;
+        self.seat_target_from_read_only_feed = false;
         keys.into_iter()
             .zip(event_ids)
             .map(|(key, event_id)| {
@@ -418,6 +437,35 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
         })
     }
 
+    /// Record seat ownership observed by the existing Legacy VT path. This
+    /// updates only the prerequisite snapshot, then lets pending work such as
+    /// DPMS converge when ownership returns. It does not create a VT event or
+    /// ask the driver to execute VT policy.
+    pub fn observe_seat_target(
+        &mut self,
+        target: SeatTarget,
+    ) -> Result<Vec<CoordinatorActionDispatch<D, I>>, CoordinatorError> {
+        let epoch = self
+            .seat_epoch
+            .checked_add(1)
+            .ok_or(CoordinatorError::EpochExhausted)?;
+        self.seat_target = Some(target);
+        self.seat_epoch = epoch;
+        self.seat_target_from_read_only_feed = true;
+
+        let keys: Vec<_> = self.devices.keys().cloned().collect();
+        keys.into_iter()
+            .map(|key| {
+                let actions =
+                    self.apply_input(&key, ArbiterInput::SeatTargetObserved { target, epoch })?;
+                Ok(CoordinatorActionDispatch {
+                    device: key,
+                    actions,
+                })
+            })
+            .collect()
+    }
+
     /// Feed acknowledged driver/executor inputs to one arbiter. Event and
     /// completion-loss inputs stay coordinator-owned.
     pub fn apply_device_input(
@@ -430,6 +478,7 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
             ArbiterInput::LifecycleEvent { .. }
                 | ArbiterInput::CompletionUnknown { .. }
                 | ArbiterInput::RecoveryIncidentAllocated { .. }
+                | ArbiterInput::SeatTargetObserved { .. }
         ) {
             return Err(CoordinatorError::CoordinatorOwnedInput);
         }
@@ -1455,6 +1504,16 @@ mod tests {
                 ArbiterInput::CompletionUnknown {
                     event_id: LifecycleEventId::from_raw(99),
                     boundary_recovery_id: None,
+                },
+            ),
+            Err(CoordinatorError::CoordinatorOwnedInput)
+        );
+        assert_eq!(
+            coordinator.apply_device_input(
+                &1,
+                ArbiterInput::SeatTargetObserved {
+                    target: SeatTarget::Released,
+                    epoch: 1,
                 },
             ),
             Err(CoordinatorError::CoordinatorOwnedInput)
