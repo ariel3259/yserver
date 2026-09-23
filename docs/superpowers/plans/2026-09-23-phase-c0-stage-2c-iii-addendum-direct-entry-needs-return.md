@@ -50,7 +50,7 @@ its return.
 
 **Step 1 — inventory before editing.** List every existing test that offers a direct **entry** on an Owner conductor (the `c0_conv_cii_*`, `c0_conv_ciii_*`, `c0_conv_cfb_*`, `c0_conv_cp_*` and `c0_adm*` families) and, for each, whether its fixture establishes a composed return before the entry. Report the list in your final message.
 
-**Step 2 — implement I-1/I-2** at the direct readiness report in `admission_snapshot`.
+**Step 2 — implement I-0, I-1, I-2 and I-4**: the per-device current-direct check and every caller of the device-blind one; the gate at the direct readiness report in `admission_snapshot`; the once-per-generation request for a full composed frame.
 
 **Step 3 — fixtures.** Every inventoried test whose entry now waits because its fixture had no composed return gets a fixture that **establishes one through production entries** (a composed frame dispatched and retired through `route_owner_event_batch`, or the existing helper `c0_conv_ciii_mark_retained_composed` where it already does that) — never a weakened assertion, never a bypass of the gate. If a test cannot establish a return through production entries, that is an F8: stop and report it.
 
@@ -66,7 +66,7 @@ its return.
 
 **Mutations** (apply by line, confirm the run compiled, restore; ledger in your report):
 
-- **A1** — remove the I-1 check: the first and third tests fail.
+- **A1** — remove the I-1 check: `direct_entry_waits_without_a_composed_return` and `direct_entry_admitted_once_the_return_exists_vulkan` fail.
 - **A2** — apply the check to successors too (drop the `has_current_direct` condition): the second test fails.
 - **A3** — evaluate the gate against the *first* output only instead of every
   output of the device. The third test proves A3 only through the
