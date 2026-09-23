@@ -138,6 +138,16 @@ others. §6.4 `Quiescing` and `TransportState::Quiescing` are different things
 and keep different names in code (the sub-stage 3a spec chooses them).
 `CompletionQualification` is consumed by the §6.4 state, not duplicated.
 
+`TransportState` exists only while Legacy and Owner coexist. It is **not** dead
+code at the end of stage 3: production devices stay `Legacy`, and the primary
+(`drm/page_flip.rs`, `scene.rs`), modeset and cursor/gamma legacy writers
+(`platform.rs:4211`, `:4343`, `:4465`, `:4664`) keep asking `allows_legacy`
+until stage 4 converts the last of them. Removing it earlier would either strip
+production of those writers or force production to `Owner` while the legacy
+cursor is still refused there, and it would delete the Legacy oracle that the
+section 4.1 differential gate of the later sub-stages compares against. It is
+removed at the moment it is replaced: the first act of stage 5 (section 6).
+
 ## 3. Sub-stages (approved)
 
 Every sub-stage: own spec → codex review → plan of at most ~14 tasks (split
@@ -307,6 +317,11 @@ therefore proposes a fifth stage inside the same PR:
 > section 4.1 layer-3 client battery, the upstream-fixes revalidation
 > (`docs/phase-c0-upstream-fixes-revalidation.md`) on Owner, and the final-tip
 > gate. Stage 5 has its own spec and plan.
+>
+> Its first act, once the last legacy writer is gone, deletes `TransportState`
+> entirely — the handover (`Quiescing` → `publish_owner`, `HandoverPermit`,
+> `LegacyDrained`) and `allows_legacy` — and folds `Closed`/`force_close` into
+> the §6.4 state, which becomes the only device state.
 
 **Entry preconditions of stage 5** (owed debts, named here so they are not
 loose findings):
@@ -326,4 +341,13 @@ loose findings):
 - Production activation and legacy removal — stage 5.
 - Phase C.1 (including the commit-correlated completion sample for composed
   commits that plan Cp asked C.1 for).
-- Any new client API: X11 DPMS stays one global protocol control (`REC-5`).
+- **No new protocol surface.** Stage 3 adds no extension, request, event or
+  RANDR property. X11 DPMS stays one global control (`REC-5`); the per-output
+  projection is internal and never exposed to clients (for example as a
+  per-output `DPMS` property — today RANDR publishes only `EDID`, `EDID_DATA`
+  and `ConnectorType`, `process_request.rs:3202`). What changes is execution,
+  not the control: one global request becomes one atomic transition per
+  device, replacing the per-output best-effort loop, the global
+  `kms_outputs_active` boolean and the `request_exit()` fail-stop on a partial
+  all-off. Extensions unrelated to the lifecycle are outside C.0, neither
+  forbidden nor governed by it.
