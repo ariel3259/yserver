@@ -251,6 +251,22 @@ fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
     ))
 }
 
+/// Log target for the once-a-second resource lines (`vram`,
+/// `gpu load`, `pixmap pool live`).
+///
+/// Deliberately NOT the crate-root target. At `RUST_LOG=info` this
+/// server writes ~2.1 MB/s — MEASURED, 434 MB over 195 s on silence,
+/// which extrapolates to ~179 GB/day. A contributor asked to leave a
+/// session running for a day needs these three lines and nothing
+/// else, which this target makes expressible:
+///
+/// ```text
+/// RUST_LOG=warn,yserver::resources=info
+/// ```
+///
+/// ~3 lines/s at ~150 B is ~39 MB/day, which is a log you can keep.
+pub const RESOURCE_TELEMETRY_TARGET: &str = "yserver::resources";
+
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
@@ -299,6 +315,17 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // (atomic-add is ~1ns); only the per-second emission is
     // env-gated.
     if std::env::var_os("YSERVER_LOOP_TELEMETRY").is_some() {
+        // Announced at warn! so it survives the narrow filter a
+        // long run uses. An empty resources log then means "the
+        // filter is wrong", not "the server was idle" — absence of
+        // an unloggable line is not evidence, and a log that comes
+        // out empty otherwise reads as a clean run.
+        log::warn!(
+            "resource telemetry active: 1 Hz on target `{RESOURCE_TELEMETRY_TARGET}` \
+             (vram / gpu load / pixmap pool live). For a long run filter with \
+             RUST_LOG=warn,{RESOURCE_TELEMETRY_TARGET}=info \
+             — full `info` writes ~2 MB/s."
+        );
         thread::spawn(|| {
             use std::time::Duration;
             // Previous-snapshot cache for the pool delta. The pool's
@@ -306,6 +333,12 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             // deltas so the line reads the same way as the vk-call
             // rates.
             let mut prev_pool = crate::kms::vk::pixmap_pool::PixmapPoolStats::default();
+            // Previous GPU-engine reading + when it was taken. The
+            // fdinfo counters are cumulative, so a busy fraction
+            // needs both the delta and the wall interval it spans —
+            // the 1 s sleep below is nominal, not exact.
+            let mut prev_gpu: Option<(crate::drm::fdinfo::GpuLoadSample, std::time::Instant)> =
+                None;
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let s = crate::kms::vk::call_stats::VK_CALLS.snapshot_and_reset();
@@ -466,6 +499,110 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                         d_over_bins[3],
                     );
                     prev_pool = cur;
+                }
+                // Device-memory use, as the driver accounts it for
+                // THIS process — so a reading is not polluted by
+                // another compositor holding memory on a different
+                // VT. `usage` is ours; `budget` is what we may still
+                // allocate and shrinks when others take the heap, so
+                // a small budget beside a small usage means someone
+                // else is the tenant.
+                //
+                // Absent (no `VK_EXT_memory_budget`, or Vulkan not up
+                // yet) the line is omitted rather than printed as
+                // zeros, which would read as "we use no memory".
+                // Live pool occupancy. The cumulative counters above
+                // cannot answer "how much is the pool holding right
+                // now" — entries leave only via takes_hit, so
+                // residency is a difference of two large numbers.
+                // The pool has no eviction and drains only at
+                // shutdown, so this is a high-water mark by
+                // construction; `nominal_bytes` is a FLOOR (real
+                // cost is mem_reqs.size per OPTIMAL-tiled image, each
+                // its own BO — there is no suballocator).
+                if let Some(r) = crate::kms::vk::pixmap_pool::residency_snapshot() {
+                    log::info!(
+                        target: RESOURCE_TELEMETRY_TARGET,
+                        "pixmap pool live: buckets={} empty_buckets={} entries={} \
+                         nominal_bytes_floor={:.1}MiB",
+                        r.buckets,
+                        r.empty_buckets,
+                        r.entries,
+                        r.nominal_bytes as f64 / (1024.0 * 1024.0),
+                    );
+                }
+                // Per-process GPU engine time, from DRM fdinfo —
+                // summed over EVERY DRM fd this process holds,
+                // because rendering goes through the fd Mesa opens
+                // for the Vulkan device, not the KMS fd we open.
+                //
+                // This answers "is the GPU load ours or the
+                // client's", which no Vulkan API reports: timestamp
+                // queries (`gpu_render_ns`) time one pass of our own
+                // work, not our share of the device.
+                //
+                // Percentages can legitimately exceed 100 in total:
+                // two engines each busy for a second inside one
+                // second of wall time is 200% of engine time.
+                if let Some(cur_gpu) = crate::drm::fdinfo::sample() {
+                    let now = std::time::Instant::now();
+                    if let Some((prev, at)) = prev_gpu.take() {
+                        let elapsed_ns =
+                            u64::try_from(now.duration_since(at).as_nanos()).unwrap_or(u64::MAX);
+                        // One line PER PHYSICAL GPU. silence and the
+                        // hybrid laptops hold fds to two, and summing
+                        // engine time across them describes neither.
+                        for (pdev, dev) in &cur_gpu.devices {
+                            let engines = crate::drm::fdinfo::busy_percent(
+                                prev.devices.get(pdev),
+                                dev,
+                                elapsed_ns,
+                            )
+                            .iter()
+                            .map(|(name, pct)| format!("{name}={pct:.1}%"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                            let mib = |b: Option<u64>| {
+                                b.map_or_else(
+                                    || "n/a".to_owned(),
+                                    |b| format!("{:.1}MiB", b as f64 / (1024.0 * 1024.0)),
+                                )
+                            };
+                            log::info!(
+                                target: RESOURCE_TELEMETRY_TARGET,
+                                "gpu load [1s] {} {pdev}: {} clients={} drm_vram={} drm_gtt={}",
+                                dev.driver,
+                                // amdgpu emits no engine counters
+                                // until work is submitted, so an
+                                // empty list is idle-or-unused, not
+                                // unsupported.
+                                if engines.is_empty() {
+                                    "(no engine counters)".to_owned()
+                                } else {
+                                    engines
+                                },
+                                dev.clients,
+                                mib(dev.vram_bytes),
+                                mib(dev.gtt_bytes),
+                            );
+                        }
+                    }
+                    prev_gpu = Some((cur_gpu, now));
+                }
+                if let Some(v) = crate::kms::vk::vram::sample() {
+                    // MiB at one decimal: the numbers under
+                    // investigation are GiB-scale, and byte counts
+                    // make a per-second log unreadable.
+                    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+                    log::info!(
+                        target: RESOURCE_TELEMETRY_TARGET,
+                        "vram [1s]: device_local_usage={:.1}MiB device_local_budget={:.1}MiB \
+                         other_usage={:.1}MiB device_local_heaps={}",
+                        mib(v.device_local_usage),
+                        mib(v.device_local_budget),
+                        mib(v.other_usage),
+                        v.device_local_heaps,
+                    );
                 }
             }
         });

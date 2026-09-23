@@ -674,6 +674,8 @@ struct DamageAuditTarget {
     /// turns the audit's existing candidate-vs-reference pair into a direct
     /// A/B of clipped versus full compose cost on an identical scene.
     timestamp_pool: vk::QueryPool,
+    /// See `TransferResources::timestamps_written`.
+    timestamps_written: bool,
     last_gpu_render_ns: Option<u64>,
 }
 
@@ -801,6 +803,7 @@ impl DamageAuditTarget {
             command_pool,
             command_buffer,
             timestamp_pool,
+            timestamps_written: false,
             last_gpu_render_ns: None,
         })
     }
@@ -5350,9 +5353,10 @@ fn audit_overlay_pipeline(
     if !needed {
         return Ok((vk::Pipeline::null(), vk::PipelineLayout::null()));
     }
-    let pipeline = inner
-        .overlay_xor_cache
-        .get(yserver_core::backend::GcFunction::Xor, true)?;
+    let pipeline = inner.overlay_xor_cache.get(
+        yserver_core::backend::GcFunction::Xor,
+        crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
+    )?;
     Ok((pipeline, inner.overlay_xor_cache.pipeline_layout()))
 }
 
@@ -7007,9 +7011,10 @@ fn tick_one_output(
     let (xor_pipeline, xor_layout) = if overlay_ops.is_empty() {
         (vk::Pipeline::null(), vk::PipelineLayout::null())
     } else {
-        let pl = inner
-            .overlay_xor_cache
-            .get(yserver_core::backend::GcFunction::Xor, true)?;
+        let pl = inner.overlay_xor_cache.get(
+            yserver_core::backend::GcFunction::Xor,
+            crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
+        )?;
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
     let mut gpu_submitted = false;
@@ -10010,6 +10015,10 @@ pub(crate) trait ComposeRenderTarget {
     fn width(&self) -> u32;
     fn height(&self) -> u32;
     fn timestamp_pool(&self) -> vk::QueryPool;
+    /// Whether a submitted compose has reset and written this target's
+    /// timestamp queries, i.e. whether reading them is legal yet.
+    fn timestamps_written(&self) -> bool;
+    fn mark_timestamps_written(&mut self);
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>);
     fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError>;
     fn record_post_compose(
@@ -10059,6 +10068,14 @@ impl ComposeRenderTarget for ScanoutBo {
 
     fn timestamp_pool(&self) -> vk::QueryPool {
         self.vk_transfer.timestamp_pool
+    }
+
+    fn timestamps_written(&self) -> bool {
+        self.vk_transfer.timestamps_written
+    }
+
+    fn mark_timestamps_written(&mut self) {
+        self.vk_transfer.timestamps_written = true;
     }
 
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
@@ -10134,6 +10151,14 @@ impl<'a> ComposeRenderTarget for ManagedSharedComposeTarget<'a> {
         self.shared.transfer.timestamp_pool
     }
 
+    fn timestamps_written(&self) -> bool {
+        self.shared.transfer.timestamps_written
+    }
+
+    fn mark_timestamps_written(&mut self) {
+        self.shared.transfer.timestamps_written = true;
+    }
+
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
         self.bo.last_gpu_render_ns = value;
     }
@@ -10202,6 +10227,14 @@ impl ComposeRenderTarget for CopiedRenderSource {
         self.transfer.timestamp_pool
     }
 
+    fn timestamps_written(&self) -> bool {
+        self.transfer.timestamps_written
+    }
+
+    fn mark_timestamps_written(&mut self) {
+        self.transfer.timestamps_written = true;
+    }
+
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
         self.last_gpu_render_ns = value;
     }
@@ -10260,6 +10293,14 @@ impl ComposeRenderTarget for DamageAuditTarget {
 
     fn timestamp_pool(&self) -> vk::QueryPool {
         self.timestamp_pool
+    }
+
+    fn timestamps_written(&self) -> bool {
+        self.timestamps_written
+    }
+
+    fn mark_timestamps_written(&mut self) {
+        self.timestamps_written = true;
     }
 
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
@@ -10695,12 +10736,14 @@ pub(crate) fn record_and_submit_render(
     // timestamps BEFORE the CB overwrites them; the read is
     // synchronous (no WAIT flag), and the bo is being re-acquired so
     // its prior compose fence has already signalled → results are
-    // available. `NOT_READY` on the very first compose (pool never
-    // written) → `None`. `tick_one_output` takes and forwards this to
+    // available. The first compose of a new pool must NOT read: its
+    // queries have never been reset, and reading them is invalid
+    // (validation: "query not reset") even though drivers tend to
+    // answer `NOT_READY`. `tick_one_output` takes and forwards this to
     // `telemetry.record_gpu_render_ns` after submission returns.
     let ts_pool = target.timestamp_pool();
     let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
-    let last_gpu_render_ns = if ts_enabled {
+    let last_gpu_render_ns = if ts_enabled && target.timestamps_written() {
         let mut ts = [0u64; 2];
         match unsafe {
             vk.device
@@ -10795,6 +10838,11 @@ pub(crate) fn record_and_submit_render(
     }
     target.note_submit_succeeded();
     *gpu_submitted = true;
+    // The CB just submitted reset and wrote both queries
+    // (`record_command_buffer`), so the next compose may read them.
+    if ts_enabled {
+        target.mark_timestamps_written();
+    }
     Ok(ComposeSubmit {
         descriptor_count: descriptors.len(),
     })

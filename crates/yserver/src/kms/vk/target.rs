@@ -1323,26 +1323,35 @@ pub enum TilingStrategy {
     /// has no compression metadata, so live writes are immediately
     /// visible.
     Linear,
-    /// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`. Required on RADV /
-    /// RDNA2 — that driver rejects `LINEAR + COLOR_ATTACHMENT + dma-buf`
-    /// with `VK_ERROR_FORMAT_NOT_SUPPORTED`.
+    /// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with exactly
+    /// `DRM_FORMAT_MOD_LINEAR`: the same linear layout as [`Self::Linear`],
+    /// declared through the modifier path. For drivers whose format query
+    /// rejects `TILING_LINEAR` dma-bufs outright but accepts the LINEAR
+    /// modifier for every usage — RADV on RDNA2.
+    LinearModifier,
+    /// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with any export-capable
+    /// modifier, for a driver that cannot export the LINEAR modifier.
     Modifier,
 }
 
 /// Allocate an external-memory, dma-buf-exportable `VkImage` + `VkDeviceMemory`.
 ///
-/// **LINEAR-preferred, modifier-fallback.** The strategy is selected
-/// once per `VkContext` and cached on its `tfp_tiling_strategy`
-/// `OnceLock`:
+/// **Linear layout preferred, chosen by asking the driver.** The strategy
+/// is selected once per `VkContext` and cached on its
+/// `tfp_tiling_strategy` `OnceLock`. On the first call, in order:
 ///
-/// - Empty (first call): try LINEAR first. If `vkCreateImage` accepts
-///   it (Turnip, Mesa software, most non-AMD drivers), cache
-///   [`TilingStrategy::Linear`]. If it rejects with
-///   `FORMAT_NOT_SUPPORTED` (RADV/RDNA2), try the modifier path with
-///   the driver's export-capable single-plane modifiers list and cache
-///   [`TilingStrategy::Modifier`] on success.
-/// - Set: dispatch directly to the cached path, skipping the failing
-///   probe each call.
+/// 1. [`TilingStrategy::Linear`] if the format query advertises a
+///    `TILING_LINEAR` exportable dma-buf (ANV, Honeykrisp).
+/// 2. [`TilingStrategy::LinearModifier`] if it advertises the LINEAR DRM
+///    modifier instead (RADV on RDNA2, which rejects `TILING_LINEAR`
+///    dma-bufs for every usage).
+/// 3. [`TilingStrategy::Modifier`] with any export-capable modifier.
+/// 4. Otherwise `TILING_LINEAR` outside advertised support (RADV on GFX8,
+///    which advertises no dma-buf tiling at all), deliberately.
+///
+/// It never probes by calling `vkCreateImage`: RADV's accepts a
+/// `TILING_LINEAR` dma-buf image its own query rejects, so success there
+/// proved nothing.
 ///
 /// The modifier path uses `VkImageDrmFormatModifierListCreateInfoEXT`
 /// with the list from [`crate::kms::vk::dri3::export_capable_modifiers`],
@@ -1365,42 +1374,99 @@ pub fn allocate_exportable(
         return allocate_with_strategy(vk, width, height, format, *strategy);
     }
 
-    // First allocation: probe LINEAR first. Turnip / Adreno requires
-    // it for same-GPU coherence (UBWC's compression metadata stays in
-    // driver caches and the Mesa GL importer reads stale tiles).
-    match allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE) {
-        Ok(img) => {
-            let _ = vk.tfp_tiling_strategy.set(TilingStrategy::Linear);
-            return Ok(img);
-        }
-        Err(e) => {
-            // RADV / RDNA2 path: LINEAR + COLOR_ATTACHMENT + dma-buf
-            // → `VK_ERROR_FORMAT_NOT_SUPPORTED`. Fall through to the
-            // modifier path. Log at debug — RADV ALWAYS lands here on
-            // first export; warning would be noise.
-            log::debug!("allocate_exportable: LINEAR probe failed ({e:?}); trying modifier path");
-        }
-    }
+    // First allocation: ASK the driver, don't probe by creating. RADV's
+    // vkCreateImage accepts a `TILING_LINEAR` dma-buf image that its own
+    // format query rejects (seen on RDNA2 and Polaris), so a successful
+    // create proves nothing and the image it yields is outside what the
+    // driver supports. Linear layout stays preferred throughout: Turnip /
+    // Adreno needs it for same-GPU coherence (see `TilingStrategy::Linear`).
+    let (strategy, img) = if linear_tiling_exportable(vk, format) {
+        let img = allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE)?;
+        (TilingStrategy::Linear, img)
+    } else if vk.image_drm_format_modifier
+        && super::dri3::can_export_modifier(vk, format, super::dri3::DRM_FORMAT_MOD_LINEAR)
+    {
+        let img = allocate_exportable_modifier(
+            vk,
+            width,
+            height,
+            format,
+            &[super::dri3::DRM_FORMAT_MOD_LINEAR],
+            EXPORT_IMAGE_USAGE,
+        )?;
+        (TilingStrategy::LinearModifier, img)
+    } else if let Some(modifiers) = vk
+        .image_drm_format_modifier
+        .then(|| super::dri3::export_capable_modifiers(vk, format))
+        .filter(|m| !m.is_empty())
+    {
+        let img = allocate_exportable_modifier(
+            vk,
+            width,
+            height,
+            format,
+            &modifiers,
+            EXPORT_IMAGE_USAGE,
+        )?;
+        (TilingStrategy::Modifier, img)
+    } else {
+        // No advertised route at all. RADV on GFX8 (Polaris) has no
+        // modifier extension and rejects `TILING_LINEAR` dma-bufs for every
+        // usage subset (tools/vk-dmabuf-usage-probe.c); the same fallback
+        // covers any driver that advertises nothing exportable. vkCreateImage
+        // accepts this image anyway and it works in practice, so it is used
+        // deliberately — refusing would disable DRI3 export on these GPUs.
+        // It stays visible under validation. When it fails too (lavapipe),
+        // the driver has said no both ways: report it as unsupported.
+        let img = allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE)
+            .map_err(|e| {
+                log::debug!(
+                    "allocate_exportable: unadvertised TILING_LINEAR export failed ({e:?})"
+                );
+                vk::Result::ERROR_FORMAT_NOT_SUPPORTED
+            })?;
+        log::info!(
+            "allocate_exportable: driver advertises no dma-buf export tiling for {format:?}; \
+             using TILING_LINEAR outside advertised support"
+        );
+        (TilingStrategy::Linear, img)
+    };
+    let _ = vk.tfp_tiling_strategy.set(strategy);
+    Ok(img)
+}
 
-    if !vk.image_drm_format_modifier {
-        return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+/// Whether the driver advertises a `TILING_LINEAR` image with
+/// [`EXPORT_IMAGE_USAGE`] as an exportable dma-buf. The `TILING_LINEAR`
+/// counterpart of [`super::dri3::can_export_modifier`].
+#[track_caller]
+fn linear_tiling_exportable(vk: &VkContext, format: vk::Format) -> bool {
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::LINEAR)
+        .usage(EXPORT_IMAGE_USAGE)
+        .push_next(&mut external_info);
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    let result = super::image_format_properties2(
+        vk,
+        "target::linear_tiling_exportable",
+        None,
+        &format_info,
+        &mut props2,
+    );
+    if result.is_err() {
+        return false;
     }
-    let modifiers = super::dri3::export_capable_modifiers(vk, format);
-    if modifiers.is_empty() {
-        return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
-    }
-    match allocate_exportable_modifier(vk, width, height, format, &modifiers, EXPORT_IMAGE_USAGE) {
-        Ok(img) => {
-            let _ = vk.tfp_tiling_strategy.set(TilingStrategy::Modifier);
-            Ok(img)
-        }
-        Err(e) => {
-            log::warn!(
-                "allocate_exportable: both LINEAR and modifier paths failed (modifier err {e:?})"
-            );
-            Err(e)
-        }
-    }
+    let props = external_props.external_memory_properties;
+    props
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+        && props
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
 }
 
 fn allocate_with_strategy(
@@ -1414,6 +1480,14 @@ fn allocate_with_strategy(
         TilingStrategy::Linear => {
             allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE)
         }
+        TilingStrategy::LinearModifier => allocate_exportable_modifier(
+            vk,
+            width,
+            height,
+            format,
+            &[super::dri3::DRM_FORMAT_MOD_LINEAR],
+            EXPORT_IMAGE_USAGE,
+        ),
         TilingStrategy::Modifier => {
             if !vk.image_drm_format_modifier {
                 return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
