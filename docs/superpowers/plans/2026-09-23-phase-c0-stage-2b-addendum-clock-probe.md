@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only the filters `c0_2b_add_`, `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm`, each by its own command with `--include-ignored`; never `_drm` tests (including the one this plan edits), `c0_hw_` tests, `render_acceptance`, `c0_2ci` (known intermittent hang, `docs/known-issues.md`), an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Stop with the tree dirty when done. **Do not ask for approval inside a run** — if something this plan states does not hold in the code, stop and report it (F8); never silently substitute a test shape or weaken an existing assertion.
 
+**Revision 4 (2026-09-23)** — codex round 3
+(`../findings/2026-09-23-2b-addendum-clock-probe-plan-review-round3.md`:
+1 blocking, 1 major, both APPLIED): "stale" discards only a *result* — an
+uncertain outcome of a superseded probe still stalls the executor and takes
+the completion-loss route (I-3, B-1); the waiting probe is promoted at every
+slot release, validation resolution included, with its own test (M-1).
+
 **Revision 3 (2026-09-23)** — codex round 2
 (`../findings/2026-09-23-2b-addendum-clock-probe-plan-review-round2.md`:
 1 blocking, verified and APPLIED): I-1a now names the executor-level barrier
@@ -105,7 +112,18 @@ device**, composed or lifecycle. A stream of composed frames cannot starve it:
 it is sent between two composed commits at the latest. When a new clock epoch
 replaces one whose probe is waiting or in flight, the old key is dropped from
 the waiting set, an in-flight result for it is discarded as stale when it
-arrives (C.0), and the new epoch's key is waiting.
+arrives (C.0), and the new epoch's key is waiting. **Stale applies to results
+only:** a superseded probe's success or explicit rejection can never resolve
+the new epoch's clock, but an **uncertain** outcome of that superseded host
+call (timeout, IPC loss, helper exit) is still an executor fact — it takes
+I-1a's two layers exactly as a current one does (the executor stalls and
+reaps; the lifecycle reaches logical `Poisoned`). **Every slot release is a
+promotion point:** a composed or lifecycle commit's retirement, a
+validation's resolution (passed, rejected or abandoned) and a probe's own
+resolution; at each, a waiting probe key is sent before the next queued
+commit or validation of that device begins, whichever queue (composed
+admission or lifecycle driver) holds it. Task 1 names each release site in
+its inventory.
 
 **I-4. DPMS waits for its clock.** A lifecycle DPMS whose expected-completion
 CRTCs include one whose clock is not yet resolved (probe not started, pending
@@ -167,7 +185,8 @@ stub-executor fixture driven through production entries (no
 | `c0_2b_add_clock_exists_without_a_randr_query` | the same setup with no RANDR enumeration: the clock record exists and is probed | **P2** install only from the RANDR path |
 | `c0_2b_add_failed_probe_is_not_retried_in_the_epoch` | stub replies `EOPNOTSUPP`: clock stays `Unresolved`; further ticks and a refresh at the same epoch send no second probe; a genuinely new epoch probes again | **P3** retry within the epoch |
 | `c0_2b_add_probe_is_not_starved_by_composed_frames_vulkan` | the clock is installed while a composed commit holds the slot, and composed frames keep arriving: the waiting probe is sent at that commit's retirement, before the next composed commit begins | **P4** promote the waiting probe only when no composed work is queued |
-| `c0_2b_add_new_epoch_replaces_an_in_flight_probe` | a probe in flight, then a genuinely new clock epoch for the same CRTC: the old reply, when it arrives, is discarded and does not resolve the new clock; the new epoch is probed | **P4b** resolve the new clock from the old reply |
+| `c0_2b_add_new_epoch_replaces_an_in_flight_probe` | a probe in flight, then a genuinely new clock epoch for the same CRTC, in two runs: (i) the old probe then succeeds — its reply is discarded and does not resolve the new clock, and the new epoch is probed; (ii) the old probe then times out — the executor stalls and reaps and the lifecycle reaches `Poisoned`, it is not discarded as stale | **P4b** resolve the new clock from the old reply; **P4d** discard the old timeout as stale |
+| `c0_2b_add_probe_is_promoted_after_a_validation` | a clock installed while a lifecycle validation holds the slot, with a lifecycle successor queued: when the validation resolves, the waiting probe is sent before the successor's validation begins | **P4e** promote only on commit retirement |
 | `c0_2b_add_uncertain_probe_stalls_the_executor` | the stub never replies to the probe and its watchdog expires while a DPMS waits: the executor reaches `Stalled` then `Reaped` through `tick` and yields a `ReapProof`; the production completion-loss route reaches `Poisoned`; the DPMS is logical-only; no further host call is sent and the owner's slot stays held | **P4c** treat `Unknown` like an explicit errno (release the slot and mark unresolved) |
 | `c0_2b_add_legacy_device_never_probes` | a Legacy device: no `ClockProbe` host call, no clock state change | **P5** probe without the Owner condition |
 
