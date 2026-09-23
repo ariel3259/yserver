@@ -2,6 +2,17 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only the filters `c0_2b_add_`, `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm`, each by its own command with `--include-ignored`; never `_drm` tests (including the one this plan edits), `c0_hw_` tests, `render_acceptance`, `c0_2ci` (known intermittent hang, `docs/known-issues.md`), an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Stop with the tree dirty when done. **Do not ask for approval inside a run** — if something this plan states does not hold in the code, stop and report it (F8); never silently substitute a test shape or weaken an existing assertion.
 
+**Revision 6 (2026-09-23, coordinator)** — Task 1 F8 before editing, three
+plan gaps, all verified: (1) two Task 1 tests needed Task 2's DPMS wait —
+the uncertain-probe test, the stale-timeout run and the passed-validation
+re-validation run move to Task 2 with I-1a; (2) a sequence-queue lease also
+blocks `acquire_probe` — added to I-3's release points with a test run;
+(3) production has **no Owner activation site yet** (C0-R8: production stays
+Legacy until stage 5; `install_admission_conductor` and
+`try_finish_legacy_transport` have no production caller) — I-2 is anchored to
+one activation step that every conductor-install entry goes through, and
+stage 5 inherits it.
+
 **Revision 5 (2026-09-23, coordinator)** — codex round 4
 (`../findings/2026-09-23-2b-addendum-clock-probe-plan-review-round4.md`:
 **0 blocking**, 1 major, verified and APPLIED, not re-reviewed): a *passed*
@@ -104,11 +115,17 @@ RANDR query. A CRTC that first becomes a served output later (client modeset,
 hotplug) is 3b/3c's installation site and carries the same obligation. A
 lifecycle description that names a CRTC with **no** clock record is an
 internal inconsistency: logged at error level with the CRTC, never
-dispatched, never sent with a partial clock map. If the only installer is
-the RANDR enumeration path, the implementer adds the installation to the
-Owner device's own setup path (where the executor/owner pair is installed)
-and keeps the RANDR path as a refresh. If no such setup site can be named in
-production code, **stop with an F8**.
+dispatched, never sent with a partial clock map. **Anchor (rev 6):** production has
+no Owner activation yet (C0-R8), so the anchor is the **activation step**:
+one function that every admission-conductor installation goes through —
+`install_admission_conductor` (the production entry stage 5 will call) and
+both `#[cfg(test)]` variants — which installs a clock record for every served
+CRTC of the device and queues its probe. A probe cannot start while the
+owner holds its Legacy permit (`begin_clock_probe` refuses with
+`LegacyTransportActive`), so the permit's clearing
+(`try_finish_legacy_transport`) is a promotion point (I-3). The RANDR refresh
+remains the installer of genuinely new epochs. **Carried to stage 5:** the
+activation calls this step; stage 5 must not add a second install path.
 
 **I-3. The probe gets the slot.** The probe uses the device's commit slot,
 and `begin_clock_probe` acquires it immediately or fails
@@ -128,7 +145,8 @@ call (timeout, IPC loss, helper exit) is still an executor fact — it takes
 I-1a's two layers exactly as a current one does (the executor stalls and
 reaps; the lifecycle reaches logical `Poisoned`). **Every slot release is a
 promotion point:** a composed or lifecycle commit's retirement, a
-validation that is rejected or abandoned, and a probe's own resolution. A
+validation that is rejected or abandoned, a sequence-queue lease's release,
+the Legacy permit's clearing, and a probe's own resolution. A
 **passed** validation is not a release: its lease passes directly to the
 validated live commit (`consume_validation`). That commit may proceed only if
 every clock its completion context needs is ready at that moment; if one of
@@ -184,7 +202,7 @@ are unchanged.
   is the 3a design's rule, not changed here; 3d's recovery exits own the
   return to `Ready`.
 
-## Task 1 — the probe in production (I-1, I-2, I-3, I-6)
+## Task 1 — the probe in production (I-1 without its uncertain outcome, I-2, I-3, I-6)
 
 **Step 1 — inventory before editing.** Every production site that installs,
 invalidates or refreshes an Owner clock record; every production site that
@@ -198,16 +216,15 @@ stub-executor fixture driven through production entries (no
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
-| `c0_2b_add_clock_is_probed_on_install` | Owner device set up through its production path: exactly one `ClockProbe` host call per active CRTC reaches the executor; the stub's `ProbeAccepted` reply routed through the production event path makes the clock `KernelSequence` with that reference | **P1** remove the probe start |
+| `c0_2b_add_clock_is_probed_on_install` | an Owner device activated through the activation step (I-2): exactly one `ClockProbe` host call per served CRTC reaches the executor, only after the owner holds no Legacy permit; the stub's `ProbeAccepted` reply routed through the production event path makes the clock `KernelSequence` with that reference | **P1** remove the probe start |
 | `c0_2b_add_clock_exists_without_a_randr_query` | the same setup with no RANDR enumeration: the clock record exists and is probed | **P2** install only from the RANDR path |
 | `c0_2b_add_failed_probe_is_not_retried_in_the_epoch` | stub replies `EOPNOTSUPP`: clock stays `Unresolved`; further ticks and a refresh at the same epoch send no second probe; a genuinely new epoch probes again | **P3** retry within the epoch |
 | `c0_2b_add_probe_is_not_starved_by_composed_frames_vulkan` | the clock is installed while a composed commit holds the slot, and composed frames keep arriving: the waiting probe is sent at that commit's retirement, before the next composed commit begins | **P4** promote the waiting probe only when no composed work is queued |
-| `c0_2b_add_new_epoch_replaces_an_in_flight_probe` | a probe in flight, then a genuinely new clock epoch for the same CRTC, in two runs: (i) the old probe then succeeds — its reply is discarded and does not resolve the new clock, and the new epoch is probed; (ii) the old probe then times out — the executor stalls and reaps and the lifecycle reaches `Poisoned`, it is not discarded as stale | **P4b** resolve the new clock from the old reply; **P4d** discard the old timeout as stale |
-| `c0_2b_add_probe_is_promoted_after_a_validation` | a clock installed while a lifecycle validation holds the slot, with a lifecycle successor queued, in three runs: (i) the validation is rejected — the waiting probe is sent before the successor's validation begins; (ii) it passes and the new epoch is on a CRTC the validated commit needs — the validation is abandoned, the probe is sent, then the same work re-validates and dispatches once, its attempt not consumed; (iii) it passes and the new epoch is on a CRTC it does not need — the validated commit proceeds and the probe is sent at its retirement | **P4e** promote only on commit retirement; **P4f** let a passed validation proceed with a not-ready clock it needs |
-| `c0_2b_add_uncertain_probe_stalls_the_executor` | the stub never replies to the probe and its watchdog expires while a DPMS waits: the executor reaches `Stalled` then `Reaped` through `tick` and yields a `ReapProof`; the production completion-loss route reaches `Poisoned`; the DPMS is logical-only; no further host call is sent and the owner's slot stays held | **P4c** treat `Unknown` like an explicit errno (release the slot and mark unresolved) |
+| `c0_2b_add_new_epoch_replaces_an_in_flight_probe` | a probe in flight, then a genuinely new clock epoch for the same CRTC; the old probe then succeeds: its reply is discarded and does not resolve the new clock, and the new epoch is probed | **P4b** resolve the new clock from the old reply |
+| `c0_2b_add_probe_is_promoted_at_every_release` | a clock installed while the slot is held, with a successor queued, in four runs: (i) a lifecycle validation that is rejected — the waiting probe is sent before the successor's validation begins; (ii) a validation that passes, with the new epoch on a CRTC the validated commit does **not** need — the validated commit proceeds and the probe is sent at its retirement; (iii) a sequence-queue lease — the probe is sent when the queue lease is released, before the successor; (iv) the owner still holds its Legacy permit at activation — the probe is sent when the permit clears (`try_finish_legacy_transport`) | **P4e** promote only on commit retirement; **P4g** omit the queue-release promotion; **P4h** omit the permit-clearing promotion |
 | `c0_2b_add_legacy_device_never_probes` | a Legacy device: no `ClockProbe` host call, no clock state change | **P5** probe without the Owner condition |
 
-## Task 2 — DPMS waits, refusals are named (I-4, I-5) and the hardware test
+## Task 2 — the uncertain probe, DPMS waits, refusals are named (I-1a, I-4, I-5) and the hardware test
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
@@ -215,6 +232,9 @@ stub-executor fixture driven through production entries (no
 | `c0_2b_add_dpms_after_a_failed_probe_is_readiness_closed` | probe replies `EOPNOTSUPP`, then DPMS off: no commit host call, `Deferred(ReadinessClosed)`, no `TopologyLatched` | **P8** dispatch with a partial clock set |
 | `c0_2b_add_missing_clock_record_is_never_a_partial_commit` | a lifecycle description naming a served CRTC whose clock record was removed: no commit host call, the refusal is logged and never-dispatched | **P8b** drop the CRTC from the clock map and send |
 | `c0_2b_add_presubmit_refusal_is_not_a_kernel_rejection` | a forced non-transient `DispatchError` at the validated-submit step (through a test seam on the owner, not by editing the classification): the terminal is never-dispatched, the representative is `Deferred(ReadinessClosed)`, never `TopologyLatched` | **P9** restore the synthesized `IoctlRejected { EINVAL }` |
+| `c0_2b_add_uncertain_probe_stalls_the_executor` | the stub never replies to the probe and its watchdog expires while a DPMS waits: the executor reaches `Stalled` then `Reaped` through `tick` and yields a `ReapProof`; the production completion-loss route reaches `Poisoned`; the DPMS is logical-only; no further host call is sent and the owner's slot stays held | **P4c** treat `Unknown` like an explicit errno (release the slot and mark unresolved) |
+| `c0_2b_add_stale_probe_timeout_still_stalls` | a probe in flight, then a genuinely new clock epoch for the same CRTC, then the old probe times out: the executor stalls and reaps and the lifecycle reaches `Poisoned` — the timeout is not discarded as stale | **P4d** discard the old timeout as stale |
+| `c0_2b_add_passed_validation_waits_for_a_needed_clock` | a DPMS validation passes while a new epoch is installed on a CRTC the validated commit needs: the validation is abandoned (a slot release, the probe is sent), then the same DPMS re-validates and dispatches once, its attempt not consumed | **P4f** let a passed validation proceed with a not-ready clock it needs |
 
 **Existing tests.** Fixture tests that install clocks by hand may keep doing
 so where they test something else; the 3a-ii DPMS tests that exercise
