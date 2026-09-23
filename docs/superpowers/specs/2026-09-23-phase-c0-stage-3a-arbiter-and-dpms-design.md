@@ -7,9 +7,11 @@
 [4](../findings/2026-09-23-stage-3a-design-review-round4.md) and
 [5](../findings/2026-09-23-stage-3a-design-review-round5.md)), written by
 the coordinator on 2026-09-23 under the user's instruction to continue the
-stage 3 specs. The decisions marked
-**(coordinator decision)** were taken without a brainstorming exchange and
-are open to the user's veto before the plan is written.
+stage 3 specs. The decisions marked **(coordinator decision)** were taken without a
+brainstorming exchange; the user **approved all of them on 2026-09-23**
+(the ACTIVE-only off, direct kept pinned through off, a rejected off leaving
+the server running, no cursor detach before stage 4, C.0's state names
+verbatim).
 
 **Authority:** [C.0](2026-08-26-phase-c0-atomic-kms-migration-design.md)
 (§6.4 `REC-1..6`, §9.2, §10 and its lifecycle table, §10.3, §16, §18 as
