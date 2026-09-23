@@ -2,6 +2,14 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only the filters `c0_2b_add_`, `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm`, each by its own command with `--include-ignored`; never `_drm` tests (including the one this plan edits), `c0_hw_` tests, `render_acceptance`, `c0_2ci` (known intermittent hang, `docs/known-issues.md`), an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Stop with the tree dirty when done. **Do not ask for approval inside a run** — if something this plan states does not hold in the code, stop and report it (F8); never silently substitute a test shape or weaken an existing assertion.
 
+**Revision 3 (2026-09-23)** — codex round 2
+(`../findings/2026-09-23-2b-addendum-clock-probe-plan-review-round2.md`:
+1 blocking, verified and APPLIED): I-1a now names the executor-level barrier
+a timed-out probe gets — the same one every host call gets
+(`terminalize_unknown` → `Stalled` + `request_termination`; `tick` reaps →
+`Reaped` with a `ReapProof`) — and separates it from the lifecycle's logical
+`Poisoned`; the timeout test asserts the barrier, not only the disposition.
+
 **Revision 2 (2026-09-23)** — codex round 1
 (`../findings/2026-09-23-2b-addendum-clock-probe-plan-review-round1.md`:
 1 blocking, 2 major, all verified in the code and APPLIED): an uncertain
@@ -56,6 +64,19 @@ production route a lifecycle completion loss takes (Task 8:
 on that clock becomes logical-only (Task 8's poisoned rule), no commit is
 begun behind the held slot, and nothing pretends the slot is free. If no such
 route can carry a probe outcome, **stop with an F8**.
+
+Two layers, each with one owner, neither new: **(a) the executor** owns the
+helper process, its alias and the fd lifetime. A probe is a host call like a
+commit, so its watchdog expiry already takes the generic path in
+`kms/executor/mod.rs`: `terminalize_unknown` sets `ExecutorState::Stalled`
+and calls `request_termination`, and `tick` reaps the helper to
+`ExecutorState::Reaped`, recording the `ReapProof`; IPC loss and helper exit
+reach `Stalled`/`Reaped` the same way. This addendum does not change that
+path and must not add a probe-specific one. **(b) the device owner** keeps
+the probe's slot lease held (it is released only by device replacement, 3d's
+recovery exit, exactly as for a commit whose completion is unknown), and the
+lifecycle arbiter records the logical `Poisoned` state. Logical `Poisoned`
+does not claim the helper is gone; the reap proof does.
 
 **I-2. Every served Owner CRTC has a clock before its first lifecycle
 commit.** The DPMS description is built from the device's served outputs
@@ -147,7 +168,7 @@ stub-executor fixture driven through production entries (no
 | `c0_2b_add_failed_probe_is_not_retried_in_the_epoch` | stub replies `EOPNOTSUPP`: clock stays `Unresolved`; further ticks and a refresh at the same epoch send no second probe; a genuinely new epoch probes again | **P3** retry within the epoch |
 | `c0_2b_add_probe_is_not_starved_by_composed_frames_vulkan` | the clock is installed while a composed commit holds the slot, and composed frames keep arriving: the waiting probe is sent at that commit's retirement, before the next composed commit begins | **P4** promote the waiting probe only when no composed work is queued |
 | `c0_2b_add_new_epoch_replaces_an_in_flight_probe` | a probe in flight, then a genuinely new clock epoch for the same CRTC: the old reply, when it arrives, is discarded and does not resolve the new clock; the new epoch is probed | **P4b** resolve the new clock from the old reply |
-| `c0_2b_add_uncertain_probe_stalls_the_executor` | the stub times the probe out (`Unknown`) while a DPMS waits: the production completion-loss route reaches `Poisoned`, the DPMS is logical-only, no commit is begun and the slot stays held | **P4c** treat `Unknown` like an explicit errno (release and mark unresolved) |
+| `c0_2b_add_uncertain_probe_stalls_the_executor` | the stub never replies to the probe and its watchdog expires while a DPMS waits: the executor reaches `Stalled` then `Reaped` through `tick` and yields a `ReapProof`; the production completion-loss route reaches `Poisoned`; the DPMS is logical-only; no further host call is sent and the owner's slot stays held | **P4c** treat `Unknown` like an explicit errno (release the slot and mark unresolved) |
 | `c0_2b_add_legacy_device_never_probes` | a Legacy device: no `ClockProbe` host call, no clock state change | **P5** probe without the Owner condition |
 
 ## Task 2 — DPMS waits, refusals are named (I-4, I-5) and the hardware test
