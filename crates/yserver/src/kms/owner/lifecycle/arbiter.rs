@@ -3,9 +3,9 @@
 use super::{
     CompletionUnknownRow, DesiredField, DesiredIntent, DeviceLifecycleState, Disposition,
     DpmsTarget, IncidentOrigin, IncidentSeed, LifecycleDesired, LifecycleEpochId, LifecycleEventId,
-    LifecycleKind, LifecycleTransitionId, OutputProjection, Prerequisite, RecoveryFate,
-    RecoveryIncident, RecoveryWinner, TableFOutcome, TableUOutcome, TransitionTag, WorkTag,
-    table_f, table_u,
+    LifecycleKind, LifecycleTransitionId, OutputProjection, Prerequisite, RecoveryAttemptTrigger,
+    RecoveryFate, RecoveryIncident, RecoveryResolution, RecoveryWinner, TableFOutcome,
+    TableUOutcome, TransitionTag, WorkTag, table_f, table_u,
 };
 
 /// Commit progress known by the arbiter. A submitted request cannot be
@@ -145,6 +145,12 @@ pub enum ArbiterInput<I> {
         event_id: LifecycleEventId,
         incident: RecoveryIncident,
     },
+    /// Progress of the one Table U/F-authorized recovery attempt. The tag is
+    /// the recovery transition, not the completion-loss event's old work tag.
+    RecoveryAttempt {
+        tag: TransitionTag<I>,
+        outcome: RecoveryAttemptOutcome,
+    },
     DeviceStateChanged(DeviceLifecycleState),
     /// The 3d fd-family barrier discharged a quarantine fence left by a
     /// failed or late safety receipt.
@@ -154,6 +160,15 @@ pub enum ArbiterInput<I> {
     OrdinaryReply {
         tag: WorkTag<I>,
     },
+}
+
+/// The attempt-start acknowledgement and its one terminal result.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum RecoveryAttemptOutcome {
+    /// Accepted only after the authorized reap and only for an available id.
+    Started(RecoveryAttemptTrigger),
+    Qualified,
+    FailedOrUnknown,
 }
 
 /// Terminal result at the C.0 result boundary.
@@ -274,6 +289,12 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         self.transition
     }
 
+    /// Tag a current transition for the driver and its acknowledged inputs.
+    pub fn transition_tag(&self) -> Option<TransitionTag<I>> {
+        self.transition
+            .map(|transition| self.tag_for(transition.id, self.epoch))
+    }
+
     pub const fn recovery(&self) -> Option<RecoveryIncident> {
         self.recovery
     }
@@ -284,6 +305,11 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
 
     pub fn add_protocol_output(&mut self, output: O) -> Option<OutputProjection> {
         self.desired.add_protocol_output(output)
+    }
+
+    /// Remove one stable protocol output projection from this device.
+    pub fn remove_protocol_output(&mut self, output: &O) -> Option<super::OutputProjectionRemoval> {
+        self.desired.remove_protocol_output(output)
     }
 
     /// Ordinary work always carries the current lifecycle epoch and no
@@ -313,6 +339,9 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
             } => self.apply_completion_unknown(event_id, boundary_recovery_id),
             ArbiterInput::RecoveryIncidentAllocated { event_id, incident } => {
                 self.apply_allocated_incident(event_id, incident)
+            }
+            ArbiterInput::RecoveryAttempt { tag, outcome } => {
+                self.apply_recovery_attempt(tag, outcome)
             }
             ArbiterInput::DeviceStateChanged(state) => {
                 self.state = state;
@@ -614,6 +643,7 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
             self.apply_recovery_fate(outcome.fate, actions);
             actions.push(LifecycleAction::RecoveryTableF(outcome));
         }
+        self.ensure_recovery_transition(actions);
     }
 
     fn current_dpms_target(&self) -> DpmsTarget {
@@ -994,6 +1024,14 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         }
         actions.push(LifecycleAction::CompletionLossTableU { row, outcome });
         actions.push(LifecycleAction::CompletionBarriersRequired(outcome));
+        let recovery_transition_kind = if outcome.physical
+            == super::PhysicalUnknownOutcome::TransferQuarantineToRebuildThenQualifiedInstall
+        {
+            LifecycleKind::TopologyRebuild
+        } else {
+            LifecycleKind::NormalRecovery
+        };
+        self.ensure_recovery_transition_as(recovery_transition_kind, &mut actions);
         actions
     }
 
@@ -1031,8 +1069,115 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                 });
             }
         }
+        self.ensure_recovery_transition(&mut actions);
         actions.extend(self.converge());
         actions
+    }
+
+    fn ensure_recovery_transition(&mut self, actions: &mut Vec<LifecycleAction<I>>) {
+        self.ensure_recovery_transition_as(LifecycleKind::NormalRecovery, actions);
+    }
+
+    fn ensure_recovery_transition_as(
+        &mut self,
+        kind: LifecycleKind,
+        actions: &mut Vec<LifecycleAction<I>>,
+    ) {
+        if self.transition.is_some()
+            || !self.recovery.is_some_and(|incident| {
+                incident.state() == super::RecoveryIncidentState::Active
+                    && incident.budget() == super::RecoveryAttemptBudget::Available
+            })
+        {
+            return;
+        }
+
+        self.start_transition(kind, actions);
+    }
+
+    fn apply_recovery_attempt(
+        &mut self,
+        tag: TransitionTag<I>,
+        outcome: RecoveryAttemptOutcome,
+    ) -> Vec<LifecycleAction<I>> {
+        if !self.is_current_transition_tag(&tag) {
+            return vec![LifecycleAction::StaleResultIgnored {
+                transition_id: Some(tag.transition),
+            }];
+        }
+
+        let Some(active) = self.transition else {
+            return vec![LifecycleAction::StaleResultIgnored {
+                transition_id: Some(tag.transition),
+            }];
+        };
+        match outcome {
+            RecoveryAttemptOutcome::Started(trigger) => {
+                let authorized = active.phase == LifecycleTransitionPhase::PhysicalReady
+                    && trigger == RecoveryAttemptTrigger::AfterReap
+                    && self.recovery.is_some_and(|incident| {
+                        incident.state() == super::RecoveryIncidentState::Active
+                            && incident.budget() == super::RecoveryAttemptBudget::Available
+                    });
+                if !authorized {
+                    return Vec::new();
+                }
+                let Some(incident) = self.recovery.as_mut() else {
+                    return Vec::new();
+                };
+                if !incident.request_attempt(trigger) {
+                    return Vec::new();
+                }
+                self.state = DeviceLifecycleState::Recovering(incident.id());
+                Vec::new()
+            }
+            RecoveryAttemptOutcome::Qualified | RecoveryAttemptOutcome::FailedOrUnknown => {
+                let Some(incident) = self.recovery else {
+                    return Vec::new();
+                };
+                if self.state != DeviceLifecycleState::Recovering(incident.id())
+                    || incident.state() != super::RecoveryIncidentState::Attempting
+                {
+                    return Vec::new();
+                }
+
+                let resolution = incident.resolve(match outcome {
+                    RecoveryAttemptOutcome::Qualified => RecoveryResolution::Qualified(active.id),
+                    RecoveryAttemptOutcome::FailedOrUnknown => RecoveryResolution::Failed,
+                    RecoveryAttemptOutcome::Started(_) => unreachable!(),
+                });
+                let mut actions = Vec::new();
+                if let Some((event_id, disposition)) = resolution.representative_disposition {
+                    self.set_disposition(event_id, disposition, &mut actions);
+                }
+                self.transition = None;
+                self.coalesced_epoch_bumped = false;
+                match outcome {
+                    RecoveryAttemptOutcome::Qualified => {
+                        self.recovery = resolution.incident;
+                        if resolution.representative_disposition.is_none()
+                            || active.kind != LifecycleKind::NormalRecovery
+                        {
+                            self.mark_active_representative_applied(active, &mut actions);
+                        }
+                        self.state = DeviceLifecycleState::Ready;
+                        self.admission_open = true;
+                        self.desired.clear_recovery_incident(resolution.id);
+                        actions.extend(self.converge());
+                        if self.admission_open && self.transition.is_none() {
+                            actions.push(LifecycleAction::ReopenAdmission(self.current_work_tag()));
+                        }
+                    }
+                    RecoveryAttemptOutcome::FailedOrUnknown => {
+                        self.recovery = resolution.incident;
+                        self.state = DeviceLifecycleState::RecoveryFailed;
+                        self.admission_open = false;
+                    }
+                    RecoveryAttemptOutcome::Started(_) => unreachable!(),
+                }
+                actions
+            }
+        }
     }
 
     fn converge(&mut self) -> Vec<LifecycleAction<I>> {

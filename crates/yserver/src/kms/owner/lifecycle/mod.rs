@@ -1,6 +1,7 @@
 //! Pure lifecycle decision types and identities.
 
 mod arbiter;
+mod coordinator;
 mod desired;
 mod ids;
 mod recovery;
@@ -9,6 +10,10 @@ mod values;
 pub use arbiter::{
     ArbiterInput, CommitProgress, LifecycleAction, LifecycleArbiter, LifecycleCommitOutcome,
     LifecycleReceipt, LifecycleReceiptResult, LifecycleTransition, LifecycleTransitionPhase,
+    RecoveryAttemptOutcome,
+};
+pub use coordinator::{
+    CoordinatorDispatch, CoordinatorError, CoordinatorOutputAddition, LifecycleCoordinator,
 };
 pub use desired::{
     DesiredField, DesiredIntent, DispositionChange, LifecycleDesired, OutputProjection,
