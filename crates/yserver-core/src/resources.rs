@@ -142,7 +142,37 @@ pub struct ExposedRect {
     pub height: u16,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Windows whose viewability changed in one operation: `became_viewable` in
+/// pre-order (parent before child), `became_unviewable` in post-order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ViewabilityDelta {
+    pub became_viewable: Vec<ResourceId>,
+    pub became_unviewable: Vec<ResourceId>,
+}
+
+impl ViewabilityDelta {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.became_viewable.is_empty() && self.became_unviewable.is_empty()
+    }
+
+    /// Appends a disjoint sibling subtree's delta, keeping both orders.
+    pub fn extend(&mut self, other: ViewabilityDelta) {
+        self.became_viewable.extend(other.became_viewable);
+        self.became_unviewable.extend(other.became_unviewable);
+    }
+}
+
+/// Result of a map/unmap: `mapping_changed` is the Unmapped<->mapped flip
+/// that drives MapNotify/UnmapNotify, independent of the viewability delta.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[must_use]
+pub struct MapTransition {
+    pub mapping_changed: bool,
+    pub delta: ViewabilityDelta,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReparentResult {
     pub window: ResourceId,
     pub old_parent: ResourceId,
@@ -153,6 +183,7 @@ pub struct ReparentResult {
     pub host_xid: Option<crate::backend::WindowHandle>,
     pub old_map_state: MapState,
     pub new_map_state: MapState,
+    pub delta: ViewabilityDelta,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1253,16 +1284,7 @@ impl ResourceTable {
         false
     }
 
-    #[must_use]
-    pub fn map_window(&mut self, id: ResourceId) -> bool {
-        self.map_window_with_promoted_descendants(id).0
-    }
-
-    #[must_use]
-    pub fn map_window_with_promoted_descendants(
-        &mut self,
-        id: ResourceId,
-    ) -> (bool, Vec<ResourceId>) {
+    pub fn map_window(&mut self, id: ResourceId) -> MapTransition {
         // A window is Viewable only if it is mapped AND all ancestors
         // up to the root are also mapped (Viewable). If any ancestor
         // is not Viewable, the window becomes Unviewable instead.
@@ -1275,18 +1297,24 @@ impl ResourceTable {
                 .is_some_and(|p| p.map_state == MapState::Viewable),
             None => false,
         };
+        let mut delta = ViewabilityDelta::default();
         let was_unmapped = if let Some(window) = self.windows.get_mut(&id.0) {
             let was_unmapped = window.map_state == MapState::Unmapped;
+            let was_viewable = window.map_state == MapState::Viewable;
             window.map_state = if parent_viewable {
                 MapState::Viewable
             } else {
                 MapState::Unviewable
             };
+            if !was_viewable && parent_viewable {
+                delta.became_viewable.push(id);
+            } else if was_viewable && !parent_viewable {
+                delta.became_unviewable.push(id);
+            }
             was_unmapped
         } else {
-            return (false, Vec::new());
+            return MapTransition::default();
         };
-        let mut promoted_descendants = Vec::new();
         // If we just transitioned to Viewable, promote any descendant
         // that was Unviewable (i.e. mapped before its ancestor became
         // viewable — e.g. xclock's child window after the WM frame
@@ -1294,9 +1322,12 @@ impl ResourceTable {
         // staying Unviewable; mapping the parent must propagate down or
         // Expose-fanout silently skips it because of the Viewable filter).
         if parent_viewable {
-            self.promote_unviewable_descendants(id, &mut promoted_descendants);
+            self.promote_unviewable_descendants(id, &mut delta.became_viewable);
         }
-        (was_unmapped, promoted_descendants)
+        MapTransition {
+            mapping_changed: was_unmapped,
+            delta,
+        }
     }
 
     fn promote_unviewable_descendants(
@@ -1353,7 +1384,6 @@ impl ResourceTable {
             let demoted = if let Some(w) = self.windows.get_mut(&child.0) {
                 if w.map_state == MapState::Viewable {
                     w.map_state = MapState::Unviewable;
-                    demoted_descendants.push(child);
                     true
                 } else {
                     false
@@ -1363,22 +1393,23 @@ impl ResourceTable {
             };
             // Recurse only through descendants that were on-screen (now
             // demoted, or already Unviewable under us); Unmapped subtrees
-            // stay Unmapped and halt the cascade.
+            // stay Unmapped and halt the cascade. Post-order: child first.
             if demoted {
                 self.demote_viewable_descendants(child, demoted_descendants);
+                demoted_descendants.push(child);
             }
         }
     }
 
-    #[must_use]
-    pub fn unmap_window(&mut self, id: ResourceId) -> bool {
+    pub fn unmap_window(&mut self, id: ResourceId) -> MapTransition {
         if id == ROOT_WINDOW {
-            return false;
+            return MapTransition::default();
         }
         let Some(window) = self.windows.get_mut(&id.0) else {
-            return false;
+            return MapTransition::default();
         };
         let was_mapped = window.map_state != MapState::Unmapped;
+        let was_viewable = window.map_state == MapState::Viewable;
         window.map_state = MapState::Unmapped;
         // Mirror of `promote_unviewable_descendants`: X11 defines
         // Viewable as "mapped AND every ancestor mapped", so unmapping
@@ -1391,13 +1422,17 @@ impl ResourceTable {
         // every viewability-gated path (damage in particular) treated
         // that subtree as on-screen, so the compositor kept compositing
         // a window that had left the workspace.
-        // Reuses the helper the reparent path already relies on. X11 sends
-        // NO UnmapNotify for descendants of an unmapped window, so the
-        // demoted list is intentionally discarded — the state change is the
-        // whole point, not an event fanout.
-        let mut demoted = Vec::new();
-        self.demote_viewable_descendants(id, &mut demoted);
-        was_mapped
+        // X11 sends NO UnmapNotify for descendants of an unmapped window;
+        // the demoted list is the viewability delta, not an event fanout.
+        let mut delta = ViewabilityDelta::default();
+        self.demote_viewable_descendants(id, &mut delta.became_unviewable);
+        if was_viewable {
+            delta.became_unviewable.push(id);
+        }
+        MapTransition {
+            mapping_changed: was_mapped,
+            delta,
+        }
     }
 
     pub fn window(&self, id: ResourceId) -> Option<&Window> {
@@ -1749,12 +1784,19 @@ impl ResourceTable {
             };
         }
         let new_map_state = window.map_state;
+        let was_viewable = old_map_state == MapState::Viewable;
+        let mut delta = ViewabilityDelta::default();
         if propagate {
-            let mut scratch = Vec::new();
             if parent_viewable {
-                self.promote_unviewable_descendants(request.window, &mut scratch);
+                if !was_viewable {
+                    delta.became_viewable.push(request.window);
+                }
+                self.promote_unviewable_descendants(request.window, &mut delta.became_viewable);
             } else {
-                self.demote_viewable_descendants(request.window, &mut scratch);
+                self.demote_viewable_descendants(request.window, &mut delta.became_unviewable);
+                if was_viewable {
+                    delta.became_unviewable.push(request.window);
+                }
             }
         }
         // Phase 3.6 Step 4a forwards XReparentWindow to the host, so
@@ -1773,6 +1815,7 @@ impl ResourceTable {
             host_xid,
             old_map_state,
             new_map_state,
+            delta,
         })
     }
 
@@ -4087,7 +4130,7 @@ mod tests {
             table.window(ResourceId(0x100002)).unwrap().map_state,
             MapState::Viewable
         );
-        let was_mapped = table.unmap_window(ResourceId(0x100002));
+        let was_mapped = table.unmap_window(ResourceId(0x100002)).mapping_changed;
         assert!(was_mapped);
         assert_eq!(
             table.window(ResourceId(0x100002)).unwrap().map_state,
@@ -4101,7 +4144,7 @@ mod tests {
         make_window(&mut table, 0x100002);
         // Force Unviewable directly — no public setter, but the field is pub.
         table.windows.get_mut(&0x100002).unwrap().map_state = MapState::Unviewable;
-        let was_mapped = table.unmap_window(ResourceId(0x100002));
+        let was_mapped = table.unmap_window(ResourceId(0x100002)).mapping_changed;
         assert!(was_mapped);
         assert_eq!(
             table.window(ResourceId(0x100002)).unwrap().map_state,
@@ -4118,16 +4161,16 @@ mod tests {
             table.window(ResourceId(0x100002)).unwrap().map_state,
             MapState::Unmapped
         );
-        let first = table.unmap_window(ResourceId(0x100002));
+        let first = table.unmap_window(ResourceId(0x100002)).mapping_changed;
         assert!(!first);
-        let second = table.unmap_window(ResourceId(0x100002));
+        let second = table.unmap_window(ResourceId(0x100002)).mapping_changed;
         assert!(!second);
     }
 
     #[test]
     fn unmap_window_returns_false_for_unknown_window() {
         let mut table = ResourceTable::new();
-        let was_mapped = table.unmap_window(ResourceId(0x9999_9999));
+        let was_mapped = table.unmap_window(ResourceId(0x9999_9999)).mapping_changed;
         assert!(!was_mapped);
     }
 
@@ -4138,7 +4181,7 @@ mod tests {
             table.window(ROOT_WINDOW).unwrap().map_state,
             MapState::Viewable
         );
-        let was_mapped = table.unmap_window(ROOT_WINDOW);
+        let was_mapped = table.unmap_window(ROOT_WINDOW).mapping_changed;
         assert!(!was_mapped);
         assert_eq!(
             table.window(ROOT_WINDOW).unwrap().map_state,
@@ -4514,6 +4557,144 @@ mod tests {
         );
     }
 
+    // Viewability-delta fixture: F{ A{ A1, A2{ A2a } }, B{ B1 }, C }, a
+    // top-level G, all created unmapped. Viewable iff it and every ancestor
+    // is mapped (dix/window.c MapWindow / UnmapWindow).
+    const VD_F: u32 = 0x0010_0100;
+    const VD_A: u32 = 0x0010_0101;
+    const VD_A1: u32 = 0x0010_0102;
+    const VD_A2: u32 = 0x0010_0103;
+    const VD_A2A: u32 = 0x0010_0104;
+    const VD_B: u32 = 0x0010_0105;
+    const VD_B1: u32 = 0x0010_0106;
+    const VD_C: u32 = 0x0010_0107;
+    const VD_G: u32 = 0x0010_0108;
+
+    fn ids(raw: &[u32]) -> Vec<ResourceId> {
+        raw.iter().copied().map(ResourceId).collect()
+    }
+
+    /// Builds the fixture with A, A1, A2a, B1 and C mapped (all Unviewable,
+    /// F still unmapped); A2 and B stay unmapped.
+    fn viewability_fixture() -> ResourceTable {
+        let mut t = ResourceTable::new();
+        make_window(&mut t, VD_F);
+        make_window(&mut t, VD_G);
+        make_child(&mut t, VD_A, VD_F, 0, 0);
+        make_child(&mut t, VD_A1, VD_A, 0, 0);
+        make_child(&mut t, VD_A2, VD_A, 0, 0);
+        make_child(&mut t, VD_A2A, VD_A2, 0, 0);
+        make_child(&mut t, VD_B, VD_F, 0, 0);
+        make_child(&mut t, VD_B1, VD_B, 0, 0);
+        make_child(&mut t, VD_C, VD_F, 0, 0);
+        for w in [VD_A, VD_A1, VD_A2A, VD_B1, VD_C] {
+            let tr = t.map_window(ResourceId(w));
+            assert!(tr.mapping_changed);
+            assert!(tr.delta.is_empty(), "0x{w:x} maps under an unmapped F");
+        }
+        t
+    }
+
+    #[test]
+    fn map_window_delta_is_newly_viewable_subtree_in_pre_order() {
+        let mut t = viewability_fixture();
+        let tr = t.map_window(ResourceId(VD_F));
+        assert!(tr.mapping_changed);
+        assert_eq!(tr.delta.became_viewable, ids(&[VD_F, VD_A, VD_A1, VD_C]));
+        assert!(tr.delta.became_unviewable.is_empty());
+
+        // Mapping A2 now exposes A2a beneath it: parent before child.
+        let tr = t.map_window(ResourceId(VD_A2));
+        assert!(tr.mapping_changed);
+        assert_eq!(tr.delta.became_viewable, ids(&[VD_A2, VD_A2A]));
+        assert!(tr.delta.became_unviewable.is_empty());
+    }
+
+    #[test]
+    fn unmap_window_delta_is_viewable_subtree_in_post_order() {
+        let mut t = viewability_fixture();
+        let _ = t.map_window(ResourceId(VD_F));
+        let _ = t.map_window(ResourceId(VD_A2));
+
+        let tr = t.unmap_window(ResourceId(VD_A));
+        assert!(tr.mapping_changed);
+        assert!(tr.delta.became_viewable.is_empty());
+        assert_eq!(
+            tr.delta.became_unviewable,
+            ids(&[VD_A1, VD_A2A, VD_A2, VD_A])
+        );
+
+        let tr = t.unmap_window(ResourceId(VD_F));
+        assert!(tr.mapping_changed);
+        assert_eq!(tr.delta.became_unviewable, ids(&[VD_C, VD_F]));
+    }
+
+    #[test]
+    fn remap_of_viewable_window_has_no_transition() {
+        let mut t = viewability_fixture();
+        let _ = t.map_window(ResourceId(VD_F));
+        for w in [VD_F, VD_A, VD_C] {
+            assert_eq!(t.map_window(ResourceId(w)), MapTransition::default());
+        }
+    }
+
+    #[test]
+    fn mapping_changes_without_viewability_under_unmapped_ancestor() {
+        let mut t = viewability_fixture();
+        // Map under an unmapped parent: Unmapped -> Unviewable.
+        let tr = t.map_window(ResourceId(VD_A2));
+        assert!(tr.mapping_changed);
+        assert!(tr.delta.is_empty());
+        assert_eq!(
+            t.window(ResourceId(VD_A2)).unwrap().map_state,
+            MapState::Unviewable
+        );
+        // Unmap of an unviewable window: Unviewable -> Unmapped.
+        let tr = t.unmap_window(ResourceId(VD_A));
+        assert!(tr.mapping_changed);
+        assert!(tr.delta.is_empty());
+        assert_eq!(
+            t.window(ResourceId(VD_A)).unwrap().map_state,
+            MapState::Unmapped
+        );
+    }
+
+    #[test]
+    fn reparent_window_delta_follows_new_parent_viewability() {
+        let mut t = viewability_fixture();
+        let _ = t.map_window(ResourceId(VD_F));
+        let _ = t.map_window(ResourceId(VD_A2));
+        let reparent = |t: &mut ResourceTable, window: u32, parent: u32| {
+            t.reparent_window(ReparentWindowRequest {
+                window: ResourceId(window),
+                parent: ResourceId(parent),
+                x: 0,
+                y: 0,
+            })
+            .unwrap()
+            .delta
+        };
+
+        // Viewable A under unmapped G: the subtree leaves, child first.
+        let delta = reparent(&mut t, VD_A, VD_G);
+        assert!(delta.became_viewable.is_empty());
+        assert_eq!(delta.became_unviewable, ids(&[VD_A1, VD_A2A, VD_A2, VD_A]));
+
+        // Back under viewable F: the subtree returns, parent first.
+        let delta = reparent(&mut t, VD_A, VD_F);
+        assert_eq!(delta.became_viewable, ids(&[VD_A, VD_A1, VD_A2, VD_A2A]));
+        assert!(delta.became_unviewable.is_empty());
+
+        // Viewable -> viewable parent and an unmapped window: no change.
+        assert!(reparent(&mut t, VD_C, VD_A).is_empty());
+        assert!(reparent(&mut t, VD_B, VD_G).is_empty());
+        assert!(reparent(&mut t, VD_B, VD_F).is_empty());
+
+        // B was reparented while unmapped; mapping it now exposes B1.
+        let tr = t.map_window(ResourceId(VD_B));
+        assert_eq!(tr.delta.became_viewable, ids(&[VD_B, VD_B1]));
+    }
+
     /// #133 step 8 (P9) fixtures. A root child at (100, 200), 300x400,
     /// `border_width = 16` — awesome's configured width. Its CONTENT
     /// origin is therefore (116, 216) in root coordinates
@@ -4842,7 +5023,7 @@ mod tests {
 
             let mut results = Vec::with_capacity(n);
             for _ in 0..n {
-                results.push(table.unmap_window(target));
+                results.push(table.unmap_window(target).mapping_changed);
             }
 
             let expected_first = !matches!(initial, InitialState::Unmapped);

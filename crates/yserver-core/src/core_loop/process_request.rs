@@ -51,7 +51,10 @@ use crate::{
         pointer_fanout::replay_frozen_pointer_event_to_state,
     },
     properties,
-    resources::{BorderSource, COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
+    resources::{
+        BorderSource, COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, ViewabilityDelta,
+        Window,
+    },
     server::{
         PendingPresentPixmap, PendingPresentRequest, ScreenSaverActive, ServerState, XI_FIRST_EVENT,
     },
@@ -20435,7 +20438,7 @@ fn handle_reparent_window(
         subscribers_by_id(state, result.new_parent, 0x0008_0000)
     };
     debug!(
-        "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?} map_state={:?}->{:?}",
+        "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?} map_state={:?}->{:?} viewable+{} viewable-{}",
         client_id.0,
         sequence.0,
         result.window.0,
@@ -20446,6 +20449,8 @@ fn handle_reparent_window(
         result.host_xid,
         result.old_map_state,
         result.new_map_state,
+        result.delta.became_viewable.len(),
+        result.delta.became_unviewable.len(),
     );
     if let Some(xid) = result.host_xid {
         let new_host_parent = if result.new_parent == ROOT_WINDOW {
@@ -24640,10 +24645,9 @@ fn handle_map_window(
         return Ok(RequestOutcome::Handled);
     }
 
-    let (was_unmapped, promoted_descendants) =
-        state.resources.map_window_with_promoted_descendants(window);
+    let transition = state.resources.map_window(window);
     debug_assert!(
-        was_unmapped,
+        transition.mapping_changed,
         "current_map_state == Unmapped guard above was checked; \
          map_window should now transition",
     );
@@ -24736,14 +24740,23 @@ fn handle_map_window(
     // mate-xorg.xtrace lines 5164→5173.
     if host_xid.is_some() {
         let _dropped = accumulate_damage_full_to_state(state, window);
-        for promoted in &promoted_descendants {
+        // The mapped window itself keeps its just-fired notify cycle.
+        for promoted in transition
+            .delta
+            .became_viewable
+            .iter()
+            .filter(|w| **w != window)
+        {
             reset_damage_notify_cycle_for_drawable(state, *promoted);
         }
         accumulate_damage_viewable_descendants_to_state(state, window);
     }
     debug!(
-        "client {} #{} MapWindow 0x{:x}",
-        client_id.0, sequence.0, window.0
+        "client {} #{} MapWindow 0x{:x} viewable+{}",
+        client_id.0,
+        sequence.0,
+        window.0,
+        transition.delta.became_viewable.len()
     );
     Ok(RequestOutcome::Handled)
 }
@@ -24769,8 +24782,22 @@ fn handle_map_subwindows(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    map_subwindows_with_delta(state, backend, origin, client_id, sequence, body)
+        .map(|(outcome, _delta)| outcome)
+}
+
+/// MapSubwindows; also returns the union of the children's viewability deltas.
+fn map_subwindows_with_delta(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<(RequestOutcome, ViewabilityDelta)> {
+    let mut delta = ViewabilityDelta::default();
     let Some(parent) = x11::map_window_id(body) else {
-        return Ok(RequestOutcome::Handled);
+        return Ok((RequestOutcome::Handled, delta));
     };
     if state.resources.window(parent).is_none() {
         // Xorg `dix/dispatch.c::ProcMapSubwindows` returns BadWindow
@@ -24783,11 +24810,14 @@ fn handle_map_subwindows(
             x11::error::BAD_WINDOW,
             parent.0,
             9,
-        );
+        )
+        .map(|outcome| (outcome, delta));
     }
     let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
     for child in children {
-        let was_unmapped = state.resources.map_window(child);
+        let transition = state.resources.map_window(child);
+        let was_unmapped = transition.mapping_changed;
+        delta.extend(transition.delta);
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
         let extents = state.resources.window(child).map(|w| (w.width, w.height));
         let override_redirect = state
@@ -24843,8 +24873,13 @@ fn handle_map_subwindows(
             let _dropped = emit_expose_subtree_to_state(state, child);
         }
     }
-    debug!("client {} #{} MapSubwindows", client_id.0, sequence.0);
-    Ok(RequestOutcome::Handled)
+    debug!(
+        "client {} #{} MapSubwindows viewable+{}",
+        client_id.0,
+        sequence.0,
+        delta.became_viewable.len()
+    );
+    Ok((RequestOutcome::Handled, delta))
 }
 
 fn handle_unmap_window(
@@ -24870,7 +24905,8 @@ fn handle_unmap_window(
             );
         }
         let host_xid = state.resources.window(window).and_then(|w| w.host_xid);
-        let was_mapped = state.resources.unmap_window(window);
+        let transition = state.resources.unmap_window(window);
+        let was_mapped = transition.mapping_changed;
         let parent = if was_mapped {
             state
                 .resources
@@ -24939,8 +24975,22 @@ fn handle_unmap_subwindows(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body)
+        .map(|(outcome, _delta)| outcome)
+}
+
+/// UnmapSubwindows; also returns the union of the children's viewability deltas.
+fn unmap_subwindows_with_delta(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<(RequestOutcome, ViewabilityDelta)> {
+    let mut delta = ViewabilityDelta::default();
     let Some(parent) = x11::map_window_id(body) else {
-        return Ok(RequestOutcome::Handled);
+        return Ok((RequestOutcome::Handled, delta));
     };
     struct PendingUnmap {
         child: ResourceId,
@@ -24954,14 +25004,17 @@ fn handle_unmap_subwindows(
             x11::error::BAD_WINDOW,
             parent.0,
             11,
-        );
+        )
+        .map(|outcome| (outcome, delta));
     };
     // Snapshot mapping order + collect host xids; unmap each in the
     // resource table.
     let mut pending: Vec<PendingUnmap> = Vec::new();
     for child in children {
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
-        if state.resources.unmap_window(child) {
+        let transition = state.resources.unmap_window(child);
+        delta.extend(transition.delta);
+        if transition.mapping_changed {
             pending.push(PendingUnmap { child, host_xid });
         }
     }
@@ -24980,8 +25033,13 @@ fn handle_unmap_subwindows(
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
-    debug!("client {} #{} UnmapSubwindows", client_id.0, sequence.0);
-    Ok(RequestOutcome::Handled)
+    debug!(
+        "client {} #{} UnmapSubwindows viewable-{}",
+        client_id.0,
+        sequence.0,
+        delta.became_unviewable.len()
+    );
+    Ok((RequestOutcome::Handled, delta))
 }
 
 fn handle_ge_request(
@@ -40810,7 +40868,12 @@ mod tests {
             let mut peer = install_client(&mut state, CLIENT);
             make(&mut state, WIN_A);
             make(&mut state, WIN_B);
-            assert!(state.resources.map_window(ResourceId(WIN_B)));
+            assert!(
+                state
+                    .resources
+                    .map_window(ResourceId(WIN_B))
+                    .mapping_changed
+            );
             {
                 let c = state.clients.get_mut(&CLIENT).unwrap();
                 c.event_masks.insert(ResourceId(WIN_A), FOCUS_CHANGE_MASK);
@@ -49716,7 +49779,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(state.resources.map_window(WINDOW));
+        assert!(state.resources.map_window(WINDOW).mapping_changed);
         let window = state
             .resources
             .window_mut(WINDOW)
@@ -57447,11 +57510,143 @@ mod tests {
         );
     }
 
+    /// F{ A{ A1 }, B{ B1 }, C }: F viewable, A and B unmapped with their
+    /// child mapped (Unviewable), C mapped.
+    fn subwindows_delta_fixture(state: &mut ServerState) -> [ResourceId; 6] {
+        let [f, a, a1, b, b1, c] = [
+            0x0010_0200,
+            0x0010_0201,
+            0x0010_0202,
+            0x0010_0203,
+            0x0010_0204,
+            0x0010_0205,
+        ]
+        .map(ResourceId);
+        for (id, parent) in [(f, ROOT_WINDOW), (a, f), (a1, a), (b, f), (b1, b), (c, f)] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: id,
+                    parent,
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        for w in [a1, b1, f, c] {
+            let _ = state.resources.map_window(w);
+        }
+        [f, a, a1, b, b1, c]
+    }
+
+    #[test]
+    fn map_subwindows_delta_includes_promoted_grandchildren() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, _c] = subwindows_delta_fixture(&mut state);
+
+        let (_, delta) = map_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &f.0.to_le_bytes(),
+        )
+        .expect("MapSubwindows");
+        // C was already viewable; A and B each bring their grandchild.
+        assert_eq!(delta.became_viewable, vec![a, a1, b, b1]);
+        assert!(delta.became_unviewable.is_empty());
+    }
+
+    #[test]
+    fn unmap_subwindows_delta_is_union_in_post_order() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, c] = subwindows_delta_fixture(&mut state);
+        let _ = state.resources.map_window(a);
+        let _ = state.resources.map_window(b);
+
+        let (_, delta) = unmap_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &f.0.to_le_bytes(),
+        )
+        .expect("UnmapSubwindows");
+        assert!(delta.became_viewable.is_empty());
+        assert_eq!(delta.became_unviewable, vec![a1, a, b1, b, c]);
+    }
+
+    #[test]
+    fn map_and_unmap_under_unmapped_parent_still_send_notify() {
+        const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [_f, _a, a1, ..] = subwindows_delta_fixture(&mut state);
+        let _ = state.resources.unmap_window(a1);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .event_masks
+            .insert(a1, STRUCTURE_NOTIFY);
+        let notified = |bytes: &[u8], code: u8| {
+            bytes.chunks_exact(32).any(|evt| {
+                evt[0] == code && u32::from_le_bytes([evt[8], evt[9], evt[10], evt[11]]) == a1.0
+            })
+        };
+
+        // A1 under unmapped A: Unmapped -> Unviewable, still MapNotify.
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &a1.0.to_le_bytes(),
+        )
+        .expect("MapWindow");
+        assert_eq!(
+            state.resources.window(a1).map(|w| w.map_state),
+            Some(MapState::Unviewable)
+        );
+        assert!(notified(&read_all_available(&mut peer), 19), "MapNotify");
+
+        // Unviewable -> Unmapped, still UnmapNotify.
+        handle_unmap_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            &a1.0.to_le_bytes(),
+        )
+        .expect("UnmapWindow");
+        assert_eq!(
+            state.resources.window(a1).map(|w| w.map_state),
+            Some(MapState::Unmapped)
+        );
+        assert!(notified(&read_all_available(&mut peer), 18), "UnmapNotify");
+    }
+
     #[test]
     fn map_subwindows_exposes_grandchild_promoted_by_viewability_cascade() {
         // MapSubwindows(parent) maps parent's direct children. When a
         // child transitions Unmapped -> Viewable, the viewability cascade
-        // (map_window_with_promoted_descendants) also promotes any of the
+        // (map_window) also promotes any of the
         // child's descendants that were sitting Unviewable (mapped while
         // their ancestor was unmapped) to Viewable. Xorg fires Expose on
         // every newly-viewable window, not just the directly-mapped child.
@@ -64796,7 +64991,10 @@ mod tests {
         if let Some(w) = state.resources.window_mut(win) {
             w.border_width = 2;
         }
-        assert!(state.resources.map_window(win), "window must map");
+        assert!(
+            state.resources.map_window(win).mapping_changed,
+            "window must map"
+        );
         // Raw level: `area` on the wire then carries the real rect
         // instead of the NonEmpty full-extent substitute, so the test
         // can prove the negative origin survives the i16 encoding.
@@ -64903,7 +65101,10 @@ mod tests {
                 w.border_width = bw;
             }
             if map {
-                assert!(state.resources.map_window(win), "window must map");
+                assert!(
+                    state.resources.map_window(win).mapping_changed,
+                    "window must map"
+                );
             }
             state.damage_objects.insert(
                 DAMAGE_XID,
@@ -64976,7 +65177,10 @@ mod tests {
                     depth: 24,
                 });
             }
-            assert!(state.resources.map_window(win), "window must map");
+            assert!(
+                state.resources.map_window(win).mapping_changed,
+                "window must map"
+            );
             state.composite_redirects.insert(
                 (win, false),
                 RedirectRecord {
@@ -65114,7 +65318,10 @@ mod tests {
                 });
             }
             if map {
-                assert!(state.resources.map_window(win), "window must map");
+                assert!(
+                    state.resources.map_window(win).mapping_changed,
+                    "window must map"
+                );
             }
             state.composite_redirects.insert(
                 (win, false),

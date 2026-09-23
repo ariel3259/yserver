@@ -35749,7 +35749,7 @@ mod tests {
                 },
             );
             state.resources.window_mut(xid).unwrap().host_xid = WindowHandle::from_raw(host);
-            assert!(state.resources.map_window(xid));
+            assert!(state.resources.map_window(xid).mapping_changed);
             b.windows.insert(
                 host,
                 super::WindowGeometry {
