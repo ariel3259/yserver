@@ -2,6 +2,15 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); this plan needs **no GPU and no `#[ignore]` test** — run none of them, never `_drm`, never `render_acceptance`, never an unfiltered `--ignored`; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape.
 
+**Revision 4 (2026-09-23)** — codex round 3
+(`../findings/2026-09-23-stage-3a-i-plan-review-round3.md`: 3 blocking, 1
+major, all verified): a receipt proves only the transfer its own transition
+requested — a new winner requests and awaits its own (B-1); the row active
+when a loss is observed decides, with no "ordinary work" exception (B-2); an
+incident created during a DPMS transition is paused only if the device's
+target is off (B-3); a same-identity rebuild with no incident follows the
+normal-live row (M-1).
+
 **Revision 3 (2026-09-23)** — codex round 2
 (`../findings/2026-09-23-stage-3a-i-plan-review-round2.md`: 4 blocking, 1
 major, all verified against C.0) showed revision 2's R4-2a and R6-0 traded.
@@ -181,8 +190,7 @@ one); Table U and Table F as functions over (row or winning kind, incident
 state) returning a typed outcome.
 
 **Invariants:**
-- **U-1** *(round-2 B-2)* Table U by row, exactly: **normal live operation**
-  (no lifecycle transition active, or ordinary work) → stop admission, logical
+- **U-1** *(round-2 B-2)* Table U by row, exactly: **normal live operation** (no lifecycle transition active when the loss is **observed**; the active row decides even for a loss of ordinary work, round-3 B-2) → stop admission, logical
   withdrawal of protocol work, quarantine both states, and create the incident
   (U-3) whose sole attempt follows reap; **`VTRelease`** active → release the
   seat logically **now**, record the `REC-6` invalidation of any existing
@@ -190,13 +198,19 @@ state) returning a typed outcome.
   **`DeviceRemoved`** active → `Invalidated(DeviceRemoved)` for any incident,
   logical withdrawal now, no incident; **`Shutdown`** active →
   `Invalidated(Shutdown)`, no incident; **same-identity `TopologyRebuild`**
-  active → the existing incident and quarantine transfer, or — if none exists —
-  the row's own `RecoveryId` outcome applies to the rebuild's single attempt;
+  active → the existing incident and quarantine transfer to the rebuild, whose
+  qualified install consumes it or whose failure terminalizes that same id as
+  `RecoveryFailed`; **if none exists** (round-3 M-1), the loss is handled as a
+  normal-live loss — the incident is created by U-3 with the coordinator's
+  event id, its one attempt runs after reap — and the rebuild is terminalized,
+  never given an id of its own;
   **`DeviceAddedOrReplaced`/`VTAcquire`/`AdministrativeReprobe`/
   `IdentityChangingHotplug`** active → their fresh id (at most one) reaches
-  `RecoveryFailed` on failure or unknown; **`DPMS`** active → the device is
-  poisoned, no KMS mutation follows, and the incident is created (U-3) and at
-  once paused by Table F's DPMS row.
+  `RecoveryFailed` on failure or unknown; **`DPMS`** active → the device is poisoned, no KMS mutation follows, and the
+  incident is created (U-3); it is **paused only if the device's current DPMS
+  target is off** (Table F's DPMS row defers it "on `dpms_target = On`"); with
+  the target on it is active and its attempt proceeds after reap
+  (round-3 B-3).
 - **U-2** Every row's outcome says separately what is **logical** (immediate:
   seat release, withdrawal, protocol terminalization) and what is **physical**
   (waits: reap, fd-family close, fresh install). Task 4 uses that split.
@@ -235,6 +249,9 @@ state) returning a typed outcome.
 | `c0_3a_recovery_matrix_is_total` | every winning kind × an active incident (and × `RecoveryFailed`): the exact outcome of F-1 (item 67) | **T23** transfer the incident on `IdentityChangingHotplug`; **T24** let DPMS allocate a fresh id |
 | `c0_3a_no_double_fate` | every row of both tables: never both invalidated and transferred, at most one id allocated | **T25** allocate a fresh id and also transfer the old one on `VTAcquire` |
 | `c0_3a_first_loss_creates_one_incident` | no incident; a loss during normal live operation reported with a coordinator-allocated event id E: exactly one `RecoveryId`, representative E; then a second loss (id E2) and three normal-recovery events: same `RecoveryId`, each `AbsorbedByEvent(E)` exactly | **T31** allocate a new id on the second loss; **T40** create the incident with no representative |
+| `c0_3a_unknown_during_teardown_follows_the_active_row` | an ordinary commit becomes unknown while `VTRelease`, `DeviceRemoved` and `Shutdown` are each active: each follows its own row — no incident, logical obligations at once | **T45** treat an ordinary-work loss as normal live operation during `VTRelease` |
+| `c0_3a_first_loss_during_dpms_on_is_not_paused` | no incident; a DPMS-on commit becomes unknown: the incident is created, **active** (target on), and its attempt is authorized after reap; the same during DPMS-off: created **paused** | **T46** pause every incident created during a DPMS transition |
+| `c0_3a_first_loss_during_rebuild_is_normal_live` | no incident; a same-identity rebuild's commit becomes unknown: one incident via the coordinator's event id, attempt after reap, rebuild terminalized with no id of its own | **T47** give the rebuild a `RecoveryId` of its own |
 | `c0_3a_dpms_on_resumes_the_paused_incident` | an incident, DPMS off (paused), the device poisoned, DPMS on applied logically: the same id resumes with the same remaining budget, no id allocated, no KMS action, the DPMS representative still `Deferred(ReadinessClosed)` | **T41** keep the incident paused until a KMS installation; **T42** reset the attempt budget on resume |
 | `c0_3a_one_attempt_per_incident` | an attempt fails, then DPMS on, a timer, and repeated normal-recovery events: no second attempt, state `RecoveryFailed` | **T26** let DPMS-on resume a `RecoveryFailed` incident |
 
@@ -260,11 +277,13 @@ the lifecycle epoch.
   executor host call is outstanding"). Only its **physical** advancement —
   final `TEST_ONLY`, opening an fd, installing state, a topology request — waits
   for the driver's receipts that admission is closed, pre-submit work is
-  cancelled, each Present is terminalized and quarantine is transferred. Each
-  receipt carries the tag of the transition that requested it; a receipt for a
-  transition that has since been superseded is re-attributed to the current
-  winner (quarantine follows the winner), never lost and never applied to the
-  wrong transition. Receipts do not wait on the loser's own terminal state. A
+  cancelled, each Present is terminalized and quarantine is transferred **to
+  this transition**. A receipt proves only what its own transition requested
+  (round-3 B-1): when a transition is superseded, the new winner requests its
+  own transfer — from wherever the resources now are — and waits for the
+  receipt tagged with its own id; a late receipt tagged with a superseded
+  transition is recorded against that transition and never counts toward the
+  winner's gate. Receipts do not wait on the loser's own terminal state. A
   **failed** receipt leaves the affected resources in quarantine and the winner
   physically fenced — the device cannot install until the fd-family barrier
   (3d) — but never blocks the winner's logical obligations.
@@ -303,7 +322,7 @@ the lifecycle epoch.
 | --- | --- | --- |
 | `c0_3a_every_pair_elects_by_precedence` | for **every ordered pair** of kinds (active, arriving): supersede iff arriving is higher; coalesce iff equal; else desired-only (items 57, 63) | **T12** supersede on equal kinds; **T13** let a lower kind supersede |
 | `c0_3a_never_two_transitions` | every pair above, then every third kind: the arbiter never holds two | **T14** start the winner before the loser's terminal action |
-| `c0_3a_logical_now_physical_after_receipts` | for `VTRelease`, `DeviceRemoved` and `Shutdown` superseding a DPMS whose host call is outstanding: the logical actions are emitted at once; no physical action until all four receipts; with one receipt delayed or failed the logical ones are still emitted and the physical ones never are; a receipt arriving after a second supersession is attributed to the newest winner | **T32** gate a logical action on a receipt; **T33** let physical advancement proceed with a failed quarantine receipt; **T43** apply a late receipt to the superseded transition |
+| `c0_3a_logical_now_physical_after_receipts` | for `VTRelease`, `DeviceRemoved` and `Shutdown` superseding a DPMS whose host call is outstanding: the logical actions are emitted at once; no physical action until all four receipts; with one receipt delayed or failed the logical ones are still emitted and the physical ones never are; a receipt tagged with a superseded transition, arriving after a second supersession, does **not** open the newest winner's gate, which opens only on its own receipts | **T32** gate a logical action on a receipt; **T33** let physical advancement proceed with a failed quarantine receipt; **T43** count a retagged late receipt toward the newest winner |
 | `c0_3a_submitted_is_never_cancelled_as_never_submitted` | supersession of a transition whose commit is accepted: the action is "await terminal", never "cancel" | **T15** emit cancel for an accepted commit |
 | `c0_3a_convergence_selects_the_highest_unsatisfied` | for every subset of unsatisfied fields (with prerequisites present and absent), after terminalization: exactly one next transition of the highest kind, or `Deferred` with the right prerequisite (item 66) | **T16** pick the first unsatisfied field in declaration order |
 | `c0_3a_mixed_arrivals_keep_every_lower_field` | *(round-2 M-1)* for **every active kind** (generated), arrivals of every mix of lower kinds — including two generations of each latest-wins field — in every order: after it terminalizes, the exact ledger (which ids are `SupersededBy` which, which remain representatives) and the exact sequence of successive winners match C.0 (item 63) | **T34** drop the reprobe field when a topology event arrives |
