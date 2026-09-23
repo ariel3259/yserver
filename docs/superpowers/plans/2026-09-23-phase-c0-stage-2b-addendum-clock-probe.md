@@ -2,6 +2,15 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only the filters `c0_2b_add_`, `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm`, each by its own command with `--include-ignored`; never `_drm` tests (including the one this plan edits), `c0_hw_` tests, `render_acceptance`, `c0_2ci` (known intermittent hang, `docs/known-issues.md`), an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Stop with the tree dirty when done. **Do not ask for approval inside a run** — if something this plan states does not hold in the code, stop and report it (F8); never silently substitute a test shape or weaken an existing assertion.
 
+**Revision 2 (2026-09-23)** — codex round 1
+(`../findings/2026-09-23-2b-addendum-clock-probe-plan-review-round1.md`:
+1 blocking, 2 major, all verified in the code and APPLIED): an uncertain
+probe outcome (timeout, IPC loss, executor failure) is not an ordinary
+failure — it keeps the slot and follows `COMMIT-5`/`ExecutorStalled` (new
+I-1a, B-1); I-2 names the CRTC set a DPMS can touch and a missing record is
+an internal error, never a partial commit (M-1); I-3 now says who holds a
+probe that cannot take the slot yet and who promotes it (M-2).
+
 **Revision 1 (2026-09-23, coordinator).** Two tasks. Found by the 3a-ii
 hardware test; the user chose to fix it as its own addendum before 3a-ii's
 acceptance.
@@ -38,20 +47,44 @@ makes the clock `KernelSequence` with its reference; `EOPNOTSUPP`, any other
 explicit errno or a malformed reply leaves it `Unresolved` and permits **no
 retry within the same clock epoch** (C.0). A stale reply is discarded.
 
+**I-1a. An uncertain probe is a stalled executor, not a failed probe.** A
+probe whose outcome is `Unknown` (timeout, IPC loss, executor failure — the
+owner emits `ClockProbeResolved { outcome: Unknown(..) }` and deliberately
+keeps the slot) follows C.0 `COMMIT-5`/`ExecutorStalled`: it reaches the same
+production route a lifecycle completion loss takes (Task 8:
+`lifecycle_report_completion_loss` → Table U → `Poisoned`), so a DPMS waiting
+on that clock becomes logical-only (Task 8's poisoned rule), no commit is
+begun behind the held slot, and nothing pretends the slot is free. If no such
+route can carry a probe outcome, **stop with an F8**.
+
 **I-2. Every served Owner CRTC has a clock before its first lifecycle
-commit.** The clock record for each active CRTC of an Owner device exists at
-the device's current lifecycle epoch and topology generation without
-depending on a client having issued a RANDR query. If the only installer is
+commit.** The DPMS description is built from the device's served outputs
+(`platform.outputs` filtered by the lifecycle projection,
+`admission.rs` ~1095), so the set is: the CRTC of every served output of an
+Owner device. Each has a clock record at the device's current lifecycle
+epoch and topology generation without depending on a client having issued a
+RANDR query. A CRTC that first becomes a served output later (client modeset,
+hotplug) is 3b/3c's installation site and carries the same obligation. A
+lifecycle description that names a CRTC with **no** clock record is an
+internal inconsistency: logged at error level with the CRTC, never
+dispatched, never sent with a partial clock map. If the only installer is
 the RANDR enumeration path, the implementer adds the installation to the
 Owner device's own setup path (where the executor/owner pair is installed)
 and keeps the RANDR path as a refresh. If no such setup site can be named in
 production code, **stop with an F8**.
 
-**I-3. The probe gets the slot.** The probe uses the device's commit slot
-(`slot.acquire_probe`). A pending probe is sent at the first moment the slot
-is free and **before** any lifecycle-class or event-bearing commit on that
-device is begun; a stream of composed frames cannot starve it indefinitely
-(it is sent between two composed commits at the latest).
+**I-3. The probe gets the slot.** The probe uses the device's commit slot,
+and `begin_clock_probe` acquires it immediately or fails
+(`slot.acquire_probe`, `owner/slot.rs` ~150): when the slot is occupied there
+is no pending probe. So an installed clock whose probe could not start is
+held as a **waiting probe key** by the owner (or the backend beside it —
+implementer's choice, named in the report), and the waiting key is
+**promoted when the slot frees, before any new commit is begun on that
+device**, composed or lifecycle. A stream of composed frames cannot starve it:
+it is sent between two composed commits at the latest. When a new clock epoch
+replaces one whose probe is waiting or in flight, the old key is dropped from
+the waiting set, an in-flight result for it is discarded as stale when it
+arrives (C.0), and the new epoch's key is waiting.
 
 **I-4. DPMS waits for its clock.** A lifecycle DPMS whose expected-completion
 CRTCs include one whose clock is not yet resolved (probe not started, pending
@@ -112,7 +145,9 @@ stub-executor fixture driven through production entries (no
 | `c0_2b_add_clock_is_probed_on_install` | Owner device set up through its production path: exactly one `ClockProbe` host call per active CRTC reaches the executor; the stub's `ProbeAccepted` reply routed through the production event path makes the clock `KernelSequence` with that reference | **P1** remove the probe start |
 | `c0_2b_add_clock_exists_without_a_randr_query` | the same setup with no RANDR enumeration: the clock record exists and is probed | **P2** install only from the RANDR path |
 | `c0_2b_add_failed_probe_is_not_retried_in_the_epoch` | stub replies `EOPNOTSUPP`: clock stays `Unresolved`; further ticks and a refresh at the same epoch send no second probe; a genuinely new epoch probes again | **P3** retry within the epoch |
-| `c0_2b_add_probe_is_not_starved_by_composed_frames_vulkan` | composed frames submitted back to back while a probe is pending: the probe is sent no later than between two composed commits | **P4** send the probe only when no composed work is queued |
+| `c0_2b_add_probe_is_not_starved_by_composed_frames_vulkan` | the clock is installed while a composed commit holds the slot, and composed frames keep arriving: the waiting probe is sent at that commit's retirement, before the next composed commit begins | **P4** promote the waiting probe only when no composed work is queued |
+| `c0_2b_add_new_epoch_replaces_an_in_flight_probe` | a probe in flight, then a genuinely new clock epoch for the same CRTC: the old reply, when it arrives, is discarded and does not resolve the new clock; the new epoch is probed | **P4b** resolve the new clock from the old reply |
+| `c0_2b_add_uncertain_probe_stalls_the_executor` | the stub times the probe out (`Unknown`) while a DPMS waits: the production completion-loss route reaches `Poisoned`, the DPMS is logical-only, no commit is begun and the slot stays held | **P4c** treat `Unknown` like an explicit errno (release and mark unresolved) |
 | `c0_2b_add_legacy_device_never_probes` | a Legacy device: no `ClockProbe` host call, no clock state change | **P5** probe without the Owner condition |
 
 ## Task 2 — DPMS waits, refusals are named (I-4, I-5) and the hardware test
@@ -121,6 +156,7 @@ stub-executor fixture driven through production entries (no
 | --- | --- | --- |
 | `c0_2b_add_dpms_waits_for_the_clock` | Owner device, probe pending (stub holds the reply): DPMS off queues, no validation or commit host call is sent and the representative is not `Rejected`/`Deferred`; the probe reply arrives: the off validates and dispatches exactly once | **P6** begin the DPMS without waiting; **P7** never re-drive after the probe resolves |
 | `c0_2b_add_dpms_after_a_failed_probe_is_readiness_closed` | probe replies `EOPNOTSUPP`, then DPMS off: no commit host call, `Deferred(ReadinessClosed)`, no `TopologyLatched` | **P8** dispatch with a partial clock set |
+| `c0_2b_add_missing_clock_record_is_never_a_partial_commit` | a lifecycle description naming a served CRTC whose clock record was removed: no commit host call, the refusal is logged and never-dispatched | **P8b** drop the CRTC from the clock map and send |
 | `c0_2b_add_presubmit_refusal_is_not_a_kernel_rejection` | a forced non-transient `DispatchError` at the validated-submit step (through a test seam on the owner, not by editing the classification): the terminal is never-dispatched, the representative is `Deferred(ReadinessClosed)`, never `TopologyLatched` | **P9** restore the synthesized `IoctlRejected { EINVAL }` |
 
 **Existing tests.** Fixture tests that install clocks by hand may keep doing
