@@ -4060,11 +4060,29 @@ review stages inside that PR, not separately mergeable PRs:
    targets; VT release/acquire, hotplug/reprobe, off-transition fences,
    qualification, recovery, and shutdown use the single arbiter and quarantine
    rules.
+
+   *(Amended 2026-09-22, stage 3 umbrella design revision 2.)* "Convert every
+   use" means every lifecycle caller's **Owner path**: stage 3 proves that no
+   Owner path reads the all-output model. While production devices remain
+   `Legacy`, the legacy uses stay behind `allows_legacy` and are deleted in
+   stage 5, together with the model itself. Stage 3 is planned as sub-stages
+   3a–3d, see
+   `docs/superpowers/specs/2026-09-22-phase-c0-stage-3-lifecycle-design.md`.
 4. **Atomic cursor and gamma conversion.** Add universal cursor payloads, VT
    detach, direct absorption, RANDR gamma blobs and atomic-only size discovery,
    HW/SW cursor transitions, multi-device coordination, and removal of every
    legacy gamma and cursor load/show/hide/disable call. The only possible
    survivor is the qualified owner-mediated coordinate transport.
+5. **Activation and legacy removal** *(added 2026-09-22, stage 3 umbrella
+   design revision 2)*. Switch every device to `Owner` in production. Remove
+   the legacy lifecycle, cursor and gamma writers, the `allows_legacy` gates,
+   `kms_outputs_active` and its sites, and every structure that exists only for
+   Legacy/Owner coexistence: its first act deletes `TransportState` entirely
+   (the handover and `allows_legacy`) and folds `Closed` into the section 6.4
+   state, which becomes the only device state. It runs the real-client battery
+   against the Legacy golden, the upstream-fixes revalidation on Owner and the
+   final-tip gate. Its entry preconditions are listed in the stage 3 umbrella
+   design, section 6.
 
 Every stage has its focused parser/ABI, state-machine, primary, lifecycle or
 cursor/gamma software tests, but stage boundaries are not merge boundaries.

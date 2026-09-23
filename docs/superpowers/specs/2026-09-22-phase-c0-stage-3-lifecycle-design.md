@@ -1,6 +1,8 @@
 # Phase C.0 stage 3 — lifecycle, modeset, DPMS, VT and topology
 
-**Status:** Umbrella design. Sections 1–4 approved section by section by the
+**Status:** Umbrella design, **revision 2** (codex round 1:
+[findings](../findings/2026-09-22-stage-3-umbrella-design-review-round1.md)).
+Sections 1–4 approved section by section by the
 user on 2026-09-22 (brainstorming session). It fixes the decomposition, the
 shared contracts, the client-visible contract and the evidence regime of
 stage 3. Each sub-stage (3a–3d) gets its own spec → codex review → plan cycle;
@@ -102,20 +104,47 @@ protocol output, `recovery_incident`), at most one
 `LifecycleTransition { id, kind, phase }`, the §6.4 state and the
 `RecoveryId`.
 
-The arbiter is **pure**: its inputs are projected events and slot outcomes,
-its outputs are typed actions (request a topology commit for a transition,
-quiesce, terminalize, record a disposition). It owns no fd, no executor call
+The arbiter is **pure**: its inputs are projected events and acknowledged
+outcomes, its outputs are typed actions (request a topology commit for a
+transition, close admission, cancel pre-submit work, terminalize protocol work,
+transfer quarantine, record a disposition). It owns no fd, no executor call
 and no resource. That is what lets `REC-4/5/6` be proven by exhaustive tables
 rather than samples (section 5.1).
 
-### 2.4. `Tier::Topology` carries the transition, not a `u64`
+### 2.3.1. The lifecycle driver applies the actions *(rev 2, round-1 M-1)*
 
-The tier's payload becomes `(LifecycleTransitionId, LifecycleEpochId)` in
-place of the bare generation. An executor result whose transition or epoch is
-no longer current gets the `REC-4` accepted-stale treatment and can never
-promote installed state. As with Ciii's `CommitKey`, a stale use must be
-rejected by the type — fail to compile, or be unrepresentable — not depend on
-a site remembering to compare.
+A pure arbiter decides; something must act. Each device's **lifecycle driver**
+is the effectful owner: it lives in the backend beside that device's admission
+conductor, on the core loop, at the site that already routes the device's
+owner events (`route_owner_event_batch`, `backend.rs:20801`). It is the only
+code that applies arbiter actions: it closes and reopens admission, cancels
+pre-submit work and helpers, terminalizes each Present exactly once, requests
+`Tier::Topology` work, and moves retained resources into the winning
+transition's quarantine. It reports each action's **acknowledged** outcome back
+to the arbiter as an input; the arbiter never assumes an action succeeded.
+Supersession (`REC-4`) is therefore a sequence the driver executes promptly on
+the core loop — it never waits on an executor host call — and admission
+priority alone is never relied on to perform it.
+
+### 2.4. `Tier::Topology` carries the transition, not a `u64` *(rev 2, round-1 M-3)*
+
+The tier's payload becomes the transition's identity — incarnation,
+`LifecycleEpochId` and `LifecycleTransitionId` — in place of the bare
+generation. A type cannot know whether a *later* reply is still current, so
+the tag alone proves nothing about freshness. What it buys is that there is
+**one owner-side result-disposition boundary**, in the lifecycle driver, which
+every executor reply for lifecycle work must cross and which compares the
+reply's identity with the device's current incarnation, epoch and transition.
+The typed tag makes that comparison unavoidable (the installed-state promotion
+takes the validated result, never the raw reply), as Ciii's `CommitKey` made a
+device-blind lookup fail to compile.
+
+At that boundary, per `REC-4`: a current explicit success may promote; an
+explicit rejection permits generation-local never-submitted cleanup; a stale
+explicit success is **accepted-stale** — every returned fd is adopted or closed
+exactly once, protocol work is terminalized once, and both possible
+state/resource sets are retained in the winning transition's quarantine; an
+absent or invalid result is acceptance-unknown with the same quarantine.
 
 ### 2.5. The Legacy fork is unchanged until stage 5
 
@@ -169,14 +198,52 @@ them.
 - DPMS-off requires old-active out-fence evidence (C.0 §16.2 item 45).
 - A DPMS target arriving while the seat is released is `Deferred`, not
   dropped (C.0 §16.3, lifecycle hardware list).
+- **The failure entry edge is executed in 3a, not deferred** *(rev 2, round-1
+  B-1)*. No live lifecycle commit exists without it. A DPMS transition whose
+  commit is rejected, loses completion evidence or breaches its deadline goes
+  through the device owner's existing poison (`DeviceCommitOwner::is_poisoned`
+  closes admission; `CompletionUnknown` records are quarantined by the 2b
+  ledger), and the driver then: terminalizes the transition, moves the §6.4
+  state to `Poisoned`, records the `REC-6` outcome for any incident, gives
+  every affected event id its disposition, and retains the quarantine under the
+  device. What 3d adds is the **exit** from `Poisoned` — the sole `REC-1`
+  recovery attempt, `RecoveryFailed`, `ExecutorStalled` and teardown. Between
+  3a and 3d a poisoned Owner device simply stays closed; that window exists
+  only in fixtures, because production is `Legacy` until stage 5.
+- **Projections follow topology** *(rev 2, round-1 M-2)*. Any installation of a
+  topology — here, and in 3b and 3c — first refreshes each stable output's
+  `dpms_target` from the coordinator's current global level and epoch, so a
+  newly discovered or re-created output is never installed active after a
+  global DPMS-off; a removed output's projection is invalidated exactly once.
+  3a defines the rule and its test; 3b and 3c each prove it at their
+  installation sites.
 - Exit: `dpms` coverage proven. Hardware: DPMS off/on × 4 on card1.
 
 ### 3b — Modeset and RANDR
 
-- `apply_crtc_config` through the existing `begin_crtc_config` →
-  `Pending` → `CrtcConfigReady` path; `enable_connector_inner`,
-  `disable_output` and the two `replay_*_scanout_plan` as lifecycle intents
-  (`TopologyRebuild` on the same identity).
+- `apply_crtc_config` through the `begin_crtc_config` → `Pending` →
+  `CrtcConfigReady` path; `enable_connector_inner`, `disable_output` and the
+  two `replay_*_scanout_plan` as lifecycle intents (`TopologyRebuild` on the
+  same identity).
+- The direct-scanout all-off/relight helpers around a topology change,
+  `teardown_direct_before_topology_requery` and
+  `relight_after_direct_teardown` (`backend.rs:3457`, `:3430`), are converted
+  here; their RANDR callers are 3b's, and 3c reuses the converted helpers for
+  the output-topology change (`backend.rs:14103`).
+- **Publication is independent of the requester** *(rev 2, round-1 B-2)*.
+  Today only the PRIME qualification probe is asynchronous: disables and
+  same-device changes return `Applied` synchronously
+  (`backend.rs:23685`–`23700`), and a ready token whose client has gone is
+  **cancelled** (`core_loop/run.rs:1061`) — correct for a disposable probe,
+  wrong for an Owner commit that has already reached the hardware. On Owner,
+  every real mutation is parked, including disables and same-device changes,
+  and its outcome is split in two: the **publication** (RANDR state refresh and
+  the change notifications of `complete_crtc_config`,
+  `process_request.rs:4934`) happens when the transition reaches `Applied`
+  whether or not the requester is still connected; the **reply** goes only to
+  a requester that is still waiting. A requester's disconnect cancels its reply,
+  never an accepted transition or its broadcast. This touches `yserver-core`'s
+  continuation and is part of 3b's scope.
 - Topology epochs invalidate earlier queued intents (C.0 §9.2, §13).
 - Exit: `modeset` coverage proven. Hardware: a RANDR mode change and an
   output disable/enable, × 4.
@@ -237,15 +304,23 @@ Real X11 clients cannot reach the Owner before stage 5: C.0 §18 forbids an
 environment flag that selects a stage, so until activation the Owner runs only
 inside `cargo test` fixtures.
 
-1. **Differential gate, per sub-stage, no display.** Drive the `KmsBackend`
-   through the `Backend` trait exactly as `process_request` does
-   (`set_dpms_power`; `begin_crtc_config` → `drain_ready_crtc_configs` →
-   `finish_crtc_config`; VT suspend/resume; hotplug) with one script on a
-   Legacy fixture and on an Owner fixture. Compare each result's status, the
-   protocol-state writes, and the order of notifications to the core (RANDR
-   events relative to the reply of the same request). Identical, except for the
-   named exceptions. This is the exit gate of every sub-stage.
-   `randr.rs` validation stays upstream of the backend and is not touched.
+1. **Differential gate, per sub-stage, no display** *(rev 2, round-1 M-4)*.
+   Two levels, because the notifications and the reply are written by the
+   core, not the backend (`complete_crtc_config`, `process_request.rs:4934`):
+   - **Backend state.** Drive the `KmsBackend` through the `Backend` trait as
+     `process_request` does (`set_dpms_power`; `begin_crtc_config` →
+     `drain_ready_crtc_configs` → `finish_crtc_config`; VT suspend/resume;
+     hotplug) with one script on a Legacy fixture and on an Owner fixture, and
+     compare each result's status and the resulting RANDR/protocol state.
+   - **Protocol order — the exit gate.** Drive the *core* request path with the
+     same two fixtures: the request is dispatched, the client is parked, the
+     ready wake is drained and completed, and the bytes written to each client
+     connection are compared — the reply, its status, and the RANDR events on
+     the requester's connection and on a second, listening connection, in
+     order. The script includes a requester that disconnects while parked
+     (section 3b's publication rule: the listener still receives the events).
+   Identical, except for the named exceptions. `randr.rs` validation stays
+   upstream of the backend and is not touched.
 2. **Legacy golden, captured before 3a is implemented.** The current
    production server from a tty (user approval required), under `x11trace`,
    running: `xrandr` (`--mode`, `--off`, `--auto`, `--verbose`, a position or
@@ -254,7 +329,7 @@ inside `cargo test` fixtures.
    VT switch × 4; HDMI-2 unplug/replug. Serials and timestamps are normalized
    before any diff. xev and xrandr are separate connections, so their relative
    order proves nothing; same-connection reply/event order is covered by layer
-   1 and by MATE in layer 3.
+   1's protocol-order gate and by MATE in layer 3.
 3. **Real clients against the Owner, in stage 5.** The layer-2 battery rerun
    and diffed against the golden (only the named exceptions may differ), plus:
    **MATE** (`mate-settings-daemon`'s xrandr plugin and the display settings
@@ -302,12 +377,19 @@ Codex `gpt-6-luna` xhigh implements; codex `gpt-6-sol` xhigh reviews specs and
 plans; the coordinator verifies, applies mutations and commits. Plans give
 interfaces, invariants, tests and mutations — not prototype code.
 
-## 6. Proposed amendment to C.0 §18: stage 5
+## 6. Amendment to C.0 §18: stage 5 *(rev 2, round-1 M-5)*
 
-C.0 §18 lists four stages. Stage 3 keeps the Legacy lifecycle writers alive
-behind `allows_legacy`, and stage 4 does the same for cursor and gamma. Leaving
-them for after the squash would hand the maintainer dead code. This design
-therefore proposes a fifth stage inside the same PR:
+C.0 §18.3 assigns to stage 3 the conversion of "every use of the merged
+all-output `dpms_set_outputs_active(bool)`/`kms_outputs_active` model". This
+design keeps the Legacy uses alive behind `allows_legacy` until activation, and
+stage 4 does the same for cursor and gamma; leaving them for after the squash
+would hand the maintainer dead code. Appending a stage does not by itself
+change stage 3's exit contract, so the amendment is applied **to C.0 §18
+itself** (C.0 revision note of 2026-09-22): stage 3 converts every lifecycle
+caller's **Owner path** and proves that no Owner path reads the legacy model;
+the Legacy uses and the model itself are deleted in stage 5. A 3d exit with
+Legacy uses still present is therefore compliant with the amended §18.3, and
+not before the amendment is committed. The fifth stage inside the same PR:
 
 > **5. Activation and legacy removal.** Switch every device to `Owner` in
 > production. Remove the legacy lifecycle, cursor and gamma writers, the
