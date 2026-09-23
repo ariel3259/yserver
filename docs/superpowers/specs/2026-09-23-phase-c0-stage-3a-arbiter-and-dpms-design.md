@@ -442,6 +442,20 @@ defect of Ciii — ours, by the project's ownership rule — fixed in its own
 commit with its own test and mutation, named as a stage 2c-iii addendum, and
 not absorbed into 3a's design.
 
+**Investigation so far (coordinator, 2026-09-23).** On an Owner device the
+composed return is the output's composed `OwnerBuffer` in state `Current`
+(`owner_current_framebuffer`, `scene.rs:1944`). The only transition that
+takes a composed buffer out of `Current` is its replacement by a newer
+composed buffer on the same output (`retire_owner_buffer`, `scene.rs:2470`,
+`into_releasing` at `:2511`). A direct commit never touches the composed owner
+buffers, so a composed return that existed at direct entry is still retained
+while direct is current, through DPMS or not. Two cases remain open and the
+plan must close each with a test (or a proof that it cannot occur) before any
+3a task depends on it: **(a)** direct entry on an output that has no composed
+`Current` yet (for example the first frames after an installation), and
+**(b)** the drain and reset paths (`scene.drain_all`,
+`reset_scanout_bos_for_suspend`, a relayout) while direct is current.
+
 ## 7. Out of scope
 
 VT, hotplug, reprobe, device add/remove as executed transitions (3c); client
