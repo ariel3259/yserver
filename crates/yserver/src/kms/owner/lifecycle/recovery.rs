@@ -12,6 +12,17 @@ pub enum DpmsTarget {
     Off,
 }
 
+/// Convert an X11 DPMS level to the binary KMS power target.
+///
+/// Level 0 means On; Standby, Suspend, and Off (levels 1–3) all mean Off.
+pub const fn dpms_target_for_level(level: u8) -> Option<DpmsTarget> {
+    match level {
+        0 => Some(DpmsTarget::On),
+        1..=3 => Some(DpmsTarget::Off),
+        _ => None,
+    }
+}
+
 /// State of one incident's sole automatic recovery attempt.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum RecoveryIncidentState {

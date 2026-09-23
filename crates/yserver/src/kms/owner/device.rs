@@ -421,6 +421,29 @@ impl<R> DeviceCommitOwner<R> {
         self.lifecycle_epoch
     }
 
+    /// The transition stamped into the next executor correlation. The
+    /// lifecycle coordinator remains authoritative; this getter lets its
+    /// driver enforce a full-tag freshness check before validation and send.
+    pub fn lifecycle_transition(&self) -> Option<LifecycleTransitionId> {
+        self.transition
+    }
+
+    /// Install the coordinator's current lifecycle identity before issuing
+    /// lifecycle-owned executor work. Older queued actions cannot roll the
+    /// owner back to a superseded epoch.
+    pub fn update_lifecycle_context(
+        &mut self,
+        lifecycle_epoch: LifecycleEpochId,
+        transition: Option<LifecycleTransitionId>,
+    ) -> bool {
+        if lifecycle_epoch < self.lifecycle_epoch {
+            return false;
+        }
+        self.lifecycle_epoch = lifecycle_epoch;
+        self.transition = transition;
+        true
+    }
+
     pub fn topology_generation(&self) -> u64 {
         self.topology_generation
     }
@@ -1311,6 +1334,7 @@ impl<R> DeviceCommitOwner<R> {
         }
         if context.class == CompletionClass::LifecycleInstallRestore {
             match context.lifecycle_observed_max {
+                None => {}
                 Some(d) if d <= std::time::Duration::from_secs(28) => {}
                 _ => return Err(DispatchError::LifecycleUnvalidated),
             }

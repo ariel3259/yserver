@@ -1091,6 +1091,22 @@ and `docs/superpowers/findings/2026-06-25-xkb-request-coverage-audit.md`.
       each stall; the depth-4 path itself is fast (verified offscreen
       under lavapipe) and unrelated.
 
+- [ ] **`c0_2ci` hangs intermittently with four unreaped helper zombies
+      (measured 2026-09-23, parallel runs of `c0_2ci --include-ignored`).**
+      The whole filter stops making progress after 176–188 of 201 tests and
+      the test process has exactly four `[yserver] <defunct>` children: some
+      test waits forever while the executor helpers it spawned are dead and
+      unreaped. Serial runs (`--test-threads=1`) passed every time tried.
+      **Pre-existing since stage 2:** 4/25 hangs at `1bdde511` (end of stage
+      2, before any stage 3 code and before the `a232d2af` upstream merge),
+      1/25 at `11698781`, 3/25 with stage 3a-ii task 5 in the tree — the same
+      signature every time, so stage 3 did not introduce it. Not yet
+      attributed to a test: `eu-stack` cannot attach on this machine (ptrace
+      refused), so the next step is to run the helper-spawning `c0_2ci` tests
+      one by one in a loop with a timeout. Ours (stage 2c-i code); to be fixed
+      in its own commit. Until then a hung `c0_2ci` run in a gate is rerun,
+      and a pass is only accepted after repeated runs (see the executor-race
+      note: one green run is not evidence).
 - [ ] **`device_lock` tests flake on "the last close releases it"
       (~1 in 10 filtered runs, 2026-09-22).** Seen on
       `dropping_a_device_lock_does_not_unlock_a_shared_description`,

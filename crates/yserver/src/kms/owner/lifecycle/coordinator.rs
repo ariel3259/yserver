@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     ArbiterInput, DesiredField, DesiredIntent, Disposition, IncidentOrigin, LifecycleAction,
     LifecycleArbiter, LifecycleEventId, LifecycleKind, OutputProjection, OutputProjectionRemoval,
-    RecoveryAttemptOutcome, RecoveryIdAllocator, SeatTarget, TransitionTag,
+    RecoveryAttemptOutcome, RecoveryIdAllocator, SeatTarget, TransitionTag, dpms_target_for_level,
 };
 
 /// Result of one coordinator-assigned event projection to a device.
@@ -308,7 +308,7 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
         &mut self,
         level: u8,
     ) -> Result<Vec<CoordinatorDispatch<D, I>>, CoordinatorError> {
-        if level > 3 {
+        if dpms_target_for_level(level).is_none() {
             return Err(CoordinatorError::InvalidDpmsLevel(level));
         }
         let epoch = self
@@ -602,7 +602,7 @@ fn is_recovery_boundary(kind: LifecycleKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoordinatorError, LifecycleCoordinator};
+    use super::{CoordinatorError, LifecycleCoordinator, dpms_target_for_level};
     use crate::kms::owner::lifecycle::{
         ArbiterInput, CompletionUnknownRow, CompletionUnknownRowKind, DesiredField, DesiredIntent,
         DeviceLifecycleState, Disposition, DpmsTarget, IncidentOrigin, LifecycleAction,
@@ -768,11 +768,7 @@ mod tests {
             }
             CompletionUnknownRowKind::TopologyRebuild => CompletionUnknownRow::TopologyRebuild,
             CompletionUnknownRowKind::DPMS => CompletionUnknownRow::DPMS {
-                target: if dpms_level == 0 {
-                    DpmsTarget::On
-                } else {
-                    DpmsTarget::Off
-                },
+                target: dpms_target_for_level(dpms_level).expect("valid test DPMS level"),
             },
         }
     }
@@ -846,17 +842,46 @@ mod tests {
                     assert_eq!(projection.level, level);
                     assert_eq!(projection.epoch, Some(epoch));
                     assert_eq!(projection.representative, Some(representative.event_id));
-                    assert_ne!(
-                        if projection.level == 0 {
-                            DpmsTarget::On
-                        } else {
-                            DpmsTarget::Off
-                        },
-                        DpmsTarget::On,
+                    assert_eq!(
+                        dpms_target_for_level(projection.level),
+                        Some(DpmsTarget::Off),
                         "levels 1, 2, and 3 all request off"
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn c0_3aii_one_dpms_level_mapping() {
+        for (level, expected) in [
+            (0, DpmsTarget::On),
+            (1, DpmsTarget::Off),
+            (2, DpmsTarget::Off),
+            (3, DpmsTarget::Off),
+        ] {
+            assert_eq!(dpms_target_for_level(level), Some(expected));
+
+            let mut coordinator = with_devices(&[1]);
+            add_output(&mut coordinator, 1, 10);
+            coordinator.set_protocol_dpms_level(level).unwrap();
+            let projected = coordinator
+                .device(&1)
+                .unwrap()
+                .desired()
+                .dpms_targets()
+                .get(&10)
+                .expect("projected output");
+            assert_eq!(dpms_target_for_level(projected.level), Some(expected));
+
+            let loss = coordinator.report_completion_loss(&1).unwrap();
+            assert!(loss.actions.iter().any(|action| matches!(
+                action,
+                LifecycleAction::CompletionLossTableU {
+                    row: CompletionUnknownRow::DPMS { target },
+                    ..
+                } if *target == expected
+            )));
         }
     }
 

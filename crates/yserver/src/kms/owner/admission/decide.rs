@@ -7,10 +7,10 @@ use super::{
 
 impl Admission {
     pub fn decide(&self, snapshot: &ReadinessSnapshot) -> Option<AdmissionDecision> {
-        if let Some(generation) = self.topology() {
+        if let Some(tag) = self.topology() {
             return Some(self.decision(
                 Tier::Topology,
-                Admitted::Topology { generation },
+                Admitted::Topology { tag },
                 Vec::new(),
                 snapshot,
             ));
@@ -461,7 +461,8 @@ pub enum Tier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admitted {
     Topology {
-        generation: u64,
+        tag:
+            crate::kms::owner::lifecycle::TransitionTag<crate::kms::owner::identity::IncarnationId>,
     },
     Unflip {
         crtcs: BTreeSet<CrtcId>,

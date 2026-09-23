@@ -34,6 +34,17 @@ fn gamma_key(crtc: CrtcId) -> MaintenanceKey {
     }
 }
 
+fn topology_tag(
+    id: u64,
+) -> crate::kms::owner::lifecycle::TransitionTag<crate::kms::owner::identity::IncarnationId> {
+    use crate::kms::owner::{identity::IncarnationId, lifecycle::*};
+    TransitionTag::new(
+        IncarnationId::first(),
+        LifecycleEpochId::first(),
+        LifecycleTransitionId::from_raw(id),
+    )
+}
+
 fn ticket_from_completed_generation(
     admission: &mut Admission,
     key: MaintenanceKey,
@@ -394,19 +405,18 @@ fn c0_adm_ordinals_are_device_monotonic_across_shapes() {
 }
 
 #[test]
-fn c0_adm_topology_requests_are_monotonic() {
+fn c0_adm_topology_requests_replace_only_the_matching_transition() {
     let mut admission = Admission::new();
 
-    admission.request_topology(10).unwrap();
-    assert_eq!(
-        admission.request_topology(10),
-        Err(AdmissionError::StaleGeneration {
-            queued: 10,
-            offered: 10,
-        })
-    );
-    admission.request_topology(11).unwrap();
-    assert_eq!(admission.topology(), Some(11));
+    let first = topology_tag(10);
+    let second = topology_tag(11);
+    admission.request_topology(first).unwrap();
+    admission.request_topology(second).unwrap();
+    assert_eq!(admission.topology(), Some(second));
+    assert!(!admission.cancel_topology(first));
+    assert_eq!(admission.topology(), Some(second));
+    assert!(admission.cancel_topology(second));
+    assert_eq!(admission.topology(), None);
 }
 
 #[test]
@@ -424,7 +434,8 @@ fn c0_adm_tiers_topology_then_unflip_then_primary() {
     let mut with_topology = Admission::new();
     with_topology.set_composed(1, 10).unwrap();
     with_topology.request_unflip(super::crtcs(&[2])).unwrap();
-    with_topology.request_topology(30).unwrap();
+    let topology_tag = topology_tag(30);
+    with_topology.request_topology(topology_tag).unwrap();
 
     let mut snapshot = ReadinessSnapshot::new(20, 30);
     snapshot.report(
@@ -440,7 +451,7 @@ fn c0_adm_tiers_topology_then_unflip_then_primary() {
         with_topology.decide(&snapshot),
         Some(AdmissionDecision {
             tier: Tier::Topology,
-            admitted: Admitted::Topology { generation: 30 },
+            admitted: Admitted::Topology { tag: topology_tag },
             carried: Vec::new(),
             combined_primary: None,
             ages: BTreeSet::new(),
@@ -987,7 +998,8 @@ fn c0_adm_confirm_consumes_a_direct_unflip_or_topology_admission_exactly() {
     {
         let mut admission = Admission::new();
         admission.set_composed(2, 40).unwrap();
-        admission.request_topology(50).unwrap();
+        let topology_tag = topology_tag(50);
+        admission.request_topology(topology_tag).unwrap();
 
         let mut snapshot = ReadinessSnapshot::new(0, 0);
         snapshot.report(
@@ -998,7 +1010,7 @@ fn c0_adm_confirm_consumes_a_direct_unflip_or_topology_admission_exactly() {
             Readiness::Ready,
         );
         let decision = admission.decide(&snapshot).unwrap();
-        assert_eq!(decision.admitted, Admitted::Topology { generation: 50 });
+        assert_eq!(decision.admitted, Admitted::Topology { tag: topology_tag });
         let token = admission.lock(decision, &snapshot).unwrap();
         admission.confirm(token).unwrap();
 
@@ -1183,7 +1195,7 @@ fn c0_adm_an_intervening_admission_ends_the_successive_run() {
         .unwrap();
     admission.confirm(composed_token).unwrap();
 
-    admission.request_topology(20).unwrap();
+    admission.request_topology(topology_tag(20)).unwrap();
     let topology_decision = admission.decide(&ReadinessSnapshot::new(0, 0)).unwrap();
     let topology_token = admission
         .lock(topology_decision, &ReadinessSnapshot::new(0, 0))
@@ -1504,7 +1516,7 @@ fn c0_adm_a_multi_crtc_unflip_serves_every_crtc_it_covers() {
 #[test]
 fn c0_adm_retirement_preference_needs_no_other_crtc_owed() {
     let mut admission = Admission::new();
-    admission.request_topology(10).unwrap();
+    admission.request_topology(topology_tag(10)).unwrap();
     let topology_snapshot = ReadinessSnapshot::new(0, 0);
     let topology_decision = admission.decide(&topology_snapshot).unwrap();
     let topology_token = admission
@@ -1584,7 +1596,7 @@ fn c0_adm_maint_barrier_ages_overtaken_maintenance_without_resetting_tickets() {
     let key = cursor_key(1);
     admission.set_maintenance(key, 7, false).unwrap();
     let ticket = admission.maintenance(key).unwrap().ticket;
-    admission.request_topology(10).unwrap();
+    admission.request_topology(topology_tag(10)).unwrap();
 
     let mut snapshot = ReadinessSnapshot::new(0, 0);
     snapshot.report(
@@ -2644,7 +2656,7 @@ fn c0_adm_maint_stale_required_maintenance_blocks_the_successor_in_every_tier() 
 #[test]
 fn c0_adm_maint_seven_tiers_in_order() {
     let mut topology = Admission::new();
-    topology.request_topology(1).unwrap();
+    topology.request_topology(topology_tag(1)).unwrap();
     topology.request_unflip(super::crtcs(&[1])).unwrap();
     let mut topology_snapshot = ReadinessSnapshot::new(0, 0);
     topology_snapshot.report(IntentKey::Unflip, Readiness::Ready);
@@ -2806,7 +2818,7 @@ fn c0_adm_maint_allowance_grows_when_an_older_identity_ages_later() {
     let older_ticket = admission.maintenance(older).unwrap().ticket;
     let younger_ticket = admission.maintenance(younger).unwrap().ticket;
 
-    admission.request_topology(1).unwrap();
+    admission.request_topology(topology_tag(1)).unwrap();
     let mut barrier_snapshot = ReadinessSnapshot::new(0, 0);
     barrier_snapshot.report(
         IntentKey::Maintenance {
@@ -3004,7 +3016,7 @@ fn c0_adm_maint_bound_violation_is_reported() {
     admission.set_maintenance(younger, 20, true).unwrap();
     let older_ticket = admission.maintenance(older).unwrap().ticket;
 
-    admission.request_topology(1).unwrap();
+    admission.request_topology(topology_tag(1)).unwrap();
     let mut barrier_snapshot = ReadinessSnapshot::new(0, 0);
     for (key, generation) in [(older, 10), (younger, 20)] {
         barrier_snapshot.report(IntentKey::Maintenance { key, generation }, Readiness::Ready);
@@ -3061,7 +3073,9 @@ fn c0_adm_maint_barriers_do_not_count_against_the_bound() {
     let ticket = admission.maintenance(key).unwrap().ticket;
 
     for generation in 1..=3 {
-        admission.request_topology(generation).unwrap();
+        admission
+            .request_topology(topology_tag(generation))
+            .unwrap();
         let mut snapshot = ReadinessSnapshot::new(0, 0);
         snapshot.report(
             IntentKey::Maintenance { key, generation: 7 },

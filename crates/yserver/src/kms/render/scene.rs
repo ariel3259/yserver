@@ -2293,6 +2293,37 @@ impl SceneCompositor {
         }
     }
 
+    /// Invalidate open damage transactions only for the selected DRM devices.
+    /// DPMS has a server-wide protocol target, but a Legacy device's local
+    /// power transition must not discard Owner damage bookkeeping elsewhere.
+    pub(crate) fn invalidate_owner_damage_transactions_for_devices(
+        &mut self,
+        platform: &mut PlatformBackend,
+        devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) {
+        let commits = self
+            .inner
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .owner_damage_transactions
+                    .iter()
+                    .filter(|(commit, transaction)| {
+                        devices.contains(&commit.device)
+                            || transaction
+                                .members
+                                .iter()
+                                .any(|member| devices.contains(&member.output_key.device_key))
+                    })
+                    .map(|(commit, _)| *commit)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for commit in commits {
+            self.invalidate_owner_damage_transaction(commit, platform);
+        }
+    }
+
     fn invalidate_owner_damage_transactions_for_device(
         &mut self,
         device: crate::platform::drm::DrmDeviceKey,
@@ -3051,6 +3082,33 @@ impl SceneCompositor {
         self.scene_structure_dirty = true;
     }
 
+    /// Wake composition while restricting the new full-output damage to the
+    /// selected device outputs. The shared dirty bit schedules the scene walk;
+    /// unselected outputs retain their per-output scanout and damage state.
+    pub(crate) fn wake_for_devices(
+        &mut self,
+        platform: &PlatformBackend,
+        devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) {
+        if self.damage_audit_active() {
+            self.record_damage_audit_event(Location::caller(), self.full_output_audit_area());
+        }
+        self.scene_structure_dirty = true;
+        if let Some(inner) = self.inner.as_mut() {
+            for output in &mut inner.outputs {
+                let Some(layout) = platform.outputs.get(output.output_idx) else {
+                    continue;
+                };
+                if devices.contains(&layout.key.device_key) {
+                    output.scene_structure_damage.add(vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: output.output_extent,
+                    });
+                }
+            }
+        }
+    }
+
     /// Mark scene structure as changed. This is the coarse fallback
     /// for map/unmap/configure/restack/redirect/root-background
     /// transitions where old/new visibility cannot yet be expressed
@@ -3372,7 +3430,17 @@ impl SceneCompositor {
     pub(crate) fn drain_all(
         &mut self,
         platform: &mut PlatformBackend,
+        resource_service: Option<&mut ResourceService>,
+    ) {
+        let devices = platform.devices.iter().map(|device| device.key).collect();
+        self.drain_devices(platform, resource_service, &devices);
+    }
+
+    pub(crate) fn drain_devices(
+        &mut self,
+        platform: &mut PlatformBackend,
         mut resource_service: Option<&mut ResourceService>,
+        devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
     ) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -3382,9 +3450,16 @@ impl SceneCompositor {
         // fence ticket below still proves A's submitted command buffer is done
         // before descriptor slots are reset, and the platform subsequently
         // drains both devices before any copied pool is reset or dropped.
-        platform.clear_scanout_render_completions();
+        platform.clear_scanout_render_completions_for_devices(devices);
         let vk = inner.vk.clone();
         for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
+            if !platform
+                .outputs
+                .get(output_idx)
+                .is_some_and(|output| devices.contains(&output.key.device_key))
+            {
+                continue;
+            }
             let prepared_indices = o
                 .owner_buffers
                 .iter()
@@ -3593,7 +3668,7 @@ impl SceneCompositor {
         }
         // Hide the plane everywhere + invalidate uploaded_version.
         // Best-effort; the platform hook logs per-CRTC failures.
-        let _ = platform.cursor_plane_hide_all();
+        let _ = platform.cursor_plane_hide_for_devices(devices);
     }
 
     /// Compose a frame per output. Each output that has a free

@@ -34,6 +34,15 @@ Cross-cutting bugs and followups that don't fit a stage live in
   coordinator, all pure and with no production caller until plan 3a-ii.
   `c0_3a_` 37, `--lib` 1998/0/226. Finding:
   `docs/superpowers/findings/2026-09-23-stage-3a-i-plan-accepted.md`.
+- **2026-09-23 Phase C.0 stage 3a-ii Tasks 1–2 implemented; remaining tasks and
+  acceptance are pending.** Owner devices now project DPMS through a per-device
+  lifecycle driver queue, and topology admission carries its transition tag
+  through validation, live dispatch and result disposition. Legacy DPMS keeps
+  its existing path. The current Owner request is an `ACTIVE=1` no-op; Task 3
+  must replace it with the DPMS toggle and `LifecycleInstallRestore` commit.
+  The nine `c0_3aii_` tests pass in debug and release; the permitted filters,
+  compile-fail harness and yserver library suite pass. No modeset or DRM master
+  was used.
 - **2026-09-23 Phase C.0 stage 2c-iii direct-entry addendum ACCEPTED**
   (coordinator re-ran the gate and mutations A1 and A3 by line; both caught). Initial direct eligibility on an active
   Owner conductor now waits until every output has a composed return, using the

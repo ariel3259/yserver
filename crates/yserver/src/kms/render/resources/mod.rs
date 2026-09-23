@@ -331,6 +331,11 @@ impl ResourceService {
         self.seat_active = active;
     }
 
+    #[cfg(test)]
+    pub(crate) const fn seat_active_for_tests(&self) -> bool {
+        self.seat_active
+    }
+
     pub(crate) fn waiters_mut(&mut self) -> &mut WaiterRegistry {
         &mut self.waiters
     }

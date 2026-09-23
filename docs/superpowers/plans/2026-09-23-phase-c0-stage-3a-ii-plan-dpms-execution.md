@@ -2,6 +2,28 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 6 (2026-09-23)** — a second Task 1 F8 (again before editing):
+the queued intent Task 1 must tag is typed by Task 2. The dependency is
+mutual, so Tasks 1 and 2 become **one implementation unit**; eight units in
+all.
+
+**Revision 5 (2026-09-23)** — Task 1 F8 from the implementer (stopped before
+editing): two Task 1 tests needed the conductor's `Admitted::Topology` dispatch
+arm, which is Task 2's. Task 1 proves the kick up to the queued topology
+request; the dispatch-on-an-idle-device and synchronous-refusal tests move to
+Task 2.
+
+**Revision 4 (2026-09-23)** — codex round 2
+(`../findings/2026-09-23-stage-3a-ii-plan-review-round2.md`: 0 blocking, 2 major;
+every round-1 finding APPLIED): the driver is a per-device run-to-completion
+queue, never re-entered (M-1); the protocol differential covers a listener
+subscribed to `DPMSInfoNotify` and one that is not — the core **does** emit that
+event, which the 3a design and the umbrella had wrongly denied (M-2).
+
+**Revision 3 (2026-09-23)** — anchors re-pointed after the upstream merge
+`a232d2af` (joske/master `14f5df87`), which shifted `render/backend.rs` by 80–120
+lines; Task 1 names the second `MechanismFailed` site (the Legacy drain route).
+
 **Revision 2 (2026-09-23)** — incorporates codex round 1
 (`../findings/2026-09-23-stage-3a-ii-plan-review-round1.md`: 2 blocking, 4
 major, all verified): the driver is kicked by the projection itself (B-1);
@@ -36,7 +58,7 @@ i.e. in fixtures, until stage 5.
 1. **The driver** lives in the backend beside `admission_conductors`, one per
    Owner device, and is the only code that applies arbiter actions and feeds
    acknowledged outcomes back (umbrella §2.3.1). It runs at the owner-event
-   routing site (`route_owner_event_batch`, `render/backend.rs:20801`). The
+   routing site (`route_owner_event_batch`, `render/backend.rs:20884`). The
    coordinator is a backend field. A Legacy device has neither.
 2. **Test names start with `c0_3aii_`**; Vulkan tests end in `_vulkan` with
    `#[ignore = "needs live Vulkan ICD"]` on the Owner live fixture
@@ -51,6 +73,12 @@ i.e. in fixtures, until stage 5.
 
 ## Task 1 — the driver and the coordinator in the backend
 
+> **Tasks 1 and 2 are one implementation unit** *(rev 6, second Task 1 F8)*:
+> the driver's topology request needs Task 2's typed `Tier::Topology`, and
+> Task 2's freshness check needs the driver's current transition. They are
+> dispatched, gated and committed together, with every test and mutation of
+> both tables. The two headings stay only to keep the tests grouped.
+
 **Deliver:** the backend owns one `LifecycleCoordinator` and, per Owner
 device, the device's arbiter; the driver applies every arbiter action for that
 device (close/reopen admission through the conductor, cancel pre-submit work,
@@ -59,17 +87,32 @@ arbiter input. **The driver is kicked by the projection itself** *(rev 2,
 B-1)*: when the coordinator projects an event into an Owner device's arbiter,
 the resulting actions are applied in the same call (or on a wake the same
 call schedules), and every receipt re-enters the arbiter as it is produced —
-a DPMS request never waits for an unrelated owner event to be routed. `MechanismFailed` on an Owner device (`render/backend.rs:21183`, today
+a DPMS request never waits for an unrelated owner event to be routed.
+**Run to completion, never re-entered** *(rev 4, round-2 M-1)*: a conductor
+refusal routes its owner batch synchronously (`render/admission.rs:2279`), so
+a dispatch started by the kick can hand the driver a receipt while the driver
+is still applying its first action batch. Each device's driver therefore owns
+a FIFO of pending inputs (arbiter inputs and receipts): an entry while the
+driver is already running only enqueues and returns; the outermost call drains
+the queue in arrival order until it is empty, and each action is applied only
+after every action emitted before it. The drain is bounded: every arbiter
+action produces at most one receipt per requested safety action and at most one
+commit dispatch, and the arbiter emits no new work for a transition whose
+physical side is fenced. `set_dpms_power` returns after the projection and
+that drain — it never waits for hardware completion (3a design §3.3). `MechanismFailed` on an Owner device (`render/backend.rs:21266`, today
 `request_exit()`) is reported to the coordinator as a completion loss (C-5)
-and enters `Poisoned` through Table U; the branch recording a failed Legacy
-handover (`legacy_handover_failed`) keeps its behavior for a device that is
-not `Owner`, and the two are distinguished **by the device's transport**.
+and enters `Poisoned` through Table U; the branch recording a failed Legacy handover (`legacy_handover_failed`)
+keeps its behavior for a device that is not `Owner`, and the two are
+distinguished **by the device's transport**. The **second** `MechanismFailed`
+site, in `dispose_legacy_drain_event` (`render/backend.rs:20776`), is the Legacy
+drain route and keeps its exit unchanged *(rev 3)*.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3aii_owner_mechanism_failure_poisons_and_keeps_running` | an Owner fixture, an owner `MechanismFailed` routed through `route_owner_event_batch`: the device's §6.4 state is `Poisoned`, admission closed, `request_exit` never requested; a Legacy-handover failure on a non-Owner device still exits as today | **D1** restore the unconditional `request_exit()` |
 | `c0_3aii_driver_returns_receipts_with_their_own_tag` | a DPMS transition superseded by a second: the first transition's late receipts are reported with its tag and never open the second's gate | **D2** tag receipts with the device's current transition instead of the requester's |
-| `c0_3aii_dpms_starts_on_an_idle_device` | an Owner device with no commit in flight and no pending owner event: `set_dpms_power(off)` alone leads to the topology request and the dispatch | **D34** apply the arbiter's actions only at `route_owner_event_batch` |
+| `c0_3aii_dpms_requests_topology_on_an_idle_device` | an Owner device with no commit in flight and no pending owner event: `set_dpms_power(off)` alone leads to a queued `Tier::Topology` intent in that device's conductor, tagged with the transition — the dispatch itself is Task 2's (rev 5, Task 1 F8) | **D34** apply the arbiter's actions only at `route_owner_event_batch` |
+
 | `c0_3aii_legacy_device_has_no_arbiter` | a Legacy device: no coordinator projection, no driver, no behavior change (a named Legacy characterisation test stays green) | **D3** create a driver for every device |
 
 ## Task 2 — `Tier::Topology` carries the transition, freshness before submission
@@ -77,8 +120,8 @@ not `Owner`, and the two are distinguished **by the device's transport**.
 **Deliver:** `Admission::request_topology` and `Tier::Topology` carry the
 `TransitionTag` instead of a bare `u64` (`admission/intents.rs:180`,
 `admission/decide.rs:451`). The conductor's `Admitted::Topology` arm
-(`render/admission.rs:2019`, today `Unsupported`) dispatches through a new
-path modelled on `admission_dispatch_unflip` (`:1130`). **Before the final
+(`render/admission.rs:2041`, today `Unsupported`) dispatches through a new
+path modelled on `admission_dispatch_unflip` (`:1152`). **Before the final
 `TEST_ONLY` and again before executor dispatch** it compares the tag with the
 device's current incarnation, epoch and transition; a stale entry is cancelled
 as never-submitted and reported to the arbiter. A supersession removes the
@@ -91,6 +134,8 @@ stale absent/invalid → acceptance-unknown, quarantined.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
+| `c0_3aii_dpms_dispatches_on_an_idle_device` | *(moved from Task 1, rev 5)* an idle Owner device: `set_dpms_power(off)` alone leads to the topology commit's dispatch, with no unrelated owner event | **D34b** drop the kick so the queued topology waits for an owner event |
+| `c0_3aii_synchronous_refusal_does_not_reenter_the_driver` | *(moved from Task 1, rev 5)* the kick's topology dispatch is refused before IPC, so `route_owner_event_batch` runs inside the kick: the refusal's receipt is queued and applied after the first batch, in order; the arbiter sees each input once | **D40** let the routing site call the driver directly while it is running |
 | `c0_3aii_stale_topology_never_reaches_test_only` | a DPMS off queued, superseded by on before dispatch: the off never reaches final `TEST_ONLY` nor the executor (C.0 §16.2 item 9) | **D4** drop the pre-`TEST_ONLY` check; **D5** drop the pre-dispatch check (with the first kept, supersede between the two) |
 | `c0_3aii_winner_waits_for_a_delayed_executor_call` | an off whose host call is deliberately delayed (the stub executor's delay control), superseded by on: the on stays queued until the off's call returns or is reaped, then dispatches; the off's late result goes through the boundary as stale | **D35** release the slot to the winner before the delayed call returns |
 | `c0_3aii_result_boundary_rows` | every row of the 3a design §3.6 table through `route_owner_event_batch` | **D6** promote a stale explicit success |
@@ -111,7 +156,7 @@ The commit's completion class is `LifecycleInstallRestore` with the 2 s
 this plan):** C.0 §10.3's Bootstrap paragraph requires that, with no measured
 `LifecycleCompletionObservedMax`, the lifecycle hardware deadline is the 30 s
 ceiling. Today the owner **refuses to dispatch** any lifecycle-class commit
-without a measurement (`owner/device.rs:1313`,
+without a measurement (`owner/device.rs:1312`,
 `DispatchError::LifecycleUnvalidated`), and `deadlines::lifecycle_hardware`
 returns `LifecycleUnvalidated` for `None` (`owner/deadlines.rs:37`, whose unit
 test asserts exactly that). Both follow the pre-amendment text. Implement the
@@ -133,13 +178,13 @@ twice, arbiter once) into one function used by all three.
 
 ## Task 4 — the transport fork of `set_dpms_power`
 
-**Deliver (3a design §3.3):** `set_dpms_power` (`render/backend.rs:30965`)
+**Deliver (3a design §3.3):** `set_dpms_power` (`render/backend.rs:31075`)
 splits per device. Legacy devices keep today's code **restricted to Legacy
 devices**: the loop of `dpms_set_outputs_active` (`render/platform.rs:8184`)
 iterates only their outputs, and every other server-wide step of the off and
 on paths is inventoried by the implementer and either scoped to Legacy devices
 or proven harmless to an Owner device — at least `scene.drain_all`,
-`platform.reset_scanout_bos_for_suspend()` (`render/backend.rs:31087`–`31090`),
+`platform.reset_scanout_bos_for_suspend()` (`render/backend.rs:31198`–`31200`),
 vblank-target clearing, cursor re-arm, gamma reapply, `wake_for_damage`.
 Owner devices go to the coordinator (projection, idempotence from the
 arbiter's targets, never `kms_outputs_active`). **A new output inherits
@@ -149,7 +194,7 @@ it; today's discovery/registration path), the coordinator's current level and
 epoch are projected onto it **before** any installation can light it, and a
 removed output's projection is invalidated exactly once. Executed hotplug is
 3c's; the hook and its test are 3a's. **The resource service's
-serviced-time clock** (`set_seat_active`, `render/backend.rs:31099`,
+serviced-time clock** (`set_seat_active`, `render/backend.rs:31214`,
 `resources/mod.rs:319`) runs while any served output of any device is lit.
 
 | Test | Scenario | Must fail under |
@@ -222,8 +267,8 @@ representative is `Deferred(TopologyLatched(gen))` for an attributable
 `EINVAL`/`EOPNOTSUPP` or `Deferred(ReadinessClosed)` otherwise, never retried
 under the same generation; a completion loss enters `Poisoned` through Table
 U; while `Poisoned` a DPMS change is logical only. The seat target is fed
-read-only from `run_suspend`/`run_resume` (`render/backend.rs:13762`,
-`:13890`) into the coordinator; a DPMS request while the seat is released is
+read-only from `run_suspend`/`run_resume` (`render/backend.rs:13845`,
+`:13973`) into the coordinator; a DPMS request while the seat is released is
 `Deferred(SeatReleased)` and converges on reacquire. Capability stability:
 the advertised cursor/primary capability does not change across DPMS cycles
 or an injected completion loss (C.0 §16.2 item 39).
@@ -245,10 +290,13 @@ or an injected completion loss (C.0 §16.2 item 39).
   result's status and the resulting power state.
 - **Protocol differential**: drive the **core** request path with both
   fixtures and compare the bytes written to the requesting client **and to a
-  second, listening connection** — identical; DPMS has no event, so any byte to
-  the listener is a defect.
+  second, listening connection** — identical — in **two listener states**
+  *(rev 4, round-2 M-2)*: a listener that selected `DPMSInfoNotify` with
+  `DPMSSelectInput` must receive exactly the events Legacy sends (the core emits
+  them at `process_request.rs:8933` from the protocol level), and a listener
+  that did not select it must receive nothing. DPMS has no RANDR event.
 - **The hardware test** `c0_hw_3a_dpms_owner_on_card1_drm`, beside
-  `c0_hw_ciii_owner_route_on_card1_drm` (`render/backend.rs:67829`) with the
+  `c0_hw_ciii_owner_route_on_card1_drm` (`render/backend.rs:67990`) with the
   same conventions, **written and compiled, never run by the implementer**:
   off/on × 4 on card1, each off's out-fence observed signalled with no later
   vblank, the retained buffer unchanged, composed frames admitted again after
@@ -260,7 +308,7 @@ or an injected completion loss (C.0 §16.2 item 39).
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3aii_dpms_differential_backend_state` | the script above, Legacy vs Owner | **D32** leave an Owner output lit after an applied off |
-| `c0_3aii_dpms_differential_protocol_bytes` | the core path, requester and listener, Legacy vs Owner | **D33** emit any event to the listener on an Owner DPMS change |
+| `c0_3aii_dpms_differential_protocol_bytes` | the core path, requester and listener, Legacy vs Owner | **D33** emit a second `DPMSInfoNotify` from the Owner completion path, or suppress it for a subscribed listener on Owner |
 
 ## Gate (every task)
 
