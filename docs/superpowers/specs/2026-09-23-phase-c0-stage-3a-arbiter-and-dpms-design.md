@@ -1,9 +1,10 @@
 # Phase C.0 stage 3a — the lifecycle arbiter and global DPMS
 
-**Status:** Revision 4 (codex rounds
+**Status:** Revision 5 (codex rounds
 [1](../findings/2026-09-23-stage-3a-design-review-round1.md),
-[2](../findings/2026-09-23-stage-3a-design-review-round2.md) and
-[3](../findings/2026-09-23-stage-3a-design-review-round3.md)), written by
+[2](../findings/2026-09-23-stage-3a-design-review-round2.md),
+[3](../findings/2026-09-23-stage-3a-design-review-round3.md) and
+[4](../findings/2026-09-23-stage-3a-design-review-round4.md)), written by
 the coordinator on 2026-09-23 under the user's instruction to continue the
 stage 3 specs. The decisions marked
 **(coordinator decision)** were taken without a brainstorming exchange and
@@ -199,13 +200,29 @@ not assumed (C.0 §10.1: no advance claim about a driver not run).
     allocation to follow its own release. A client that destroys its window
     while off therefore leaves the pinned buffer in place until a later commit
     replaces it;
-  - while off, the off CRTCs are ineligible for direct scanout and no direct
-    successor is admissible (`OutputPoweredOff`), so a client's Presents take
-    the composed path;
-  - after on is `Applied`, the device's ordinary admission resumes; a direct
+    - while off, the off CRTCs are ineligible for direct scanout and no direct
+    successor is admissible (`OutputPoweredOff`). A client's Presents take
+    the path Legacy already uses when its outputs are dark: the scanout
+    blackout (`present_scanout_blackout`, `backend.rs:23360`, today
+    `!(scanout_allowed() && kms_outputs_active)`). On an Owner device that
+    predicate is one of the section 3.8 sites and is answered **per CRTC** from
+    the arbiter's installed power state, so completion, `IdleNotify` and
+    release of a Present that arrives while off follow the existing blackout
+    path exactly once and never wait for an off CRTC's KMS completion *(rev 5,
+    round-4 M-1)*. The older direct frame stays pinned until a proven
+    replacement, as above;
+    - after on is `Applied`, the device's ordinary admission resumes; a direct
     unit that is no longer eligible (or whose source is gone) returns to
-    composed through the **ordinary** Ciii unflip, under normal admission,
-    with every Ciii readiness precondition and its own bounds.
+    composed through the **ordinary** Ciii unflip, under normal admission.
+    *(rev 5, round-4 B-1)* DPMS changes none of that unflip's readiness
+    inputs — exit retirement, the retained composed return
+    (`retained_composed_framebuffer` / the owner's current composed
+    framebuffer, `render/admission.rs:844`), the direct shadow — so after on
+    the unflip is in exactly the state it would be in had the client
+    destroyed its window while lit, with no DPMS at all. 3a proves that
+    equivalence (section 5.2) and claims no more: whether Ciii bounds that
+    wait is Ciii's property, examined in section 6 before the 3a plan is
+    written.
   The off is thus a single commit, bounded by its own deadline (section 3.6),
   and depends on no composition. No transition-owned unflip and no exception
   to the §6.4 `Quiescing` closure exist.
@@ -351,7 +368,11 @@ supersedes it; off with a **direct** client buffer current (rev 4) — no unflip
 runs before off, the client buffer stays bound and pinned, the client destroys
 its window while off and the allocation survives until replaced, no direct
 successor is admitted while off, and after on the ordinary unflip returns to
-composed; a
+composed; the **equivalence** (rev 5): destroy-while-off followed by on reaches
+the same unflip readiness and the same outcome as destroy-while-lit, both with
+and without an established composed return; Presents sent while off (rev 5)
+— each terminalized exactly once through the blackout path, `IdleNotify` and
+release included, the direct frame still pinned; a
 mixed server with a pending resource batch and a rejected Owner off — the
 serviced-time clock keeps running; and a Legacy off on a mixed server leaving
 the Owner device's scanout state untouched. Added in revision 3: supersession
@@ -406,7 +427,22 @@ the off; the direct allocation released while its CRTC is off; a direct
 successor admitted on an off CRTC; the off commit timed by the fast primary clamp; the advertised capability changing
 across DPMS or poison.
 
-## 6. Out of scope
+## 6. Question to answer before the plan *(rev 5, round-4 B-1)*
+
+Rounds 3 and 4 both reached the same wait: the Ciii unflip is ready only with
+exit retirement vacant, a composed return established and the shadow
+materialized (`render/admission.rs:1007`), and the tick returns before
+composing while an unflip is requested (`backend.rs:22551`). If a direct unit
+can be current while **no** composed return is established, a client that
+destroys its window leaves its last frame on screen until something else
+establishes one — with or without DPMS. Before the 3a plan: determine whether
+any path leaves a direct unit current without a retained composed return. If
+none does, record the proof and the case cannot arise. If one does, it is a
+defect of Ciii — ours, by the project's ownership rule — fixed in its own
+commit with its own test and mutation, named as a stage 2c-iii addendum, and
+not absorbed into 3a's design.
+
+## 7. Out of scope
 
 VT, hotplug, reprobe, device add/remove as executed transitions (3c); client
 modesets and the RANDR obligations (3b); recovery out of `Poisoned`,
