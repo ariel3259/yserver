@@ -4068,7 +4068,7 @@ impl KmsBackend {
         let mut eligibility = direct_present_eligibility_decision(
             self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch),
             self.scanout_allowed(),
-            self.kms_outputs_active,
+            self.crtc_outputs_powered_on(candidate.crtc_id),
             matches!(
                 self.scene.cursor_mode(),
                 crate::kms::render::scene::CursorPlaneMode::Hw
@@ -4648,7 +4648,7 @@ impl KmsBackend {
         if !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             || !scanout_m1_probe_eligible(
                 self.scanout_allowed(),
-                self.kms_outputs_active,
+                self.crtc_outputs_powered_on(candidate.crtc_id),
                 matches!(
                     self.scene.cursor_mode(),
                     crate::kms::render::scene::CursorPlaneMode::Hw
@@ -5094,14 +5094,14 @@ impl KmsBackend {
         let crtc_eligible =
             self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch);
         let scanout_allowed = self.scanout_allowed();
-        let kms_outputs_active = self.kms_outputs_active;
+        let outputs_powered_on = self.crtc_outputs_powered_on(candidate.crtc_id);
         let cursor_mode = self.scene.cursor_mode();
         let cursor_hw = matches!(cursor_mode, crate::kms::render::scene::CursorPlaneMode::Hw);
         let root_overlay_empty = self.scene.root_overlay.is_empty();
         let m1_gate_open = m1_shape_candidate
             && crtc_eligible
             && scanout_allowed
-            && kms_outputs_active
+            && outputs_powered_on
             && cursor_hw
             && root_overlay_empty
             && source_id.is_some();
@@ -5142,7 +5142,7 @@ impl KmsBackend {
             if !scanout_allowed {
                 diag.m1_gate_reject_vt = diag.m1_gate_reject_vt.saturating_add(1);
             }
-            if !kms_outputs_active {
+            if !outputs_powered_on {
                 diag.m1_gate_reject_outputs = diag.m1_gate_reject_outputs.saturating_add(1);
             }
             if !cursor_hw {
@@ -5226,7 +5226,7 @@ impl KmsBackend {
                 m1_shape_candidate,
                 crtc_eligible,
                 scanout_allowed,
-                kms_outputs_active,
+                outputs_powered_on,
                 root_overlay_empty,
                 source_id.is_some(),
             );
@@ -7336,9 +7336,10 @@ impl KmsBackend {
     /// Advance the running cursor animation if its deadline elapsed.
     /// Called from `maybe_composite` AFTER its scanout/DPMS gates
     /// (spec "Frame tick"). One advance per call — a stale deadline
-    /// after a blank advances a single frame, never fast-forwards.
+    /// after a blank advances a single frame, never fast-forwards. A
+    /// mixed backend advances while any served output is powered.
     pub(crate) fn tick_cursor_animation(&mut self) {
-        if !self.kms_outputs_active || !self.scanout_allowed() {
+        if !self.any_served_output_powered_on() || !self.scanout_allowed() {
             return;
         }
         let now = std::time::Instant::now();
@@ -7373,7 +7374,7 @@ impl KmsBackend {
     /// Deadline for `next_wakeup`: the animation's next frame, only
     /// while it could actually be displayed (same gates as the tick).
     fn cursor_anim_deadline(&self) -> Option<std::time::Instant> {
-        if !self.kms_outputs_active || !self.scanout_allowed() {
+        if !self.any_served_output_powered_on() || !self.scanout_allowed() {
             return None;
         }
         self.active_cursor_anim.as_ref().map(|st| st.next_frame)
@@ -13554,6 +13555,60 @@ impl KmsBackend {
     /// `vt_state` is always `Active`, so this is always `true` there.
     fn scanout_allowed(&self) -> bool {
         self.vt_state.allows_scanout()
+    }
+
+    fn device_is_owner(&self, device: DrmDeviceKey) -> bool {
+        self.platform.transport_gate(&device).is_some_and(|gate| {
+            gate.state() == crate::kms::render::resources::TransportState::Owner
+        })
+    }
+
+    /// The scene must keep producing off-screen generations for Owner
+    /// devices; admission holds those generations until the arbiter relights
+    /// the output. Preserve the Legacy EINVAL guard when no Owner output is
+    /// served.
+    fn scene_composition_enabled(&self) -> bool {
+        self.platform
+            .outputs
+            .iter()
+            .any(|output| self.device_is_owner(output.key.device_key))
+            || self.kms_outputs_active
+    }
+
+    /// Power state for one served KMS device. The Legacy cache applies only
+    /// to Legacy outputs; Owner outputs use the last state acknowledged by
+    /// their lifecycle arbiter.
+    fn device_outputs_powered_on(&self, device: DrmDeviceKey) -> bool {
+        if self.device_is_owner(device) {
+            self.owner_outputs_powered_on(device)
+        } else {
+            self.kms_outputs_active
+        }
+    }
+
+    fn crtc_outputs_powered_on(&self, crtc_id: u32) -> bool {
+        self.present_crtc_output(crtc_id)
+            .is_some_and(|(_, crtc)| self.device_outputs_powered_on(crtc.device_key))
+    }
+
+    fn any_served_output_powered_on(&self) -> bool {
+        self.platform
+            .outputs
+            .iter()
+            .any(|output| self.device_outputs_powered_on(output.key.device_key))
+    }
+
+    /// A composed Owner generation with power off is already parked by
+    /// admission. Waking the scene loop immediately cannot make progress;
+    /// the DPMS completion and output reconciliation provide the next wake.
+    fn owner_composed_generation_waiting_for_power(&self) -> bool {
+        self.admission_conductors
+            .iter()
+            .any(|(&device, conductor)| {
+                self.device_is_owner(device)
+                    && !self.owner_outputs_powered_on(device)
+                    && !conductor.composed.is_empty()
+            })
     }
 
     /// The scene needs a (re)compose when its structure changed
@@ -22732,8 +22787,13 @@ impl Backend for KmsBackend {
 
     fn next_wakeup(&self) -> Option<std::time::Instant> {
         let now = std::time::Instant::now();
-        let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
-        let scene_deadline = if allow_kms_timers {
+        let any_served_output_powered_on = self.any_served_output_powered_on();
+        let allow_kms_timers = self.scanout_allowed() && any_served_output_powered_on;
+        let owner_generation_waiting_for_power = self.owner_composed_generation_waiting_for_power();
+        let scene_deadline = if self.scanout_allowed()
+            && self.scene_composition_enabled()
+            && (any_served_output_powered_on || !owner_generation_waiting_for_power)
+        {
             if self.scene_wants_compose() {
                 if self.scene.has_output_ready_for_submit() {
                     Some(now)
@@ -22821,15 +22881,10 @@ impl Backend for KmsBackend {
         if !self.scanout_allowed() {
             return Ok(());
         }
-        // DPMS gate: outputs are inactive (every CRTC has ACTIVE=0 +
-        // MODE_ID=0 from disable_output). Submitting an atomic page-flip
-        // commit against a disabled CRTC returns EINVAL. Without this
-        // gate the core loop's per-iteration `backend.maybe_composite()`
-        // call would loop a tight EINVAL storm while DPMS is Off (and
-        // the `composite_and_flip` gate at :3196 wouldn't catch it —
-        // maybe_composite is a separate scene.tick caller).
-        // See project_einval_atomic_commit_storm_wedge memory entry.
-        if !self.kms_outputs_active {
+        // Preserve the Legacy DPMS/EINVAL guard when no Owner output is
+        // served. An Owner output keeps the scene ticking off screen; its
+        // composed generation waits in admission until installed power is on.
+        if !self.scene_composition_enabled() {
             return Ok(());
         }
         // Animated-cursor frame advance — after both gates above so
@@ -54740,7 +54795,10 @@ mod tests {
             });
         super::scanout_direct_eligible(
             backend.scanout_allowed(),
-            backend.kms_outputs_active,
+            backend
+                .present_crtc_output(candidate.crtc_id)
+                .map(|(_, crtc)| backend.device_outputs_powered_on(crtc.device_key))
+                .unwrap_or_else(|| backend.kms_outputs_active),
             matches!(
                 backend.scene.cursor_mode(),
                 crate::kms::render::scene::CursorPlaneMode::Hw
@@ -59547,6 +59605,203 @@ mod tests {
             .expect("ordinary composed admission reopens after on");
         assert!(composed.closure().expected_completion().contains(&crtc));
         c0_3aii_accept_and_complete_live_record(backend, device);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_owner_ignores_kms_outputs_active_vulkan() {
+        use crate::kms::{
+            owner::admission::{IntentKey, Readiness, WaitReason},
+            render::cursor::{ActiveCursorAnim, AnimCursorRecord, AnimFrame, CursorRecord},
+        };
+        use std::time::{Duration, Instant};
+
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.primary_device().expect("Owner device").key;
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+
+        // With Owner power on, the Legacy cache is deliberately wrong. The
+        // production composition path must still establish the composed
+        // return required by admission.
+        backend.kms_outputs_active = false;
+        backend.scene.scene_structure_dirty = true;
+        let owner_scene_wakeup = Backend::next_wakeup(backend);
+        let scene_wakeup_checked = Instant::now();
+        assert!(
+            owner_scene_wakeup.is_some_and(|deadline| deadline <= scene_wakeup_checked),
+            "Owner-on scene wakeup remains immediate with the Legacy cache false \
+             (wants_compose={} output_ready={} retry={:?} wake={owner_scene_wakeup:?})",
+            backend.scene_wants_compose(),
+            backend.scene.has_output_ready_for_submit(),
+            backend.scene.earliest_retry_deadline(),
+        );
+        c0_conv_ciii_establish_composed_return(backend, device);
+
+        let anim_handle = 0xC0D2_6001;
+        let first = CursorRecord::new(1, 1, 0, 0, vec![0x11, 0, 0, 0xff], 1);
+        let second = CursorRecord::new(1, 1, 0, 0, vec![0x22, 0, 0, 0xff], 2);
+        backend
+            .cursor_records
+            .insert(anim_handle, std::sync::Arc::clone(&first));
+        backend.anim_cursor_records.insert(
+            anim_handle,
+            AnimCursorRecord {
+                frames: vec![
+                    AnimFrame {
+                        record: first,
+                        pixmap: None,
+                        delay: Duration::from_secs(60),
+                    },
+                    AnimFrame {
+                        record: second,
+                        pixmap: None,
+                        delay: Duration::from_secs(60),
+                    },
+                ],
+            },
+        );
+        backend.active_cursor_anim = Some(ActiveCursorAnim {
+            handle: anim_handle,
+            frame: 0,
+            next_frame: Instant::now() - Duration::from_millis(1),
+        });
+
+        backend.tick_cursor_animation();
+        assert_eq!(
+            backend.active_cursor_anim.as_ref().unwrap().frame,
+            1,
+            "Owner-on cursor tick follows installed power with the Legacy cache false"
+        );
+        let cursor_deadline = Instant::now() + Duration::from_secs(60);
+        backend.active_cursor_anim.as_mut().unwrap().next_frame = cursor_deadline;
+        assert_eq!(
+            backend.cursor_anim_deadline(),
+            Some(cursor_deadline),
+            "Owner-on cursor deadline follows installed power with the Legacy cache false"
+        );
+        assert_eq!(
+            Backend::next_wakeup(backend),
+            Some(cursor_deadline),
+            "next_wakeup keeps the Owner cursor timer despite the Legacy cache false"
+        );
+
+        let candidate = c0_direct_eligibility_candidate(backend, 0xC0D2, 0xC0D3, 0xC0D4, 0);
+        assert!(
+            c0_direct_pure_eligibility(backend, &candidate),
+            "the pure direct predicate reads the candidate Owner device's installed power"
+        );
+        assert!(
+            backend.direct_present_eligibility(candidate).eligible,
+            "Owner-on direct eligibility ignores the Legacy cache false"
+        );
+        assert!(
+            !backend.present_scanout_blackout(candidate.crtc_id),
+            "Owner-on blackout follows installed power with the Legacy cache false"
+        );
+
+        let probe_rejects_before = backend.scanout_m0.m1_probe_reject;
+        let m1_open_before = backend.scanout_m0.m1_gate_open;
+        let output_rejects_before = backend.scanout_m0.m1_gate_reject_outputs;
+        backend.observe_scanout_m0(candidate);
+        assert_eq!(
+            backend.scanout_m0.m1_probe_reject,
+            probe_rejects_before + 1,
+            "the Owner-on M1 probe reaches its topology check despite the Legacy cache false"
+        );
+        assert_eq!(
+            backend.scanout_m0.m1_gate_open,
+            m1_open_before + 1,
+            "the Owner-on M0 observation reports its candidate output powered"
+        );
+        assert_eq!(
+            backend.scanout_m0.m1_gate_reject_outputs, output_rejects_before,
+            "the Owner-on M0 observation does not reject the output from the Legacy cache"
+        );
+
+        c0_3aii_apply_dpms_transition(backend, device, 3);
+        assert!(!backend.owner_outputs_powered_on(device));
+        backend.kms_outputs_active = true;
+        let source_id = backend
+            .store
+            .lookup(candidate.src_host_xid)
+            .expect("M1 test source");
+        backend.scanout_m1.remove(source_id);
+
+        assert!(
+            !c0_direct_pure_eligibility(backend, &candidate),
+            "the pure direct predicate refuses an Owner-off candidate despite the Legacy cache true"
+        );
+        assert!(
+            !backend.direct_present_eligibility(candidate).eligible,
+            "Owner-off direct eligibility follows installed power with the Legacy cache true"
+        );
+        assert!(
+            backend.present_scanout_blackout(candidate.crtc_id),
+            "Owner-off blackout follows installed power with the Legacy cache true"
+        );
+
+        let probe_rejects_before_off = backend.scanout_m0.m1_probe_reject;
+        let m1_open_before_off = backend.scanout_m0.m1_gate_open;
+        let output_rejects_before_off = backend.scanout_m0.m1_gate_reject_outputs;
+        backend.observe_scanout_m0(candidate);
+        assert_eq!(
+            backend.scanout_m0.m1_probe_reject, probe_rejects_before_off,
+            "the Owner-off M1 probe is closed before its topology check despite the Legacy cache true"
+        );
+        assert_eq!(
+            backend.scanout_m0.m1_gate_open, m1_open_before_off,
+            "the Owner-off M0 observation never reports an open power gate"
+        );
+        assert_eq!(
+            backend.scanout_m0.m1_gate_reject_outputs,
+            output_rejects_before_off + 1,
+            "the Owner-off M0 observation records its per-output power refusal"
+        );
+
+        let cursor_frame_off = backend.active_cursor_anim.as_ref().unwrap().frame;
+        backend.active_cursor_anim.as_mut().unwrap().next_frame =
+            Instant::now() - Duration::from_millis(1);
+        backend.tick_cursor_animation();
+        assert_eq!(
+            backend.active_cursor_anim.as_ref().unwrap().frame,
+            cursor_frame_off,
+            "Owner-off cursor tick stays parked despite the Legacy cache true"
+        );
+        assert_eq!(
+            backend.cursor_anim_deadline(),
+            None,
+            "Owner-off cursor deadline is suppressed despite the Legacy cache true"
+        );
+
+        c0_3aii_compose_from_scene(backend, 0);
+        assert!(
+            backend.device_owner_for_tests(0).live_record().is_none(),
+            "off-screen composition ticks, but no commit is submitted to the dark Owner CRTC"
+        );
+        let (&crtc, &generation) = backend
+            .admission_conductors
+            .get(&device)
+            .expect("Owner conductor")
+            .composed
+            .iter()
+            .next()
+            .expect("composition runs while Owner output is off");
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .expect("Owner readiness snapshot")
+                .readiness(IntentKey::Composed { crtc, generation }),
+            Some(Readiness::Waiting(WaitReason::OutputPoweredOff)),
+            "off-screen generation waits for Owner power reconciliation"
+        );
+        let before_wakeup = Instant::now();
+        assert!(
+            Backend::next_wakeup(backend).is_none_or(|deadline| deadline > before_wakeup),
+            "an OutputPoweredOff generation never gives next_wakeup an immediate scene deadline"
+        );
     }
 
     #[test]
