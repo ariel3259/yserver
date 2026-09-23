@@ -92,12 +92,12 @@ Paths that currently assume a window has storage and must accept `None`
 | Core drawing (PolyFill, PutImage, text, …) to an unviewable window | writes the leaf | no-op, no damage (Xorg: empty clip) |
 | CopyArea / CopyPlane with an unviewable **source** (`process_request.rs:26869`, no viewability check) | reads the leaf | no copy; GraphicsExpose for the source area if the GC asks for it |
 | CopyArea with an unviewable **destination** | writes the leaf | no-op |
-| Present copy path into an unviewable window (`process_request.rs:10543-10556`) | writes the leaf | complete the request without copying — check Xorg's present behaviour for unviewable windows before choosing |
+| Present copy path into an unviewable window (`process_request.rs:10543-10556`) | writes the leaf | Xorg accepts it (not BadMatch): the copy goes through a GC validated against the empty clip, writes nothing, and still delivers the normal idle/complete events with CompleteModeCopy. Under A: bypass direct scanout, no copy and no damage when the resolver returns `None`, complete normally |
 | Render Picture on a window (`apply_pending_picture_refs`, `backend.rs:9208`, increfs the leaf) | holds the leaf | `pending_picture_drawable_refs` already tolerates storage that appears later; must also tolerate it disappearing |
 | GetImage | BadMatch when unviewable (`process_request.rs:26045-26061`) | unchanged |
 | Redirect seed / restore (`restore_leaves_from_backing`, `backend.rs:3920`) | reads/writes leaves; planner skips unmapped subtrees (test `backend.rs:39011`) | must skip windows without storage |
 | Direct scanout / pinned frames referencing the drawable (`direct_frame_references_host_drawable`) | unflip requested on unmap | unchanged; storage release goes through the store's fence-deferred decref (`store.rs:1062-1136`), so a pinned image outlives the window's reference |
-| DRI3 BuffersFromPixmap / GLX TFP on a window | exports the leaf | clients bind *pixmaps* (NameWindowPixmap), which hold their own reference; confirm no path exports a window's leaf directly |
+| DRI3 BuffersFromPixmap / GLX TFP on a window | no client path exports a leaf: DRI3 accepts only pixmaps (`process_request.rs:12803`); GLX takes an export lifetime ref only for CreatePixmap, CreateWindow has no export host xid (`process_request.rs:14622`) | unchanged; internal users (Present/direct-frame pins, Pictures, debug dumps) must tolerate the leaf disappearing |
 | Border ring paint on CWBorderPixel/Pixmap for an unviewable window | paints the leaf | record only; paint at realize |
 
 ### Composite redirect under A
@@ -107,8 +107,11 @@ allocated when the window is (redirected and) viewable, released when it
 becomes unviewable. The backing is released by dropping the window's
 reference; a `NameWindowPixmap` alias keeps its own (`name_window_pixmap`,
 `backend.rs:21264`, and the `alias_registry`), so compositors keep their
-pixmap across the unmap exactly as on Xorg. Check that the alias really
-holds a store reference and not just a mapping.
+pixmap across the unmap exactly as on Xorg. Verified: NameWindowPixmap
+increments the `AliasRegistry` (`kms/core.rs:1743`), and the backing's
+store reference is released only when that count reaches zero
+(`free_pixmap`, `backend.rs:21835`). Indirect rather than a per-alias
+`DrawableStore::incref`, but it keeps a fade-out backing alive.
 
 The window's own leaf is dead weight while it is redirected (all paint goes
 to the backing, `backend.rs:6472-6511`). Out of scope for A, but cheap
@@ -171,6 +174,10 @@ Known hard parts:
 - **Scene / damage.** The scene composes top-level images only; child
   damage is damage on the top-level.
 
-Open question for 2: whether the root's direct children are the right
-boundary with reparenting WMs that nest deeper (e.g. a frame inside a
-virtual-root window).
+Boundary: children of the root. Right for ordinary reparenting WMs (the
+outer frame stays a root child) and the same criterion Xwayland uses for
+rootless realization (`xwayland-window.c:1638`). Not universal: a
+virtual-root / container WM makes its container the only root child and
+would collapse every frame into one image. Start with root children and
+treat virtual-root WMs as an explicit compatibility case to probe, not an
+assumed fit.
