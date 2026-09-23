@@ -2,6 +2,14 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 7 (2026-09-23, coordinator)** — Task 7 F8 (before editing): four
+`kms_outputs_active` reads on the CRTC-config/topology-requery path run on
+Owner but are consumed only after the Owner gate's refusal; the plan did not
+say whether they count. Classified as value-dead in 3a, carried to 3b/3c
+(Task 7, "Value-dead on Owner in 3a"). Task 6's mutation D40 (a not-ready
+entry closing its window's blackout flush) was added on review for Legacy
+parity; the driver re-entry mutation in Task 2 keeps its own label.
+
 **Revision 6 (2026-09-23)** — a second Task 1 F8 (again before editing):
 the queued intent Task 1 must tag is typed by Task 2. The dependency is
 mutual, so Tasks 1 and 2 become **one implementation unit**; eight units in
@@ -258,6 +266,25 @@ with file:line and the decision for each.
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3aii_owner_ignores_kms_outputs_active_vulkan` | an Owner fixture with `kms_outputs_active` forced to the wrong value in each state (off/on): composition, wakeups, eligibility and blackout behave as the arbiter's power state says | **D26** restore each inventoried Owner-reachable read in turn — one mutation per read, each caught by this test (the report lists them); a read no test catches is an F8 |
+
+**Value-dead on Owner in 3a (revision 7, Task 7 F8).** Four reads run on
+an Owner device but their value is consumed only after the Legacy writer
+step that the Owner transport gate refuses: `teardown_direct_before_topology_requery`
+(`relight`, used only if the Legacy disable succeeds),
+`crtc_config_topology_signature`, `enqueue_prepared_crtc_config_probe`
+(`was_active`) and `apply_crtc_config` (all consumed after
+`quiesce_before_topology_mutation`). Client modesets and topology requeries
+as executed Owner transitions are 3b/3c, so these four **stay as they are**
+in 3a, are listed in the inventory as "Owner-reachable, value-dead: consumed
+after the Owner refusal", and get no D26 mutation. **Carried to 3b/3c:**
+whichever sub-stage first lets one of these paths proceed past the refusal
+on Owner routes the read to the device's installed power in the same change.
+Every other Owner-reachable read (direct eligibility, the M1 probe and M0
+observation, the cursor animation tick and deadline, `next_wakeup`,
+`maybe_composite`, the Owner branch of `present_scanout_blackout`) is routed
+and gets its D26 mutation. A backend-wide gate (cursor tick, wakeups,
+composition) asks whether any served output is powered: Legacy outputs by
+`kms_outputs_active`, Owner outputs by installed power.
 
 ## Task 8 — failure edges and the seat
 
