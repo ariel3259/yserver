@@ -340,7 +340,7 @@ behavior, so a client can break. The surfaces:
 | --- | --- | --- |
 | `RRSetCrtcConfig` reply | status (`Success`/`Failed`/`InvalidTime`) and timing | 3b |
 | RANDR events (`ScreenChangeNotify`, `CrtcChange`, `OutputChange`) | order, and whether they precede the hardware change | 3b, 3c |
-| DPMS (`DPMSForceLevel`, `DPMSInfo`) | low: no reply; `DPMSInfo` reports the protocol level, updated at once | 3a |
+| DPMS (`DPMSForceLevel`, `DPMSInfo`, `DPMSInfoNotify`) | low: no reply; `DPMSInfo` reports the protocol level, updated at once; `DPMSInfoNotify` goes to subscribed clients from the core at the protocol change (corrected 2026-09-23) | 3a |
 | VT switch | today clients see nothing (mirrors Xorg `xf86Events.c:358`); must stay so | 3c |
 | Hotplug | `GetScreenResources` contents and timing relative to events | 3c |
 

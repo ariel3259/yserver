@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 4 (2026-09-23)** — codex round 2
+(`../findings/2026-09-23-stage-3a-ii-plan-review-round2.md`: 0 blocking, 2 major;
+every round-1 finding APPLIED): the driver is a per-device run-to-completion
+queue, never re-entered (M-1); the protocol differential covers a listener
+subscribed to `DPMSInfoNotify` and one that is not — the core **does** emit that
+event, which the 3a design and the umbrella had wrongly denied (M-2).
+
 **Revision 3 (2026-09-23)** — anchors re-pointed after the upstream merge
 `a232d2af` (joske/master `14f5df87`), which shifted `render/backend.rs` by 80–120
 lines; Task 1 names the second `MechanismFailed` site (the Legacy drain route).
@@ -63,7 +70,19 @@ arbiter input. **The driver is kicked by the projection itself** *(rev 2,
 B-1)*: when the coordinator projects an event into an Owner device's arbiter,
 the resulting actions are applied in the same call (or on a wake the same
 call schedules), and every receipt re-enters the arbiter as it is produced —
-a DPMS request never waits for an unrelated owner event to be routed. `MechanismFailed` on an Owner device (`render/backend.rs:21266`, today
+a DPMS request never waits for an unrelated owner event to be routed.
+**Run to completion, never re-entered** *(rev 4, round-2 M-1)*: a conductor
+refusal routes its owner batch synchronously (`render/admission.rs:2279`), so
+a dispatch started by the kick can hand the driver a receipt while the driver
+is still applying its first action batch. Each device's driver therefore owns
+a FIFO of pending inputs (arbiter inputs and receipts): an entry while the
+driver is already running only enqueues and returns; the outermost call drains
+the queue in arrival order until it is empty, and each action is applied only
+after every action emitted before it. The drain is bounded: every arbiter
+action produces at most one receipt per requested safety action and at most one
+commit dispatch, and the arbiter emits no new work for a transition whose
+physical side is fenced. `set_dpms_power` returns after the projection and
+that drain — it never waits for hardware completion (3a design §3.3). `MechanismFailed` on an Owner device (`render/backend.rs:21266`, today
 `request_exit()`) is reported to the coordinator as a completion loss (C-5)
 and enters `Poisoned` through Table U; the branch recording a failed Legacy handover (`legacy_handover_failed`)
 keeps its behavior for a device that is not `Owner`, and the two are
@@ -76,6 +95,7 @@ drain route and keeps its exit unchanged *(rev 3)*.
 | `c0_3aii_owner_mechanism_failure_poisons_and_keeps_running` | an Owner fixture, an owner `MechanismFailed` routed through `route_owner_event_batch`: the device's §6.4 state is `Poisoned`, admission closed, `request_exit` never requested; a Legacy-handover failure on a non-Owner device still exits as today | **D1** restore the unconditional `request_exit()` |
 | `c0_3aii_driver_returns_receipts_with_their_own_tag` | a DPMS transition superseded by a second: the first transition's late receipts are reported with its tag and never open the second's gate | **D2** tag receipts with the device's current transition instead of the requester's |
 | `c0_3aii_dpms_starts_on_an_idle_device` | an Owner device with no commit in flight and no pending owner event: `set_dpms_power(off)` alone leads to the topology request and the dispatch | **D34** apply the arbiter's actions only at `route_owner_event_batch` |
+| `c0_3aii_synchronous_refusal_does_not_reenter_the_driver` | the kick's topology dispatch is refused before IPC, so `route_owner_event_batch` runs inside the kick: the refusal's receipt is queued and applied after the first batch, in order; the arbiter sees each input once | **D40** let the routing site call the driver directly while it is running |
 | `c0_3aii_legacy_device_has_no_arbiter` | a Legacy device: no coordinator projection, no driver, no behavior change (a named Legacy characterisation test stays green) | **D3** create a driver for every device |
 
 ## Task 2 — `Tier::Topology` carries the transition, freshness before submission
@@ -251,8 +271,11 @@ or an injected completion loss (C.0 §16.2 item 39).
   result's status and the resulting power state.
 - **Protocol differential**: drive the **core** request path with both
   fixtures and compare the bytes written to the requesting client **and to a
-  second, listening connection** — identical; DPMS has no event, so any byte to
-  the listener is a defect.
+  second, listening connection** — identical — in **two listener states**
+  *(rev 4, round-2 M-2)*: a listener that selected `DPMSInfoNotify` with
+  `DPMSSelectInput` must receive exactly the events Legacy sends (the core emits
+  them at `process_request.rs:8933` from the protocol level), and a listener
+  that did not select it must receive nothing. DPMS has no RANDR event.
 - **The hardware test** `c0_hw_3a_dpms_owner_on_card1_drm`, beside
   `c0_hw_ciii_owner_route_on_card1_drm` (`render/backend.rs:67990`) with the
   same conventions, **written and compiled, never run by the implementer**:
@@ -266,7 +289,7 @@ or an injected completion loss (C.0 §16.2 item 39).
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3aii_dpms_differential_backend_state` | the script above, Legacy vs Owner | **D32** leave an Owner output lit after an applied off |
-| `c0_3aii_dpms_differential_protocol_bytes` | the core path, requester and listener, Legacy vs Owner | **D33** emit any event to the listener on an Owner DPMS change |
+| `c0_3aii_dpms_differential_protocol_bytes` | the core path, requester and listener, Legacy vs Owner | **D33** emit a second `DPMSInfoNotify` from the Owner completion path, or suppress it for a subscribed listener on Owner |
 
 ## Gate (every task)
 

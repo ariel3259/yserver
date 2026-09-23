@@ -348,13 +348,20 @@ fixture with `kms_outputs_active` forced to the wrong value behaves the same.
 
 ## 4. Client contract for 3a
 
-DPMS has no reply and no event; `DPMSInfo` reports the protocol level. The
-3a differential therefore compares, on a Legacy fixture and an Owner fixture,
+DPMS has no reply and no **RANDR** event; `DPMSInfo` reports the protocol
+level. It **does** have an event: the core emits `DPMSInfoNotify` after a
+changed level to every client that selected it with `DPMSSelectInput`
+(`yserver-core/src/core_loop/process_request.rs:8933`), from the protocol
+level and before any backend work completes — so it is the same for Legacy and
+Owner by construction *(corrected 2026-09-23, plan 3a-ii review round 2 M-2;
+revision 5 and earlier said "no event", which was true only of RANDR, the one
+extension the Legacy golden's listener selected)*. The 3a differential
+therefore compares, on a Legacy fixture and an Owner fixture,
 the script off → `DPMSInfo` → on → `DPMSInfo` × 4, standby, suspend, off while
 off, and a request while the seat is released: the core's bytes to the
-requesting client **and to a second, listening connection** (rev 4, round-3
-m-1: DPMS has no event, so any byte to the listener is a defect) must be
-identical, and the backend state must show each device's outputs in
+requesting client **and to a second, listening connection** (rev 4, round-3 m-1), in two listener states — one that selected
+`DPMSInfoNotify` (it must receive the same events, byte for byte) and one that
+did not (it must receive nothing) — must be identical, and the backend state must show each device's outputs in
 the projected power state (Owner) or `kms_outputs_active` (Legacy). The
 2026-09-22 Legacy golden's DPMS steps (24–45) are the reference for what a
 real client sees.
