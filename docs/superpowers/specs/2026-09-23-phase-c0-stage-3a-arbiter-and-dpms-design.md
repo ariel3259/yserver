@@ -1,10 +1,11 @@
 # Phase C.0 stage 3a — the lifecycle arbiter and global DPMS
 
-**Status:** Revision 5 (codex rounds
+**Status:** Revision 6 (codex rounds
 [1](../findings/2026-09-23-stage-3a-design-review-round1.md),
 [2](../findings/2026-09-23-stage-3a-design-review-round2.md),
-[3](../findings/2026-09-23-stage-3a-design-review-round3.md) and
-[4](../findings/2026-09-23-stage-3a-design-review-round4.md)), written by
+[3](../findings/2026-09-23-stage-3a-design-review-round3.md),
+[4](../findings/2026-09-23-stage-3a-design-review-round4.md) and
+[5](../findings/2026-09-23-stage-3a-design-review-round5.md)), written by
 the coordinator on 2026-09-23 under the user's instruction to continue the
 stage 3 specs. The decisions marked
 **(coordinator decision)** were taken without a brainstorming exchange and
@@ -209,8 +210,23 @@ not assumed (C.0 §10.1: no advance claim about a driver not run).
     the arbiter's installed power state, so completion, `IdleNotify` and
     release of a Present that arrives while off follow the existing blackout
     path exactly once and never wait for an off CRTC's KMS completion *(rev 5,
-    round-4 M-1)*. The older direct frame stays pinned until a proven
-    replacement, as above;
+    round-4 M-1)*. **Blackout becomes per CRTC end to end** *(rev 6, round-5
+    M-1)*: today the core samples one boolean (`process_request.rs:10299`)
+    and, when true, executes every source-ready parked Present and flushes
+    every queued completion past its MSC due check (`:10379`). With one CRTC
+    off and another lit — possible whenever device projections converge
+    independently (C.0 `REC-5`) or an Owner off is rejected — no single
+    boolean is right. So the backend answers blackout **per target CRTC**,
+    and both core sweeps filter by each entry's target: an entry on a
+    blacked-out CRTC is executed or flushed as today; an entry on a lit CRTC
+    keeps its MSC due check. Producer waits are preserved (a
+    `source_ready == false` entry is never forced, as today), and per-window
+    order is preserved: a window's entries are flushed in order and the flush
+    stops at its first entry that is not flushable, so a later Present never
+    completes before an earlier one. Legacy CRTCs keep Legacy's answer
+    (all dark or none). This changes `yserver-core`'s blackout consumer and
+    the `Backend` trait's blackout query, and is part of 3a's scope. The
+    older direct frame stays pinned until a proven replacement, as above;
     - after on is `Applied`, the device's ordinary admission resumes; a direct
     unit that is no longer eligible (or whose source is gone) returns to
     composed through the **ordinary** Ciii unflip, under normal admission.
@@ -372,7 +388,11 @@ composed; the **equivalence** (rev 5): destroy-while-off followed by on reaches
 the same unflip readiness and the same outcome as destroy-while-lit, both with
 and without an established composed return; Presents sent while off (rev 5)
 — each terminalized exactly once through the blackout path, `IdleNotify` and
-release included, the direct frame still pinned; a
+release included, the direct frame still pinned; a **mixed lit/off** server
+(rev 6) with future-target Presents on both CRTCs — the off CRTC's flush,
+the lit CRTC's keep their MSC timing, a window with Presents on both keeps
+its order; an unflip requested while the device is off or `Quiescing` (rev 6)
+— kept as the admission's unflip intent and decided after on, never lost; a
 mixed server with a pending resource batch and a rejected Owner off — the
 serviced-time clock keeps running; and a Legacy off on a mixed server leaving
 the Owner device's scanout state untouched. Added in revision 3: supersession
@@ -423,7 +443,9 @@ the serviced-time clock
 paused by a Legacy off while an Owner output is lit; `drain_all` or
 `reset_scanout_bos_for_suspend` reaching an Owner device; a superseded
 topology entry reaching final `TEST_ONLY`; an unflip made a precondition of
-the off; the direct allocation released while its CRTC is off; a direct
+the off; the direct allocation released while its CRTC is off; a global blackout
+answer reaching a lit CRTC's Present; a window's later Present completed
+before its earlier one; a direct
 successor admitted on an off CRTC; the off commit timed by the fast primary clamp; the advertised capability changing
 across DPMS or poison.
 
