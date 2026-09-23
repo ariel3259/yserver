@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`), run **without sandbox** (`--sandbox danger-full-access`, user-authorized) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); this plan needs **no GPU and no `#[ignore]` test** — run none of them, never `_drm`, never `render_acceptance`, never an unfiltered `--ignored`; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape.
 
+**Revision 7 (2026-09-23)** — Task 3 F8 from the implementer (stopped
+before editing): C.0's `REC-6` table covers only an **active** incident, and a
+boundary row of Table U has no "without incident" case. F-4 defines the fate
+after `RecoveryFailed` from C.0's own §6.4 row for that state; U-4 makes a
+boundary row's fresh id a mandatory input.
+
 **Revision 6 (2026-09-23)** — codex round 5
 (`../findings/2026-09-23-stage-3a-i-plan-review-round5.md`: 1 blocking; no
 regression): an incident's representative event is pending while the incident
@@ -248,6 +254,14 @@ state) returning a typed outcome.
   invalidates the incident → `Invalidated(that row's reason)`; a Table F
   transfer keeps it pending under the same id. Events absorbed by it are
   terminal at once (`AbsorbedByEvent(representative)`).
+- **U-4** *(rev 7, Task 3 F8)* **A boundary row always holds its fresh id.**
+  `REC-6` (line 926): the boundary "allocates exactly one fresh `RecoveryId`
+  before its first attempt". A completion loss during a
+  `DeviceAddedOrReplaced`, `VTAcquire`, `AdministrativeReprobe` or
+  `IdentityChangingHotplug` attempt therefore always has that id: the Table U
+  row for those kinds takes it as a **mandatory input** (the type makes the
+  no-id case unrepresentable) and returns `RecoveryFailed` for it. Their
+  "without incident" variant is not tested because it cannot be constructed.
 - **U-2** Every row's outcome says separately what is **logical** (immediate:
   seat release, withdrawal, protocol terminalization) and what is **physical**
   (waits: reap, fd-family close, fresh install). Task 4 uses that split.
@@ -274,6 +288,26 @@ state) returning a typed outcome.
   never revives `RecoveryFailed`.
 - **F-3** No path both invalidates and transfers an id, allocates two ids, or
   spends an attempt twice (item 67).
+- **F-4** *(rev 7, Task 3 F8)* **After `RecoveryFailed`.** `REC-6` defines
+  outcomes for an active incident only. A failed incident is terminal (its
+  representative already `Invalidated(RecoveryFailed)`, U-1b) and the device
+  stays `RecoveryFailed`. C.0's §6.4 row for that state (line 763) names its
+  only exits: "actual hotplug identity change, VT reacquire, administrative
+  reprobe, or restart creates at most one fresh attempt" — together with
+  `DeviceAddedOrReplaced` for a newly present identity (`REC-6`, line 924).
+  So, for a device in `RecoveryFailed`: `DeviceAddedOrReplaced`, `VTAcquire`,
+  `AdministrativeReprobe`, `IdentityChangingHotplug` → if installation is
+  required, allocate **one** fresh `RecoveryId` owned by that boundary
+  transition; `Shutdown`, `DeviceRemoved`, `VTRelease`, same-identity
+  `TopologyRebuild`, `DPMS` → the failed record is kept, nothing is allocated,
+  the device stays `RecoveryFailed`; a `NormalRecovery` event (a later loss
+  report) → `Invalidated(RecoveryFailed)`, no attempt (`REC-1`).
+  **A boundary's fresh id has no representative event**: its outcome is an
+  incident state (consumed as recovered by a qualified install, or
+  `RecoveryFailed` on failure or unknown), recorded on the boundary
+  transition, while the boundary's own event keeps its `REC-5` disposition
+  for its own field. U-1b's representative rule applies only to incidents
+  created from a loss report (U-3).
 - **R1** `REC-1`: one automatic attempt per incident; any failure or unknown
   during it → `RecoveryFailed`; timers, DPMS, client traffic and queued intents
   cannot create another attempt.
@@ -282,8 +316,8 @@ state) returning a typed outcome.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
-| `c0_3a_unknown_table_by_row` | for **every** row of Table U, with and without an existing incident: the exact logical outcome, physical outcome, incident created or not, and the `REC-6` fate recorded | **T38** create an incident on a loss encountered by `VTRelease`; **T39** poison-and-create during `Shutdown` |
-| `c0_3a_recovery_matrix_is_total` | every winning kind × an active incident (and × `RecoveryFailed`): the exact outcome of F-1 (item 67) | **T23** transfer the incident on `IdentityChangingHotplug`; **T24** let DPMS allocate a fresh id |
+| `c0_3a_unknown_table_by_row` | for **every** row of Table U, with and without an existing incident where both are constructible (the four boundary rows take their mandatory fresh id, U-4): the exact logical outcome, physical outcome, incident created or not, and the `REC-6` fate recorded | **T38** create an incident on a loss encountered by `VTRelease`; **T39** poison-and-create during `Shutdown` |
+| `c0_3a_recovery_matrix_is_total` | every winning kind × an active incident: the exact outcome of F-1 (item 67); and every winning kind × a device in `RecoveryFailed`: the exact outcome of F-4 — a fresh id only for the four boundaries, never for the others, and a later loss report `Invalidated(RecoveryFailed)` | **T23** transfer the incident on `IdentityChangingHotplug`; **T24** let DPMS allocate a fresh id; **T51** let a same-identity `TopologyRebuild` allocate a fresh id after `RecoveryFailed`; **T52** give a boundary's fresh id a representative event |
 | `c0_3a_no_double_fate` | every row of both tables: never both invalidated and transferred, at most one id allocated | **T25** allocate a fresh id and also transfer the old one on `VTAcquire` |
 | `c0_3a_first_loss_creates_one_incident` | no incident; a loss during normal live operation reported with a coordinator-allocated event id E: exactly one `RecoveryId`, representative E; then a second loss (id E2) and three normal-recovery events: same `RecoveryId`, each `AbsorbedByEvent(E)` exactly; E stays pending while the incident lives, then ends `Applied(installing transition)` on a successful attempt and — in a second run — `Invalidated(RecoveryFailed)` on a failed one (U-1b) | **T31** allocate a new id on the second loss; **T40** create the incident with no representative; **T50** leave E without a disposition after `RecoveryFailed` |
 | `c0_3a_unknown_during_teardown_follows_the_active_row` | an ordinary commit becomes unknown while `VTRelease`, `DeviceRemoved` and `Shutdown` are each active: each follows its own row — no incident, logical obligations at once, and the reported event ends exactly `Invalidated(VTRelease)`, `Invalidated(DeviceRemoved)`, `Invalidated(Shutdown)` before the row completes (U-1a) | **T45** treat an ordinary-work loss as normal live operation during `VTRelease`; **T48** leave the reported event without a disposition when no incident exists |
