@@ -2632,6 +2632,28 @@ impl KmsBackend {
         frame_device.or_else(|| self.platform.primary_device().map(|device| device.key))
     }
 
+    /// Whether every frame direct scanout holds (on screen, submitted, or
+    /// queued) is the composite overlay window or a descendant of it.
+    /// `false` when there are none, or when any is an ordinary window.
+    fn direct_frames_are_under_cow(&self) -> bool {
+        let frames = [
+            self.scanout_m2.current.as_ref(),
+            self.scanout_m2.pending.as_ref(),
+            self.scanout_m2.queued_successor.as_ref(),
+        ];
+        let mut any = false;
+        for frame in frames.into_iter().flatten() {
+            any = true;
+            if !matches!(
+                self.scanout_m0_target(frame.candidate.paint_dst_host_xid, None, None),
+                ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
+            ) {
+                return false;
+            }
+        }
+        any
+    }
+
     pub(crate) fn request_direct_unflip(&mut self, reason: &'static str) {
         if !self.scanout_m2.active() {
             return;
@@ -8166,6 +8188,52 @@ impl KmsBackend {
         ) && self.platform.vk.is_some()
         {
             log::warn!("render init_root_storage: initial root fill failed: {e:?}");
+        }
+    }
+
+    /// Stamp alpha = 0xFF over `rects` (storage coordinates) when `target`
+    /// is a depth-24 drawable resolved into a depth-32 ancestor's redirect
+    /// backing; a no-op for every other target.
+    ///
+    /// A depth-24 window has no alpha, so its pixels must read opaque in
+    /// that backing — Xorg composites a mismatched-depth child into its
+    /// parent with alpha forced to 1. The fills and RENDER paths already
+    /// honour that; a raw image copy does not, and carries the source's
+    /// undefined X byte across (a GL client's background is commonly 0,
+    /// which picom then shows through). Called after each raw copy with
+    /// the rects it wrote.
+    fn stamp_opaque_alpha_if_shared(&mut self, target: PaintTarget, rects: &[ash::vk::Rect2D]) {
+        if rects.is_empty() || target.x11_depth() != 24 {
+            return;
+        }
+        if !self
+            .store
+            .get(target.backing_id())
+            .is_some_and(|d| d.depth == 32)
+        {
+            return;
+        }
+        let rects16: Vec<Rectangle16> = rects
+            .iter()
+            .filter_map(|r| {
+                Some(Rectangle16 {
+                    x: i16::try_from(r.offset.x).ok()?,
+                    y: i16::try_from(r.offset.y).ok()?,
+                    width: u16::try_from(r.extent.width).ok()?,
+                    height: u16::try_from(r.extent.height).ok()?,
+                })
+            })
+            .collect();
+        if let Err(e) = self.engine.stamp_opaque_alpha(
+            &mut self.store,
+            &mut self.platform,
+            target.dst(),
+            &rects16,
+        ) {
+            log::warn!(
+                "render: stamping opaque alpha into depth-32 backing {:?} failed: {e:?}",
+                target.backing_id()
+            );
         }
     }
 
@@ -22121,12 +22189,22 @@ impl Backend for KmsBackend {
             order.push(host);
         }
         let order_changed = self.core.top_level_order != order;
-        if order_changed {
+        // The unflip takes upstream's COW exemption (dc753c13); the layout
+        // note below does not: it is the generation the Owner route checks a
+        // queued direct successor against, so every real order change still
+        // advances it (a queued successor is withdrawn, never shown stale).
+        if order_changed && !self.direct_frames_are_under_cow() {
             // A direct frame bypasses the composed root scene. A real
             // top-level restack changes that scene even when the direct
             // Present target itself is untouched, so retire it through the
             // normal composed replacement path before accepting another
             // direct Present (upstream #163).
+            //
+            // Not when every direct frame is the compositor's overlay window
+            // or a descendant of it: the COW stacks above every top-level, so
+            // a restack beneath it cannot change the screen. A compositing
+            // desktop restacks constantly (raises, tooltips, notifications),
+            // and each needless unflip showed a stale frame on Cinnamon.
             self.request_direct_unflip("top_level_stack_changed");
         }
         self.core.top_level_order = order;
@@ -26567,10 +26645,10 @@ impl Backend for KmsBackend {
             // non-mask scissors = compute_copy_area_scissors). Out-of-scope
             // cases fall through to the run-based path unchanged.
             let route_fn = self.core.current_function;
-            let route_dst_depth = self
-                .store
-                .get(dst_target.backing_id())
-                .map_or(24, |d| d.depth);
+            // The drawable's own depth, not its storage's: a depth-24 child
+            // painting into a depth-32 ancestor backing still has 24 planes,
+            // and its CPU fallback must force its alpha like any depth-24 write.
+            let route_dst_depth = dst_target.x11_depth();
             let route_full_mask = depth_plane_mask(route_dst_depth);
             let route_plane_mask = self.core.current_plane_mask & route_full_mask;
             let route_snapshot = if copy_area_masked_blit_eligible(
@@ -26677,6 +26755,10 @@ impl Backend for KmsBackend {
                         &scissors,
                     )
                     .map_err(|e| io::Error::other(format!("masked_copy_area: {e:?}")))?;
+                // Every pixel of a depth-24 child's area is opaque in a
+                // depth-32 backing, so stamping the whole scissor (not only
+                // the mask's pixels) is exact, not an approximation.
+                self.stamp_opaque_alpha_if_shared(dst_target, &scissors);
                 self.scene.wake_for_damage();
                 // ONE masked draw replaces the run fan-out. Telemetry: Task 15.
                 return Ok(());
@@ -26698,10 +26780,8 @@ impl Backend for KmsBackend {
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
             }
-            let dst_depth = self
-                .store
-                .get(dst_target.backing_id())
-                .map_or(24, |d| d.depth);
+            // As `route_dst_depth` above: the drawable's depth, not its storage's.
+            let dst_depth = dst_target.x11_depth();
             let full_mask = depth_plane_mask(dst_depth);
             let plane_mask = self.core.current_plane_mask & full_mask;
             if plane_mask == 0 {
@@ -26719,6 +26799,7 @@ impl Backend for KmsBackend {
             let routes_to_cow =
                 self.cow_id == Some(dst_target.backing_id()) && src != dst_target.backing_id();
             let mut any_gpu = false;
+            let mut copied: Vec<ash::vk::Rect2D> = Vec::new();
             for run in runs {
                 let sub_src = ash::vk::Rect2D {
                     offset: ash::vk::Offset2D {
@@ -26764,6 +26845,10 @@ impl Backend for KmsBackend {
                         );
                     } else {
                         any_gpu = true;
+                        copied.push(ash::vk::Rect2D {
+                            offset: dst_pos,
+                            extent: sub_src.extent,
+                        });
                     }
                 } else {
                     self.telemetry.record_copy_area_cpu_pixmap_clip();
@@ -26778,6 +26863,7 @@ impl Backend for KmsBackend {
                     );
                 }
             }
+            self.stamp_opaque_alpha_if_shared(dst_target, &copied);
             if any_gpu && !routes_to_cow {
                 self.telemetry.record_paint_submit();
                 self.trace_simple(SubmitKind::CopyArea, dst_target.backing_id(), 1);
@@ -26850,6 +26936,7 @@ impl Backend for KmsBackend {
             self.cow_id == Some(dst_target.backing_id()) && src != dst_target.backing_id();
 
         let mut all_ok = true;
+        let mut copied: Vec<ash::vk::Rect2D> = Vec::with_capacity(sub_rects.len());
         for sub in &sub_rects {
             let sub_dst_x = sub.offset.x;
             let sub_dst_y = sub.offset.y;
@@ -26896,8 +26983,16 @@ impl Backend for KmsBackend {
                      dst=0x{dst_host_xid:x} sub_rect={sub:?} cow_routed={routes_to_cow}): {e:?}",
                 );
                 all_ok = false;
+            } else {
+                copied.push(ash::vk::Rect2D {
+                    offset: dst_pos,
+                    extent: sub.extent,
+                });
             }
         }
+        // The PresentPixmap path lands here: a raw image copy that carries
+        // the source's X byte into the backing verbatim.
+        self.stamp_opaque_alpha_if_shared(dst_target, &copied);
         if all_ok {
             if !routes_to_cow {
                 self.telemetry.record_paint_submit();
@@ -44253,6 +44348,72 @@ mod tests {
 
         assert!(!b.scanout_m2.unflip_requested);
         assert!(b.scanout_m2.hold_direct);
+    }
+
+    /// A compositor's frame (the COW, or a window inside it — Muffin's output
+    /// window) stacks above every top-level, so a restack beneath it cannot
+    /// change the screen and must NOT unflip. Cinnamon restacks on every
+    /// raise, tooltip and notification, and each needless unflip showed a
+    /// stale frame. The ordinary-window case above still unflips.
+    fn restack_under_direct_target_is_ignored(direct_target_under_cow: fn(&mut KmsBackend) -> u32) {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let below = ResourceId(0x0010_0b10);
+        let above = ResourceId(0x0010_0b20);
+        seed_state_window(&mut state, &mut b, below, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, above, ROOT_WINDOW, 0, 0, 100, 100);
+        let _ = state.resources.map_window(below);
+        let _ = state.resources.map_window(above);
+        b.sync_top_level_order(&state);
+
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let target = direct_target_under_cow(&mut b);
+        let _ = install_direct_frame_for_target_test(&mut b, target, cow_id, true);
+
+        state.resources.configure_window(ConfigureWindowRequest {
+            window: below,
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: Some(0), // Above, no sibling -> raise to top.
+        });
+        b.sync_top_level_order(&state);
+
+        assert!(
+            !b.scanout_m2.unflip_requested,
+            "a restack under the COW must not leave direct scanout"
+        );
+        assert!(b.scanout_m2.hold_direct);
+    }
+
+    #[test]
+    fn sync_top_level_order_restack_under_direct_cow_keeps_direct_scanout() {
+        restack_under_direct_target_is_ignored(|_| {
+            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0
+        });
+    }
+
+    #[test]
+    fn sync_top_level_order_restack_under_direct_cow_descendant_keeps_direct_scanout() {
+        restack_under_direct_target_is_ignored(|b| {
+            let child = 0x00F0_0D00;
+            let _ = seed_window(
+                b,
+                child,
+                Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
+                0,
+                0,
+            );
+            child
+        });
     }
 
     /// A direct Present bypasses the scene compositor, so a fullscreen

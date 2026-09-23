@@ -4625,6 +4625,226 @@ fn render_composite_depth24_src_samples_opaque_alpha() {
     }
 }
 
+/// As [`copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha`],
+/// but through a bitmap clip mask, which routes CopyArea to the GPU
+/// masked blit — a second raw-copy path with the same leak. The mask's
+/// excluded half is only checked for its colour: every pixel of the child
+/// is opaque in the backing, so alpha there is not the masked copy's to
+/// decide.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn masked_copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha() {
+    use yserver_core::{
+        backend::{ClipState, PixmapHandle as ApplyPixmapHandle, WindowHandle},
+        host_x11::HostSubwindowVisual,
+    };
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    let visual = |depth| HostSubwindowVisual::Explicit {
+        depth,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    let p = b
+        .create_subwindow(None, root, 0, 0, 64, 64, 0, visual(32), None, None)
+        .expect("depth-32 parent");
+    b.map_subwindow(None, p.as_raw()).expect("map P");
+    let backing = b.create_pixmap(None, 32, 64, 64).expect("P backing");
+    assert!(b.test_set_redirected_target(p.as_raw(), backing.as_raw()));
+    let c = b
+        .create_subwindow(None, p, 8, 8, 16, 16, 0, visual(24), None, None)
+        .expect("depth-24 child");
+    b.map_subwindow(None, c.as_raw()).expect("map C");
+    b.fill_rectangle(None, backing.as_raw(), 0x0000_0000, 0, 0, 64, 64)
+        .expect("clear P backing to transparent");
+
+    let src = b.create_pixmap(None, 24, 16, 16).expect("depth-24 source");
+    b.engine_put_image_for_tests(
+        src.as_raw(),
+        ash::vk::Offset2D { x: 0, y: 0 },
+        ash::vk::Extent2D {
+            width: 16,
+            height: 16,
+        },
+        &[0x10u8, 0x20, 0x30, 0x00].repeat(16 * 16),
+        32,
+    )
+    .expect("upload source with X byte 0");
+
+    // Clip mask: top 8 rows copy, bottom 8 do not.
+    let mask = b.create_pixmap(None, 1, 16, 16).unwrap().as_raw();
+    let mut bits = vec![0u8; 4 * 16];
+    for row in 0..8 {
+        bits[row * 4] = 0xFF;
+        bits[row * 4 + 1] = 0xFF;
+    }
+    b.put_image(None, mask, 1, 16, 16, 0, 0, &bits)
+        .expect("put_image mask");
+    b.apply_clip_state(
+        None,
+        &ClipState::Pixmap {
+            origin: (0, 0),
+            pixmap: ApplyPixmapHandle::from_raw(mask).expect("mask handle"),
+        },
+    )
+    .expect("apply_clip_state Pixmap");
+
+    let pre = b.telemetry().lifetime.copy_area_masked_draw;
+    b.copy_area(None, src.as_raw(), c.as_raw(), 0, 0, 0, 0, 16, 16)
+        .expect("copy into C");
+    assert_eq!(
+        b.telemetry().lifetime.copy_area_masked_draw - pre,
+        1,
+        "must exercise the masked-blit route, or this test proves nothing"
+    );
+
+    let px = b
+        .get_image_pixels_for_tests(backing.as_raw(), 2, 8, 8, 16, 16, !0)
+        .expect("get_image")
+        .expect("pixels");
+    for (i, p) in px.chunks_exact(4).enumerate() {
+        let row = i / 16;
+        if row < 8 {
+            assert_eq!(
+                &p[..3],
+                &[0x10, 0x20, 0x30],
+                "pixel {i}: masked-in colour must land"
+            );
+            assert_eq!(
+                p[3], 0xFF,
+                "pixel {i}: depth-24 child must be opaque in the depth-32 backing"
+            );
+        } else {
+            assert_eq!(
+                &p[..3],
+                &[0, 0, 0],
+                "pixel {i}: masked-out colour must not change"
+            );
+        }
+    }
+}
+
+/// A depth-24 window that paints into its depth-32 parent's redirect
+/// backing must come out OPAQUE there, whatever its source's undefined X
+/// byte says. X gives the window no alpha, and Xorg composites such a
+/// child into its parent with alpha forced to 1 (`compWindowUpdateAutomatic`,
+/// composite/compwindow.c). A GL client's buffer commonly has 0 in that
+/// byte: glxgears under awesome + picom showed through to stale frames,
+/// because a raw copy put alpha 0 into the depth-32 frame backing that
+/// picom binds with alpha.
+///
+/// The backing is cleared to transparent first, so a fix that merely
+/// masks alpha out of the write (and so keeps whatever was there) still
+/// fails.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+
+    // Depth-32 parent P (an ARGB WM frame), redirected.
+    let p = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            64,
+            64,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("depth-32 parent");
+    b.map_subwindow(None, p.as_raw()).expect("map P");
+    let backing = b.create_pixmap(None, 32, 64, 64).expect("P backing");
+    assert!(
+        b.test_set_redirected_target(p.as_raw(), backing.as_raw()),
+        "redirect route must be recorded"
+    );
+
+    // Depth-24 child C at (8, 8): not redirected, so it paints into P's backing.
+    let c = b
+        .create_subwindow(
+            None,
+            p,
+            8,
+            8,
+            16,
+            16,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("depth-24 child");
+    b.map_subwindow(None, c.as_raw()).expect("map C");
+
+    // Transparent backing, after any map-time background paint.
+    b.fill_rectangle(None, backing.as_raw(), 0x0000_0000, 0, 0, 64, 64)
+        .expect("clear P backing to transparent");
+
+    // Depth-24 source whose X byte is 0, as a GL client's buffer has it.
+    // Uploaded as depth-32 bytes so nothing forces the alpha on the way in.
+    let src = b.create_pixmap(None, 24, 16, 16).expect("depth-24 source");
+    let bgra: Vec<u8> = [0x10u8, 0x20, 0x30, 0x00].repeat(16 * 16);
+    b.engine_put_image_for_tests(
+        src.as_raw(),
+        ash::vk::Offset2D { x: 0, y: 0 },
+        ash::vk::Extent2D {
+            width: 16,
+            height: 16,
+        },
+        &bgra,
+        32,
+    )
+    .expect("upload source with X byte 0");
+
+    // The PresentPixmap fallback is exactly this: CopyArea with a default GC.
+    b.copy_area(None, src.as_raw(), c.as_raw(), 0, 0, 0, 0, 16, 16)
+        .expect("copy into C");
+
+    let px = b
+        .get_image_pixels_for_tests(backing.as_raw(), 2, 8, 8, 16, 16, !0)
+        .expect("get_image")
+        .expect("pixels");
+    for (i, p) in px.chunks_exact(4).enumerate() {
+        assert_eq!(
+            [p[0], p[1], p[2]],
+            [0x10, 0x20, 0x30],
+            "pixel {i}: the copy's colour must land"
+        );
+        assert_eq!(
+            p[3], 0xFF,
+            "pixel {i}: depth-24 child must be opaque in the depth-32 backing"
+        );
+    }
+}
+
 /// Destination half of the same rule — sibling to
 /// `render_composite_depth24_src_samples_opaque_alpha` above, which
 /// covers the SOURCE side.

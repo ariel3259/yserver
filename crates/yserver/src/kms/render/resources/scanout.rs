@@ -595,6 +595,15 @@ impl CopiedSourceAllocation {
         self.transfer.timestamp_pool
     }
 
+    /// See `TransferResources::timestamps_written`.
+    pub(crate) fn timestamps_written(&self) -> bool {
+        self.transfer.timestamps_written
+    }
+
+    pub(crate) fn mark_timestamps_written(&mut self) {
+        self.transfer.timestamps_written = true;
+    }
+
     pub(crate) fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
         self.last_gpu_render_ns = value;
     }

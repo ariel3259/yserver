@@ -138,6 +138,14 @@ impl ComposeRenderTarget for ManagedCopiedComposeTarget<'_> {
         self.source.timestamp_pool()
     }
 
+    fn timestamps_written(&self) -> bool {
+        self.source.timestamps_written()
+    }
+
+    fn mark_timestamps_written(&mut self) {
+        self.source.mark_timestamps_written();
+    }
+
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
         self.source.set_last_gpu_render_ns(value);
     }

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/yserver", "crates/yserver-core", "crates/yserver-protocol"]
 
 [workspace.package]
-version = "1.5.1"
+version = "1.6.0"
 edition = "2024"
 repository = "https://github.com/joske/yserver"
 license = "MIT"

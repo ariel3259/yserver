@@ -221,10 +221,14 @@ struct FenceTicketInner {
     /// has released. `None` only for the test-only `for_tests_stub`
     /// constructor which has no real device available.
     vk: Option<Arc<VkContext>>,
-    /// Temporary SYNC_FD semaphore payloads waited by this submission.
-    /// Vulkan requires each semaphore handle to remain alive until the
-    /// queue operation retires, so these share the submission fence's
-    /// lifetime rather than being destroyed immediately after submit.
+    /// Semaphores this submission names that must outlive it: the
+    /// temporary SYNC_FD payloads it waits on, and the exportable
+    /// signal semaphore of a GLX-TFP write publish
+    /// ([`FenceTicket::retain_signal_semaphore`]). Vulkan requires each
+    /// handle to remain alive until the queue operation retires
+    /// (VUID-vkDestroySemaphore-semaphore-05149), so these share the
+    /// submission fence's lifetime rather than being destroyed
+    /// immediately after submit.
     imported_wait_semaphores: RefCell<Vec<vk::Semaphore>>,
 }
 
@@ -321,6 +325,17 @@ impl FenceTicket {
     /// lifetime via the pool.
     pub(crate) fn fence(&self) -> vk::Fence {
         self.inner.fence
+    }
+
+    /// Keep this submission's exported signal semaphore alive until its
+    /// fence retires. Called only after a successful `vkQueueSubmit2`,
+    /// once the semaphore's sync_file has been exported — destroying it
+    /// any earlier destroys a semaphore the queue is still using.
+    fn retain_signal_semaphore(&self, semaphore: vk::Semaphore) {
+        self.inner
+            .imported_wait_semaphores
+            .borrow_mut()
+            .push(semaphore);
     }
 
     /// Keep imported binary wait semaphores alive until this submission's
@@ -456,6 +471,13 @@ impl PresentCompletionSignal {
         self.semaphore
     }
 
+    /// Give up ownership of the semaphore without destroying it, for a
+    /// caller that ties its lifetime to a submission fence instead.
+    /// The `Arc<VkContext>` is still released normally.
+    fn into_raw(mut self) -> vk::Semaphore {
+        std::mem::replace(&mut self.semaphore, vk::Semaphore::null())
+    }
+
     pub(crate) fn export_sync_file_fd(&self) -> Result<Option<OwnedFd>, vk::Result> {
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.semaphore)
@@ -477,6 +499,10 @@ fn create_present_completion_signal(
 
 impl Drop for PresentCompletionSignal {
     fn drop(&mut self) {
+        // Null after `into_raw`: ownership moved to a fence ticket.
+        if self.semaphore == vk::Semaphore::null() {
+            return;
+        }
         unsafe {
             self.vk.device.destroy_semaphore(self.semaphore, None);
         }
@@ -6339,8 +6365,14 @@ impl PlatformBackend {
                 // GLX-TFP write→read publish: export the submit's
                 // completion sync_file and import it onto every exported
                 // dma-buf the group wrote.
-                if let Some(sig) = export_signal.as_ref() {
-                    Self::publish_export_write_fences(sig, exported_writes);
+                if let Some(sig) = export_signal {
+                    Self::publish_export_write_fences(&sig, exported_writes);
+                    // The semaphore is a signal operation of the submit
+                    // just queued. Dropping it here — as this did before —
+                    // destroyed it while the queue was still using it,
+                    // once per write to any exported pixmap. The ticket
+                    // destroys it when the fence retires.
+                    ticket.retain_signal_semaphore(sig.into_raw());
                 }
                 let outcome = FlushOutcome {
                     flushed_entries: n,

@@ -1725,8 +1725,8 @@ impl RenderEngine {
                 {
                     log::warn!(
                         target: "yserver::kms::render::fbtrace",
-                        "fbtrace frame_seq={} op#{} LogicFill dst={} mode={:?} opaque_alpha={} rects={} color={:?} old_layout={:?}",
-                        frame_seq, idx, lf.dst_id.as_u64(), lf.logic_mode, lf.opaque_alpha,
+                        "fbtrace frame_seq={} op#{} LogicFill dst={} mode={:?} channels={:?} rects={} color={:?} old_layout={:?}",
+                        frame_seq, idx, lf.dst_id.as_u64(), lf.logic_mode, lf.channels,
                         lf.rects.len(), lf.color, lf.dst_old_layout,
                     )
                 }
@@ -4131,6 +4131,59 @@ impl RenderEngine {
         fg: u32,
         rects: &[Rectangle16],
     ) -> Result<(), RenderError> {
+        self.logic_fill_channels(
+            store,
+            platform,
+            dst,
+            function,
+            crate::kms::vk::logic_fill_pipeline::LogicFillChannels::from_opaque_alpha(opaque_alpha),
+            fg,
+            rects,
+        )
+    }
+
+    /// Set alpha to 0xFF over `rects` (storage coordinates, clamped to
+    /// `dst`'s bounds) and leave RGB untouched.
+    ///
+    /// For a depth-24 window that paints into a depth-32 ancestor's
+    /// redirect backing: X gives such a window no alpha, so its pixels
+    /// must read opaque there — Xorg composites a mismatched-depth child
+    /// into its parent with alpha forced to 1. A raw image copy carries
+    /// the source's undefined X byte across instead (a GL client's
+    /// background is commonly 0), so the copy is followed by this stamp.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::logic_fill`].
+    pub(crate) fn stamp_opaque_alpha(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        dst: Dst,
+        rects: &[Rectangle16],
+    ) -> Result<(), RenderError> {
+        self.logic_fill_channels(
+            store,
+            platform,
+            dst,
+            yserver_core::backend::GcFunction::Set,
+            crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Alpha,
+            0,
+            rects,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn logic_fill_channels(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        dst: Dst,
+        function: yserver_core::backend::GcFunction,
+        channels: crate::kms::vk::logic_fill_pipeline::LogicFillChannels,
+        fg: u32,
+        rects: &[Rectangle16],
+    ) -> Result<(), RenderError> {
         use yserver_core::backend::GcFunction;
 
         let target = dst.id();
@@ -4247,7 +4300,7 @@ impl RenderEngine {
             dst_format: format,
             dst_old_layout: dst_pre_layout,
             logic_mode: function,
-            opaque_alpha,
+            channels,
             color,
             rects: vk_rects,
         });
@@ -10722,7 +10775,7 @@ fn emit_recorded_logic_fill_into_cb(
         .get_mut(&lf.dst_format)
         .ok_or(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
     let pipeline = cache
-        .get(lf.logic_mode, lf.opaque_alpha)
+        .get(lf.logic_mode, lf.channels)
         .map_err(|_| RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
     let pipeline_layout = cache.pipeline_layout();
 
@@ -10947,7 +11000,7 @@ fn emit_session_open_and_draws(
                 .get_mut(&lf.dst_format)
                 .ok_or(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
             let pipeline = cache
-                .get(lf.logic_mode, lf.opaque_alpha)
+                .get(lf.logic_mode, lf.channels)
                 .map_err(|_| RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
             let pipeline_layout = cache.pipeline_layout();
             open_dst_color_pass(
@@ -11026,7 +11079,7 @@ fn emit_session_continue_draws(
                 .get_mut(&lf.dst_format)
                 .ok_or(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
             let pipeline = cache
-                .get(lf.logic_mode, lf.opaque_alpha)
+                .get(lf.logic_mode, lf.channels)
                 .map_err(|_| RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
             let pipeline_layout = cache.pipeline_layout();
             emit_logic_fill_draws(&vk, cb, pipeline, pipeline_layout, lf);
