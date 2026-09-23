@@ -1,9 +1,10 @@
 # Phase C.0 stage 3 — lifecycle, modeset, DPMS, VT and topology
 
-**Status:** Umbrella design, **revision 4** (codex rounds
+**Status:** Umbrella design, **revision 5** (codex rounds
 [1](../findings/2026-09-22-stage-3-umbrella-design-review-round1.md),
-[2](../findings/2026-09-22-stage-3-umbrella-design-review-round2.md) and
-[3](../findings/2026-09-22-stage-3-umbrella-design-review-round3.md)).
+[2](../findings/2026-09-22-stage-3-umbrella-design-review-round2.md),
+[3](../findings/2026-09-22-stage-3-umbrella-design-review-round3.md) and
+[4](../findings/2026-09-22-stage-3-umbrella-design-review-round4.md)).
 Sections 1–4 approved section by section by the
 user on 2026-09-22 (brainstorming session). It fixes the decomposition, the
 shared contracts, the client-visible contract and the evidence regime of
@@ -254,71 +255,54 @@ them.
   `relight_after_direct_teardown` (`backend.rs:3457`, `:3430`), are converted
   here; their RANDR callers are 3b's, and 3c reuses the converted helpers for
   the output-topology change (`backend.rs:14103`).
-- **The RANDR protocol contract** *(rev 4: rewritten as one block after
-  rounds 1–3 — round-1 B-2, round-2 M-1/M-2 and round-3 B-1/M-1/M-2 were
-  successive patches to the same rule, each exposing the next)*. Today only
-  the PRIME qualification probe is asynchronous: disables and probe-less
-  changes return `Applied` synchronously (`backend.rs:23678`–`23700`); a ready
-  token whose client has gone is cancelled (`core_loop/run.rs:1061`); a parked
-  request leaves the core's table only on a ready wake or a cancellation
-  (`:1055`); `set_time` is captured at dispatch (`process_request.rs:4657`)
-  and written as `lastSetTime` by a successful completion
-  (`complete_crtc_config`, `process_request.rs:4934`;
-  `rebuild_randr_state`, `backend.rs:10652`). Legacy is synchronous, so it
-  publishes in dispatch order by construction, exactly as Xorg does. The
-  Owner path keeps that shape rather than inventing an asynchronous protocol:
+- **The RANDR protocol obligations** *(rev 5)*. Revisions 2–4 tried to
+  design the Owner's asynchronous RANDR protocol inside this umbrella; four
+  review rounds each went one layer deeper into the same rule (round-1 B-2,
+  round-2 M-1/M-2, round-3 B-1/M-1/M-2, round-4 B-1/M-1/M-2/M-3). That design
+  belongs to the 3b spec, where its own review cycle works at the right level
+  of detail. The umbrella fixes only the obligations 3b's design must meet;
+  every one of them comes from a confirmed finding, and each is an acceptance
+  criterion of the 3b spec:
 
-  1. **One RANDR mutation in flight, server-wide.** A `RRSetCrtcConfig` on an
-     Owner device is dispatched only when no other RANDR mutation is in flight
-     on any device; later ones stay parked behind it in dispatch order. The
-     queue is bounded by the number of clients (a parked client issues nothing
-     further) and it is protocol state, not a lifecycle FIFO: lifecycle events
-     still converge through `LifecycleDesired` (`REC-5`). Publication order is
-     dispatch order by construction, so `lastSetTime` never moves backward and
-     no cross-device ordering rule is needed.
-  2. **The request in flight always terminates within a bound.** A RANDR
-     request never waits on a nonterminal prerequisite: if its device cannot
-     start the transition now — seat released, §6.4 state not `Ready`,
-     `ExecutorStalled` — it is answered immediately, with the behavior Legacy
-     shows in the same situation (measured by the user's VT golden capture;
-     Legacy's `apply_crtc_config` has no seat gate today, so its answer is
-     whatever the failed ioctl produces). Once dispatched, its transition
-     reaches a terminal outcome within the commit's completion deadline or the
-     executor watchdog (C.0 §10.3, `COMMIT-6`). No request is ever `Deferred`,
-     so the queue behind it cannot be held indefinitely.
-  3. **`Success` if and only if the request's own transaction is installed.**
-     A client modeset is not a `REC-5` event, so its outcome is not a `REC-5`
-     disposition; it is the transaction's terminal state (C.0 §10) plus
-     whether a lifecycle event superseded it. The mapping is total:
+  1. **Parity with Legacy and Xorg in what a client sees.** Reply status,
+     reply timestamp, `lastSetTime` and `lastConfigTime` effects, and the
+     presence and order of change notifications match Legacy for the same
+     request — including the **idempotent request** already installed
+     (Legacy answers `Success` with no timestamp change and no notification,
+     `backend.rs:24103`, `process_request.rs:4963`). `lastSetTime` takes the
+     request's timestamp as Xorg does (`ProcRRSetCrtcConfig`, `randr/rrcrtc.c`
+     lines 1389 and 1481: no `InvalidTime` check, so it can move backward
+     when a client supplies an older time); Owner may not add a monotonicity
+     rule Legacy and Xorg do not have. *(r4 B-1, M-3)*
+  2. **`Success` means installed.** A request is answered `Success` only when
+     its own transaction was installed at the section 2.4 boundary or it was
+     idempotent; rejection, completion loss, a stale result and supersession
+     by a `REC-4` event all answer `Failed` and publish nothing of the
+     request. A dispatched transaction is never cancelled as never-submitted.
+     A client modeset is class-1 client work, not one of the ten `REC-4`
+     kinds and not a `LifecycleDesired` field; any `REC-4` event supersedes it
+     (C.0 §9.2). *(r1 B-2, r2 M-1, r3 M-1/M-2)*
+  3. **Publication outlives the requester; the reply does not.** An installed
+     change is published whether or not its requester is still connected;
+     a disconnect cancels only the reply. Today a gone client's ready token is
+     cancelled (`core_loop/run.rs:1061`) — right for the disposable PRIME
+     probe, wrong for an Owner commit. *(r1 B-2)*
+  4. **Publication order equals dispatch order, across devices and across
+     transports.** One named component orders RANDR mutations for Legacy and
+     Owner devices alike — Legacy's synchronous path included — while DRM
+     commit ownership stays per device (C.0 §13). *(r2 M-2, r4 M-2)*
+  5. **Every parked request is answered within a stated bound** that covers
+     the whole request — PRIME qualification probe (its own 30 s watchdog,
+     `probe_executor.rs:46`) and commit (C.0 §10.3 clocks start only at
+     dispatch) — with a timeout wake. No request parks on a nonterminal
+     prerequisite such as a released VT; what a requester sees then matches
+     Legacy (the user's VT golden capture). *(r3 B-1, r4 M-1)*
+  6. **Changes no RANDR request caused** — hotplug, VT acquire, recovery —
+     publish from their own transitions (3c, 3d); `lastConfigTime` keeps its
+     rule.
 
-     | Outcome of the request's transaction | Reply | Publication |
-     | --- | --- | --- |
-     | `Completed` and installed as current at the section 2.4 boundary | `Success` | this request's changes; `lastSetTime = set_time` |
-     | `FailedBeforeSubmit` (explicit rejection, or cancellation before dispatch) | `Failed` | none; previous state authoritative |
-     | `CompletionUnknown`, or a stale result (accepted-stale) | `Failed` | none from this request; the device's poison or withdrawal publishes on its own |
-     | superseded by a `REC-4` lifecycle event before dispatch | `Failed` | none from this request; the winner publishes its own result |
-
-     A dispatched transaction is never cancelled as never-submitted (`REC-4`):
-     a supersession that arrives after dispatch waits for its terminal state
-     and lands in the first three rows.
-
-     A RANDR request is never retried by the server (Legacy does not retry),
-     so a retryable rejection still terminalizes the event; the client may
-     retry. No absorption is ever answered `Success`: a winner that happens to
-     install the same target carries no obligation for this request's
-     `set_time` or notifications, so the request is answered `Failed` and the
-     winner publishes as itself. `lastSetTime` moves only on `Applied`.
-  4. **Publication is independent of the requester; the reply is not.** At
-     `Applied` the RANDR refresh and change notifications happen whether or not
-     the requester is still connected; the reply goes only to a requester that
-     is still waiting. A requester's disconnect cancels its reply, never an
-     accepted transition or its broadcast. A stale result never publishes: the
-     section 2.4 boundary refuses to promote it. This changes `yserver-core`'s
-     continuation and is part of 3b's scope.
-  5. **Changes that no RANDR request caused** — hotplug, VT acquire, recovery —
-     publish from their own transitions, with the `lastConfigTime` rule
-     unchanged (bumped by configuration changes, never by a CRTC set). That is
-     3c's and 3d's, not this contract's.
+  The 3b spec's protocol-order gate (section 4.1 layer 1) carries a case for
+  each obligation.
 - Topology epochs invalidate earlier queued intents (C.0 §9.2, §13).
 - Exit: `modeset` coverage proven. Hardware: a RANDR mode change and an
   output disable/enable, × 4.
@@ -366,9 +350,8 @@ neither Xorg nor wlroots has an isolated asynchronous executor.
 
 **Timing rule.** RANDR events and the `RRSetCrtcConfig` reply are emitted only
 when the transition reaches `Applied` — never at submission. A rejected or
-acceptance-unknown transition answers `Failed`; the full mapping from every
-outcome to reply and publication, and the one-in-flight rule that keeps
-publication in dispatch order, are 3b's RANDR protocol contract. Any other behavior that differs
+acceptance-unknown transition answers `Failed`; the complete contract is
+3b's, bound by the RANDR obligations listed there. Any other behavior that differs
 from Legacy is written into the sub-stage spec as a named exception with its
 justification.
 
@@ -395,13 +378,10 @@ inside `cargo test` fixtures.
      connection are compared — the reply, its status, and the RANDR events on
      the requester's connection and on a second, listening connection, in
      order. The script includes a requester that disconnects while parked
-     (section 3b's publication rule: the listener still receives the events),
-   a request superseded by a lifecycle event (answered `Failed`, nothing of it
-   published), a second request on another device parked behind the one in
-   flight (dispatched only after the first is terminal; `lastSetTime` never
-   moves backward), a request whose device cannot start now (answered at once,
-   as Legacy answers), and an in-flight request whose completion is lost
-   (answered `Failed` within the deadline, releasing the queue).
+     (the listener still receives the events), and one case per 3b RANDR
+   obligation (idempotent request, supersession, cross-device and
+   cross-transport order, the bounded wait across probe and commit, a device
+   that cannot start now).
    Identical, except for the named exceptions. `randr.rs` validation stays
    upstream of the backend and is not touched.
 2. **Legacy golden, captured before 3a is implemented.** The current
