@@ -23678,8 +23678,27 @@ impl Backend for KmsBackend {
         result
     }
 
-    fn present_scanout_blackout(&self) -> bool {
-        !(self.scanout_allowed() && self.kms_outputs_active)
+    fn present_scanout_blackout(&self, crtc_id: u32) -> bool {
+        // VT-away still blacks out every CRTC. Owner DPMS comes from the
+        // lifecycle arbiter's installed state; Legacy retains its server-wide
+        // `kms_outputs_active` answer.
+        if !self.scanout_allowed() {
+            return true;
+        }
+        let Some((_, crtc_key)) = self.present_crtc_output(crtc_id) else {
+            return !self.kms_outputs_active;
+        };
+        let is_owner = self
+            .platform
+            .transport_gate(&crtc_key.device_key)
+            .is_some_and(|gate| {
+                gate.state() == crate::kms::render::resources::TransportState::Owner
+            });
+        if is_owner {
+            !self.owner_outputs_powered_on(crtc_key.device_key)
+        } else {
+            !self.kms_outputs_active
+        }
     }
 
     fn pin_present_source(&mut self, host_xid: u32) -> Option<u64> {
@@ -50284,16 +50303,75 @@ mod tests {
     fn present_scanout_blackout_true_when_kms_outputs_active_false_even_while_scanout_allowed() {
         let mut b = super::KmsBackend::for_tests();
         assert!(b.scanout_allowed(), "VT is Active in the test fixture");
-        assert!(!b.present_scanout_blackout(), "not blacked out initially");
+        let crtc_id = 0x5000;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
+        assert!(
+            !b.present_scanout_blackout(crtc_id),
+            "not blacked out initially"
+        );
 
         // DPMS-off toggles kms_outputs_active, not vt_state — round-4 F1a:
         // scanout_allowed() alone is VT-only and would never see this.
         b.kms_outputs_active = false;
         assert!(b.scanout_allowed(), "DPMS-off does not change VT state");
         assert!(
-            b.present_scanout_blackout(),
+            b.present_scanout_blackout(crtc_id),
             "kms_outputs_active=false must blackout even while scanout_allowed()"
         );
+    }
+
+    #[test]
+    fn c0_3aii_backend_blackout_uses_owner_power_and_legacy_global_state() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, legacy_device, owner_device) =
+            lifecycle_mixed_dpms_backend(StubBehaviour::NeverReply);
+        const LEGACY_CRTC: u32 = 0x6600;
+        const OWNER_CRTC: u32 = 0x6601;
+        bind_test_randr_crtc(&mut backend, 0, LEGACY_CRTC);
+        bind_test_randr_crtc(&mut backend, 1, OWNER_CRTC);
+
+        assert_eq!(backend.platform.outputs[0].key.device_key, legacy_device);
+        assert_eq!(backend.platform.outputs[1].key.device_key, owner_device);
+        backend
+            .owner_dpms_installed_active
+            .insert(owner_device, false);
+
+        assert!(
+            !Backend::present_scanout_blackout(&backend, LEGACY_CRTC),
+            "lit Legacy output keeps the Legacy global answer"
+        );
+        assert!(
+            Backend::present_scanout_blackout(&backend, OWNER_CRTC),
+            "an Owner CRTC reads the arbiter's installed off state"
+        );
+
+        backend.kms_outputs_active = false;
+        assert!(
+            Backend::present_scanout_blackout(&backend, LEGACY_CRTC),
+            "Legacy keeps its all-or-nothing global output gate"
+        );
+        backend
+            .owner_dpms_installed_active
+            .insert(owner_device, true);
+        assert!(
+            !Backend::present_scanout_blackout(&backend, OWNER_CRTC),
+            "a lit Owner CRTC does not inherit a Legacy/global output blackout"
+        );
+    }
+
+    #[test]
+    fn c0_3aii_legacy_blackout_unchanged() {
+        let mut backend = super::KmsBackend::for_tests();
+        const CRTC: u32 = 0x6501;
+        bind_test_randr_crtc(&mut backend, 0, CRTC);
+
+        assert!(!Backend::present_scanout_blackout(&backend, CRTC));
+        backend.kms_outputs_active = false;
+        assert!(Backend::present_scanout_blackout(&backend, CRTC));
+        backend.kms_outputs_active = true;
+        backend.vt_state = crate::vt::state::VtState::Suspended;
+        assert!(Backend::present_scanout_blackout(&backend, CRTC));
     }
 
     #[test]
@@ -50314,7 +50392,7 @@ mod tests {
 
         assert!(b.scanout_allowed(), "the fixture VT remains active");
         assert!(
-            b.present_scanout_blackout(),
+            b.present_scanout_blackout(0),
             "zero active outputs must flush Present through blackout fallback instead of parking for an MSC that cannot advance"
         );
     }
@@ -50339,7 +50417,7 @@ mod tests {
                 .expect("absolute arm no-op"),
             0
         );
-        assert!(b.present_scanout_blackout());
+        assert!(b.present_scanout_blackout(0));
     }
 
     #[test]
