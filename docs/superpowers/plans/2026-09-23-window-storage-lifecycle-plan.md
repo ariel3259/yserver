@@ -36,11 +36,19 @@ storage, and by then it is mostly deletion of the unconditional allocation.
 Pure refactor; no behaviour change.
 
 - `resources.rs`: `map_window` (`:1257`), `unmap_window` (`:1374`) and
-  `reparent_window` (`:1687`) return a `ViewabilityDelta { became_viewable,
-  became_unviewable }` instead of discarding the lists built by
+  `reparent_window` (`:1687`) return a
+  `MapTransition { mapping_changed: bool, delta: ViewabilityDelta }`, where
+  `ViewabilityDelta { became_viewable, became_unviewable }` replaces the
+  discarded lists built by
   `promote_unviewable_descendants` (`:1302`) and `demote_viewable_descendants`
   (`:1342`); see the discarded vectors at `:1398-1400` and `:1753-1758`.
   Fold `map_window_with_promoted_descendants` (`:1262`) into it.
+  `mapping_changed` is kept separate from the delta because the two
+  diverge: mapping a window under an unmapped parent (Unmapped →
+  Unviewable) has an empty delta but still sends MapNotify; unmapping an
+  unviewable window (Unviewable → Unmapped) has an empty delta but still
+  sends UnmapNotify and runs the grab/focus handling. Today's `bool`
+  returns carry exactly `mapping_changed`.
 - `process_request.rs`: `handle_map_window` (`:24563`),
   `handle_map_subwindows` (`:24765`), `handle_unmap_window` (`:24851`),
   `handle_unmap_subwindows` (`:24935`) and `handle_reparent_window`
@@ -52,8 +60,18 @@ Pure refactor; no behaviour change.
   (`:24740-24743`) switches to `delta.became_viewable`.
 - Tests (core, no Vulkan): map/unmap/reparent/MapSubwindows/UnmapSubwindows
   of a frame with nested children, some unmapped, yield the exact sets. An
-  already-viewable remap and an unmap of an unviewable window yield empty
-  deltas.
+  already-viewable remap yields `mapping_changed = false` and an empty
+  delta. Map under an unmapped parent and unmap of an unviewable window
+  yield `mapping_changed = true` with an empty delta, and still send
+  MapNotify / UnmapNotify.
+
+### Delta processing order (all later steps)
+
+Every consumer walks `became_viewable` **parent before child**, so
+background-None seeding and redirect-backing seeding always find the parent
+already materialized, and walks `became_unviewable` **child before parent**.
+The delta's vectors are produced in that order (pre-order for viewable,
+post-order for unviewable) and a test asserts it.
 
 ## Step 2 — Core: protocol results for unviewable windows
 
@@ -105,9 +123,12 @@ Correct today already, with the storage still present.
 - Split `teardown_redirect_for_window` (`process_disconnect.rs:598`), which
   today releases the backing (`:613`) *and* restores scene participation
   (`:636`):
-  - `unrealize_redirect_backing`: release the backing only; the
+  - `unrealize_redirect_backing`: `take()` the window's `redirected_backing`
+    (as the full teardown does at `:604-609`) and release it; the
     `composite_redirects` record (`server.rs:1135`, `RedirectRecord`
-    `:817-820`) and the window's non-participation stay.
+    `:817-820`) and the window's scene exclusion stay. Clearing
+    `redirected_backing` matters: a stale value would make the remap path
+    think a backing exists and skip reallocating it.
   - the full teardown stays for UnredirectWindow, UnredirectSubwindows, the
     reparent REVOKE (`process_request.rs:20568`) and destruction.
 - Consume the step-1 delta: `became_unviewable` of a redirected window →
@@ -126,13 +147,18 @@ Correct today already, with the storage still present.
 
 ## Step 5 — The switch: window storage follows viewability
 
-- `create_subwindow` (`backend.rs:20635`) no longer calls
-  `allocate_window_storage` (`:20668`); it records geometry, depth,
-  background and border only.
+- Split `allocate_window_storage` (`backend.rs:15452`), which today does
+  both and returns early when the geometry is already recorded (`:15464`
+  `self.windows.contains_key`), into:
+  - `register_window_geometry`: records geometry, depth, parent, background
+    and border; called by `create_subwindow` (`:20635`, today's call at
+    `:20668`);
+  - `allocate_window_leaf`: allocates, fills and seeds the leaf, idempotent
+    on `store.lookup(host_xid)` rather than on `self.windows`.
 - New backend entry points driven by the delta (core calls them for every
   member, never inferring a subtree):
   - `realize_window_storage(xid)`: allocate at the current bordered size
-    through `allocate_window_storage` (`:15452`), fill the background, paint
+    through `allocate_window_leaf`, fill the background, paint
     the border ring, and for bg None seed from the parent with
     `seed_backing_from_parent` (`:7669`) (accepted deviation: no lower
     siblings).
@@ -146,16 +172,23 @@ Correct today already, with the storage still present.
 - `configure_subwindow` of an unviewable window updates geometry only; the
   border-attribute path records the border without painting
   (`border_ring_thickness` `:4829` must handle a missing leaf).
+- `resolve_paint_target` (`:6401`) gets a **functional** viewability gate
+  before it walks to a redirected ancestor: an unviewable window resolves to
+  `None` even if a viewable ancestor has a redirect backing. Without it, a
+  hidden child with no leaf would resolve to that ancestor's backing and
+  paint into it. The gate reads the backend's mirror of core's viewability,
+  kept current by the delta.
 - `map_subwindow` / `unmap_subwindow` (`:20716`, `:20758`) and
-  `window_viewable` / `collect_viewable_bg_paint_targets` (`:5066`, `:5086`)
-  become delta consumers; keep `window_viewable` only as a debug assertion
-  that agrees with core.
+  `collect_viewable_bg_paint_targets` (`:5086`) become delta consumers;
+  `window_viewable` (`:5066`) is replaced by the delta-maintained mirror.
 - Audit every window-path `store.lookup(host_xid)` in `backend.rs` (128
   occurrences including tests) for a missing leaf being an error, warning or
   panic. The redirect route flip (`:21357`, `:21526`, `:21539`) must accept
   a redirected window without a leaf.
 - Tests: storage absent after an ancestor's unmap and present after its
-  map; a window Picture rebinding to the new leaf; drawing to an unmapped
+  map; an unmapped child of a viewable redirected window resolves to `None`,
+  not to the ancestor's backing, and a draw to it leaves the backing
+  unchanged; a window Picture rebinding to the new leaf; drawing to an unmapped
   window writes nothing; a pool hit on remap of the same size.
 
 ## Step 6 — Measure and smoke
