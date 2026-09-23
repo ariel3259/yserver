@@ -113,8 +113,11 @@ C.0's precedence (`Shutdown` highest … `NormalRecovery` lowest);
 `AbsorbedByTransition(transition)`, `Invalidated(reason)`,
 `SupersededBy(event)` (terminal) and `Deferred(prerequisite)` (nonterminal);
 `InvalidationReason` — exactly C.0's (shutdown, device removed, VT release,
-protocol-output removal, newer generation) plus the three external boundaries
-`REC-6` names for an invalidated incident; `Prerequisite` — seat released,
+protocol-output removal, newer generation) plus the **four** authorized
+external boundaries at which `REC-6` invalidates an existing incident, one
+reason per winning kind — `DeviceAddedOrReplaced`, `VTAcquire`,
+`AdministrativeReprobe`, `IdentityChangingHotplug` (C.0: "terminally
+invalidated by that authorized external boundary"; Task 1 F8, 2026-09-23); `Prerequisite` — seat released,
 device absent, and the two stage 3a failure prerequisites
 `TopologyLatched(generation)` and `ReadinessClosed`; `DeviceLifecycleState`
 — the nine §6.4 states, `Recovering` carrying its `RecoveryId`; `RecoveryId`
