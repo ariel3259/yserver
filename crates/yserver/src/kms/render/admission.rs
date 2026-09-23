@@ -258,6 +258,7 @@ struct PendingTopologyValidation {
     decision: AdmissionDecision,
     token: Option<AdmissionToken>,
     description: CommitDescription,
+    dpms_active: bool,
     sent: bool,
     cancelled: bool,
 }
@@ -277,6 +278,7 @@ pub(crate) struct LifecycleDriver {
     routing_batch_depth: usize,
     pending_topology_validations: BTreeMap<CommitId, PendingTopologyValidation>,
     topology_commits: BTreeMap<CommitId, TransitionTag<IncarnationId>>,
+    topology_dpms_active: BTreeMap<CommitId, bool>,
     #[cfg(test)]
     pub(crate) hook: Option<LifecycleTopologyTestHook>,
     #[cfg(test)]
@@ -309,6 +311,7 @@ impl LifecycleDriver {
             routing_batch_depth: 0,
             pending_topology_validations: BTreeMap::new(),
             topology_commits: BTreeMap::new(),
+            topology_dpms_active: BTreeMap::new(),
             #[cfg(test)]
             hook: None,
             #[cfg(test)]
@@ -619,11 +622,6 @@ impl KmsBackend {
     ) -> Result<(), crate::kms::owner::lifecycle::CoordinatorError> {
         use crate::kms::owner::lifecycle::LifecycleArbiter;
 
-        if self.lifecycle_drivers.contains_key(&device)
-            && self.lifecycle_coordinator.device(&device).is_some()
-        {
-            return Ok(());
-        }
         let Some(incarnation) = self
             .platform
             .owner_ref(device)
@@ -631,6 +629,9 @@ impl KmsBackend {
         else {
             return Err(crate::kms::owner::lifecycle::CoordinatorError::UnknownDevice);
         };
+        self.owner_dpms_installed_active
+            .entry(device)
+            .or_insert(true);
         self.admission_conductors
             .entry(device)
             .or_insert_with(|| AdmissionConductor::new(Box::new(LifecycleOnlyAdmissionSource)));
@@ -657,6 +658,19 @@ impl KmsBackend {
             .filter(|output| output.key.device_key == device)
             .map(|output| output.key.clone())
             .collect::<Vec<_>>();
+        let current_outputs: std::collections::HashSet<_> = outputs.iter().cloned().collect();
+        let removed_outputs = self
+            .lifecycle_coordinator
+            .device(&device)
+            .into_iter()
+            .flat_map(|arbiter| arbiter.desired().dpms_targets().keys())
+            .filter(|output| !current_outputs.contains(*output))
+            .cloned()
+            .collect::<Vec<_>>();
+        for output in removed_outputs {
+            self.lifecycle_coordinator
+                .remove_protocol_output(&device, &output)?;
+        }
         for output in outputs {
             let addition = self
                 .lifecycle_coordinator
@@ -1153,6 +1167,7 @@ impl KmsBackend {
                 return AdmissionOutcome::PreparationRefused;
             }
         };
+        let dpms_active = self.lifecycle_coordinator.protocol_dpms_level() == 0;
         let validation_commit = {
             let Some(owner) = self.platform.owner_for(device) else {
                 self.admission_abort(device, token);
@@ -1187,6 +1202,7 @@ impl KmsBackend {
                     decision,
                     token: Some(token),
                     description,
+                    dpms_active,
                     sent: false,
                     cancelled: false,
                 },
@@ -1380,6 +1396,7 @@ impl KmsBackend {
         mut pending: PendingTopologyValidation,
     ) {
         let tag = pending.tag;
+        let dpms_active = pending.dpms_active;
         let decision = pending.decision.clone();
         let Some(token) = pending.token.take() else {
             return;
@@ -1458,11 +1475,17 @@ impl KmsBackend {
                 .expect("Owner lifecycle driver")
                 .topology_commits
                 .insert(commit, tag);
+            self.lifecycle_drivers
+                .get_mut(&device)
+                .expect("Owner lifecycle driver")
+                .topology_dpms_active
+                .insert(commit, dpms_active);
             let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
             return;
         }
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.topology_commits.insert(commit, tag);
+            driver.topology_dpms_active.insert(commit, dpms_active);
         }
 
         #[cfg(test)]
@@ -1557,6 +1580,25 @@ impl KmsBackend {
         tag: TransitionTag<IncarnationId>,
         terminal: TerminalState,
     ) {
+        let installed_dpms_active = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.topology_dpms_active.remove(&commit));
+        if let Some(installed_active) = installed_dpms_active {
+            match &terminal {
+                TerminalState::Completed => {
+                    self.owner_dpms_installed_active
+                        .insert(device, installed_active);
+                }
+                TerminalState::CompletionUnknown(_) => {
+                    // Keep serviced time moving until the device is rebuilt:
+                    // an unknown physical outcome may have left scanout lit.
+                    self.owner_dpms_installed_active.insert(device, true);
+                }
+                TerminalState::FailedBeforeSubmit(_) => {}
+            }
+            self.update_resource_service_activity();
+        }
         let current = self.lifecycle_tag_current(device, tag);
         #[cfg(test)]
         if !current && let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
@@ -1633,6 +1675,7 @@ impl KmsBackend {
         }
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.topology_commits.remove(&commit);
+            driver.topology_dpms_active.remove(&commit);
         }
     }
 
@@ -2264,14 +2307,32 @@ impl KmsBackend {
     pub(crate) fn admission_note_layout_change_all_devices(&mut self, reason: &'static str) {
         let devices: Vec<_> = self.admission_conductors.keys().copied().collect();
         for device in devices {
-            if matches!(
-                self.admission_note_layout_change(device),
-                AdmissionOutcome::TransportClosed
-            ) {
-                log::error!(
-                    "admission layout generation overflow or queued successor mismatch for {device:?}: {reason}"
-                );
-            }
+            self.admission_note_layout_change_for_device(device, reason);
+        }
+    }
+
+    pub(crate) fn admission_note_layout_change_for_devices(
+        &mut self,
+        devices: &std::collections::HashSet<DrmDeviceKey>,
+        reason: &'static str,
+    ) {
+        for device in devices.iter().copied() {
+            self.admission_note_layout_change_for_device(device, reason);
+        }
+    }
+
+    fn admission_note_layout_change_for_device(
+        &mut self,
+        device: DrmDeviceKey,
+        reason: &'static str,
+    ) {
+        if matches!(
+            self.admission_note_layout_change(device),
+            AdmissionOutcome::TransportClosed
+        ) {
+            log::error!(
+                "admission layout generation overflow or queued successor mismatch for {device:?}: {reason}"
+            );
         }
     }
 

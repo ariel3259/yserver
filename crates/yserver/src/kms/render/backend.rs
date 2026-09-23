@@ -1716,6 +1716,9 @@ pub struct KmsBackend {
         crate::kms::owner::lifecycle::LifecycleCoordinator<DrmDeviceKey, OutputKey, IncarnationId>,
     pub(crate) lifecycle_drivers:
         std::collections::BTreeMap<DrmDeviceKey, crate::kms::render::admission::LifecycleDriver>,
+    /// Last acknowledged ACTIVE state for each Owner device. Missing entries
+    /// are conservatively treated as lit until the first registration.
+    pub(crate) owner_dpms_installed_active: HashMap<DrmDeviceKey, bool>,
     pub(crate) resource_service: Option<crate::kms::render::resources::ResourceService>,
     pub(crate) drm_cleanup_registry: Option<crate::kms::render::resources::DrmCleanupRegistry>,
     pub(crate) commit_consumer: crate::kms::render::resources::CommitResourceConsumer,
@@ -2428,23 +2431,40 @@ pub(crate) struct SequenceArm {
 
 #[derive(Debug, Default)]
 pub(crate) struct SequenceArmTable {
-    live: HashMap<SequenceArmToken, SequenceArm>,
+    live: HashMap<SequenceArmToken, (Option<crate::platform::drm::DrmDeviceKey>, SequenceArm)>,
 }
 
 impl SequenceArmTable {
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, arm: SequenceArm) {
-        self.live.insert(arm.token, arm);
+        self.live.insert(arm.token, (None, arm));
+    }
+
+    pub(crate) fn insert_for_device(
+        &mut self,
+        device: crate::platform::drm::DrmDeviceKey,
+        arm: SequenceArm,
+    ) {
+        self.live.insert(arm.token, (Some(device), arm));
     }
 
     /// Consume the arm this token names, if it is still live. An unknown,
     /// already-consumed, or foreign-purpose token yields `None`; the caller
     /// treats that as telemetry, never as a reference advance.
     pub(crate) fn take_matching_arm(&mut self, token: SequenceArmToken) -> Option<SequenceArm> {
-        self.live.remove(&token)
+        self.live.remove(&token).map(|(_, arm)| arm)
     }
 
     pub(crate) fn clear(&mut self) {
         self.live.clear();
+    }
+
+    pub(crate) fn clear_for_devices(
+        &mut self,
+        devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) {
+        self.live
+            .retain(|_, (device, _)| device.is_none_or(|device| !devices.contains(&device)));
     }
 }
 
@@ -3541,6 +3561,70 @@ impl KmsBackend {
             .collect()
     }
 
+    fn pending_pageflip_crtcs_for_devices(
+        &self,
+        devices: &HashSet<DrmDeviceKey>,
+    ) -> HashSet<CrtcKey> {
+        self.platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(output_idx, output)| {
+                devices.contains(&output.key.device_key)
+                    && (self
+                        .platform
+                        .scanout_pools
+                        .get(*output_idx)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
+                        || self
+                            .scanout_m2
+                            .pending
+                            .as_ref()
+                            .is_some_and(|frame| frame.awaiting_outputs.contains(output_idx))
+                        || self.scanout_m2.unflip_awaiting_outputs.contains(output_idx))
+            })
+            .map(|(_, output)| CrtcKey::for_output(output))
+            .collect()
+    }
+
+    fn scanout_m2_touches_devices(&self, devices: &HashSet<DrmDeviceKey>) -> bool {
+        let frame_touches = |frame: &DirectPresentFrame| {
+            frame
+                .members
+                .iter()
+                .any(|member| devices.contains(&member.crtc.device_key))
+        };
+        self.scanout_m2.pending.as_ref().is_some_and(frame_touches)
+            || self
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .is_some_and(frame_touches)
+            || self.scanout_m2.current.as_ref().is_some_and(frame_touches)
+            || self
+                .scanout_m2
+                .owner_unflip_return
+                .as_ref()
+                .is_some_and(|record| {
+                    record
+                        .affected_outputs
+                        .iter()
+                        .any(|key| devices.contains(&key.device_key))
+                })
+            || self
+                .scanout_m2
+                .unflip_awaiting_outputs
+                .iter()
+                .chain(self.scanout_m2.owner_unflip_awaiting_outputs.iter())
+                .any(|&index| {
+                    self.platform
+                        .outputs
+                        .get(index)
+                        .is_some_and(|output| devices.contains(&output.key.device_key))
+                })
+    }
+
     fn quiesce_before_topology_mutation(&mut self, context: &'static str) -> io::Result<()> {
         self.bump_crtc_config_topology_epoch(context);
         let old_pending_pageflips = self.pending_pageflip_crtcs();
@@ -4220,6 +4304,50 @@ impl KmsBackend {
             // A completed worker result may already have been announced but
             // not yet consumed by finish. Replace it so a topology change can
             // never install that stale plan, while avoiding a duplicate wake.
+            let already_announced = self.ready_crtc_config_results.contains_key(&token);
+            if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+                executor.cancel(token);
+            }
+            self.ready_crtc_config_results.insert(
+                token,
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("asynchronous CRTC configuration {token:?} invalidated by {reason}"),
+                )),
+            );
+            self.invalidated_crtc_config_probes.insert(token);
+            if !already_announced {
+                self.ready_crtc_config_announcements.push_back(token);
+                announced = true;
+            }
+        }
+        if announced {
+            self.wake_crtc_config_ready();
+        }
+    }
+
+    fn bump_crtc_config_topology_epoch_for_devices(
+        &mut self,
+        reason: &str,
+        devices: &HashSet<DrmDeviceKey>,
+    ) {
+        // A Legacy DPMS transition invalidates only its own damage and
+        // admission state. The epoch remains shared because asynchronous
+        // CRTC probe results are validated against that epoch; invalidating a
+        // stale probe only defers its configuration result and performs no
+        // Owner KMS or scanout mutation.
+        self.scene
+            .invalidate_owner_damage_transactions_for_devices(&mut self.platform, devices);
+        self.crtc_config_topology_epoch = self.crtc_config_topology_epoch.wrapping_add(1);
+        self.admission_note_layout_change_for_devices(devices, "CRTC/topology epoch changed");
+
+        let mut tokens: Vec<_> = self.pending_crtc_config_probes.keys().copied().collect();
+        tokens.sort_unstable_by_key(|token| token.0);
+        let mut announced = false;
+        for token in tokens {
+            if self.invalidated_crtc_config_probes.contains(&token) {
+                continue;
+            }
             let already_announced = self.ready_crtc_config_results.contains_key(&token);
             if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
                 executor.cancel(token);
@@ -6694,6 +6822,7 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
             lifecycle_drivers: std::collections::BTreeMap::new(),
+            owner_dpms_installed_active: HashMap::new(),
             resource_service: None,
             drm_cleanup_registry: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
@@ -8030,6 +8159,7 @@ impl KmsBackend {
             admission_conductors: std::collections::BTreeMap::new(),
             lifecycle_coordinator: crate::kms::owner::lifecycle::LifecycleCoordinator::new(),
             lifecycle_drivers: std::collections::BTreeMap::new(),
+            owner_dpms_installed_active: HashMap::new(),
             resource_service: None,
             drm_cleanup_registry: None,
             commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
@@ -13482,6 +13612,17 @@ impl KmsBackend {
         self.sequence_arms.clear();
     }
 
+    pub(crate) fn clear_armed_vblank_targets_for_devices(
+        &mut self,
+        devices: &HashSet<DrmDeviceKey>,
+    ) {
+        self.armed_vblank_targets
+            .retain(|crtc, _| !devices.contains(&crtc.device_key));
+        self.absolute_vblank_targets
+            .retain(|crtc, _| !devices.contains(&crtc.device_key));
+        self.sequence_arms.clear_for_devices(devices);
+    }
+
     pub(crate) fn record_unknown_sequence_echo(
         &mut self,
         device: crate::platform::drm::DrmDeviceKey,
@@ -13758,13 +13899,16 @@ impl KmsBackend {
             }
         });
         if result.as_ref().is_ok_and(|&count| count > 0) {
-            self.sequence_arms.insert(SequenceArm {
-                token,
-                crtc_id,
-                epoch,
-                purpose: SequenceArmPurpose::Relative,
-                target: 0,
-            });
+            self.sequence_arms.insert_for_device(
+                crtc_key.device_key,
+                SequenceArm {
+                    token,
+                    crtc_id,
+                    epoch,
+                    purpose: SequenceArmPurpose::Relative,
+                    target: 0,
+                },
+            );
         }
         if newly_unsupported {
             self.record_sequence_unsupported(crtc_key, epoch);
@@ -20529,6 +20673,19 @@ impl KmsBackend {
             self.reapply_gamma_for_output(&output_key);
         }
     }
+
+    fn reapply_gamma_for_devices(&self, devices: &HashSet<DrmDeviceKey>) {
+        let output_keys: Vec<OutputKey> = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| devices.contains(&layout.key.device_key))
+            .map(|layout| layout.key.clone())
+            .collect();
+        for output_key in output_keys {
+            self.reapply_gamma_for_output(&output_key);
+        }
+    }
 }
 
 /// DRI3 version for a given syncobj capability. 1.4 is the version carrying
@@ -23503,7 +23660,8 @@ impl Backend for KmsBackend {
                 }
             });
         for arm in armed_records {
-            self.sequence_arms.insert(arm);
+            self.sequence_arms
+                .insert_for_device(crtc_key.device_key, arm);
         }
         if newly_unsupported {
             self.record_sequence_unsupported(crtc_key, epoch);
@@ -31134,9 +31292,24 @@ impl Backend for KmsBackend {
     }
 
     fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {
-        // Owner devices use the staged coordinator/driver path, which submits
-        // one ACTIVE-only DPMS transition with lifecycle completion evidence.
-        if self.lifecycle_set_dpms_power(level)? {
+        // Project the global level to every Owner device first. The Legacy
+        // path below remains responsible only for Legacy devices.
+        self.lifecycle_set_dpms_power(level)?;
+        let legacy_devices = self.dpms_legacy_devices();
+        let has_owner_outputs = self.platform.outputs.iter().any(|output| {
+            self.platform
+                .transport_gate(&output.key.device_key)
+                .is_some_and(|gate| {
+                    gate.state() == crate::kms::render::resources::TransportState::Owner
+                })
+        });
+        let has_legacy_outputs = self
+            .platform
+            .outputs
+            .iter()
+            .any(|output| legacy_devices.contains(&output.key.device_key));
+        if has_owner_outputs && !has_legacy_outputs {
+            self.update_resource_service_activity();
             return Ok(());
         }
         // Levels 1/2/3 collapse to "outputs off"; only 0 is "on".
@@ -31174,7 +31347,14 @@ impl Backend for KmsBackend {
             );
             return Ok(()); // same binary state (e.g. Standby → Suspend)
         }
-        self.bump_crtc_config_topology_epoch("DPMS output state changed");
+        if has_owner_outputs {
+            self.bump_crtc_config_topology_epoch_for_devices(
+                "DPMS output state changed",
+                &legacy_devices,
+            );
+        } else {
+            self.bump_crtc_config_topology_epoch("DPMS output state changed");
+        }
         log::info!(
             "kms: set_dpms_power(level={level}) — transition active={} → {want_active}",
             self.kms_outputs_active,
@@ -31200,8 +31380,12 @@ impl Backend for KmsBackend {
             // failure, the next set_dpms_power(On) retry sees
             // kms_outputs_active=false and re-attempts (idempotent on
             // the outputs that already came up).
-            let res = self.platform.dpms_set_outputs_active(true);
-            self.reapply_gamma_for_live_outputs();
+            let res = self.platform.dpms_set_legacy_outputs_active(true);
+            if has_owner_outputs {
+                self.reapply_gamma_for_devices(&legacy_devices);
+            } else {
+                self.reapply_gamma_for_live_outputs();
+            }
             let (hot_x, hot_y) = self
                 .effective_cursor_xid
                 .and_then(|xid| self.cursor_records.get(&xid))
@@ -31212,17 +31396,38 @@ impl Backend for KmsBackend {
             #[allow(clippy::cast_possible_truncation)]
             let cy = self.core.cursor_y as i32;
             log::info!("kms: dpms wake — rearm_cursor hot=({hot_x},{hot_y}) pos=({cx},{cy})");
-            self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+            if has_owner_outputs {
+                self.platform
+                    .rearm_cursor_for_devices(&legacy_devices, hot_x, hot_y, cx, cy);
+            } else {
+                self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+            }
             // Outputs were dark; any incremental damage tracking is
             // stale. Force a fresh full frame on the next composite tick.
-            self.scene.wake_for_damage();
+            if has_owner_outputs {
+                self.scene.wake_for_devices(&self.platform, &legacy_devices);
+            } else {
+                self.scene.wake_for_damage();
+            }
             if res.is_ok() {
-                self.kms_outputs_active = !self.platform.outputs.is_empty();
-                // B-11: outputs are back on -- resume the resource service's
-                // serviced-time budget. Inert when no service exists (R8).
-                if let Some(service) = self.resource_service.as_mut() {
+                self.kms_outputs_active = if has_owner_outputs {
+                    self.platform
+                        .outputs
+                        .iter()
+                        .any(|output| legacy_devices.contains(&output.key.device_key))
+                } else {
+                    !self.platform.outputs.is_empty()
+                };
+                if has_owner_outputs {
+                    self.update_resource_service_activity();
+                } else if let Some(service) = self.resource_service.as_mut() {
                     service.set_seat_active(true, std::time::Instant::now());
                 }
+            } else if has_owner_outputs && let Some(service) = self.resource_service.as_mut() {
+                // A best-effort Legacy wake can partially relight outputs.
+                // Keep serviced time running while that physical state is
+                // uncertain; `kms_outputs_active` stays false for retry.
+                service.set_seat_active(true, std::time::Instant::now());
             }
             res
         } else {
@@ -31230,16 +31435,22 @@ impl Backend for KmsBackend {
             //    its queued flip events consumed before scene acknowledgements
             //    or BO phases are reset. Otherwise a live front buffer can be
             //    reused, or a stale event can retire a fresh post-wake flip.
-            let direct_shadow_error = if self.scanout_m2.active() {
+            let direct_legacy = self.scanout_m2.active()
+                && (!has_owner_outputs || self.scanout_m2_touches_devices(&legacy_devices));
+            let direct_shadow_error = if direct_legacy {
                 self.materialize_direct_shadow_for_unflip().err()
             } else {
                 None
             };
-            let old_pending_pageflips = self.pending_pageflip_crtcs();
+            let old_pending_pageflips = if has_owner_outputs {
+                self.pending_pageflip_crtcs_for_devices(&legacy_devices)
+            } else {
+                self.pending_pageflip_crtcs()
+            };
             log::info!("kms: dpms sleep — wait_idle_bounded");
             self.platform.wait_idle_bounded();
             log::info!("kms: dpms sleep — disable_output per output");
-            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+            if let Err(error) = self.platform.dpms_set_legacy_outputs_active(false) {
                 // The helper attempted every CRTC, so this may be a partial
                 // all-off. Without a transactional rollback the only safe
                 // policy is to keep allocations/direct pins and fail-stop.
@@ -31248,22 +31459,52 @@ impl Backend for KmsBackend {
                 self.request_exit();
                 return Err(error);
             }
-            self.clear_all_armed_vblank_targets();
-            if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
-                &old_pending_pageflips,
-                std::time::Duration::from_secs(1),
-            ) {
+            if has_owner_outputs {
+                self.clear_armed_vblank_targets_for_devices(&legacy_devices);
+            } else {
+                self.clear_all_armed_vblank_targets();
+            }
+            let event_drain = if has_owner_outputs {
+                self.platform
+                    .discard_old_drm_events_after_all_off_for_devices(
+                        &old_pending_pageflips,
+                        std::time::Duration::from_secs(1),
+                        Some(&legacy_devices),
+                    )
+            } else {
+                self.platform.discard_old_drm_events_after_all_off(
+                    &old_pending_pageflips,
+                    std::time::Duration::from_secs(1),
+                )
+            };
+            if let Err(error) = event_drain {
                 log::error!("kms: DPMS off could not drain old DRM events: {error}; exiting");
                 self.request_exit();
                 return Err(error);
             }
-            self.stop_direct_after_scanout_replaced("DPMS off");
+            if direct_legacy {
+                self.stop_direct_after_scanout_replaced("DPMS off");
+            }
             self.scanout_m1.clear("DPMS off");
             log::info!("kms: dpms sleep — scene.drain_all");
-            self.scene
-                .drain_all(&mut self.platform, self.resource_service.as_mut());
+            if has_owner_outputs {
+                self.scene.drain_devices(
+                    &mut self.platform,
+                    self.resource_service.as_mut(),
+                    &legacy_devices,
+                );
+            } else {
+                self.scene
+                    .drain_all(&mut self.platform, self.resource_service.as_mut());
+            }
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
-            if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
+            let reset_result = if has_owner_outputs {
+                self.platform
+                    .reset_scanout_bos_for_devices(Some(&legacy_devices))
+            } else {
+                self.platform.reset_scanout_bos_for_suspend()
+            };
+            if let Err(error) = reset_result {
                 self.kms_outputs_active = false;
                 log::error!(
                     "kms: DPMS off could not quiesce copied scanout devices after all outputs \
@@ -31273,10 +31514,9 @@ impl Backend for KmsBackend {
                 return Err(error);
             }
             self.kms_outputs_active = false;
-            // B-11: outputs are dark -- pause the resource service's
-            // serviced-time budget (R9: a batch's deadline must not count
-            // display-dark time). Inert when no service exists (R8).
-            if let Some(service) = self.resource_service.as_mut() {
+            if has_owner_outputs {
+                self.update_resource_service_activity();
+            } else if let Some(service) = self.resource_service.as_mut() {
                 service.set_seat_active(false, std::time::Instant::now());
             }
             if let Some(error) = direct_shadow_error {
@@ -31285,6 +31525,43 @@ impl Backend for KmsBackend {
                 return Err(error);
             }
             Ok(())
+        }
+    }
+}
+
+impl KmsBackend {
+    fn dpms_legacy_devices(&self) -> HashSet<DrmDeviceKey> {
+        self.platform
+            .devices
+            .iter()
+            .filter(|device| {
+                !self
+                    .platform
+                    .transport_gate(&device.key)
+                    .is_some_and(|gate| {
+                        gate.state() == crate::kms::render::resources::TransportState::Owner
+                    })
+            })
+            .map(|device| device.key)
+            .collect()
+    }
+
+    pub(crate) fn update_resource_service_activity(&mut self) {
+        let any_output_lit = self.platform.outputs.iter().any(|output| {
+            let device = output.key.device_key;
+            if self.platform.transport_gate(&device).is_some_and(|gate| {
+                gate.state() == crate::kms::render::resources::TransportState::Owner
+            }) {
+                self.owner_dpms_installed_active
+                    .get(&device)
+                    .copied()
+                    .unwrap_or(true)
+            } else {
+                self.kms_outputs_active
+            }
+        });
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(any_output_lit, std::time::Instant::now());
         }
     }
 }
@@ -51392,7 +51669,7 @@ mod tests {
             .platform
             .outputs
             .iter()
-            .map(|output| u32::from(output.output.crtc))
+            .map(|output| (output.key.device_key, output.output.crtc))
             .collect::<Vec<_>>();
         for output in &mut backend.platform.outputs {
             output.output.plane = ::drm::control::from_u32(10).expect("fixture plane");
@@ -51403,10 +51680,15 @@ mod tests {
             output.output.crtc_out_fence_ptr_prop =
                 Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
         }
-        for crtc in test_crtcs {
-            backend.platform.devices[0]
+        for (device_key, crtc) in test_crtcs {
+            backend
+                .platform
+                .devices
+                .iter_mut()
+                .find(|device| device.key == device_key)
+                .expect("fixture output has a DRM device")
                 .active_property_cache
-                .insert_for_tests(crtc, 21);
+                .insert_for_tests(u32::from(crtc), 21);
         }
     }
 
@@ -58438,6 +58720,383 @@ mod tests {
             c0_conv_cii_install_owner_clock(&mut backend, device, output_idx, 1000);
         }
         (backend, device)
+    }
+
+    fn lifecycle_mixed_dpms_backend(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> (super::KmsBackend, DrmDeviceKey, DrmDeviceKey) {
+        let mut backend = super::KmsBackend::for_tests();
+        let legacy_device = backend
+            .platform
+            .primary_device()
+            .expect("fixture Legacy device")
+            .key;
+        let owner_device = test_device_key(91);
+        push_test_device(&mut backend, owner_device);
+        c0_conv_ciii_id_push_output_for_device(&mut backend, owner_device, 91, "owner-test");
+        seed_direct_owner_description_properties_for_tests(&mut backend);
+
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
+            .expect("spawn mixed-server Owner executor");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        let owner = backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == owner_device)
+            .expect("mixed Owner device");
+        owner.executor = Some(executor);
+        owner.owner = Some(crate::kms::owner::device::DeviceCommitOwner::new(
+            incarnation,
+            lifecycle,
+            1,
+        ));
+        install_admission_owner_gate(&mut backend, owner_device);
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            owner_device,
+            incarnation,
+        ));
+        c0_conv_cii_install_owner_clock(&mut backend, owner_device, 1, 1000);
+        (backend, legacy_device, owner_device)
+    }
+
+    fn wait_lifecycle_executor_readable(backend: &super::KmsBackend, device: DrmDeviceKey) {
+        use std::os::fd::AsFd;
+
+        let fd = backend
+            .platform
+            .devices
+            .iter()
+            .find(|entry| entry.key == device)
+            .and_then(|entry| entry.executor.as_ref())
+            .and_then(|executor| executor.control_fd())
+            .expect("Owner executor control fd");
+        crate::kms::executor::test_support::wait_readable(
+            fd.as_fd(),
+            std::time::Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn c0_3aii_dpms_off_on_a_mixed_server_does_not_exit() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, legacy_device, owner_device) =
+            lifecycle_mixed_dpms_backend(StubBehaviour::NeverReply);
+        let legacy_output = backend.platform.outputs[0].key.clone();
+        let owner_output = backend.platform.outputs[1].key.clone();
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+
+        Backend::set_dpms_power(&mut backend, 3).expect("mixed-server DPMS off");
+        let off = backend
+            .lifecycle_drivers
+            .get(&owner_device)
+            .expect("Owner lifecycle driver")
+            .pending_topology_descriptions_for_tests();
+        assert!(
+            off.iter().any(|description| {
+                description.objects.len() == 1
+                    && description.objects[0].object
+                        == u32::from(backend.platform.outputs[1].output.crtc)
+                    && description.objects[0].props == vec![(description.property_ids.active, 0)]
+            }),
+            "the Owner off transition is one atomic ACTIVE-only topology"
+        );
+        Backend::set_dpms_power(&mut backend, 0).expect("mixed-server DPMS on");
+
+        assert_eq!(legacy_output.device_key, legacy_device);
+        assert_eq!(owner_output.device_key, owner_device);
+        assert_eq!(
+            backend.platform.dpms_output_calls_for_tests,
+            Some(vec![
+                (false, vec![legacy_output.clone()]),
+                (true, vec![legacy_output])
+            ]),
+            "the Legacy transport sees its output on both transitions only"
+        );
+        let coordinator = &backend.lifecycle_coordinator;
+        assert_eq!(coordinator.protocol_dpms_level(), 0);
+        assert_eq!(coordinator.dpms_epoch(), 2);
+        let projection = coordinator
+            .device(&owner_device)
+            .and_then(|device| device.desired().dpms_targets().get(&owner_output))
+            .expect("Owner output remains in the protocol domain");
+        assert_eq!(projection.level, 0);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3aii_legacy_off_leaves_owner_scanout_state_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let mut backend = super::KmsBackend::for_tests_with_vk()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let legacy_device = backend.platform.primary_device().unwrap().key;
+        let owner_device = test_device_key(91);
+        push_test_device(&mut backend, owner_device);
+        c0_conv_ciii_id_push_output_for_device(&mut backend, owner_device, 91, "owner-test");
+        let owner_output_idx = 1;
+        let vk = backend.platform.vk().expect("live test Vulkan").clone();
+        let drm = std::rc::Rc::clone(
+            &backend
+                .platform
+                .device_for_key(owner_device)
+                .expect("Owner KMS device")
+                .device,
+        );
+        let mut owner_bo = crate::kms::vk::scanout::ScanoutBo::for_tests(drm, vk);
+        owner_bo.state.transition_to_recording();
+        owner_bo.state.transition_to_submitted(-1);
+        let _ = owner_bo.state.transition_to_pending(-1);
+        let mut owner_pool = crate::kms::vk::scanout::ScanoutBoPool::for_tests();
+        owner_pool.bos.push(owner_bo);
+        backend.platform.scanout_pools[owner_output_idx] =
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(owner_pool));
+        backend.platform.bo_generations[owner_output_idx] = vec![
+            crate::kms::render::platform::BoGenerationEntry {
+                last_present_generation: Some(73),
+                content_invalidated: false,
+            };
+            1
+        ];
+        backend.scene = crate::kms::render::scene::SceneCompositor::new(&backend.platform)
+            .expect("build two-output test scene");
+        let owner_pool_before = backend.platform.bo_generations[owner_output_idx]
+            .iter()
+            .map(|entry| (entry.last_present_generation, entry.content_invalidated))
+            .collect::<Vec<_>>();
+        let owner_bo_phase_before = backend.platform.scanout_pools[owner_output_idx]
+            .as_ref()
+            .expect("Owner scanout pool")
+            .display_pool()
+            .bos[0]
+            .state
+            .phase;
+        assert_eq!(
+            owner_bo_phase_before,
+            crate::kms::vk::scanout::BoPhase::Pending
+        );
+        let owner_scene_before = (
+            backend
+                .scene
+                .scanout_damage_signature_for_tests(owner_output_idx),
+            backend
+                .scene
+                .scene_structure_damage_for_tests(owner_output_idx),
+        );
+
+        let executor =
+            crate::kms::executor::test_support::spawn_stub_helper(StubBehaviour::NeverReply)
+                .expect("spawn Owner executor");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        let owner = backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == owner_device)
+            .expect("Owner device");
+        owner.executor = Some(executor);
+        owner.owner = Some(crate::kms::owner::device::DeviceCommitOwner::new(
+            incarnation,
+            lifecycle,
+            1,
+        ));
+        install_admission_owner_gate(&mut backend, owner_device);
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            owner_device,
+            incarnation,
+        ));
+        c0_conv_cii_install_owner_clock(&mut backend, owner_device, owner_output_idx, 1000);
+        seed_direct_owner_description_properties_for_tests(&mut backend);
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+
+        Backend::set_dpms_power(&mut backend, 3).expect("Legacy-only DPMS off path");
+
+        assert_eq!(backend.platform.bo_generations[owner_output_idx].len(), 1);
+        assert_eq!(
+            backend.platform.bo_generations[owner_output_idx]
+                .iter()
+                .map(|entry| (entry.last_present_generation, entry.content_invalidated))
+                .collect::<Vec<_>>(),
+            owner_pool_before,
+            "Legacy suspend reset must leave Owner scanout BO generations unchanged"
+        );
+        assert_eq!(
+            backend.platform.scanout_pools[owner_output_idx]
+                .as_ref()
+                .expect("Owner scanout pool remains installed")
+                .display_pool()
+                .bos[0]
+                .state
+                .phase,
+            owner_bo_phase_before,
+            "Legacy suspend reset must leave the Owner scanout BO in Pending"
+        );
+        assert_eq!(
+            (
+                backend
+                    .scene
+                    .scanout_damage_signature_for_tests(owner_output_idx),
+                backend
+                    .scene
+                    .scene_structure_damage_for_tests(owner_output_idx),
+            ),
+            owner_scene_before,
+            "Legacy scene drain must leave Owner per-output damage state unchanged"
+        );
+        assert_eq!(backend.platform.outputs[0].key.device_key, legacy_device);
+    }
+
+    #[test]
+    fn c0_3aii_new_output_inherits_the_global_off() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        Backend::set_dpms_power(&mut backend, 3).expect("global DPMS off");
+        let epoch = backend.lifecycle_coordinator.dpms_epoch();
+
+        push_test_output(&mut backend, 93);
+        let new_output = backend.platform.outputs[1].key.clone();
+        backend.lifecycle_begin_owner_event_batch(device);
+        let projection = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.desired().dpms_targets().get(&new_output))
+            .copied()
+            .expect("production registration projected the new output");
+        backend.lifecycle_end_owner_event_batch(device);
+
+        assert_eq!(projection.level, 3);
+        assert_eq!(projection.epoch, Some(epoch));
+        let pending = backend
+            .lifecycle_drivers
+            .get(&device)
+            .expect("Owner lifecycle driver")
+            .pending_topology_descriptions_for_tests();
+        assert!(
+            pending.iter().all(|description| {
+                !description.objects.iter().any(|object| {
+                    object.object == u32::from(backend.platform.outputs[1].output.crtc)
+                        && object.props.iter().any(|(property, value)| {
+                            *property == description.property_ids.active && *value == 1
+                        })
+                })
+            }),
+            "no pending topology may install the newly joined output active"
+        );
+    }
+
+    #[test]
+    fn c0_3aii_legacy_off_keeps_owner_vblank_arms() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, _, owner_device) =
+            lifecycle_mixed_dpms_backend(StubBehaviour::NeverReply);
+        let legacy_crtc = output_crtc_key(&backend, 0);
+        let owner_crtc = output_crtc_key(&backend, 1);
+        let owner_token = backend.ids.next_sequence_arm();
+        let legacy_token = backend.ids.next_sequence_arm();
+        backend.armed_vblank_targets.insert(legacy_crtc, 0);
+        backend.armed_vblank_targets.insert(owner_crtc, 0);
+        backend
+            .absolute_vblank_targets
+            .insert(legacy_crtc, [10].into_iter().collect());
+        backend
+            .absolute_vblank_targets
+            .insert(owner_crtc, [11].into_iter().collect());
+        for (device, token, key) in [
+            (legacy_crtc.device_key, legacy_token, legacy_crtc),
+            (owner_device, owner_token, owner_crtc),
+        ] {
+            backend.sequence_arms.insert_for_device(
+                device,
+                SequenceArm {
+                    token,
+                    crtc_id: u32::from(key.crtc),
+                    epoch: ClockEpochId::first(),
+                    purpose: SequenceArmPurpose::Relative,
+                    target: 0,
+                },
+            );
+        }
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+
+        Backend::set_dpms_power(&mut backend, 3).expect("mixed-server DPMS off");
+
+        assert!(!backend.armed_vblank_targets.contains_key(&legacy_crtc));
+        assert!(backend.armed_vblank_targets.contains_key(&owner_crtc));
+        assert!(!backend.absolute_vblank_targets.contains_key(&legacy_crtc));
+        assert!(backend.absolute_vblank_targets.contains_key(&owner_crtc));
+        assert!(!backend.sequence_arms.live.contains_key(&legacy_token));
+        assert!(backend.sequence_arms.live.contains_key(&owner_token));
+    }
+
+    #[test]
+    fn c0_3aii_resource_clock_runs_while_any_output_lit() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::resources::CoreRetirementBatch,
+        };
+
+        let (mut rejected, _, owner_device) =
+            lifecycle_mixed_dpms_backend(StubBehaviour::RejectWith(libc::EINVAL));
+        rejected.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        rejected
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .register_batch(CoreRetirementBatch::new(Vec::new(), Vec::new(), false));
+        Backend::set_dpms_power(&mut rejected, 3).expect("Legacy off and Owner request");
+        wait_lifecycle_executor_readable(&rejected, owner_device);
+        Backend::on_executor_readable(&mut rejected, &mut ServerState::new());
+        let service = rejected.resource_service().expect("resource service");
+        assert_eq!(service.pending_batches().len(), 1);
+        assert!(
+            service.seat_active_for_tests(),
+            "rejected Owner off stays lit"
+        );
+
+        let (mut applied, _, applied_owner) =
+            lifecycle_mixed_dpms_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }));
+        applied.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        applied
+            .resource_service
+            .as_mut()
+            .expect("resource service")
+            .register_batch(CoreRetirementBatch::new(Vec::new(), Vec::new(), false));
+        Backend::set_dpms_power(&mut applied, 3).expect("mixed-server DPMS off");
+        wait_lifecycle_executor_readable(&applied, applied_owner);
+        Backend::on_executor_readable(&mut applied, &mut ServerState::new());
+        let commit = applied
+            .device_owner_for_tests(1)
+            .live_record()
+            .expect("Owner off commit was accepted")
+            .commit_id();
+        applied.route_owner_event_batch(
+            applied_owner,
+            vec![
+                crate::kms::owner::device::OwnerEvent::Accepted { commit },
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit },
+            ],
+            std::time::Instant::now(),
+        );
+        let completion = applied.complete_owner_for_tests(1);
+        applied.route_owner_event_batch(applied_owner, completion, std::time::Instant::now());
+        assert!(
+            !applied
+                .resource_service()
+                .expect("resource service")
+                .seat_active_for_tests(),
+            "once every served output is off, serviced-time pauses"
+        );
+        assert_eq!(
+            applied.resource_service().unwrap().pending_batches().len(),
+            1,
+            "the test keeps a resource batch pending while observing the clock"
+        );
     }
 
     fn lifecycle_test_tag(

@@ -2747,6 +2747,8 @@ pub struct PlatformBackend {
     /// ownership, cancellation, and delivery semantics.
     scanout_render_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
+    #[cfg(test)]
+    pub(crate) dpms_output_calls_for_tests: Option<Vec<(bool, Vec<OutputKey>)>>,
     next_scanout_render_job_id: u64,
     pub owner_completion_poller: crate::kms::render::completion_poller::CompletionPoller,
     pub owner_completion_detached: bool,
@@ -3555,6 +3557,8 @@ impl PlatformBackend {
             wakeup_eventfd,
             scanout_render_completion_epfd,
             pending_scanout_render_completions: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            dpms_output_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
             owner_completion_detached: false,
@@ -3695,6 +3699,8 @@ impl PlatformBackend {
             wakeup_eventfd,
             scanout_render_completion_epfd,
             pending_scanout_render_completions: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            dpms_output_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
             owner_completion_detached: false,
@@ -4656,13 +4662,25 @@ impl PlatformBackend {
     /// Per-CRTC failures are logged; this never returns `Err`
     /// unless the plane is unavailable.
     pub(crate) fn cursor_plane_hide_all(&mut self) -> io::Result<()> {
+        let devices = self.devices.iter().map(|device| device.key).collect();
+        self.cursor_plane_hide_for_devices(&devices)
+    }
+
+    pub(crate) fn cursor_plane_hide_for_devices(
+        &mut self,
+        devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) -> io::Result<()> {
         let outputs: Vec<_> = self
             .outputs
             .iter()
+            .filter(|layout| devices.contains(&layout.key.device_key))
             .map(|layout| (layout.key.device_key, layout.output.crtc))
             .collect();
         let mut found = false;
         for device in &mut self.devices {
+            if !devices.contains(&device.key) {
+                continue;
+            }
             device.cursor.pending_move = None;
             let Some(plane) = device.cursor.plane.as_mut() else {
                 continue;
@@ -5426,6 +5444,32 @@ impl PlatformBackend {
         }
     }
 
+    pub(crate) fn clear_scanout_render_completions_for_devices(
+        &mut self,
+        devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) {
+        let mut index = 0;
+        while index < self.pending_scanout_render_completions.len() {
+            if !devices.contains(
+                &self.pending_scanout_render_completions[index]
+                    .output_key
+                    .device_key,
+            ) {
+                index += 1;
+                continue;
+            }
+            let pending = self
+                .pending_scanout_render_completions
+                .remove(index)
+                .expect("scanout completion index was checked");
+            if let Some(fd) = pending.fd.as_ref()
+                && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+            {
+                log::warn!("scanout completion teardown unregister failed: {error}");
+            }
+        }
+    }
+
     pub(crate) fn clear_scanout_render_completions(&mut self) {
         while let Some(pending) = self.pending_scanout_render_completions.pop_front() {
             if let Some(fd) = pending.fd.as_ref()
@@ -5480,6 +5524,22 @@ impl PlatformBackend {
         expected_pageflips: &HashSet<CrtcKey>,
         timeout: std::time::Duration,
     ) -> io::Result<()> {
+        self.discard_old_drm_events_after_all_off_for_devices(expected_pageflips, timeout, None)
+    }
+
+    pub(crate) fn discard_old_drm_events_after_all_off_for_devices(
+        &mut self,
+        expected_pageflips: &HashSet<CrtcKey>,
+        timeout: std::time::Duration,
+        devices: Option<&HashSet<crate::platform::drm::DrmDeviceKey>>,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if self.dpms_output_calls_for_tests.is_some() && expected_pageflips.is_empty() {
+            // The recorder replaces the fixture's modeset, so no page-flip
+            // event can be produced by that fake commit. Avoid polling the
+            // test DRM sockets (which are protocol stand-ins, not kernel fds).
+            return Ok(());
+        }
         let mut expected = expected_pageflips.clone();
         let deadline = std::time::Instant::now() + timeout;
 
@@ -5502,6 +5562,7 @@ impl PlatformBackend {
             let mut poll_fds: Vec<libc::pollfd> = self
                 .devices
                 .iter()
+                .filter(|device| devices.is_none_or(|devices| devices.contains(&device.key)))
                 .map(|device| libc::pollfd {
                     fd: device.device.as_fd().as_raw_fd(),
                     events: libc::POLLIN,
@@ -7114,9 +7175,30 @@ impl PlatformBackend {
     /// generation. Safe to call while still master (no DRM ioctl here —
     /// only Vulkan idle + fence-fd close).
     pub(crate) fn reset_scanout_bos_for_suspend(&mut self) -> io::Result<()> {
-        self.clear_scanout_render_completions();
+        self.reset_scanout_bos_for_devices(None)
+    }
+
+    /// Reset scanout state only for selected DRM devices. `None` keeps the
+    /// server-wide suspend behavior used outside DPMS.
+    pub(crate) fn reset_scanout_bos_for_devices(
+        &mut self,
+        devices: Option<&HashSet<crate::platform::drm::DrmDeviceKey>>,
+    ) -> io::Result<()> {
+        if let Some(devices) = devices {
+            self.clear_scanout_render_completions_for_devices(devices);
+        } else {
+            self.clear_scanout_render_completions();
+        }
         let mut first_error = None;
         for output_idx in 0..self.scanout_pools.len() {
+            if devices.is_some_and(|devices| {
+                !self
+                    .outputs
+                    .get(output_idx)
+                    .is_some_and(|output| devices.contains(&output.key.device_key))
+            }) {
+                continue;
+            }
             if let Err(error) = self.drain_scanout_pool_at(output_idx) {
                 log::error!(
                     "suspend could not quiesce scanout output {output_idx}: {error}; \
@@ -7127,7 +7209,15 @@ impl PlatformBackend {
                 }
             }
         }
-        for gens in &mut self.bo_generations {
+        for (output_idx, gens) in self.bo_generations.iter_mut().enumerate() {
+            if devices.is_some_and(|devices| {
+                !self
+                    .outputs
+                    .get(output_idx)
+                    .is_some_and(|output| devices.contains(&output.key.device_key))
+            }) {
+                continue;
+            }
             for g in gens {
                 g.last_present_generation = None;
                 g.content_invalidated = true;
@@ -8214,12 +8304,37 @@ impl PlatformBackend {
     /// rest, then returns it. The caller (KmsBackend::set_dpms_power)
     /// logs and advances the in-memory DPMS state regardless.
     pub(crate) fn dpms_set_outputs_active(&mut self, active: bool) -> io::Result<()> {
+        self.dpms_set_outputs_active_inner(active, false)
+    }
+
+    pub(crate) fn dpms_set_legacy_outputs_active(&mut self, active: bool) -> io::Result<()> {
+        self.dpms_set_outputs_active_inner(active, true)
+    }
+
+    fn dpms_set_outputs_active_inner(&mut self, active: bool, legacy_only: bool) -> io::Result<()> {
+        #[cfg(test)]
+        let record_outputs = self.dpms_output_calls_for_tests.is_some();
+        #[cfg(test)]
+        let mut recorded_outputs = Vec::new();
         let mut first_err: Option<io::Error> = None;
         if active {
             // Re-commit modeset. Pick the OnScreen BO (last frame
             // before blank) or any registered fb — same selection
             // logic as `requery_outputs_and_modeset` at :2030.
             for (i, layout) in self.outputs.iter().enumerate() {
+                if legacy_only
+                    && !self.allows_legacy(
+                        &layout.key.device_key,
+                        crate::kms::render::resources::WriterClass::Dpms,
+                    )
+                {
+                    continue;
+                }
+                #[cfg(test)]
+                if record_outputs {
+                    recorded_outputs.push(layout.key.clone());
+                    continue;
+                }
                 let Some(device) = self
                     .device_for_output(&layout.key)
                     .map(|device| Rc::clone(&device.device))
@@ -8305,6 +8420,19 @@ impl PlatformBackend {
             }
         } else {
             for layout in &self.outputs {
+                if legacy_only
+                    && !self.allows_legacy(
+                        &layout.key.device_key,
+                        crate::kms::render::resources::WriterClass::Dpms,
+                    )
+                {
+                    continue;
+                }
+                #[cfg(test)]
+                if record_outputs {
+                    recorded_outputs.push(layout.key.clone());
+                    continue;
+                }
                 let Some(device) = self
                     .device_for_output(&layout.key)
                     .map(|device| Rc::clone(&device.device))
@@ -8342,6 +8470,11 @@ impl PlatformBackend {
                     }
                 }
             }
+        }
+        #[cfg(test)]
+        if let Some(calls) = self.dpms_output_calls_for_tests.as_mut() {
+            calls.push((active, recorded_outputs));
+            return Ok(());
         }
         match first_err {
             Some(e) => Err(e),
@@ -8551,12 +8684,27 @@ impl PlatformBackend {
     /// caller (backend passes `core.cursor_x/y` and the effective
     /// cursor's hotspot).
     pub(crate) fn rearm_cursor(&mut self, hot_x: u16, hot_y: u16, x: i32, y: i32) {
-        self.refresh_cursor_topology();
+        let devices = self.devices.iter().map(|device| device.key).collect();
+        self.rearm_cursor_for_devices(&devices, hot_x, hot_y, x, y);
+    }
+
+    pub(crate) fn rearm_cursor_for_devices(
+        &mut self,
+        devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+        hot_x: u16,
+        hot_y: u16,
+        x: i32,
+        y: i32,
+    ) {
+        self.refresh_cursor_topology_for_devices(devices);
         let routes: Vec<_> = self
             .outputs
             .iter()
             .enumerate()
             .filter_map(|(output_idx, layout)| {
+                if !devices.contains(&layout.key.device_key) {
+                    return None;
+                }
                 let device = self.device_for_key(layout.key.device_key)?;
                 device
                     .cursor
