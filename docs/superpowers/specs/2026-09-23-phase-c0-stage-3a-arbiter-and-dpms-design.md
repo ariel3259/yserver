@@ -1,7 +1,9 @@
 # Phase C.0 stage 3a — the lifecycle arbiter and global DPMS
 
-**Status:** Revision 1, written by the coordinator on 2026-09-23 under the
-user's instruction to continue the stage 3 specs. The decisions marked
+**Status:** Revision 2 (codex round 1:
+[findings](../findings/2026-09-23-stage-3a-design-review-round1.md)), written by
+the coordinator on 2026-09-23 under the user's instruction to continue the
+stage 3 specs. The decisions marked
 **(coordinator decision)** were taken without a brainstorming exchange and
 are open to the user's veto before the plan is written.
 
@@ -112,10 +114,26 @@ next.
 
 `set_dpms_power(level)` splits by transport, per device:
 
-- **Legacy devices** keep today's code, with one change: the legacy loop
-  iterates only outputs of Legacy devices. An Owner device's outputs are never
-  offered to `dpms_set_outputs_active`, so its refusal can no longer reach
-  `request_exit()`.
+- **Legacy devices** keep today's code, restricted to Legacy devices. The
+  legacy loop iterates only their outputs, so an Owner device's refusal can no
+  longer reach `request_exit()`. The rest of Legacy's off path is also
+  server-wide today and must be restricted the same way *(rev 2, author's
+  own finding while verifying round-1 M-2)*: `scene.drain_all` and
+  `platform.reset_scanout_bos_for_suspend()` (`backend.rs:31087`–`31090`)
+  would otherwise drain and reset an Owner device's scanout state behind its
+  owner's back. The plan inventories every server-wide step of both the off
+  and the on path (cursor re-arm, gamma reapply, `wake_for_damage`, vblank
+  target clearing) and scopes each to Legacy devices or proves it harmless to
+  an Owner device.
+- **The resource service's serviced-time clock** *(rev 2, round-1 M-2)*. Today
+  a successful Legacy off pauses it and a successful on resumes it
+  (`set_seat_active`, `backend.rs:31099`; `resources/mod.rs:319`), and that
+  clock drives pending-batch expiry. The service is shared by every device, so
+  its power domain becomes **any served output lit**: the clock runs while at
+  least one output of any device — Legacy by `kms_outputs_active`, Owner by
+  its installed power state — is lit, and pauses only when none is. A Legacy
+  off on a mixed server therefore leaves the clock running while an Owner
+  output is still lit (for example after its off was rejected).
 - **Owner devices**: the coordinator replaces `protocol_dpms_level`, advances
   `dpms_epoch`, allocates one representative `LifecycleEventId` per affected
   Owner device, and projects the binary target (levels 1–3 are off, as
@@ -164,8 +182,21 @@ not assumed (C.0 §10.1: no advance claim about a driver not run).
   **powered off**: primary work on an off CRTC is not admissible, and composed
   offers for it wait with a new reason, `OutputPoweredOff`. The scene keeps
   running off screen.
-- The buffer bound to an off CRTC's primary plane **stays current**: it is
-  referenced by KMS state and is not released or reused while off.
+- **Direct scanout exits before off** *(rev 2, round-1 M-1)*. If a direct
+  ownership unit is current on any CRTC of the transition, the DPMS-off
+  transition's first phase is the Owner unflip of stage 2c-iii (Ciii): the
+  direct shadow is materialized, the composed return commit is admitted and
+  retires, and the client buffer and its source pin are released by the
+  unflip's own retirement rules (C.0 §10.2: only after the replacement's
+  dependency proves the prior buffer unused). Only then is the `ACTIVE=0`
+  commit built. This reuses the proven Legacy order — shadow first, direct
+  stopped after (`backend.rs:31057`, `:31084`) — through Owner machinery, and it
+  means a client buffer is never what an off CRTC holds. If the unflip fails,
+  the DPMS transition fails with it under section 3.7, before any power
+  change.
+- The buffer bound to an off CRTC's primary plane — always a composed buffer
+  after the rule above — **stays current**: it is referenced by KMS state and
+  is not released or reused while off.
 - After on is `Applied`, readiness reopens and the next composed frame
   replaces the retained buffer through ordinary admission; the scene is marked
   for a full frame, the Owner counterpart of Legacy's
@@ -198,16 +229,30 @@ result boundary (umbrella §2.4) before it reaches the arbiter:
 | stale tag, absent or invalid | acceptance-unknown, quarantined |
 
 The coordinator marks the protocol request `Applied` only when every Owner
-device's representative has a terminal disposition (umbrella §2.1).
+device's representative is `Applied` or was invalidated by output removal
+(C.0 `REC-5`); **a representative that ended any other way never counts
+toward `Applied`** *(rev 2, round-1 B-1)*.
 
 ### 3.7. Failure edges
 
 As the umbrella's rev-3 3a bullet states, and concretely:
 
-- **Rejection** (`FailedBeforeSubmit`): the previous power state stays
-  authoritative, nothing is quarantined, the device returns to `Ready`, and
-  the representative is terminalized with the classified result. DPMS does
-  not retry on its own; the next protocol request is a new generation.
+- **Rejection** (`FailedBeforeSubmit`) *(rev 2, round-1 B-1)*: the previous
+  power state stays authoritative and nothing is quarantined. The target is
+  **not** satisfied, so the representative is not `Applied` and not
+  terminal; it stays desired under the classification C.0 §10 requires:
+  - an `EINVAL`/`EOPNOTSUPP` attributable to this object combination latches
+    **that topology generation** (C.0 latch scopes): the device returns to
+    `Ready` for other work, and the representative becomes
+    `Deferred(TopologyLatched(generation))`. It is not retried under the same
+    generation — no retry loop — and is revalidated when the generation
+    changes or a newer DPMS request supersedes it;
+  - any other explicit rejection closes readiness for the device, and the
+    representative becomes `Deferred(ReadinessClosed)`, resolved by the
+    lifecycle transition that re-establishes readiness (3c, 3d).
+  `Deferred` is C.0's nonterminal disposition for a target that "cannot run
+  while a required external state … is absent"; a latched generation and a
+  closed readiness are such states, so the authority is used, not amended.
   **(coordinator decision)** A rejected DPMS-off leaves the outputs lit, as a
   failed Legacy `disable_output` would, but unlike Legacy the server keeps
   running.
@@ -262,7 +307,15 @@ device) where DPMS reaches both and neither exits; `Deferred` while the seat
 is released and its resolution on reacquire; the projection refresh of the
 umbrella's rev-2 M-2 rule when an output appears after a global off; the
 retained buffer is the same object before off and after on; and the section
-3.8 invariant.
+3.8 invariant. Added in revision 2: a rejected off (attributable and not) —
+the protocol request is never `Applied`, the target stays `Deferred` with the
+right prerequisite, no retry under the same generation, and a newer request
+supersedes it; off with a **direct** client buffer current — the unflip runs
+first, the client buffer is released only by the unflip's retirement, the
+client may destroy its window while off, and on shows the composed buffer; a
+mixed server with a pending resource batch and a rejected Owner off — the
+serviced-time clock keeps running; and a Legacy off on a mixed server leaving
+the Owner device's scanout state untouched.
 
 ### 5.3. Hardware (user approval, tty, GPU free)
 
@@ -283,7 +336,11 @@ fallback after a combined rejection; a rejection treated as poison; a
 `MechanismFailed` on Owner reaching `request_exit()`; a stale success
 promoted; the retained buffer released while off; a composed offer admitted
 on an off CRTC; the representative marked `Applied` before every projection
-retired; a DPMS request while `Poisoned` issuing a KMS mutation.
+retired; a DPMS request while `Poisoned` issuing a KMS mutation; a rejected
+representative counted toward `Applied`; a latched generation retried;
+`ACTIVE=0` built while a direct unit is still current; the serviced-time clock
+paused by a Legacy off while an Owner output is lit; `drain_all` or
+`reset_scanout_bos_for_suspend` reaching an Owner device.
 
 ## 6. Out of scope
 
