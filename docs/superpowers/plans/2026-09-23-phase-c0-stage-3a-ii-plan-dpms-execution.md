@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run **without sandbox** (`--sandbox danger-full-access`, user-authorized for GPU work) with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3aii_`, `c0_3a_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` (the GPU is used only with the user's approval, recorded in the prompt); **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 5 (2026-09-23)** — Task 1 F8 from the implementer (stopped before
+editing): two Task 1 tests needed the conductor's `Admitted::Topology` dispatch
+arm, which is Task 2's. Task 1 proves the kick up to the queued topology
+request; the dispatch-on-an-idle-device and synchronous-refusal tests move to
+Task 2.
+
 **Revision 4 (2026-09-23)** — codex round 2
 (`../findings/2026-09-23-stage-3a-ii-plan-review-round2.md`: 0 blocking, 2 major;
 every round-1 finding APPLIED): the driver is a per-device run-to-completion
@@ -94,8 +100,8 @@ drain route and keeps its exit unchanged *(rev 3)*.
 | --- | --- | --- |
 | `c0_3aii_owner_mechanism_failure_poisons_and_keeps_running` | an Owner fixture, an owner `MechanismFailed` routed through `route_owner_event_batch`: the device's §6.4 state is `Poisoned`, admission closed, `request_exit` never requested; a Legacy-handover failure on a non-Owner device still exits as today | **D1** restore the unconditional `request_exit()` |
 | `c0_3aii_driver_returns_receipts_with_their_own_tag` | a DPMS transition superseded by a second: the first transition's late receipts are reported with its tag and never open the second's gate | **D2** tag receipts with the device's current transition instead of the requester's |
-| `c0_3aii_dpms_starts_on_an_idle_device` | an Owner device with no commit in flight and no pending owner event: `set_dpms_power(off)` alone leads to the topology request and the dispatch | **D34** apply the arbiter's actions only at `route_owner_event_batch` |
-| `c0_3aii_synchronous_refusal_does_not_reenter_the_driver` | the kick's topology dispatch is refused before IPC, so `route_owner_event_batch` runs inside the kick: the refusal's receipt is queued and applied after the first batch, in order; the arbiter sees each input once | **D40** let the routing site call the driver directly while it is running |
+| `c0_3aii_dpms_requests_topology_on_an_idle_device` | an Owner device with no commit in flight and no pending owner event: `set_dpms_power(off)` alone leads to a queued `Tier::Topology` intent in that device's conductor, tagged with the transition — the dispatch itself is Task 2's (rev 5, Task 1 F8) | **D34** apply the arbiter's actions only at `route_owner_event_batch` |
+
 | `c0_3aii_legacy_device_has_no_arbiter` | a Legacy device: no coordinator projection, no driver, no behavior change (a named Legacy characterisation test stays green) | **D3** create a driver for every device |
 
 ## Task 2 — `Tier::Topology` carries the transition, freshness before submission
@@ -117,6 +123,8 @@ stale absent/invalid → acceptance-unknown, quarantined.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
+| `c0_3aii_dpms_dispatches_on_an_idle_device` | *(moved from Task 1, rev 5)* an idle Owner device: `set_dpms_power(off)` alone leads to the topology commit's dispatch, with no unrelated owner event | **D34b** drop the kick so the queued topology waits for an owner event |
+| `c0_3aii_synchronous_refusal_does_not_reenter_the_driver` | *(moved from Task 1, rev 5)* the kick's topology dispatch is refused before IPC, so `route_owner_event_batch` runs inside the kick: the refusal's receipt is queued and applied after the first batch, in order; the arbiter sees each input once | **D40** let the routing site call the driver directly while it is running |
 | `c0_3aii_stale_topology_never_reaches_test_only` | a DPMS off queued, superseded by on before dispatch: the off never reaches final `TEST_ONLY` nor the executor (C.0 §16.2 item 9) | **D4** drop the pre-`TEST_ONLY` check; **D5** drop the pre-dispatch check (with the first kept, supersede between the two) |
 | `c0_3aii_winner_waits_for_a_delayed_executor_call` | an off whose host call is deliberately delayed (the stub executor's delay control), superseded by on: the on stays queued until the off's call returns or is reaped, then dispatches; the off's late result goes through the boundary as stale | **D35** release the slot to the winner before the delayed call returns |
 | `c0_3aii_result_boundary_rows` | every row of the 3a design §3.6 table through `route_owner_event_batch` | **D6** promote a stale explicit success |
