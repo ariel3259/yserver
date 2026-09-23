@@ -480,6 +480,16 @@ plan must close each with a test (or a proof that it cannot occur) before any
 **(b)** the drain and reset paths (`scene.drain_all`,
 `reset_scanout_bos_for_suspend`, a relayout) while direct is current.
 
+**Answered (2026-09-23,
+[finding](../findings/2026-09-23-ciii-direct-entry-without-composed-return.md)).**
+Case (b): no path found — a relayout on an Owner device leaves composed owner
+buffers alone, and the drain/reset steps are Legacy-only under section 3.3.
+Case (a): **reachable** — neither direct readiness nor direct eligibility
+checks the composed return; only the 8-Present entry probation makes it
+unlikely. It is a Ciii defect, fixed as a stage 2c-iii addendum in its own
+commit (direct entry waits for an established composed return) **before** any
+3a task that relies on the post-on unflip.
+
 ## 7. Out of scope
 
 VT, hotplug, reprobe, device add/remove as executed transitions (3c); client
