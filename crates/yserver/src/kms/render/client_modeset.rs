@@ -1,23 +1,23 @@
 //! Minimal atomic description for one output's client modeset.
 //!
-//! Preparation owns the new framebuffer and mode blob. This builder only
-//! projects those already-prepared handles and the staged DPMS decision into
-//! the device commit description; it performs no DRM or renderer work.
-//!
-//! Until Task 5 installs production preparation, the builder is exercised by
-//! the stub-executor test source and is intentionally unreachable in release
-//! builds.
+//! Preparation owns the new scanout pool, scene state and mode blob. This
+//! module projects their already-prepared handles and the staged DPMS
+//! decision into the device commit description.
 
-#![cfg_attr(not(test), allow(dead_code))]
+use std::rc::Rc;
 
 use crate::kms::{
-    backend::OutputKey,
+    backend::{OutputInstanceId, OutputKey},
     owner::{
         build::CommitDescription,
         closure::{CrtcPower, ObjectKind, PropertyIds, SerializedObject},
         lifecycle::{DpmsTarget, dpms_target_for_level},
     },
+    render::scene::StagedOutputSceneState,
+    vk::scanout::OutputScanout,
 };
+
+use crate::platform::drm::Output;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedDpmsProjection {
@@ -73,13 +73,85 @@ pub(crate) struct ClientModesetDescriptionInput {
     pub(crate) operation: ClientModesetOperation,
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct PreparedClientModesetDescription {
     pub(crate) description: CommitDescription,
     /// Present for enable and mode-change transactions. The caller retains it
     /// with the prepared transaction so freshness can be checked before both
     /// validation and executor dispatch.
     pub(crate) staged_projection: Option<StagedDpmsProjection>,
+    pub(crate) prepared_set: PreparedClientModesetSet,
+}
+
+pub(crate) struct BuiltClientModesetDescription {
+    pub(crate) description: CommitDescription,
+    pub(crate) staged_projection: Option<StagedDpmsProjection>,
+}
+
+/// Resources kept alive from preparation until promotion or a non-installing
+/// result. The owner consumes this set on every terminal path; Task 6 will
+/// move its members into the installed platform and scene.
+pub(crate) struct PreparedClientModesetSet {
+    pub(crate) output: Option<Output>,
+    pub(crate) output_instance_id: Option<OutputInstanceId>,
+    pub(crate) scanout: Option<OutputScanout>,
+    pub(crate) scene: Option<StagedOutputSceneState>,
+    pub(crate) mode_blob: Option<OwnedModeBlob>,
+    pub(crate) allocation_keys: Vec<crate::kms::render::resources::AllocationKey>,
+    #[cfg(test)]
+    pub(crate) framebuffer_handles_for_tests: Vec<u32>,
+}
+
+impl PreparedClientModesetSet {
+    /// Drop the staged scene before releasing its never-submitted pool. The
+    /// pool's managed retain leases and counted DRM aliases must be detached
+    /// through the same 2c-i service path that adopted them.
+    pub(crate) fn release(
+        mut self,
+        service: &mut crate::kms::render::resources::ResourceService,
+        registry: &mut crate::kms::render::resources::DrmCleanupRegistry,
+    ) {
+        self.scene.take();
+        if let Some(mut scanout) = self.scanout.take() {
+            scanout.detach_managed_entries(Some(registry));
+            drop(scanout);
+        }
+        self.mode_blob.take();
+        let _ = service.service_ready_with_registry(registry);
+    }
+}
+
+/// RAII owner for a DRM mode property blob used by TEST_ONLY and the live
+/// request. Destroying it before installation is safe; a successful kernel
+/// commit retains its own reference before this userspace reference drops.
+pub(crate) struct OwnedModeBlob {
+    device: Rc<crate::drm::Device>,
+    raw: Option<u64>,
+}
+
+impl OwnedModeBlob {
+    pub(crate) fn new(device: Rc<crate::drm::Device>, raw: u64) -> Self {
+        Self {
+            device,
+            raw: Some(raw),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_for_tests(&self) -> Option<u64> {
+        self.raw
+    }
+}
+
+impl Drop for OwnedModeBlob {
+    fn drop(&mut self) {
+        use ::drm::control::Device as _;
+
+        if let Some(raw) = self.raw.take()
+            && let Err(error) = self.device.destroy_property_blob(raw)
+        {
+            log::error!("could not destroy prepared client modeset blob {raw}: {error}");
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -117,7 +189,7 @@ pub(crate) fn stage_dpms_projection(
 
 pub(crate) fn build_client_modeset_description(
     input: ClientModesetDescriptionInput,
-) -> Result<PreparedClientModesetDescription, ClientModesetBuildError> {
+) -> Result<BuiltClientModesetDescription, ClientModesetBuildError> {
     let ClientModesetDescriptionInput {
         objects,
         properties,
@@ -239,7 +311,7 @@ pub(crate) fn build_client_modeset_description(
         property_ids: properties.common,
     };
 
-    Ok(PreparedClientModesetDescription {
+    Ok(BuiltClientModesetDescription {
         description,
         staged_projection,
     })

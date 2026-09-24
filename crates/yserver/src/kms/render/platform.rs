@@ -1416,7 +1416,7 @@ fn scanout_pool_needs_reallocation(
     })
 }
 
-const SCANOUT_POOL_DEPTH: usize = 3;
+pub(crate) const SCANOUT_POOL_DEPTH: usize = 3;
 /// Fresh completion timeout for each submitted disposable-probe fence.
 /// Allocation, atomic TEST_ONLY, pipeline setup, and completed CPU content
 /// validation are not charged to this GPU-liveness bound.
@@ -6881,6 +6881,70 @@ impl PlatformBackend {
         }
 
         Ok(display_key)
+    }
+
+    /// Adopt a not-yet-installed, same-device scanout pool through the same
+    /// 2c-i ownership path as an installed output. The caller owns the pool
+    /// until promotion; a partial adoption is unwound before this returns an
+    /// error.
+    pub(crate) fn register_prepared_client_scanout_pool(
+        &mut self,
+        scanout: &mut OutputScanout,
+        service: &mut crate::kms::render::resources::ResourceService,
+        registry: &mut crate::kms::render::resources::DrmCleanupRegistry,
+    ) -> Result<
+        Vec<crate::kms::render::resources::AllocationKey>,
+        crate::kms::render::resources::ResourceError,
+    > {
+        use crate::kms::render::resources::{AllocationPayload, ResourceError, ScanoutAllocation};
+
+        if !matches!(scanout, OutputScanout::Shared(_)) || service.is_exhausted() {
+            return Err(if service.is_exhausted() {
+                ResourceError::Exhausted
+            } else {
+                ResourceError::InvalidState
+            });
+        }
+
+        let bo_count = scanout.display_pool().bos.len();
+        let mut keys = Vec::with_capacity(bo_count);
+        for bo_idx in 0..bo_count {
+            let bo = &mut scanout.display_pool_mut().bos[bo_idx];
+            if bo.fb_handle.is_none() || bo.gem_handle.is_none() {
+                scanout.detach_managed_entries(Some(registry));
+                let _ = service.service_ready_with_registry(registry);
+                return Err(ResourceError::InvalidState);
+            }
+            let backing = bo
+                .take_physical_backing()
+                .expect("a new client modeset pool has physical scanout backing");
+            let allocation = ScanoutAllocation::from_scanout_bo_backing(backing, registry)
+                .expect("framebuffer and GEM handles were validated above");
+            let lease = match service
+                .adopt_with_registry(AllocationPayload::Scanout(allocation), registry)
+            {
+                Ok(lease) => lease,
+                Err((error, AllocationPayload::Scanout(allocation))) => {
+                    if let Some(bo) = scanout.display_pool_mut().bos.get_mut(bo_idx) {
+                        bo.restore_physical_backing(allocation.into_scanout_bo_backing());
+                    }
+                    scanout.detach_managed_entries(Some(registry));
+                    let _ = service.service_ready_with_registry(registry);
+                    return Err(error);
+                }
+                Err((error, _)) => return Err(error),
+            };
+
+            let key = lease.key();
+            let bo = &mut scanout.display_pool_mut().bos[bo_idx];
+            bo.set_managed(lease);
+            let alias = bo
+                .take_husk_alias()
+                .expect("managed adoption leaves a counted pool husk alias");
+            bo.set_husk_registration(registry.register_pool_husk(alias));
+            keys.push(key);
+        }
+        Ok(keys)
     }
 
     /// F2-M2 rollback helper: restores a display bo's physical backing after

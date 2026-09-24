@@ -1211,6 +1211,8 @@ pub(crate) struct SceneCompositor {
     /// cursor gate without bypassing the backend predicate under test.
     #[cfg(test)]
     test_cursor_mode_override: Option<CursorPlaneMode>,
+    #[cfg(test)]
+    drain_all_calls_for_tests: usize,
 }
 
 pub(crate) struct ComposedOffer {
@@ -1674,6 +1676,8 @@ impl SceneCompositor {
             test_flip_in_flight_override: None,
             #[cfg(test)]
             test_cursor_mode_override: None,
+            #[cfg(test)]
+            drain_all_calls_for_tests: 0,
         })
     }
 
@@ -1683,22 +1687,46 @@ impl SceneCompositor {
         i: usize,
     ) -> Result<OutputSceneState, SceneError> {
         let layout = &platform.outputs[i];
-        let ring = CompositePoolRing::new(Arc::clone(vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
-            .map_err(SceneError::Vk)?;
         let bo_depth = platform
             .scanout_pools
             .get(i)
             .and_then(|p| p.as_ref().map(|pool| pool.display_pool().bos.len()))
             .unwrap_or(3);
+        Self::build_output_state_for(
+            vk,
+            i,
+            &layout.key,
+            platform.output_instance_ids[i],
+            layout.width,
+            layout.height,
+            layout.x,
+            layout.y,
+            bo_depth,
+        )
+    }
+
+    fn build_output_state_for(
+        vk: &Arc<crate::kms::vk::device::VkContext>,
+        output_idx: usize,
+        output_key: &OutputKey,
+        output_instance_id: OutputInstanceId,
+        width: u16,
+        height: u16,
+        x: i32,
+        y: i32,
+        bo_depth: usize,
+    ) -> Result<OutputSceneState, SceneError> {
+        let ring = CompositePoolRing::new(Arc::clone(vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
+            .map_err(SceneError::Vk)?;
         Ok(OutputSceneState {
-            output_idx: i,
-            output_key: layout.key.clone(),
-            output_instance_id: platform.output_instance_ids[i],
+            output_idx,
+            output_key: output_key.clone(),
+            output_instance_id,
             damage_audit: build_output_damage_audit(
                 vk,
                 vk::Extent2D {
-                    width: u32::from(layout.width),
-                    height: u32::from(layout.height),
+                    width: u32::from(width),
+                    height: u32::from(height),
                 },
             )?,
             pool_ring: ring,
@@ -1712,10 +1740,10 @@ impl SceneCompositor {
             scene_structure_damage: RegionSet::new(),
             pending_repaint_after_failed_submit: RegionSet::new(),
             output_extent: vk::Extent2D {
-                width: u32::from(layout.width),
-                height: u32::from(layout.height),
+                width: u32::from(width),
+                height: u32::from(height),
             },
-            output_origin: (layout.x, layout.y),
+            output_origin: (x, y),
             next_submit_retry_at: None,
             last_frame_cursor_mode: OutputCursorMode::Hidden,
             cursor_prev_pos: None,
@@ -1734,8 +1762,8 @@ impl SceneCompositor {
             damage: ScanoutDamage::new(
                 bo_depth,
                 vk::Extent2D {
-                    width: u32::from(layout.width),
-                    height: u32::from(layout.height),
+                    width: u32::from(width),
+                    height: u32::from(height),
                 },
             ),
         })
@@ -1752,6 +1780,33 @@ impl SceneCompositor {
         };
         let mut scene = Self::build_output_state(&inner.vk, platform, output_idx)?;
         scene.output_instance_id = output_instance_id;
+        Ok(StagedOutputSceneState { scene })
+    }
+
+    pub(crate) fn stage_client_output_scene_state(
+        &self,
+        key: &OutputKey,
+        output_instance_id: OutputInstanceId,
+        width: u16,
+        height: u16,
+        x: i32,
+        y: i32,
+        scanout: &OutputScanout,
+    ) -> Result<StagedOutputSceneState, SceneError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Err(SceneError::NoVk);
+        };
+        let scene = Self::build_output_state_for(
+            &inner.vk,
+            0,
+            key,
+            output_instance_id,
+            width,
+            height,
+            x,
+            y,
+            scanout.display_pool().bos.len(),
+        )?;
         Ok(StagedOutputSceneState { scene })
     }
 
@@ -2005,6 +2060,8 @@ impl SceneCompositor {
             test_flip_in_flight_override: None,
             #[cfg(test)]
             test_cursor_mode_override: None,
+            #[cfg(test)]
+            drain_all_calls_for_tests: 0,
         }
     }
 
@@ -3840,8 +3897,17 @@ impl SceneCompositor {
         platform: &mut PlatformBackend,
         resource_service: Option<&mut ResourceService>,
     ) {
+        #[cfg(test)]
+        {
+            self.drain_all_calls_for_tests = self.drain_all_calls_for_tests.saturating_add(1);
+        }
         let devices = platform.devices.iter().map(|device| device.key).collect();
         self.drain_devices(platform, resource_service, &devices);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_all_calls_for_tests(&self) -> usize {
+        self.drain_all_calls_for_tests
     }
 
     pub(crate) fn drain_devices(
