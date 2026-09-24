@@ -31,7 +31,8 @@ use crate::{
         },
         render::{
             backend::{
-                DirectEligibility, KmsBackend, PreparedDirectDispatch, effective_refresh_matches,
+                ClientModesetUnflipHold, DirectEligibility, KmsBackend, PreparedDirectDispatch,
+                effective_refresh_matches,
             },
             client_modeset::{
                 ClientModesetDescriptionInput, ClientModesetObjects, ClientModesetOperation,
@@ -192,7 +193,6 @@ pub(crate) enum OwnerRefusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientModesetUnsupportedFeature {
     CopiedRoute,
-    DirectActive,
     PositionOnly,
 }
 
@@ -2067,6 +2067,7 @@ impl KmsBackend {
             self.lifecycle_release_client_modeset_slot(slot);
             self.complete_owner_client_modeset(token, result);
         }
+        self.lifecycle_end_client_modeset_direct_hold(device, tag, false);
     }
 
     fn lifecycle_cancel_client_modeset_before_dispatch(
@@ -2211,15 +2212,6 @@ impl KmsBackend {
             .filter(|key| key.device_key == device && key.connector_name == request.1)
             .cloned()
             .ok_or_else(|| preparation_error(Stage::Discovery))?;
-        if self.direct_scanout_active_for_device(device) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                ClientModesetFailure::OwnerRefused(OwnerRefusal::NotYetSupported(
-                    ClientModesetUnsupportedFeature::DirectActive,
-                )),
-            ));
-        }
-
         let current = self
             .platform
             .outputs
@@ -3107,6 +3099,15 @@ impl KmsBackend {
             );
             return AdmissionOutcome::NothingAdmissible;
         }
+        if self
+            .scanout_m2
+            .client_modeset_unflip_holds
+            .iter()
+            .any(|hold| hold.modeset_device == device && hold.tag == tag && !hold.unflip_terminal)
+        {
+            self.admission_abort(device, token);
+            return AdmissionOutcome::NothingAdmissible;
+        }
 
         let prepared = self
             .lifecycle_drivers
@@ -3146,6 +3147,10 @@ impl KmsBackend {
                 return AdmissionOutcome::PreparationRefused;
             }
         };
+        if self.lifecycle_client_modeset_requires_direct_unflip(device, tag) {
+            self.lifecycle_park_client_modeset_for_unflip(device, token, tag);
+            return AdmissionOutcome::NothingAdmissible;
+        }
         let required_clock_crtcs = description
             .crtc_state
             .iter()
@@ -3350,6 +3355,18 @@ impl KmsBackend {
         tag: ClientModesetTag<IncarnationId>,
         result: std::io::Result<bool>,
     ) {
+        self.lifecycle_complete_client_modeset_without_dispatch_with_readiness(
+            device, tag, result, true,
+        );
+    }
+
+    fn lifecycle_complete_client_modeset_without_dispatch_with_readiness(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: ClientModesetTag<IncarnationId>,
+        result: std::io::Result<bool>,
+        close_on_completion_unknown: bool,
+    ) {
         if let Some(conductor) = self.admission_conductors.get_mut(&device) {
             conductor
                 .admission
@@ -3366,13 +3383,15 @@ impl KmsBackend {
                 failure,
                 Some(ClientModesetFailure::OwnerRefused(
                     OwnerRefusal::ReadinessClosed
-                )) | Some(ClientModesetFailure::CompletionUnknown)
-            ) || matches!(
-                failure,
-                Some(ClientModesetFailure::Preparation(PreparationStage::TestOnly {
-                    errno,
-                })) if !test_only_errno_keeps_readiness(errno)
-            );
+                ))
+            ) || (close_on_completion_unknown
+                && failure == Some(ClientModesetFailure::CompletionUnknown))
+                || matches!(
+                    failure,
+                    Some(ClientModesetFailure::Preparation(PreparationStage::TestOnly {
+                        errno,
+                    })) if !test_only_errno_keeps_readiness(errno)
+                );
             if closes_readiness {
                 self.lifecycle_close_client_modeset_readiness(device, tag);
             }
@@ -3380,6 +3399,7 @@ impl KmsBackend {
             self.lifecycle_release_client_modeset_slot(slot);
             self.complete_owner_client_modeset(token, result);
         }
+        self.lifecycle_end_client_modeset_direct_hold(device, tag, false);
     }
 
     fn lifecycle_close_client_modeset_readiness(
@@ -3415,6 +3435,358 @@ impl KmsBackend {
             tag,
             self.lifecycle_superseding_kind(device),
         );
+    }
+
+    fn lifecycle_client_modeset_requires_direct_unflip(
+        &self,
+        device: DrmDeviceKey,
+        tag: ClientModesetTag<IncarnationId>,
+    ) -> bool {
+        let Some(slot) = self
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.client_modeset.as_ref())
+            .filter(|slot| slot.tag == tag)
+        else {
+            return false;
+        };
+        if !self.scanout_m2.active() {
+            return false;
+        }
+        let direct_device = self.direct_scanout_device_for_unflip();
+        let output_key = crate::kms::backend::OutputKey::new(device, slot.connector.clone());
+        let prepared_output = slot
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.prepared_set.output.as_ref());
+        let mut projected = Vec::with_capacity(self.platform.outputs.len() + 1);
+        let mut saw_target = false;
+        for output in &self.platform.outputs {
+            if output.key != output_key {
+                projected.push((
+                    output.key.device_key,
+                    output.x,
+                    output.y,
+                    output.width,
+                    output.height,
+                    output.output.picked.clone(),
+                ));
+                continue;
+            }
+            saw_target = true;
+            if let Some(mode) = slot.mode {
+                let Some(prepared_output) = prepared_output else {
+                    return true;
+                };
+                projected.push((
+                    device,
+                    slot.x,
+                    slot.y,
+                    mode.width,
+                    mode.height,
+                    prepared_output.picked.clone(),
+                ));
+            }
+        }
+        if let Some(mode) = slot.mode
+            && !saw_target
+        {
+            let Some(prepared_output) = prepared_output else {
+                return true;
+            };
+            projected.push((
+                device,
+                slot.x,
+                slot.y,
+                mode.width,
+                mode.height,
+                prepared_output.picked.clone(),
+            ));
+        }
+
+        let topology_direct_eligible = self
+            .platform
+            .primary_device()
+            .and_then(|primary| {
+                let first = projected.first()?;
+                Some(
+                    first.0 == primary.key
+                        && projected.iter().all(|output| {
+                            output.0 == primary.key
+                                && crate::kms::render::backend::effective_refresh_matches(
+                                    &first.5, &output.5,
+                                )
+                        }),
+                )
+            })
+            .unwrap_or(false);
+        let projected_extent = crate::kms::render::platform::recompute_fb_extent_from(
+            &projected
+                .iter()
+                .map(|output| (output.1, output.2, output.3, output.4))
+                .collect::<Vec<_>>(),
+        );
+        let root_extent_changes = projected_extent != (self.platform.fb_w, self.platform.fb_h);
+
+        direct_device == Some(device) || !topology_direct_eligible || root_extent_changes
+    }
+
+    fn lifecycle_park_client_modeset_for_unflip(
+        &mut self,
+        device: DrmDeviceKey,
+        token: AdmissionToken,
+        tag: ClientModesetTag<IncarnationId>,
+    ) {
+        let unflip_device = self.direct_scanout_device_for_unflip();
+        let Some(unflip_device) = unflip_device else {
+            self.admission_abort(device, token);
+            self.lifecycle_complete_client_modeset_without_dispatch(
+                device,
+                tag,
+                Err(std::io::Error::other(ClientModesetFailure::Preparation(
+                    PreparationStage::Unflip,
+                ))),
+            );
+            return;
+        };
+        if !self.admission_is_active(unflip_device) {
+            self.admission_abort(device, token);
+            self.lifecycle_complete_client_modeset_without_dispatch(
+                device,
+                tag,
+                Err(std::io::Error::other(ClientModesetFailure::Preparation(
+                    PreparationStage::Unflip,
+                ))),
+            );
+            return;
+        }
+        if !self
+            .scanout_m2
+            .client_modeset_unflip_holds
+            .iter()
+            .any(|hold| hold.modeset_device == device && hold.tag == tag)
+        {
+            let in_flight = self
+                .scanout_m2
+                .owner_unflip_return
+                .as_ref()
+                .filter(|record| record.commit.device == unflip_device)
+                .map(|record| record.commit);
+            self.scanout_m2
+                .client_modeset_unflip_holds
+                .push(ClientModesetUnflipHold {
+                    modeset_device: device,
+                    tag,
+                    unflip_device,
+                    unflip_commit: in_flight,
+                    unflip_terminal: false,
+                    request_ended: false,
+                });
+        }
+
+        self.admission_abort(device, token);
+        if unflip_device == device
+            && let Some(conductor) = self.admission_conductors.get_mut(&device)
+        {
+            conductor
+                .admission
+                .cancel_topology(TopologyWork::ClientModeset(tag));
+        }
+        self.request_direct_unflip("client_modeset_direct_ineligible");
+        let queued = self
+            .admission_conductors
+            .get(&unflip_device)
+            .is_some_and(|conductor| conductor.admission.unflip().is_some());
+        let returned = self
+            .scanout_m2
+            .owner_unflip_return
+            .as_ref()
+            .is_some_and(|record| record.commit.device == unflip_device);
+        if !queued && !returned {
+            self.lifecycle_client_modeset_unflip_dispatch_failed(unflip_device, None);
+            return;
+        }
+        if self.direct_unflip_shadow_ready() {
+            let outcome = self.admission_wake(unflip_device, false);
+            if matches!(
+                outcome,
+                AdmissionOutcome::PreparationRefused
+                    | AdmissionOutcome::BeginRefused
+                    | AdmissionOutcome::TransportClosed
+                    | AdmissionOutcome::Unsupported(_)
+            ) {
+                self.lifecycle_client_modeset_unflip_dispatch_failed(unflip_device, None);
+            }
+        }
+    }
+
+    fn lifecycle_end_client_modeset_direct_hold(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: ClientModesetTag<IncarnationId>,
+        promoted: bool,
+    ) {
+        let Some(index) = self
+            .scanout_m2
+            .client_modeset_unflip_holds
+            .iter()
+            .position(|hold| hold.modeset_device == device && hold.tag == tag)
+        else {
+            return;
+        };
+        if self.scanout_m2.client_modeset_unflip_holds[index].unflip_terminal {
+            self.scanout_m2.client_modeset_unflip_holds.remove(index);
+            if promoted {
+                self.scanout_m2.reset_eligible_root_probation();
+            }
+        } else {
+            self.scanout_m2.client_modeset_unflip_holds[index].request_ended = true;
+        }
+    }
+
+    pub(crate) fn lifecycle_client_modeset_unflip_retired(
+        &mut self,
+        unflip_device: DrmDeviceKey,
+        commit: crate::kms::render::resources::CommitKey,
+    ) {
+        let holds = &mut self.scanout_m2.client_modeset_unflip_holds;
+        for hold in holds.iter_mut().filter(|hold| {
+            hold.unflip_device == unflip_device && hold.unflip_commit == Some(commit)
+        }) {
+            hold.unflip_terminal = true;
+        }
+        let ready = holds
+            .iter()
+            .filter(|hold| {
+                hold.unflip_device == unflip_device
+                    && hold.unflip_commit == Some(commit)
+                    && hold.unflip_terminal
+            })
+            .map(|hold| (hold.modeset_device, hold.tag, hold.request_ended))
+            .collect::<Vec<_>>();
+        let mut wake = Vec::new();
+        for (modeset_device, tag, request_ended) in ready {
+            let live = !request_ended
+                && self.client_modeset_tag_current(modeset_device, tag)
+                && self
+                    .lifecycle_drivers
+                    .get(&modeset_device)
+                    .and_then(|driver| driver.client_modeset.as_ref())
+                    .is_some_and(|slot| slot.tag == tag);
+            if live {
+                if let Some(conductor) = self.admission_conductors.get_mut(&modeset_device) {
+                    let _ = conductor
+                        .admission
+                        .request_topology(TopologyWork::ClientModeset(tag));
+                    if modeset_device != unflip_device {
+                        wake.push(modeset_device);
+                    }
+                }
+            } else {
+                self.lifecycle_end_client_modeset_direct_hold(modeset_device, tag, false);
+            }
+        }
+        for device in wake {
+            let _ = self.admission_wake(device, false);
+        }
+    }
+
+    pub(crate) fn lifecycle_client_modeset_unflip_terminal(
+        &mut self,
+        unflip_device: DrmDeviceKey,
+        commit: crate::kms::render::resources::CommitKey,
+        terminal: TerminalState,
+    ) {
+        if !self
+            .scanout_m2
+            .client_modeset_unflip_holds
+            .iter()
+            .any(|hold| hold.unflip_device == unflip_device && hold.unflip_commit == Some(commit))
+        {
+            return;
+        }
+        match terminal {
+            TerminalState::Completed => return,
+            TerminalState::FailedBeforeSubmit(_) | TerminalState::CompletionUnknown(_) => {}
+        }
+        if matches!(terminal, TerminalState::CompletionUnknown(_)) {
+            let affected = self
+                .scanout_m2
+                .client_modeset_unflip_holds
+                .iter_mut()
+                .filter(|hold| {
+                    hold.unflip_device == unflip_device && hold.unflip_commit == Some(commit)
+                })
+                .map(|hold| {
+                    hold.unflip_terminal = true;
+                    (hold.modeset_device, hold.tag, hold.request_ended)
+                })
+                .collect::<Vec<_>>();
+            for (modeset_device, tag, request_ended) in affected {
+                if !request_ended
+                    && self
+                        .lifecycle_drivers
+                        .get(&modeset_device)
+                        .and_then(|driver| driver.client_modeset.as_ref())
+                        .is_some_and(|slot| slot.tag == tag)
+                {
+                    self.lifecycle_complete_client_modeset_without_dispatch_with_readiness(
+                        modeset_device,
+                        tag,
+                        Err(std::io::Error::other(
+                            ClientModesetFailure::CompletionUnknown,
+                        )),
+                        false,
+                    );
+                } else {
+                    self.lifecycle_end_client_modeset_direct_hold(modeset_device, tag, false);
+                }
+            }
+            self.lifecycle_report_completion_loss(unflip_device);
+        } else {
+            self.lifecycle_client_modeset_unflip_dispatch_failed(unflip_device, Some(commit));
+        }
+    }
+
+    fn lifecycle_client_modeset_unflip_dispatch_failed(
+        &mut self,
+        unflip_device: DrmDeviceKey,
+        commit: Option<crate::kms::render::resources::CommitKey>,
+    ) {
+        let affected = self
+            .scanout_m2
+            .client_modeset_unflip_holds
+            .iter_mut()
+            .filter(|hold| {
+                hold.unflip_device == unflip_device
+                    && commit.map_or(hold.unflip_commit.is_none(), |commit| {
+                        hold.unflip_commit == Some(commit)
+                    })
+            })
+            .map(|hold| {
+                hold.unflip_terminal = true;
+                (hold.modeset_device, hold.tag, hold.request_ended)
+            })
+            .collect::<Vec<_>>();
+        for (modeset_device, tag, request_ended) in affected {
+            if !request_ended
+                && self
+                    .lifecycle_drivers
+                    .get(&modeset_device)
+                    .and_then(|driver| driver.client_modeset.as_ref())
+                    .is_some_and(|slot| slot.tag == tag)
+            {
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    modeset_device,
+                    tag,
+                    Err(std::io::Error::other(ClientModesetFailure::Preparation(
+                        PreparationStage::Unflip,
+                    ))),
+                );
+            } else {
+                self.lifecycle_end_client_modeset_direct_hold(modeset_device, tag, false);
+            }
+        }
     }
 
     fn lifecycle_abort_pending_validation(
@@ -4537,6 +4909,7 @@ impl KmsBackend {
         } else {
             terminal
         };
+        let promoted = terminal == TerminalState::Completed;
         let (result, close_readiness, completion_unknown) = match terminal {
             TerminalState::Completed => {
                 log::debug!(
@@ -4625,6 +4998,7 @@ impl KmsBackend {
         if completion_unknown {
             self.lifecycle_report_completion_loss(device);
         }
+        self.lifecycle_end_client_modeset_direct_hold(device, tag, promoted);
         match self
             .lifecycle_coordinator
             .client_modeset_resolved(&device, &tag)
@@ -5826,7 +6200,17 @@ impl KmsBackend {
         } else if decision_requires_unsupported(&decision) {
             self.admission_abort_unsupported(device, token, &decision)
         } else if matches!(decision.admitted, Admitted::Unflip { .. }) {
-            self.admission_dispatch_unflip(device, token, decision)
+            let outcome = self.admission_dispatch_unflip(device, token, decision);
+            if matches!(
+                outcome,
+                AdmissionOutcome::PreparationRefused
+                    | AdmissionOutcome::BeginRefused
+                    | AdmissionOutcome::TransportClosed
+                    | AdmissionOutcome::Unsupported(_)
+            ) {
+                self.lifecycle_client_modeset_unflip_dispatch_failed(device, None);
+            }
+            outcome
         } else if matches!(decision_primary(&decision), Some(Admitted::Direct { .. })) {
             self.admission_dispatch_direct(device, token, decision)
         } else if matches!(
