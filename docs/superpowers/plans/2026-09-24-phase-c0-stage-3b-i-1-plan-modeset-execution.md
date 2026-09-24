@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 3 (2026-09-24, coordinator)** — Task 2 F8 (after implementing,
+at mutation E6): with a DPMS commit in flight the owner's single-flight slot
+blocks the modeset independently of the transition guard, so the named test
+could not catch E6. The scenario now holds the DPMS transition active before
+its commit (waiting for its clock) and uses a modeset that needs no clock.
+
 **Revision 2 (2026-09-24, coordinator)** — codex round 1
 (`../findings/2026-09-24-stage-3b-i-1-plan-review-round1.md`: 0 blocking, 3
 major, all verified): a DPMS change before dispatch supersedes, it does not
@@ -150,7 +156,7 @@ source may be used, provided no production path can reach it.
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3bi_topology_work_is_typed` | a transition and a client modeset queued on two fixtures: each `Admitted::Topology` carries its own `TopologyWork` variant, and a client result cannot be consumed as a transition result (compile-level: the boundary matches on the variant; runtime: a client tag with a stale generation is refused) | **E5** compare only incarnation and epoch for a client tag |
-| `c0_3bi_modeset_waits_for_the_active_transition` | DPMS-off in flight (stub `NeverReply` until released), then a modeset begin: no modeset validation is sent until the DPMS transition's result is at the boundary | **E6** dispatch the modeset while a transition is active |
+| `c0_3bi_modeset_waits_for_the_active_transition` | *(rev 3, Task 2 F8)* a DPMS-off transition **active but with no commit in the owner's slot** — it waits for the clock probe of its lit CRTC, which the stub holds — then a modeset begin that needs no clock (an enable of a disabled output, inactive before): no modeset validation is sent while the transition is active; after the probe reply the DPMS commit dispatches first and the modeset only after the DPMS result crossed the boundary. (With a DPMS commit in flight the owner's single-flight slot blocks the modeset by itself, so that scenario cannot catch E6.) | **E6** dispatch the modeset while a transition is active |
 | `c0_3bi_rec4_supersedes_before_dispatch` | modeset queued, a DPMS event arrives before dispatch: the modeset ends `Superseded(DPMS)` with no validation or live send, and the DPMS transition proceeds | **E7** let the queued modeset dispatch first |
 | `c0_3bi_rec4_waits_after_dispatch` | modeset dispatched (stub holds the reply), DPMS event arrives: the modeset is not cancelled; the DPMS transition's first send happens only after the modeset's reply crossed the boundary | **E8** cancel a dispatched modeset as never-submitted (design mutation 2) |
 | `c0_3bi_seat_released_refuses_every_form` | the seat released (`vt_state` suspended): enable, mode change and disable each answer `SeatReleased` at once, take no slot and send nothing; the idempotent form keeps Legacy's answer | **E9b** check the seat only on the enable path |
