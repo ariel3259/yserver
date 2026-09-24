@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    ArbiterInput, DesiredField, DesiredIntent, Disposition, IncidentOrigin, LifecycleAction,
-    LifecycleArbiter, LifecycleEventId, LifecycleKind, OutputProjection, OutputProjectionRemoval,
-    RecoveryAttemptOutcome, RecoveryIdAllocator, SeatTarget, TransitionTag, dpms_target_for_level,
+    ArbiterInput, ClientModesetTag, DesiredField, DesiredIntent, Disposition, IncidentOrigin,
+    LifecycleAction, LifecycleArbiter, LifecycleEventId, LifecycleKind, OutputProjection,
+    OutputProjectionRemoval, RecoveryAttemptOutcome, RecoveryIdAllocator, SeatTarget,
+    TransitionTag, dpms_target_for_level,
 };
 
 /// Result of one coordinator-assigned event projection to a device.
@@ -493,6 +494,35 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
         outcome: RecoveryAttemptOutcome,
     ) -> Result<Vec<LifecycleAction<I>>, CoordinatorError> {
         self.apply_device_input(device, ArbiterInput::RecoveryAttempt { tag, outcome })
+    }
+
+    /// Mark one client modeset as dispatched on its device. Returns false if
+    /// the captured lifecycle context is no longer current or a transition is
+    /// already active.
+    pub fn client_modeset_submitting(
+        &mut self,
+        device: &D,
+        tag: &ClientModesetTag<I>,
+    ) -> Result<bool, CoordinatorError> {
+        let entry = self
+            .devices
+            .get_mut(device)
+            .ok_or(CoordinatorError::UnknownDevice)?;
+        Ok(entry.arbiter.client_modeset_submitting(tag))
+    }
+
+    /// Resolve a dispatched client modeset at the Owner result boundary and
+    /// converge any REC-4 events projected while it was in flight.
+    pub fn client_modeset_resolved(
+        &mut self,
+        device: &D,
+        tag: &ClientModesetTag<I>,
+    ) -> Result<Vec<LifecycleAction<I>>, CoordinatorError> {
+        let entry = self
+            .devices
+            .get_mut(device)
+            .ok_or(CoordinatorError::UnknownDevice)?;
+        Ok(entry.arbiter.client_modeset_resolved(tag))
     }
 
     /// The latest protocol DPMS request is complete only if every device

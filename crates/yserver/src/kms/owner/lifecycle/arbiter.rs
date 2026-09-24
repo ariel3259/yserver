@@ -1,11 +1,11 @@
 //! Pure per-device lifecycle arbitration from C.0 §6.4 and REC-4.
 
 use super::{
-    CompletionUnknownRow, DesiredField, DesiredIntent, DeviceLifecycleState, Disposition,
-    DpmsTarget, IncidentOrigin, IncidentSeed, LifecycleDesired, LifecycleEpochId, LifecycleEventId,
-    LifecycleKind, LifecycleTransitionId, OutputProjection, Prerequisite, RecoveryAttemptTrigger,
-    RecoveryFate, RecoveryIncident, RecoveryResolution, RecoveryWinner, TableFOutcome,
-    TableUOutcome, TransitionTag, WorkTag, dpms_target_for_level, table_f, table_u,
+    ClientModesetTag, CompletionUnknownRow, DesiredField, DesiredIntent, DeviceLifecycleState,
+    Disposition, DpmsTarget, IncidentOrigin, IncidentSeed, LifecycleDesired, LifecycleEpochId,
+    LifecycleEventId, LifecycleKind, LifecycleTransitionId, OutputProjection, Prerequisite,
+    RecoveryAttemptTrigger, RecoveryFate, RecoveryIncident, RecoveryResolution, RecoveryWinner,
+    TableFOutcome, TableUOutcome, TransitionTag, WorkTag, dpms_target_for_level, table_f, table_u,
 };
 
 /// Commit progress known by the arbiter. A submitted request cannot be
@@ -251,6 +251,7 @@ pub struct LifecycleArbiter<O, I> {
     state: DeviceLifecycleState,
     epoch: LifecycleEpochId,
     transition: Option<LifecycleTransition>,
+    client_modeset_submitting: Option<ClientModesetTag<I>>,
     next_transition_id: Option<u64>,
     last_transition_id: Option<LifecycleTransitionId>,
     recovery: Option<RecoveryIncident>,
@@ -269,6 +270,7 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
             state: DeviceLifecycleState::Ready,
             epoch: LifecycleEpochId::first(),
             transition: None,
+            client_modeset_submitting: None,
             next_transition_id: Some(1),
             last_transition_id: None,
             recovery: None,
@@ -282,6 +284,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
 
     pub fn desired(&self) -> &LifecycleDesired<O> {
         &self.desired
+    }
+
+    pub fn incarnation(&self) -> &I {
+        &self.incarnation
     }
 
     pub const fn state(&self) -> DeviceLifecycleState {
@@ -300,6 +306,58 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
     pub fn transition_tag(&self) -> Option<TransitionTag<I>> {
         self.transition
             .map(|transition| self.tag_for(transition.id, self.epoch))
+    }
+
+    /// Mark the client modeset as having crossed its executor-dispatch
+    /// boundary. REC-4 events continue to project while this is set, but the
+    /// resulting transition is converged only after the modeset result crosses
+    /// the owner boundary.
+    pub fn client_modeset_submitting(&mut self, tag: &ClientModesetTag<I>) -> bool {
+        if self.transition.is_some()
+            || self.state != DeviceLifecycleState::Ready
+            || !self.admission_open
+            || tag.incarnation != self.incarnation
+            || tag.lifecycle_epoch != self.epoch
+            || self.client_modeset_submitting.is_some()
+        {
+            return false;
+        }
+        self.client_modeset_submitting = Some(tag.clone());
+        true
+    }
+
+    /// Release the class-1 barrier at the Owner result boundary and start any
+    /// REC-4 transition accumulated while the client commit was dispatched.
+    pub fn client_modeset_resolved(
+        &mut self,
+        tag: &ClientModesetTag<I>,
+    ) -> Vec<LifecycleAction<I>> {
+        if self.client_modeset_submitting.as_ref() != Some(tag) {
+            return Vec::new();
+        }
+        self.client_modeset_submitting = None;
+        if self.transition.is_none()
+            && !matches!(
+                self.state,
+                DeviceLifecycleState::Poisoned
+                    | DeviceLifecycleState::Removed
+                    | DeviceLifecycleState::ShutdownExecutorStalled
+            )
+        {
+            if self.state == DeviceLifecycleState::Ready {
+                self.admission_open = true;
+            }
+            let mut actions = self.converge();
+            if self.transition.is_none()
+                && self.state == DeviceLifecycleState::Ready
+                && self.admission_open
+            {
+                actions.push(LifecycleAction::ReopenAdmission(self.current_work_tag()));
+            }
+            actions
+        } else {
+            Vec::new()
+        }
     }
 
     pub const fn recovery(&self) -> Option<RecoveryIncident> {
@@ -452,6 +510,14 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
 
         if kind == LifecycleKind::Shutdown {
             self.state = DeviceLifecycleState::Quiescing;
+        }
+
+        // A dispatched class-1 modeset is allowed to cross its result
+        // boundary before a newly projected REC-4 transition starts. Its
+        // desired snapshot is already recorded above; resolving the client
+        // tag calls `converge` and starts the winning transition then.
+        if self.client_modeset_submitting.is_some() {
+            return actions;
         }
 
         if self.state == DeviceLifecycleState::Poisoned && kind == LifecycleKind::DPMS {

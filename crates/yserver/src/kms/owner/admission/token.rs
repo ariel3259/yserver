@@ -100,8 +100,8 @@ impl Admission {
 
     fn consume(&mut self, admitted: &Admitted) {
         match admitted {
-            Admitted::Topology { tag } => {
-                if self.topology == Some(*tag) {
+            Admitted::Topology { work } => {
+                if self.topology == Some(*work) {
                     self.topology = None;
                 }
             }

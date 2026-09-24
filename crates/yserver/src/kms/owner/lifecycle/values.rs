@@ -1,6 +1,6 @@
 //! Value types shared by the pure lifecycle desired-state and arbitration layers.
 
-use super::{LifecycleEpochId, LifecycleTransitionId};
+use super::{ClientModesetId, LifecycleEpochId, LifecycleTransitionId};
 
 /// Coordinator-assigned identity for one projected lifecycle event.
 ///
@@ -285,6 +285,23 @@ impl<I> TransitionTag<I> {
     pub fn as_work_tag(self) -> WorkTag<I> {
         WorkTag::transition_owned(self)
     }
+}
+
+/// Identity and freshness snapshot for one client modeset queued on the
+/// lifecycle driver's class-1 slot.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct ClientModesetTag<I> {
+    pub incarnation: I,
+    pub lifecycle_epoch: LifecycleEpochId,
+    pub topology_generation: u64,
+    pub modeset: ClientModesetId,
+}
+
+/// The two distinct kinds of work admitted at the topology tier.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum TopologyWork<I> {
+    Transition(TransitionTag<I>),
+    ClientModeset(ClientModesetTag<I>),
 }
 
 #[cfg(test)]

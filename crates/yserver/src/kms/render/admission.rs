@@ -23,8 +23,9 @@ use crate::{
             device::{DispatchError, FallibleBeginError, OwnerEvent},
             identity::{CommitId, IncarnationId},
             lifecycle::{
-                ArbiterInput, CommitProgress, LifecycleAction, LifecycleCommitOutcome,
-                LifecycleReceipt, LifecycleReceiptResult, TransitionTag,
+                ArbiterInput, ClientModesetId, ClientModesetTag, CommitProgress, LifecycleAction,
+                LifecycleCommitOutcome, LifecycleReceipt, LifecycleReceiptResult, TopologyWork,
+                TransitionTag,
             },
             record::{FailureCause, RefusalCause, TerminalState},
         },
@@ -174,6 +175,28 @@ enum DispatchFailureRouteKind {
     Unflip,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientModesetRefusal {
+    SeatReleased,
+    SlotOccupied,
+    NotYetSupported,
+    DeviceNotReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientModesetFailure {
+    OwnerRefused(ClientModesetRefusal),
+    Superseded(crate::kms::owner::lifecycle::LifecycleKind),
+}
+
+impl std::fmt::Display for ClientModesetFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ClientModesetFailure {}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AdmissionTraceStep {
@@ -252,6 +275,11 @@ enum LifecycleDriverWork {
         tag: TransitionTag<IncarnationId>,
         terminal: TerminalState,
     },
+    ClientModesetTerminal {
+        commit: CommitId,
+        tag: ClientModesetTag<IncarnationId>,
+        terminal: TerminalState,
+    },
 }
 
 enum LifecycleClockReadiness {
@@ -280,6 +308,34 @@ struct PendingTopologyValidation {
     cancelled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientModesetPhase {
+    Queued,
+    Validating,
+    Dispatched,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ClientModesetSlot {
+    pub(crate) tag: ClientModesetTag<IncarnationId>,
+    pub(crate) token: yserver_core::backend::CrtcConfigToken,
+    pub(crate) output_id: u32,
+    pub(crate) connector: String,
+    pub(crate) mode: Option<yserver_core::backend::ModeSpec>,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) phase: ClientModesetPhase,
+}
+
+struct PendingClientModesetValidation {
+    tag: ClientModesetTag<IncarnationId>,
+    decision: AdmissionDecision,
+    token: Option<AdmissionToken>,
+    description: CommitDescription,
+    sent: bool,
+    cancelled: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum LifecycleOwnerMilestone {
     Accepted(CommitId),
@@ -294,8 +350,12 @@ pub(crate) struct LifecycleDriver {
     pub(crate) draining: bool,
     routing_batch_depth: usize,
     pending_topology_validations: BTreeMap<CommitId, PendingTopologyValidation>,
+    pending_client_modeset_validations: BTreeMap<CommitId, PendingClientModesetValidation>,
     topology_commits: BTreeMap<CommitId, TransitionTag<IncarnationId>>,
+    client_modeset_commits: BTreeMap<CommitId, ClientModesetTag<IncarnationId>>,
     topology_dpms_active: BTreeMap<CommitId, bool>,
+    pub(crate) client_modeset: Option<ClientModesetSlot>,
+    next_client_modeset_id: Option<u64>,
     #[cfg(test)]
     pub(crate) hook: Option<LifecycleTopologyTestHook>,
     #[cfg(test)]
@@ -313,6 +373,10 @@ pub(crate) struct LifecycleDriver {
     #[cfg(test)]
     live_sends: Vec<TransitionTag<IncarnationId>>,
     #[cfg(test)]
+    client_validation_sends: Vec<ClientModesetTag<IncarnationId>>,
+    #[cfg(test)]
+    client_live_sends: Vec<ClientModesetTag<IncarnationId>>,
+    #[cfg(test)]
     stale_before_test_only: usize,
     #[cfg(test)]
     stale_before_live_dispatch: usize,
@@ -327,8 +391,12 @@ impl LifecycleDriver {
             draining: false,
             routing_batch_depth: 0,
             pending_topology_validations: BTreeMap::new(),
+            pending_client_modeset_validations: BTreeMap::new(),
             topology_commits: BTreeMap::new(),
+            client_modeset_commits: BTreeMap::new(),
             topology_dpms_active: BTreeMap::new(),
+            client_modeset: None,
+            next_client_modeset_id: Some(1),
             #[cfg(test)]
             hook: None,
             #[cfg(test)]
@@ -345,6 +413,10 @@ impl LifecycleDriver {
             validation_sends: Vec::new(),
             #[cfg(test)]
             live_sends: Vec::new(),
+            #[cfg(test)]
+            client_validation_sends: Vec::new(),
+            #[cfg(test)]
+            client_live_sends: Vec::new(),
             #[cfg(test)]
             stale_before_test_only: 0,
             #[cfg(test)]
@@ -394,7 +466,10 @@ impl LifecycleDriver {
     }
 
     pub(crate) fn has_inflight_topology(&self) -> bool {
-        !self.pending_topology_validations.is_empty() || !self.topology_commits.is_empty()
+        !self.pending_topology_validations.is_empty()
+            || !self.pending_client_modeset_validations.is_empty()
+            || !self.topology_commits.is_empty()
+            || !self.client_modeset_commits.is_empty()
     }
 
     #[cfg(test)]
@@ -447,6 +522,19 @@ impl LifecycleDriver {
     }
 
     #[cfg(test)]
+    pub(crate) fn client_modeset_test_stats(
+        &self,
+    ) -> (
+        Vec<ClientModesetTag<IncarnationId>>,
+        Vec<ClientModesetTag<IncarnationId>>,
+    ) {
+        (
+            self.client_validation_sends.clone(),
+            self.client_live_sends.clone(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn run_to_completion_test_stats(&self) -> (usize, usize, usize, usize) {
         (
             self.drain_entries,
@@ -454,6 +542,12 @@ impl LifecycleDriver {
             self.applied_inputs,
             self.stale_receipts,
         )
+    }
+
+    pub(crate) fn allocate_client_modeset_id(&mut self) -> Option<ClientModesetId> {
+        let raw = self.next_client_modeset_id?;
+        self.next_client_modeset_id = raw.checked_add(1);
+        Some(ClientModesetId::from_raw(raw))
     }
 }
 
@@ -623,6 +717,112 @@ impl AdmissionConductor {
 
 #[allow(dead_code)]
 impl KmsBackend {
+    pub(crate) fn admission_start_client_modeset(
+        &mut self,
+        device: DrmDeviceKey,
+        token: yserver_core::backend::CrtcConfigToken,
+        output_id: u32,
+        connector: String,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> std::io::Result<()> {
+        self.lifecycle_register_owner_device(device)
+            .map_err(|error| {
+                std::io::Error::other(format!("Owner lifecycle unavailable: {error:?}"))
+            })?;
+        let state = self
+            .lifecycle_coordinator
+            .device(&device)
+            .map(|arbiter| arbiter.state());
+        if state != Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Ready) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                ClientModesetFailure::OwnerRefused(ClientModesetRefusal::DeviceNotReady),
+            ));
+        }
+        if self
+            .lifecycle_drivers
+            .get(&device)
+            .is_some_and(|driver| driver.client_modeset.is_some())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                ClientModesetFailure::OwnerRefused(ClientModesetRefusal::SlotOccupied),
+            ));
+        }
+        let (incarnation, lifecycle_epoch, topology_generation) = self
+            .platform
+            .owner_ref(device)
+            .map(|owner| {
+                (
+                    owner.incarnation(),
+                    owner.lifecycle_epoch(),
+                    owner.topology_generation(),
+                )
+            })
+            .ok_or_else(|| std::io::Error::other("Owner modeset has no device owner"))?;
+        let driver = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .expect("Owner lifecycle registration installs a driver");
+        let modeset = driver
+            .allocate_client_modeset_id()
+            .ok_or_else(|| std::io::Error::other("Owner client modeset identity exhausted"))?;
+        let tag = ClientModesetTag {
+            incarnation,
+            lifecycle_epoch,
+            topology_generation,
+            modeset,
+        };
+        driver.client_modeset = Some(ClientModesetSlot {
+            tag,
+            token,
+            output_id,
+            connector,
+            mode,
+            x,
+            y,
+            phase: ClientModesetPhase::Queued,
+        });
+        if let Some(conductor) = self.admission_conductors.get_mut(&device)
+            && conductor.admission.topology().is_none()
+        {
+            let _ = conductor
+                .admission
+                .request_topology(TopologyWork::ClientModeset(tag));
+        }
+        self.admission_wake(device, false);
+        Ok(())
+    }
+
+    fn lifecycle_queue_waiting_client_modeset(&mut self, device: DrmDeviceKey) {
+        let current = self
+            .lifecycle_coordinator
+            .device(&device)
+            .is_some_and(|arbiter| {
+                arbiter.state() == crate::kms::owner::lifecycle::DeviceLifecycleState::Ready
+                    && arbiter.transition().is_none()
+            });
+        if !current {
+            return;
+        }
+        let tag = self.lifecycle_drivers.get(&device).and_then(|driver| {
+            let slot = driver.client_modeset.as_ref()?;
+            (slot.phase == ClientModesetPhase::Queued).then_some(slot.tag)
+        });
+        let Some(tag) = tag else {
+            return;
+        };
+        if let Some(conductor) = self.admission_conductors.get_mut(&device)
+            && conductor.admission.topology().is_none()
+        {
+            let _ = conductor
+                .admission
+                .request_topology(TopologyWork::ClientModeset(tag));
+        }
+    }
+
     fn lifecycle_owner_devices(&self) -> Vec<DrmDeviceKey> {
         self.platform
             .devices
@@ -785,6 +985,15 @@ impl KmsBackend {
         if actions.is_empty() {
             return;
         }
+        if actions
+            .iter()
+            .any(|action| matches!(action, LifecycleAction::CloseAdmission(_)))
+        {
+            self.lifecycle_cancel_client_modeset_before_dispatch(
+                device,
+                self.lifecycle_superseding_kind(device),
+            );
+        }
         let Some(driver) = self.lifecycle_drivers.get_mut(&device) else {
             return;
         };
@@ -865,6 +1074,13 @@ impl KmsBackend {
                 } => {
                     self.lifecycle_dispose_topology_result(device, commit, tag, terminal);
                 }
+                LifecycleDriverWork::ClientModesetTerminal {
+                    commit,
+                    tag,
+                    terminal,
+                } => {
+                    self.lifecycle_finish_client_modeset(device, commit, tag, terminal);
+                }
             }
         }
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
@@ -924,6 +1140,8 @@ impl KmsBackend {
                             &std::collections::HashSet::from([device]),
                         );
                     }
+                    self.lifecycle_queue_waiting_client_modeset(device);
+                    self.admission_wake(device, false);
                 }
             }
             LifecycleAction::StopAliasCreation(_tag) => {}
@@ -969,7 +1187,9 @@ impl KmsBackend {
                     return;
                 }
                 if let Some(conductor) = self.admission_conductors.get_mut(&device) {
-                    let _ = conductor.admission.request_topology(tag);
+                    let _ = conductor
+                        .admission
+                        .request_topology(TopologyWork::Transition(tag));
                 }
                 self.lifecycle_sync_owner_tag(device, tag);
                 self.admission_wake(device, false);
@@ -1067,6 +1287,122 @@ impl KmsBackend {
             })
     }
 
+    pub(crate) fn client_modeset_tag_current(
+        &self,
+        device: DrmDeviceKey,
+        tag: ClientModesetTag<IncarnationId>,
+    ) -> bool {
+        self.platform.transport_gate(&device).is_some_and(|gate| {
+            gate.state() == crate::kms::render::resources::TransportState::Owner
+        }) && self
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.client_modeset.as_ref())
+            .is_some_and(|slot| slot.tag == tag)
+            && self.platform.owner_ref(device).is_some_and(|owner| {
+                owner.incarnation() == tag.incarnation
+                    && owner.lifecycle_epoch() == tag.lifecycle_epoch
+                    && owner.topology_generation() == tag.topology_generation
+            })
+            && self
+                .lifecycle_coordinator
+                .device(&device)
+                .is_some_and(|arbiter| {
+                    arbiter.incarnation() == &tag.incarnation
+                        && arbiter.epoch() == tag.lifecycle_epoch
+                })
+    }
+
+    fn lifecycle_superseding_kind(
+        &self,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::lifecycle::LifecycleKind {
+        self.lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .map_or(
+                crate::kms::owner::lifecycle::LifecycleKind::DPMS,
+                |transition| transition.kind,
+            )
+    }
+
+    fn lifecycle_complete_queued_client_modeset(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: ClientModesetTag<IncarnationId>,
+        kind: crate::kms::owner::lifecycle::LifecycleKind,
+    ) {
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor
+                .admission
+                .cancel_topology(TopologyWork::ClientModeset(tag));
+        }
+        let token = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+            driver
+                .client_modeset
+                .as_ref()
+                .is_some_and(|slot| slot.tag == tag)
+                .then(|| driver.client_modeset.take().expect("slot checked").token)
+        });
+        if let Some(token) = token {
+            self.complete_owner_client_modeset(
+                token,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    ClientModesetFailure::Superseded(kind),
+                )),
+            );
+        }
+    }
+
+    fn lifecycle_cancel_client_modeset_before_dispatch(
+        &mut self,
+        device: DrmDeviceKey,
+        kind: crate::kms::owner::lifecycle::LifecycleKind,
+    ) -> bool {
+        let Some((tag, phase)) = self
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.client_modeset.as_ref())
+            .map(|slot| (slot.tag, slot.phase))
+        else {
+            return true;
+        };
+        match phase {
+            ClientModesetPhase::Queued => {
+                self.lifecycle_complete_queued_client_modeset(device, tag, kind);
+                true
+            }
+            ClientModesetPhase::Validating => {
+                let pending_commit = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+                    driver
+                        .pending_client_modeset_validations
+                        .iter_mut()
+                        .find(|(_, pending)| pending.tag == tag)
+                        .map(|(commit, pending)| {
+                            pending.cancelled = true;
+                            (*commit, pending.sent)
+                        })
+                });
+                if let Some((commit, false)) = pending_commit {
+                    let abandoned = self
+                        .platform
+                        .owner_for(device)
+                        .is_some_and(|owner| owner.abandon_validation(commit).is_ok());
+                    if abandoned {
+                        self.lifecycle_finish_client_modeset_validation_cancelled(
+                            device, commit, tag,
+                        );
+                    }
+                    abandoned
+                } else {
+                    true
+                }
+            }
+            ClientModesetPhase::Dispatched => true,
+        }
+    }
+
     fn lifecycle_cancel_pre_submit(
         &mut self,
         device: DrmDeviceKey,
@@ -1074,7 +1410,9 @@ impl KmsBackend {
     ) -> bool {
         let mut success = true;
         if let Some(conductor) = self.admission_conductors.get_mut(&device) {
-            conductor.admission.cancel_topology(tag);
+            conductor
+                .admission
+                .cancel_topology(TopologyWork::Transition(tag));
         }
         let validation = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
             driver
@@ -1100,6 +1438,10 @@ impl KmsBackend {
                 }
             }
         }
+        success &= self.lifecycle_cancel_client_modeset_before_dispatch(
+            device,
+            self.lifecycle_superseding_kind(device),
+        );
         success
     }
 
@@ -1117,6 +1459,58 @@ impl KmsBackend {
         }
         let _ = self.managed_terminalize_queued_direct_successor(None);
         true
+    }
+
+    #[cfg(test)]
+    fn lifecycle_client_modeset_description_for_tests(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: ClientModesetTag<IncarnationId>,
+    ) -> Result<CommitDescription, String> {
+        let request = self
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.client_modeset.as_ref())
+            .filter(|slot| slot.tag == tag)
+            .map(|slot| {
+                (
+                    slot.output_id,
+                    slot.connector.clone(),
+                    slot.mode,
+                    slot.x,
+                    slot.y,
+                )
+            })
+            .ok_or_else(|| "client modeset slot became stale".to_string())?;
+        if request.0 == 0 || request.1.is_empty() {
+            return Err("client modeset test source received an invalid request".to_string());
+        }
+        let _requested_mode_and_origin = request
+            .2
+            .map(|mode| (mode.width, mode.height, mode.vrefresh, request.3, request.4));
+        let enables_inactive_output = request.2.is_some()
+            && !self.platform.outputs.iter().any(|output| {
+                output.key.device_key == device && output.key.connector_name == request.1
+            });
+        let mut description = self.lifecycle_topology_description(device)?;
+        if enables_inactive_output {
+            // Task 2 needs a clock-free enable case before production client
+            // descriptions land in Task 4. Reuse the fixture's serialized
+            // CRTC object, but model its old power as Off and the requested
+            // power as On; no old CRTC clock belongs to this test request.
+            for crtc in &mut description.crtc_state {
+                crtc.old_active = false;
+                crtc.new_active = true;
+            }
+            for object in &mut description.objects {
+                for (property, value) in &mut object.props {
+                    if *property == description.property_ids.active {
+                        *value = 1;
+                    }
+                }
+            }
+        }
+        Ok(description)
     }
 
     fn lifecycle_topology_description(
@@ -1295,7 +1689,9 @@ impl KmsBackend {
         tag: TransitionTag<IncarnationId>,
     ) {
         if let Some(conductor) = self.admission_conductors.get_mut(&device) {
-            conductor.admission.cancel_topology(tag);
+            conductor
+                .admission
+                .cancel_topology(TopologyWork::Transition(tag));
         }
         self.lifecycle_queue_input(
             device,
@@ -1346,13 +1742,32 @@ impl KmsBackend {
         token: AdmissionToken,
         decision: AdmissionDecision,
     ) -> AdmissionOutcome {
-        let Admitted::Topology { tag } = decision.admitted else {
+        let Admitted::Topology { work } = decision.admitted else {
             self.admission_abort(device, token);
             return AdmissionOutcome::Unsupported(decision.tier);
         };
+        match work {
+            TopologyWork::Transition(tag) => {
+                self.admission_dispatch_lifecycle_topology(device, token, decision, tag)
+            }
+            TopologyWork::ClientModeset(tag) => {
+                self.admission_dispatch_client_modeset(device, token, decision, tag)
+            }
+        }
+    }
+
+    fn admission_dispatch_lifecycle_topology(
+        &mut self,
+        device: DrmDeviceKey,
+        token: AdmissionToken,
+        decision: AdmissionDecision,
+        tag: TransitionTag<IncarnationId>,
+    ) -> AdmissionOutcome {
         if !self.lifecycle_tag_current(device, tag) {
             if let Some(conductor) = self.admission_conductors.get_mut(&device) {
-                conductor.admission.cancel_topology(tag);
+                conductor
+                    .admission
+                    .cancel_topology(TopologyWork::Transition(tag));
                 let _ = conductor.admission.abort(token);
             }
             self.lifecycle_queue_input(
@@ -1583,6 +1998,281 @@ impl KmsBackend {
         }
     }
 
+    fn admission_dispatch_client_modeset(
+        &mut self,
+        device: DrmDeviceKey,
+        token: AdmissionToken,
+        decision: AdmissionDecision,
+        tag: ClientModesetTag<IncarnationId>,
+    ) -> AdmissionOutcome {
+        let Some(arbiter) = self.lifecycle_coordinator.device(&device) else {
+            self.admission_abort(device, token);
+            return AdmissionOutcome::BeginRefused;
+        };
+        if arbiter.state() != crate::kms::owner::lifecycle::DeviceLifecycleState::Ready {
+            self.admission_abort(device, token);
+            return AdmissionOutcome::NothingAdmissible;
+        }
+        if !self.client_modeset_tag_current(device, tag)
+            || self
+                .lifecycle_coordinator
+                .device(&device)
+                .is_none_or(|arbiter| arbiter.transition().is_some())
+        {
+            self.admission_abort(device, token);
+            self.lifecycle_complete_queued_client_modeset(
+                device,
+                tag,
+                self.lifecycle_superseding_kind(device),
+            );
+            return AdmissionOutcome::NothingAdmissible;
+        }
+
+        #[cfg(test)]
+        let description = if self.client_modeset_description_source_for_tests {
+            self.lifecycle_client_modeset_description_for_tests(device, tag)
+                .map_err(std::io::Error::other)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                ClientModesetFailure::OwnerRefused(ClientModesetRefusal::NotYetSupported),
+            ))
+        };
+        #[cfg(not(test))]
+        let description: std::io::Result<CommitDescription> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            ClientModesetFailure::OwnerRefused(ClientModesetRefusal::NotYetSupported),
+        ));
+        let description = match description {
+            Ok(description) => description,
+            Err(error) => {
+                self.admission_abort(device, token);
+                self.lifecycle_complete_client_modeset_without_dispatch(device, tag, Err(error));
+                return AdmissionOutcome::PreparationRefused;
+            }
+        };
+        let required_clock_crtcs = description
+            .crtc_state
+            .iter()
+            .filter(|state| state.old_active)
+            .map(|state| state.crtc_id)
+            .collect::<Vec<_>>();
+        match self.lifecycle_clock_readiness(device, &required_clock_crtcs) {
+            LifecycleClockReadiness::Ready(_) => {}
+            LifecycleClockReadiness::Waiting => {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::NothingAdmissible;
+            }
+            LifecycleClockReadiness::Failed { .. }
+            | LifecycleClockReadiness::Missing(_)
+            | LifecycleClockReadiness::Inconsistent { .. } => {
+                self.admission_abort(device, token);
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        ClientModesetFailure::OwnerRefused(ClientModesetRefusal::DeviceNotReady),
+                    )),
+                );
+                return AdmissionOutcome::BeginRefused;
+            }
+        }
+        let validation_commit = match self.platform.owner_for(device).map(|owner| {
+            owner.begin_validation_with_options(
+                &description,
+                crate::kms::executor::HostCallClass::SeatActiveValidation,
+                true,
+            )
+        }) {
+            Some(Ok(commit)) => commit,
+            Some(Err(error)) => {
+                self.admission_abort(device, token);
+                if Self::lifecycle_dispatch_error_is_transient(&error) {
+                    return AdmissionOutcome::BeginRefused;
+                }
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(format!(
+                        "Owner modeset validation refused: {error}"
+                    ))),
+                );
+                return AdmissionOutcome::BeginRefused;
+            }
+            None => {
+                self.admission_abort(device, token);
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(
+                        "Owner disappeared before modeset validation",
+                    )),
+                );
+                return AdmissionOutcome::BeginRefused;
+            }
+        };
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            if let Some(slot) = driver.client_modeset.as_mut()
+                && slot.tag == tag
+            {
+                slot.phase = ClientModesetPhase::Validating;
+            }
+            driver.pending_client_modeset_validations.insert(
+                validation_commit,
+                PendingClientModesetValidation {
+                    tag,
+                    decision,
+                    token: Some(token),
+                    description,
+                    sent: false,
+                    cancelled: false,
+                },
+            );
+        }
+        if !self.client_modeset_tag_current(device, tag) {
+            if let Some(owner) = self.platform.owner_for(device) {
+                let _ = owner.abandon_validation(validation_commit);
+            }
+            self.lifecycle_finish_client_modeset_validation_cancelled(
+                device,
+                validation_commit,
+                tag,
+            );
+            return AdmissionOutcome::NothingAdmissible;
+        }
+        if let Some(pending) = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+            driver
+                .pending_client_modeset_validations
+                .get_mut(&validation_commit)
+        }) {
+            pending.sent = true;
+        }
+        #[cfg(test)]
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            driver.client_validation_sends.push(tag);
+        }
+        let send_result = self
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device)
+            .and_then(|entry| {
+                let owner = entry.owner.as_mut()?;
+                let executor = entry.executor.as_mut()?;
+                Some(owner.send_validation_on(executor))
+            });
+        match send_result {
+            Some(Ok(_events)) => AdmissionOutcome::NothingAdmissible,
+            Some(Err(error @ DispatchError::Refused { .. })) => {
+                let cause = match error {
+                    DispatchError::Refused { cause, .. } => cause,
+                    _ => unreachable!(),
+                };
+                if cause == RefusalCause::AlreadyInFlight {
+                    self.lifecycle_abort_client_modeset_validation(device, validation_commit, true);
+                    if let Some(slot) = self
+                        .lifecycle_drivers
+                        .get_mut(&device)
+                        .and_then(|driver| driver.client_modeset.as_mut())
+                        && slot.tag == tag
+                    {
+                        slot.phase = ClientModesetPhase::Queued;
+                    }
+                    AdmissionOutcome::SendRefused(cause)
+                } else {
+                    self.lifecycle_abort_client_modeset_validation(device, validation_commit, true);
+                    self.lifecycle_complete_client_modeset_without_dispatch(
+                        device,
+                        tag,
+                        Err(std::io::Error::other(format!(
+                            "Owner modeset validation refused: {cause:?}"
+                        ))),
+                    );
+                    AdmissionOutcome::SendRefused(cause)
+                }
+            }
+            Some(Err(error)) => {
+                self.lifecycle_abort_client_modeset_validation(device, validation_commit, true);
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(format!(
+                        "Owner modeset validation failed: {error}"
+                    ))),
+                );
+                AdmissionOutcome::BeginRefused
+            }
+            None => {
+                self.lifecycle_abort_client_modeset_validation(device, validation_commit, true);
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(
+                        "Owner executor disappeared before validation",
+                    )),
+                );
+                AdmissionOutcome::BeginRefused
+            }
+        }
+    }
+
+    fn lifecycle_abort_client_modeset_validation(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        abort_token: bool,
+    ) {
+        let pending = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.pending_client_modeset_validations.remove(&commit));
+        if let Some(pending) = pending
+            && abort_token
+            && let (Some(token), Some(conductor)) =
+                (pending.token, self.admission_conductors.get_mut(&device))
+        {
+            let _ = conductor.admission.abort(token);
+        }
+    }
+
+    fn lifecycle_complete_client_modeset_without_dispatch(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: ClientModesetTag<IncarnationId>,
+        result: std::io::Result<bool>,
+    ) {
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor
+                .admission
+                .cancel_topology(TopologyWork::ClientModeset(tag));
+        }
+        let token = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+            driver
+                .client_modeset
+                .as_ref()
+                .is_some_and(|slot| slot.tag == tag)
+                .then(|| driver.client_modeset.take().expect("slot checked").token)
+        });
+        if let Some(token) = token {
+            self.complete_owner_client_modeset(token, result);
+        }
+    }
+
+    fn lifecycle_finish_client_modeset_validation_cancelled(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        tag: ClientModesetTag<IncarnationId>,
+    ) {
+        self.lifecycle_abort_client_modeset_validation(device, commit, true);
+        self.lifecycle_complete_queued_client_modeset(
+            device,
+            tag,
+            self.lifecycle_superseding_kind(device),
+        );
+    }
+
     fn lifecycle_abort_pending_validation(
         &mut self,
         device: DrmDeviceKey,
@@ -1602,12 +2292,319 @@ impl KmsBackend {
         }
     }
 
+    fn lifecycle_finish_client_modeset_validation(
+        &mut self,
+        device: DrmDeviceKey,
+        validation_commit: CommitId,
+        outcome: crate::kms::owner::device::ValidationOutcome,
+    ) {
+        let Some(mut pending) = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+            driver
+                .pending_client_modeset_validations
+                .remove(&validation_commit)
+        }) else {
+            return;
+        };
+        let tag = pending.tag;
+        if pending.cancelled || !self.client_modeset_tag_current(device, tag) {
+            if let Some(owner) = self.platform.owner_for(device) {
+                let _ = owner.abandon_validation(validation_commit);
+            }
+            if let Some(token) = pending.token.take()
+                && let Some(conductor) = self.admission_conductors.get_mut(&device)
+            {
+                let _ = conductor.admission.abort(token);
+            }
+            self.lifecycle_complete_queued_client_modeset(
+                device,
+                tag,
+                self.lifecycle_superseding_kind(device),
+            );
+            return;
+        }
+        match outcome {
+            crate::kms::owner::device::ValidationOutcome::Passed => {
+                self.lifecycle_submit_validated_client_modeset(device, validation_commit, pending);
+            }
+            crate::kms::owner::device::ValidationOutcome::Rejected { errno } => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(token) = pending.token.take()
+                    && let Some(conductor) = self.admission_conductors.get_mut(&device)
+                {
+                    let _ = conductor.admission.abort(token);
+                }
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::from_raw_os_error(errno)),
+                );
+            }
+            crate::kms::owner::device::ValidationOutcome::Abandoned(reason) => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(token) = pending.token.take()
+                    && let Some(conductor) = self.admission_conductors.get_mut(&device)
+                {
+                    let _ = conductor.admission.abort(token);
+                }
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(format!(
+                        "Owner modeset validation was abandoned: {reason:?}"
+                    ))),
+                );
+            }
+        }
+    }
+
+    fn lifecycle_submit_validated_client_modeset(
+        &mut self,
+        device: DrmDeviceKey,
+        validation_commit: CommitId,
+        mut pending: PendingClientModesetValidation,
+    ) {
+        let tag = pending.tag;
+        if !self.client_modeset_tag_current(device, tag)
+            || self
+                .lifecycle_coordinator
+                .device(&device)
+                .is_none_or(|arbiter| arbiter.transition().is_some())
+        {
+            if let Some(owner) = self.platform.owner_for(device) {
+                let _ = owner.abandon_validation(validation_commit);
+            }
+            if let Some(token) = pending.token.take()
+                && let Some(conductor) = self.admission_conductors.get_mut(&device)
+            {
+                let _ = conductor.admission.abort(token);
+            }
+            self.lifecycle_complete_queued_client_modeset(
+                device,
+                tag,
+                self.lifecycle_superseding_kind(device),
+            );
+            return;
+        }
+        let Some(token) = pending.token.take() else {
+            return;
+        };
+        let expected_crtcs = pending
+            .description
+            .crtc_state
+            .iter()
+            .filter(|state| state.old_active || state.new_active)
+            .map(|state| state.crtc_id)
+            .collect::<Vec<_>>();
+        let required_clock_crtcs = pending
+            .description
+            .crtc_state
+            .iter()
+            .filter(|state| state.old_active)
+            .map(|state| state.crtc_id)
+            .collect::<Vec<_>>();
+        let clocks = match self.lifecycle_clock_readiness(device, &required_clock_crtcs) {
+            LifecycleClockReadiness::Ready(clocks) => clocks,
+            LifecycleClockReadiness::Waiting => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                if let Some(slot) = self
+                    .lifecycle_drivers
+                    .get_mut(&device)
+                    .and_then(|driver| driver.client_modeset.as_mut())
+                    && slot.tag == tag
+                {
+                    slot.phase = ClientModesetPhase::Queued;
+                }
+                return;
+            }
+            LifecycleClockReadiness::Failed { .. }
+            | LifecycleClockReadiness::Missing(_)
+            | LifecycleClockReadiness::Inconsistent { .. } => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        ClientModesetFailure::OwnerRefused(ClientModesetRefusal::DeviceNotReady),
+                    )),
+                );
+                return;
+            }
+        };
+        let mode_periods = expected_crtcs
+            .iter()
+            .map(|&crtc| (crtc, None))
+            .collect::<BTreeMap<_, _>>();
+        let completion_context = crate::kms::owner::completion::CompletionContext {
+            class: crate::kms::owner::completion::CompletionClass::LifecycleInstallRestore,
+            host_class: crate::kms::executor::HostCallClass::SeatActiveNonblock,
+            allow_modeset: true,
+            clocks,
+            mode_periods,
+            lifecycle_observed_max: None,
+        };
+        let begin_result = self.platform.owner_for(device).map(|owner| {
+            owner.begin_validated_with_context(
+                &pending.description,
+                crate::kms::owner::ledger::Submitted::new(Vec::new(), Vec::new()),
+                completion_context,
+            )
+        });
+        let commit = match begin_result {
+            Some(Ok((commit, _events))) => commit,
+            Some(Err(error)) => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(format!(
+                        "Owner modeset dispatch refused: {error}"
+                    ))),
+                );
+                return;
+            }
+            None => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(
+                        "Owner disappeared before modeset dispatch",
+                    )),
+                );
+                return;
+            }
+        };
+        let dependencies_ready = self.resource_service.as_mut().is_some_and(|service| {
+            register_commit_dependencies(commit, Vec::new(), Vec::new(), service).is_ok()
+        });
+        if !dependencies_ready {
+            if let Some(owner) = self.platform.owner_for(device) {
+                let _ = owner.cancel_live(commit);
+            }
+            if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                let _ = conductor.admission.abort(token);
+            }
+            self.lifecycle_complete_client_modeset_without_dispatch(
+                device,
+                tag,
+                Err(std::io::Error::other(
+                    "Owner modeset dependencies were not ready",
+                )),
+            );
+            return;
+        }
+        if !self.client_modeset_tag_current(device, tag) {
+            if let Some(owner) = self.platform.owner_for(device) {
+                let _ = owner.cancel_live(commit);
+            }
+            if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                let _ = conductor.admission.abort(token);
+            }
+            self.lifecycle_complete_queued_client_modeset(
+                device,
+                tag,
+                self.lifecycle_superseding_kind(device),
+            );
+            return;
+        }
+        let marked_submitting = self
+            .lifecycle_coordinator
+            .client_modeset_submitting(&device, &tag)
+            .unwrap_or(false);
+        if !marked_submitting {
+            if let Some(owner) = self.platform.owner_for(device) {
+                let _ = owner.cancel_live(commit);
+            }
+            if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                let _ = conductor.admission.abort(token);
+            }
+            self.lifecycle_complete_queued_client_modeset(
+                device,
+                tag,
+                self.lifecycle_superseding_kind(device),
+            );
+            return;
+        }
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            if let Some(slot) = driver.client_modeset.as_mut()
+                && slot.tag == tag
+            {
+                slot.phase = ClientModesetPhase::Dispatched;
+            }
+            driver.client_modeset_commits.insert(commit, tag);
+        }
+        #[cfg(test)]
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            driver.client_live_sends.push(tag);
+        }
+        let send = self
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device)
+            .and_then(|entry| {
+                let owner = entry.owner.as_mut()?;
+                let executor = entry.executor.as_mut()?;
+                Some(owner.send_on(executor))
+            });
+        match send {
+            Some(Ok(events)) => {
+                let _ = self.admission_confirm(device, token, commit, pending.decision);
+                let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
+            }
+            Some(Err(_)) | None => {
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                let events = self
+                    .platform
+                    .owner_for(device)
+                    .and_then(|owner| owner.cancel_live(commit).ok())
+                    .unwrap_or_default();
+                let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
+            }
+        }
+    }
+
     fn lifecycle_finish_topology_validation(
         &mut self,
         device: DrmDeviceKey,
         validation_commit: CommitId,
         outcome: crate::kms::owner::device::ValidationOutcome,
     ) {
+        if self.lifecycle_drivers.get(&device).is_some_and(|driver| {
+            driver
+                .pending_client_modeset_validations
+                .contains_key(&validation_commit)
+        }) {
+            self.lifecycle_finish_client_modeset_validation(device, validation_commit, outcome);
+            return;
+        }
         let Some(mut pending) = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
             driver
                 .pending_topology_validations
@@ -1948,7 +2945,9 @@ impl KmsBackend {
                 let _ = self.admission_dispose_refusal(
                     device,
                     token,
-                    Admitted::Topology { tag },
+                    Admitted::Topology {
+                        work: TopologyWork::Transition(tag),
+                    },
                     error,
                 );
             }
@@ -1983,6 +2982,57 @@ impl KmsBackend {
         }
     }
 
+    fn lifecycle_finish_client_modeset(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        tag: ClientModesetTag<IncarnationId>,
+        terminal: TerminalState,
+    ) {
+        let tracked_tag = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.client_modeset_commits.remove(&commit));
+        if tracked_tag != Some(tag) {
+            return;
+        }
+        let token = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+            driver
+                .client_modeset
+                .as_ref()
+                .is_some_and(|slot| slot.tag == tag)
+                .then(|| driver.client_modeset.take().expect("slot checked").token)
+        });
+        let Some(token) = token else {
+            return;
+        };
+        let result = match terminal {
+            TerminalState::Completed => Ok(true),
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno }) => {
+                Err(std::io::Error::from_raw_os_error(errno))
+            }
+            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(cause)) => Err(
+                std::io::Error::other(format!("Owner modeset was not dispatched: {cause:?}")),
+            ),
+            TerminalState::CompletionUnknown(cause) => Err(std::io::Error::other(format!(
+                "Owner modeset completion is unknown: {cause:?}"
+            ))),
+        };
+        match self
+            .lifecycle_coordinator
+            .client_modeset_resolved(&device, &tag)
+        {
+            Ok(actions) => {
+                let requester = self.lifecycle_current_tag(device);
+                self.lifecycle_queue_actions(device, actions, requester);
+            }
+            Err(error) => log::error!(
+                "Owner modeset result could not release lifecycle barrier for {device:?}: {error:?}"
+            ),
+        }
+        self.complete_owner_client_modeset(token, result);
+    }
+
     fn lifecycle_dispose_topology_result(
         &mut self,
         device: DrmDeviceKey,
@@ -1997,7 +3047,9 @@ impl KmsBackend {
             ))
         );
         if !transient_refusal && let Some(conductor) = self.admission_conductors.get_mut(&device) {
-            conductor.admission.cancel_topology(tag);
+            conductor
+                .admission
+                .cancel_topology(TopologyWork::Transition(tag));
         }
         let installed_dpms_active = self
             .lifecycle_drivers
@@ -2150,10 +3202,12 @@ impl KmsBackend {
         event: &OwnerEvent<CommitResources>,
     ) -> bool {
         if let OwnerEvent::ValidationResolved { commit, outcome } = event
-            && self
-                .lifecycle_drivers
-                .get(&device)
-                .is_some_and(|driver| driver.pending_topology_validations.contains_key(commit))
+            && self.lifecycle_drivers.get(&device).is_some_and(|driver| {
+                driver.pending_topology_validations.contains_key(commit)
+                    || driver
+                        .pending_client_modeset_validations
+                        .contains_key(commit)
+            })
         {
             if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
                 driver.enqueue(LifecycleDriverWork::ValidationResolved {
@@ -2192,14 +3246,26 @@ impl KmsBackend {
                 }
             }
             Some(LifecycleOwnerMilestone::Terminal(commit, terminal)) => {
-                let tag = self
+                let transition_tag = self
                     .lifecycle_drivers
                     .get(&device)
                     .and_then(|driver| driver.topology_commits.get(&commit).copied());
-                if let Some(tag) = tag
+                let client_tag = self
+                    .lifecycle_drivers
+                    .get(&device)
+                    .and_then(|driver| driver.client_modeset_commits.get(&commit).copied());
+                if let Some(tag) = transition_tag
                     && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
                 {
                     driver.enqueue(LifecycleDriverWork::TopologyTerminal {
+                        commit,
+                        tag,
+                        terminal,
+                    });
+                } else if let Some(tag) = client_tag
+                    && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+                {
+                    driver.enqueue(LifecycleDriverWork::ClientModesetTerminal {
                         commit,
                         tag,
                         terminal,
@@ -2240,11 +3306,16 @@ impl KmsBackend {
         terminal: TerminalState,
     ) -> TerminalState {
         let stale_success = terminal == TerminalState::Completed
-            && self
-                .lifecycle_drivers
-                .get(&device)
-                .and_then(|driver| driver.topology_commits.get(&commit).copied())
-                .is_some_and(|tag| !self.lifecycle_tag_current(device, tag));
+            && self.lifecycle_drivers.get(&device).is_some_and(|driver| {
+                driver
+                    .topology_commits
+                    .get(&commit)
+                    .is_some_and(|tag| !self.lifecycle_tag_current(device, *tag))
+                    || driver
+                        .client_modeset_commits
+                        .get(&commit)
+                        .is_some_and(|tag| !self.client_modeset_tag_current(device, *tag))
+            });
         if stale_success {
             TerminalState::CompletionUnknown(
                 crate::kms::owner::record::UnknownCause::ContradictoryEvidence,
