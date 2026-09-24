@@ -28,21 +28,25 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-09-24 Phase C.0 stage 3a-ii (DPMS execution on the Owner) ACCEPTED**
+  at `1f252e52`, with the stage 2b clock-probe addendum. DPMS on an Owner
+  device is an `ACTIVE`-only lifecycle commit driven by the 3a-i arbiter
+  through a per-device driver queue; Legacy DPMS is byte-for-byte unchanged and
+  the Legacy/Owner differential (backend state and client bytes) holds. The
+  card1 hardware test passes 3/3 with `nvidia-drm vblank=1`. The hardware run
+  found that no Owner clock was ever probed (fixed by the addendum), that
+  NVIDIA's default `nvidia-drm` has no DRM vblank (user decision: stage 5
+  becomes activation by capability and Legacy stays as the fallback route;
+  `docs/setup.md` documents `vblank=1` for Turing and newer), and three
+  integration-test regressions hidden by a `--lib`-only gate (repaired; every
+  gate now runs each integration file). `--lib` 1873/0/217. Finding:
+  `docs/superpowers/findings/2026-09-24-stage-3a-ii-plan-accepted.md`.
 - **2026-09-23 Phase C.0 stage 3a-i (the pure lifecycle arbiter) ACCEPTED**
   at `64d0bd68`: identities, `REC-5` desired snapshot, the two recovery tables
   (C.0 §10 by active row and `REC-6`), the per-device arbiter and the
   coordinator, all pure and with no production caller until plan 3a-ii.
   `c0_3a_` 37, `--lib` 1998/0/226. Finding:
   `docs/superpowers/findings/2026-09-23-stage-3a-i-plan-accepted.md`.
-- **2026-09-23 Phase C.0 stage 3a-ii Tasks 1–2 implemented; remaining tasks and
-  acceptance are pending.** Owner devices now project DPMS through a per-device
-  lifecycle driver queue, and topology admission carries its transition tag
-  through validation, live dispatch and result disposition. Legacy DPMS keeps
-  its existing path. The current Owner request is an `ACTIVE=1` no-op; Task 3
-  must replace it with the DPMS toggle and `LifecycleInstallRestore` commit.
-  The nine `c0_3aii_` tests pass in debug and release; the permitted filters,
-  compile-fail harness and yserver library suite pass. No modeset or DRM master
-  was used.
 - **2026-09-23 Phase C.0 stage 2c-iii direct-entry addendum ACCEPTED**
   (coordinator re-ran the gate and mutations A1 and A3 by line; both caught). Initial direct eligibility on an active
   Owner conductor now waits until every output has a composed return, using the
