@@ -4084,6 +4084,21 @@ review stages inside that PR, not separately mergeable PRs:
    final-tip gate. Its entry preconditions are listed in the stage 3 umbrella
    design, section 6.
 
+   *(Amended 2026-09-24, user decision after the stage 3a-ii hardware test;
+   `docs/superpowers/findings/2026-09-23-nvidia-get-sequence-eopnotsupp.md`.)*
+   With Legacy removed, a structurally incapable device has no route, so
+   stage 5 makes structural capability a **startup requirement**, not a
+   fallback trigger. A device whose discovery leaves it structurally incapable
+   — in particular a device without DRM vblank support, whose
+   `DRM_IOCTL_CRTC_GET_SEQUENCE` returns `EOPNOTSUPP` — makes the server exit at
+   startup with a message naming the device and the failed capability; the
+   decision stays based on ioctl behaviour, not on a driver name. For NVIDIA the
+   message names the fix: the `nvidia-drm` module parameter `vblank` defaults
+   to off, and `options nvidia-drm vblank=1` in `/etc/modprobe.d/` enables it
+   (measured on card1, driver 615.71.09: `GET_SEQUENCE` succeeds and the stage
+   3a DPMS hardware test passes). The requirement is documented for users.
+   The no-software-clock rule above is unchanged.
+
 Every stage has its focused parser/ABI, state-machine, primary, lifecycle or
 cursor/gamma software tests, but stage boundaries are not merge boundaries.
 Before evidence collection, the PR adds an evidence manifest containing the
