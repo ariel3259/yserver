@@ -894,7 +894,7 @@ impl crate::kms::render::resources::DirectOwnershipState for ScanoutM2OwnershipH
     }
 }
 
-struct ScanoutM2State {
+pub(super) struct ScanoutM2State {
     ownership: ScanoutM2OwnershipHandle,
     pending: Option<DirectPresentFrame>,
     /// One eligible direct successor, retained while `pending` owns the
@@ -941,13 +941,16 @@ struct ScanoutM2State {
     /// composed return it owns. This is set only after the dispatch crosses
     /// the send/confirm boundary; an ordinary retiring commit cannot trigger
     /// the return path by merely observing that an unflip was requested.
-    owner_unflip_return: Option<OwnerUnflipReturn>,
+    pub(super) owner_unflip_return: Option<OwnerUnflipReturn>,
     /// Outputs whose post-unflip repaint has been applied by the scene but
     /// whose scene-produced proof has not yet arrived at this backend seam.
     owner_unflip_awaiting_outputs: HashSet<usize>,
     /// Once the owner return retires, this keeps the direct-entry barrier
     /// cumulative across as many scene ticks as the affected outputs need.
     owner_unflip_barrier_active: bool,
+    /// Client modesets that have requested an Owner unflip retain direct-entry
+    /// exclusion until that unflip is terminal and the modeset itself ends.
+    pub(super) client_modeset_unflip_holds: Vec<ClientModesetUnflipHold>,
     #[cfg(test)]
     test_force_active: bool,
     #[cfg(test)]
@@ -979,6 +982,7 @@ impl ScanoutM2State {
             owner_unflip_return: None,
             owner_unflip_awaiting_outputs: HashSet::new(),
             owner_unflip_barrier_active: false,
+            client_modeset_unflip_holds: Vec::new(),
             #[cfg(test)]
             test_force_active: false,
             #[cfg(test)]
@@ -986,7 +990,7 @@ impl ScanoutM2State {
         }
     }
 
-    fn active(&self) -> bool {
+    pub(super) fn active(&self) -> bool {
         self.pending.is_some() || self.queued_successor.is_some() || self.current.is_some() || {
             #[cfg(test)]
             {
@@ -1010,7 +1014,7 @@ impl ScanoutM2State {
         self.eligible_root_streak >= SCANOUT_M2_ELIGIBLE_ROOT_PROBATION
     }
 
-    fn reset_eligible_root_probation(&mut self) {
+    pub(super) fn reset_eligible_root_probation(&mut self) {
         self.eligible_root_streak = 0;
     }
 
@@ -1028,9 +1032,19 @@ impl ScanoutM2State {
     }
 }
 
-struct OwnerUnflipReturn {
-    commit: crate::kms::render::resources::CommitKey,
+pub(super) struct OwnerUnflipReturn {
+    pub(super) commit: crate::kms::render::resources::CommitKey,
     affected_outputs: Vec<OutputKey>,
+}
+
+pub(super) struct ClientModesetUnflipHold {
+    pub(super) modeset_device: DrmDeviceKey,
+    pub(super) tag:
+        crate::kms::owner::lifecycle::ClientModesetTag<crate::kms::owner::identity::IncarnationId>,
+    pub(super) unflip_device: DrmDeviceKey,
+    pub(super) unflip_commit: Option<crate::kms::render::resources::CommitKey>,
+    pub(super) unflip_terminal: bool,
+    pub(super) request_ended: bool,
 }
 
 #[cfg(test)]
@@ -1706,7 +1720,7 @@ pub struct KmsBackend {
     /// drawable pin, submits DRM work, or affects Present capabilities.
     scanout_m0: ScanoutM0Telemetry,
     scanout_m1: ScanoutM1ProbeCache,
-    scanout_m2: ScanoutM2State,
+    pub(super) scanout_m2: ScanoutM2State,
     #[allow(dead_code)]
     pub(crate) admission_conductors:
         std::collections::BTreeMap<DrmDeviceKey, crate::kms::render::admission::AdmissionConductor>,
@@ -2723,10 +2737,6 @@ impl KmsBackend {
         frame_device.or_else(|| self.platform.primary_device().map(|device| device.key))
     }
 
-    pub(crate) fn direct_scanout_active_for_device(&self, device: DrmDeviceKey) -> bool {
-        self.scanout_m2.active() && self.direct_scanout_device_for_unflip() == Some(device)
-    }
-
     pub(crate) fn output_key_for_id(&self, output_id: u32) -> Option<&OutputKey> {
         self.output_key_by_id.get(&output_id)
     }
@@ -3508,6 +3518,7 @@ impl KmsBackend {
         self.scanout_m2.reentry_blocked_until_composed = true;
         self.scene
             .invalidate_scanout_damage_for_outputs(&affected_outputs, &self.platform);
+        self.lifecycle_client_modeset_unflip_retired(commit.device, commit);
     }
 
     pub(crate) fn record_owner_unflip_return(
@@ -3515,6 +3526,11 @@ impl KmsBackend {
         commit: crate::kms::render::resources::CommitKey,
         affected_outputs: Vec<OutputKey>,
     ) {
+        for hold in &mut self.scanout_m2.client_modeset_unflip_holds {
+            if hold.unflip_device == commit.device && hold.unflip_commit.is_none() {
+                hold.unflip_commit = Some(commit);
+            }
+        }
         self.scanout_m2.owner_unflip_return = Some(OwnerUnflipReturn {
             commit,
             affected_outputs,
@@ -4160,6 +4176,9 @@ impl KmsBackend {
         eligibility.authoritative_root = authoritative_root;
         eligibility.source_id = source_id;
         eligibility.paint_target = paint_target;
+        if !self.scanout_m2.client_modeset_unflip_holds.is_empty() {
+            eligibility.eligible = false;
+        }
         if self
             .present_crtc_key(candidate.crtc_id)
             .map(|key| key.device_key)
@@ -21937,6 +21956,13 @@ impl KmsBackend {
                             service,
                         )
                         .is_ok();
+                if consumed {
+                    self.lifecycle_client_modeset_unflip_terminal(
+                        device_key,
+                        commit_key,
+                        resource_terminal,
+                    );
+                }
                 if consumed && completion_unknown {
                     self.managed_enqueue_unknown_direct_completion(commit_key);
                 }
@@ -81335,6 +81361,352 @@ mod tests {
             backend.scene.output_instance_id_for_tests(0),
             Some(third_instance)
         );
+    }
+
+    fn c0_3bi_live_direct_modeset_fixture(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> Result<
+        (
+            OwnerLiveFixture,
+            DrmDeviceKey,
+            u32,
+            String,
+            yserver_core::backend::ModeSpec,
+            OwnerDirectCandidate,
+        ),
+        std::io::Error,
+    > {
+        let (mut fixture, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(behaviour, false)?;
+        let direct =
+            c0_conv_ciii_add_enter_direct_and_retire(&mut fixture.backend, device, 0x3b10)?;
+        Ok((fixture, device, output_id, connector, mode, direct))
+    }
+
+    fn c0_3bi_owner_unflip_commit(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::identity::CommitId {
+        if backend.device_owner_for_tests(0).live_record().is_none() {
+            backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        }
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("client modeset direct hold dispatches an Owner unflip");
+        let commit = record.commit_id();
+        assert_eq!(
+            backend
+                .scanout_m2
+                .owner_unflip_return
+                .as_ref()
+                .map(|record| record.commit),
+            Some(crate::kms::render::resources::CommitKey::new(
+                device, commit
+            )),
+            "the exact unflip commit is retained for the modeset handoff"
+        );
+        commit
+    }
+
+    fn c0_3bi_retire_owner_unflip(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+        next_executor: Option<crate::kms::executor::test_support::StubBehaviour>,
+    ) {
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        if let Some(behaviour) = next_executor {
+            c0_3aii_replace_owner_executor(backend, behaviour);
+        }
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+    }
+
+    fn c0_3bi_repaint_after_owner_unflip(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("Owner unflip repaint output");
+        let crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<Vec<_>>();
+        c0_conv_ciii_compose_and_retire_output(backend, output_idx, &crtcs);
+        assert!(backend.composed_return_established(device));
+    }
+
+    fn c0_3bi_assert_direct_reentry_probation(
+        backend: &mut super::KmsBackend,
+        direct: &OwnerDirectCandidate,
+    ) {
+        for attempt in 1..=super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+            let present_id = direct.candidate.present_id + u64::from(attempt);
+            let candidate = yserver_core::backend::PresentScanoutCandidate {
+                present_id,
+                ..direct.candidate
+            };
+            let mut event = direct.event.clone();
+            event.present_id = present_id;
+            event.serial = u32::try_from(present_id).expect("fixture Present id fits");
+            assert_eq!(
+                backend
+                    .try_present_direct(candidate, event)
+                    .expect("direct-eligible Present after a modeset end"),
+                attempt == super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION,
+                "direct re-entry follows the existing root probation"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_modeset_waits_for_unflip_retirement_vulkan() {
+        let (mut fixture, device, output_id, connector, mode, _direct) =
+            c0_3bi_live_direct_modeset_fixture(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("environmental skip: live Vulkan direct modeset fixture");
+        let backend = &mut fixture.backend;
+        let validation_before = backend.lifecycle_drivers[&device]
+            .client_modeset_test_stats()
+            .0
+            .len();
+        let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
+        let unflip = c0_3bi_owner_unflip_commit(backend, device);
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            validation_before,
+            "modeset TEST_ONLY is parked until the unflip retires"
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .is_some_and(
+                    |slot| slot.phase == crate::kms::render::admission::ClientModesetPhase::Queued
+                )
+        );
+
+        c0_3bi_retire_owner_unflip(backend, device, unflip, None);
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            validation_before + 1,
+            "modeset TEST_ONLY starts only after unflip retirement"
+        );
+        assert_eq!(
+            Backend::finish_crtc_config(backend, token)
+                .expect_err("TEST_ONLY remains pending")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_unflip_outcomes_reach_the_modeset_vulkan() {
+        use crate::kms::{
+            executor::{HostCallEvent, HostCallOutcome, UnknownReason},
+            render::admission::{ClientModesetFailure, PreparationStage},
+        };
+
+        for unknown in [false, true] {
+            let (mut fixture, device, output_id, connector, mode, _direct) =
+                c0_3bi_live_direct_modeset_fixture(
+                    crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                )
+                .expect("environmental skip: live Vulkan direct modeset fixture");
+            let backend = &mut fixture.backend;
+            let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
+            let _unflip = c0_3bi_owner_unflip_commit(backend, device);
+            let correlation = *backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("unflip record")
+                .correlation();
+            let outcome = if unknown {
+                HostCallOutcome::Unknown(UnknownReason::WatchdogExpired)
+            } else {
+                HostCallOutcome::Rejected {
+                    errno: libc::EINVAL,
+                    helper_duration_ns: 0,
+                    round_trip_ns: 0,
+                    unexpected_fence_output: false,
+                }
+            };
+            let events = backend.platform.devices[0]
+                .owner
+                .as_mut()
+                .expect("Owner")
+                .apply_host_call_event(HostCallEvent::Outcome {
+                    correlation,
+                    outcome,
+                });
+            assert!(backend.route_owner_event_batch(device, events, std::time::Instant::now()));
+            let error = Backend::finish_crtc_config(backend, token)
+                .expect_err("failed unflip fails its parked client modeset");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(if unknown {
+                    ClientModesetFailure::CompletionUnknown
+                } else {
+                    ClientModesetFailure::Preparation(PreparationStage::Unflip)
+                })
+            );
+            assert!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .0
+                    .is_empty(),
+                "the modeset was never sent after a failed unflip"
+            );
+            if unknown {
+                assert_eq!(
+                    backend
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .unwrap()
+                        .state(),
+                    crate::kms::owner::lifecycle::DeviceLifecycleState::Poisoned
+                );
+            } else {
+                assert!(
+                    backend.scanout_m2.active(),
+                    "rejected unflip leaves direct current"
+                );
+            }
+            assert!(
+                backend.scanout_m2.client_modeset_unflip_holds.is_empty(),
+                "each terminal unflip outcome releases its request-owned hold"
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .1
+                    .len(),
+                0,
+                "a failed unflip sends no client modeset commit"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_present_during_modeset_unflip_stays_composed_vulkan() {
+        let (mut fixture, device, output_id, connector, mode, direct) =
+            c0_3bi_live_direct_modeset_fixture(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            )
+            .expect("environmental skip: live Vulkan direct modeset fixture");
+        let backend = &mut fixture.backend;
+        let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
+        let unflip = c0_3bi_owner_unflip_commit(backend, device);
+        assert!(!backend.scanout_m2.client_modeset_unflip_holds.is_empty());
+
+        let candidate = yserver_core::backend::PresentScanoutCandidate {
+            present_id: direct.candidate.present_id + 1,
+            ..direct.candidate
+        };
+        assert!(
+            !backend.direct_present_eligibility(candidate).eligible,
+            "the request-owned hold keeps direct ineligible while the unflip is pending"
+        );
+        let mut event = direct.event.clone();
+        event.present_id = candidate.present_id;
+        event.serial = u32::try_from(candidate.present_id).expect("fixture Present id fits");
+        assert!(
+            !backend
+                .try_present_direct(candidate, event)
+                .expect("held direct-eligible Present takes composition"),
+            "direct is not admitted between unflip request and modeset promotion"
+        );
+        assert!(backend.scanout_m2.pending.is_none());
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .map(|record| record.commit_id()),
+            Some(unflip),
+            "the only live commit remains the composed unflip"
+        );
+        c0_3bi_retire_owner_unflip(backend, device, unflip, None);
+        assert!(backend.scanout_m2.current.is_none());
+        assert_eq!(
+            Backend::finish_crtc_config(backend, token)
+                .expect_err("TEST_ONLY remains pending")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_direct_hold_released_on_every_end_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, output_id, connector, mode, direct) =
+            c0_3bi_live_direct_modeset_fixture(StubBehaviour::NeverReply)
+                .expect("environmental skip: live Vulkan direct modeset fixture");
+        let backend = &mut fixture.backend;
+        let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
+        let unflip = c0_3bi_owner_unflip_commit(backend, device);
+        c0_3bi_retire_owner_unflip(
+            backend,
+            device,
+            unflip,
+            Some(StubBehaviour::RejectWith(libc::EINVAL)),
+        );
+        let error = c0_3bi_reject_test_only_client_modeset(backend, device, token)
+            .expect_err("TEST_ONLY rejection ends the modeset");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(
+                crate::kms::render::admission::ClientModesetFailure::Preparation(
+                    crate::kms::render::admission::PreparationStage::TestOnly {
+                        errno: libc::EINVAL
+                    }
+                )
+            )
+        );
+        assert!(backend.scanout_m2.client_modeset_unflip_holds.is_empty());
+        c0_3aii_replace_owner_executor(backend, StubBehaviour::NeverReply);
+        c0_3bi_repaint_after_owner_unflip(backend, device);
+        c0_3bi_assert_direct_reentry_probation(backend, &direct);
+
+        let (mut fixture, device, output_id, connector, mode, direct) =
+            c0_3bi_live_direct_modeset_fixture(StubBehaviour::NeverReply)
+                .expect("environmental skip: second live Vulkan direct modeset fixture");
+        let backend = &mut fixture.backend;
+        let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
+        let unflip = c0_3bi_owner_unflip_commit(backend, device);
+        c0_3bi_retire_owner_unflip(backend, device, unflip, None);
+        c0_3aii_apply_dpms_transition(backend, device, 3);
+        let error = Backend::finish_crtc_config(backend, token)
+            .expect_err("DPMS supersedes the parked modeset");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(
+                crate::kms::render::admission::ClientModesetFailure::Superseded(
+                    crate::kms::owner::lifecycle::LifecycleKind::DPMS
+                )
+            )
+        );
+        assert!(backend.scanout_m2.client_modeset_unflip_holds.is_empty());
+        c0_3aii_apply_dpms_transition(backend, device, 0);
+        c0_3bi_repaint_after_owner_unflip(backend, device);
+        c0_3aii_replace_owner_executor(backend, StubBehaviour::NeverReply);
+        c0_3bi_assert_direct_reentry_probation(backend, &direct);
     }
 
     #[test]
