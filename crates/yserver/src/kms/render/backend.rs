@@ -41745,6 +41745,180 @@ mod tests {
         );
     }
 
+    fn dispatch_raw(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from((4 + body.len()) / 4).expect("request length"),
+            },
+            body,
+            None,
+        )
+        .expect("process_request must succeed");
+    }
+
+    /// Window-storage step 4: a NameWindowPixmap taken before an unmap keeps
+    /// the released backing alive and readable, and the remap hands the
+    /// window a new backing (Xorg compUnrealizeWindow / compRealizeWindow).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn named_pixmap_survives_unmap_and_remap_gets_new_backing() {
+        use yserver_core::{backend::Backend, resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let window = ResourceId(0x0140_0001);
+        let named = ResourceId(0x0140_0002);
+        let host = create_live_window(
+            &mut state,
+            &mut backend,
+            window,
+            ROOT_WINDOW,
+            10,
+            10,
+            16,
+            16,
+        );
+        let window_body = window.0.to_le_bytes();
+        let mut redirect = window.0.to_le_bytes().to_vec();
+        redirect.extend_from_slice(&[1, 0, 0, 0]); // Manual
+        dispatch_raw(&mut state, &mut backend, 144, 1, &redirect); // RedirectWindow
+        let first = state
+            .resources
+            .window(window)
+            .unwrap()
+            .redirected_backing
+            .as_ref()
+            .expect("viewable redirected window has a backing")
+            .host_pixmap
+            .as_raw();
+
+        let color = 0x00aa_55ff;
+        backend
+            .fill_rectangle(None, host.as_raw(), color, 0, 0, 16, 16)
+            .expect("paint window");
+        let mut name = window.0.to_le_bytes().to_vec();
+        name.extend_from_slice(&named.0.to_le_bytes());
+        dispatch_raw(&mut state, &mut backend, 144, 6, &name); // NameWindowPixmap
+        let named_host = state
+            .resources
+            .pixmap(named)
+            .and_then(|p| p.host_xid)
+            .expect("named pixmap resource")
+            .as_raw();
+        assert_eq!(named_host, first, "named pixmap is the backing");
+
+        dispatch_raw(&mut state, &mut backend, 10, 0, &window_body); // UnmapWindow
+        assert!(
+            state
+                .resources
+                .window(window)
+                .unwrap()
+                .redirected_backing
+                .is_none()
+        );
+        assert!(
+            state.composite_redirects.contains_key(&(window, false)),
+            "redirect stays"
+        );
+        assert_eq!(backend.test_host_window_to_backing(host.as_raw()), None);
+        assert_eq!(
+            backend.test_alias_registry_get(first).map(|e| e.refcount),
+            Some(1),
+            "only the named pixmap holds the old backing",
+        );
+        let read = |backend: &mut KmsBackend, xid: u32| {
+            backend
+                .get_image_pixels_for_tests(xid, 2, 0, 0, 16, 16, !0)
+                .expect("get_image")
+                .expect("bytes")
+        };
+        let painted = |bytes: &[u8]| {
+            bytes
+                .chunks_exact(4)
+                .all(|px| px[..3] == [0xff, 0x55, 0xaa])
+        };
+        assert!(
+            painted(&read(&mut backend, named_host)),
+            "named pixmap readable after unmap"
+        );
+        let copy = backend.create_pixmap(None, 24, 16, 16).expect("copy dst");
+        backend
+            .copy_area(None, named_host, copy.as_raw(), 0, 0, 0, 0, 16, 16)
+            .expect("copy");
+        assert!(
+            painted(&read(&mut backend, copy.as_raw())),
+            "CopyArea from named pixmap"
+        );
+
+        dispatch_raw(&mut state, &mut backend, 8, 0, &window_body); // MapWindow
+        let second = state
+            .resources
+            .window(window)
+            .unwrap()
+            .redirected_backing
+            .as_ref()
+            .expect("remap re-creates the backing")
+            .host_pixmap
+            .as_raw();
+        assert_ne!(second, first, "remap gets a new backing");
+        assert_eq!(
+            backend.test_host_window_to_backing(host.as_raw()),
+            Some(second)
+        );
+        assert_eq!(
+            state
+                .resources
+                .pixmap(named)
+                .and_then(|p| p.host_xid)
+                .map(|h| h.as_raw()),
+            Some(first),
+            "named pixmap keeps the old backing",
+        );
+        assert!(
+            painted(&read(&mut backend, named_host)),
+            "named pixmap unchanged by the remap"
+        );
+
+        dispatch_raw(&mut state, &mut backend, 54, 0, &named.0.to_le_bytes()); // FreePixmap
+        assert!(
+            backend.test_alias_registry_get(first).is_none(),
+            "FreePixmap drops the last hold"
+        );
+        assert_eq!(
+            backend.test_alias_registry_get(second).map(|e| e.refcount),
+            Some(1)
+        );
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn root_copy_area_include_inferiors_captures_window_into_pixmap() {

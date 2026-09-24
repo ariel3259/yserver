@@ -4434,11 +4434,8 @@ fn mode_flip_preserves_backing_and_aliases() {
 //     return `BadMatch` per the X11 COMPOSITE spec, not silently
 //     succeed with an alias to whatever backing exists.
 //
-// TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
-// - existing_alias_survives_window_unmap
-//     A held NameWindowPixmap alias must keep the backing alive past
-//     a subsequent UnmapWindow(W) (no race that drops the storage
-//     when the redirect map clears).
+// existing_alias_survives_window_unmap: covered by the lib test
+// `named_pixmap_survives_unmap_and_remap_gets_new_backing`.
 
 /// Stage 4d — paint into the Composite Overlay Window via its xid
 /// after `GetOverlayWindow`, and assert the paint lands on COW

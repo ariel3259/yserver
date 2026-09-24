@@ -604,21 +604,7 @@ pub(crate) fn teardown_redirect_for_window(
     origin: Option<crate::backend::OriginContext>,
     window: ResourceId,
 ) {
-    let (host_window, backing) = {
-        let Some(w) = state.resources.window_mut(window) else {
-            return;
-        };
-        (w.host_xid, w.redirected_backing.take())
-    };
-    let Some(backing) = backing else {
-        return;
-    };
-    if let Err(err) = backend.release_redirected_backing(origin, backing.host_pixmap) {
-        log::warn!(
-            "release_redirected_backing(0x{:x}) failed: {err}",
-            backing.host_pixmap.as_raw()
-        );
-    }
+    unrealize_redirect_backing(state, backend, origin, window);
     // Restore W's scene-participation. The matching
     // `activate_redirect_backing_for` in `process_request.rs` flipped
     // it to false for Manual mode (and true for Automatic — a no-op
@@ -629,6 +615,14 @@ pub(crate) fn teardown_redirect_for_window(
     // session) leaves every Manually-redirected window with
     // `scene_participating=false` — i.e. invisible — for the rest of
     // the session.
+    // A mapped window hidden by an unmapped ancestor has no backing but is still excluded.
+    let Some((host_window, mapped)) = state
+        .resources
+        .window(window)
+        .map(|w| (w.host_xid, w.map_state != MapState::Unmapped))
+    else {
+        return;
+    };
     let Some(host_window) = host_window else {
         log::debug!(
             "teardown_redirect_for_window(0x{:x}): no host_xid; skipping participation restore",
@@ -636,12 +630,43 @@ pub(crate) fn teardown_redirect_for_window(
         );
         return;
     };
-    if let Err(err) = backend.set_window_scene_participation(origin, host_window, true) {
+    if let Err(err) = backend.set_window_scene_participation(origin, host_window, mapped) {
         log::warn!(
-            "teardown_redirect_for_window: set_window_scene_participation(0x{:x}, true) failed: {err}",
+            "teardown_redirect_for_window: set_window_scene_participation(0x{:x}, {mapped}) failed: {err}",
             window.0
         );
     }
+}
+
+/// Drop a redirected window's backing when it becomes unviewable, as Xorg's
+/// `compUnrealizeWindow` → `compCheckRedirect` does
+/// (`composite/compwindow.c:291`, `:176-181`). Unlike
+/// [`teardown_redirect_for_window`] the redirect record and the window's
+/// scene exclusion stay: a later realize allocates a fresh backing for the
+/// same redirect. Named pixmaps keep the old backing alive through the
+/// backend's alias registry and stop following the window, as Xorg's
+/// `DestroyPixmap` only drops the window's own reference (`:181`).
+/// Returns the released backing, if the window had one.
+pub(crate) fn unrealize_redirect_backing(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<crate::backend::OriginContext>,
+    window: ResourceId,
+) -> Option<crate::backend::PixmapHandle> {
+    let backing = {
+        let w = state.resources.window_mut(window)?;
+        let backing = w.redirected_backing.take()?;
+        w.composite_named_pixmaps
+            .retain(|alias| alias.host_pixmap != backing.host_pixmap);
+        backing
+    };
+    if let Err(err) = backend.release_redirected_backing(origin, backing.host_pixmap) {
+        log::warn!(
+            "release_redirected_backing(0x{:x}) failed: {err}",
+            backing.host_pixmap.as_raw()
+        );
+    }
+    Some(backing.host_pixmap)
 }
 
 /// Destroy every resource owned by a zombie client — invoked by
@@ -1529,6 +1554,8 @@ mod tests {
                 ..Default::default()
             },
         );
+        // Viewable: only a viewable redirected window holds a backing.
+        let _ = state.resources.map_window(window_id);
         {
             let w = state.resources.window_mut(window_id).unwrap();
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(host_xid));

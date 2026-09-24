@@ -902,6 +902,14 @@ fn activate_redirect_backing_for(
     if window == COMPOSITE_OVERLAY_WINDOW {
         return;
     }
+    // compCheckRedirect allocates only for a realized window (compwindow.c:162); realize does it later.
+    if state
+        .resources
+        .window(window)
+        .is_none_or(|w| w.map_state != MapState::Viewable)
+    {
+        return;
+    }
     // Mode-flip on an existing redirect is routed through
     // `flip_redirect_target_mode` upstream — don't reallocate
     // here (Xorg preserves the backing per
@@ -1110,53 +1118,55 @@ fn flip_redirect_target_mode(
     }
 }
 
-/// Stage 4b.7: post-hook for `handle_map_window` /
-/// `handle_map_subwindows`. When a child window is mapped under a
-/// parent that has `RedirectSubwindows(mode)` recorded, the child
-/// inherits the redirect and needs its own backing — per Composite
-/// spec ("redirected hierarchy pixels are available whenever it is
-/// viewable", `compositeproto.txt:44-48`) and Xorg's compositional
-/// realize at `xserver/composite/compwindow.c:267`.
+/// A window that just became viewable under an existing redirect (its own
+/// `RedirectWindow`, or its parent's `RedirectSubwindows`) gets a fresh
+/// backing, as Xorg's `compRealizeWindow` → `compCheckRedirect` →
+/// `compAllocPixmap` does (`composite/compwindow.c:274`, `:173-174`).
 ///
-/// Must be called AFTER `backend.map_subwindow`. The v2 backend's
-/// `map_subwindow` unconditionally sets `scene_participating = true`
-/// (it doesn't know about the parent's redirect record). Running
-/// activation AFTER lets `set_window_scene_participation(W, false)`
-/// (Manual mode) win over `map_subwindow`'s blind flip — the
-/// codex-round-6 ordering decision.
-///
-/// Gated on `backend.supports_redirect_activation()`; no-op on v1
-/// and the host-X11 test backends.
-fn maybe_activate_child_under_redirected_parent(
+/// Must be called AFTER `backend.map_subwindow`: `map_subwindow` blindly
+/// sets `scene_participating = true`, and the Manual participation flip
+/// inside `activate_redirect_backing_for` must land last. Callers walk the
+/// delta's `became_viewable` parent first, so the seed finds the parent's
+/// storage (or backing) already in place.
+fn realize_redirect_backing(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
-    child: ResourceId,
+    window: ResourceId,
 ) {
     if !backend.supports_redirect_activation() {
         return;
     }
-    let Some(parent) = state.resources.window(child).map(|w| w.parent) else {
-        return;
-    };
-    // Already redirected? `activate_redirect_backing_for` is
-    // idempotent on this case (the v2 backend's
-    // `allocate_redirected_backing` returns the existing handle
-    // unchanged), but we skip up front to avoid the wasted call.
-    let already_redirected = state
+    if state
         .resources
-        .window(child)
-        .is_some_and(|w| w.redirected_backing.is_some());
-    if already_redirected {
+        .window(window)
+        .is_none_or(|w| w.redirected_backing.is_some())
+    {
         return;
     }
-    // Look up `(parent, subwindows = true)` in
-    // `composite_redirects`. The single-window `RedirectWindow(parent)`
-    // doesn't auto-redirect children; only `RedirectSubwindows` does.
-    let Some(record) = state.composite_redirects.get(&(parent, true)).copied() else {
+    let Some(mode) = effective_redirect_mode_for_window(state, window) else {
         return;
     };
-    activate_redirect_backing_for(state, backend, origin, child, record.mode);
+    activate_redirect_backing_for(state, backend, origin, window, mode);
+}
+
+/// Apply a viewability delta to COMPOSITE backings: the windows that became
+/// unviewable (child first) drop theirs, those that became viewable (parent
+/// first) get a fresh one. The redirect records are untouched.
+fn apply_viewability_delta_to_redirects(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_unviewable {
+        let _ = crate::core_loop::process_disconnect::unrealize_redirect_backing(
+            state, backend, origin, *window,
+        );
+    }
+    for window in &delta.became_viewable {
+        realize_redirect_backing(state, backend, origin, *window);
+    }
 }
 
 /// Re-apply a window's effective COMPOSITE redirect mode after a
@@ -20715,7 +20725,7 @@ fn handle_reparent_window(
             new_parent.0,
         );
         if !directly_redirected {
-            if old_parent_redirects_subwindows && !new_parent_redirects_subwindows && had_backing {
+            if old_parent_redirects_subwindows && !new_parent_redirects_subwindows {
                 log::debug!(
                     "reparent reconcile: REVOKE window=0x{:x} (left redirected subtree)",
                     window.0,
@@ -20776,6 +20786,8 @@ fn handle_reparent_window(
             );
         }
     }
+    // After the reconcile, so a revoke still sees the backing it tears down.
+    apply_viewability_delta_to_redirects(state, backend, origin, &result.delta);
     let _dropped = fanout_event_to_clients(state, &on_window, |buf, seq, order| {
         x11::encode_reparent_notify_event(
             buf,
@@ -24809,17 +24821,15 @@ fn handle_map_window(
         .map(|w| (w.parent, w.override_redirect));
     if let Some(xid) = host_xid {
         let _ = backend.map_subwindow(origin, xid.as_raw());
-        // Stage 4b.7: if the window's parent has a
-        // `RedirectSubwindows(mode)` record, the newly-mapped child
-        // needs its own backing (per Composite spec: "redirected
-        // hierarchy pixels are available whenever it is viewable",
-        // and Xorg activates on realize at `compwindow.c:267`).
-        // AFTER `map_subwindow` per the plan's codex-round-6
-        // ordering fix — `map_subwindow` blindly flips
-        // `scene_participating = true`, so the Manual
-        // participation flip inside `activate_redirect_backing_for`
-        // (sets it back to false) must land last.
-        maybe_activate_child_under_redirected_parent(state, backend, origin, window);
+    }
+    // Every window that became viewable under a redirect (its own, or its
+    // parent's RedirectSubwindows) gets a backing, as Xorg allocates on
+    // realize (`compwindow.c:274`). AFTER `map_subwindow` per the plan's
+    // codex-round-6 ordering fix — `map_subwindow` blindly flips
+    // `scene_participating = true`, so the Manual participation flip
+    // inside `activate_redirect_backing_for` must land last.
+    apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+    if host_xid.is_some() {
         reapply_redirect_mode_after_map(state, backend, origin, window);
     }
 
@@ -24968,7 +24978,6 @@ fn map_subwindows_with_delta(
     for child in children {
         let transition = state.resources.map_window(child);
         let was_unmapped = transition.mapping_changed;
-        delta.extend(transition.delta);
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
         let extents = state.resources.window(child).map(|w| (w.width, w.height));
         let override_redirect = state
@@ -24977,10 +24986,11 @@ fn map_subwindows_with_delta(
             .is_some_and(|w| w.override_redirect);
         if let Some(xid) = host_xid {
             let _ = backend.map_subwindow(origin, xid.as_raw());
-            // Stage 4b.7: same post-hook as `handle_map_window`.
-            // Activation MUST run AFTER `map_subwindow` per the
-            // plan's round-6 ordering fix.
-            maybe_activate_child_under_redirected_parent(state, backend, origin, child);
+        }
+        // Same post-hook as `handle_map_window`: AFTER `map_subwindow`.
+        apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+        delta.extend(transition.delta);
+        if host_xid.is_some() {
             reapply_redirect_mode_after_map(state, backend, origin, child);
             // Audit #11: see `handle_map_window` for the rationale.
             // Mirror the damage bump so MapSubwindows-driven mass
@@ -25069,6 +25079,8 @@ fn handle_unmap_window(
         if let Some(xid) = host_xid {
             let _ = backend.unmap_subwindow(origin, xid.as_raw());
         }
+        // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
+        apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
         // XI1: an active device grab is released automatically when its
         // grab window becomes not viewable (XTS XGrabDeviceKey-9; Xorg
         // DeactivateGrabsOnWindowUnmap shape).
@@ -25181,6 +25193,8 @@ fn unmap_subwindows_with_delta(
             x11::encode_unmap_notify_event(buf, seq, order, parent, child, false);
         });
     }
+    // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
+    apply_viewability_delta_to_redirects(state, backend, origin, &delta);
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
@@ -51743,6 +51757,8 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
+        // Viewable: Xorg allocates a redirect backing only for a realized window.
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
         state.composite_redirects.insert(
             (ResourceId(WINDOW_XID), false),
             crate::server::RedirectRecord {
@@ -51893,6 +51909,8 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
+        // Viewable: Xorg allocates a redirect backing only for a realized window.
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
         state.composite_redirects.insert(
             (ResourceId(WINDOW_XID), false),
             crate::server::RedirectRecord {
@@ -62932,6 +62950,10 @@ mod tests {
         seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
         seed_window(&mut state, unredirected_parent_xid, root_xid, 100, 100);
         seed_window(&mut state, target_xid, unredirected_parent_xid, 50, 50);
+        // Viewable throughout: an unviewable window gets its backing at realize instead.
+        for w in [mate_panel_xid, unredirected_parent_xid, target_xid] {
+            let _ = state.resources.map_window(w);
+        }
 
         assert!(
             state
@@ -63015,6 +63037,391 @@ mod tests {
         assert_eq!(
             backing_before, backing_after,
             "RedirectWindow(W) survives reparent"
+        );
+    }
+
+    // Window-storage step 4: a redirect backing follows viewability (Xorg
+    // compRealizeWindow / compUnrealizeWindow → compCheckRedirect); the
+    // redirect itself survives until Unredirect or destruction.
+
+    fn storage_req(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request must succeed");
+    }
+
+    fn storage_redirect(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        minor: u8,
+        window: ResourceId,
+    ) {
+        let mut body = window.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&[1, 0, 0, 0]); // Manual
+        storage_req(state, backend, 144, minor, &body);
+    }
+
+    fn storage_window_req(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        opcode: u8,
+        window: ResourceId,
+    ) {
+        storage_req(state, backend, opcode, 0, &window.0.to_le_bytes());
+    }
+
+    fn drain_calls(
+        backend: &crate::backend::recording::RecordingBackend,
+    ) -> Vec<crate::backend::recording::RecordedCall> {
+        std::mem::take(&mut *backend.calls.lock().unwrap())
+    }
+
+    const MAP_WINDOW: u8 = 8;
+    const MAP_SUBWINDOWS: u8 = 9;
+    const UNMAP_WINDOW: u8 = 10;
+    const UNMAP_SUBWINDOWS: u8 = 11;
+
+    fn backing_of(state: &ServerState, window: ResourceId) -> Option<u32> {
+        state
+            .resources
+            .window(window)
+            .and_then(|w| w.redirected_backing.as_ref())
+            .map(|b| b.host_pixmap.as_raw())
+    }
+
+    fn storage_host(window: ResourceId) -> u32 {
+        0x8000_0000 | window.0
+    }
+
+    fn released(calls: &[crate::backend::recording::RecordedCall], backing: u32) -> bool {
+        calls.iter().any(|c| {
+            matches!(c, crate::backend::recording::RecordedCall::ReleaseRedirectedBacking(b) if *b == backing)
+        })
+    }
+
+    fn allocations_for(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> usize {
+        calls
+            .iter()
+            .filter(|c| {
+                matches!(c, crate::backend::recording::RecordedCall::AllocateRedirectedBacking { host_window, .. } if *host_window == storage_host(window))
+            })
+            .count()
+    }
+
+    fn participation_restored(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> bool {
+        calls.iter().any(|c| {
+            matches!(c, crate::backend::recording::RecordedCall::SetWindowSceneParticipation { host_window, participating: true } if *host_window == storage_host(window))
+        })
+    }
+
+    fn last_participation(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> Option<bool> {
+        calls.iter().rev().find_map(|c| match c {
+            crate::backend::recording::RecordedCall::SetWindowSceneParticipation {
+                host_window,
+                participating,
+            } if *host_window == storage_host(window) => Some(*participating),
+            _ => None,
+        })
+    }
+
+    /// A mapped top-level `W`, Manual-redirected through the dispatcher.
+    fn storage_redirected_top_level() -> (
+        ServerState,
+        crate::backend::recording::RecordingBackend,
+        ResourceId,
+        u32,
+    ) {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let window = ResourceId(0x0600_0001);
+        seed_window(&mut state, window, crate::resources::ROOT_WINDOW, 64, 48);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        let backing = backing_of(&state, window).expect("viewable redirected window has a backing");
+        (state, backend, window, backing)
+    }
+
+    #[test]
+    fn unmap_of_redirected_window_frees_backing_keeps_redirect_and_exclusion() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        let calls = drain_calls(&backend);
+        assert!(
+            released(&calls, backing),
+            "unmap releases the backing; calls={calls:#?}"
+        );
+        assert_eq!(backing_of(&state, window), None);
+        assert!(
+            state.composite_redirects.contains_key(&(window, false)),
+            "redirect record kept"
+        );
+        assert!(
+            !participation_restored(&calls, window),
+            "window stays out of the scene"
+        );
+    }
+
+    #[test]
+    fn remap_of_redirected_window_allocates_a_fresh_backing() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, window), 1);
+        let fresh = backing_of(&state, window).expect("remap re-creates the backing");
+        assert_ne!(fresh, backing);
+        assert_eq!(
+            last_participation(&calls, window),
+            Some(false),
+            "Manual stays excluded"
+        );
+    }
+
+    #[test]
+    fn redirect_of_unviewable_window_allocates_at_map() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let window = ResourceId(0x0600_0001);
+        seed_window(&mut state, window, crate::resources::ROOT_WINDOW, 64, 48);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        assert_eq!(
+            allocations_for(&drain_calls(&backend), window),
+            0,
+            "Xorg: not realized, no pixmap"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 1);
+        assert!(backing_of(&state, window).is_some());
+    }
+
+    #[test]
+    fn ancestor_unmap_frees_redirected_descendant_backing_and_remap_restores_it() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let frame = ResourceId(0x0600_0010);
+        let window = ResourceId(0x0600_0011);
+        seed_window(&mut state, frame, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, window, frame, 32, 24);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        let backing = backing_of(&state, window).expect("backing");
+        drain_calls(&backend);
+
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, frame);
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(state.composite_redirects.contains_key(&(window, false)));
+        assert!(!participation_restored(&calls, window));
+
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        let calls = drain_calls(&backend);
+        assert_eq!(
+            allocations_for(&calls, window),
+            1,
+            "descendant realized with its ancestor"
+        );
+        assert_ne!(backing_of(&state, window), Some(backing));
+        assert!(backing_of(&state, window).is_some());
+        assert_eq!(last_participation(&calls, window), Some(false));
+    }
+
+    #[test]
+    fn redirect_subwindows_children_follow_viewability() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let parent = ResourceId(0x0600_0020);
+        let shown = ResourceId(0x0600_0021);
+        let hidden = ResourceId(0x0600_0022);
+        seed_window(&mut state, parent, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, shown, parent, 16, 16);
+        seed_window(&mut state, hidden, parent, 16, 16);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, parent);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, shown);
+        storage_redirect(&mut state, &mut backend, 2, parent); // RedirectSubwindows
+        let shown_backing = backing_of(&state, shown).expect("viewable child redirected");
+        assert_eq!(
+            backing_of(&state, hidden),
+            None,
+            "unmapped child has no backing"
+        );
+        assert_eq!(
+            backing_of(&state, parent),
+            None,
+            "the parent itself is not redirected"
+        );
+
+        storage_window_req(&mut state, &mut backend, UNMAP_SUBWINDOWS, parent);
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, shown_backing));
+        assert_eq!(backing_of(&state, shown), None);
+        assert!(state.composite_redirects.contains_key(&(parent, true)));
+        assert!(!participation_restored(&calls, shown));
+
+        storage_window_req(&mut state, &mut backend, MAP_SUBWINDOWS, parent);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, shown), 1);
+        assert_eq!(allocations_for(&calls, hidden), 1);
+        assert_eq!(last_participation(&calls, shown), Some(false));
+        assert_eq!(last_participation(&calls, hidden), Some(false));
+
+        let (a, b) = (
+            backing_of(&state, shown).unwrap(),
+            backing_of(&state, hidden).unwrap(),
+        );
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, parent);
+        let calls = drain_calls(&backend);
+        assert!(
+            released(&calls, a) && released(&calls, b),
+            "ancestor unmap frees every child"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, parent);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, shown), 1);
+        assert_eq!(allocations_for(&calls, hidden), 1);
+    }
+
+    #[test]
+    fn unredirect_window_still_tears_down_and_restores_participation() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_redirect(&mut state, &mut backend, 3, window); // UnredirectWindow
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(!state.composite_redirects.contains_key(&(window, false)));
+        assert_eq!(last_participation(&calls, window), Some(true));
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        assert_eq!(
+            allocations_for(&drain_calls(&backend), window),
+            0,
+            "no redirect, no backing"
+        );
+    }
+
+    #[test]
+    fn unredirect_of_hidden_mapped_window_restores_participation_without_backing() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let frame = ResourceId(0x0600_0030);
+        let window = ResourceId(0x0600_0031);
+        seed_window(&mut state, frame, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, window, frame, 32, 24);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, frame);
+        drain_calls(&backend);
+        storage_redirect(&mut state, &mut backend, 3, window);
+        let calls = drain_calls(&backend);
+        assert_eq!(
+            last_participation(&calls, window),
+            Some(true),
+            "mapped window rejoins the scene"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 0);
+    }
+
+    #[test]
+    fn destroy_of_redirected_window_still_releases_backing_and_record() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, 4, window); // DestroyWindow
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert!(!state.composite_redirects.contains_key(&(window, false)));
+    }
+
+    #[test]
+    fn destroy_of_unmapped_redirected_window_drops_the_record() {
+        let (mut state, mut backend, window, _backing) = storage_redirected_top_level();
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, 4, window);
+        assert!(!state.composite_redirects.contains_key(&(window, false)));
+    }
+
+    #[test]
+    fn reparent_under_unmapped_parent_frees_backing_keeps_redirect() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        let hidden_parent = ResourceId(0x0600_0040);
+        seed_window(
+            &mut state,
+            hidden_parent,
+            crate::resources::ROOT_WINDOW,
+            64,
+            48,
+        );
+        drain_calls(&backend);
+        dispatch_reparent_window(&mut state, &mut backend, window, hidden_parent, 0, 0);
+        assert!(released(&drain_calls(&backend), backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(state.composite_redirects.contains_key(&(window, false)));
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, hidden_parent);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 1);
+    }
+
+    #[test]
+    fn unmap_severs_named_pixmaps_from_the_window() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        let named = ResourceId(0x0600_0050);
+        if let Some(w) = state.resources.window_mut(window) {
+            w.composite_named_pixmaps
+                .push(crate::resources::NamedCompositePixmap {
+                    client_pixmap: named,
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(backing),
+                    width: 64,
+                    height: 48,
+                });
+        }
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        assert!(
+            state
+                .resources
+                .window(window)
+                .unwrap()
+                .composite_named_pixmaps
+                .is_empty()
+        );
+        assert_eq!(
+            render_picture_damage_drawable(&state, named),
+            named,
+            "no longer the window's"
         );
     }
 
