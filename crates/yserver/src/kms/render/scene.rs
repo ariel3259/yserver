@@ -3226,6 +3226,31 @@ impl SceneCompositor {
     }
 
     #[cfg(test)]
+    pub(crate) fn add_quarantined_retired_owner_buffer_for_tests(
+        &mut self,
+        instance: OutputInstanceId,
+        identity: OwnerBufferIdentity,
+    ) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        let Some(bundles) = inner.retired_outputs.get_mut(&instance.device_key) else {
+            return false;
+        };
+        let Some(bundle) = bundles
+            .iter_mut()
+            .find(|bundle| bundle.instance == instance)
+        else {
+            return false;
+        };
+        bundle
+            .scene
+            .owner_buffers
+            .push(OwnerBuffer::Quarantined { identity });
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn retired_output_pool_occupancy_for_tests(
         &self,
         instance: OutputInstanceId,
@@ -3781,6 +3806,37 @@ impl SceneCompositor {
         self.inner
             .as_ref()
             .is_some_and(|inner| inner.outputs.iter().any(|o| !o.pending_acks.is_empty()))
+    }
+
+    /// Retired bundles remain owned until teardown, but only fence-gated work
+    /// needs a periodic poll. Owner buffers and pool slots may wait on KMS or
+    /// resource events, which wake the loop and service the bundle directly.
+    pub(crate) fn retired_output_work_pending(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner.retired_outputs.values().flatten().any(|bundle| {
+                !bundle.scene.failed_submit_bos.is_empty()
+                    || !bundle.scene.pending_pool_releases.is_empty()
+                    || bundle
+                        .scene
+                        .pending_acks
+                        .iter()
+                        .any(|ack| ack.ticket.is_some())
+            })
+        })
+    }
+
+    /// Service retired-output proofs without running composition. The core
+    /// loop calls this after owner/resource completion servicing so a bundle
+    /// continues to drain when there are no outputs to tick.
+    pub(crate) fn service_retired_output_bundles(
+        &mut self,
+        platform: &mut PlatformBackend,
+        resource_service: Option<&ResourceService>,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        drain_retired_output_bundles(inner, platform, resource_service);
     }
 
     /// True while one specific output has an atomic pageflip awaiting
