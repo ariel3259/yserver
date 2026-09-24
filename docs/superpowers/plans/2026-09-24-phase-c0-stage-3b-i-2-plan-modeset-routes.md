@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 3 (2026-09-25, coordinator)** — the user's standing testing rule
+(after three hardware-only defects in 3b-i-1): Task H, inserted before Task 3,
+gives every 3b scenario test an end-state leak check (A) and a single driver
+that advances the backend only through the core loop's own entries (B). The
+hardware test (C) is run by the coordinator after every task that touches a
+real path; the implementer never runs it.
+
 **Revision 2 (2026-09-24, coordinator)** — codex round 1
 (`../findings/2026-09-24-stage-3b-i-2-plan-review-round1.md`: 0 blocking, 3
 major, all verified): kept outputs repaint when the root storage identity
@@ -121,6 +128,51 @@ frame's last row.
 | `c0_3bi_retired_copied_frame_stages_vulkan` | disable and mode change with a frame at each stage (a) A in flight, (b) A done / B never prepared, (c) B in flight, (d) B done / never submitted: each follows its row, no B is prepared for a retired frame, the pool survives until every frame's last row | **F5** prepare B for a retired frame (design mutation 29); **F6** destroy the bundle before every frame's proof |
 | `c0_3bi_retired_submitted_copied_frame_vulkan` | *(rev 2, M-3)* a copied frame whose B was submitted to KMS, then its output disabled: with the displacing commit's `KmsRelease` withheld the pool survives B's fence; with the `KmsRelease` discharged but the FOREIGN return withheld it still survives; it is destroyed only after both | **F6b** destroy on B's fence alone; **F6c** destroy on the `KmsRelease` alone |
 | `c0_3bi_late_copy_completion_vulkan` | a copy job completes after its output was disabled and an index shift, and after a mode change: proofs serviced from the bundle, nothing offered or submitted, the new pool untouched | **F7** route the copied completion by index or key (design mutation 25) |
+
+## Task H — end-state check and core-loop driver for every 3b test *(rev 3)*
+
+**Why:** in 3b-i-1 the card1 hardware run found three defects no fixture test
+could: retired bundles were never serviced without composition (A1), never
+destroyed and a disable kept the CRTC's `current_resources` lease (A2), and a
+retired front BO stayed `OnScreen` (A2 follow-up). The fixture tests passed
+because they asserted only the value their author expected to change, drove
+the backend through hand-rolled loops that drifted from the core loop, and
+used a stub executor that never produces some kernel side effects.
+
+**Deliver:**
+1. **(A) One end-state check**, a test helper every lifecycle scenario test in
+   `c0_3bi_`, `c0_3bii_` (KMS side) and `c0_3aii_` calls when its scenario is
+   over. It fails when: a retired-output bundle exists that is not justified by
+   an outstanding proof the test names; the resource service holds an
+   allocation that is not in the expected live set (the installed pools, the
+   named retained bundles, the named quarantines); a BO sits in an
+   intermediate phase (`OnScreen` on a pool that is not current, `Retiring`,
+   `Owner` without an owner buffer) with no pending proof; a lease survives
+   whose holder no longer exists. The helper states the expected set
+   explicitly per test — never "whatever is there now".
+2. **(B) One driver.** A test helper that advances a `KmsBackend` exactly as
+   `yserver-core`'s loop does — through the `Backend` trait entries the loop
+   calls (`on_executor_readable`, `on_owner_completion_ready`, the DRM-event
+   entry, `drain_ready_crtc_configs`, `before_block`, and `next_wakeup` to
+   bound the wait) — and nothing else. Every 3b test that today calls
+   `route_owner_event_batch`, `service_owner_completions`,
+   `service_completions`, `drain_owner_events` or other internals to make
+   progress is moved to it. The hardware test's drive loop
+   (`c0_hw_3b_drive_until`) moves to it too, keeping its `HardwareComplete`
+   capture through an observation hook that does not replace any entry.
+   Where a test genuinely needs a stub (no kernel), the test says in a comment
+   which kernel side effect the stub does not reproduce.
+3. **Any existing test that fails under A or B is a finding, not something to
+   adjust:** stop and report it (F8) with the failing test and the leaked or
+   stuck object; the coordinator decides whether it is a defect (addendum) or
+   a test that needs a named justification. Do not weaken an assertion or add
+   a justification on your own.
+
+| Test | Scenario | Must fail under |
+| --- | --- | --- |
+| `c0_3bi_h_end_state_check_catches_a_leak_vulkan` | a mode change whose retired bundle is deliberately kept alive (a test-only hold): the end-state check fails naming it; without the hold it passes | **H1** make the check ignore retired bundles |
+| `c0_3bi_h_end_state_check_catches_a_stuck_phase_vulkan` | a pool BO left `OnScreen` after its pool stopped being current (the pre-A2 state): the check fails | **H2** make the check ignore BO phases |
+| `c0_3bi_h_driver_uses_only_core_entries` | the driver's progress on a scripted scenario equals the core loop's (`yserver-core` run loop with the same backend): same completions, same order | **H3** drop `before_block` from the driver |
 
 ## Task 3 — position-only changes (design §3.3)
 
