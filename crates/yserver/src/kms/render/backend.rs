@@ -79761,7 +79761,11 @@ mod tests {
         );
         let vblank = std::fs::read_to_string("/sys/module/nvidia_drm/parameters/vblank")
             .expect("set nvidia-drm vblank=1 before running this hardware test");
-        assert_eq!(vblank.trim(), "1", "nvidia-drm vblank must be 1");
+        assert!(
+            matches!(vblank.trim(), "Y" | "1"),
+            "nvidia-drm vblank must be enabled (the module reports {:?})",
+            vblank.trim()
+        );
 
         let probe = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
             .unwrap_or_else(|error| panic!("card1 modeset preflight failed: {error}"));
