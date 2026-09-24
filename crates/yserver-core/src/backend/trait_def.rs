@@ -1092,6 +1092,26 @@ pub trait Backend {
 
     fn unmap_subwindow(&mut self, origin: Option<OriginContext>, host_xid: u32) -> io::Result<()>;
 
+    /// A window became viewable: allocate and paint its storage (parent first; never root/COW).
+    fn realize_window_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        let _ = (origin, host_xid);
+        Ok(())
+    }
+
+    /// A window became unviewable: drop its storage (core: child first, never root/COW).
+    fn release_window_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        let _ = (origin, host_xid);
+        Ok(())
+    }
+
     fn configure_subwindow(
         &mut self,
         origin: Option<OriginContext>,

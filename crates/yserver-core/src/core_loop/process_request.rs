@@ -1169,6 +1169,50 @@ fn apply_viewability_delta_to_redirects(
     }
 }
 
+/// Host xid of a window whose storage follows its viewability; the root and the COW own theirs.
+fn storage_lifecycle_host_xid(state: &ServerState, window: ResourceId) -> Option<u32> {
+    if window == ROOT_WINDOW || window == COMPOSITE_OVERLAY_WINDOW {
+        return None;
+    }
+    state
+        .resources
+        .window(window)
+        .and_then(|w| w.host_xid)
+        .map(|h| h.as_raw())
+}
+
+/// Windows that became viewable get storage, parent first; call before their redirect backings.
+fn realize_storage_for_delta(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_viewable {
+        if let Some(xid) = storage_lifecycle_host_xid(state, *window)
+            && let Err(err) = backend.realize_window_storage(origin, xid)
+        {
+            log::warn!("realize_window_storage(0x{xid:x}) failed: {err}");
+        }
+    }
+}
+
+/// Windows that became unviewable drop storage, child first; call after their redirect backings.
+fn release_storage_for_delta(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_unviewable {
+        if let Some(xid) = storage_lifecycle_host_xid(state, *window)
+            && let Err(err) = backend.release_window_storage(origin, xid)
+        {
+            log::warn!("release_window_storage(0x{xid:x}) failed: {err}");
+        }
+    }
+}
+
 /// Re-apply a window's effective COMPOSITE redirect mode after a
 /// map operation. `map_subwindow` flips storage visible by default;
 /// Manual-redirected windows must be forced back to
@@ -20672,6 +20716,8 @@ fn handle_reparent_window(
             backend.sync_top_level_order(state);
         }
     }
+    // Before the reconcile below, so a GRANT backing finds the leaf that carries its route.
+    realize_storage_for_delta(state, backend, origin, &result.delta);
     let window = result.window;
     let new_parent = result.new_parent;
     let old_parent = result.old_parent;
@@ -20788,6 +20834,7 @@ fn handle_reparent_window(
     }
     // After the reconcile, so a revoke still sees the backing it tears down.
     apply_viewability_delta_to_redirects(state, backend, origin, &result.delta);
+    release_storage_for_delta(state, backend, origin, &result.delta);
     let _dropped = fanout_event_to_clients(state, &on_window, |buf, seq, order| {
         x11::encode_reparent_notify_event(
             buf,
@@ -24822,6 +24869,7 @@ fn handle_map_window(
     if let Some(xid) = host_xid {
         let _ = backend.map_subwindow(origin, xid.as_raw());
     }
+    realize_storage_for_delta(state, backend, origin, &transition.delta);
     // Every window that became viewable under a redirect (its own, or its
     // parent's RedirectSubwindows) gets a backing, as Xorg allocates on
     // realize (`compwindow.c:274`). AFTER `map_subwindow` per the plan's
@@ -24987,6 +25035,7 @@ fn map_subwindows_with_delta(
         if let Some(xid) = host_xid {
             let _ = backend.map_subwindow(origin, xid.as_raw());
         }
+        realize_storage_for_delta(state, backend, origin, &transition.delta);
         // Same post-hook as `handle_map_window`: AFTER `map_subwindow`.
         apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
         delta.extend(transition.delta);
@@ -25081,6 +25130,7 @@ fn handle_unmap_window(
         }
         // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
         apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+        release_storage_for_delta(state, backend, origin, &transition.delta);
         // XI1: an active device grab is released automatically when its
         // grab window becomes not viewable (XTS XGrabDeviceKey-9; Xorg
         // DeactivateGrabsOnWindowUnmap shape).
@@ -25195,6 +25245,7 @@ fn unmap_subwindows_with_delta(
     }
     // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
     apply_viewability_delta_to_redirects(state, backend, origin, &delta);
+    release_storage_for_delta(state, backend, origin, &delta);
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
@@ -57849,6 +57900,114 @@ mod tests {
             let _ = state.resources.map_window(w);
         }
         [f, a, a1, b, b1, c]
+    }
+
+    /// Window storage follows the delta: realize parent first, release child first, never the COW.
+    #[test]
+    fn window_storage_follows_viewability_delta_in_order() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, c] = subwindows_delta_fixture(&mut state);
+        for w in [f, a, a1, b, b1, c] {
+            state.resources.window_mut(w).expect("window").host_xid =
+                Some(crate::backend::WindowHandle::from_raw_for_test(w.0));
+        }
+        let _ = state.resources.map_window(a);
+        let _ = state.resources.map_window(b);
+        let storage_calls = |backend: &RecordingBackend, from: usize| -> Vec<RecordedCall> {
+            backend
+                .calls()
+                .into_iter()
+                .skip(from)
+                .filter(|c| {
+                    matches!(
+                        c,
+                        RecordedCall::RealizeWindowStorage(_)
+                            | RecordedCall::ReleaseWindowStorage(_)
+                    )
+                })
+                .collect()
+        };
+        let unmap = |state: &mut ServerState, backend: &mut RecordingBackend, w: ResourceId| {
+            handle_unmap_window(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(1),
+                &w.0.to_le_bytes(),
+            )
+            .expect("UnmapWindow");
+        };
+        let map = |state: &mut ServerState, backend: &mut RecordingBackend, w: ResourceId| {
+            handle_map_window(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(2),
+                &w.0.to_le_bytes(),
+            )
+            .expect("MapWindow");
+        };
+
+        unmap(&mut state, &mut backend, f);
+        assert_eq!(
+            storage_calls(&backend, 0),
+            [a1, a, b1, b, c, f].map(|w| RecordedCall::ReleaseWindowStorage(w.0)),
+            "the whole subtree releases, child first",
+        );
+        let from = backend.calls().len();
+        map(&mut state, &mut backend, f);
+        assert_eq!(
+            storage_calls(&backend, from),
+            [f, a, a1, b, b1, c].map(|w| RecordedCall::RealizeWindowStorage(w.0)),
+            "the whole subtree realizes, parent first",
+        );
+        let realize_at = backend
+            .calls()
+            .iter()
+            .skip(from)
+            .position(|c| matches!(c, RecordedCall::RealizeWindowStorage(_)))
+            .expect("realize recorded");
+        let map_at = backend
+            .calls()
+            .iter()
+            .skip(from)
+            .position(|c| matches!(c, RecordedCall::MapSubwindow(_)))
+            .expect("map recorded");
+        assert!(
+            map_at < realize_at,
+            "map_subwindow flips `mapped` before realize reads it"
+        );
+
+        // A mapped window under an unmapped parent gets nothing; the root and the COW never do.
+        unmap(&mut state, &mut backend, a);
+        let _ = state.resources.unmap_window(a1);
+        let from = backend.calls().len();
+        map(&mut state, &mut backend, a1);
+        assert!(
+            storage_calls(&backend, from).is_empty(),
+            "Unmapped -> Unviewable is no transition"
+        );
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(
+                COMPOSITE_OVERLAY_WINDOW.0,
+            ));
+        let from = backend.calls().len();
+        unmap(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW);
+        map(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW);
+        assert!(
+            storage_calls(&backend, from).is_empty(),
+            "the COW is outside the lifecycle"
+        );
+        assert_eq!(storage_lifecycle_host_xid(&state, ROOT_WINDOW), None);
+        assert_eq!(
+            storage_lifecycle_host_xid(&state, COMPOSITE_OVERLAY_WINDOW),
+            None
+        );
     }
 
     #[test]

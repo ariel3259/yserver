@@ -9822,6 +9822,7 @@ mod tests {
                 height: h,
                 depth: 32,
                 mapped,
+                viewable: true,
                 parent,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -12679,6 +12680,7 @@ mod tests {
                 height: 40,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: rank,
                 bg_pixel: None,
@@ -14554,7 +14556,7 @@ mod tests {
     // byte-identical draw list.
 
     /// A window whose storage is the BORDERED extent placed at the OUTER
-    /// origin, exactly as `allocate_window_storage` builds it
+    /// origin, exactly as `allocate_window_leaf` builds it
     /// (`backend.rs:13440`-`:13476`): extent `(w + 2bw) x (h + 2bw)` and the
     /// allocation's `content_offset` recorded as `bw`.
     #[allow(clippy::too_many_arguments)]
@@ -14595,6 +14597,7 @@ mod tests {
                 height: h,
                 depth: 32,
                 mapped,
+                viewable: true,
                 parent,
                 stack_rank: 0,
                 bg_pixel: None,

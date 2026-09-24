@@ -47,6 +47,8 @@ pub enum RecordedCall {
     DestroySubwindow(u32),
     MapSubwindow(u32),
     UnmapSubwindow(u32),
+    RealizeWindowStorage(u32),
+    ReleaseWindowStorage(u32),
     ConfigureSubwindow {
         host_xid: u32,
         config: HostSubwindowConfig,
@@ -1284,6 +1286,24 @@ impl Backend for RecordingBackend {
 
     fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         self.record(RecordedCall::UnmapSubwindow(host_xid));
+        Ok(())
+    }
+
+    fn realize_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::RealizeWindowStorage(host_xid));
+        Ok(())
+    }
+
+    fn release_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::ReleaseWindowStorage(host_xid));
         Ok(())
     }
 

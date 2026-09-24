@@ -2175,7 +2175,7 @@ fn root_fill_with_include_inferiors_matches_top_level_result() {
         )
         .expect("top-level");
     let top_xid = top.as_raw();
-    b.map_subwindow(None, top_xid).expect("map top");
+    b.map_window_for_tests(top_xid).expect("map top");
 
     b.fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
         .expect("clear top");
@@ -2208,7 +2208,7 @@ fn root_fill_with_include_inferiors_matches_top_level_result() {
                 None,
             )
             .expect("strip child");
-        b.map_subwindow(None, child.as_raw()).expect("map child");
+        b.map_window_for_tests(child.as_raw()).expect("map child");
         for j in 0..9 {
             let grandchild = b
                 .create_subwindow(
@@ -2228,7 +2228,7 @@ fn root_fill_with_include_inferiors_matches_top_level_result() {
                     None,
                 )
                 .expect("strip grandchild");
-            b.map_subwindow(None, grandchild.as_raw())
+            b.map_window_for_tests(grandchild.as_raw())
                 .expect("map grandchild");
         }
     }
@@ -2329,7 +2329,7 @@ fn stroke_on_root_include_inferiors_reaches_redirected_toplevel_backing() {
         )
         .expect("top-level W");
     let w_xid = w.as_raw();
-    b.map_subwindow(None, w_xid).expect("map W");
+    b.map_window_for_tests(w_xid).expect("map W");
 
     // Redirected backing for W. `get_image(w_xid)` now reads this.
     let backing = b.create_pixmap(None, 24, 200, 200).expect("W backing");
@@ -2414,7 +2414,7 @@ fn stroke_root_xor_include_inferiors_no_gap_over_subwindow() {
         )
         .expect("top-level W");
     let w_xid = w.as_raw();
-    b.map_subwindow(None, w_xid).expect("map W");
+    b.map_window_for_tests(w_xid).expect("map W");
 
     let backing = b.create_pixmap(None, 24, 200, 200).expect("W backing");
     assert!(
@@ -2447,7 +2447,7 @@ fn stroke_root_xor_include_inferiors_no_gap_over_subwindow() {
             None,
         )
         .expect("child C");
-    b.map_subwindow(None, c.as_raw()).expect("map C");
+    b.map_window_for_tests(c.as_raw()).expect("map C");
 
     // GC: IncludeInferiors + Invert.
     b.apply_draw_state(
@@ -2887,8 +2887,7 @@ fn subwindow_resize_clears_old_paint() {
     };
 
     // Create depth-32 child window at 16×16 with no bg attributes.
-    // 3f.14's allocate_window_storage fills it with transparent-
-    // black on creation.
+    // The map allocates it; bg None seeds it from the parent (the root).
     let parent = WindowHandle::from_raw(1).expect("root WindowHandle");
     let child = b
         .create_subwindow(
@@ -2909,6 +2908,7 @@ fn subwindow_resize_clears_old_paint() {
         )
         .expect("create_subwindow");
     let xid = child.as_raw();
+    b.map_window_for_tests(xid).expect("map");
 
     // Paint red into the 16×16 window so the "old paint" exists.
     // Foreground 0xFFFF0000 = ARGB(0xFF, R=0xFF, G=0, B=0).
@@ -3277,6 +3277,7 @@ fn clear_area_with_bg_pixmap_tiles_window_background() {
         )
         .expect("window");
     let xid = window.as_raw();
+    b.map_window_for_tests(xid).expect("map");
 
     b.fill_rectangle(None, xid, 0xFF00_00FF, 0, 0, 8, 8)
         .expect("window blue");
@@ -3364,6 +3365,7 @@ fn resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
         )
         .expect("window");
     let xid = window.as_raw();
+    b.map_window_for_tests(xid).expect("map");
 
     b.fill_rectangle(None, xid, 0xFF00_00FF, 0, 0, 8, 8)
         .expect("window blue");
@@ -3398,8 +3400,7 @@ fn resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
 /// (3f.10) handed back stale content — caja's drag exhibited this
 /// as widget-rect islands on black. Test: create a 16×16 depth-32
 /// subwindow, register it through the Backend trait, then
-/// get_image its xid and assert every pixel is transparent black
-/// (depth-32 safe default).
+/// get_image its xid and assert no pool garbage shows (step 5: the map seeds from the parent).
 ///
 /// We don't directly exercise the pool here — the test fixture's
 /// platform has no `pixmap_pool` attached, so fresh allocs always
@@ -3446,19 +3447,19 @@ fn window_storage_no_bg_pixel_inits_to_safe_default() {
         )
         .expect("create_subwindow");
     let child_xid = child.as_raw();
+    b.map_window_for_tests(child_xid).expect("map");
 
     let out = b
         .get_image_pixels_for_tests(child_xid, 2, 0, 0, 16, 16, !0)
         .expect("get_image")
         .expect("Some");
     assert_eq!(out.len(), 16 * 16 * 4);
-    // Depth-32 → transparent black `(0, 0, 0, 0)` per
-    // `default_window_init_color`.
+    // Background None: realize seeds over the safe default from the parent, the root's 0x505050.
     for (i, px) in out.chunks_exact(4).enumerate() {
         assert_eq!(
             &px[0..4],
-            &[0x00, 0x00, 0x00, 0x00],
-            "fresh depth-32 storage pixel #{i} must be transparent black (got {:?})",
+            &[0x50, 0x50, 0x50, 0xFF],
+            "fresh depth-32 storage pixel #{i} must hold the parent's pixels (got {:?})",
             &px[0..4],
         );
     }
@@ -3658,7 +3659,7 @@ fn unredirect_restores_the_window_leaf_from_the_backing() {
     // The restore walks the plan `plan_backing_inferiors` builds, and
     // that walk prunes unmapped subtrees (X11: an unmapped window is
     // invisible), so W has to be mapped for any of this to be reached.
-    b.map_subwindow(None, w_xid).expect("map W");
+    b.map_window_for_tests(w_xid).expect("map W");
 
     // Redirect through the production path: allocates the backing,
     // seeds it parent → B and installs the route.
@@ -3732,14 +3733,14 @@ fn unredirect_restores_a_reparented_child_leaf_not_just_the_frame() {
         .create_subwindow(None, root, 0, 0, 16, 16, 0, visual, None, None)
         .expect("create frame");
     let frame_xid = frame.as_raw();
-    b.map_subwindow(None, frame_xid).expect("map frame");
+    b.map_window_for_tests(frame_xid).expect("map frame");
     // The client's window, reparented inside the frame at (2, 3) —
     // background None, dolphin's shape.
     let client = b
         .create_subwindow(None, frame, 2, 3, 8, 8, 0, visual, None, None)
         .expect("create client");
     let client_xid = client.as_raw();
-    b.map_subwindow(None, client_xid).expect("map client");
+    b.map_window_for_tests(client_xid).expect("map client");
 
     // The compositor redirects the FRAME, not the client window.
     let backing = b
@@ -3815,6 +3816,7 @@ fn set_redirected_target_descendant_fill_lands_at_offset() {
         )
         .expect("create W");
     let w_xid = w.as_raw();
+    b.map_window_for_tests(w_xid).expect("map");
     let c = b
         .create_subwindow(
             None,
@@ -3834,6 +3836,7 @@ fn set_redirected_target_descendant_fill_lands_at_offset() {
         )
         .expect("create C");
     let c_xid = c.as_raw();
+    b.map_window_for_tests(c_xid).expect("map");
 
     // Allocate B (a pixmap) for the backing storage. Seed it black
     // so the post-fill check can detect green-at-offset.
@@ -4652,13 +4655,13 @@ fn masked_copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha() {
     let p = b
         .create_subwindow(None, root, 0, 0, 64, 64, 0, visual(32), None, None)
         .expect("depth-32 parent");
-    b.map_subwindow(None, p.as_raw()).expect("map P");
+    b.map_window_for_tests(p.as_raw()).expect("map P");
     let backing = b.create_pixmap(None, 32, 64, 64).expect("P backing");
     assert!(b.test_set_redirected_target(p.as_raw(), backing.as_raw()));
     let c = b
         .create_subwindow(None, p, 8, 8, 16, 16, 0, visual(24), None, None)
         .expect("depth-24 child");
-    b.map_subwindow(None, c.as_raw()).expect("map C");
+    b.map_window_for_tests(c.as_raw()).expect("map C");
     b.fill_rectangle(None, backing.as_raw(), 0x0000_0000, 0, 0, 64, 64)
         .expect("clear P backing to transparent");
 
@@ -4773,7 +4776,7 @@ fn copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha() {
             None,
         )
         .expect("depth-32 parent");
-    b.map_subwindow(None, p.as_raw()).expect("map P");
+    b.map_window_for_tests(p.as_raw()).expect("map P");
     let backing = b.create_pixmap(None, 32, 64, 64).expect("P backing");
     assert!(
         b.test_set_redirected_target(p.as_raw(), backing.as_raw()),
@@ -4799,7 +4802,7 @@ fn copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha() {
             None,
         )
         .expect("depth-24 child");
-    b.map_subwindow(None, c.as_raw()).expect("map C");
+    b.map_window_for_tests(c.as_raw()).expect("map C");
 
     // Transparent backing, after any map-time background paint.
     b.fill_rectangle(None, backing.as_raw(), 0x0000_0000, 0, 0, 64, 64)
@@ -8354,7 +8357,7 @@ fn two_fills_then_get_image_returns_second_fill() {
         )
         .expect("create_subwindow");
     let xid = win.as_raw();
-    b.map_subwindow(None, xid).expect("map_subwindow");
+    b.map_window_for_tests(xid).expect("map_subwindow");
 
     // XCALL fill at (20, 30, 70, 30) with fg=W_FG=1 (pixel value 1).
     let small_rect = {
@@ -8442,7 +8445,7 @@ fn compose_then_fill_then_get_image_returns_second_fill() {
         )
         .expect("create_subwindow");
     let xid = win.as_raw();
-    b.map_subwindow(None, xid).expect("map_subwindow");
+    b.map_window_for_tests(xid).expect("map_subwindow");
 
     let composite_submits_before = b.telemetry().lifetime.composite_submits;
     b.tick_maybe_composite_for_tests();
@@ -10409,6 +10412,7 @@ fn brd_bordered_window(b: &mut KmsBackend, bg: u32) -> (yserver_core::backend::W
         )
         .expect("create bordered window");
     let xid = w.as_raw();
+    b.map_window_for_tests(xid).expect("map bordered window");
     assert_eq!(
         b.storage_extent_for_tests(xid),
         Some((BRD_SW, BRD_SH)),
@@ -10486,6 +10490,7 @@ fn border_storage_is_bordered_extent_and_init_reaches_the_ring() {
             None,
         )
         .expect("create bw=0 window");
+    b.map_window_for_tests(plain.as_raw()).expect("map");
     assert_eq!(
         b.storage_extent_for_tests(plain.as_raw()),
         Some((u32::from(BRD_CW), u32::from(BRD_CH))),
@@ -11583,6 +11588,7 @@ fn copy_plane_source_follows_redirect_routing() {
             .expect("create W");
         (w, w.as_raw())
     };
+    b.map_window_for_tests(xid).expect("map");
     // Leaf := 0x…0001 in the low bit (plane 1 SET).
     b.fill_rectangle(None, xid, 0xFF00_0001, 0, 0, 4, 4)
         .expect("seed leaf plane-set");
@@ -11650,7 +11656,7 @@ fn border_redirect_seed_places_content_at_the_content_origin() {
     );
     b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
         .expect("client content fill");
-    b.map_subwindow(None, xid).expect("map");
+    b.map_window_for_tests(xid).expect("map");
     // The map repaints the background over the content, so restore the
     // marker colour after mapping.
     b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
@@ -11905,8 +11911,8 @@ fn border_render_source_on_child_of_redirected_ancestor_accumulates_the_offset()
         )
         .expect("create C");
     let c_xid = c.as_raw();
-    b.map_subwindow(None, w_xid).expect("map W");
-    b.map_subwindow(None, c_xid).expect("map C");
+    b.map_window_for_tests(w_xid).expect("map W");
+    b.map_window_for_tests(c_xid).expect("map C");
 
     // Redirect W at the bordered extent.
     let _backing = b
@@ -12119,7 +12125,7 @@ fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
             None,
         )
         .expect("create bare");
-    b.map_subwindow(None, bare.as_raw()).expect("map bare");
+    b.map_window_for_tests(bare.as_raw()).expect("map bare");
     b.apply_draw_state(
         None,
         &DrawState {
@@ -12155,7 +12161,7 @@ fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
             None,
         )
         .expect("create parent");
-    b.map_subwindow(None, parent.as_raw()).expect("map parent");
+    b.map_window_for_tests(parent.as_raw()).expect("map parent");
     for i in 0..2u16 {
         let strip = b
             .create_subwindow(
@@ -12171,7 +12177,7 @@ fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
                 None,
             )
             .expect("create strip");
-        b.map_subwindow(None, strip.as_raw()).expect("map strip");
+        b.map_window_for_tests(strip.as_raw()).expect("map strip");
         for j in (0..PH).step_by(6) {
             let grand = b
                 .create_subwindow(
@@ -12187,7 +12193,7 @@ fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
                     None,
                 )
                 .expect("create grandchild");
-            b.map_subwindow(None, grand.as_raw()).expect("map grand");
+            b.map_window_for_tests(grand.as_raw()).expect("map grand");
         }
     }
     b.apply_draw_state(
@@ -12258,7 +12264,7 @@ fn include_inferiors_root_fill_reaches_a_top_level_windows_storage() {
     let w = b
         .create_subwindow(None, root, 0, 0, PW, PH, 1, visual, Some(BRD_RED), None)
         .expect("create top-level");
-    b.map_subwindow(None, w.as_raw()).expect("map");
+    b.map_window_for_tests(w.as_raw()).expect("map");
     b.configure_subwindow(
         None,
         w.as_raw(),
@@ -12338,7 +12344,7 @@ fn include_inferiors_root_fill_after_border_width_change_has_no_stale_copy() {
         .create_subwindow(None, root, 10, 5, W, H, 1, visual, Some(BRD_RED), None)
         .expect("create test window");
     let xid = w.as_raw();
-    b.map_subwindow(None, xid).expect("map");
+    b.map_window_for_tests(xid).expect("map");
     b.apply_draw_state(
         None,
         &DrawState {
@@ -12449,7 +12455,7 @@ fn include_inferiors_fanout_lands_where_a_direct_draw_lands() {
         .create_subwindow(None, root, WX, WY, W, H, BW, visual, Some(BRD_RED), None)
         .expect("create test window");
     let xid = w.as_raw();
-    b.map_subwindow(None, xid).expect("map");
+    b.map_window_for_tests(xid).expect("map");
     b.apply_draw_state(
         None,
         &DrawState {
@@ -14731,7 +14737,8 @@ fn window_storage_init_covers_the_whole_allocation() {
             yserver_core::resources::ROOT_VISUAL.0,
             0u32,
             vec![],
-            [0u8, 0, 0, 255],
+            // Background None: realize seeds the leaf from the parent, here the root's 0x505050.
+            [80u8, 80, 80, 255],
         ),
         (
             "no background attribute, depth 32",
@@ -14739,7 +14746,7 @@ fn window_storage_init_covers_the_whole_allocation() {
             visual,
             CW_BORDER_PIXEL | CW_COLORMAP,
             vec![0u32, cmap],
-            [0, 0, 0, 0],
+            [80, 80, 80, 255],
         ),
         (
             "background-pixel = 0, depth 32",
@@ -15243,5 +15250,133 @@ fn a_shrink_keeps_the_content_at_the_border_inset() {
         at(sw as usize - BW - 1, sh as usize - BW - 1),
         [0x00, 0xFF, 0x00, 0xFF],
         "and runs to the far content corner",
+    );
+}
+
+/// Window-storage step 5, through core: storage exists only while viewable, subtree-wide.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn window_storage_exists_only_while_viewable() {
+    const FRAME: u32 = 0x0069_0001;
+    const CLIENT: u32 = 0x0069_0002;
+    const INNER: u32 = 0x0069_0003;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let vis = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(&mut f, FRAME, root_res, 24, 10, 10, 100, 80, 0, vis, 0, &[]);
+    or_create_window(&mut f, CLIENT, FRAME, 24, 5, 5, 60, 50, 0, vis, 0, &[]);
+    or_create_window(&mut f, INNER, CLIENT, 24, 2, 2, 20, 10, 0, vis, 0, &[]);
+    let storage = |f: &ProtoFixture| {
+        [FRAME, CLIENT, INNER].map(|w| f.backend.storage_extent_for_tests(f.host_xid(w)).is_some())
+    };
+    assert_eq!(storage(&f), [false; 3], "created unmapped: no storage");
+    wz_map(&mut f, CLIENT);
+    wz_map(&mut f, INNER);
+    assert_eq!(
+        storage(&f),
+        [false; 3],
+        "mapped under an unmapped frame: still none"
+    );
+    wz_map(&mut f, FRAME);
+    assert_eq!(
+        storage(&f),
+        [true; 3],
+        "the frame's map realizes the subtree"
+    );
+    f.req(10, 0, &FRAME.to_le_bytes()); // UnmapWindow
+    assert_eq!(
+        storage(&f),
+        [false; 3],
+        "the frame's unmap releases the subtree"
+    );
+    wz_map(&mut f, FRAME);
+    assert_eq!(storage(&f), [true; 3], "the remap realizes it again");
+}
+
+/// Window-storage step 5, through core: a resize while unmapped is allocated at map time.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn resize_while_unmapped_allocates_at_the_new_size_on_map() {
+    const W: u32 = 0x0069_0010;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let vis = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(&mut f, W, root_res, 24, 0, 0, 40, 30, 2, vis, 0, &[]);
+    wz_configure(&mut f, W, 0x4 | 0x8, &[64, 48]);
+    let host = f.host_xid(W);
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host),
+        None,
+        "no storage while unmapped"
+    );
+    wz_map(&mut f, W);
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host),
+        Some((68, 52)),
+        "allocated at the new size plus the border",
+    );
+}
+
+/// Window-storage step 5, through core: a bg-None window's remap storage is seeded from its parent.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn bg_none_window_is_seeded_from_its_parent_on_remap() {
+    const PARENT: u32 = 0x0069_0020;
+    const CHILD: u32 = 0x0069_0021;
+    const GC: u32 = 0x0069_0022;
+    const CW_BACK_PIXEL: u32 = 0x0000_0002;
+    const RED: u32 = 0x00FF_0000;
+    const BLUE: u32 = 0x0000_00FF;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let vis = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(
+        &mut f,
+        PARENT,
+        root_res,
+        24,
+        0,
+        0,
+        60,
+        60,
+        0,
+        vis,
+        CW_BACK_PIXEL,
+        &[RED],
+    );
+    or_create_window(&mut f, CHILD, PARENT, 24, 10, 10, 20, 20, 0, vis, 0, &[]);
+    wz_map(&mut f, PARENT);
+    wz_map(&mut f, CHILD);
+    or_create_gc(&mut f, GC, CHILD, BLUE);
+    or_fill(&mut f, CHILD, GC, 0, 0, 20, 20);
+    let uniform = |f: &mut ProtoFixture| {
+        let (_, _, px) = f.backing(CHILD);
+        let first: [u8; 3] = px[..3].try_into().expect("pixel");
+        assert!(
+            px.chunks_exact(4).all(|p| p[..3] == first),
+            "child not uniform"
+        );
+        first
+    };
+    assert_eq!(
+        uniform(&mut f),
+        or_bgr(BLUE),
+        "the child holds its own paint"
+    );
+    f.req(10, 0, &CHILD.to_le_bytes()); // UnmapWindow
+    wz_map(&mut f, CHILD);
+    assert_eq!(
+        uniform(&mut f),
+        or_bgr(RED),
+        "the remap seeds from the parent"
     );
 }
