@@ -22,6 +22,19 @@ focus is on yserver (KMS) now
 - squash merge when ready (ask confirmation)
 - Spec compliance is the goal, but if Xorg deviates from spec (unlikely), we need to follow Xorg, clients are tested for 40+ years on Xorg.
 
+- tests must exercise the real paths, for every feature and spec:
+  - **end-state check**: a scenario test that allocates or retires resources ends by checking nothing is left
+    behind that should not be (no unjustified retained objects, the resource ledger equal to the expected live
+    set, no buffer stuck in an intermediate phase) — not only the value the author expected to change;
+  - **production driver**: tests advance the backend only through the entry points the core loop itself calls
+    (the `Backend` trait methods such as `before_block`, `on_owner_completion_ready`, `next_wakeup`), never a
+    hand-rolled loop that imitates them; a stub may stand in for the kernel only where the test says what the
+    stub cannot reproduce;
+  - **hardware per task**: a task that touches a real KMS/GPU path runs its hardware test when that task is done,
+    not at the end of the plan (ask first when the machine is in use).
+  Plans name these checks per test, and plan reviews ask whether each scenario comes from production entries and
+  whether a stub hides a side effect the real kernel/driver produces.
+
 ## environment
 
 - you are most likely running in a bwrap sandbox, if you see /home/jos/realhome, you are.
