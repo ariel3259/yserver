@@ -2602,6 +2602,17 @@ fn restore_primary_output_after_rebuild(
 }
 
 impl KmsBackend {
+    /// Service retired-output bundles and the resource releases their
+    /// destruction makes ready, without composing. One entry for every site
+    /// that services owner or resource completions -- `before_block`,
+    /// `on_owner_completion_ready` and the hardware tests' drive loop --
+    /// so none of them can omit a step (addenda A1, A2).
+    pub(crate) fn service_retired_outputs(&mut self) {
+        self.scene
+            .service_retired_output_bundles(&mut self.platform, self.resource_service.as_ref());
+        self.service_resource_releases_after_retired_outputs();
+    }
+
     fn service_resource_releases_after_retired_outputs(&mut self) {
         // Dropping a drained pool releases its Retain leases. Scanout payloads
         // also own DRM aliases, so reap those newly ready entries through the
@@ -23430,9 +23441,7 @@ impl Backend for KmsBackend {
             self.route_owner_event_batch(device_key, events, now);
         }
         self.service_direct_framebuffer_edges(now, true);
-        self.scene
-            .service_retired_output_bundles(&mut self.platform, self.resource_service.as_ref());
-        self.service_resource_releases_after_retired_outputs();
+        self.service_retired_outputs();
     }
 
     fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -23445,9 +23454,7 @@ impl Backend for KmsBackend {
             self.route_owner_event_batch(device_key, events, now);
         }
         self.service_direct_framebuffer_edges(now, true);
-        self.scene
-            .service_retired_output_bundles(&mut self.platform, self.resource_service.as_ref());
-        self.service_resource_releases_after_retired_outputs();
+        self.service_retired_outputs();
     }
 
     fn on_executor_readable(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -80105,12 +80112,9 @@ mod tests {
                 }
             }
             backend.service_direct_framebuffer_edges(now, false);
-            // As `before_block` does on every core-loop iteration
-            // (addendum A1): retired bundles drain without composition.
-            backend.scene.service_retired_output_bundles(
-                &mut backend.platform,
-                backend.resource_service.as_ref(),
-            );
+            // The same retired-output servicing `before_block` runs on every
+            // core-loop iteration (addenda A1, A2).
+            backend.service_retired_outputs();
             if done(backend) {
                 return Ok(());
             }
