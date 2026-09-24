@@ -2,6 +2,11 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 7 (2026-09-25, coordinator)** — Task 7 F8: an unproven dark CRTC
+is unreachable in 3b (an unknown off poisons the device; a fresh incarnation
+after recovery is 3d's), so its test uses a seam; E30 belongs to the negative
+test, and the positive test gets E30b.
+
 **Revision 6 (2026-09-24, coordinator)** — the 3b-i-2 plan review (M-1):
 kept outputs repaint on a root storage change (Task 6).
 
@@ -344,8 +349,8 @@ discharged.
 | --- | --- | --- |
 | `c0_3bi_displaced_pool_waits_for_retirement_vulkan` | mode change on a lit CRTC: the old allocations hold `KmsRelease` after acceptance, discharged only by `CompletionRetired`, destroyed only after the GPU/FOREIGN proofs | **E28** discharge at acceptance |
 | `c0_3bi_rejection_cancels_the_displacement_vulkan` | a rejected mode change then a successful one: the rejected registrations are cancelled once, the old pool is discharged by the successful commit | **E29** leave the rejected registrations (design mutation 26) |
-| `c0_3bi_dark_crtc_displacement_vulkan` | DPMS-off, then three mode changes and a disable: each displaced pool is discharged by `DarkCrtcDisplacement` at its successor's `Completed` | **E30** issue the dark proof without a proven off (design mutation 21) |
-| `c0_3bi_unproven_off_issues_no_dark_proof_vulkan` | the off commit made `CompletionUnknown` in the fixture, then a mode change: no dark proof; the pool stays retained | **E31** treat an absent fence as a proof |
+| `c0_3bi_dark_crtc_displacement_vulkan` | DPMS-off, then three mode changes and a disable: each displaced pool is discharged by `DarkCrtcDisplacement` at its successor's `Completed` | **E30b** *(rev 7)* withhold the dark proof when the off is proven |
+| `c0_3bi_unproven_off_issues_no_dark_proof_vulkan` | *(rev 7, Task 7 F8)* the CRTC's installed-power proof absent while the device stays `Ready` — set by a test seam: `CompletionUnknown` on the off would poison the device, and the production way to reach an unproven dark CRTC with an old pool (a new incarnation after recovery) is 3d's — then a mode change: no dark proof; the pool stays retained | **E30** issue the dark proof without a proven off (design mutation 21); **E31** treat an absent fence as a proof |
 
 ## Task 8 — the failure table and the typed cause
 
