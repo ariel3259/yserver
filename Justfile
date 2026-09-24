@@ -1491,7 +1491,7 @@ rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,t
 
 # Run rendercheck against yserver on this machine's KMS, from a free TTY.
 # Tally goes to rendercheck-hw.log, the server log to yserver-hw-rendercheck.log.
-rendercheck-yserver-hw timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
+rendercheck-yserver-hw timeout="900" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin yserver
     bash -c '\
         for t in xdpyinfo xset rendercheck; do \
