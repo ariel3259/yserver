@@ -1,6 +1,6 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 10 (codex rounds
+**Status:** Revision 11 (codex rounds
 [1](../findings/2026-09-24-stage-3b-design-review-round1.md),
 [2](../findings/2026-09-24-stage-3b-design-review-round2.md),
 [3](../findings/2026-09-24-stage-3b-design-review-round3.md),
@@ -9,7 +9,7 @@
 [6](../findings/2026-09-24-stage-3b-design-review-round6.md) and
 [7](../findings/2026-09-24-stage-3b-design-review-round7.md); revision 9 corrects a
 contradiction the 3b-i-1 plan review found; revision 10 adds the generation
-reset rule the 3b-ii plan review found), written by the
+reset rule and revision 11 the forced-reprobe rule the 3b-ii plan reviews found), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -592,8 +592,19 @@ mutation is every RANDR request that changes configuration —
 `SetScreenConfig`, `SetScreenSize`, `SetCrtcConfig`, `SetOutputPrimary`,
 `SetProviderOutputSource`; the plan enumerates them from
 `handle_randr_request` and states each inclusion. `SetCrtcGamma` is color,
-class 4, stage 4, and is excluded. Queries (`GetScreenResources`,
+class 4, stage 4, and is excluded. Queries (`GetScreenResourcesCurrent`,
 `GetCrtcInfo`, …) never wait and read the published state.
+
+**The forced reprobe** *(rev 11, 3b-ii plan round-5 B-1)*. `GetScreenResources`
+forces a connector reprobe before its reply (`reprobe_connectors`,
+`process_request.rs:2939`), and the reprobe can rebuild RANDR state and emit
+notifications (`render/backend.rs:10348`) — it can publish. While the gate
+holds an **install-capable** mutation (a dispatched Owner modeset) it is
+therefore a synchronous gate member: it waits in the FIFO like a synchronous
+mutation, is never expired, and is bounded like one (`Q + E`, plus `L` in a
+mixed server), so its probe and publication follow the in-flight
+publication. Otherwise — including a pure-Legacy server with a parked PRIME
+probe — it runs at once, as today. Named exception 6.
 
 While a mutation is in flight, a client whose **next** request is a RANDR
 mutation is not dispatched: it is blocked through the existing ready-ring
@@ -917,6 +928,10 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
 5. `GateExpired`: a parkable request that waited `Q` behind a slow mutation
    answers `Failed` whatever Legacy's validation would have decided (section
    7.3).
+6. `GetScreenResources` behind a dispatched Owner modeset waits for its
+   publication (section 7.1). Legacy blocks the whole core loop during its
+   synchronous modeset, so the query waited there too; the difference is only
+   that other clients' requests keep running.
 
 ## 9. Out of scope
 

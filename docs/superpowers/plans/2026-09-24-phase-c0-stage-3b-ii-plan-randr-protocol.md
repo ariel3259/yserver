@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bii_`, `c0_3bi_`, `c0_3aii_`, `c0_adm` in `yserver`, and the whole `yserver-core` suite — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 6 (2026-09-24, coordinator)** — codex round 5 (1 blocking,
+`../findings/2026-09-24-stage-3b-ii-plan-review-round5.md`): the plan
+contradicted the design's "queries never wait". Design revision 11 names the
+forced reprobe: `GetScreenResources` joins the gate only behind an
+install-capable mutation (named exception 6); the plan follows it.
+
 **Revision 5 (2026-09-24, coordinator)** — codex round 4 (0 blocking, 1
 major, `../findings/2026-09-24-stage-3b-ii-plan-review-round4.md`):
 `KillClient`'s inline removal of an **in-flight** requester applies the same
@@ -58,7 +64,9 @@ revision 9, §7 and §8.2; the umbrella §3b obligations and §4.1 layer 1.
 2. **Blocking reuses the ready ring**: `client_is_blocked` (`run.rs:564`)
    becomes true also for a client whose **next** deferred request is a RANDR
    mutation and which is not the gate's FIFO head while a mutation is in
-   flight, or is not the FIFO head at all. Queries never block.
+   flight, or is not the FIFO head at all. Queries never block, except
+   `GetScreenResources` behind an install-capable mutation (Task 1, design
+   revision 11 §7.1).
 3. **Test names**: `c0_3bii_` in both crates; core tests use
    `RecordingBackend` extended with a scripted `begin_crtc_config`
    (`Applied`/`Pending`, controllable completion, controllable stall).
@@ -94,10 +102,12 @@ relationship — at least `SetScreenConfig`, `SetScreenSize`, `SetCrtcConfig`,
 `SetPanning`, `SetCrtcTransform`; `SetCrtcGamma` and the output/provider
 property requests are excluded unless their arm changes configuration. The
 implementer states the decision for **every** RANDR opcode in the report.
-*(Rev 4, B-1.)* `GetScreenResources` forces a connector reprobe
+*(Rev 4, B-1; narrowed in rev 6 to design revision 11.)* `GetScreenResources` forces a connector reprobe
 (`reprobe_connectors`, `process_request.rs:2939`) that can rebuild RANDR state
 and emit notifications before its reply (`render/backend.rs:24457`,
-`:10348`). It is therefore a **synchronous gate member**: while a mutation is
+`:10348`). It is therefore a **synchronous gate member while the gate holds an
+install-capable mutation** (a dispatched Owner modeset) — otherwise, including
+behind a Legacy PRIME probe, it runs at once as today: while such a mutation is
 in flight it waits in the FIFO like a synchronous mutation (never expired), so
 its probe and any publication it makes happen after the in-flight mutation's
 publication — Legacy's serial order. `GetScreenResourcesCurrent` and the other
@@ -116,6 +126,7 @@ named exception (the concurrent PRIME probe no longer goes stale).
 | `c0_3bii_queries_read_published_state` | A in flight (installed in the backend but not yet published): a `GetCrtcInfo` from B answers the published, old state | **G4** publish at backend completion instead of in the gate |
 | `c0_3bii_mate_reassert_behind_a_change` | A changes HDMI-2 to 1280x720 (parked); B sends the 1920x1080 re-assert: after A publishes, B is evaluated as a real change back (not idempotent) and its events follow A's | **G5** validate or compare B before A publishes |
 | `c0_3bii_forced_reprobe_waits_for_the_gate` | *(rev 4)* A's modeset in flight; B sends `GetScreenResources` while the recording backend's reprobe would report a changed connector: B's reply and the reprobe's notifications come after A's publication; a `GetScreenResourcesCurrent` from C is served at once from the published state | **G6b** treat `GetScreenResources` as a pure query |
+| `c0_3bii_forced_reprobe_does_not_wait_for_a_prime_probe` | *(rev 6)* a Legacy PRIME probe parked: `GetScreenResources` from another client runs at once, as today | **G6c** make it wait behind any in-flight mutation |
 | `c0_3bii_every_opcode_classified` | a table test over every RANDR minor opcode asserting its mutation/query classification as reported | **G6** drop one mutation from the set |
 
 ## Task 2 — publication outlives the requester (obligation 3)
