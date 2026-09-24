@@ -19,6 +19,7 @@ use crate::{
                 ReentryKind, Tier, WaitReason,
             },
             build::CommitDescription,
+            clock::{ClockKey, ClockSource, ProbeOutcome, ProbeState},
             device::{DispatchError, FallibleBeginError, OwnerEvent},
             identity::{CommitId, IncarnationId},
             lifecycle::{
@@ -250,6 +251,22 @@ enum LifecycleDriverWork {
         commit: CommitId,
         tag: TransitionTag<IncarnationId>,
         terminal: TerminalState,
+    },
+}
+
+enum LifecycleClockReadiness {
+    Ready(BTreeMap<u32, ClockKey>),
+    Waiting,
+    Failed {
+        crtc: u32,
+        key: ClockKey,
+        outcome: ProbeOutcome,
+    },
+    Missing(u32),
+    Inconsistent {
+        crtc: u32,
+        key: ClockKey,
+        detail: &'static str,
     },
 }
 
@@ -958,9 +975,23 @@ impl KmsBackend {
                 self.admission_wake(device, false);
             }
             LifecycleAction::EpochAdvanced(epoch) => {
-                let transition = self.lifecycle_current_tag(device).map(|tag| tag.transition);
-                if let Some(owner) = self.platform.owner_for(device) {
-                    let _ = owner.update_lifecycle_context(epoch, transition);
+                let current = self
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .and_then(|arbiter| arbiter.transition());
+                let transition = current.map(|transition| transition.id);
+                let context_updated = self
+                    .platform
+                    .owner_for(device)
+                    .is_some_and(|owner| owner.update_lifecycle_context(epoch, transition));
+                if context_updated {
+                    if current.is_some_and(|transition| {
+                        transition.kind == crate::kms::owner::lifecycle::LifecycleKind::DPMS
+                    }) && let Some(owner) = self.platform.owner_for(device)
+                    {
+                        owner.carry_resolved_clock_context(epoch);
+                    }
+                    self.activate_admission_clock_probes(device);
                 }
             }
             LifecycleAction::DispositionChanged { .. }
@@ -1169,6 +1200,146 @@ impl KmsBackend {
         })
     }
 
+    fn lifecycle_clock_readiness(
+        &self,
+        device: DrmDeviceKey,
+        expected_crtcs: &[u32],
+    ) -> LifecycleClockReadiness {
+        let Some(owner) = self.platform.owner_ref(device) else {
+            return LifecycleClockReadiness::Missing(
+                expected_crtcs.first().copied().unwrap_or_default(),
+            );
+        };
+        let (lifecycle, generation) = owner.clock_context();
+        let mut clocks = BTreeMap::new();
+        for &crtc in expected_crtcs {
+            let Some(key) = owner.clock_key_for_hardware_crtc(crtc) else {
+                return LifecycleClockReadiness::Missing(crtc);
+            };
+            let Some(clock) = owner.clock(key) else {
+                return LifecycleClockReadiness::Missing(crtc);
+            };
+            if clock.lifecycle_epoch != lifecycle || clock.topology_generation != generation {
+                return LifecycleClockReadiness::Inconsistent {
+                    crtc,
+                    key,
+                    detail: "clock context does not match the current owner epoch",
+                };
+            }
+            match (
+                clock.source,
+                clock.probe,
+                clock.reference,
+                clock.probe_outcome,
+            ) {
+                (
+                    ClockSource::KernelSequence,
+                    ProbeState::Succeeded,
+                    Some(_),
+                    Some(ProbeOutcome::Ready { .. }),
+                ) => {
+                    clocks.insert(crtc, key);
+                }
+                (
+                    ClockSource::Unresolved,
+                    ProbeState::NotStarted | ProbeState::InFlight(_),
+                    _,
+                    _,
+                ) => {
+                    return LifecycleClockReadiness::Waiting;
+                }
+                (ClockSource::Unresolved, ProbeState::Failed, _, Some(outcome)) => {
+                    return LifecycleClockReadiness::Failed { crtc, key, outcome };
+                }
+                _ => {
+                    return LifecycleClockReadiness::Inconsistent {
+                        crtc,
+                        key,
+                        detail: "clock source and probe outcome disagree",
+                    };
+                }
+            }
+        }
+        LifecycleClockReadiness::Ready(clocks)
+    }
+
+    fn lifecycle_log_probe_failure_once(
+        &mut self,
+        device: DrmDeviceKey,
+        crtc: u32,
+        key: ClockKey,
+        outcome: ProbeOutcome,
+    ) {
+        let should_log = self
+            .platform
+            .owner_for(device)
+            .and_then(|owner| owner.clock_mut(key))
+            .is_some_and(|clock| {
+                if clock.probe_failure_reported {
+                    false
+                } else {
+                    clock.probe_failure_reported = true;
+                    true
+                }
+            });
+        if should_log {
+            log::error!(
+                "lifecycle DPMS cannot dispatch: CRTC {crtc} clock probe resolved as {outcome:?}"
+            );
+        }
+    }
+
+    fn lifecycle_report_never_dispatched(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: TransitionTag<IncarnationId>,
+    ) {
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor.admission.cancel_topology(tag);
+        }
+        self.lifecycle_queue_input(
+            device,
+            ArbiterInput::CommitOutcome {
+                tag,
+                outcome: LifecycleCommitOutcome::Rejected {
+                    topology_latched_generation: None,
+                },
+            },
+        );
+    }
+
+    fn lifecycle_retry_topology_without_consuming_attempt(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: TransitionTag<IncarnationId>,
+    ) {
+        self.lifecycle_queue_input(
+            device,
+            ArbiterInput::CommitProgress {
+                tag,
+                progress: CommitProgress::NotSubmitted,
+            },
+        );
+    }
+
+    fn lifecycle_dispatch_error_is_transient(error: &DispatchError<CommitResources>) -> bool {
+        matches!(
+            error,
+            DispatchError::Slot(
+                crate::kms::owner::slot::SlotError::AlreadyOccupied(_)
+                    | crate::kms::owner::slot::SlotError::ValidationOutstanding(_)
+                    | crate::kms::owner::slot::SlotError::ProbeOutstanding(_)
+                    | crate::kms::owner::slot::SlotError::QueueOutstanding(_)
+                    | crate::kms::owner::slot::SlotError::AtomicUnresolved(_),
+            ) | DispatchError::ClockNotReady(_)
+                | DispatchError::LegacyTransportActive
+                | DispatchError::Refused {
+                    cause: RefusalCause::AlreadyInFlight,
+                    ..
+                }
+        )
+    }
+
     fn admission_dispatch_topology(
         &mut self,
         device: DrmDeviceKey,
@@ -1213,31 +1384,73 @@ impl KmsBackend {
                 return AdmissionOutcome::PreparationRefused;
             }
         };
-        let dpms_active = self.lifecycle_coordinator.protocol_dpms_level() == 0;
-        let validation_commit = {
-            let Some(owner) = self.platform.owner_for(device) else {
+        let expected_crtcs = description
+            .crtc_state
+            .iter()
+            .filter(|state| state.old_active || state.new_active)
+            .map(|state| state.crtc_id)
+            .collect::<Vec<_>>();
+        match self.lifecycle_clock_readiness(device, &expected_crtcs) {
+            LifecycleClockReadiness::Ready(_) => {}
+            LifecycleClockReadiness::Waiting => {
                 self.admission_abort(device, token);
+                return AdmissionOutcome::NothingAdmissible;
+            }
+            LifecycleClockReadiness::Failed { crtc, key, outcome } => {
+                self.admission_abort(device, token);
+                if let ProbeOutcome::Unknown(_) = outcome {
+                    self.lifecycle_report_completion_loss(device);
+                } else {
+                    self.lifecycle_log_probe_failure_once(device, crtc, key, outcome);
+                    self.lifecycle_report_never_dispatched(device, tag);
+                }
                 return AdmissionOutcome::BeginRefused;
-            };
-            match owner.begin_validation_with_options(
+            }
+            LifecycleClockReadiness::Missing(crtc) => {
+                log::error!(
+                    "lifecycle topology for {device:?} names served CRTC {crtc} without a clock record"
+                );
+                self.admission_abort(device, token);
+                self.lifecycle_report_never_dispatched(device, tag);
+                return AdmissionOutcome::BeginRefused;
+            }
+            LifecycleClockReadiness::Inconsistent { crtc, key, detail } => {
+                log::error!(
+                    "lifecycle topology for {device:?} has inconsistent CRTC {crtc} clock {key:?}: {detail}"
+                );
+                self.admission_abort(device, token);
+                self.lifecycle_report_never_dispatched(device, tag);
+                return AdmissionOutcome::BeginRefused;
+            }
+        }
+        let dpms_active = self.lifecycle_coordinator.protocol_dpms_level() == 0;
+        let validation_result = self.platform.owner_for(device).map(|owner| {
+            owner.begin_validation_with_options(
                 &description,
                 crate::kms::executor::HostCallClass::SeatActiveValidation,
                 true,
-            ) {
-                Ok(commit) => commit,
-                Err(_error) => {
-                    self.admission_abort(device, token);
-                    self.lifecycle_queue_input(
-                        device,
-                        ArbiterInput::CommitOutcome {
-                            tag,
-                            outcome: LifecycleCommitOutcome::Rejected {
-                                topology_latched_generation: None,
-                            },
-                        },
-                    );
+            )
+        });
+        let validation_commit = match validation_result {
+            Some(Ok(commit)) => commit,
+            Some(Err(error)) => {
+                self.admission_abort(device, token);
+                if Self::lifecycle_dispatch_error_is_transient(&error) {
                     return AdmissionOutcome::BeginRefused;
                 }
+                log::error!(
+                    "lifecycle validation for {device:?} was refused before dispatch: {error}"
+                );
+                self.lifecycle_report_never_dispatched(device, tag);
+                return AdmissionOutcome::BeginRefused;
+            }
+            None => {
+                log::error!(
+                    "lifecycle validation for {device:?} was never dispatched: owner disappeared"
+                );
+                self.admission_abort(device, token);
+                self.lifecycle_report_never_dispatched(device, tag);
+                return AdmissionOutcome::BeginRefused;
             }
         };
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
@@ -1288,13 +1501,6 @@ impl KmsBackend {
         {
             pending.sent = true;
         }
-        self.lifecycle_queue_input(
-            device,
-            ArbiterInput::CommitProgress {
-                tag,
-                progress: CommitProgress::Submitting,
-            },
-        );
         #[cfg(test)]
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.validation_sends.push(tag);
@@ -1310,29 +1516,66 @@ impl KmsBackend {
                 Some(owner.send_validation_on(executor))
             });
         match send_result {
-            Some(Ok(_events)) => AdmissionOutcome::NothingAdmissible,
+            Some(Ok(_events)) => {
+                self.lifecycle_queue_input(
+                    device,
+                    ArbiterInput::CommitProgress {
+                        tag,
+                        progress: CommitProgress::Submitting,
+                    },
+                );
+                AdmissionOutcome::NothingAdmissible
+            }
             Some(Err(error @ DispatchError::Refused { .. })) => {
-                self.lifecycle_abort_pending_validation(device, validation_commit, true);
-                let terminal = match &error {
-                    DispatchError::Refused { cause, .. } => {
-                        TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(*cause))
-                    }
+                let cause = match &error {
+                    DispatchError::Refused { cause, .. } => *cause,
                     _ => unreachable!(),
                 };
-                self.lifecycle_dispose_topology_result(device, validation_commit, tag, terminal);
-                AdmissionOutcome::SendRefused(match error {
-                    DispatchError::Refused { cause, .. } => cause,
-                    _ => unreachable!(),
-                })
-            }
-            Some(Err(_)) | None => {
                 self.lifecycle_abort_pending_validation(device, validation_commit, true);
+                if cause == RefusalCause::AlreadyInFlight {
+                    return AdmissionOutcome::SendRefused(cause);
+                }
+                log::error!(
+                    "lifecycle validation for {device:?} was refused before dispatch: {error}"
+                );
+                self.lifecycle_dispose_topology_result(
+                    device,
+                    validation_commit,
+                    tag,
+                    TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(cause)),
+                );
+                AdmissionOutcome::SendRefused(cause)
+            }
+            Some(Err(error)) => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                self.lifecycle_abort_pending_validation(device, validation_commit, true);
+                log::error!("lifecycle validation for {device:?} failed before dispatch: {error}");
                 self.lifecycle_dispose_topology_result(
                     device,
                     validation_commit,
                     tag,
                     TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
-                        crate::kms::owner::record::RefusalCause::Reaped,
+                        RefusalCause::OwnerInternalError,
+                    )),
+                );
+                AdmissionOutcome::BeginRefused
+            }
+            None => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                self.lifecycle_abort_pending_validation(device, validation_commit, true);
+                log::error!(
+                    "lifecycle validation for {device:?} was never dispatched: owner or executor disappeared"
+                );
+                self.lifecycle_dispose_topology_result(
+                    device,
+                    validation_commit,
+                    tag,
+                    TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                        RefusalCause::OwnerInternalError,
                     )),
                 );
                 AdmissionOutcome::BeginRefused
@@ -1447,61 +1690,153 @@ impl KmsBackend {
         let Some(token) = pending.token.take() else {
             return;
         };
-        let commit = {
-            let Some(owner) = self.platform.owner_for(device) else {
+        let expected_crtcs = pending
+            .description
+            .crtc_state
+            .iter()
+            .filter(|state| state.old_active || state.new_active)
+            .map(|state| state.crtc_id)
+            .collect::<Vec<_>>();
+        let clocks = match self.lifecycle_clock_readiness(device, &expected_crtcs) {
+            LifecycleClockReadiness::Ready(clocks) => clocks,
+            LifecycleClockReadiness::Waiting => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
                 if let Some(conductor) = self.admission_conductors.get_mut(&device) {
                     let _ = conductor.admission.abort(token);
                 }
+                self.lifecycle_retry_topology_without_consuming_attempt(device, tag);
+                self.promote_waiting_clock_probe(device);
                 return;
-            };
-            let expected_crtcs = pending
-                .description
-                .crtc_state
-                .iter()
-                .filter(|state| state.old_active || state.new_active)
-                .map(|state| state.crtc_id)
-                .collect::<Vec<_>>();
-            let clocks = expected_crtcs
-                .iter()
-                .filter_map(|&crtc| {
-                    owner
-                        .clock_key_for_hardware_crtc(crtc)
-                        .map(|key| (crtc, key))
-                })
-                .collect::<BTreeMap<_, _>>();
-            let mode_periods = expected_crtcs
-                .iter()
-                .map(|&crtc| (crtc, None))
-                .collect::<BTreeMap<_, _>>();
-            let completion_context = crate::kms::owner::completion::CompletionContext {
-                class: crate::kms::owner::completion::CompletionClass::LifecycleInstallRestore,
-                host_class: crate::kms::executor::HostCallClass::SeatActiveNonblock,
-                allow_modeset: true,
-                clocks,
-                mode_periods,
-                lifecycle_observed_max: None,
-            };
-            match owner.begin_validated_with_context(
+            }
+            LifecycleClockReadiness::Failed { crtc, key, outcome } => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                if matches!(outcome, ProbeOutcome::Unknown(_)) {
+                    return;
+                }
+                self.lifecycle_log_probe_failure_once(device, crtc, key, outcome);
+                self.lifecycle_dispose_topology_result(
+                    device,
+                    validation_commit,
+                    tag,
+                    TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                        RefusalCause::OwnerInternalError,
+                    )),
+                );
+                return;
+            }
+            LifecycleClockReadiness::Missing(crtc) => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                log::error!(
+                    "lifecycle topology for {device:?} names served CRTC {crtc} without a clock record"
+                );
+                self.lifecycle_dispose_topology_result(
+                    device,
+                    validation_commit,
+                    tag,
+                    TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                        RefusalCause::OwnerInternalError,
+                    )),
+                );
+                return;
+            }
+            LifecycleClockReadiness::Inconsistent { crtc, key, detail } => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                log::error!(
+                    "lifecycle topology for {device:?} has inconsistent CRTC {crtc} clock {key:?}: {detail}"
+                );
+                self.lifecycle_dispose_topology_result(
+                    device,
+                    validation_commit,
+                    tag,
+                    TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                        RefusalCause::OwnerInternalError,
+                    )),
+                );
+                return;
+            }
+        };
+        let mode_periods = expected_crtcs
+            .iter()
+            .map(|&crtc| (crtc, None))
+            .collect::<BTreeMap<_, _>>();
+        let completion_context = crate::kms::owner::completion::CompletionContext {
+            class: crate::kms::owner::completion::CompletionClass::LifecycleInstallRestore,
+            host_class: crate::kms::executor::HostCallClass::SeatActiveNonblock,
+            allow_modeset: true,
+            clocks,
+            mode_periods,
+            lifecycle_observed_max: None,
+        };
+        let begin_result = self.platform.owner_for(device).map(|owner| {
+            owner.begin_validated_with_context(
                 &pending.description,
                 crate::kms::owner::ledger::Submitted::new(Vec::new(), Vec::new()),
                 completion_context,
-            ) {
-                Ok((commit, _events)) => commit,
-                Err(_error) => {
+            )
+        });
+        let commit = match begin_result {
+            Some(Ok((commit, _events))) => commit,
+            Some(Err(error)) => {
+                if let Some(owner) = self.platform.owner_for(device) {
                     let _ = owner.abandon_validation(validation_commit);
-                    if let Some(conductor) = self.admission_conductors.get_mut(&device) {
-                        let _ = conductor.admission.abort(token);
-                    }
-                    self.lifecycle_dispose_topology_result(
-                        device,
-                        validation_commit,
-                        tag,
-                        TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected {
-                            errno: libc::EINVAL,
-                        }),
-                    );
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                if Self::lifecycle_dispatch_error_is_transient(&error) {
+                    self.lifecycle_retry_topology_without_consuming_attempt(device, tag);
+                    self.promote_waiting_clock_probe(device);
                     return;
                 }
+                log::error!(
+                    "validated lifecycle commit for {device:?} was refused before dispatch: {error}"
+                );
+                self.lifecycle_dispose_topology_result(
+                    device,
+                    validation_commit,
+                    tag,
+                    TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                        RefusalCause::OwnerInternalError,
+                    )),
+                );
+                return;
+            }
+            None => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                log::error!(
+                    "validated lifecycle commit for {device:?} was never dispatched: owner disappeared"
+                );
+                self.lifecycle_dispose_topology_result(
+                    device,
+                    validation_commit,
+                    tag,
+                    TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                        RefusalCause::OwnerInternalError,
+                    )),
+                );
+                return;
             }
         };
         let dependencies_ready = self.resource_service.as_mut().is_some_and(|service| {
@@ -1598,6 +1933,11 @@ impl KmsBackend {
                 let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
             }
             Some(Err(error @ DispatchError::Refused { .. })) => {
+                if !Self::lifecycle_dispatch_error_is_transient(&error) {
+                    log::error!(
+                        "validated lifecycle commit for {device:?} was refused before dispatch: {error}"
+                    );
+                }
                 let _ = self.admission_dispose_refusal(
                     device,
                     token,
@@ -1605,7 +1945,7 @@ impl KmsBackend {
                     error,
                 );
             }
-            Some(Err(_)) | None => {
+            Some(Err(error)) => {
                 if let Some(conductor) = self.admission_conductors.get_mut(&device) {
                     let _ = conductor.admission.abort(token);
                 }
@@ -1614,6 +1954,23 @@ impl KmsBackend {
                     .owner_for(device)
                     .and_then(|owner| owner.cancel_live(commit).ok())
                     .unwrap_or_default();
+                log::error!(
+                    "validated lifecycle commit for {device:?} failed before dispatch: {error}"
+                );
+                let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
+            }
+            None => {
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                let events = self
+                    .platform
+                    .owner_for(device)
+                    .and_then(|owner| owner.cancel_live(commit).ok())
+                    .unwrap_or_default();
+                log::error!(
+                    "validated lifecycle commit for {device:?} was never dispatched: owner or executor disappeared"
+                );
                 let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
             }
         }
@@ -1626,6 +1983,15 @@ impl KmsBackend {
         tag: TransitionTag<IncarnationId>,
         terminal: TerminalState,
     ) {
+        let transient_refusal = matches!(
+            terminal,
+            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                RefusalCause::AlreadyInFlight
+            ))
+        );
+        if !transient_refusal && let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor.admission.cancel_topology(tag);
+        }
         let installed_dpms_active = self
             .lifecycle_drivers
             .get_mut(&device)
@@ -1678,6 +2044,11 @@ impl KmsBackend {
                             },
                         },
                     );
+                }
+                TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                    RefusalCause::AlreadyInFlight,
+                )) => {
+                    self.lifecycle_retry_topology_without_consuming_attempt(device, tag);
                 }
                 TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(_)) => {
                     self.lifecycle_queue_input(
@@ -1829,6 +2200,16 @@ impl KmsBackend {
 
     pub(crate) fn lifecycle_owner_mechanism_failed(&mut self, device: DrmDeviceKey) {
         self.lifecycle_report_completion_loss(device);
+    }
+
+    pub(crate) fn lifecycle_owner_clock_probe_resolved(
+        &mut self,
+        device: DrmDeviceKey,
+        outcome: ProbeOutcome,
+    ) {
+        if matches!(outcome, ProbeOutcome::Unknown(_)) {
+            self.lifecycle_report_completion_loss(device);
+        }
     }
 
     #[cfg(test)]
@@ -2673,7 +3054,7 @@ impl KmsBackend {
         } else if self
             .platform
             .owner_ref(device)
-            .is_none_or(|owner| owner.slot().occupant().is_some())
+            .is_none_or(|owner| !owner.slot().is_idle())
             || self
                 .admission_conductors
                 .get(&device)

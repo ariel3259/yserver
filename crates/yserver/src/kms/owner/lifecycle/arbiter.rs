@@ -791,6 +791,20 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                 transition.phase = LifecycleTransitionPhase::AwaitingTerminal;
             }
         }
+        if progress == CommitProgress::NotSubmitted {
+            let ready = self
+                .transition
+                .is_some_and(|transition| transition.receipts_complete() && !self.fd_family_fenced);
+            if ready {
+                if let Some(transition) = self.transition.as_mut() {
+                    transition.phase = LifecycleTransitionPhase::PhysicalReady;
+                    transition.terminal_wait_requested = false;
+                }
+                return vec![LifecycleAction::PhysicalAdvanceAllowed(
+                    self.tag_for(tag.transition, self.epoch),
+                )];
+            }
+        }
         Vec::new()
     }
 

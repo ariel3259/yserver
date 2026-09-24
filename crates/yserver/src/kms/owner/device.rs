@@ -35,7 +35,7 @@ use std::{
     time::Instant,
 };
 
-pub use super::{completion::MechanismFailure, fences::FenceStatus};
+pub use super::{clock::ProbeOutcome, completion::MechanismFailure, fences::FenceStatus};
 
 #[derive(Debug)]
 pub enum OwnerEvent<R> {
@@ -118,13 +118,6 @@ pub enum ValidationOutcome {
     Abandoned(UnknownReason),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ProbeOutcome {
-    Ready { reference: u64 },
-    Rejected { errno: i32 },
-    Unknown(UnknownReason),
-    Contradictory,
-}
 // crates/yserver/src/kms/owner/device.rs
 
 const TOMBSTONE_RING_CAPACITY: usize = 64;
@@ -231,6 +224,8 @@ pub struct DeviceCommitOwner<R> {
     pub(crate) inject_hardware_overflow: bool,
     #[doc(hidden)]
     pub(crate) inject_present_overflow_crtc: Option<u32>,
+    #[cfg(test)]
+    refuse_next_validated_begin_for_tests: bool,
 }
 
 impl<R> DeviceCommitOwner<R> {
@@ -266,6 +261,8 @@ impl<R> DeviceCommitOwner<R> {
             },
             inject_hardware_overflow: false,
             inject_present_overflow_crtc: None,
+            #[cfg(test)]
+            refuse_next_validated_begin_for_tests: false,
         }
     }
 
@@ -1281,6 +1278,18 @@ impl<R> DeviceCommitOwner<R> {
         (self.lifecycle_epoch, self.topology_generation)
     }
 
+    pub(crate) fn carry_resolved_clock_context(&mut self, lifecycle_epoch: LifecycleEpochId) {
+        for clock in self.clocks.values_mut() {
+            if clock.source == ClockSource::KernelSequence
+                && clock.probe == ProbeState::Succeeded
+                && clock.reference.is_some()
+                && matches!(clock.probe_outcome, Some(ProbeOutcome::Ready { .. }))
+            {
+                clock.lifecycle_epoch = lifecycle_epoch;
+            }
+        }
+    }
+
     #[allow(dead_code)] // Task 7 supplies the only checked production proof issuer.
     pub(crate) fn finish_legacy_transport(
         &mut self,
@@ -1785,6 +1794,10 @@ impl<R> DeviceCommitOwner<R> {
         ledger: Submitted<R>,
         context: CompletionContext,
     ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.refuse_next_validated_begin_for_tests) {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
         if self.legacy_drain_permit.is_some() {
             return Err(DispatchError::LegacyTransportActive);
         }
@@ -2163,6 +2176,11 @@ impl<R> DeviceCommitOwner<R> {
     pub fn slot(&self) -> &DeviceSlot {
         &self.slot
     }
+
+    #[cfg(test)]
+    pub(crate) fn host_call_sequence_for_tests(&self) -> u64 {
+        self.next_seq
+    }
     pub fn live_record(&self) -> Option<&CommitRecord<R>> {
         self.live.as_ref()
     }
@@ -2220,6 +2238,10 @@ impl<R> DeviceCommitOwner<R> {
         let (commit, request, _) = self.pending_validation.take().expect("validation");
         self.validation_in_flight = Some((commit, request.correlation()));
     }
+    #[cfg(test)]
+    pub(crate) fn refuse_next_validated_begin_for_tests(&mut self) {
+        self.refuse_next_validated_begin_for_tests = true;
+    }
     fn resolve_clock_probe(
         &mut self,
         correlation: HostCallCorrelation,
@@ -2262,11 +2284,15 @@ impl<R> DeviceCommitOwner<R> {
                 } else {
                     ProbeOutcome::Rejected { errno }
                 };
+                if let Some(clock) = self.clocks.get_mut(&key) {
+                    clock.probe_outcome = Some(outcome);
+                }
                 vec![OwnerEvent::ClockProbeResolved { key, outcome }]
             }
             HostCallOutcome::Unknown(reason) => {
                 if let Some(clock) = self.clocks.get_mut(&key) {
                     clock.probe = ProbeState::Failed;
+                    clock.probe_outcome = Some(ProbeOutcome::Unknown(reason));
                 }
                 vec![OwnerEvent::ClockProbeResolved {
                     key,
@@ -2278,6 +2304,7 @@ impl<R> DeviceCommitOwner<R> {
                 if let Some(clock) = self.clocks.get_mut(&key) {
                     clock.probe = ProbeState::Failed;
                     clock.source = ClockSource::Unresolved;
+                    clock.probe_outcome = Some(ProbeOutcome::Contradictory);
                 }
                 vec![OwnerEvent::ClockProbeResolved {
                     key,

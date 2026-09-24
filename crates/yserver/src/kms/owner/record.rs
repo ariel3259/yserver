@@ -45,9 +45,9 @@ pub enum FailureCause {
     IoctlRejected { errno: i32 },
 }
 
-/// Why the executor refused *before* installing `InFlight`. Each maps to a
+/// Why dispatch did not cross the ioctl boundary. Executor causes map to a
 /// `SendError` that `executor/mod.rs:665-692` returns before it writes
-/// anything, so no IPC occurred and nothing is uncertain.
+/// anything; `OwnerInternalError` records a non-transient owner refusal.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RefusalCause {
     Reaped,
@@ -59,6 +59,9 @@ pub enum RefusalCause {
     /// touched the wire (no production issuer exists yet, R8, so this is
     /// unreachable in production today).
     TransportGateRefused,
+    /// The owner refused the request before dispatch because its own
+    /// validation or bookkeeping failed.
+    OwnerInternalError,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

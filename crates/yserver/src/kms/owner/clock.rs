@@ -3,6 +3,14 @@ use super::{
     lifecycle::{ClockProbeId, LifecycleEpochId},
 };
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProbeOutcome {
+    Ready { reference: u64 },
+    Rejected { errno: i32 },
+    Unknown(crate::kms::executor::UnknownReason),
+    Contradictory,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ClockKey {
     pub hardware_crtc: u32,
@@ -47,6 +55,8 @@ pub struct CrtcClock {
     pub topology_generation: u64,
     pub source: ClockSource,
     pub probe: ProbeState,
+    pub probe_outcome: Option<ProbeOutcome>,
+    pub probe_failure_reported: bool,
     pub queue_failed: bool,
     pub reference: Option<u64>,
     pub latest: Option<ClockSample>,
@@ -60,6 +70,8 @@ impl CrtcClock {
             topology_generation,
             source: ClockSource::Unresolved,
             probe: ProbeState::NotStarted,
+            probe_outcome: None,
+            probe_failure_reported: false,
             queue_failed: false,
             reference: None,
             latest: None,
@@ -69,6 +81,9 @@ impl CrtcClock {
     pub fn install_reference(&mut self, sequence: u64) {
         self.source = ClockSource::KernelSequence;
         self.probe = ProbeState::Succeeded;
+        self.probe_outcome = Some(ProbeOutcome::Ready {
+            reference: sequence,
+        });
         self.reference = Some(sequence);
     }
 
