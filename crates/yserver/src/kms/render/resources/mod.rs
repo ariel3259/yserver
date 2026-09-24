@@ -39,8 +39,9 @@ pub(crate) use capacity::{
 };
 #[allow(unused_imports)]
 pub(crate) use commit::{
-    CommitKey, CommitResourceConsumer, CommitResources, GroupMember, PresentRelease,
-    cancel_pre_ipc_commit, register_commit_dependencies,
+    CommitKey, CommitResourceConsumer, CommitResources, DarkCrtcDisplacement, GroupMember,
+    KmsReleaseObligation, KmsReleaseProof, PresentRelease, cancel_pre_ipc_commit,
+    register_commit_dependencies, register_kms_displacements,
 };
 #[allow(unused_imports)]
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
@@ -1023,6 +1024,62 @@ impl ResourceService {
             .kms_dispositions
             .get(&obligation)
             .map(|(_, _, disp)| *disp)
+    }
+
+    pub(crate) fn discharge_kms_release(
+        &mut self,
+        registration: commit::KmsReleaseObligation,
+        proof: commit::KmsReleaseProof,
+    ) -> Result<(), ResourceError> {
+        let key = registration.allocation;
+        if key.device != self.device || key.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let availability = entry.availability.borrow();
+        if availability
+            .pending_obligations
+            .get(&registration.obligation)
+            != Some(&ObligationKind::KmsRelease)
+        {
+            return Err(ResourceError::InvalidProof);
+        }
+        let Some((member, registered_commit, disposition)) =
+            availability.kms_dispositions.get(&registration.obligation)
+        else {
+            return Err(ResourceError::InvalidProof);
+        };
+        if *member != registration.member
+            || *registered_commit != registration.commit
+            || *disposition != handoff::KmsDisposition::Outstanding
+        {
+            return Err(ResourceError::InvalidProof);
+        }
+
+        let proof_matches = match proof {
+            commit::KmsReleaseProof::CompletionRetired {
+                through_commit,
+                crtc,
+            } => {
+                through_commit >= registration.commit
+                    && crtc.device_key == self.device
+                    && crtc == registration.member.crtc
+            }
+            commit::KmsReleaseProof::DarkCrtcDisplacement {
+                through_commit,
+                proof,
+            } => {
+                through_commit >= registration.commit
+                    && proof.off_commit <= through_commit
+                    && proof.crtc.device_key == self.device
+                    && proof.crtc == registration.member.crtc
+            }
+        };
+        drop(availability);
+        if !proof_matches {
+            return Err(ResourceError::InvalidProof);
+        }
+        self.apply_validated_proof(key, registration.obligation)
     }
 
     #[cfg(test)]

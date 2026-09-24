@@ -5,7 +5,7 @@
 //! between that source, A1's pure decider, and the managed 2c-i seams.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -369,6 +369,31 @@ struct PendingClientModesetValidation {
     cancelled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerCrtcPowerChange {
+    pub(crate) incarnation: IncarnationId,
+    pub(crate) crtc: u32,
+    pub(crate) new_active: bool,
+    pub(crate) expected_completion: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstalledCrtcPower {
+    Unknown {
+        incarnation: IncarnationId,
+    },
+    Active {
+        incarnation: IncarnationId,
+    },
+    InactiveUnproven {
+        incarnation: IncarnationId,
+    },
+    InactiveProven {
+        incarnation: IncarnationId,
+        off_commit: CommitId,
+    },
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum LifecycleOwnerMilestone {
     Accepted(CommitId),
@@ -387,6 +412,9 @@ pub(crate) struct LifecycleDriver {
     topology_commits: BTreeMap<CommitId, TransitionTag<IncarnationId>>,
     client_modeset_commits: BTreeMap<CommitId, ClientModesetTag<IncarnationId>>,
     topology_dpms_active: BTreeMap<CommitId, bool>,
+    owner_commit_power_changes: BTreeMap<CommitId, Vec<OwnerCrtcPowerChange>>,
+    installed_crtc_power: BTreeMap<u32, InstalledCrtcPower>,
+    kms_displacements: BTreeMap<CommitId, Vec<crate::kms::render::resources::KmsReleaseObligation>>,
     pub(crate) client_modeset: Option<ClientModesetSlot>,
     next_client_modeset_id: Option<u64>,
     #[cfg(test)]
@@ -430,6 +458,9 @@ impl LifecycleDriver {
             topology_commits: BTreeMap::new(),
             client_modeset_commits: BTreeMap::new(),
             topology_dpms_active: BTreeMap::new(),
+            owner_commit_power_changes: BTreeMap::new(),
+            installed_crtc_power: BTreeMap::new(),
+            kms_displacements: BTreeMap::new(),
             client_modeset: None,
             next_client_modeset_id: Some(1),
             #[cfg(test)]
@@ -461,6 +492,32 @@ impl LifecycleDriver {
             #[cfg(test)]
             client_modeset_promotion_steps: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kms_displacements_for_tests(
+        &self,
+        commit: CommitId,
+    ) -> Vec<crate::kms::render::resources::KmsReleaseObligation> {
+        self.kms_displacements
+            .get(&commit)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installed_crtc_power_for_tests(&self, crtc: u32) -> Option<InstalledCrtcPower> {
+        self.installed_crtc_power.get(&crtc).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_crtc_power_unproven_for_tests(
+        &mut self,
+        crtc: u32,
+        incarnation: IncarnationId,
+    ) {
+        self.installed_crtc_power
+            .insert(crtc, InstalledCrtcPower::Unknown { incarnation });
     }
 
     fn enqueue(&mut self, work: LifecycleDriverWork) {
@@ -1435,6 +1492,316 @@ impl KmsBackend {
                 && self.lifecycle_coordinator.protocol_dpms_level() == projection.level
                 && self.lifecycle_coordinator.dpms_epoch() == projection.epoch
         })
+    }
+
+    fn client_modeset_displaced_pool(
+        &self,
+        device: DrmDeviceKey,
+        connector: &str,
+        target_crtc: u32,
+    ) -> Result<
+        Option<(
+            GroupMember,
+            Vec<crate::kms::render::resources::AllocationKey>,
+        )>,
+        ResourceError,
+    > {
+        let Some(output_idx) = self.platform.outputs.iter().position(|output| {
+            output.key == crate::kms::backend::OutputKey::new(device, connector)
+        }) else {
+            return Ok(None);
+        };
+        let output = &self.platform.outputs[output_idx];
+        let crtc = CrtcKey::for_output(output);
+        if u32::from(crtc.crtc) != target_crtc {
+            return Err(ResourceError::InvalidState);
+        }
+        let scanout = self
+            .platform
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .ok_or(ResourceError::InvalidState)?;
+        if !matches!(scanout, crate::kms::vk::scanout::OutputScanout::Shared(_)) {
+            return Err(ResourceError::InvalidState);
+        }
+        let allocations = scanout
+            .display_pool()
+            .bos
+            .iter()
+            .map(|bo| bo.managed_key().ok_or(ResourceError::InvalidState))
+            .collect::<Result<Vec<_>, _>>()?;
+        let owner = self
+            .platform
+            .owner_ref(device)
+            .ok_or(ResourceError::InvalidState)?;
+        let clock_epoch = owner
+            .clock_key_for_hardware_crtc(target_crtc)
+            .ok_or(ResourceError::InvalidState)?
+            .epoch
+            .get();
+        let member = GroupMember::new(crtc, owner.topology_generation(), clock_epoch);
+        Ok(Some((member, allocations)))
+    }
+
+    pub(crate) fn lifecycle_complete_kms_displacements(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        retired_members: &[GroupMember],
+    ) {
+        let Some(incarnation) = self
+            .platform
+            .owner_ref(device)
+            .map(|owner| owner.incarnation())
+        else {
+            return;
+        };
+        self.lifecycle_record_untracked_retired_crtcs(device, commit, incarnation, retired_members);
+        let (fenced_crtcs, dark_proofs, registrations) = {
+            let Some(driver) = self.lifecycle_drivers.get(&device) else {
+                return;
+            };
+            let stale_client = driver
+                .client_modeset_commits
+                .get(&commit)
+                .is_some_and(|tag| !self.client_modeset_tag_current(device, *tag));
+            let stale_transition = driver
+                .topology_commits
+                .get(&commit)
+                .is_some_and(|tag| !self.lifecycle_tag_current(device, *tag));
+            if stale_client || stale_transition {
+                return;
+            }
+
+            let mut fenced_crtcs = retired_members
+                .iter()
+                .map(|member| u32::from(member.crtc.crtc))
+                .collect::<HashSet<_>>();
+            let changes = driver
+                .owner_commit_power_changes
+                .get(&commit)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            fenced_crtcs.extend(
+                changes
+                    .iter()
+                    .filter(|change| {
+                        change.incarnation == incarnation && change.expected_completion
+                    })
+                    .map(|change| change.crtc),
+            );
+            let mut dark_proofs = BTreeMap::new();
+            for change in changes.iter().filter(|change| {
+                change.incarnation == incarnation
+                    && !change.new_active
+                    && !change.expected_completion
+            }) {
+                if let Some(InstalledCrtcPower::InactiveProven {
+                    incarnation: proof_incarnation,
+                    off_commit,
+                }) = driver.installed_crtc_power.get(&change.crtc)
+                    && *proof_incarnation == incarnation
+                    && *off_commit <= commit
+                {
+                    let Some(handle) = ::drm::control::from_u32(change.crtc) else {
+                        continue;
+                    };
+                    dark_proofs.insert(
+                        change.crtc,
+                        crate::kms::render::resources::DarkCrtcDisplacement {
+                            off_commit: *off_commit,
+                            crtc: CrtcKey::new(device, handle),
+                        },
+                    );
+                }
+            }
+            let registrations = driver
+                .kms_displacements
+                .iter()
+                .flat_map(|(&registered_commit, registrations)| {
+                    registrations
+                        .iter()
+                        .copied()
+                        .map(move |registration| (registered_commit, registration))
+                })
+                .filter(|(registered_commit, registration)| {
+                    *registered_commit <= commit
+                        && registration.commit <= commit
+                        && registration.allocation.incarnation == incarnation
+                })
+                .collect::<Vec<_>>();
+            (fenced_crtcs, dark_proofs, registrations)
+        };
+
+        let Some(service) = self.resource_service.as_mut() else {
+            return;
+        };
+        let mut discharged = Vec::new();
+        for (registered_commit, registration) in registrations {
+            let crtc_id = u32::from(registration.member.crtc.crtc);
+            let proof = if fenced_crtcs.contains(&crtc_id) {
+                Some(
+                    crate::kms::render::resources::KmsReleaseProof::CompletionRetired {
+                        through_commit: commit,
+                        crtc: registration.member.crtc,
+                    },
+                )
+            } else {
+                dark_proofs.get(&crtc_id).copied().map(|proof| {
+                    crate::kms::render::resources::KmsReleaseProof::DarkCrtcDisplacement {
+                        through_commit: commit,
+                        proof,
+                    }
+                })
+            };
+            let Some(proof) = proof else {
+                continue;
+            };
+            match service.discharge_kms_release(registration, proof) {
+                Ok(()) => discharged.push((registered_commit, registration)),
+                Err(error) => log::error!(
+                    "Owner KMS displacement proof refused for {device:?} commit {commit:?} allocation {:?}: {error:?}",
+                    registration.allocation
+                ),
+            }
+        }
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            for (registered_commit, discharged) in discharged {
+                let mut remove_entry = false;
+                if let Some(registrations) = driver.kms_displacements.get_mut(&registered_commit) {
+                    registrations.retain(|registration| *registration != discharged);
+                    remove_entry = registrations.is_empty();
+                }
+                if remove_entry {
+                    driver.kms_displacements.remove(&registered_commit);
+                }
+            }
+        }
+    }
+
+    fn lifecycle_record_untracked_retired_crtcs(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        incarnation: IncarnationId,
+        retired_members: &[GroupMember],
+    ) {
+        let Some(driver) = self.lifecycle_drivers.get_mut(&device) else {
+            return;
+        };
+        let tracked_crtcs = driver
+            .owner_commit_power_changes
+            .get(&commit)
+            .into_iter()
+            .flatten()
+            .filter(|change| change.incarnation == incarnation)
+            .map(|change| change.crtc)
+            .collect::<HashSet<_>>();
+        for member in retired_members.iter().filter(|member| {
+            member.crtc.device_key == device
+                && !tracked_crtcs.contains(&u32::from(member.crtc.crtc))
+        }) {
+            // Resource-bearing non-lifecycle Owner commits carry only lit
+            // composed work. Seeing one retire on a CRTC invalidates any
+            // earlier OFF chain that this driver did not track explicitly.
+            driver.installed_crtc_power.insert(
+                u32::from(member.crtc.crtc),
+                InstalledCrtcPower::Active { incarnation },
+            );
+        }
+    }
+
+    pub(crate) fn lifecycle_cancel_kms_displacements(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+    ) {
+        let registrations = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.kms_displacements.remove(&commit))
+            .unwrap_or_default();
+        let Some(service) = self.resource_service.as_mut() else {
+            if !registrations.is_empty() {
+                log::error!(
+                    "Owner KMS displacement cancellation has no resource service for {device:?}"
+                );
+            }
+            return;
+        };
+        for registration in registrations {
+            if let Err(error) = service.cancel(registration.allocation, registration.obligation) {
+                log::error!(
+                    "Owner KMS displacement cancellation refused for {device:?} commit {commit:?} allocation {:?}: {error:?}",
+                    registration.allocation
+                );
+            }
+        }
+    }
+
+    pub(crate) fn lifecycle_update_installed_crtc_power(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+        terminal: TerminalState,
+    ) {
+        let Some(incarnation) = self
+            .platform
+            .owner_ref(device)
+            .map(|owner| owner.incarnation())
+        else {
+            return;
+        };
+        let Some(driver) = self.lifecycle_drivers.get_mut(&device) else {
+            return;
+        };
+        let changes = driver
+            .owner_commit_power_changes
+            .remove(&commit)
+            .unwrap_or_default();
+        match terminal {
+            TerminalState::Completed => {
+                for change in changes {
+                    if change.incarnation != incarnation {
+                        continue;
+                    }
+                    let power = if change.new_active {
+                        InstalledCrtcPower::Active { incarnation }
+                    } else if change.expected_completion {
+                        InstalledCrtcPower::InactiveProven {
+                            incarnation,
+                            off_commit: commit,
+                        }
+                    } else if matches!(
+                        driver.installed_crtc_power.get(&change.crtc),
+                        Some(InstalledCrtcPower::InactiveProven {
+                            incarnation: known,
+                            ..
+                        }) if *known == incarnation
+                    ) {
+                        *driver
+                            .installed_crtc_power
+                            .get(&change.crtc)
+                            .expect("the inactive proof was just checked")
+                    } else {
+                        InstalledCrtcPower::InactiveUnproven { incarnation }
+                    };
+                    driver.installed_crtc_power.insert(change.crtc, power);
+                }
+            }
+            TerminalState::FailedBeforeSubmit(_) => {}
+            TerminalState::CompletionUnknown(_) => {
+                for power in driver.installed_crtc_power.values_mut() {
+                    *power = InstalledCrtcPower::Unknown { incarnation };
+                }
+                for change in changes {
+                    driver
+                        .installed_crtc_power
+                        .insert(change.crtc, InstalledCrtcPower::Unknown { incarnation });
+                }
+            }
+        }
     }
 
     fn lifecycle_superseding_kind(
@@ -2953,6 +3320,55 @@ impl KmsBackend {
             .filter(|state| state.old_active || state.new_active)
             .map(|state| state.crtc_id)
             .collect::<Vec<_>>();
+        let owner_commit_power_changes = pending
+            .description
+            .crtc_state
+            .iter()
+            .map(|state| OwnerCrtcPowerChange {
+                incarnation: tag.incarnation,
+                crtc: state.crtc_id,
+                new_active: state.new_active,
+                expected_completion: state.old_active || state.new_active,
+            })
+            .collect::<Vec<_>>();
+        let connector = self
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.client_modeset.as_ref())
+            .filter(|slot| slot.tag == tag)
+            .map(|slot| slot.connector.clone());
+        let displaced_pool = match (
+            connector.as_deref(),
+            pending
+                .description
+                .crtc_state
+                .first()
+                .map(|state| state.crtc_id),
+        ) {
+            (Some(connector), Some(crtc)) => {
+                self.client_modeset_displaced_pool(device, connector, crtc)
+            }
+            _ => Err(ResourceError::InvalidState),
+        };
+        let displaced_pool = match displaced_pool {
+            Ok(displaced_pool) => displaced_pool,
+            Err(error) => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(format!(
+                        "Owner modeset displacement resources were not ready: {error}"
+                    ))),
+                );
+                return;
+            }
+        };
         let required_clock_crtcs = pending
             .description
             .crtc_state
@@ -3053,31 +3469,60 @@ impl KmsBackend {
                 return;
             }
         };
-        let dependencies_ready = self.resource_service.as_mut().is_some_and(|service| {
-            register_commit_dependencies(commit, Vec::new(), Vec::new(), service).is_ok()
-        });
-        if !dependencies_ready {
-            if let Some(owner) = self.platform.owner_for(device) {
-                let _ = owner.cancel_live(commit);
+        let registrations = self
+            .resource_service
+            .as_mut()
+            .ok_or(ResourceError::InvalidState)
+            .and_then(|service| match displaced_pool.as_ref() {
+                Some((member, allocations)) => {
+                    crate::kms::render::resources::register_kms_displacements(
+                        commit,
+                        *member,
+                        allocations,
+                        service,
+                    )
+                }
+                None => Ok(Vec::new()),
+            });
+        let registrations = match registrations {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                let events = self
+                    .platform
+                    .owner_for(device)
+                    .and_then(|owner| owner.cancel_live(commit).ok())
+                    .unwrap_or_default();
+                let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(format!(
+                        "Owner modeset dependencies were not ready: {error}"
+                    ))),
+                );
+                return;
             }
-            if let Some(conductor) = self.admission_conductors.get_mut(&device) {
-                let _ = conductor.admission.abort(token);
+        };
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            driver
+                .owner_commit_power_changes
+                .insert(commit, owner_commit_power_changes);
+            if !registrations.is_empty() {
+                driver.kms_displacements.insert(commit, registrations);
             }
-            self.lifecycle_complete_client_modeset_without_dispatch(
-                device,
-                tag,
-                Err(std::io::Error::other(
-                    "Owner modeset dependencies were not ready",
-                )),
-            );
-            return;
         }
         if !self.client_modeset_tag_current(device, tag)
             || !self.client_modeset_projection_current(device, pending.staged_projection.as_ref())
         {
-            if let Some(owner) = self.platform.owner_for(device) {
-                let _ = owner.cancel_live(commit);
-            }
+            let events = self
+                .platform
+                .owner_for(device)
+                .and_then(|owner| owner.cancel_live(commit).ok())
+                .unwrap_or_default();
+            let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
             if let Some(conductor) = self.admission_conductors.get_mut(&device) {
                 let _ = conductor.admission.abort(token);
             }
@@ -3093,9 +3538,12 @@ impl KmsBackend {
             .client_modeset_submitting(&device, &tag)
             .unwrap_or(false);
         if !marked_submitting {
-            if let Some(owner) = self.platform.owner_for(device) {
-                let _ = owner.cancel_live(commit);
-            }
+            let events = self
+                .platform
+                .owner_for(device)
+                .and_then(|owner| owner.cancel_live(commit).ok())
+                .unwrap_or_default();
+            let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
             if let Some(conductor) = self.admission_conductors.get_mut(&device) {
                 let _ = conductor.admission.abort(token);
             }
@@ -3240,6 +3688,17 @@ impl KmsBackend {
     ) {
         let tag = pending.tag;
         let dpms_active = pending.dpms_active;
+        let owner_commit_power_changes = pending
+            .description
+            .crtc_state
+            .iter()
+            .map(|state| OwnerCrtcPowerChange {
+                incarnation: tag.incarnation,
+                crtc: state.crtc_id,
+                new_active: state.new_active,
+                expected_completion: state.old_active || state.new_active,
+            })
+            .collect::<Vec<_>>();
         let decision = pending.decision.clone();
         let Some(token) = pending.token.take() else {
             return;
@@ -3422,12 +3881,20 @@ impl KmsBackend {
                 .expect("Owner lifecycle driver")
                 .topology_dpms_active
                 .insert(commit, dpms_active);
+            self.lifecycle_drivers
+                .get_mut(&device)
+                .expect("Owner lifecycle driver")
+                .owner_commit_power_changes
+                .insert(commit, owner_commit_power_changes);
             let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
             return;
         }
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.topology_commits.insert(commit, tag);
             driver.topology_dpms_active.insert(commit, dpms_active);
+            driver
+                .owner_commit_power_changes
+                .insert(commit, owner_commit_power_changes);
         }
 
         #[cfg(test)]
