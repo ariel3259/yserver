@@ -1,7 +1,8 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 2 (codex round
-[1](../findings/2026-09-24-stage-3b-design-review-round1.md)), written by the
+**Status:** Revision 3 (codex rounds
+[1](../findings/2026-09-24-stage-3b-design-review-round1.md) and
+[2](../findings/2026-09-24-stage-3b-design-review-round2.md)), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -273,11 +274,13 @@ slot is taken, while the old topology keeps scanning out and composing:
    transaction and released exactly once if it is not installed;
 4. `TEST_ONLY` of the complete device transaction through the 3a-ii
    validation path;
-5. *(rev 2, round-1 M-2)* **the new scene state** of every output of the
-   device whose state changes (the target output's `OutputSceneState` —
-   composition ring, damage audit, extent and origin — built against the
-   staged layout), and the staged `OutputKey` → position map of the whole
-   new `platform.outputs`. Nothing is swapped in yet.
+5. *(rev 2, round-1 M-2; rev 3, round-2 B-1)* **the new scene state of the
+   target output only** (its `OutputSceneState` — composition ring, damage
+   audit, extent and origin — built against the staged layout; none for a
+   disable), and the staged `OutputKey` → position map of the whole new
+   `platform.outputs`. Nothing is swapped in yet. No other output's scene
+   state is rebuilt, on this device or another: a modeset changes neither
+   their mode nor their origin.
 
 The scene state is built during preparation so that nothing after the kernel
 accepts can fail except the global renderer loss (section 6).
@@ -310,9 +313,10 @@ order:
    are invalidated, C.0 §9.2, §13) and a new clock epoch for every CRTC whose
    mode changed (C.0 §10), probed when active (section 3.5).
 2. The projection hook (section 3.4).
-3. **Scene promotion — per device** (section 5.1): the staged scene states
-   swapped in and every kept state re-associated through the staged identity
-   map.
+3. **Scene promotion** (section 5.1): the target's staged state swapped in,
+   every kept state re-associated through the staged identity map, and the
+   target's **old** state (mode change or disable) moved to the retirement
+   list of section 5.1 — never dropped.
 
 All three steps move data only; none has a fallible call *(rev 2, round-1
 M-2)*. Other devices can therefore never resume against positions that do
@@ -328,9 +332,28 @@ first lets their path proceed on Owner, each with its D26-style mutation.
 
 ### 5.1. Per-device scene rebuild, keyed by output identity
 
-The scene rebuild becomes per device: the `OutputSceneState` of every output
-of the modeset's device is rebuilt; every other output's state — including
-its `owner_buffers`, `pending_acks` and damage history — is **kept**.
+The scene rebuild becomes per output: only the target output's
+`OutputSceneState` is replaced; every other output's state — including its
+`owner_buffers`, `pending_acks`, `pending_pool_releases` and damage history —
+is **kept**.
+
+**The replaced state is retired, not dropped** *(rev 3, round-2 B-1)*. An
+`OutputSceneState` owns GPU-lifetime resources whose release is proven by
+their own evidence, not by the modeset: `pending_pool_releases` holds
+descriptor-pool slots (and managed allocation keys) behind a Vulkan
+`FenceTicket` that may still be unsignalled after the page flip retired
+(`scene.rs:508`); `pool_ring` backs them; `owner_buffers` and `pending_acks`
+carry composed generations whose KMS retirement is the old pool's (section
+4.2). Legacy satisfies this by waiting the device idle and draining the whole
+scene before the rebuild (`quiesce_before_topology_mutation`). The Owner
+does not wait: the replaced state moves to a per-output **scene retirement
+list**, serviced where the scene already polls fences
+(`drain_deferred_scene_resources`, `scene.rs:394`). Each resource is freed
+only on its own proof — a descriptor slot on its fence ticket, a composed
+generation on the old pool's KMS retirement — and the ring after its last
+slot. Nothing on the list can be reused by the new state. At teardown the
+list follows the 2c-i teardown handoff like any other retained owner (its
+barrier is 3d's).
 
 The scene state and `platform.scanout_pools` are indexed **by position** in
 `platform.outputs`. Adding or removing an output shifts the positions of the
@@ -388,7 +411,7 @@ server with no Owner device behaves exactly as today.
 | Preparation: discovery, unadvertised mode, route, allocation, `TEST_ONLY` | prepared set released; old topology authoritative; device stays `Ready` | `Failed` |
 | Superseded by a `REC-4` event before dispatch | same | `Failed` |
 | Real commit rejected with `EBUSY` *(rev 2, round-1 B-1)* | C.0 §9.4: the owner never dispatches while its own record occupies the slot, so `EBUSY` is an ownership invariant failure, not a scheduling signal — no retry. The prepared set is released, the foreign/internal-busy evidence recorded, readiness closed, and the device enters the bounded topology/recovery path (its exit is 3c/3d's) | `Failed` |
-| Real commit explicitly rejected (other errno) | `FailedBeforeSubmit`: nothing became current, prepared set released, no poison. An `EINVAL`/`EOPNOTSUPP` attributable to the object combination latches **the requested topology generation** (C.0 §10 latch scopes): an identical request answers `Failed` without dispatch until the device's topology generation changes; the current topology stays `Ready` | `Failed` |
+| Real commit explicitly rejected (other errno) | `FailedBeforeSubmit`: nothing became current, prepared set released, no poison. An `EINVAL`/`EOPNOTSUPP` attributable to the object combination latches **the requested topology** (C.0 §10 latch scopes): the latch key is `(installed topology generation, requested configuration of the device)`; an identical request under the same installed generation answers `Failed` (`Latched`) without dispatch; any installed-generation change clears it; the installed topology stays `Ready` | `Failed` |
 | Completion loss: missing/invalid/error fence, deadline, contradiction | `CompletionUnknown` → `Poisoned`, both state sets quarantined (3a-ii) | `Failed`, nothing published |
 | Stale result (accepted after its identity stopped being current) | accepted-stale: fds adopted or closed once, quarantine retained by the winning transition, nothing installed | `Failed` |
 | Renderer device loss at any point | existing `renderer_failed` clean shutdown (global render-device policy, unchanged) | none — the server exits cleanly |
@@ -506,13 +529,15 @@ sum of existing deadlines, each with its own timeout wake of the core loop
 
 **Gate queue deadline `Q` = 30 s** — the wait before admission. A parkable
 request (`SetCrtcConfig`) that has waited `Q` at the gate without being
-admitted is taken out of the queue and processed with no backend call:
-`randr.rs` validation runs as usual against the published state (so a
-protocol error is the one Legacy would send), and a request that validates
-answers `Failed` (`GateExpired`) with the current timestamp and no
-publication. Nothing of it was dispatched, so "`Success` means installed"
-holds. The other mutations are synchronous, have no `Failed` status, and are
-never expired.
+admitted is taken out of the queue and answered **without state-dependent
+validation** *(rev 3, round-2 B-2)*: its predecessor may still install and
+change what validation would decide, so validating against the published
+state would give a result serial Legacy could not. Only the stateless request
+checks run (length and field format, whose result does not depend on any
+configuration); a request that passes them answers `Failed` (`GateExpired`)
+with the current published timestamp and no publication. Nothing of it was
+dispatched, so "`Success` means installed" holds. The other mutations are
+synchronous, have no `Failed` status, and are never expired.
 
 **The bound.** Every admitted request is terminal within `E` of admission. A
 request that reaches the gate at `t` is either admitted by `t + Q` or expired
@@ -524,8 +549,10 @@ synchronous one executes by then. Worst case about 30 + 95 s. Each stage and
 
 **Named exception — `GateExpired`.** Legacy would have executed a request
 that waited behind a slow one (it blocks the whole core loop while it
-modesets); the Owner answers `Failed` after `Q`. Reachable only when a
-mutation stays in flight longer than 30 s.
+modesets), answering whatever its validation and execution decided —
+`Success`, `Failed`, `InvalidConfigTime` or a protocol error. The Owner
+answers `Failed` after `Q` for any request that passes the stateless checks.
+Reachable only when a mutation stays in flight longer than 30 s.
 
 ### 7.4. What never parks
 
@@ -581,6 +608,11 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   RANDR state, reply and events match Legacy's.
 - **Staged scene state:** a failure while building it is a preparation
   failure with nothing changed; promotion runs no fallible call.
+- **Scene retirement:** a mode change promoted while the target's old state
+  has a pending deferred pool release with an unsignalled fence: the slot is
+  not freed until the fence signals, the ring outlives it, and the new state
+  never receives that slot; other outputs' states are the same objects before
+  and after.
 - **`EBUSY`:** no retry, readiness closed, evidence recorded.
 - **Unflip handoff:** each unflip outcome (retired, rejected, unknown) reaches
   the parked modeset.
@@ -604,8 +636,9 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   (the gate, including the section 7.1 MATE sequence); cross-device and
   cross-transport order; the requester disconnecting while parked; each
   section 7.3 stage expired; the gate queue deadline `Q` (a parkable request
-  expired with a validation error and without one; a synchronous mutation
-  behind it is not expired); FIFO admission order at the gate; the VT
+  expired behind a predecessor whose installation would change its
+  validation outcome answers `Failed` either way; a malformed one still gets
+  its stateless error; a synchronous mutation behind it is not expired); FIFO admission order at the gate; the VT
   released; a requester-less mutation from the test producer, including the
   section 7.5 supersession sequence. Identical except the named exceptions.
 - **Hardware:** the 3b-i sequences driven by an in-test protocol client
@@ -635,6 +668,10 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
 13. A position-only change dispatched to KMS → the position-only test fails.
 14. A fallible call placed after acceptance in promotion → the staged-scene
     test fails.
+17. The replaced scene state dropped at promotion, or its deferred release
+    freed before its fence → the scene-retirement test fails.
+18. `Q` expiry running state-dependent validation → the expiry case with a
+    predecessor that changes the outcome fails.
 15. A `REC-4` event held at the gate → the section 7.5 sequence fails.
 16. Gate admission in ready-ring order instead of arrival order, or `Q`
     applied to a synchronous mutation → the gate cases fail.
@@ -648,7 +685,8 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
 4. Other devices do not blank during a modeset (section 5; physical, not
    client-visible).
 5. `GateExpired`: a parkable request that waited `Q` behind a slow mutation
-   answers `Failed` (section 7.3).
+   answers `Failed` whatever Legacy's validation would have decided (section
+   7.3).
 
 ## 9. Out of scope
 
