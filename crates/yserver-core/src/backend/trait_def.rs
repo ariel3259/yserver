@@ -54,6 +54,65 @@ pub enum CrtcConfigApply {
     Pending(CrtcConfigToken),
 }
 
+/// What happens to a pending CRTC operation when its requesting client leaves.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RequesterAbandon {
+    /// The backend cancelled the operation; it can no longer install.
+    Cancelled,
+    /// The operation may still install and must complete without a reply.
+    ContinuesWithoutRequester,
+}
+
+/// A backend-originated RANDR publication with no client request attached.
+///
+/// Backends provide the state update and notification continuation together so
+/// the core can order them as one publication. The core preserves `lastSetTime`
+/// and advances `lastConfigTime` only when `config_changed` is true.
+type RequesterlessStateUpdate = Box<dyn FnOnce(&mut ServerState) + Send + 'static>;
+type RequesterlessNotifications =
+    Box<dyn FnOnce(&mut ServerState, Option<(u16, u16)>) + Send + 'static>;
+
+pub struct RequesterlessPublication {
+    config_changed: bool,
+    update_state: RequesterlessStateUpdate,
+    emit_notifications: RequesterlessNotifications,
+}
+
+impl RequesterlessPublication {
+    /// Build a publication from the backend's state update and its matching
+    /// notifications. `emit_notifications` receives the enabled-output bbox
+    /// from immediately before the update, so a resize notification is based
+    /// on the state that was current when this publication reached the gate.
+    pub fn new(
+        config_changed: bool,
+        update_state: impl FnOnce(&mut ServerState) + Send + 'static,
+        emit_notifications: impl FnOnce(&mut ServerState, Option<(u16, u16)>) + Send + 'static,
+    ) -> Self {
+        Self {
+            config_changed,
+            update_state: Box::new(update_state),
+            emit_notifications: Box::new(emit_notifications),
+        }
+    }
+
+    pub(crate) fn publish(self, state: &mut ServerState, output_bbox_before: Option<(u16, u16)>) {
+        let last_set_time = state.randr.timestamp;
+        let last_config_time = state.randr.config_timestamp;
+        (self.update_state)(state);
+
+        // Backend state refreshes may replace the whole RandR projection.
+        // A requester-less publication never changes lastSetTime; only an
+        // available-configuration change advances lastConfigTime.
+        state.randr.timestamp = last_set_time;
+        state.randr.config_timestamp = if self.config_changed {
+            state.timestamp_now()
+        } else {
+            last_config_time
+        };
+        (self.emit_notifications)(state, output_bbox_before);
+    }
+}
+
 /// A pair identifying a logical Present sequence consumer and its requested
 /// sequence target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -689,6 +748,14 @@ pub trait Backend {
         Vec::new()
     }
 
+    /// Drain backend-originated RANDR publications that have no requesting
+    /// client. Producers must send `Message::CrtcConfigReady` after enqueueing
+    /// one so the core wakes even when no CRTC token is ready. The core orders
+    /// these publications against its in-flight RANDR mutation.
+    fn drain_requesterless_publications(&mut self) -> Vec<RequesterlessPublication> {
+        Vec::new()
+    }
+
     /// Finish a ready asynchronous CRTC operation on the core thread.
     /// Returns the same changed/no-op result as `apply_crtc_config`.
     fn finish_crtc_config(&mut self, _token: CrtcConfigToken) -> io::Result<bool> {
@@ -701,6 +768,24 @@ pub trait Backend {
     /// longer waiting. Implementations must tolerate a completion racing the
     /// cancellation and must never install that cancelled result later.
     fn cancel_crtc_config(&mut self, _token: CrtcConfigToken) {}
+
+    /// Detach the requesting client from an asynchronous CRTC operation.
+    /// `Cancelled` means the backend has also cancelled the token; a
+    /// `ContinuesWithoutRequester` token remains live and must still be
+    /// drained and finished so any installed state can be published.
+    fn abandon_crtc_config_requester(&mut self, token: CrtcConfigToken) -> RequesterAbandon {
+        self.cancel_crtc_config(token);
+        RequesterAbandon::Cancelled
+    }
+
+    /// Whether an outstanding CRTC configuration token has been dispatched
+    /// to work that may still install. `GetScreenResources` is serialized
+    /// behind such work because its forced connector reprobe can publish
+    /// RANDR state. Backends that only expose cancellable prerequisite work
+    /// (including the Legacy PRIME probe) keep the default `false` behavior.
+    fn crtc_config_install_capable(&self, _token: CrtcConfigToken) -> bool {
+        false
+    }
 
     /// Number of entries in the RANDR CRTC's hardware gamma LUT (`0` = gamma
     /// unsupported). The XID, rather than a connector name, preserves device

@@ -17,7 +17,11 @@
 //! `nested::handle_request`'s ChangeWindowAttributes path on
 //! ROOT_WINDOW pokes the container).
 
-use std::{io, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    io,
+    sync::{Arc, Mutex},
+};
 
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes};
 
@@ -26,8 +30,9 @@ use crate::{
         AnyHandle, Backend, ClipState, CompletedPresentEvent, CrtcConfigApply, CrtcConfigToken,
         CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle, ModeSpec, OriginContext,
         PictureHandle, PixmapHandle, PresentScanoutCandidate, PresentSequenceTarget,
-        PresentSourceWait, WindowHandle,
+        PresentSourceWait, RequesterAbandon, RequesterlessPublication, WindowHandle,
     },
+    core_loop::{CoreSender, Message},
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
 
@@ -136,6 +141,10 @@ pub enum RecordedCall {
         x: i32,
         y: i32,
     },
+    SetLogicalScreenSize {
+        width: u16,
+        height: u16,
+    },
     /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
     AcquireGlxPixmapExport(u32),
     /// GLX-TFP Task 3.4: `release_glx_pixmap_export(host_xid)` called.
@@ -198,6 +207,25 @@ type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
 type BeforeBlockAction = Box<dyn FnMut(&mut RecordingBackend) + Send>;
+
+/// Test producer for backend-originated RANDR publications. Enqueueing always
+/// sends the same wake used for ready CRTC tokens, including when no token is
+/// pending.
+#[derive(Clone)]
+pub struct RequesterlessPublicationProducer {
+    publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
+    sender: CoreSender,
+}
+
+impl RequesterlessPublicationProducer {
+    pub fn enqueue(&self, publication: RequesterlessPublication) -> io::Result<()> {
+        self.publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(publication);
+        self.sender.send(Message::CrtcConfigReady)
+    }
+}
 
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
@@ -295,10 +323,25 @@ pub struct RecordingBackend {
     /// `None` preserves the synchronous `apply_crtc_config` path.
     pub pending_crtc_config: Option<CrtcConfigToken>,
     pub ready_crtc_configs: Vec<CrtcConfigToken>,
+    requesterless_publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
     pub crtc_config_results:
         std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
     pub finished_crtc_configs: Vec<CrtcConfigToken>,
     pub cancelled_crtc_configs: Vec<CrtcConfigToken>,
+    /// Script whether the current pending CRTC token may still install.
+    /// Defaults to `false`, like backends that only park a PRIME probe.
+    pub crtc_config_is_install_capable: bool,
+    /// Script what requester abandonment does for the current token.
+    pub crtc_config_requester_abandon: RequesterAbandon,
+    /// Number of forced RANDR connector reprobes performed by tests.
+    pub reprobe_connectors_calls: usize,
+    /// When set, a forced reprobe toggles the first output's connection
+    /// state and emits the corresponding RANDR change notifications.
+    pub reprobe_connectors_changes_state: bool,
+    /// Stall a forced reprobe for deadline-ordering tests.
+    pub reprobe_connectors_delay: std::time::Duration,
+    /// Stall a synchronous screen-size mutation for deadline-ordering tests.
+    pub set_logical_screen_size_delay: std::time::Duration,
     /// Startup input-probe model. Each inner `Vec` is one "dispatch
     /// round" the fake libinput would yield; `probe_input_devices`
     /// consumes the front round per iteration and seeds the registry,
@@ -531,9 +574,16 @@ impl RecordingBackend {
             provider_output_source_error: None,
             pending_crtc_config: None,
             ready_crtc_configs: Vec::new(),
+            requesterless_publications: Arc::new(Mutex::new(VecDeque::new())),
             crtc_config_results: std::collections::HashMap::new(),
             finished_crtc_configs: Vec::new(),
             cancelled_crtc_configs: Vec::new(),
+            crtc_config_is_install_capable: false,
+            crtc_config_requester_abandon: RequesterAbandon::Cancelled,
+            reprobe_connectors_calls: 0,
+            reprobe_connectors_changes_state: false,
+            reprobe_connectors_delay: std::time::Duration::ZERO,
+            set_logical_screen_size_delay: std::time::Duration::ZERO,
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
@@ -589,6 +639,19 @@ impl RecordingBackend {
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
             applied_device_configs: Vec::new(),
+        }
+    }
+
+    /// Return a producer handle for tests that enqueue a requester-less
+    /// publication while the backend is owned by the core-loop thread.
+    #[must_use]
+    pub fn requesterless_publication_producer(
+        &self,
+        sender: CoreSender,
+    ) -> RequesterlessPublicationProducer {
+        RequesterlessPublicationProducer {
+            publications: Arc::clone(&self.requesterless_publications),
+            sender,
         }
     }
 
@@ -761,6 +824,28 @@ impl Backend for RecordingBackend {
 
     fn window_id(&self) -> u32 {
         self.fake_window_id
+    }
+
+    fn reprobe_connectors(&mut self, state: &mut crate::server::ServerState) -> io::Result<()> {
+        self.reprobe_connectors_calls += 1;
+        std::thread::sleep(self.reprobe_connectors_delay);
+        if self.reprobe_connectors_changes_state {
+            let changed = state.randr.outputs.first_mut().map(|output| {
+                output.connected = !output.connected;
+                (output.output_id, output.crtc_id, output.mode_id)
+            });
+            if let Some(changed) = changed {
+                state.randr.config_timestamp = state.randr.config_timestamp.wrapping_add(1);
+                crate::core_loop::run::emit_randr_change_notifications(state, &[changed]);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_logical_screen_size(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.record(RecordedCall::SetLogicalScreenSize { width, height });
+        std::thread::sleep(self.set_logical_screen_size_delay);
+        Ok(())
     }
 
     fn root_visual_xid(&self) -> u32 {
@@ -1270,6 +1355,14 @@ impl Backend for RecordingBackend {
         std::mem::take(&mut self.ready_crtc_configs)
     }
 
+    fn drain_requesterless_publications(&mut self) -> Vec<RequesterlessPublication> {
+        self.requesterless_publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
+    }
+
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
         self.finished_crtc_configs.push(token);
         self.crtc_config_results
@@ -1281,6 +1374,25 @@ impl Backend for RecordingBackend {
     fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
         self.cancelled_crtc_configs.push(token);
         self.crtc_config_results.remove(&token);
+    }
+
+    fn abandon_crtc_config_requester(&mut self, token: CrtcConfigToken) -> RequesterAbandon {
+        if self.crtc_config_requester_abandon == RequesterAbandon::Cancelled {
+            self.cancel_crtc_config(token);
+        }
+        self.crtc_config_requester_abandon
+    }
+
+    fn crtc_config_install_capable(&self, _token: CrtcConfigToken) -> bool {
+        self.crtc_config_is_install_capable
+    }
+
+    fn refresh_randr_state_set_time(
+        &mut self,
+        state: &mut crate::server::ServerState,
+        set_time: u32,
+    ) {
+        state.randr.timestamp = set_time;
     }
 
     fn set_crtc_gamma(
