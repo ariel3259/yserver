@@ -95,6 +95,9 @@ pub(crate) struct PreparedClientModesetSet {
     pub(crate) output_instance_id: Option<OutputInstanceId>,
     pub(crate) scanout: Option<OutputScanout>,
     pub(crate) scene: Option<StagedOutputSceneState>,
+    /// The CRTC clock epoch this configure transaction will install. Its
+    /// identity is reserved during preparation so promotion only moves data.
+    pub(crate) clock_key: Option<crate::kms::owner::clock::ClockKey>,
     pub(crate) mode_blob: Option<OwnedModeBlob>,
     pub(crate) allocation_keys: Vec<crate::kms::render::resources::AllocationKey>,
     #[cfg(test)]

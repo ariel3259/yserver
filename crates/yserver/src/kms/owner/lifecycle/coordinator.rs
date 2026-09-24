@@ -244,6 +244,41 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
         })
     }
 
+    /// Commit the output membership installed by a client modeset. A DPMS
+    /// event may have arrived after dispatch, so the protocol projection is
+    /// taken from the coordinator's current desired state; the accepted KMS
+    /// state is promoted separately from the prepared modeset description.
+    /// The device and output membership were verified before dispatch.
+    pub fn commit_staged_protocol_output(&mut self, device: &D, output: O) {
+        let current_representative = self
+            .dpms_request
+            .as_ref()
+            .and_then(|request| request.representatives.get(device).copied());
+        let entry = self
+            .devices
+            .get_mut(device)
+            .expect("staged output's lifecycle device was verified before dispatch");
+        let projection =
+            if let Some(projection) = entry.arbiter.desired().dpms_targets().get(&output) {
+                *projection
+            } else {
+                entry
+                    .arbiter
+                    .add_protocol_output(output.clone())
+                    .expect("staged output projection is added exactly once")
+            };
+        if projection.representative == current_representative
+            && self
+                .dpms_request
+                .as_ref()
+                .and_then(|request| request.representatives.get(device))
+                == projection.representative.as_ref()
+            && let Some(request) = self.dpms_request.as_mut()
+        {
+            request.removed_devices.remove(device);
+        }
+    }
+
     /// Remove one protocol output and remember its current request projection
     /// as invalidated only when that device has no remaining projection for it.
     pub fn remove_protocol_output(
@@ -273,6 +308,33 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
             request.removed_devices.insert(device.clone());
         }
         Ok(Some(removal))
+    }
+
+    /// Infallibly invalidate a protocol output projection after the KMS
+    /// disable that removed it. The target's presence is checked while the
+    /// modeset is prepared, before the kernel can accept the transaction.
+    pub fn invalidate_staged_protocol_output(&mut self, device: &D, output: &O) {
+        let entry = self
+            .devices
+            .get_mut(device)
+            .expect("removed output's lifecycle device was verified before dispatch");
+        let removal = entry
+            .arbiter
+            .remove_protocol_output(output)
+            .expect("staged output projection is invalidated exactly once");
+
+        if let Some(request) = self.dpms_request.as_mut()
+            && let Some(event_id) = request.representatives.get(device).copied()
+            && removal.projection.representative == Some(event_id)
+            && !entry
+                .arbiter
+                .desired()
+                .dpms_targets()
+                .values()
+                .any(|projection| projection.representative == Some(event_id))
+        {
+            request.removed_devices.insert(device.clone());
+        }
     }
 
     /// Accept a shutdown request. The global bit is monotonic and is updated

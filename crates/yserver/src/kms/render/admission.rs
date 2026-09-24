@@ -338,6 +338,14 @@ pub(crate) enum ClientModesetPhase {
     Dispatched,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientModesetPromotionStep {
+    KmsState,
+    Projection,
+    Scene,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ClientModesetSlot {
     pub(crate) tag: ClientModesetTag<IncarnationId>,
@@ -407,6 +415,8 @@ pub(crate) struct LifecycleDriver {
     stale_before_live_dispatch: usize,
     #[cfg(test)]
     stale_results: usize,
+    #[cfg(test)]
+    pub(crate) client_modeset_promotion_steps: Vec<ClientModesetPromotionStep>,
 }
 
 impl LifecycleDriver {
@@ -448,6 +458,8 @@ impl LifecycleDriver {
             stale_before_live_dispatch: 0,
             #[cfg(test)]
             stale_results: 0,
+            #[cfg(test)]
+            client_modeset_promotion_steps: Vec::new(),
         }
     }
 
@@ -938,7 +950,7 @@ impl KmsBackend {
             .collect()
     }
 
-    fn lifecycle_register_owner_device(
+    pub(super) fn lifecycle_register_owner_device(
         &mut self,
         device: DrmDeviceKey,
     ) -> Result<(), crate::kms::owner::lifecycle::CoordinatorError> {
@@ -1767,6 +1779,9 @@ impl KmsBackend {
             .device(&device)
             .ok_or_else(|| preparation_error(Stage::SceneState))?
             .desired();
+        if request.2.is_none() && !device_desired.dpms_targets().contains_key(&output_key) {
+            return Err(preparation_error(Stage::SceneState));
+        }
         if let Some(current) = device_desired.dpms_targets().get(&output_key)
             && (current.level != global_level || current.epoch.unwrap_or(0) != global_epoch)
         {
@@ -1830,11 +1845,34 @@ impl KmsBackend {
                 .get(&device)
                 .copied()
                 .unwrap_or(true);
+        let clock_key = if request.2.is_some() {
+            let hardware_crtc = u32::from(output.crtc);
+            let owner = self
+                .platform
+                .owner_ref(device)
+                .ok_or_else(|| preparation_error(Stage::Allocation))?;
+            let epoch =
+                owner.next_clock_epoch_after(hardware_crtc, self.next_present_crtc_clock_epoch);
+            if epoch.get().checked_add(1).is_none()
+                || owner
+                    .clock_key_for_hardware_crtc(hardware_crtc)
+                    .is_some_and(|current| epoch <= current.epoch)
+            {
+                return Err(preparation_error(Stage::Allocation));
+            }
+            Some(crate::kms::owner::clock::ClockKey {
+                hardware_crtc,
+                epoch,
+            })
+        } else {
+            None
+        };
         let mut prepared_set = PreparedClientModesetSet {
             output: Some(output),
             output_instance_id: None,
             scanout: None,
             scene: None,
+            clock_key,
             mode_blob: None,
             allocation_keys: Vec::new(),
             #[cfg(test)]
@@ -1885,6 +1923,14 @@ impl KmsBackend {
                 .map(u32::from)
                 .filter(|framebuffer| *framebuffer != 0)
                 .ok_or_else(|| preparation_error(Stage::Allocation))?;
+            if let Some(front) = scanout.display_pool_mut().bos.first_mut() {
+                front.state.mark_on_screen_after_modeset();
+                scanout
+                    .note_kms_modeset_installed(0)
+                    .map_err(|_| preparation_error(Stage::Allocation))?;
+            } else {
+                return Err(preparation_error(Stage::Allocation));
+            }
             #[cfg(test)]
             let framebuffer_handles_for_tests = scanout
                 .display_pool()
@@ -3493,6 +3539,269 @@ impl KmsBackend {
         }
     }
 
+    pub(super) fn lifecycle_promote_client_modeset(
+        &mut self,
+        device: DrmDeviceKey,
+        mut slot: ClientModesetSlot,
+    ) {
+        use crate::kms::backend::ActiveOutput;
+        #[cfg(test)]
+        use crate::kms::render::admission::ClientModesetPromotionStep as Step;
+
+        let key = crate::kms::backend::OutputKey::new(device, slot.connector.clone());
+        let mut prepared = slot
+            .prepared
+            .take()
+            .expect("a dispatched modeset retains its complete prepared set");
+        let mut prepared_set = prepared.prepared_set;
+        let mut identity_map = self.scene.stage_output_identity_map();
+        let old_extent = (self.platform.fb_w, self.platform.fb_h);
+        let mut lit_clock = None;
+        let mut staged_projection_for_promotion = None;
+
+        if let Some(mode) = slot.mode {
+            let output = prepared_set
+                .output
+                .take()
+                .expect("configure promotion owns its discovered output");
+            let output_instance = prepared_set
+                .output_instance_id
+                .take()
+                .expect("configure promotion owns its reserved output instance");
+            let scanout = prepared_set
+                .scanout
+                .take()
+                .expect("configure promotion owns its registered scanout pool");
+            let staged_scene = prepared_set
+                .scene
+                .take()
+                .expect("configure promotion owns its staged scene state");
+            let staged_projection = prepared
+                .staged_projection
+                .take()
+                .expect("configure promotion owns its staged DPMS projection");
+            let clock_key = prepared_set
+                .clock_key
+                .take()
+                .expect("configure promotion owns its reserved CRTC clock epoch");
+            lit_clock = (staged_projection.target == crate::kms::owner::lifecycle::DpmsTarget::On)
+                .then_some(clock_key);
+            staged_projection_for_promotion = Some(staged_projection);
+            let scanout_route = scanout.route();
+            let bo_count = scanout.display_pool().bos.len();
+            assert!(
+                bo_count != 0,
+                "prepared scanout pool has a modeset front BO"
+            );
+            let hardware_crtc = clock_key.hardware_crtc;
+
+            if let Some(output_idx) = self
+                .platform
+                .outputs
+                .iter()
+                .position(|output| output.key == key)
+            {
+                let retired_pool = self.platform.scanout_pools[output_idx]
+                    .take()
+                    .expect("a kept Owner output has its installed scanout pool");
+                identity_map.replace(&key, staged_scene, retired_pool);
+                let layout = &mut self.platform.outputs[output_idx];
+                layout.output = output;
+                layout.scanout_route = scanout_route;
+                layout.x = slot.x;
+                layout.y = slot.y;
+                layout.width = mode.width;
+                layout.height = mode.height;
+                self.platform.scanout_pools[output_idx] = Some(scanout);
+                self.platform.output_instance_ids[output_idx] = output_instance;
+                self.platform.bo_generations[output_idx] = vec![Default::default(); bo_count];
+                self.platform.first_pageflip_logged[output_idx] = false;
+            } else {
+                identity_map.insert(key.clone(), staged_scene);
+                self.platform.outputs.push(ActiveOutput::new(
+                    scanout_route,
+                    output,
+                    crate::drm::Swapchain::empty_for_tests(),
+                    slot.x,
+                    slot.y,
+                ));
+                self.platform.scanout_pools.push(Some(scanout));
+                self.platform.output_instance_ids.push(output_instance);
+                self.platform
+                    .bo_generations
+                    .push(vec![Default::default(); bo_count]);
+                self.platform.first_pageflip_logged.push(false);
+            }
+
+            let entry = self.randr_id_alloc.entry_mut(&key);
+            entry.config = crate::kms::render::backend::ConnectorConfig::Enabled {
+                mode_w: mode.width,
+                mode_h: mode.height,
+                vrefresh: mode.vrefresh,
+                x: slot.x,
+                y: slot.y,
+            };
+            entry.crtc_associated = true;
+            entry.client_configured = true;
+            entry.connected = true;
+            entry.last_enabled = None;
+
+            let owner = self
+                .platform
+                .owner_for(device)
+                .expect("current modeset owner remains installed through promotion");
+            owner.install_modeset_clock_epoch(clock_key);
+            self.next_present_crtc_clock_epoch = self.next_present_crtc_clock_epoch.max(
+                clock_key
+                    .epoch
+                    .get()
+                    .checked_add(1)
+                    .expect("clock epoch reserved"),
+            );
+            assert_eq!(
+                hardware_crtc,
+                u32::from(
+                    self.platform
+                        .outputs
+                        .iter()
+                        .find(|output| output.key == key)
+                        .expect("configured output was promoted")
+                        .output
+                        .crtc,
+                )
+            );
+            let (fb_w, fb_h) = crate::kms::render::platform::recompute_fb_extent_from(
+                &self
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| (output.x, output.y, output.width, output.height))
+                    .collect::<Vec<_>>(),
+            );
+            self.platform.fb_w = fb_w;
+            self.platform.fb_h = fb_h;
+            self.update_input_extent(fb_w, fb_h);
+            self.prune_armed_targets_to_live_outputs();
+        } else {
+            let output_idx = self
+                .platform
+                .outputs
+                .iter()
+                .position(|output| output.key == key)
+                .expect("disable promotion retains its bound output until the boundary");
+            let retired_pool = self.platform.scanout_pools[output_idx]
+                .take()
+                .expect("a disabled Owner output has its installed scanout pool");
+            identity_map.remove(&key, retired_pool);
+            self.platform.outputs.remove(output_idx);
+            self.platform.scanout_pools.remove(output_idx);
+            self.platform.output_instance_ids.remove(output_idx);
+            self.platform.bo_generations.remove(output_idx);
+            self.platform.first_pageflip_logged.remove(output_idx);
+
+            let entry = self.randr_id_alloc.entry_mut(&key);
+            entry.config = crate::kms::render::backend::ConnectorConfig::Off;
+            entry.crtc_associated = false;
+            entry.client_configured = true;
+            entry.last_enabled = None;
+
+            let (fb_w, fb_h) = crate::kms::render::platform::recompute_fb_extent_from(
+                &self
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| (output.x, output.y, output.width, output.height))
+                    .collect::<Vec<_>>(),
+            );
+            self.platform.fb_w = fb_w;
+            self.platform.fb_h = fb_h;
+            self.update_input_extent(fb_w, fb_h);
+            self.prune_armed_targets_to_live_outputs();
+        }
+
+        let root_extent_changed = old_extent != (self.platform.fb_w, self.platform.fb_h);
+        let affected_devices = if root_extent_changed {
+            self.lifecycle_conductors_devices_for_root_change()
+        } else {
+            std::collections::HashSet::from([device])
+        };
+        for affected in affected_devices {
+            let _ = self.admission_advance_layout_generation(affected);
+        }
+
+        let has_live_device_outputs = self
+            .platform
+            .outputs
+            .iter()
+            .any(|output| output.key.device_key == device);
+        let installed_active = if has_live_device_outputs {
+            staged_projection_for_promotion
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection.target == crate::kms::owner::lifecycle::DpmsTarget::On
+                })
+                || (slot.mode.is_none() && self.owner_outputs_powered_on(device))
+        } else {
+            false
+        };
+        self.owner_dpms_installed_active
+            .insert(device, installed_active);
+        self.update_resource_service_activity();
+
+        #[cfg(test)]
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            driver.client_modeset_promotion_steps.push(Step::KmsState);
+        }
+
+        if let Some(projection) = staged_projection_for_promotion {
+            #[cfg(test)]
+            if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+                driver.client_modeset_promotion_steps.push(Step::Projection);
+            }
+            self.lifecycle_coordinator
+                .commit_staged_protocol_output(&device, projection.output);
+        } else {
+            #[cfg(test)]
+            if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+                driver.client_modeset_promotion_steps.push(Step::Projection);
+            }
+            self.lifecycle_coordinator
+                .invalidate_staged_protocol_output(&device, &key);
+        }
+
+        self.scene
+            .promote_output_identity_map(&self.platform, identity_map);
+        #[cfg(test)]
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            driver.client_modeset_promotion_steps.push(Step::Scene);
+        }
+        if root_extent_changed {
+            self.scene.invalidate_all_scanout_damage();
+        }
+        self.scene.wake_for_damage();
+
+        if let Some(key) = lit_clock {
+            self.modeset_lit_clock_probes
+                .insert((device, key.hardware_crtc, key.epoch.get()));
+            self.retain_waiting_clock_probe(device, key);
+            self.promote_waiting_clock_probe(device);
+        }
+        for affected in if root_extent_changed {
+            self.lifecycle_conductors_devices_for_root_change()
+        } else {
+            std::collections::HashSet::from([device])
+        } {
+            let _ = self.admission_wake(affected, false);
+        }
+        prepared_set.mode_blob.take();
+    }
+
+    fn lifecycle_conductors_devices_for_root_change(
+        &self,
+    ) -> std::collections::HashSet<DrmDeviceKey> {
+        self.admission_conductors.keys().copied().collect()
+    }
+
     fn lifecycle_finish_client_modeset(
         &mut self,
         device: DrmDeviceKey,
@@ -3507,22 +3816,42 @@ impl KmsBackend {
         if tracked_tag != Some(tag) {
             return;
         }
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor
+                .admission
+                .cancel_topology(TopologyWork::ClientModeset(tag));
+        }
+        let current = self.client_modeset_tag_current(device, tag);
         let Some(slot) = self.lifecycle_take_client_modeset_slot(device, tag) else {
             return;
         };
         let token = slot.token;
-        self.lifecycle_release_client_modeset_slot(slot);
+        let terminal = if terminal == TerminalState::Completed && !current {
+            TerminalState::CompletionUnknown(
+                crate::kms::owner::record::UnknownCause::ContradictoryEvidence,
+            )
+        } else {
+            terminal
+        };
         let result = match terminal {
-            TerminalState::Completed => Ok(true),
+            TerminalState::Completed => {
+                self.lifecycle_promote_client_modeset(device, slot);
+                Ok(true)
+            }
             TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno }) => {
+                self.lifecycle_release_client_modeset_slot(slot);
                 Err(std::io::Error::from_raw_os_error(errno))
             }
-            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(cause)) => Err(
-                std::io::Error::other(format!("Owner modeset was not dispatched: {cause:?}")),
-            ),
-            TerminalState::CompletionUnknown(cause) => Err(std::io::Error::other(format!(
-                "Owner modeset completion is unknown: {cause:?}"
-            ))),
+            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(cause)) => Err({
+                self.lifecycle_release_client_modeset_slot(slot);
+                std::io::Error::other(format!("Owner modeset was not dispatched: {cause:?}"))
+            }),
+            TerminalState::CompletionUnknown(cause) => {
+                self.lifecycle_release_client_modeset_slot(slot);
+                Err(std::io::Error::other(format!(
+                    "Owner modeset completion is unknown: {cause:?}"
+                )))
+            }
         };
         match self
             .lifecycle_coordinator
@@ -4283,6 +4612,24 @@ impl KmsBackend {
         &mut self,
         device: DrmDeviceKey,
     ) -> AdmissionOutcome {
+        let outcome = self.admission_advance_layout_generation(device);
+        if outcome == AdmissionOutcome::TransportClosed {
+            return outcome;
+        }
+        if outcome == AdmissionOutcome::Inert {
+            return outcome;
+        }
+        self.admission_wake(device, false)
+    }
+
+    /// Advance one device's layout generation and invalidate its queued
+    /// direct successor without waking admission. Topology promotion uses
+    /// this form to finish all KMS, projection and scene moves before a
+    /// newly eligible composed intent can dispatch.
+    pub(crate) fn admission_advance_layout_generation(
+        &mut self,
+        device: DrmDeviceKey,
+    ) -> AdmissionOutcome {
         if !self.admission_is_active(device) {
             return AdmissionOutcome::Inert;
         }
@@ -4326,7 +4673,7 @@ impl KmsBackend {
             }
         }
 
-        self.admission_wake(device, false)
+        AdmissionOutcome::NothingAdmissible
     }
 
     /// Advance every live device's layout generation after a backend scene
