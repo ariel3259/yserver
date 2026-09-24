@@ -1,9 +1,10 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 4 (codex rounds
+**Status:** Revision 5 (codex rounds
 [1](../findings/2026-09-24-stage-3b-design-review-round1.md),
-[2](../findings/2026-09-24-stage-3b-design-review-round2.md) and
-[3](../findings/2026-09-24-stage-3b-design-review-round3.md)), written by the
+[2](../findings/2026-09-24-stage-3b-design-review-round2.md),
+[3](../findings/2026-09-24-stage-3b-design-review-round3.md) and
+[4](../findings/2026-09-24-stage-3b-design-review-round4.md)), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -195,9 +196,13 @@ region in the root — composition state, not a KMS property: the CRTC keeps its
 mode and its pool, and no plane `SRC`/`CRTC` rectangle changes. The Owner
 therefore runs a position-only request as a **logical transaction with no
 commit**: it takes the device's client-modeset slot (so it is ordered with
-real modesets and superseded like them before promotion), stages the new
-scene state (section 4.1 step 5), and promotes it (section 4.2) without a
-`Tier::Topology` dispatch. Its reply, timestamps and events match Legacy's
+real modesets and superseded like them before promotion) and promotes
+(section 4.2) without a `Tier::Topology` dispatch. *(Rev 5, round-4 B-1.)* It
+does **not** replace the output's scene state: the existing
+`OutputSceneState` is updated in place — its origin, and full damage — so its
+composition ring, pending releases, pending acknowledgements and owner
+buffers keep their owner and their proofs. The update is data-only and
+infallible; there is nothing to stage and nothing to retire. Its reply, timestamps and events match Legacy's
 for the same request. C.0's minimal property list is respected: nothing
 changes in KMS, so nothing is sent. A request that changes the mode **and**
 the position is an ordinary mode change.
@@ -276,9 +281,10 @@ slot is taken, while the old topology keeps scanning out and composing:
 4. `TEST_ONLY` of the complete device transaction through the 3a-ii
    validation path;
 5. *(rev 2, round-1 M-2; rev 3, round-2 B-1)* **the new scene state of the
-   target output only** (its `OutputSceneState` — composition ring, damage
-   audit, extent and origin — built against the staged layout; none for a
-   disable), and the staged `OutputKey` → position map of the whole new
+   target output only**, for an enable or a mode change (its
+   `OutputSceneState` — composition ring, damage audit, extent and origin —
+   built against the staged layout; none for a disable or a position-only
+   change), and the staged `OutputKey` → position map of the whole new
    `platform.outputs`. Nothing is swapped in yet. No other output's scene
    state is rebuilt, on this device or another: a modeset changes neither
    their mode nor their origin.
@@ -316,8 +322,9 @@ order:
 2. The projection hook (section 3.4).
 3. **Scene promotion** (section 5.1): the target's staged state swapped in,
    every kept state re-associated through the staged identity map, and the
-   target's **old** state (mode change or disable) moved to the retirement
-   list of section 5.1 — never dropped.
+   target's **old** state and **old pool** (mode change or disable) moved
+   together into a detached retired-output bundle (section 5.1) — never
+   dropped.
 
 All three steps move data only; none has a fallible call *(rev 2, round-1
 M-2)*. Other devices can therefore never resume against positions that do
@@ -330,7 +337,36 @@ applies to every displacing owner commit: at dispatch, each displaced
 allocation registers a `KmsRelease` obligation against that commit and CRTC
 (`ResourceService::register_kms`, `resources/mod.rs:998`), and the
 commit's `CompletionRetired` discharges it (as for the composed allocation a
-direct entry displaces, `backend.rs:54313`). That discharges **only** the KMS
+direct entry displaces, `backend.rs:54313`) — when the CRTC is **active
+before or after** the commit, which is exactly when C.0 puts it in
+`ExpectedCompletionCrtcs` with an out-fence.
+
+**A CRTC dark before and after** *(coordinator, rev 5, round-4 B-2)*. Under a
+global DPMS-off a mode change or a disable targets a CRTC that is inactive
+before and stays inactive after. C.0 excludes it from
+`ExpectedCompletionCrtcs` (inactive-to-inactive) and forbids an out-fence for
+it, so the commit brings no completion evidence for that CRTC. The release
+proof is instead the **dark-CRTC displacement proof**: the displaced
+allocation's `KmsRelease` is discharged when both hold —
+
+1. the CRTC's installed power is `Off` **by proof**: an `ACTIVE=0` commit on
+   it in the current incarnation retired with its successful out-fence (3a-ii
+   observes exactly this), and every owner commit on that CRTC since kept it
+   inactive. The owner is the sole writer of the device and records each
+   CRTC's installed power, so the chain is checkable, and nothing scanned
+   out from that CRTC's planes after the proven off;
+2. the displacing commit reached its terminal `Completed`. With an empty
+   expected set that is its acceptance, which removes the framebuffer from
+   the plane's committed state.
+
+If the chain in (1) cannot be shown — the power record is unproven, or any
+commit since the off is `CompletionUnknown` — no dark proof exists, and the
+allocation stays retained until the next displacing commit that has an
+out-fence on that CRTC (the DPMS-on that lights it) or the device-scoped
+barrier (2c-i), whichever comes first. The proof is typed
+(`DarkCrtcDisplacement { off_commit, crtc }`), never inferred from the
+absence of a fence, and repeated mode changes under DPMS-off each discharge
+their predecessor's pool through it. That discharges **only** the KMS
 obligation: each allocation's GPU gate and Vulkan/FOREIGN return rules remain
 separate proofs (C.0 §10.2, COMMIT-2), serviced as today. A disable is not a
 special case: its commit sets the plane's `FB_ID` to zero, so it displaces
@@ -373,6 +409,22 @@ generation on the old pool's KMS retirement — and the ring after its last
 slot. Nothing on the list can be reused by the new state. At teardown the
 list follows the 2c-i teardown handoff like any other retained owner (its
 barrier is 3d's).
+
+**A retired output has no position** *(rev 5, round-4 M-1)*. The replaced
+scene state and the old pool (`OutputScanout`, which for the copied route
+holds both the source-side render resources and the sink-side scanout BOs)
+leave `platform.outputs`, `platform.scanout_pools` and the scene's output
+vector together, as one **retired-output bundle** keyed by its `OutputKey`
+and a retirement id, owned by a per-device retirement list. Every operation
+on it — fence polling, owner-buffer displacement and leave, `KmsRelease`
+discharge, GPU and FOREIGN returns — addresses the bundle itself, never an
+output index; the existing index-addressed helpers (for example
+`retire_owner_displaced`, `scene.rs:5062`, which calls
+`platform.leave_owner_buffer(output_idx, …)`) gain a bundle-addressed form
+and the index form is never called for a retired output. An index shift after
+the disable therefore cannot redirect a retired resource to another output,
+and the copied route's source-side resources retire with their bundle under
+2c-iii's copied-route rules.
 
 The scene state and `platform.scanout_pools` are indexed **by position** in
 `platform.outputs`. Adding or removing an output shifts the positions of the
@@ -649,11 +701,24 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
 - **`EBUSY`:** no retry, readiness closed, evidence recorded.
 - **Unflip handoff:** each unflip outcome (retired, rejected, unknown) reaches
   the parked modeset.
-- **Old pool release:** after a disable and after a mode change, each old pool
-  allocation holds a `KmsRelease` against the modeset commit, survives
-  acceptance, is discharged only by that commit's `CompletionRetired`, and is
-  destroyed only once its GPU/FOREIGN proofs also hold; under
-  `CompletionUnknown` it stays quarantined.
+- **Old pool release:** after a disable and after a mode change on a lit
+  CRTC, each old pool allocation holds a `KmsRelease` against the modeset
+  commit, survives acceptance, is discharged only by that commit's
+  `CompletionRetired`, and is destroyed only once its GPU/FOREIGN proofs also
+  hold; under `CompletionUnknown` it stays quarantined.
+- **Dark CRTC:** three mode changes and then a disable under DPMS-off: each
+  displaced pool is discharged by `DarkCrtcDisplacement` at its successor's
+  `Completed`; with an unproven off (the off commit made `CompletionUnknown`
+  in the fixture) no dark proof is issued and the pool waits for the lighting
+  commit or the device barrier.
+- **Position-only in place:** with a pending unsignalled descriptor release
+  and a current composed buffer on the output, a position-only change keeps
+  the same scene state object; the release waits for its fence and the
+  buffer keeps its owner.
+- **Retired bundle:** a disable of output A with an unsignalled deferred
+  release, then an index shift that moves B into A's former position: A's
+  release is serviced from its bundle and nothing of B is touched; the same
+  for a copied-route output, including its source-side resources.
 - **Two devices:** a modeset on A issues zero lifecycle commits on B and B's
   in-flight composed commits complete; enabling/removing an output shifts
   indices without moving B's buffers; A in direct plus an enable on B
@@ -717,6 +782,12 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
     `KmsRelease` registered → the old-pool test fails.
 20. Queued deadlines not serviced before the next admission after a
     synchronous mutation → the mixed-server sequence fails.
+21. The dark proof issued without a proven off, or at acceptance when the CRTC
+    was lit → the dark-CRTC test fails.
+22. A position-only change replacing the scene state → the in-place test
+    fails.
+23. A retired resource addressed by output index → the retired-bundle test
+    fails.
 15. A `REC-4` event held at the gate → the section 7.5 sequence fails.
 16. Gate admission in ready-ring order instead of arrival order, or `Q`
     applied to a synchronous mutation → the gate cases fail.
@@ -756,3 +827,9 @@ from C.0 or a review finding, none reverses a decision of the session:
 4. **Position-only changes** run with no KMS commit (section 3.3).
 5. **Gate queue deadline `Q` = 30 s** and the `GateExpired` exception (section
    7.3, round-1 B-2).
+6. **Dark-CRTC displacement proof** (section 4.2, round-4 B-2): a new typed
+   release proof for a buffer displaced on a CRTC that was proven dark before
+   and stays dark. It reads C.0 §10.2's "resource-appropriate" release rule;
+   the alternative — keeping every pool displaced under DPMS-off until the
+   CRTC is lit — grows memory with each mode change made while the screen is
+   off.
