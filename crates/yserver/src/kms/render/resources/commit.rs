@@ -236,6 +236,30 @@ impl CommitResourceConsumer {
         Ok(selected)
     }
 
+    /// Retire the current owner resources for one CRTC after a completed
+    /// disable. Client modesets have no successor frame to move these leases
+    /// out of `current_resources` when the last output goes dark.
+    pub(crate) fn retire_current_for_crtc(&mut self, crtc: CrtcKey) {
+        assert!(
+            !self.current_resources.iter().any(|resources| {
+                resources.crtcs.iter().any(|member| member.crtc == crtc)
+                    && resources.crtcs.iter().any(|member| member.crtc != crtc)
+            }),
+            "a client disable cannot split a current resource group across CRTCs"
+        );
+
+        let current = std::mem::take(&mut self.current_resources);
+        let mut retained = Vec::with_capacity(current.len());
+        for resources in current {
+            if resources.crtcs.iter().any(|member| member.crtc == crtc) {
+                self.releasing_resources.push(resources);
+            } else {
+                retained.push(resources);
+            }
+        }
+        self.current_resources = retained;
+    }
+
     pub(crate) fn take_released_presents(&mut self) -> Vec<PresentRelease> {
         std::mem::take(&mut self.released_presents)
     }

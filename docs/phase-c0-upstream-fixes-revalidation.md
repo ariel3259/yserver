@@ -61,6 +61,7 @@ Rules for keeping it current:
 | `36405c09` | — | a depth-24 child stays opaque in its depth-32 parent's backing | low — render | render smoke |
 | `16581ab3` | — | telemetry: VRAM, per-GPU engine load, pixmap-pool residency (`drm/fdinfo.rs`, `kms/vk/vram.rs`) | low — observability; reads fdinfo | none beyond the telemetry output existing on Owner |
 | `2282c94f` | — | telemetry: VRAM accounted by use; every `vkAllocateMemory`/`vkFreeMemory` goes through `kms/vk/mem_accounting` (clippy disallows the raw calls) | **medium** — the merge routed three raw `free_memory` calls of C.0's resource service (`resources/scanout.rs` ×2, `resources/storage.rs`) through the ledger, and the managed-storage promotion now recategorises the exportable memory from either backing (`engine.rs`); a missed free would leave phantom ledger entries, not a leak | on Owner, the `vram by use` line's `untracked` stays flat across a composed/direct/unflip cycle and a TFP promotion |
+| `fc0917be` | #167 | protocol: BIG-REQUESTS advertises and accepts Xorg's `MAX_BIG_REQUEST_SIZE` (4194303 units), not 256K | **none** — protocol framing, identical on Legacy and Owner; the merge also moved 3b-ii's gate-expiry stateless check to the same constant | no Owner-specific revalidation; the protocol tests cover it |
 
 ## Reproduction tooling already in the tree
 

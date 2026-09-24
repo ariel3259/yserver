@@ -4994,7 +4994,7 @@ pub(crate) fn fail_expired_crtc_config(
     );
     let big_requests_enabled = client.is_some_and(|client| client.big_requests_enabled);
     let max_length_units = if big_requests_enabled {
-        256 * 1024
+        x11::MAX_BIG_REQUEST_UNITS
     } else {
         u32::from(u16::MAX)
     };
