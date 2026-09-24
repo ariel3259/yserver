@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bii_`, `c0_3bi_`, `c0_3aii_`, `c0_adm` in `yserver`, and the whole `yserver-core` suite — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 8 (2026-09-24, coordinator)** — codex round 7 (0 blocking, 1 major,
+1 minor, `../findings/2026-09-24-stage-3b-ii-plan-review-round7.md`): the XDMCP
+termination branch waits for the terminal result too (M-1, Task 2); the goal's
+bound includes the synchronous core-thread work `L` on every server (m-1).
+Review loop closed at the first round without a blocking finding since
+revision 4.
+
 **Revision 7 (2026-09-24, coordinator)** — codex round 6 (1 blocking,
 `../findings/2026-09-24-stage-3b-ii-plan-review-round6.md`): the forced reprobe
 is synchronous core-thread work; design revision 12 counts it in `L` and
@@ -47,7 +54,9 @@ wire-level scripts (M-1).
 **Goal:** the six RANDR obligations of the umbrella (§3b) hold for Owner and
 Legacy alike: one named component orders every RANDR mutation, `Success`
 means installed, an installed change is published even if its requester left,
-every parked request is answered within `Q + E` (+ `L` in a mixed server), and
+every parked request is answered within `Q + E + L`, `L` being the synchronous
+core-thread work ahead of it (Legacy mutations in a mixed server, and the
+forced connector reprobe until 3c — design revision 12), and
 changes no request caused have an ordered publication path.
 
 **Prerequisite:** plans 3b-i-1 and 3b-i-2 accepted. Tasks 1–4 are core-side
@@ -152,7 +161,7 @@ or by pruning, before the next admission, every FIFO entry and in-flight
 requester whose client no longer exists. For an in-flight requester the prune
 applies **the same abandonment** as a disconnect
 (`abandon_crtc_config_requester`): only the reply attachment is removed, and a
-`ContinuesWithoutRequester` publication stays in the gate *(rev 5)*. *(Rev 3, B-1.)* A **generation reset** or `-terminate`
+`ContinuesWithoutRequester` publication stays in the gate *(rev 5)*. *(Rev 3, B-1; rev 8 adds XDMCP.)* A **generation reset**, `-terminate`, or the orderly XDMCP termination (`core_loop/run.rs:1819`, reachable with XDMCP `-once`, `core_loop/xdmcp.rs:500`)
 (`core_loop/run.rs:1836`, `core_loop/reset.rs`) triggered while the gate holds
 an install-capable mutation (a `ContinuesWithoutRequester` one) is deferred
 until that mutation's terminal result — bounded by `E` — and only then
@@ -170,6 +179,7 @@ dropped. `Success` is answered only from `Ok(true)` or the idempotent
 | `c0_3bii_disconnect_after_dispatch_still_publishes` | A parked with `ContinuesWithoutRequester`, A disconnects, the backend completes `Ok(true)`: listener L receives the change notifications, nothing is written for A, the gate then admits the next waiter | **G7** drop the publication on disconnect (design mutation 6) |
 | `c0_3bii_disconnect_before_dispatch_cancels` | the backend answers `Cancelled`: no publication, the gate frees at once | **G8** keep the gate occupied after a cancel |
 | `c0_3bii_waiting_head_disconnects` | B is the FIFO head waiting behind A and disconnects: B leaves the FIFO, the next waiter keeps its place | **G9** leave the departed client in the FIFO |
+| `c0_3bii_xdmcp_termination_waits_for_an_install_capable_mutation` | *(rev 8, round-7 M-1)* an XDMCP `-once` session whose session client leaves while another client's Owner modeset is dispatched: the termination branch neither cancels the token nor exits until the result is terminal | **G9e** cancel and exit at once on the XDMCP branch |
 | `c0_3bii_reset_waits_for_an_install_capable_mutation` | *(rev 3, B-1)* the last client's dispatched modeset continues without its requester; the reset trigger fires (last client left): the reset does not cancel the token or snapshot backend state until the result is terminal; after `Ok(true)` the new generation's RANDR state is seeded from the installed topology, and nothing of the old client (reply, events) reaches the new generation; with `-terminate` the server exits only after the terminal result | **G9c** cancel the token and seed at once (today's `reset.rs` step order) |
 | `c0_3bii_killclient_of_a_dispatched_requester_still_publishes` | *(rev 5)* A's modeset dispatched (`ContinuesWithoutRequester`); D kills A with `KillClient`; the backend completes `Ok(true)`: the listener receives A's change notifications, nothing is written for A, and the next waiter is admitted after the publication | **G9d** prune the whole in-flight entry on inline removal |
 | `c0_3bii_killclient_removes_a_waiting_head` | A in flight, B the waiting head, C behind; D kills B with `KillClient`; A completes: C is admitted next and B's entry is gone | **G9b** clean the gate only in `disconnect_with_pending_cleanup` |
