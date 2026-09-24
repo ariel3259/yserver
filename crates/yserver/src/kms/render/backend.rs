@@ -74203,34 +74203,6 @@ mod tests {
             ))
         };
 
-        backend.scene.mark_scene_structure_dirty();
-        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
-        backend.platform.wait_idle_bounded();
-        backend.drain_scanout_render_completions_for_tests();
-        let _initial_commit = backend
-            .device_owner_for_tests(0)
-            .live_record()
-            .expect("initial composed frame is admitted")
-            .commit_id();
-        drive_until(
-            backend,
-            "initial composed frame",
-            Duration::from_secs(15),
-            &|backend| {
-                backend.device_owner_for_tests(0).live_record().is_none()
-                    && backend
-                        .commit_consumer
-                        .current_resources
-                        .iter()
-                        .any(|resources| resources.direct_role.is_none())
-            },
-        )
-        .unwrap_or_else(|error| panic!("initial composed frame failed: {error}"));
-        assert!(
-            c0_3aii_owner_current_framebuffer(backend, output_idx).is_some(),
-            "initial composed frame became the retained current framebuffer"
-        );
-
         let hardware_crtc = u32::from(crtc_key.crtc);
         let clock_key = backend
             .platform
@@ -74281,6 +74253,34 @@ mod tests {
                 "card1 CRTC {hardware_crtc} clock probe outcome={clock_outcome:?}, executor outcome={executor_probe_outcome:?}; expected KernelSequence"
             );
         }
+
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let _initial_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("initial composed frame is admitted")
+            .commit_id();
+        drive_until(
+            backend,
+            "initial composed frame",
+            Duration::from_secs(15),
+            &|backend| {
+                backend.device_owner_for_tests(0).live_record().is_none()
+                    && backend
+                        .commit_consumer
+                        .current_resources
+                        .iter()
+                        .any(|resources| resources.direct_role.is_none())
+            },
+        )
+        .unwrap_or_else(|error| panic!("initial composed frame failed: {error}"));
+        assert!(
+            c0_3aii_owner_current_framebuffer(backend, output_idx).is_some(),
+            "initial composed frame became the retained current framebuffer"
+        );
 
         for cycle in 1..=4 {
             let retained_framebuffer = c0_3aii_owner_current_framebuffer(backend, output_idx)
