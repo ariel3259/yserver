@@ -72,6 +72,37 @@ fn encode_page_flip(
     buf
 }
 
+/// Replace the `/dev/null` fd in `KmsBackend::for_tests()` with a nonblocking
+/// socket endpoint whose peer stays open. An empty read then returns
+/// `WouldBlock`, like an idle DRM event fd, while the backend's `Device` still
+/// owns the descriptor number and closes it when dropped.
+fn install_idle_drm_event_fd(backend: &KmsBackend) -> UnixStream {
+    let drm_fd = backend
+        .poll_fds()
+        .into_iter()
+        .find_map(|(fd, kind)| (kind == BackendFdKind::Drm).then_some(fd))
+        .expect("test backend DRM fd");
+    let (reader, writer) = UnixStream::pair().expect("idle DRM event socket pair");
+    reader
+        .set_nonblocking(true)
+        .expect("set idle DRM event fd nonblocking");
+    assert_ne!(reader.as_raw_fd(), drm_fd);
+
+    // SAFETY: `drm_fd` is the live descriptor owned by the test backend's
+    // `Device`; replacing its underlying open file description keeps that
+    // ownership intact, and O_CLOEXEC prevents the replacement from leaking
+    // across any child process spawned while the fixture is alive.
+    let replaced_fd = unsafe { libc::dup3(reader.as_raw_fd(), drm_fd, libc::O_CLOEXEC) };
+    assert_eq!(
+        replaced_fd,
+        drm_fd,
+        "replace test DRM fd with idle event socket: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(reader);
+    writer
+}
+
 /// Step 1: `poll_fds` exposes aggregate poller under `OwnerCompletion`;
 /// readiness on an adopted descriptor wakes the poller; mechanism failure detaches
 /// the poller and signals shutdown to the core loop.
@@ -375,6 +406,7 @@ fn legacy_handover_matrix_and_failure_latching() {
     // Scenario 1: Three live recipients A/B/C -> all Applied, proof consumed
     {
         let mut backend = KmsBackend::for_tests();
+        let _idle_drm_event_writer = install_idle_drm_event_fd(&backend);
         backend.set_stopped_admission_for_tests(true);
         let key = DrmDeviceKey { major: 0, minor: 0 };
 
@@ -425,6 +457,7 @@ fn legacy_handover_matrix_and_failure_latching() {
     // Scenario 2: B's recipient is gone -> B receives RecipientGone, A & C Applied, proof consumed
     {
         let mut backend = KmsBackend::for_tests();
+        let _idle_drm_event_writer = install_idle_drm_event_fd(&backend);
         backend.set_stopped_admission_for_tests(true);
         let key = DrmDeviceKey { major: 0, minor: 0 };
 
@@ -471,6 +504,7 @@ fn legacy_handover_matrix_and_failure_latching() {
     // shutdown requested, NO proof consumed, and subsequent call is refused.
     {
         let mut backend = KmsBackend::for_tests();
+        let _idle_drm_event_writer = install_idle_drm_event_fd(&backend);
         let (_poll, sender, rx) = channel().unwrap();
         backend.set_input_sender(sender);
         backend.set_stopped_admission_for_tests(true);

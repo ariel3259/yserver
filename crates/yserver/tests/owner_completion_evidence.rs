@@ -627,10 +627,7 @@ fn hardware_and_event_windows_are_independent() {
         primary_event(Some(Duration::from_secs(1))),
         Ok(Duration::from_millis(500))
     );
-    assert_eq!(
-        lifecycle_hardware(None),
-        Err(DeadlineError::LifecycleUnvalidated)
-    );
+    assert_eq!(lifecycle_hardware(None), Ok(Duration::from_secs(30)));
     assert_eq!(
         lifecycle_hardware(Some(Duration::from_secs(28))),
         Ok(Duration::from_secs(30))
@@ -1148,9 +1145,9 @@ fn failed_or_missing_caps_prevent_qualification_dispatch() {
     assert!(!owner.is_poisoned());
 }
 
-/// [COMMIT-2, COMMIT-5, CAP-1..4] Missing or above-28s lifecycle measurements refuse before dispatch with no poison.
+/// [COMMIT-2, COMMIT-5, CAP-1..4] Missing lifecycle timing uses the 30s bootstrap; above-28s timing refuses dispatch without poison.
 #[test]
-fn missing_or_excessive_lifecycle_timing_prevents_qualification_dispatch() {
+fn excessive_lifecycle_timing_prevents_qualification_dispatch_and_missing_uses_the_bootstrap() {
     let mut owner = owner_for_tests();
     let key = ClockKey {
         hardware_crtc: 1,
@@ -1173,27 +1170,58 @@ fn missing_or_excessive_lifecycle_timing_prevents_qualification_dispatch() {
 
     let desc = single_active_crtc();
 
-    // 1. None
+    // 1. No cohort measurement uses the bounded 30-second bootstrap.
     let ctx_none = lifecycle_context_for_crtcs(&[(1, key)], None);
-    let err = owner
+    let (commit, _) = owner
         .begin_install_restore(&desc, ledger(), ctx_none)
-        .unwrap_err();
-    assert!(matches!(err, DispatchError::LifecycleUnvalidated));
+        .expect("missing lifecycle timing must use the bootstrap deadline");
+    assert_eq!(
+        owner.qualification(),
+        CompletionQualification::Awaiting {
+            topology_generation: 1,
+            commit
+        }
+    );
+    owner.mark_dispatched_for_tests();
+    let accepted_at = Instant::now();
+    owner.apply_host_call_event_at(accepted(commit, 0b1, 1), accepted_at);
+    assert_eq!(
+        owner.completion_deadline(),
+        Some(accepted_at + Duration::from_secs(30))
+    );
+    assert!(!owner.is_poisoned());
 
-    // 2. 29 seconds (> 28s)
+    // 2. 29 seconds (> 28s) still refuses before dispatch.
+    let mut excessive_owner = owner_for_tests();
+    excessive_owner
+        .install_clock(key, LifecycleEpochId::first(), 1)
+        .unwrap();
+    excessive_owner
+        .clock_mut(key)
+        .unwrap()
+        .install_reference(100);
+    let excessive_caps = completion_caps_for_tests(
+        IncarnationId::first(),
+        1,
+        true,
+        true,
+        true,
+        [1].into_iter().collect(),
+    );
+    install_test_completion_caps(&mut excessive_owner, excessive_caps).unwrap();
     let ctx_29s = lifecycle_context_for_crtcs(&[(1, key)], Some(Duration::from_secs(29)));
-    let err = owner
+    let err = excessive_owner
         .begin_install_restore(&desc, ledger(), ctx_29s)
         .unwrap_err();
     assert!(matches!(err, DispatchError::LifecycleUnvalidated));
 
     assert_eq!(
-        owner.qualification(),
+        excessive_owner.qualification(),
         CompletionQualification::Unqualified {
             topology_generation: 1
         }
     );
-    assert!(!owner.is_poisoned());
+    assert!(!excessive_owner.is_poisoned());
 }
 
 /// [COMMIT-2, COMMIT-5, CAP-1..4] Topology invalidation closes a formerly qualified gate and cancels clocks/arms.
