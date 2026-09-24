@@ -208,7 +208,9 @@ pub enum PictureKind {
 #[derive(Debug)]
 pub struct PictureState {
     pub client: ClientId,
-    pub host_picture_xid: crate::backend::PictureHandle,
+    /// `None` when the backend could not back an otherwise valid Picture: it still
+    /// exists at protocol level, and every op on it is a no-op.
+    pub host_picture_xid: Option<crate::backend::PictureHandle>,
     pub host_owned_pixmap: Option<crate::backend::PixmapHandle>,
     pub kind: PictureKind,
     /// For `PictureKind::Drawable` pictures: the client-visible XID of
@@ -216,6 +218,11 @@ pub struct PictureState {
     /// accumulate damage on the right drawable after painting.
     /// `None` for `Sourceless` pictures (SolidFill / gradient).
     pub drawable: Option<ResourceId>,
+    /// The window this Picture was created on (`None` for pixmap and
+    /// sourceless Pictures). Destroying that window frees the Picture,
+    /// whichever client owns it (Xorg `PictureDestroyWindow`,
+    /// `render/picture.c:67`).
+    pub window: Option<ResourceId>,
 }
 
 #[derive(Debug)]
@@ -2610,6 +2617,23 @@ impl ResourceTable {
         self.pictures.get(&id.0)
     }
 
+    /// Remove every Picture, of any client, created on one of `windows`.
+    /// Returns `(host picture, host-owned pixmap)` for the backend frees.
+    pub fn remove_pictures_on_windows(
+        &mut self,
+        windows: &[ResourceId],
+    ) -> Vec<(u32, Option<u32>)> {
+        self.pictures
+            .extract_if(|_, p| p.window.is_some_and(|w| windows.contains(&w)))
+            .filter_map(|(_, p)| {
+                Some((
+                    p.host_picture_xid?.as_raw(),
+                    p.host_owned_pixmap.map(|h| h.as_raw()),
+                ))
+            })
+            .collect()
+    }
+
     pub fn create_glyphset(&mut self, id: ResourceId, state: GlyphSetState) {
         if let Some(old) = self.glyphsets.remove(&id.0) {
             let _ = self.release_host_glyphset_ref(old.host_glyphset_xid.as_raw());
@@ -2874,10 +2898,9 @@ impl ResourceTable {
         let mut freed_pictures: Vec<(u32, Option<u32>)> = Vec::new();
         self.pictures.retain(|_, p| {
             if p.client == client {
-                freed_pictures.push((
-                    p.host_picture_xid.as_raw(),
-                    p.host_owned_pixmap.map(|h| h.as_raw()),
-                ));
+                if let Some(hp) = p.host_picture_xid {
+                    freed_pictures.push((hp.as_raw(), p.host_owned_pixmap.map(|h| h.as_raw())));
+                }
                 false
             } else {
                 true
@@ -3874,10 +3897,11 @@ mod tests {
             pic_id.0,
             PictureState {
                 client: owner,
-                host_picture_xid: PictureHandle::from_raw_for_test(0xa06),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(0xa06)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Sourceless,
                 drawable: None,
+                window: None,
             },
         );
 

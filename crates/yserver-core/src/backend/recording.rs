@@ -114,6 +114,20 @@ pub enum RecordedCall {
         width: u16,
         height: u16,
     },
+    RenderCreatePicture {
+        host_drawable: AnyHandle,
+        host_pic: u32,
+    },
+    RenderFreePicture {
+        host_pic: u32,
+    },
+    RenderComposite {
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderFillRectangles {
+        host_dst: u32,
+    },
     CopyPlane {
         src_host_xid: u32,
         dst_host_xid: u32,
@@ -338,6 +352,8 @@ pub struct RecordingBackend {
     /// Configurable region returned by RENDER paint methods so core
     /// tests can assert exact damage plumbing without a real backend.
     pub render_return_region: Vec<xfixes::RegionRect>,
+    /// When true, `render_create_picture` cannot back the Picture (returns `Ok(None)`).
+    pub render_create_picture_fails: bool,
     /// Test controls for the asynchronous Present source-wait bridge.
     pub present_source_wait: PresentSourceWait,
     pub present_syncobj_wait: PresentSourceWait,
@@ -534,6 +550,7 @@ impl RecordingBackend {
             kbd_by_name_result: None,
             xkb_mods: (0, 0, 0, 0),
             render_return_region: Vec::new(),
+            render_create_picture_fails: false,
             present_source_wait: PresentSourceWait::Ready,
             present_syncobj_wait: PresentSourceWait::Ready,
             armed_present_syncobj_waits: Vec::new(),
@@ -1881,18 +1898,26 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: image_text16")
     }
 
-    // RENDER — `unimplemented!()`; render_opcode() returns None so call
-    // sites fast-path out before reaching these.
+    // RENDER — Picture create/free and the Composite/FillRectangles paints are recorded;
+    // the rest are no-ops.
 
     fn render_create_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_drawable: AnyHandle,
+        host_drawable: AnyHandle,
         _ynest_format: u32,
         _value_mask: u32,
         _values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        Ok(None)
+        if self.render_create_picture_fails {
+            return Ok(None);
+        }
+        let host_pic = self.allocate_handle();
+        self.record(RecordedCall::RenderCreatePicture {
+            host_drawable,
+            host_pic,
+        });
+        Ok(PictureHandle::from_raw(host_pic))
     }
 
     fn render_change_picture(
@@ -1907,8 +1932,9 @@ impl Backend for RecordingBackend {
     fn render_free_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreePicture { host_pic });
         Ok(())
     }
 
@@ -1950,9 +1976,9 @@ impl Backend for RecordingBackend {
         &mut self,
         _origin: Option<OriginContext>,
         _op: u8,
-        _host_src: u32,
+        host_src: u32,
         _host_mask: u32,
-        _host_dst: u32,
+        host_dst: u32,
         _src_x: i16,
         _src_y: i16,
         _mask_x: i16,
@@ -1962,6 +1988,7 @@ impl Backend for RecordingBackend {
         _width: u16,
         _height: u16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderComposite { host_src, host_dst });
         Ok(self.render_return_region.clone())
     }
 
@@ -1986,13 +2013,14 @@ impl Backend for RecordingBackend {
     fn render_fill_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_dst: u32,
+        host_dst: u32,
         _op: u8,
         _color: [u8; 8],
         _rects: &[u8],
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFillRectangles { host_dst });
         Ok(())
     }
 

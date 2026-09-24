@@ -259,6 +259,9 @@ pub fn process_disconnect_reporting(
             });
         }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
+        crate::core_loop::process_request::free_pictures_on_destroyed_windows(
+            state, backend, None, &order,
+        );
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }
@@ -711,6 +714,9 @@ pub fn destroy_zombie_resources_reporting(
             });
         }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
+        crate::core_loop::process_request::free_pictures_on_destroyed_windows(
+            state, backend, None, &order,
+        );
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }

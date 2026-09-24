@@ -1747,6 +1747,22 @@ pub(crate) fn purge_present_for_destroyed_windows(
 /// Common subtree-destroy used by both DestroyWindow (root = the
 /// requested window) and DestroySubwindows (each child of the
 /// requested parent).
+/// Free every Picture on the doomed `windows`, whichever client owns it, while the
+/// window records still exist (Xorg `PictureDestroyWindow`, `render/picture.c:67`).
+pub(crate) fn free_pictures_on_destroyed_windows(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    windows: &[ResourceId],
+) {
+    for (pic_xid, owned_pix) in state.resources.remove_pictures_on_windows(windows) {
+        let _ = backend.render_free_picture(origin, pic_xid);
+        if let Some(pix_xid) = owned_pix {
+            let _ = backend.free_pixmap(origin, pix_xid);
+        }
+    }
+}
+
 fn destroy_window_subtree(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -1793,6 +1809,7 @@ fn destroy_window_subtree(
         });
     }
     let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
+    free_pictures_on_destroyed_windows(state, backend, origin, &order);
     purge_present_for_destroyed_windows(state, backend, &order);
     // L2 plan B.15 — release the reason-1 hold on each destroyed
     // window's redirected backing. Surviving `NameWindowPixmap`
@@ -1908,6 +1925,22 @@ fn handle_render_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    // RenderErrBase + BadPicture for the first unknown Picture, in Xorg's per-request order.
+    macro_rules! verify_pictures {
+        ($($id:expr),+) => {
+            if let Some(bad) = first_missing_picture(state, &[$($id),+]) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::RENDER_FIRST_ERROR + 1,
+                    bad.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+        };
+    }
     match minor {
         0 => {
             let (major, minor_ver) = backend.render_query_version(origin).unwrap_or((0, 11));
@@ -1950,16 +1983,50 @@ fn handle_render_request(
             let Some(req) = x11::render_create_picture_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            // Xorg dixLookupDrawable (render.c:575): BadDrawable if unknown, BadMatch for
+            // an InputOnly window (dix/dixutils.c:208-213).
+            let input_only = match state.resources.window(req.drawable) {
+                Some(w) => w.class == crate::resources::WindowClass::InputOnly,
+                None if state.resources.pixmap(req.drawable).is_some() => false,
+                None => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        req.drawable.0,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+            };
+            if input_only {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    req.drawable.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let damage_drawable = render_picture_damage_drawable(state, req.drawable);
             let drawable_origin = state
                 .resources
                 .window(req.drawable)
                 .map(|w| (w.x, w.y))
                 .unwrap_or((0, 0));
-            let host_drawable_handle = state
-                .resources
-                .host_drawable_target(req.drawable)
-                .map(|t| t.host_handle());
+            // A window Picture names the window itself, never its redirect backing: the
+            // backend resolves the window's current storage or backing at each use.
+            let picture_window = state.resources.window(req.drawable).map(|_| req.drawable);
+            let host_drawable_handle = match state.resources.window(req.drawable) {
+                Some(w) => w.host_xid.map(crate::backend::AnyHandle::Window),
+                None => state
+                    .resources
+                    .host_drawable_target(req.drawable)
+                    .map(|t| t.host_handle()),
+            };
             let host_pic = host_drawable_handle.and_then(|host_drawable| {
                 backend
                     .render_create_picture(
@@ -1972,25 +2039,32 @@ fn handle_render_request(
                     .ok()
                     .flatten()
             });
-            if let Some(host_pic) = host_pic {
-                backend.set_picture_drawable_origin(host_pic.as_raw(), drawable_origin);
-                state.resources.create_picture(
-                    req.picture,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Drawable,
-                        drawable: Some(damage_drawable),
-                    },
-                );
+            // Core's registry is authoritative: no X error was sent, so the Picture exists.
+            match host_pic {
+                Some(hp) => backend.set_picture_drawable_origin(hp.as_raw(), drawable_origin),
+                None => debug!(
+                    "client {} #{} RENDER::CreatePicture 0x{:x}: backend could not back it; ops on it are no-ops",
+                    client_id.0, sequence.0, req.picture.0
+                ),
             }
+            state.resources.create_picture(
+                req.picture,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Drawable,
+                    drawable: Some(damage_drawable),
+                    window: picture_window,
+                },
+            );
         }
         5 => {
             if body.len() < 8 {
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             let translated = change_picture_translate_xids(value_mask, &body[8..], |attr, xid| {
                 let resource = ResourceId(xid);
@@ -2003,7 +2077,8 @@ fn handle_render_request(
                     ChangePictureAttr::AlphaMap => state
                         .resources
                         .picture(resource)
-                        .map(|p| p.host_picture_xid.as_raw()),
+                        .and_then(|p| p.host_picture_xid)
+                        .map(|h| h.as_raw()),
                 }
             });
             let Some(translated_values) = translated else {
@@ -2015,7 +2090,8 @@ fn handle_render_request(
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_change_picture(origin, hp, &patched);
             }
@@ -2025,10 +2101,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_clip_rectangles(origin, hp, body);
             }
@@ -2037,9 +2115,12 @@ fn handle_render_request(
             let Some(pic_id) = x11::render_free_resource_id(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(pic_id);
             let st = state.resources.free_picture(pic_id);
             if let Some(st) = st {
-                let _ = backend.render_free_picture(origin, st.host_picture_xid.as_raw());
+                if let Some(hp) = st.host_picture_xid {
+                    let _ = backend.render_free_picture(origin, hp.as_raw());
+                }
                 if let Some(pix) = st.host_owned_pixmap {
                     let _ = backend.free_pixmap(origin, pix.as_raw());
                 }
@@ -2049,6 +2130,7 @@ fn handle_render_request(
             let Some(req) = x11::render_composite_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2060,22 +2142,32 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            verify_pictures!(req.src);
+            if req.mask.0 != 0 {
+                verify_pictures!(req.mask);
+            }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(req.src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_mask = if req.mask.0 == 0 {
                 Some(0)
             } else {
                 state
                     .resources
                     .picture(req.mask)
-                    .map(|p| p.host_picture_xid.as_raw())
+                    .and_then(|p| p.host_picture_xid)
+                    .map(|h| h.as_raw())
             };
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let (Some(host_src), Some(host_mask), Some(host_dst)) =
                 (host_src, host_mask, host_dst)
             {
@@ -2115,6 +2207,7 @@ fn handle_render_request(
             let src_x = i16::from_le_bytes([body[16], body[17]]);
             let src_y = i16::from_le_bytes([body[18], body[19]]);
             let primitives = &body[20..];
+            verify_pictures!(src, dst);
             if dst_picture_is_sourceless(state, dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2126,14 +2219,19 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_dst = state
                 .resources
                 .picture(dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_mask_format = if ynest_mask_format == 0 {
                 Some(0u32)
             } else {
@@ -2259,6 +2357,7 @@ fn handle_render_request(
                 );
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.src, req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2270,14 +2369,19 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(req.src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_gs = state
                 .resources
                 .glyphset(req.glyphset)
@@ -2347,6 +2451,7 @@ fn handle_render_request(
             let Some(req) = x11::render_fill_rectangles_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2358,10 +2463,14 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(host_dst) = host_dst {
                 // ClipByChildren: a FillRectangles op=Clear on a window
                 // fully covered by a mapped child (mate-panel systray
@@ -2400,12 +2509,13 @@ fn handle_render_request(
             }
             let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
             let src_pic_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            verify_pictures!(src_pic_id);
             let x = u16::from_le_bytes([body[8], body[9]]);
             let y = u16::from_le_bytes([body[10], body[11]]);
             let host_src = state
                 .resources
                 .picture(src_pic_id)
-                .map(|p| p.host_picture_xid);
+                .and_then(|p| p.host_picture_xid);
             if let Some(host_src) = host_src
                 && let Some(cursor_handle) = backend
                     .render_create_cursor(origin, host_src, x, y)
@@ -2423,10 +2533,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_transform(origin, hp, body);
             }
@@ -2445,10 +2557,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_filter(origin, hp, body);
             }
@@ -2461,18 +2575,17 @@ fn handle_render_request(
                 .render_create_solid_fill(origin, color)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         34 => {
             if body.len() < 24 {
@@ -2483,18 +2596,17 @@ fn handle_render_request(
                 .render_create_linear_gradient(origin, body)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         35 => {
             if body.len() < 32 {
@@ -2505,18 +2617,17 @@ fn handle_render_request(
                 .render_create_radial_gradient(origin, body)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         31 => {
             // RENDER::CreateAnimCursor — body: cid(4), [cursor(4),
@@ -2677,7 +2788,23 @@ fn handle_render_request(
             }
         }
         36 => {
-            // CreateConicalGradient — stub.
+            // CreateConicalGradient: registered so the client can name it; rendering with it
+            // is not implemented, so ops that use it stay no-ops.
+            if body.len() < 4 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: None,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         32 => {
             // AddTraps — backend dispatch is a stub, but match the
@@ -2689,6 +2816,7 @@ fn handle_render_request(
             // y_off(2) then variable trapezoid list.
             if body.len() >= 4 {
                 let pic = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                verify_pictures!(pic);
                 if let Some(dst_drawable) = state.resources.picture(pic).and_then(|p| p.drawable) {
                     let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
@@ -6543,9 +6671,12 @@ fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
-                let Some(client_clip) =
-                    backend.picture_client_clip_rects(picture_state.host_picture_xid.as_raw())
-                else {
+                // An unbacked Picture has no clip set, like a fresh one.
+                let client_clip = match picture_state.host_picture_xid {
+                    Some(hp) => backend.picture_client_clip_rects(hp.as_raw()),
+                    None => Some(None),
+                };
+                let Some(client_clip) = client_clip else {
                     return emit_x11_error(
                         state,
                         client_id,
@@ -6809,7 +6940,8 @@ fn handle_xfixes_request(
                 let host_pic = state
                     .resources
                     .picture(pic_id)
-                    .map(|p| p.host_picture_xid.as_raw());
+                    .and_then(|p| p.host_picture_xid)
+                    .map(|h| h.as_raw());
                 if let Some(hp) = host_pic {
                     if req.region == 0 {
                         // RENDER CPClipMask = 0x40; value=None clears the clip.
@@ -26821,6 +26953,25 @@ fn drawable_size(state: &ServerState, id: ResourceId) -> Option<(u16, u16)> {
         return Some((w.width, w.height));
     }
     state.resources.pixmap(id).map(|p| (p.width, p.height))
+}
+
+/// Xorg VERIFY_PICTURE (`render/picturestr.h:363`, error value set at
+/// `render/render.c:252`): the first of `ids` that names no Picture.
+fn first_missing_picture(state: &ServerState, ids: &[ResourceId]) -> Option<ResourceId> {
+    ids.iter()
+        .copied()
+        .find(|id| state.resources.picture(*id).is_none())
+}
+
+/// A RENDER destination Picture on an unviewable window: Xorg's composite clip is the
+/// window's clipList/borderClip (`render/mipict.c:114-118`), emptied when it stops being
+/// viewable (`mi/mivaltree.c:690-695`, `mi/miwindow.c:738-745`), so nothing is drawn.
+fn dst_picture_window_unviewable(state: &ServerState, pic: ResourceId) -> bool {
+    state
+        .resources
+        .picture(pic)
+        .and_then(|p| p.window)
+        .is_some_and(|w| window_unviewable(state, w))
 }
 
 /// True for a window that is not viewable (Xorg: not realized); false for pixmaps.
@@ -60073,10 +60224,11 @@ mod tests {
             ResourceId(PICTURE_XID),
             crate::resources::PictureState {
                 client: ClientId(APP),
-                host_picture_xid: crate::backend::PictureHandle::from_raw_for_test(0x42),
+                host_picture_xid: Some(crate::backend::PictureHandle::from_raw_for_test(0x42)),
                 host_owned_pixmap: None,
                 kind: crate::resources::PictureKind::Sourceless,
                 drawable: None,
+                window: None,
             },
         );
 
@@ -62185,20 +62337,22 @@ mod tests {
             ResourceId(SRC_PIC_XID),
             PictureState {
                 client: ClientId(COMPOSITOR),
-                host_picture_xid: PictureHandle::from_raw_for_test(HOST_SRC),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(HOST_SRC)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Drawable,
                 drawable: Some(ResourceId(WIN_XID)),
+                window: None,
             },
         );
         state.resources.create_picture(
             ResourceId(DST_PIC_XID),
             PictureState {
                 client: ClientId(COMPOSITOR),
-                host_picture_xid: PictureHandle::from_raw_for_test(HOST_DST),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(HOST_DST)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Drawable,
                 drawable: Some(ResourceId(WIN_XID)),
+                window: None,
             },
         );
         // The dst window must be MAPPED for these tests to describe a real
@@ -70617,5 +70771,468 @@ mod tests {
             keyboard_mapping_notify.is_some(),
             "expected a MappingNotify with request=Keyboard(1): {bytes:02x?}"
         );
+    }
+
+    // ── Step 3 (window-storage lifecycle): Pictures on windows ──────────
+
+    const PIC_A: u32 = 0x0030_0000;
+    const PIC_B: u32 = 0x0040_0000;
+    const PIC_WIN: u32 = PIC_A | 1;
+    const PIC_WIN_HOST: u32 = 0x00E0_0001;
+    const PIC_ON_WIN: u32 = PIC_B | 1;
+    const PIC_PIXMAP: u32 = PIC_B | 2;
+    const PIC_ON_PIXMAP: u32 = PIC_B | 3;
+
+    fn picture_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// `(error code, bad value)` of every error queued on `peer`.
+    fn drain_errors(peer: &mut UnixStream) -> Vec<(u8, u32)> {
+        peer.set_nonblocking(true).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 32];
+        while peer.read_exact(&mut buf).is_ok() {
+            if buf[0] == 0 {
+                out.push((buf[1], u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])));
+            }
+        }
+        out
+    }
+
+    fn create_render_picture(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        pic: u32,
+        drawable: u32,
+    ) {
+        let mut body = Vec::new();
+        for v in [pic, drawable, 0, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        picture_request(state, backend, client, 133, 4, &body);
+    }
+
+    fn render_fill(state: &mut ServerState, backend: &mut RecordingBackend, client: u32, dst: u32) {
+        let mut body = vec![1u8, 0, 0, 0];
+        body.extend_from_slice(&dst.to_le_bytes());
+        body.extend_from_slice(&[0xff; 8]);
+        for v in [0i16, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [8u16, 8] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        picture_request(state, backend, client, 133, 26, &body);
+    }
+
+    fn render_composite_pics(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        src: u32,
+        dst: u32,
+    ) {
+        let mut body = vec![0u8; 32];
+        body[0] = 3;
+        body[4..8].copy_from_slice(&src.to_le_bytes());
+        body[12..16].copy_from_slice(&dst.to_le_bytes());
+        body[28..30].copy_from_slice(&8u16.to_le_bytes());
+        body[30..32].copy_from_slice(&8u16.to_le_bytes());
+        picture_request(state, backend, client, 133, 8, &body);
+    }
+
+    fn render_free(state: &mut ServerState, backend: &mut RecordingBackend, client: u32, pic: u32) {
+        picture_request(state, backend, client, 133, 7, &pic.to_le_bytes());
+    }
+
+    fn host_pic_of(state: &ServerState, pic: u32) -> u32 {
+        state
+            .resources
+            .picture(ResourceId(pic))
+            .expect("picture exists")
+            .host_picture_xid
+            .expect("backed picture")
+            .as_raw()
+    }
+
+    fn render_paints(backend: &RecordingBackend) -> Vec<RecordedCall> {
+        backend
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RecordedCall::RenderComposite { .. }
+                        | RecordedCall::RenderFillRectangles { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// Client A owns a mapped top-level `PIC_WIN`; client B holds a Picture on it and
+    /// one on its own pixmap.
+    fn cross_client_picture_fixture() -> (ServerState, RecordingBackend, UnixStream, UnixStream) {
+        let mut state = ServerState::new();
+        let peer_a = install_client(&mut state, 1);
+        let peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        state.resources.create_pixmap(
+            ClientId(2),
+            CreatePixmapRequest {
+                pixmap: ResourceId(PIC_PIXMAP),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(PIC_PIXMAP),
+            crate::backend::PixmapHandle::from_raw_for_test(0x00E0_0100),
+        ));
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_WIN);
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_PIXMAP, PIC_PIXMAP);
+        (state, backend, peer_a, peer_b)
+    }
+
+    fn create_pic_test_window(state: &mut ServerState, xid: u32, host: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: ROOT_WINDOW,
+                width: 64,
+                height: 64,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(xid))
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(host));
+        let _ = state.resources.map_window(ResourceId(xid));
+    }
+
+    /// B's Picture on A's window is dead once the window is gone: every use and
+    /// its FreePicture are BadPicture, its pixmap Picture is untouched, and a new
+    /// window on the same xid and host storage does not revive it.
+    fn assert_window_picture_dead_after(
+        destroy: impl FnOnce(&mut ServerState, &mut RecordingBackend),
+    ) {
+        let bad_picture = crate::nested::RENDER_FIRST_ERROR + 1;
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        let host_on_win = host_pic_of(&state, PIC_ON_WIN);
+        let host_on_pixmap = host_pic_of(&state, PIC_ON_PIXMAP);
+
+        destroy(&mut state, &mut backend);
+
+        assert!(state.resources.picture(ResourceId(PIC_ON_WIN)).is_none());
+        let freed: Vec<u32> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::RenderFreePicture { host_pic } => Some(host_pic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            freed,
+            vec![host_on_win],
+            "only the window Picture's backend record is freed"
+        );
+        assert_eq!(host_pic_of(&state, PIC_ON_PIXMAP), host_on_pixmap);
+        backend.calls.lock().unwrap().clear();
+
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_ON_PIXMAP);
+        render_free(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(bad_picture, PIC_ON_WIN); 3],
+            "FillRectangles, Composite and FreePicture on the dead Picture",
+        );
+        assert!(render_paints(&backend).is_empty());
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::RenderFreePicture { .. }))
+        );
+
+        render_fill(&mut state, &mut backend, 2, PIC_ON_PIXMAP);
+        assert_eq!(
+            render_paints(&backend),
+            vec![RecordedCall::RenderFillRectangles {
+                host_dst: host_on_pixmap
+            }],
+        );
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    #[test]
+    fn destroy_window_frees_other_clients_pictures_on_it() {
+        assert_window_picture_dead_after(|state, backend| {
+            picture_request(state, backend, 1, 4, 0, &PIC_WIN.to_le_bytes());
+        });
+    }
+
+    #[test]
+    fn owner_disconnect_frees_other_clients_pictures_on_its_windows() {
+        assert_window_picture_dead_after(|state, backend| {
+            crate::core_loop::process_disconnect::process_disconnect(state, backend, ClientId(1));
+            let _peer = install_client(state, 1);
+        });
+    }
+
+    #[test]
+    fn destroying_a_parent_frees_pictures_on_its_descendants() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const CHILD: u32 = PIC_A | 2;
+        const PIC_ON_CHILD: u32 = PIC_B | 4;
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD),
+                parent: ResourceId(PIC_WIN),
+                width: 8,
+                height: 8,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(CHILD))
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(0x00E0_0002));
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_CHILD, CHILD);
+        assert!(state.resources.picture(ResourceId(PIC_ON_CHILD)).is_some());
+
+        picture_request(&mut state, &mut backend, 1, 4, 0, &PIC_WIN.to_le_bytes());
+
+        assert!(state.resources.picture(ResourceId(PIC_ON_CHILD)).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_ON_WIN)).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_ON_PIXMAP)).is_some());
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// Xorg: an unviewable window's clipList is empty, so a Picture on it as the
+    /// destination draws nothing; the same Picture draws again after remap.
+    #[test]
+    fn window_picture_draws_nothing_while_unmapped_and_again_after_remap() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        let host_on_win = host_pic_of(&state, PIC_ON_WIN);
+        let host_on_pixmap = host_pic_of(&state, PIC_ON_PIXMAP);
+        let fill = RecordedCall::RenderFillRectangles {
+            host_dst: host_on_win,
+        };
+
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(render_paints(&backend), vec![fill.clone()]);
+        backend.calls.lock().unwrap().clear();
+
+        picture_request(&mut state, &mut backend, 1, 10, 0, &PIC_WIN.to_le_bytes());
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_PIXMAP, PIC_ON_WIN);
+        assert!(
+            render_paints(&backend).is_empty(),
+            "unmapped: nothing drawn"
+        );
+        // As a source the hidden window's contents are undefined, not an error.
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_ON_PIXMAP);
+        assert_eq!(
+            render_paints(&backend),
+            vec![RecordedCall::RenderComposite {
+                host_src: host_on_win,
+                host_dst: host_on_pixmap,
+            }],
+        );
+        backend.calls.lock().unwrap().clear();
+
+        picture_request(&mut state, &mut backend, 1, 8, 0, &PIC_WIN.to_le_bytes());
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(render_paints(&backend), vec![fill]);
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// A Picture on a redirected window names the window, not the backing it
+    /// has at creation time, so it follows backing rotations.
+    #[test]
+    fn create_picture_on_redirected_window_names_the_window() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        state
+            .resources
+            .window_mut(ResourceId(PIC_WIN))
+            .unwrap()
+            .redirected_backing = Some(crate::resources::RedirectedBacking {
+            host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(0x00E0_0200),
+            width: 64,
+            height: 64,
+            depth: 24,
+        });
+        create_render_picture(&mut state, &mut backend, 1, PIC_A | 5, PIC_WIN);
+        let host_drawables: Vec<crate::backend::AnyHandle> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::RenderCreatePicture { host_drawable, .. } => Some(host_drawable),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            host_drawables,
+            vec![crate::backend::AnyHandle::Window(
+                crate::backend::WindowHandle::from_raw_for_test(PIC_WIN_HOST)
+            )],
+        );
+        assert_eq!(
+            state
+                .resources
+                .picture(ResourceId(PIC_A | 5))
+                .unwrap()
+                .window,
+            Some(ResourceId(PIC_WIN)),
+        );
+    }
+
+    /// Xorg `compDestroyOverlayWindow` frees the overlay through DeleteWindow, so
+    /// Pictures on it are freed with it (`composite/compoverlay.c:167-172`).
+    #[test]
+    fn overlay_release_frees_pictures_on_the_overlay() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        drain_errors(&mut peer);
+        create_render_picture(&mut state, &mut backend, 1, PIC_A | 6, cow.0);
+        assert!(state.resources.picture(ResourceId(PIC_A | 6)).is_some());
+        body[0..4].copy_from_slice(&cow.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &body,
+        );
+        assert!(state.resources.window(cow).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_A | 6)).is_none());
+    }
+
+    /// CreateConicalGradient registers a Picture: usable as a source without an
+    /// error (drawing with it stays unimplemented) and freeable.
+    #[test]
+    fn conical_gradient_picture_is_usable_as_source_and_freeable() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const CONICAL: u32 = PIC_B | 9;
+        let mut body = Vec::new();
+        body.extend_from_slice(&CONICAL.to_le_bytes());
+        body.extend_from_slice(&[0u8; 16]); // center, angle, nstops = 0
+        picture_request(&mut state, &mut backend, 2, 133, 36, &body);
+        assert!(state.resources.picture(ResourceId(CONICAL)).is_some());
+        backend.calls.lock().unwrap().clear();
+        render_composite_pics(&mut state, &mut backend, 2, CONICAL, PIC_ON_PIXMAP);
+        assert!(
+            render_paints(&backend).is_empty(),
+            "unbacked source draws nothing"
+        );
+        render_free(&mut state, &mut backend, 2, CONICAL);
+        assert!(state.resources.picture(ResourceId(CONICAL)).is_none());
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// A CreatePicture the backend could not back still succeeds at protocol level:
+    /// ops on the Picture are silent no-ops and FreePicture is valid. An id that was
+    /// never created is still BadPicture.
+    #[test]
+    fn unbacked_picture_ops_are_silent_no_ops() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const UNBACKED: u32 = PIC_B | 10;
+        backend.render_create_picture_fails = true;
+        create_render_picture(&mut state, &mut backend, 2, UNBACKED, PIC_PIXMAP);
+        backend.render_create_picture_fails = false;
+        let st = state
+            .resources
+            .picture(ResourceId(UNBACKED))
+            .expect("registered");
+        assert!(st.host_picture_xid.is_none());
+        backend.calls.lock().unwrap().clear();
+
+        render_fill(&mut state, &mut backend, 2, UNBACKED);
+        render_composite_pics(&mut state, &mut backend, 2, UNBACKED, PIC_ON_PIXMAP);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_PIXMAP, UNBACKED);
+        render_free(&mut state, &mut backend, 2, UNBACKED);
+        assert!(drain_errors(&mut peer_b).is_empty());
+        assert!(state.resources.picture(ResourceId(UNBACKED)).is_none());
+        assert!(backend.calls().iter().all(|c| !matches!(
+            c,
+            RecordedCall::RenderComposite { .. }
+                | RecordedCall::RenderFillRectangles { .. }
+                | RecordedCall::RenderFreePicture { .. }
+        )));
+
+        const NEVER: u32 = PIC_B | 11;
+        render_fill(&mut state, &mut backend, 2, NEVER);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(crate::nested::RENDER_FIRST_ERROR + 1, NEVER)],
+        );
+    }
+
+    /// Xorg dixLookupDrawable: CreatePicture on an unknown drawable is BadDrawable
+    /// and registers nothing.
+    #[test]
+    fn create_picture_on_unknown_drawable_is_bad_drawable() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const PIC: u32 = PIC_B | 12;
+        create_render_picture(&mut state, &mut backend, 2, PIC, 0x00DE_AD00);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(x11::error::BAD_DRAWABLE, 0x00DE_AD00)],
+        );
+        assert!(state.resources.picture(ResourceId(PIC)).is_none());
     }
 }

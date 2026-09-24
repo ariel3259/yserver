@@ -1418,12 +1418,10 @@ pub struct KmsBackend {
     /// previous pair.
     pub(crate) recent_present_pixmaps: std::collections::VecDeque<(u32, u32)>,
 
-    /// Exact drawable instance retained by each Drawable-backed
-    /// Picture. `render_create_picture` may incref an old window
-    /// storage instance that later gets detached from `by_xid`
-    /// during an internal reconfigure/reallocate; `render_free_picture`
-    /// must drop that same `DrawableId` rather than whatever the
-    /// host xid resolves to at free time.
+    /// Exact drawable instance retained by each pixmap-backed Picture,
+    /// so `render_free_picture` drops that same `DrawableId` rather
+    /// than whatever the host xid resolves to at free time. Window
+    /// Pictures retain nothing: they resolve the window at each use.
     picture_drawable_ids: HashMap<u32, DrawableId>,
 
     /// Pictures whose backing drawable was not yet materialized in
@@ -24341,29 +24339,32 @@ impl Backend for KmsBackend {
         values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
         // Stage 3b: real picture record. Insert default
-        // `PictureRecord::Drawable`, incref the backing drawable in
-        // the store (so a `free_pixmap` on the backing survives
-        // while this picture wraps it — picture_record_drawable_
-        // refcount test), then delegate to render_change_picture for
-        // the value-mask body.
+        // `PictureRecord::Drawable`, incref a PIXMAP backing in the
+        // store (so a `free_pixmap` on the backing survives while this
+        // picture wraps it — picture_record_drawable_refcount test),
+        // then delegate to render_change_picture for the value-mask
+        // body.
         let drawable_xid = host_drawable.as_raw();
         let picture_xid = self.core.next_host_xid();
         self.core.pictures.insert(
             picture_xid,
             PictureRecord::drawable_default(drawable_xid, ynest_format),
         );
-        if let Some(id) = self.store.lookup(drawable_xid) {
-            self.store.incref(id);
-            self.picture_drawable_ids.insert(picture_xid, id);
-        } else {
-            // Backing not materialized yet (window map + redirect
-            // before backing alloc, GLX-TFP / Present / DRI3 import).
-            // Defer the incref: `apply_pending_picture_refs` pins the
-            // backing the moment it materializes, so a later
-            // `free_pixmap` can't reach refcount 0 and destroy the
-            // drawable out from under this live Picture.
-            self.pending_picture_drawable_refs
-                .insert(picture_xid, drawable_xid);
+        // A window Picture holds no store ref: every use resolves the window's current storage.
+        if matches!(host_drawable, AnyHandle::Pixmap(_)) {
+            if let Some(id) = self.store.lookup(drawable_xid) {
+                self.store.incref(id);
+                self.picture_drawable_ids.insert(picture_xid, id);
+            } else {
+                // Backing not materialized yet (GLX-TFP / Present /
+                // DRI3 import). Defer the incref:
+                // `apply_pending_picture_refs` pins the backing the
+                // moment it materializes, so a later `free_pixmap`
+                // can't reach refcount 0 and destroy the drawable out
+                // from under this live Picture.
+                self.pending_picture_drawable_refs
+                    .insert(picture_xid, drawable_xid);
+            }
         }
         if value_mask != 0 {
             // Recompose the body shape that render_change_picture
@@ -24463,8 +24464,9 @@ impl Backend for KmsBackend {
             if let Some(id) = retained_drawable_id {
                 self.store_decref_with_invalidate(id);
             } else {
-                // Backing never materialized — no store ref was ever
-                // taken; just drop the deferred ref request.
+                // A window Picture, or a backing that never
+                // materialized — no store ref was ever taken; just drop
+                // any deferred ref request.
                 self.pending_picture_drawable_refs.remove(&host_pic);
             }
         }
@@ -31870,14 +31872,13 @@ mod tests {
         assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
     }
 
-    /// A Drawable-backed Picture must release the exact drawable
-    /// instance it retained at create time, even if the same host
-    /// xid has since been detached and rebound to fresh storage by
-    /// an internal window reconfigure. Pre-fix `render_free_picture`
-    /// looked up by xid again and could drop the new live drawable
-    /// instead, blanking the window while leaking the old storage.
+    /// A window Picture takes no store reference: when the window's
+    /// storage is detached and replaced under the same xid (reconfigure
+    /// today, unmap/remap under the window-storage lifecycle), the old
+    /// storage dies with its owner ref, the Picture resolves to the new
+    /// storage, and freeing the Picture leaves that storage untouched.
     #[test]
-    fn picture_free_uses_retained_drawable_after_xid_rebind() {
+    fn window_picture_holds_no_store_ref_and_follows_rebind() {
         use ash::vk;
 
         use crate::kms::render::store::{DrawableKind, Storage};
@@ -31885,22 +31886,21 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let window_xid = 0x400230;
-        let old_id = b
-            .store
-            .allocate(
-                window_xid,
-                DrawableKind::Window,
-                24,
-                true,
-                Storage::for_tests_null(
-                    vk::Extent2D {
-                        width: 64,
-                        height: 32,
-                    },
-                    vk::Format::B8G8R8A8_UNORM,
-                ),
-            )
-            .expect("allocate old window storage");
+        let alloc = |b: &mut KmsBackend, width| {
+            b.store
+                .allocate(
+                    window_xid,
+                    DrawableKind::Window,
+                    24,
+                    true,
+                    Storage::for_tests_null(
+                        vk::Extent2D { width, height: 32 },
+                        vk::Format::B8G8R8A8_UNORM,
+                    ),
+                )
+                .expect("allocate window storage")
+        };
+        let old_id = alloc(&mut b, 64);
 
         let picture = b
             .render_create_picture(
@@ -31913,58 +31913,168 @@ mod tests {
             .expect("create_picture")
             .expect("Some(handle)");
         let pic_xid = picture.as_raw();
-        assert_eq!(b.store.get(old_id).expect("old entry").refcount, 2);
+        assert_eq!(b.store.get(old_id).expect("old entry").refcount, 1);
+        assert!(!b.pending_picture_drawable_refs.contains_key(&pic_xid));
 
-        // Mirror configure_subwindow's detach + owner decref before
-        // the replacement storage is allocated under the same xid.
+        // Mirror configure_subwindow's detach + owner decref.
         b.store.detach_xid(window_xid);
         b.store_decref_with_invalidate(old_id);
-        assert_eq!(
-            b.store
-                .get(old_id)
-                .expect("old entry kept alive by picture")
-                .refcount,
-            1,
-        );
-        assert!(
-            b.store.lookup(window_xid).is_none(),
-            "detach removes the xid binding before re-allocation",
-        );
-
-        let new_id = b
-            .store
-            .allocate(
-                window_xid,
-                DrawableKind::Window,
-                24,
-                true,
-                Storage::for_tests_null(
-                    vk::Extent2D {
-                        width: 1565,
-                        height: 32,
-                    },
-                    vk::Format::B8G8R8A8_UNORM,
-                ),
-            )
-            .expect("allocate replacement window storage");
-        assert_eq!(b.store.lookup(window_xid), Some(new_id));
-
-        b.render_free_picture(None, pic_xid).expect("free_picture");
-
         assert!(
             b.store.get(old_id).is_none(),
-            "free_picture must drop the old retained drawable",
+            "the Picture must not keep the old window storage alive",
+        );
+        let new_id = alloc(&mut b, 1565);
+        assert_eq!(
+            b.store.get(new_id).expect("new entry").refcount,
+            1,
+            "materializing window storage must not apply a picture ref",
         );
         assert_eq!(
-            b.store.lookup(window_xid),
+            b.resolve_paint_target(window_xid).map(|t| t.backing_id()),
             Some(new_id),
-            "free_picture must not detach the replacement xid binding",
+            "the Picture's drawable resolves to the replacement storage",
         );
+
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert_eq!(b.store.lookup(window_xid), Some(new_id));
         assert_eq!(
             b.store.get(new_id).expect("replacement entry").refcount,
             1,
-            "replacement window storage must keep its owner ref",
+            "freeing a window Picture must not decref the window storage",
         );
+    }
+
+    /// A window Picture draws into whatever storage the window has at the
+    /// time of use: the reallocated leaf after a resize, nothing (no error)
+    /// while the window has no storage, and a freshly allocated leaf after.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn window_picture_follows_window_storage_and_clips_away_without_it() {
+        use yserver_core::{
+            backend::{AnyHandle, Backend, WindowHandle},
+            host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+        };
+
+        use crate::kms::render::store::DrawableKind;
+
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let rect = |w: u16, h: u16| {
+            let mut r = Vec::new();
+            r.extend_from_slice(&0i16.to_le_bytes());
+            r.extend_from_slice(&0i16.to_le_bytes());
+            r.extend_from_slice(&w.to_le_bytes());
+            r.extend_from_slice(&h.to_le_bytes());
+            r
+        };
+        let red = [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF];
+        let blue = [0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
+        let assert_all = |b: &mut KmsBackend, xid: u32, n: u16, bgr: [u8; 3], what: &str| {
+            let px = b
+                .get_image_pixels_for_tests(xid, 2, 0, 0, n, n, !0)
+                .expect("get_image")
+                .expect("pixels");
+            for (i, p) in px.chunks_exact(4).enumerate() {
+                assert_eq!(&p[..3], &bgr, "{what}: pixel {i}");
+            }
+        };
+
+        let root = WindowHandle::from_raw(1).expect("root");
+        let w = b
+            .create_subwindow(
+                None,
+                root,
+                0,
+                0,
+                8,
+                8,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 24,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                None,
+                None,
+            )
+            .expect("window");
+        let w_xid = w.as_raw();
+        b.map_subwindow(None, w_xid).expect("map");
+        let pic = b
+            .render_create_picture(None, AnyHandle::Window(w), 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some")
+            .as_raw();
+        let first = b.store.lookup(w_xid).expect("leaf");
+        assert_eq!(b.store.get(first).unwrap().refcount, 1, "no picture ref");
+        b.render_fill_rectangles(None, pic, 1, red, &rect(8, 8), 0, 0)
+            .expect("fill");
+        assert_all(&mut b, w_xid, 8, [0, 0, 0xFF], "first leaf");
+
+        b.configure_subwindow(
+            None,
+            w_xid,
+            HostSubwindowConfig {
+                x: None,
+                y: None,
+                width: Some(16),
+                height: Some(16),
+                border_width: None,
+                sibling: None,
+                stack_mode: None,
+            },
+        )
+        .expect("resize");
+        let second = b.store.lookup(w_xid).expect("resized leaf");
+        assert_ne!(second, first, "resize reallocates the leaf");
+        b.render_fill_rectangles(None, pic, 1, red, &rect(16, 16), 0, 0)
+            .expect("fill");
+        assert_all(&mut b, w_xid, 16, [0, 0, 0xFF], "reallocated leaf");
+
+        // No storage: the Picture's ops are clipped away, not errors.
+        b.store.detach_xid(w_xid);
+        b.store_decref_with_invalidate(second);
+        assert!(b.store.lookup(w_xid).is_none());
+        b.render_fill_rectangles(None, pic, 1, red, &rect(16, 16), 0, 0)
+            .expect("fill with no storage");
+        let pix = b.create_pixmap(None, 24, 4, 4).expect("pixmap");
+        let pix_pic = b
+            .render_create_picture(None, AnyHandle::Pixmap(pix), 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some")
+            .as_raw();
+        b.render_fill_rectangles(None, pix_pic, 1, blue, &rect(4, 4), 0, 0)
+            .expect("fill pixmap");
+        let painted = b
+            .render_composite(None, 1, pic, 0, pix_pic, 0, 0, 0, 0, 0, 0, 4, 4)
+            .expect("composite from a window without storage");
+        assert!(painted.is_empty());
+        assert_all(&mut b, pix.as_raw(), 4, [0xFF, 0, 0], "pixmap untouched");
+
+        // New storage: the same Picture binds to it.
+        let storage = b
+            .platform
+            .allocate_drawable_storage_as(
+                16,
+                16,
+                24,
+                crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+            )
+            .expect("storage");
+        let third = b
+            .store_alloc(w_xid, DrawableKind::Window, 24, true, storage)
+            .expect("store_alloc");
+        assert_eq!(b.store.get(third).unwrap().refcount, 1, "no picture ref");
+        b.render_fill_rectangles(None, pic, 1, red, &rect(16, 16), 0, 0)
+            .expect("fill");
+        assert_all(&mut b, w_xid, 16, [0, 0, 0xFF], "new leaf");
+        b.render_free_picture(None, pic).expect("free_picture");
+        assert_eq!(b.store.get(third).unwrap().refcount, 1);
     }
 
     /// `picture_solid_fill_premul_correct` per plan §3b. NB: the
