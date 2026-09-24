@@ -2,6 +2,12 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 10 (2026-09-25, coordinator)** — with A1 in place the hardware
+run still times out at the first disable. Coordinator diagnostics: the
+displaced allocations carry no pending obligation and no KMS disposition, yet
+stay alive on `Retain` leases, and nine retired bundles are alive — the eight
+from the mode-change cycles too. Addendum A2.
+
 **Revision 9 (2026-09-25, coordinator)** — the first hardware run of
 `c0_hw_3b_modeset_owner_on_card1_drm` passed the four mode-change cycles and
 failed at the first disable: the displaced pool stayed live for 35 s.
@@ -472,3 +478,38 @@ composition tick keeps servicing them as today.
 | `c0_3bi_a1_retired_bundle_drains_with_no_output_vulkan` | disable the device's only output with its old pool's fence pending: no composition tick runs; the owner/resource wake path alone releases the pool once its proofs arrive, and the next wakeup is bounded while it waits | **A1a** service bundles only from `tick` |
 | `c0_3bi_a1_idle_bundle_wakeup_is_bounded` | a retired bundle waiting on an unsignalled fence and nothing else pending: the loop's next wakeup is a finite deadline, and it does not busy-loop (at most one poll per deadline) | **A1b** omit the bundle from the next wakeup |
 | `c0_3bi_a1_quarantined_bundle_adds_no_wakeup_vulkan` | a retired bundle's only outstanding item is a quarantined owner buffer whose `KmsRelease` is never discharged: it adds no retired-bundle wakeup deadline | **A1c** count `owner_buffers` as poll work |
+
+## Addendum A2 — retired bundles release their pools; a disable clears the CRTC's current resources *(rev 10, found on hardware)*
+
+**Evidence (2026-09-25, card1, `c0_hw_3b_modeset_owner_on_card1_drm` with A1,
+temporary diagnostic dump at the disable-cycle timeout):** after four
+mode-change cycles and one disable, `retired_output_count` = 9 — no bundle
+was ever destroyed. The disable's displaced allocations (generations 25, 26,
+27 of the old pool) show `pending_obligations: {}` and `kms_dispositions: {}`
+but `live_uses: {Retain}` each, and the front buffer (generation 26) holds a
+**second** `Retain`. The mode-change cycles passed only because the test
+checked the displaced allocations, not the bundles.
+
+**Deliver:**
+1. A retired-output bundle whose resources have all reached their proofs is
+   **destroyed**: it drops its pool — releasing the pool's `Retain` leases on
+   both devices for the copied route — and its scene state, and leaves the
+   retirement list. A bundle with any unproven resource stays. Find why the
+   current drain never reaches that end and fix it there.
+2. A disable (a lifecycle commit that leaves a CRTC inactive with no primary
+   framebuffer) clears that CRTC's **current** owner resources once the
+   commit is `Completed`, exactly as a composed replacement does for its
+   predecessor, so the displaced front buffer's extra `Retain` is released.
+   Identify the holder of the second lease and say it in the report; if it is
+   not the owner's current-resource record, stop with F8 and report what it
+   is.
+3. The hardware test's mode-change cycles also assert that each cycle's
+   bundle is destroyed (not only that the displaced allocations left the
+   service), so this cannot pass silently again.
+
+| Test | Scenario | Must fail under |
+| --- | --- | --- |
+| `c0_3bi_a2_bundle_is_destroyed_after_its_proofs_vulkan` | a mode change completes and every proof of the old pool arrives: the retired bundle leaves the list and the old pool's allocations are gone from the resource service | **A2a** keep a fully proven bundle |
+| `c0_3bi_a2_disable_releases_the_current_front_vulkan` | disable the only output: after `Completed` and the proofs, the old front buffer's allocation is gone — no second `Retain` survives | **A2b** leave the disabled CRTC's current resources in place |
+| `c0_3bi_a2_unproven_bundle_is_kept_vulkan` | a bundle with one resource still awaiting its proof is not destroyed | **A2c** destroy a bundle with an unproven resource |
+
