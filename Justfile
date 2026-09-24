@@ -1494,6 +1494,9 @@ rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,t
 rendercheck-yserver-hw timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin yserver
     bash -c '\
+        for t in xdpyinfo xset rendercheck; do \
+            command -v $t >/dev/null || { echo "error: $t not installed" >&2; exit 2; };\
+        done;\
         RUST_LOG=warn RUST_BACKTRACE=1 target/release/yserver > yserver-hw-rendercheck.log 2>&1 &\
         yserver_pid=$!;\
         for _ in $(seq 1 150); do \
@@ -1501,7 +1504,9 @@ rendercheck-yserver-hw timeout="600" tests="fill,dcoords,scoords,mcoords,tscoord
             DISPLAY=:7 timeout 2 xdpyinfo >/dev/null 2>&1 && break; sleep 0.2;\
         done;\
         if ! DISPLAY=:7 timeout 2 xdpyinfo >/dev/null 2>&1; then \
-            echo "error: yserver did not come up on :7" >&2; tail -30 yserver-hw-rendercheck.log >&2;\
+            kill -0 $yserver_pid 2>/dev/null && alive=running || alive=exited;\
+            echo "error: no X server answering on :7 (yserver $alive; socket: $(ls /tmp/.X11-unix/X7 2>&1))" >&2;\
+            DISPLAY=:7 timeout 2 xdpyinfo 2>&1 | head -3 >&2; tail -30 yserver-hw-rendercheck.log >&2;\
             kill -TERM $yserver_pid 2>/dev/null; wait $yserver_pid 2>/dev/null; exit 2;\
         fi;\
         tools/rendercheck.sh :7 {{timeout}} {{tests}} > rendercheck-hw.log 2>&1; rc=$?;\
