@@ -181,7 +181,7 @@ impl StorageAllocation {
                 self.image = vk::Image::null();
             }
             if self.memory != vk::DeviceMemory::null() {
-                vk.device.free_memory(self.memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, self.memory);
                 self.memory = vk::DeviceMemory::null();
             }
         }

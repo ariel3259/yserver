@@ -5837,10 +5837,11 @@ impl KmsBackend {
             }
             LeafContent::Migrate => Some(old_id),
         };
-        let storage = match self.platform.allocate_drawable_storage(
+        let storage = match self.platform.allocate_drawable_storage_as(
             u16::try_from(storage_w).unwrap_or(u16::MAX),
             u16::try_from(storage_h).unwrap_or(u16::MAX),
             geom.depth,
+            crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
         ) {
             Ok(storage) => storage,
             Err(_e) if self.platform.vk.is_none() => {
@@ -8327,7 +8328,12 @@ impl KmsBackend {
         }
         let width = self.platform.fb_w.max(1);
         let height = self.platform.fb_h.max(1);
-        let storage = match self.platform.allocate_drawable_storage(width, height, 32) {
+        let storage = match self.platform.allocate_drawable_storage_as(
+            width,
+            height,
+            32,
+            crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+        ) {
             Ok(storage) => {
                 self.telemetry.record_storage_allocation();
                 self.telemetry.record_image_view_create();
@@ -14617,7 +14623,12 @@ impl KmsBackend {
         if let Some(old_id) = self.store.lookup(root_xid) {
             self.store.detach_xid(root_xid);
             self.store_decref_with_invalidate(old_id);
-            match self.platform.allocate_drawable_storage(w, h, 32) {
+            match self.platform.allocate_drawable_storage_as(
+                w,
+                h,
+                32,
+                crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+            ) {
                 Ok(storage) => {
                     self.telemetry.record_storage_allocation();
                     self.telemetry.record_image_view_create();
@@ -14686,7 +14697,12 @@ impl KmsBackend {
             let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
             self.store.detach_xid(cow_xid);
             self.store_decref_with_invalidate(old_cow_id);
-            match self.platform.allocate_drawable_storage(w, h, 24) {
+            match self.platform.allocate_drawable_storage_as(
+                w,
+                h,
+                24,
+                crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+            ) {
                 Ok(storage) => {
                     self.telemetry.record_storage_allocation();
                     self.telemetry.record_image_view_create();
@@ -17773,10 +17789,11 @@ impl KmsBackend {
         // at `bw == 0`.
         let (storage_w, storage_h) =
             bordered_storage_extent(width.max(1), height.max(1), border_width);
-        match self.platform.allocate_drawable_storage(
+        match self.platform.allocate_drawable_storage_as(
             u16::try_from(storage_w).unwrap_or(u16::MAX),
             u16::try_from(storage_h).unwrap_or(u16::MAX),
             depth,
+            crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
         ) {
             Ok(storage) => {
                 if let Err(e) = self.store_alloc(
@@ -25872,6 +25889,12 @@ impl Backend for KmsBackend {
         // any pre-paint content lands in B post-flip via the normal
         // resolve_paint_target routing on the next client paint.
         if let Some(b_id) = self.store.lookup(backing_xid) {
+            if let Some(d) = self.store.get(b_id) {
+                crate::kms::vk::mem_accounting::recategorise(
+                    d.storage.memory,
+                    crate::kms::vk::mem_accounting::MemCategory::RedirectBacking,
+                );
+            }
             // #133 step 3 — the backing is allocated at the BORDERED
             // extent by the core (`bordered_backing_extent`,
             // `process_request.rs`), so its content starts `bw` inside
@@ -26157,7 +26180,12 @@ impl Backend for KmsBackend {
         }
         let fb_w = self.platform.fb_w.max(1);
         let fb_h = self.platform.fb_h.max(1);
-        let storage = match self.platform.allocate_drawable_storage(fb_w, fb_h, 24) {
+        let storage = match self.platform.allocate_drawable_storage_as(
+            fb_w,
+            fb_h,
+            24,
+            crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+        ) {
             Ok(storage) => {
                 self.telemetry.record_storage_allocation();
                 self.telemetry.record_image_view_create();
@@ -42499,6 +42527,148 @@ mod tests {
     /// window-local coords — the region the core damages. Complements the
     /// pure `render_dst_cliplist_local` unit tests by exercising the full
     /// op body (bbox derivation + helper call + RegionRect conversion).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn mem_accounting_tracks_drawable_storage_by_use() {
+        use crate::kms::vk::mem_accounting::{self, MemCategory};
+        use yserver_core::{
+            backend::{Backend, WindowHandle},
+            host_x11::HostSubwindowVisual,
+        };
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // Submit pending clears, wait, and retire freed drawables.
+        fn settle(b: &mut KmsBackend) {
+            b.engine
+                .close_open_frame(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::frame_builder::CloseReason::SyncWait,
+                )
+                .expect("close frame");
+            b.engine
+                .flush_submit_group(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::submit_group::FlushReason::SyncBoundary,
+                )
+                .expect("flush");
+            b.platform.wait_idle_bounded();
+            b.poll_pending_retire_with_invalidate();
+        }
+        // The ledger is process-global and tests run in parallel: check our
+        // own handles, and use odd extents no other test allocates.
+        let memory_of = |b: &KmsBackend, xid: u32| {
+            let id = b.store.lookup(xid).expect("drawable in store");
+            b.store.get(id).expect("drawable").storage.memory
+        };
+        let (pw, ph) = (1021u16, 1019u16);
+        let pixmap_floor = u64::from(pw) * u64::from(ph) * 4;
+        let pixmaps: Vec<u32> = (0..4)
+            .map(|_| b.create_pixmap(None, 32, pw, ph).expect("pixmap").as_raw())
+            .collect();
+        let pixmap_mems: Vec<_> = pixmaps.iter().map(|&x| memory_of(&b, x)).collect();
+        let mut ours = 0;
+        for &m in &pixmap_mems {
+            let (size, cat) = mem_accounting::entry_of(m).expect("pixmap memory tracked");
+            assert_eq!(cat, MemCategory::Pixmap);
+            assert!(size >= pixmap_floor, "size {size} < {pixmap_floor}");
+            ours += size;
+        }
+        let snap = mem_accounting::snapshot();
+        let pixmap_total =
+            snap.device_local(MemCategory::Pixmap).bytes + snap.host(MemCategory::Pixmap).bytes;
+        assert!(
+            pixmap_total >= ours,
+            "pixmap total {pixmap_total} < ours {ours}"
+        );
+
+        let root = WindowHandle::from_raw(1).expect("root");
+        let w = b
+            .create_subwindow(
+                None,
+                root,
+                0,
+                0,
+                509,
+                503,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 32,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                None,
+                None,
+            )
+            .expect("create window");
+        let w_mem = memory_of(&b, w.as_raw());
+        assert_eq!(
+            mem_accounting::entry_of(w_mem).map(|e| e.1),
+            Some(MemCategory::WindowStorage)
+        );
+        let backing = b
+            .allocate_redirected_backing(None, w, 509, 503, 32)
+            .expect("redirect backing");
+        let backing_mem = memory_of(&b, backing.as_raw());
+        assert_eq!(
+            mem_accounting::entry_of(backing_mem).map(|e| e.1),
+            Some(MemCategory::RedirectBacking)
+        );
+
+        for &x in &pixmaps {
+            b.free_pixmap(None, x).expect("free pixmap");
+        }
+        settle(&mut b);
+        for &m in &pixmap_mems {
+            // Freed, or (never here: the fixture has no pool) parked idle.
+            match mem_accounting::entry_of(m) {
+                None | Some((_, MemCategory::PoolIdle)) => {}
+                Some((size, cat)) => assert!(
+                    !(cat == MemCategory::Pixmap && size >= pixmap_floor),
+                    "freed pixmap memory still accounted as {cat:?} ({size} B)"
+                ),
+            }
+        }
+
+        // Pool round trip: a return parks the memory as PoolIdle, a hit
+        // hands the same memory back as Pixmap.
+        let vk = std::sync::Arc::clone(b.platform.vk.as_ref().expect("vk"));
+        let pool = std::sync::Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(vk));
+        b.platform.pixmap_pool = Some(std::sync::Arc::clone(&pool));
+        let small = b.create_pixmap(None, 32, 61, 59).expect("small").as_raw();
+        let small_mem = memory_of(&b, small);
+        assert_eq!(
+            mem_accounting::entry_of(small_mem).map(|e| e.1),
+            Some(MemCategory::Pixmap)
+        );
+        b.free_pixmap(None, small).expect("free small");
+        settle(&mut b);
+        assert_eq!(
+            mem_accounting::entry_of(small_mem).map(|e| e.1),
+            Some(MemCategory::PoolIdle)
+        );
+        let again = b.create_pixmap(None, 32, 61, 59).expect("again").as_raw();
+        assert_eq!(memory_of(&b, again), small_mem, "pool hit reuses memory");
+        assert_eq!(
+            mem_accounting::entry_of(small_mem).map(|e| e.1),
+            Some(MemCategory::Pixmap)
+        );
+        eprintln!(
+            "{}",
+            mem_accounting::format_line(&mem_accounting::snapshot(), None)
+        );
+        b.free_pixmap(None, again).expect("free again");
+        settle(&mut b);
+        pool.drain();
+        assert_eq!(mem_accounting::entry_of(small_mem), None);
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn render_composite_returns_child_clipped_region() {

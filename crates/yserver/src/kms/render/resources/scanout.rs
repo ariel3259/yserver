@@ -202,7 +202,7 @@ impl Drop for SharedBacking {
                 if t.command_pool != vk::CommandPool::null() {
                     vk.device.unmap_memory(t.staging_memory);
                     vk.device.destroy_buffer(t.staging_buffer, None);
-                    vk.device.free_memory(t.staging_memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, t.staging_memory);
                     vk.device.destroy_command_pool(t.command_pool, None);
                     if t.timestamp_pool != vk::QueryPool::null() {
                         vk.device.destroy_query_pool(t.timestamp_pool, None);
@@ -215,7 +215,7 @@ impl Drop for SharedBacking {
                     vk.device.destroy_image(self.image, None);
                 }
                 if self.memory != vk::DeviceMemory::null() {
-                    vk.device.free_memory(self.memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, self.memory);
                 }
             }
         }

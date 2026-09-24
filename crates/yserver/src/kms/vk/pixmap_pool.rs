@@ -316,7 +316,12 @@ impl PixmapPool {
             .expect("pixmap pool buckets mutex poisoned");
         let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
         let entry = buckets.get_mut(&key).and_then(VecDeque::pop_front);
-        if entry.is_some() {
+        if let Some(e) = entry.as_ref() {
+            // The caller recategorises again if it is not a pixmap.
+            crate::kms::vk::mem_accounting::recategorise(
+                e.memory,
+                crate::kms::vk::mem_accounting::MemCategory::Pixmap,
+            );
             stats.total_takes_hit += 1;
         } else {
             stats.total_takes_miss += 1;
@@ -353,6 +358,10 @@ impl PixmapPool {
                 .total_returns_rejected_bucket_full += 1;
             return Err(entry);
         }
+        crate::kms::vk::mem_accounting::recategorise(
+            entry.memory,
+            crate::kms::vk::mem_accounting::MemCategory::PoolIdle,
+        );
         bucket.push_back(entry);
         self.stats
             .lock()
@@ -380,7 +389,7 @@ impl PixmapPool {
         unsafe {
             self.vk.device.destroy_image_view(entry.view, None);
             self.vk.device.destroy_image(entry.image, None);
-            self.vk.device.free_memory(entry.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, entry.memory);
         }
     }
 

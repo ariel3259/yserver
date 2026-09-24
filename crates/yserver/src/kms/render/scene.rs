@@ -722,7 +722,12 @@ impl DamageAuditTarget {
         let allocation = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
-        let memory = match unsafe { vk.device.allocate_memory(&allocation, None) } {
+        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+            &vk.device,
+            &allocation,
+            crate::kms::vk::mem_accounting::MemCategory::Other,
+            &properties,
+        ) {
             Ok(memory) => memory,
             Err(error) => {
                 unsafe { vk.device.destroy_image(image, None) };
@@ -732,7 +737,7 @@ impl DamageAuditTarget {
         if let Err(error) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
             unsafe {
                 vk.device.destroy_image(image, None);
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             }
             return Err(error);
         }
@@ -751,7 +756,7 @@ impl DamageAuditTarget {
             Err(error) => {
                 unsafe {
                     vk.device.destroy_image(image, None);
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 }
                 return Err(error);
             }
@@ -765,7 +770,7 @@ impl DamageAuditTarget {
                 unsafe {
                     vk.device.destroy_image_view(view, None);
                     vk.device.destroy_image(image, None);
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 }
                 return Err(error);
             }
@@ -781,7 +786,7 @@ impl DamageAuditTarget {
                     vk.device.destroy_command_pool(command_pool, None);
                     vk.device.destroy_image_view(view, None);
                     vk.device.destroy_image(image, None);
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 }
                 return Err(error);
             }
@@ -829,7 +834,7 @@ impl Drop for DamageAuditTarget {
             self.vk.device.destroy_command_pool(self.command_pool, None);
             self.vk.device.destroy_image_view(self.view, None);
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }
