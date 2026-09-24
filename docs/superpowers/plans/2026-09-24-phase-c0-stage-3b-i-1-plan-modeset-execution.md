@@ -2,6 +2,9 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 6 (2026-09-24, coordinator)** — the 3b-i-2 plan review (M-1):
+kept outputs repaint on a root storage change (Task 6).
+
 **Revision 5 (2026-09-24, coordinator)** — Task 4 review: the one-CRTC
 description requires preparation to keep a bound output's CRTC (Task 5).
 
@@ -304,7 +307,10 @@ invalidated), a new clock epoch for each CRTC whose mode changed, probed
 when active (Task 1); (2) the staged projection committed and a removed
 output's projection invalidated once, through a coordinator form that cannot
 fail (its preconditions verified in preparation); (3) scene promotion
-(Task 3). **None of the three steps has a fallible call.** After promotion
+(Task 3). *(Rev 6, from the 3b-i-2 review M-1.)* When the promotion changes
+the root storage identity, every kept output (this device and others) gets
+full damage and repaints through an ordinary composed frame, never a
+lifecycle commit (design §5.2). **None of the three steps has a fallible call.** After promotion
 the result is announced through the existing asynchronous CRTC path so the
 core's `finish_crtc_config` answers `Success` (`Ok(true)`).
 
@@ -313,6 +319,7 @@ core's `finish_crtc_config` answers `Success` (`Ok(true)`).
 | `c0_3bi_mode_change_promotes_vulkan` | a mode change accepted and completed: `platform.outputs`, the registry entry, root and input extents equal Legacy's for the same request; the old pool is in the retired bundle; the new epoch is probed once | **E24** release the old pool at promotion (design mutation 19) |
 | `c0_3bi_enable_from_headless_device_vulkan` | the device's only output disabled, then enabled: the promotion lights it (DPMS on), extents follow, a probe follows the lit promotion | **E25** skip the extent recomputation |
 | `c0_3bi_disable_promotes_vulkan` | a disable: the output leaves `platform.outputs`, its projection is invalidated once, its scene state and pool are in a bundle | **E26** invalidate the projection twice or never |
+| `c0_3bi_enable_repaints_kept_outputs_vulkan` | three outputs; enabling a fourth that grows the root: each kept output gets full damage and a composed repaint, and no lifecycle commit is sent for it | **E27b** skip the kept outputs' damage |
 | `c0_3bi_promotion_has_no_fallible_call` | the promotion entry point's signature returns no `Result`, and a test double that makes each promoted component's setter observable shows all three steps ran after one accepted result | **E27** place a fallible call after acceptance (design mutation 14) |
 
 ## Task 7 — the old pool's release
