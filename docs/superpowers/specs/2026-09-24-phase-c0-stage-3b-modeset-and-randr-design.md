@@ -1,10 +1,12 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 1, written by the coordinator on 2026-09-24 from a
-brainstorming session with the user. Every decision below marked
-**(user decision)** was taken in that session; the rest elaborates them or
-applies the umbrella and C.0 without a new choice. It goes to codex review
-before any plan.
+**Status:** Revision 2 (codex round
+[1](../findings/2026-09-24-stage-3b-design-review-round1.md)), written by the
+coordinator on 2026-09-24 from a brainstorming session with the user. Every
+decision below marked **(user decision)** was taken in that session; the rest
+elaborates them or applies the umbrella and C.0 without a new choice. Items
+marked **(coordinator, rev 2)** were added after the session, while the user
+was away, and are listed for the user in section 10.
 
 **Authority:** [C.0](2026-08-26-phase-c0-atomic-kms-migration-design.md)
 (§6.3, §6.4, §9.2, §9.4, §10 and its latch scopes, §10.3, §13, §16, §18 as
@@ -135,10 +137,14 @@ is unreachable, and before 3b-ii it is reachable only in fixtures.
 
 A client modeset is **dispatched** only while the device is `Owner ∧ Ready`,
 the arbiter has **no active transition**, and every CRTC the transaction
-touches has a current clock (`KernelSequence` for this epoch; the 3a-ii
-readiness wait, `lifecycle_clock_readiness`). The seat must be active: while
-the VT is released the request fails at once (section 7.4); it never parks
-on the VT.
+requires a clock for has a current one (section 3.5; the 3a-ii readiness
+wait, `lifecycle_clock_readiness`). The seat must be active: while the VT is
+released the request fails at once (section 7.4); it never parks on the VT.
+
+`REC-4` events never wait at the section 7 gate *(rev 2, round-1 M-3)*: they
+reach the coordinator and the arbiter at once, so they can supersede a
+modeset that has not been dispatched. Only their publication is ordered
+(section 7.5).
 
 - A `REC-4` event that arrives **before dispatch** supersedes the modeset:
   its prepared set is released exactly once, the slot empties, and the result
@@ -179,6 +185,54 @@ Freshness is checked, as in 3a (§3.6), immediately before the final
 `TEST_ONLY` and again immediately before executor dispatch; a stale entry is
 cancelled as never-submitted.
 
+**Position-only change** *(rev 2, round-1 M-1)*. Legacy treats a request that
+changes only `x`/`y` as a real change (the idempotency guard compares the
+position, `backend.rs:24821`) and answers it with a rebuild and
+notifications. On this server an output's position is the offset of its
+region in the root — composition state, not a KMS property: the CRTC keeps its
+mode and its pool, and no plane `SRC`/`CRTC` rectangle changes. The Owner
+therefore runs a position-only request as a **logical transaction with no
+commit**: it takes the device's client-modeset slot (so it is ordered with
+real modesets and superseded like them before promotion), stages the new
+scene state (section 4.1 step 5), and promotes it (section 4.2) without a
+`Tier::Topology` dispatch. Its reply, timestamps and events match Legacy's
+for the same request. C.0's minimal property list is respected: nothing
+changes in KMS, so nothing is sent. A request that changes the mode **and**
+the position is an ordinary mode change.
+
+### 3.5. Clocks of CRTCs that were dark *(coordinator, rev 2)*
+
+C.0 §10 requires a current `KernelSequence` clock "before admitting an
+**event-bearing** commit on a newly installed active hardware CRTC or clock
+epoch". The 2b owner is stricter: `validate_completion_context`
+(`owner/device.rs`) requires a ready clock for **every** expected-completion
+CRTC of a `LifecycleInstallRestore` commit, and `lifecycle_clock_readiness`
+waits for them. On a CRTC that is inactive before the commit that cannot be
+met: the kernel answers `GET_SEQUENCE` on it with `-EINVAL`
+(`drm_crtc_vblank_off` bumps the vblank refcount and sets `inmodeset`,
+`drm_vblank.c:1372`, so `drm_vblank_get` fails at `:1228`), and C.0 makes any
+explicit probe errno a qualification failure with no same-epoch retry. A
+first enable, or a DPMS-on after a mode was installed dark, would never
+dispatch — or would close qualification if it probed.
+
+The requirement is narrowed to C.0's text for the lifecycle class:
+
+- a lifecycle commit (DPMS, client modeset) requires a ready clock only for
+  CRTCs that are **active before the commit** (`old_active`). A CRTC going
+  from inactive to active needs none: the commit is not event-bearing (no
+  page event, no Present consumer) and its completion evidence is the
+  out-fence/`HardwareComplete` path, which does not read the clock;
+- a commit that installs a new mode on a CRTC starts a **new clock epoch** for
+  it (C.0 §10), `Unresolved`;
+- that epoch's probe runs only once the CRTC is active: at promotion when it
+  was installed lit, or at the promotion of the DPMS-on that lights it. A
+  probe is never sent to an inactive CRTC;
+- event-bearing work on the CRTC (composed flips, Present) waits for the probe
+  as today.
+
+This changes the stage 2b owner and the 3a-ii readiness wait; the plan
+states it as a named change with its own test and mutation (section 8.3).
+
 ### 3.4. The composition with DPMS, and projections follow topology
 
 - The transaction reads each output's `dpms_target` from the coordinator,
@@ -218,7 +272,15 @@ slot is taken, while the old topology keeps scanning out and composing:
    The **prepared set** — pool, framebuffers, mode blob — is owned by the
    transaction and released exactly once if it is not installed;
 4. `TEST_ONLY` of the complete device transaction through the 3a-ii
-   validation path.
+   validation path;
+5. *(rev 2, round-1 M-2)* **the new scene state** of every output of the
+   device whose state changes (the target output's `OutputSceneState` —
+   composition ring, damage audit, extent and origin — built against the
+   staged layout), and the staged `OutputKey` → position map of the whole
+   new `platform.outputs`. Nothing is swapped in yet.
+
+The scene state is built during preparation so that nothing after the kernel
+accepts can fail except the global renderer loss (section 6).
 
 **First framebuffer content:** as Legacy — the first BO of the new pool,
 uncomposed; the scene repaints at once after installation. Not a
@@ -245,12 +307,16 @@ order:
    `last_enabled` exactly as Legacy sets them), the root extent
    (`fb_w`/`fb_h` recomputed from every layout, as Legacy), the input extent,
    the device's topology generation (queued intents of the older generation
-   are invalidated, C.0 §9.2, §13) and a new clock epoch with its probe for
-   every CRTC whose mode changed (C.0 §10). This step moves data only; it has
-   no fallible call.
+   are invalidated, C.0 §9.2, §13) and a new clock epoch for every CRTC whose
+   mode changed (C.0 §10), probed when active (section 3.5).
 2. The projection hook (section 3.4).
-3. **Scene promotion — per device** (section 5.1). Fallible; its failure is
-   section 6's last rows.
+3. **Scene promotion — per device** (section 5.1): the staged scene states
+   swapped in and every kept state re-associated through the staged identity
+   map.
+
+All three steps move data only; none has a fallible call *(rev 2, round-1
+M-2)*. Other devices can therefore never resume against positions that do
+not match their outputs.
 
 ### 4.3. The value-dead reads
 
@@ -284,7 +350,13 @@ Present, not a lifecycle commit.
 
 - A direct frame current **on the modeset's device** is returned to
   composition first: preparation requests the Owner composed unflip (2c-iii)
-  and the modeset is dispatched only after it retired.
+  and the modeset is dispatched only after it retired. *(Rev 2, round-1
+  B-2.)* The unflip is a class-2 commit with its own deadlines (C.0 §10.3
+  timers 2–4). Its terminal outcome is handed to the parked modeset: retired →
+  the modeset proceeds; rejected before submit → the modeset fails
+  (`Preparation(Unflip)`), nothing changed; `CompletionUnknown` → the device
+  is `Poisoned` and the modeset fails. The unflip is a stage of the request's
+  bound (section 7.3).
 - A modeset **that makes the topology direct-ineligible** — it adds an output
   on another device, or changes the root extent or an effective refresh so
   that `direct_scanout_topology_eligible` or the whole-root match fails —
@@ -315,12 +387,16 @@ server with no Owner device behaves exactly as today.
 | --- | --- | --- |
 | Preparation: discovery, unadvertised mode, route, allocation, `TEST_ONLY` | prepared set released; old topology authoritative; device stays `Ready` | `Failed` |
 | Superseded by a `REC-4` event before dispatch | same | `Failed` |
-| Real commit rejected with `EBUSY` | bounded retry per C.0 §9.4; exhausted → next row | `Failed` if exhausted |
+| Real commit rejected with `EBUSY` *(rev 2, round-1 B-1)* | C.0 §9.4: the owner never dispatches while its own record occupies the slot, so `EBUSY` is an ownership invariant failure, not a scheduling signal — no retry. The prepared set is released, the foreign/internal-busy evidence recorded, readiness closed, and the device enters the bounded topology/recovery path (its exit is 3c/3d's) | `Failed` |
 | Real commit explicitly rejected (other errno) | `FailedBeforeSubmit`: nothing became current, prepared set released, no poison. An `EINVAL`/`EOPNOTSUPP` attributable to the object combination latches **the requested topology generation** (C.0 §10 latch scopes): an identical request answers `Failed` without dispatch until the device's topology generation changes; the current topology stays `Ready` | `Failed` |
 | Completion loss: missing/invalid/error fence, deadline, contradiction | `CompletionUnknown` → `Poisoned`, both state sets quarantined (3a-ii) | `Failed`, nothing published |
 | Stale result (accepted after its identity stopped being current) | accepted-stale: fds adopted or closed once, quarantine retained by the winning transition, nothing installed | `Failed` |
-| Accepted, then scene promotion fails with renderer device loss | existing `renderer_failed` clean shutdown (global policy, unchanged) | none — the server exits cleanly |
-| Accepted, then scene promotion fails otherwise (for example the composition ring cannot be allocated) | the topology is installed and published; that device's readiness closes until 3d's recovery; other devices continue; **no new `request_exit`** | `Success` (it was installed) |
+| Renderer device loss at any point | existing `renderer_failed` clean shutdown (global render-device policy, unchanged) | none — the server exits cleanly |
+
+*(Rev 2, round-1 M-2.)* Revision 1 had a row for a scene promotion that fails
+after the kernel accepted. Scene state is now built in preparation (section
+4.1 step 5), where its failure is a preparation failure, and promotion has no
+fallible call, so that row cannot occur. The Owner adds no `request_exit`.
 
 A `TEST_ONLY` rejection does not latch: nothing reached the kernel's commit
 path, and each request runs its own `TEST_ONLY`.
@@ -330,11 +406,13 @@ path, and each request runs its own `TEST_ONLY`.
 The RANDR reply carries only a status byte, and the umbrella §7 forbids new
 protocol, so the cause is recorded server-side. Every `Failed` carries a
 typed `ClientModesetFailure` that distinguishes each row above:
-`Preparation(stage)` (with the `TEST_ONLY` errno where there is one),
-`KernelRejected { errno }` — **only** when the kernel answered —,
-`OwnerRefused(cause)` (the owner did not dispatch: slot conflict, clock not
-ready, readiness closed), `Superseded(LifecycleKind)`, `CompletionUnknown`,
-`Stale`, `Latched`, `PostInstallRender`. The owner never synthesizes an errno
+`Preparation(stage)` (discovery, mode, route, allocation, scene state,
+unflip, or `TEST_ONLY` with its errno),
+`KernelRejected { errno }` — **only** when the kernel answered, `EBUSY`
+included —, `OwnerRefused(cause)` (the owner did not dispatch: slot conflict,
+clock not ready, readiness closed), `Superseded(LifecycleKind)`,
+`CompletionUnknown`, `Stale`, `Latched`, `GateExpired` (section 7.3),
+`SeatReleased` (section 7.4). The owner never synthesizes an errno
 (the 3a-ii lesson: an owner refusal reported as a kernel `EINVAL` cost a
 `drm.debug` session).
 
@@ -358,9 +436,11 @@ class 4, stage 4, and is excluded. Queries (`GetScreenResources`,
 
 While a mutation is in flight, a client whose **next** request is a RANDR
 mutation is not dispatched: it is blocked through the existing ready-ring
-mechanism (`client_is_blocked`), keeping its position, and its later
-requests wait behind it by the per-client FIFO. The mutation leaves the gate
-when its publication (section 7.2) is complete.
+mechanism (`client_is_blocked`), and its later requests wait behind it by
+the per-client FIFO. Waiters are admitted **in the order they reached the
+gate** (a FIFO of client ids kept by the gate, not ready-ring order) — the
+bound of section 7.3 depends on it. The mutation leaves the gate when its
+publication (section 7.2) is complete, or at once when it ends without one.
 
 Why one in flight and not concurrent per-device work published in order:
 `randr.rs` validation (`screen_encompasses`, the config timestamps) and the
@@ -407,34 +487,74 @@ monotonicity rule (umbrella obligation 1).
 
 ### 7.3. Bounded wait (obligation 5)
 
-There is no separate global watchdog: one that answered `Failed` and then saw
-the change install would contradict "`Success` means installed". The bound is
-the sum of existing deadlines, each with its own timeout wake of the core
-loop (no I/O needed to observe expiry):
+There is no watchdog on work that may still install: one that answered
+`Failed` and then saw the change install would contradict "`Success` means
+installed". The bound is built from two parts *(rev 2, round-1 B-2)*.
+
+**Execution bound `E`** — from gate admission to the terminal outcome — the
+sum of existing deadlines, each with its own timeout wake of the core loop
+(no I/O needed to observe expiry):
 
 | Stage | Deadline | On expiry |
 | --- | --- | --- |
 | PRIME qualification probe | 30 s (`probe_executor.rs:46`) | `Failed` |
-| Wait to start: an active lifecycle transition, or the clock probe | that transition's or probe's own deadlines; a `REC-4` event supersedes the modeset at once | `Failed` (`Superseded`) or the probe's outcome |
+| Device not `Ready` (readiness closed, `Poisoned`, `Unqualified`) | none — a nonterminal prerequisite is never waited on | `Failed` at once (`OwnerRefused`) |
+| Wait to start: an active lifecycle transition, or the clock probe of an active CRTC | that transition's or probe's own deadlines (C.0 §10.3); a `REC-4` event supersedes the modeset at once | `Failed` (`Superseded`) or the probe's outcome |
+| Composed unflip before dispatch (section 5.3) | its own class-2 deadlines (C.0 §10.3 timers 2–4) | `Failed`, per section 5.3 |
 | Executor host call | 2 s (C.0 §10.3 timer 2) | `CompletionUnknown` → `Failed` |
 | Hardware completion | 30 s bootstrap, or the measured cohort value | `CompletionUnknown` → `Failed` |
 
-Worst case ~95 s; bounded, and each stage is tested separately.
+**Gate queue deadline `Q` = 30 s** — the wait before admission. A parkable
+request (`SetCrtcConfig`) that has waited `Q` at the gate without being
+admitted is taken out of the queue and processed with no backend call:
+`randr.rs` validation runs as usual against the published state (so a
+protocol error is the one Legacy would send), and a request that validates
+answers `Failed` (`GateExpired`) with the current timestamp and no
+publication. Nothing of it was dispatched, so "`Success` means installed"
+holds. The other mutations are synchronous, have no `Failed` status, and are
+never expired.
+
+**The bound.** Every admitted request is terminal within `E` of admission. A
+request that reaches the gate at `t` is either admitted by `t + Q` or expired
+at `t + Q`, so a parkable request is answered by `t + Q + E`. A synchronous
+mutation waits only for the waiters ahead of it in the FIFO; each of them
+reached the gate before `t` and is therefore terminal by `t + Q + E`, so the
+synchronous one executes by then. Worst case about 30 + 95 s. Each stage and
+`Q` are tested separately (section 8.2).
+
+**Named exception — `GateExpired`.** Legacy would have executed a request
+that waited behind a slow one (it blocks the whole core loop while it
+modesets); the Owner answers `Failed` after `Q`. Reachable only when a
+mutation stays in flight longer than 30 s.
 
 ### 7.4. What never parks
 
-- **VT released:** the request answers `Failed` at once, as Legacy's
-  `begin_crtc_config` does today (`Interrupted`). The user's VT golden capture
+- **VT released:** the request answers `Failed` at once (`SeatReleased`), as
+  Legacy's `begin_crtc_config` does today (`Interrupted`). The user's VT golden capture
   is the reference for what a requester sees.
 - **DPMS off:** not a prerequisite — the mode installs dark (section 3.3).
 
 ### 7.5. Changes no request caused (obligation 6)
 
 Hotplug, VT acquire and recovery publish from their own transitions (3c, 3d).
-3b-ii defines the interface: such a change **enters the same gate** as a
-mutation without a requester, so its publication is ordered with the
-clients'; `lastConfigTime` keeps its rule. 3b-ii proves the interface with a
-test producer; 3c and 3d connect the real producers.
+3b-ii defines the interface *(rev 2, round-1 M-3)*:
+
+- the **event** never waits at the gate: it reaches the coordinator and the
+  arbiter at once (section 3.2), and supersedes a client modeset that has not
+  been dispatched;
+- its **publication** is ordered through the gate as a mutation without a
+  requester. It waits only behind a mutation that can still install — a
+  dispatched Owner modeset, whose result the transition waits for anyway (C.0
+  §9.2). A mutation that the event superseded, or one not yet admitted, does
+  not hold it back: the superseded one ends `Failed` with no publication and
+  the requester-less publication goes first;
+- `lastConfigTime` keeps its rule.
+
+3b-ii proves the interface with a test producer, including the sequence
+"client modeset parked before dispatch, `REC-4` event arrives, event
+supersedes, requester-less publication, then the client's `Failed`"; 3c and 3d
+connect the real producers. A server with no Owner device keeps today's
+requester-less publication path.
 
 ## 8. Evidence
 
@@ -452,6 +572,18 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   result).
 - **DPMS composition:** a modeset under DPMS-off carries `ACTIVE=0`, the
   projection hook ran, and a later DPMS-on lights the new mode.
+- **Dark CRTCs (section 3.5):** a first enable of an inactive CRTC dispatches
+  with no clock for it and sends no probe before it is active; the new
+  epoch's probe is sent after the lit promotion; a mode installed dark is
+  lit by DPMS-on without a probe of the dark CRTC, and probed after; an
+  active CRTC's lifecycle commit still waits for its clock.
+- **Position-only change:** no `Tier::Topology` dispatch and no KMS call; the
+  RANDR state, reply and events match Legacy's.
+- **Staged scene state:** a failure while building it is a preparation
+  failure with nothing changed; promotion runs no fallible call.
+- **`EBUSY`:** no retry, readiness closed, evidence recorded.
+- **Unflip handoff:** each unflip outcome (retired, rejected, unknown) reaches
+  the parked modeset.
 - **Two devices:** a modeset on A issues zero lifecycle commits on B and B's
   in-flight composed commits complete; enabling/removing an output shifts
   indices without moving B's buffers; A in direct plus an enable on B
@@ -471,8 +603,11 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   idempotent request; supersession by a `REC-4` event; two concurrent clients
   (the gate, including the section 7.1 MATE sequence); cross-device and
   cross-transport order; the requester disconnecting while parked; each
-  section 7.3 stage expired; the VT released; a requester-less mutation from
-  the test producer. Identical except the named exceptions.
+  section 7.3 stage expired; the gate queue deadline `Q` (a parkable request
+  expired with a validation error and without one; a synchronous mutation
+  behind it is not expired); FIFO admission order at the gate; the VT
+  released; a requester-less mutation from the test producer, including the
+  section 7.5 supersession sequence. Identical except the named exceptions.
 - **Hardware:** the 3b-i sequences driven by an in-test protocol client
   (C.0 §18 forbids an environment flag selecting the Owner, so real `xrandr`,
   MATE and CS2 are stage 5's layer-3 battery).
@@ -493,6 +628,16 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
    mixed-server test fails.
 10. Each routed value-dead read restored to `kms_outputs_active` → its test
     fails.
+11. A lifecycle commit requiring a clock for a CRTC inactive before it, or a
+    probe sent to an inactive CRTC → the dark-CRTC test fails; dropping the
+    clock requirement for an active CRTC → the same test fails.
+12. `EBUSY` retried → the `EBUSY` test fails.
+13. A position-only change dispatched to KMS → the position-only test fails.
+14. A fallible call placed after acceptance in promotion → the staged-scene
+    test fails.
+15. A `REC-4` event held at the gate → the section 7.5 sequence fails.
+16. Gate admission in ready-ring order instead of arrival order, or `Q`
+    applied to a synchronous mutation → the gate cases fail.
 
 ### 8.4. Named exceptions (complete list)
 
@@ -502,6 +647,8 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
 3. The concurrent PRIME probe no longer goes stale (section 7.1).
 4. Other devices do not blank during a modeset (section 5; physical, not
    client-visible).
+5. `GateExpired`: a parkable request that waited `Q` behind a slow mutation
+   answers `Failed` (section 7.3).
 
 ## 9. Out of scope
 
@@ -509,3 +656,20 @@ VT, hotplug, reprobe and device add/remove as executed transitions (3c);
 recovery out of `Poisoned`, `ExecutorStalled`, shutdown (3d); cursor and
 gamma on the Owner (stage 4); activation by capability (stage 5); making
 direct scanout multi-device. No new protocol surface (umbrella §7).
+
+## 10. For the user *(coordinator, rev 2)*
+
+Added after the brainstorming session, while the user was away; each follows
+from C.0 or a review finding, none reverses a decision of the session:
+
+1. **Real-commit latch** (section 6): an attributable `EINVAL`/`EOPNOTSUPP`
+   from the kernel on the real commit latches the requested topology
+   generation, as C.0 §10's latch scopes require. The session said "no latch"
+   about `TEST_ONLY` rejections, which stays true.
+2. **`EBUSY`** is not retried (C.0 §9.4, round-1 B-1).
+3. **Clocks of dark CRTCs** (section 3.5): the 2b owner's clock requirement
+   for lifecycle commits is narrowed to C.0's text; without it a first enable
+   could never dispatch.
+4. **Position-only changes** run with no KMS commit (section 3.3).
+5. **Gate queue deadline `Q` = 30 s** and the `GateExpired` exception (section
+   7.3, round-1 B-2).
