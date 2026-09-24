@@ -313,6 +313,18 @@ impl ResourceService {
         }
     }
 
+    /// Retired copied pools have no later renderer use to consume a B->A
+    /// return payload. Their source half is terminal only after the retired
+    /// completion handler has consumed that source's last GPU proof and
+    /// discarded the synchronization payload.
+    pub(crate) fn copied_source_is_retirement_terminal(&self, key: &AllocationKey) -> bool {
+        let Some(entry) = self.entries.get(key) else {
+            return false;
+        };
+        let payload = entry.payload.borrow();
+        matches!(payload.as_ref(), Some(AllocationPayload::CopiedSource(source)) if source.is_retirement_terminal())
+    }
+
     pub(crate) fn incarnation(&self) -> IncarnationId {
         self.incarnation
     }

@@ -696,6 +696,41 @@ impl CopiedSourceAllocation {
         }
     }
 
+    /// Consume the copied source's final proof when its output has retired.
+    /// A-complete with no B submission is terminal in `ForeignAwaitingSink`;
+    /// B-complete is terminal in `ForeignAwaitingRenderer`. The caller must
+    /// first retire the matching resource-service batch, so neither device
+    /// can still read or write these handles.
+    pub(crate) fn retire_after_completion_proof(&mut self) -> bool {
+        if !matches!(
+            self.ownership,
+            CopiedSourceOwnership::RendererFirstUse
+                | CopiedSourceOwnership::RendererDiscard
+                | CopiedSourceOwnership::ForeignAwaitingSink
+                | CopiedSourceOwnership::ForeignAwaitingRenderer
+        ) {
+            return false;
+        }
+        self.release_sink_wait_semaphore();
+        if let Some(semaphore) = self.renderer_wait_semaphore.take()
+            && let Some(render_vk) = &self.render_vk
+        {
+            unsafe { render_vk.device.destroy_semaphore(semaphore, None) };
+        }
+        self.renderer_return_completion = None;
+        self.ownership = CopiedSourceOwnership::RendererDiscard;
+        true
+    }
+
+    pub(crate) fn is_retirement_terminal(&self) -> bool {
+        matches!(
+            self.ownership,
+            CopiedSourceOwnership::RendererFirstUse | CopiedSourceOwnership::RendererDiscard
+        ) && self.renderer_return_completion.is_none()
+            && self.sink_wait_semaphore.is_none()
+            && self.renderer_wait_semaphore.is_none()
+    }
+
     #[cfg(test)]
     pub(crate) fn waits_for_tests(&self) -> (bool, bool) {
         (
