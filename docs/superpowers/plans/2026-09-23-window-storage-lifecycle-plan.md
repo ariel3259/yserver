@@ -26,8 +26,8 @@ storage, and by then it is mostly deletion of the unconditional allocation.
 - Lavapipe ignored suite: `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
   cargo test -p yserver --lib -- --ignored`, plus `--test render_acceptance
   -- --ignored`.
-- xts A/B per step (Xlib4 + Xlib9, zero PASS→FAIL), measured against our own
-  previous run on this branch, not against Xorg.
+- `rendercheck` A/B (`just rendercheck-yserver`) for steps that change Render
+  handling. No per-step xts A/B: its runs are not deterministic.
 - `feat/vram-by-category` merged first (HW-checked on bee): step 6 measures
   with its `vram by use` line.
 
@@ -198,7 +198,7 @@ Correct today already, with the storage still present.
   returns. Then ask the reporter for one run.
 - HW smoke: Cinnamon (Muffin, direct scanout; lock screen), awesome + picom
   (fade-outs), MATE, and a menu/tooltip-heavy app for map/unmap churn.
-- Full xts A/B against the step-5 baseline.
+- rendercheck A/B against the step-2 baseline.
 
 ## Atomic-switch check
 
