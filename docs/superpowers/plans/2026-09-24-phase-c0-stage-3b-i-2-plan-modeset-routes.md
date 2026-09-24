@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 2 (2026-09-24, coordinator)** — codex round 1
+(`../findings/2026-09-24-stage-3b-i-2-plan-review-round1.md`: 0 blocking, 3
+major, all verified): kept outputs repaint when the root storage identity
+changes (M-1, Tasks 3–5); the direct-entry hold is released on every
+non-promoting end (M-2, Task 1); the copied retirement test covers a frame
+already submitted to KMS (M-3, Task 2).
+
 **Revision 1 (2026-09-24, coordinator).**
 
 **Goal:** remove every `OwnerRefused(NotYetSupported(..))` plan 3b-i-1 left:
@@ -69,10 +76,22 @@ retired → proceed; rejected before submit → `Failed`
 modeset's promotion (the existing entry probation restarts on the new
 topology). The unflip is a stage of the request's bound (design §7.3).
 
+*(Rev 2, M-2.)* **The hold ends on every terminal path.** The hold on
+direct re-entry is owned by the modeset request and released exactly once,
+when the request ends: at promotion (entry probation restarts on the new
+topology), and on every non-promoting end — preparation failure, `TEST_ONLY`
+or commit rejection, supersession, stale entry, `CompletionUnknown` — after
+the unflip it requested (if any) is terminal. A rejected or superseded
+modeset therefore leaves direct scanout able to re-enter through the ordinary
+probation on the unchanged topology; the hold never outlives its request
+(today `request_direct_unflip`, `render/backend.rs:2709`, sets
+`unflip_requested` and clears `hold_direct`; the request-owned hold is new).
+
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3bi_modeset_waits_for_unflip_retirement_vulkan` | direct frame current, mode change: no modeset validation until the unflip's composed commit retired; then the modeset dispatches | **F1** dispatch while the unflip is pending |
 | `c0_3bi_unflip_outcomes_reach_the_modeset_vulkan` | the unflip rejected, and (separately) made `CompletionUnknown`: the modeset ends `Preparation(Unflip)` / `Failed` with the device `Poisoned`, and nothing of the modeset was sent | **F2** proceed after a rejected unflip |
+| `c0_3bi_direct_hold_released_on_every_end_vulkan` | after the unflip retired: a `TEST_ONLY` rejection, and (separately) a DPMS supersession, end the modeset; a following run of direct-eligible Presents re-enters direct through the ordinary probation | **F3b** release the hold only at promotion |
 | `c0_3bi_present_during_modeset_unflip_stays_composed_vulkan` | a direct-eligible Present arrives between the unflip request and the modeset promotion: it is composed, not flipped | **F3** re-admit direct before promotion |
 
 ## Task 2 — the copied route (design §4.1, §5.1 table, §5.4)
@@ -100,6 +119,7 @@ frame's last row.
 | --- | --- | --- |
 | `c0_3bi_copied_mode_change_vulkan` | a copied output's mode change: the pool is prepared on both devices, only the sink device receives a commit, the promoted state matches Legacy's | **F4** issue a commit on the source device |
 | `c0_3bi_retired_copied_frame_stages_vulkan` | disable and mode change with a frame at each stage (a) A in flight, (b) A done / B never prepared, (c) B in flight, (d) B done / never submitted: each follows its row, no B is prepared for a retired frame, the pool survives until every frame's last row | **F5** prepare B for a retired frame (design mutation 29); **F6** destroy the bundle before every frame's proof |
+| `c0_3bi_retired_submitted_copied_frame_vulkan` | *(rev 2, M-3)* a copied frame whose B was submitted to KMS, then its output disabled: with the displacing commit's `KmsRelease` withheld the pool survives B's fence; with the `KmsRelease` discharged but the FOREIGN return withheld it still survives; it is destroyed only after both | **F6b** destroy on B's fence alone; **F6c** destroy on the `KmsRelease` alone |
 | `c0_3bi_late_copy_completion_vulkan` | a copy job completes after its output was disabled and an index shift, and after a mode change: proofs serviced from the bundle, nothing offered or submitted, the new pool untouched | **F7** route the copied completion by index or key (design mutation 25) |
 
 ## Task 3 — position-only changes (design §3.3)
@@ -112,7 +132,12 @@ logical transaction: it takes the client-modeset slot, is admitted on
 `OutputSceneState` in place (origin, full damage) — same object, same ring,
 releases and owner buffers — plus `platform.outputs`, the registry, the root
 and input extents, and the topology generation (queued older-generation
-composed intents invalidated). A change of root extent or of direct
+composed intents invalidated). *(Rev 2, M-1.)* When the promotion changes
+the root storage identity, **every kept output** — on this device and on
+every other — receives full damage and repaints through an ordinary composed
+frame (class 2), never a lifecycle commit (design §5.2); the same rule
+applies to Task 4's scoped Legacy modeset for the Owner devices' kept
+outputs and to 3b-i-1's enable/disable promotions. A change of root extent or of direct
 eligibility follows Task 1. Reply, timestamps and events match Legacy's.
 
 | Test | Scenario | Must fail under |
@@ -120,6 +145,7 @@ eligibility follows Task 1. Reply, timestamps and events match Legacy's.
 | `c0_3bi_position_only_sends_no_kms_call_vulkan` | move an output: admitted on `Tier::Topology`, no executor send of any kind, state and registry equal Legacy's | **F8m** dispatch it to KMS (design mutation 13) |
 | `c0_3bi_position_only_waits_behind_an_accepted_flip_vulkan` | an accepted composed flip held through the request: promotion and the result wait until it completes; a composed intent queued for the old origin is invalidated | **F9** promote without waiting for the slot (design mutation 24) |
 | `c0_3bi_position_only_updates_in_place_vulkan` | with an unsignalled deferred release and a current composed buffer: the scene state is the same object after, the release waits for its fence, the buffer keeps its owner | **F10** replace the scene state (design mutation 22) |
+| `c0_3bi_root_change_repaints_kept_outputs_vulkan` | two Owner devices; moving A's output grows the root while B has a composed flip in flight: B's flip completes, B then receives full damage and a composed repaint against the new root, and B's executor receives no lifecycle commit | **F11b** skip the full damage on kept outputs |
 | `c0_3bi_position_change_invalidates_direct_eligibility_vulkan` | a position change that grows the root while a direct frame is current: the unflip (Task 1) retires before promotion | **F11** promote while direct is current |
 
 ## Task 4 — the Legacy path in a mixed server (design §5.5)
