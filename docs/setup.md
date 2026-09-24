@@ -142,13 +142,14 @@ Console takeover is implemented on FreeBSD `vt(4)` consoles too, so
 `Ctrl-C` in an X client is shielded from the kernel's console signal
 handling the same way it is on Linux VTs.
 
-### NVIDIA: enable DRM vblank (driver 610 or newer)
+### NVIDIA: enable DRM vblank (Turing or newer)
 
 yserver uses the kernel's per-CRTC vblank counters when the driver exposes
 them, and falls back to a flip-paced path when it does not. The NVIDIA
 `nvidia-drm` module exposes them only on driver branch **610 or newer**, and
-only when its `vblank` parameter is on — it is **off by default**. On those
-drivers, turn it on so it persists across reboots:
+only when its `vblank` parameter is on — it is **off by default**. Branch 610+
+supports **Turing (GTX 16xx, RTX 20xx) and newer** GPUs. On those, turn it on
+so it persists across reboots:
 
 ```sh
 echo 'options nvidia-drm vblank=1' | sudo tee /etc/modprobe.d/nvidia-drm-vblank.conf
@@ -164,9 +165,11 @@ If your initramfs loads the NVIDIA modules (for example with early KMS
 configured in dracut or mkinitcpio), regenerate it after adding the file, or
 the option is not seen at boot.
 
-Driver branches 580 and 595 have no such parameter and cannot expose the
-counters on current kernels; yserver uses its fallback path there and needs no
-setting. Check your branch with `cat /sys/module/nvidia/version`.
+**Maxwell, Pascal and Volta** GPUs (for example GTX 750/900/10xx, TITAN V)
+are supported only by the legacy 580 branch, which — like 595 — has no such
+parameter and cannot expose the counters on current kernels. yserver uses its
+fallback path there and needs no setting. Check your branch with
+`cat /sys/module/nvidia/version`.
 
 ## The X11 socket directory
 
