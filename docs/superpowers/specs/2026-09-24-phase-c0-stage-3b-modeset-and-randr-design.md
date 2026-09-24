@@ -1,11 +1,12 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 6 (codex rounds
+**Status:** Revision 7 (codex rounds
 [1](../findings/2026-09-24-stage-3b-design-review-round1.md),
 [2](../findings/2026-09-24-stage-3b-design-review-round2.md),
 [3](../findings/2026-09-24-stage-3b-design-review-round3.md),
-[4](../findings/2026-09-24-stage-3b-design-review-round4.md) and
-[5](../findings/2026-09-24-stage-3b-design-review-round5.md)), written by the
+[4](../findings/2026-09-24-stage-3b-design-review-round4.md),
+[5](../findings/2026-09-24-stage-3b-design-review-round5.md) and
+[6](../findings/2026-09-24-stage-3b-design-review-round6.md)), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -253,12 +254,24 @@ states it as a named change with its own test and mutation (section 8.3).
 
 - The transaction reads each output's `dpms_target` from the coordinator,
   never `kms_outputs_active`.
-- At installation (section 4.2), the driver calls the 3a projection hook for
-  the device: an output that appeared (enable) gets a projection from the
-  current global level and epoch before it can be lit; an output that left
-  (disable) has its projection invalidated exactly once. The umbrella's rule
-  — a newly installed output is never active after a global DPMS-off — is
-  proven at this site.
+- *(Rev 7, round-6 B-2.)* **The projection is staged before the commit.** An
+  output the commit adds (an enable of a disabled or new output) has no
+  projection yet, but the commit must choose its `ACTIVE`. Preparation
+  therefore stages its projection from the coordinator's current global
+  level and epoch — a pure read (C.0 §6.4: a new output inherits the global
+  level before installation) — and the description uses that staged target.
+  Freshness covers it: a DPMS request that changes the global level after
+  staging makes the entry stale at the pre-`TEST_ONLY` or pre-dispatch check,
+  and it is re-prepared.
+- At promotion the staged projection is committed and a removed output's
+  projection is invalidated exactly once. This must not fail: every
+  precondition of the coordinator call (the device is registered, the output
+  identity is the staged one, no projection was added for it meanwhile —
+  guaranteed by the slot and the freshness check) is verified in preparation,
+  and the plan gives the promotion a form that cannot return an error; the
+  actions it produces are queued data applied after promotion. The umbrella's
+  rule — a newly installed output is never active after a global DPMS-off —
+  is proven at this site.
 - **Named exception (Legacy parity, physical only):** Legacy lights every
   output on an enable while DPMS is off and keeps the protocol level Off; the
   Owner keeps them dark. Clients see the same bytes — the reply, the events,
@@ -328,7 +341,7 @@ order:
    the device's topology generation (queued intents of the older generation
    are invalidated, C.0 §9.2, §13) and a new clock epoch for every CRTC whose
    mode changed (C.0 §10), probed when active (section 3.5).
-2. The projection hook (section 3.4).
+2. The staged projection committed (section 3.4), infallibly.
 3. **Scene promotion** (section 5.1): the target's staged state swapped in,
    every kept state re-associated through the staged identity map, and the
    target's **old** state and **old pool** (mode change or disable) moved
@@ -501,10 +514,11 @@ server with no Owner device behaves exactly as today.
 
 | Where it fails | Effect | Client status |
 | --- | --- | --- |
-| Preparation: discovery, unadvertised mode, route, allocation, `TEST_ONLY` | prepared set released; old topology authoritative; device stays `Ready` | `Failed` |
+| Preparation: discovery, unadvertised mode, route, allocation, scene state; or `TEST_ONLY` rejected with `EINVAL`/`ERANGE`/`ENOSPC` (the candidate is invalid) | prepared set released; old topology authoritative; device stays `Ready` | `Failed` |
+| *(rev 7, round-6 B-1)* `TEST_ONLY` or the real commit answered `EACCES`/`EPERM` (master lost), `ENOENT` (an object vanished), `ENODEV`/device loss, or any errno this table does not classify | C.0 §10 (spec line 1985): these never leave the device `Ready` — prepared set released, readiness closed and the device handed to topology reconstruction (3c) or recovery (3d); any later admission is refused until then | `Failed` |
 | Superseded by a `REC-4` event before dispatch | same | `Failed` |
 | Real commit rejected with `EBUSY` *(rev 2, round-1 B-1)* | C.0 §9.4: the owner never dispatches while its own record occupies the slot, so `EBUSY` is an ownership invariant failure, not a scheduling signal — no retry. The prepared set is released, the foreign/internal-busy evidence recorded, readiness closed, and the device enters the bounded topology/recovery path (its exit is 3c/3d's) | `Failed` |
-| Real commit explicitly rejected (other errno) | `FailedBeforeSubmit`: nothing became current, prepared set released, and every `KmsRelease` the commit registered on the old pool at dispatch is cancelled exactly once (`ResourceService::cancel`, `resources/mod.rs:920`) — the old pool stays current and its obligations must not outlive the rejected commit *(rev 6, round-5 M-2)*; no poison. An `EINVAL`/`EOPNOTSUPP` attributable to the object combination latches **the requested topology** (C.0 §10 latch scopes): the latch key is `(installed topology generation, requested configuration of the device)`; an identical request under the same installed generation answers `Failed` (`Latched`) without dispatch; any installed-generation change clears it; the installed topology stays `Ready` | `Failed` |
+| Real commit explicitly rejected with `EINVAL`/`EOPNOTSUPP`/`ERANGE`/`ENOSPC` | `FailedBeforeSubmit`: nothing became current, prepared set released, and every `KmsRelease` the commit registered on the old pool at dispatch is cancelled exactly once (`ResourceService::cancel`, `resources/mod.rs:920`) — the old pool stays current and its obligations must not outlive the rejected commit *(rev 6, round-5 M-2)*; no poison. An `EINVAL`/`EOPNOTSUPP` attributable to the object combination latches **the requested topology** (C.0 §10 latch scopes): the latch key is `(installed topology generation, requested configuration of the device)`; an identical request under the same installed generation answers `Failed` (`Latched`) without dispatch; any installed-generation change clears it; the installed topology stays `Ready` | `Failed` |
 | Completion loss: missing/invalid/error fence, deadline, contradiction | `CompletionUnknown` → `Poisoned`, both state sets quarantined (3a-ii) | `Failed`, nothing published |
 | Stale result (accepted after its identity stopped being current) | accepted-stale: fds adopted or closed once, quarantine retained by the winning transition, nothing installed | `Failed` |
 | Renderer device loss at any point | existing `renderer_failed` clean shutdown (global render-device policy, unchanged) | none — the server exits cleanly |
@@ -711,8 +725,17 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   epoch's probe is sent after the lit promotion; a mode installed dark is
   lit by DPMS-on without a probe of the dark CRTC, and probed after; an
   active CRTC's lifecycle commit still waits for its clock.
-- **Position-only change:** no `Tier::Topology` dispatch and no KMS call; the
-  RANDR state, reply and events match Legacy's.
+- **Position-only change** *(rev 7, round-6 M-1)*: admitted on
+  `Tier::Topology` with an empty description, and **no KMS call** (no
+  `TEST_ONLY`, no commit); the RANDR state, reply and events match Legacy's.
+- **Error classification:** `EACCES`, `ENOENT` and an unclassified errno at
+  `TEST_ONLY` and at the real commit each close readiness, and a following
+  modeset and a following composed frame are refused admission; an `EINVAL`
+  at `TEST_ONLY` leaves the device `Ready` and a following modeset proceeds.
+- **Staged projection:** enabling a disabled output under global DPMS-off
+  dispatches with `ACTIVE=0` for it; a DPMS-on arriving between staging and
+  dispatch makes the entry stale and the re-prepared commit carries
+  `ACTIVE=1`.
 - **Staged scene state:** a failure while building it is a preparation
   failure with nothing changed; promotion runs no fallible call.
 - **Scene retirement:** a mode change promoted while the target's old state
@@ -827,6 +850,11 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
     late-copy test fails.
 26. A rejected commit's `KmsRelease` left registered → the rejection test
     fails.
+27. `EACCES`/`ENOENT`/unclassified errno leaving the device `Ready` → the
+    classification test fails.
+28. The projection added only at promotion (the commit lighting a new output
+    under DPMS-off), or a fallible call in its promotion → the staged
+    projection test fails.
 15. A `REC-4` event held at the gate → the section 7.5 sequence fails.
 16. Gate admission in ready-ring order instead of arrival order, or `Q`
     applied to a synchronous mutation → the gate cases fail.
