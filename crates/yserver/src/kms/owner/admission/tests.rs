@@ -36,13 +36,13 @@ fn gamma_key(crtc: CrtcId) -> MaintenanceKey {
 
 fn topology_tag(
     id: u64,
-) -> crate::kms::owner::lifecycle::TransitionTag<crate::kms::owner::identity::IncarnationId> {
+) -> crate::kms::owner::lifecycle::TopologyWork<crate::kms::owner::identity::IncarnationId> {
     use crate::kms::owner::{identity::IncarnationId, lifecycle::*};
-    TransitionTag::new(
+    TopologyWork::Transition(TransitionTag::new(
         IncarnationId::first(),
         LifecycleEpochId::first(),
         LifecycleTransitionId::from_raw(id),
-    )
+    ))
 }
 
 fn ticket_from_completed_generation(
@@ -451,7 +451,7 @@ fn c0_adm_tiers_topology_then_unflip_then_primary() {
         with_topology.decide(&snapshot),
         Some(AdmissionDecision {
             tier: Tier::Topology,
-            admitted: Admitted::Topology { tag: topology_tag },
+            admitted: Admitted::Topology { work: topology_tag },
             carried: Vec::new(),
             combined_primary: None,
             ages: BTreeSet::new(),
@@ -1010,7 +1010,7 @@ fn c0_adm_confirm_consumes_a_direct_unflip_or_topology_admission_exactly() {
             Readiness::Ready,
         );
         let decision = admission.decide(&snapshot).unwrap();
-        assert_eq!(decision.admitted, Admitted::Topology { tag: topology_tag });
+        assert_eq!(decision.admitted, Admitted::Topology { work: topology_tag });
         let token = admission.lock(decision, &snapshot).unwrap();
         admission.confirm(token).unwrap();
 

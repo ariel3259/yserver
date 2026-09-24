@@ -8,6 +8,7 @@
 pub(crate) mod admission;
 mod backend;
 pub(crate) mod batch_resource;
+pub(crate) mod client_modeset;
 #[doc(hidden)]
 pub mod completion_poller;
 pub(crate) mod composed_commit;

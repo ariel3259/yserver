@@ -1,13 +1,14 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 8 (codex rounds
+**Status:** Revision 9 (codex rounds
 [1](../findings/2026-09-24-stage-3b-design-review-round1.md),
 [2](../findings/2026-09-24-stage-3b-design-review-round2.md),
 [3](../findings/2026-09-24-stage-3b-design-review-round3.md),
 [4](../findings/2026-09-24-stage-3b-design-review-round4.md),
 [5](../findings/2026-09-24-stage-3b-design-review-round5.md),
 [6](../findings/2026-09-24-stage-3b-design-review-round6.md) and
-[7](../findings/2026-09-24-stage-3b-design-review-round7.md)), written by the
+[7](../findings/2026-09-24-stage-3b-design-review-round7.md); revision 9 corrects a
+contradiction the 3b-i-1 plan review found), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -261,9 +262,12 @@ states it as a named change with its own test and mutation (section 8.3).
   therefore stages its projection from the coordinator's current global
   level and epoch — a pure read (C.0 §6.4: a new output inherits the global
   level before installation) — and the description uses that staged target.
-  Freshness covers it: a DPMS request that changes the global level after
-  staging makes the entry stale at the pre-`TEST_ONLY` or pre-dispatch check,
-  and it is re-prepared.
+  A DPMS request that changes the global level after staging is a `REC-4`
+  event and supersedes the modeset before dispatch (section 3.2): it answers
+  `Failed` (`Superseded(DPMS)`) and is not re-prepared *(rev 9, plan round-1
+  M-1)*. The freshness check still compares the staged DPMS epoch as a
+  defence, so no path can dispatch a staged target that is no longer
+  current.
 - At promotion the staged projection is committed and a removed output's
   projection is invalidated exactly once. This must not fail: every
   precondition of the coordinator call (the device is registered, the output
@@ -760,8 +764,8 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   at `TEST_ONLY` leaves the device `Ready` and a following modeset proceeds.
 - **Staged projection:** enabling a disabled output under global DPMS-off
   dispatches with `ACTIVE=0` for it; a DPMS-on arriving between staging and
-  dispatch makes the entry stale and the re-prepared commit carries
-  `ACTIVE=1`.
+  dispatch supersedes the modeset (`Superseded(DPMS)`), and nothing is
+  dispatched with the stale target.
 - **Staged scene state:** a failure while building it is a preparation
   failure with nothing changed; promotion runs no fallible call.
 - **Scene retirement:** a mode change promoted while the target's old state

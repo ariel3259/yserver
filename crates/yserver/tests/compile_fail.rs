@@ -162,7 +162,7 @@ fn c0_3aii_topology_payload_is_the_tag() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("TransitionTag") && stderr.contains("mismatched types"),
-        "expected a typed TransitionTag mismatch, got:\n{stderr}"
+        stderr.contains("TopologyWork") && stderr.contains("mismatched types"),
+        "expected a typed TopologyWork mismatch, got:\n{stderr}"
     );
 }

@@ -45,6 +45,10 @@ pub enum StubBehaviour {
     RejectWithRepeatedly(i32),
     AcceptLifecycleWithPendingFence,
     AcceptProbeWith(u64),
+    AcceptProbeAfterCalls {
+        sequence: u64,
+        delay: Duration,
+    },
     RejectProbeWith(i32),
     AcceptCallsWith(u64),
     AcceptCallsWithOutFence(u64),
@@ -99,6 +103,9 @@ impl StubBehaviour {
             Self::RejectWithRepeatedly(errno) => format!("reject-repeatedly:{errno}"),
             Self::AcceptLifecycleWithPendingFence => "accept-lifecycle-pending-fence".to_string(),
             Self::AcceptProbeWith(seq) => format!("accept-probe:{seq}"),
+            Self::AcceptProbeAfterCalls { sequence, delay } => {
+                format!("accept-probe-after-calls:{}:{sequence}", delay.as_millis())
+            }
             Self::RejectProbeWith(errno) => format!("reject-probe:{errno}"),
             Self::AcceptCallsWith(seq) => format!("accept-calls:{seq}"),
             Self::AcceptCallsWithOutFence(seq) => format!("accept-calls-out-fence:{seq}"),
@@ -170,6 +177,12 @@ impl StubBehaviour {
             Some(Self::AcceptLifecycleWithPendingFence)
         } else if let Some(seq_str) = s.strip_prefix("accept-probe:") {
             seq_str.parse::<u64>().ok().map(Self::AcceptProbeWith)
+        } else if let Some(rest) = s.strip_prefix("accept-probe-after-calls:") {
+            let (delay_str, sequence_str) = rest.split_once(':')?;
+            Some(Self::AcceptProbeAfterCalls {
+                sequence: sequence_str.parse::<u64>().ok()?,
+                delay: Duration::from_millis(delay_str.parse::<u64>().ok()?),
+            })
         } else if let Some(errno_str) = s.strip_prefix("reject-probe:") {
             errno_str.parse::<i32>().ok().map(Self::RejectProbeWith)
         } else if let Some(seq_str) = s.strip_prefix("accept-calls-out-fence:") {
@@ -702,6 +715,33 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             let mut sink = [0u8; 1];
             let _ = std::io::Read::read(&mut &control, &mut sink);
             Ok(())
+        }
+        StubBehaviour::AcceptProbeAfterCalls { sequence, delay } => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len == 0 {
+                return Ok(());
+            }
+            let request = protocol::decode_request(&req_buf[..received.len]).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("protocol error: {error:?}"),
+                )
+            })?;
+            let protocol::HostCallRequest::ClockProbe(probe) = request else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "accept-probe-after-calls expected a clock probe first",
+                ));
+            };
+            std::thread::sleep(delay);
+            let reply = protocol::HostCallReply::ProbeAccepted {
+                correlation: probe.correlation,
+                sequence,
+                helper_duration_ns: u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX),
+            };
+            transport::send_frame(&control, &protocol::encode_reply(&reply))?;
+            serve_call_families(&control, sequence, false, None, None)
         }
         StubBehaviour::RejectProbeWith(errno) => {
             let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];

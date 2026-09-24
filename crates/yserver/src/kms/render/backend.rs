@@ -2036,6 +2036,7 @@ pub struct KmsBackend {
     crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>>,
     pending_crtc_config_probes: HashMap<CrtcConfigToken, PendingCrtcConfigProbe>,
     ready_crtc_config_results: HashMap<CrtcConfigToken, io::Result<QualifiedScanoutPlan>>,
+    ready_client_modeset_results: HashMap<CrtcConfigToken, io::Result<bool>>,
     invalidated_crtc_config_probes: HashSet<CrtcConfigToken>,
     ready_crtc_config_announcements: VecDeque<CrtcConfigToken>,
     next_crtc_config_token: u64,
@@ -2046,6 +2047,10 @@ pub struct KmsBackend {
     /// the fd-less DRM fixture. Production always performs live discovery.
     #[cfg(test)]
     crtc_config_discovery_override: Option<crate::platform::drm::Output>,
+    /// Test-only source for Owner client modeset descriptions. Production has
+    /// no corresponding field or path; Task 4 replaces this with preparation.
+    #[cfg(test)]
+    pub(crate) client_modeset_description_source_for_tests: bool,
     /// Direct-mode input-thread control channel. Used by VT release /
     /// acquire to pause and resume the dedicated input thread.
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
@@ -4400,12 +4405,27 @@ impl KmsBackend {
         }
     }
 
-    fn wake_crtc_config_ready(&self) {
+    pub(crate) fn wake_crtc_config_ready(&self) {
         let Some(sender) = self.input_sender.as_ref() else {
             return;
         };
         if let Err(error) = sender.send(yserver_core::core_loop::Message::CrtcConfigReady) {
             log::warn!("failed to wake core for invalidated CRTC configuration: {error}");
+        }
+    }
+
+    pub(crate) fn complete_owner_client_modeset(
+        &mut self,
+        token: CrtcConfigToken,
+        result: io::Result<bool>,
+    ) {
+        if self
+            .ready_client_modeset_results
+            .insert(token, result)
+            .is_none()
+        {
+            self.ready_crtc_config_announcements.push_back(token);
+            self.wake_crtc_config_ready();
         }
     }
 
@@ -4420,6 +4440,13 @@ impl KmsBackend {
             self.next_crtc_config_token = token.0.wrapping_add(1).max(1);
             if !self.pending_crtc_config_probes.contains_key(&token)
                 && !self.ready_crtc_config_results.contains_key(&token)
+                && !self.ready_client_modeset_results.contains_key(&token)
+                && !self.lifecycle_drivers.values().any(|driver| {
+                    driver
+                        .client_modeset
+                        .as_ref()
+                        .is_some_and(|slot| slot.token == token)
+                })
             {
                 return token;
             }
@@ -6916,12 +6943,15 @@ impl KmsBackend {
             crtc_config_probe_executor,
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
+            ready_client_modeset_results: HashMap::new(),
             invalidated_crtc_config_probes: HashSet::new(),
             ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
             crtc_config_topology_epoch: 0,
             #[cfg(test)]
             crtc_config_discovery_override: None,
+            #[cfg(test)]
+            client_modeset_description_source_for_tests: false,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             provider_output_sources: HashMap::new(),
@@ -8259,12 +8289,15 @@ impl KmsBackend {
             crtc_config_probe_executor: None,
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
+            ready_client_modeset_results: HashMap::new(),
             invalidated_crtc_config_probes: HashSet::new(),
             ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
             crtc_config_topology_epoch: 0,
             #[cfg(test)]
             crtc_config_discovery_override: None,
+            #[cfg(test)]
+            client_modeset_description_source_for_tests: false,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             provider_output_sources: HashMap::new(),
@@ -20689,9 +20722,10 @@ impl KmsBackend {
         })
     }
 
-    /// Install one unresolved clock for every currently served Owner CRTC
-    /// when a conductor is activated. This is independent of the RANDR
-    /// projection; a later first projection adopts these same epochs.
+    /// Install unresolved clocks for every currently served Owner CRTC when a
+    /// conductor is activated. Dark CRTCs keep their epoch unresolved until a
+    /// later lighting promotion activates its probe. This is independent of
+    /// the RANDR projection; a later first projection adopts these epochs.
     pub(crate) fn activate_admission_clock_probes(&mut self, device: DrmDeviceKey) {
         if !self.admission_conductors.contains_key(&device) {
             return;
@@ -20803,6 +20837,10 @@ impl KmsBackend {
             else {
                 return;
             };
+            if !self.owner_outputs_powered_on(device) {
+                self.remove_waiting_clock_probe(device, key);
+                continue;
+            }
             let promotion = {
                 let Some(kms_device) = self
                     .platform
@@ -22620,6 +22658,123 @@ impl KmsBackend {
     }
 }
 
+impl KmsBackend {
+    fn begin_owner_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+        output_key: OutputKey,
+    ) -> io::Result<CrtcConfigApply> {
+        if output_key.connector_name != connector {
+            return Err(io::Error::other(format!(
+                "RANDR output {output_id} name mismatch: registry has {}, request resolved {connector}",
+                output_key.connector_name
+            )));
+        }
+
+        // Match Legacy's provider-policy ordering: an enable is refused even
+        // when it would otherwise be idempotent, so a detached split output
+        // can never be silently reasserted.
+        if mode.is_some() && !self.provider_output_source_allows(output_key.device_key) {
+            let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
+            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let selected_source = self.selected_render_provider_endpoint();
+            let source_provider = selected_source
+                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output {connector} belongs to KMS sink provider {} ({sink_endpoint:?}); attach it to selected source provider {} ({selected_source:?}) with RANDR SetProviderOutputSource before enabling it",
+                    sink_provider.map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                    source_provider.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+                ),
+            ));
+        }
+
+        let requested = mode.map_or(ConnectorConfig::Off, |mode| ConnectorConfig::Enabled {
+            mode_w: mode.width,
+            mode_h: mode.height,
+            vrefresh: mode.vrefresh,
+            x,
+            y,
+        });
+        let current = self
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == output_key)
+            .map_or(ConnectorConfig::Off, |layout| ConnectorConfig::Enabled {
+                mode_w: layout.width,
+                mode_h: layout.height,
+                vrefresh: layout.output.picked.vrefresh,
+                x: layout.x,
+                y: layout.y,
+            });
+        if current == requested {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+        if mode.is_some()
+            && self
+                .platform
+                .vk
+                .as_ref()
+                .is_some_and(|vk| vk.is_software_rasterizer())
+            && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
+        {
+            return Err(io::Error::other(format!(
+                "begin_crtc_config: refusing to enable {connector} with a software Vulkan \\
+                 renderer; install a hardware Vulkan driver or set \\
+                 YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
+            )));
+        }
+        if self.vt_state != crate::vt::state::VtState::Active {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
+                    crate::kms::render::admission::ClientModesetRefusal::SeatReleased,
+                ),
+            ));
+        }
+
+        #[cfg(test)]
+        if !self.client_modeset_description_source_for_tests {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
+                    crate::kms::render::admission::ClientModesetRefusal::NotYetSupported,
+                ),
+            ));
+        }
+        #[cfg(not(test))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
+                crate::kms::render::admission::ClientModesetRefusal::NotYetSupported,
+            ),
+        ));
+
+        #[cfg(test)]
+        {
+            let token = self.next_crtc_config_token();
+            self.admission_start_client_modeset(
+                output_key.device_key,
+                token,
+                output_id,
+                connector.to_string(),
+                mode,
+                x,
+                y,
+            )?;
+            Ok(CrtcConfigApply::Pending(token))
+        }
+    }
+}
+
 impl Backend for KmsBackend {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
@@ -24422,6 +24577,16 @@ impl Backend for KmsBackend {
         x: i32,
         y: i32,
     ) -> io::Result<CrtcConfigApply> {
+        if let Some(output_key) = self.output_key_by_id.get(&output_id).cloned()
+            && self
+                .platform
+                .transport_gate(&output_key.device_key)
+                .is_some_and(|gate| {
+                    gate.state() == crate::kms::render::resources::TransportState::Owner
+                })
+        {
+            return self.begin_owner_crtc_config(output_id, connector, mode, x, y, output_key);
+        }
         // Until a worker/helper transport is installed, preserve the existing
         // synchronous backend behavior exactly. Disables and same-device
         // changes also have no disposable PRIME qualification to move away
@@ -24617,12 +24782,27 @@ impl Backend for KmsBackend {
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
         self.remove_crtc_config_ready_announcement(token);
         self.invalidated_crtc_config_probes.remove(&token);
+        if let Some(result) = self.ready_client_modeset_results.remove(&token) {
+            return result;
+        }
         let result = match self.ready_crtc_config_results.remove(&token) {
             Some(result) => result,
             None if self.pending_crtc_config_probes.contains_key(&token) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!("asynchronous CRTC configuration {token:?} is not ready"),
+                ));
+            }
+            None if self.lifecycle_drivers.values().any(|driver| {
+                driver
+                    .client_modeset
+                    .as_ref()
+                    .is_some_and(|slot| slot.token == token)
+            }) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("Owner CRTC configuration {token:?} is not ready"),
                 ));
             }
             None => {
@@ -24745,6 +24925,7 @@ impl Backend for KmsBackend {
     fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
         self.remove_crtc_config_ready_announcement(token);
         self.invalidated_crtc_config_probes.remove(&token);
+        self.ready_client_modeset_results.remove(&token);
         self.pending_crtc_config_probes.remove(&token);
         self.ready_crtc_config_results.remove(&token);
         if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
@@ -59406,6 +59587,9 @@ mod tests {
             .primary_device()
             .expect("fixture device")
             .key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(device))];
+        backend.platform.selected_render_device = Some(render_id);
         backend.platform.devices[0].executor = Some(probe_executor);
         backend.platform.devices[0].owner = Some(
             crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
@@ -61879,6 +62063,1297 @@ mod tests {
         );
     }
 
+    fn c0_3bi_install_fresh_clock_epoch(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::clock::ClockKey {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("Owner output");
+        let hardware_crtc =
+            u32::from(CrtcKey::for_output(&backend.platform.outputs[output_idx]).crtc);
+        bind_test_randr_crtc(backend, output_idx, 0x3b01);
+        let previous = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .expect("fixture clock");
+        assert!(
+            backend
+                .platform
+                .owner_for(device)
+                .expect("Owner")
+                .invalidate_clock(previous)
+                .is_empty(),
+            "no probe is in flight while replacing the fixture epoch"
+        );
+        backend.refresh_present_crtc_clock_epochs();
+        let current = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .expect("fresh production clock epoch");
+        assert!(current.epoch > previous.epoch);
+        current
+    }
+
+    fn c0_3bi_install_unprobed_clock_epoch(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::clock::ClockKey {
+        let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+        let owner = backend.platform.owner_for(device).expect("Owner");
+        let previous = owner
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .expect("fixture clock");
+        assert!(owner.invalidate_clock(previous).is_empty());
+        let (lifecycle, generation) = owner.clock_context();
+        let epoch = owner.next_clock_epoch_after(hardware_crtc, 1);
+        let current = crate::kms::owner::clock::ClockKey {
+            hardware_crtc,
+            epoch,
+        };
+        backend
+            .platform
+            .owner_for(device)
+            .expect("Owner")
+            .install_clock(current, lifecycle, generation)
+            .expect("fresh unresolved clock epoch");
+        current
+    }
+
+    fn c0_3bi_begin_dpms_transition(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        level: u8,
+    ) -> crate::kms::owner::identity::CommitId {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (validation_before, live_before, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        Backend::set_dpms_power(backend, level).expect("Owner DPMS request");
+        let (validation_after, ..) = backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(
+            validation_after.len(),
+            validation_before.len() + 1,
+            "lifecycle validation proceeds without waiting for a dark CRTC clock"
+        );
+        wait_executor_readable_for_tests(backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+
+        let (_, live_after, ..) = backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(
+            live_after.len(),
+            live_before.len() + 1,
+            "validated lifecycle commit is dispatched exactly once"
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("validated DPMS topology must dispatch")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        commit
+    }
+
+    fn c0_3bi_complete_dpms_transition(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        post_completion_executor: crate::kms::executor::test_support::StubBehaviour,
+    ) {
+        let completion = backend.complete_owner_for_tests(0);
+        c0_3aii_replace_owner_executor(backend, post_completion_executor);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+    }
+
+    fn c0_3bi_client_modeset_backend(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> (super::KmsBackend, DrmDeviceKey, u32, String) {
+        c0_3bi_client_modeset_backend_with_output_count(behaviour, 1)
+    }
+
+    fn c0_3bi_client_modeset_backend_with_output_count(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+        output_count: usize,
+    ) -> (super::KmsBackend, DrmDeviceKey, u32, String) {
+        let (mut backend, device) =
+            lifecycle_dpms_backend_with_output_count(behaviour, output_count);
+        let output_key = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.key.device_key == device)
+            .expect("Owner output")
+            .key
+            .clone();
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        backend
+            .output_key_by_id
+            .insert(ids.output_id, output_key.clone());
+        backend.client_modeset_description_source_for_tests = true;
+        (backend, device, ids.output_id, output_key.connector_name)
+    }
+
+    fn c0_3bi_begin_client_modeset(
+        backend: &mut super::KmsBackend,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+    ) -> yserver_core::backend::CrtcConfigToken {
+        let result = Backend::begin_crtc_config(backend, output_id, connector, mode, 0, 0)
+            .expect("Owner client modeset begin");
+        let CrtcConfigApply::Pending(token) = result else {
+            panic!("non-idempotent Owner request must occupy the asynchronous slot")
+        };
+        token
+    }
+
+    #[test]
+    fn c0_3bi_owner_fork_keeps_legacy_validation_order() {
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(92);
+        push_test_device(&mut backend, sink_key);
+        let sink_output = OutputKey::new(sink_key, "DP-9");
+        let output_id = backend.randr_id_alloc.ids_for(&sink_output).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, sink_output.clone());
+        install_admission_owner_gate(&mut backend, sink_key);
+
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        let providers = backend.randr_providers();
+        let source_provider =
+            backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+        let sink_provider = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.set_providers(providers);
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_provider, Some(source_provider))
+                .expect("attach sink to selected render source")
+        );
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_provider, None)
+                .expect("detach inactive sink")
+        );
+        assert!(!backend.provider_output_source_allows(sink_key));
+        backend.client_modeset_description_source_for_tests = true;
+
+        let mode = Some(c0_3bi_changed_mode());
+        let legacy_error = Backend::apply_crtc_config(
+            &mut backend,
+            output_id,
+            &sink_output.connector_name,
+            mode,
+            0,
+            0,
+        )
+        .expect_err("Legacy refuses an enable after provider detach");
+        let owner_error = Backend::begin_crtc_config(
+            &mut backend,
+            output_id,
+            &sink_output.connector_name,
+            mode,
+            0,
+            0,
+        )
+        .expect_err("Owner refuses an enable after provider detach");
+
+        assert_eq!(owner_error.kind(), legacy_error.kind());
+        assert_eq!(owner_error.to_string(), legacy_error.to_string());
+        assert_eq!(
+            owner_error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "provider refusal preserves Legacy's error kind"
+        );
+        assert!(
+            backend
+                .lifecycle_drivers
+                .get(&sink_key)
+                .and_then(|driver| driver.client_modeset.as_ref())
+                .is_none(),
+            "a provider refusal must not take the client-modeset slot"
+        );
+    }
+
+    fn c0_3bi_client_modeset_failure(
+        error: &std::io::Error,
+    ) -> Option<crate::kms::render::admission::ClientModesetFailure> {
+        error
+            .get_ref()
+            .and_then(|source| {
+                source.downcast_ref::<crate::kms::render::admission::ClientModesetFailure>()
+            })
+            .copied()
+    }
+
+    fn c0_3bi_changed_mode() -> yserver_core::backend::ModeSpec {
+        yserver_core::backend::ModeSpec {
+            width: 1024,
+            height: 768,
+            vrefresh: 75,
+        }
+    }
+
+    fn c0_3bi_pending_client_description(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> &crate::kms::owner::build::CommitDescription {
+        backend.lifecycle_drivers[&device]
+            .pending_client_modeset_description_for_tests()
+            .expect("client modeset description is held through TEST_ONLY")
+    }
+
+    fn c0_3bi_description_property(
+        description: &crate::kms::owner::build::CommitDescription,
+        object: u32,
+        property: u32,
+    ) -> Option<u64> {
+        description
+            .objects
+            .iter()
+            .find(|entry| entry.object == object)
+            .and_then(|entry| {
+                entry
+                    .props
+                    .iter()
+                    .find(|(id, _)| *id == property)
+                    .map(|(_, value)| *value)
+            })
+    }
+
+    #[test]
+    fn c0_3bi_description_is_minimal() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend_with_output_count(StubBehaviour::NeverReply, 2);
+        let first_crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let second_crtc = u32::from(backend.platform.outputs[1].output.crtc);
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+        );
+        let description = c0_3bi_pending_client_description(&backend, device);
+
+        assert_eq!(description.objects.len(), 3);
+        assert_eq!(
+            description.objects[0].kind,
+            crate::kms::owner::closure::ObjectKind::Connector
+        );
+        assert_eq!(
+            description.objects[1].kind,
+            crate::kms::owner::closure::ObjectKind::Crtc
+        );
+        assert_eq!(description.objects[1].object, first_crtc);
+        assert_eq!(
+            description.objects[2].kind,
+            crate::kms::owner::closure::ObjectKind::Plane
+        );
+        assert!(
+            !description
+                .objects
+                .iter()
+                .any(|object| object.object == second_crtc),
+            "the other output's connector, CRTC and primary plane stay omitted"
+        );
+        assert_eq!(
+            description
+                .crtc_state
+                .iter()
+                .map(|power| power.crtc_id)
+                .collect::<Vec<_>>(),
+            vec![first_crtc]
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(token)
+        );
+    }
+
+    #[test]
+    fn c0_3bi_modeset_under_dpms_off_is_dark() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        let _off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        backend.client_modeset_description_source_for_tests = true;
+
+        let disabled_key = OutputKey::new(device, "disabled-before");
+        let output_id = backend.randr_id_alloc.ids_for(&disabled_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, disabled_key.clone());
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &disabled_key.connector_name,
+            Some(c0_3bi_changed_mode()),
+        );
+        let description = c0_3bi_pending_client_description(&backend, device);
+        let crtc = description
+            .objects
+            .iter()
+            .find(|object| object.kind == crate::kms::owner::closure::ObjectKind::Crtc)
+            .expect("target CRTC row");
+        assert_eq!(
+            c0_3bi_description_property(description, crtc.object, description.property_ids.active),
+            Some(0),
+            "an output added under global DPMS-off is installed dark"
+        );
+        assert_eq!(
+            description.crtc_state,
+            vec![crate::kms::owner::closure::CrtcPower {
+                crtc_id: crtc.object,
+                old_active: false,
+                new_active: false,
+            }]
+        );
+        let closure = crate::kms::owner::closure::AtomicCrtcClosure::compute(
+            &description.objects,
+            &description.crtc_state,
+            &description.property_ids,
+            false,
+            &[],
+        )
+        .expect("dark enable has a valid closure");
+        assert!(
+            closure.expected_completion().is_empty(),
+            "inactive-to-inactive target is outside ExpectedCompletionCrtcs"
+        );
+        let staged = backend.lifecycle_drivers[&device]
+            .pending_client_modeset_projection_for_tests()
+            .expect("the DPMS projection is staged before validation");
+        assert_eq!(staged.output, disabled_key);
+        assert_eq!(staged.level, 3);
+        assert_eq!(staged.target, crate::kms::owner::lifecycle::DpmsTarget::Off);
+        assert_eq!(staged.epoch, backend.lifecycle_coordinator.dpms_epoch());
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(token)
+        );
+    }
+
+    #[test]
+    fn c0_3bi_dpms_change_after_staging_supersedes() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        let _off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        backend.client_modeset_description_source_for_tests = true;
+
+        let disabled_key = OutputKey::new(device, "disabled-before");
+        let output_id = backend.randr_id_alloc.ids_for(&disabled_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, disabled_key.clone());
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::AcceptAfter(std::time::Duration::from_millis(400)),
+        );
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &disabled_key.connector_name,
+            Some(c0_3bi_changed_mode()),
+        );
+        let staged = backend.lifecycle_drivers[&device]
+            .pending_client_modeset_projection_for_tests()
+            .expect("off projection staged before TEST_ONLY reply");
+        assert_eq!(staged.target, crate::kms::owner::lifecycle::DpmsTarget::Off);
+        assert_eq!(
+            c0_3bi_description_property(
+                c0_3bi_pending_client_description(&backend, device),
+                u32::from(backend.platform.outputs[0].output.crtc),
+                21,
+            ),
+            Some(0)
+        );
+
+        Backend::set_dpms_power(&mut backend, 0).expect("DPMS-on supersedes staged modeset");
+        let (validation_sends, live_sends) =
+            backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation_sends.len(), 1);
+        assert!(
+            live_sends.is_empty(),
+            "no stale-target live modeset was sent"
+        );
+
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let (validation_sends, live_sends) =
+            backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation_sends.len(), 1);
+        assert!(
+            live_sends.is_empty(),
+            "a late TEST_ONLY success cannot dispatch the staged dark target"
+        );
+        assert!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("superseded mode result")
+                .to_string()
+                .contains("Superseded(DPMS)")
+        );
+        let (validation_sends, live_sends) =
+            backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation_sends.len(), 1);
+        assert!(live_sends.is_empty(), "late TEST_ONLY success stays stale");
+    }
+
+    #[test]
+    fn c0_3bi_disable_description() {
+        use crate::kms::{executor::test_support::StubBehaviour, owner::closure::ObjectKind};
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, None);
+        let description = c0_3bi_pending_client_description(&backend, device);
+        let connector_row = description
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Connector)
+            .expect("target connector row");
+        let crtc_row = description
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Crtc)
+            .expect("target CRTC row");
+        let plane_row = description
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Plane)
+            .expect("target primary plane row");
+        assert_eq!(connector_row.props, vec![(23, 0)]);
+        assert_eq!(crtc_row.props, vec![(24, 0), (21, 0)]);
+        assert_eq!(plane_row.props, vec![(19, 0), (20, 0)]);
+        assert_eq!(
+            description.crtc_state,
+            vec![crate::kms::owner::closure::CrtcPower {
+                crtc_id: crtc_row.object,
+                old_active: true,
+                new_active: false,
+            }]
+        );
+        let closure = crate::kms::owner::closure::AtomicCrtcClosure::compute(
+            &description.objects,
+            &description.crtc_state,
+            &description.property_ids,
+            false,
+            &[],
+        )
+        .expect("disable closure");
+        assert_eq!(closure.expected_completion(), &[crtc_row.object]);
+    }
+
+    #[test]
+    fn c0_3bi_refresh_only_change_is_a_modeset() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        let refresh_only = yserver_core::backend::ModeSpec {
+            width: backend.platform.outputs[0].width,
+            height: backend.platform.outputs[0].height,
+            vrefresh: backend.platform.outputs[0].output.picked.vrefresh + 15,
+        };
+        let token =
+            c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(refresh_only));
+        let description = c0_3bi_pending_client_description(&backend, device);
+        let crtc = description
+            .objects
+            .iter()
+            .find(|object| object.kind == crate::kms::owner::closure::ObjectKind::Crtc)
+            .expect("modeset CRTC row");
+        assert_eq!(
+            c0_3bi_description_property(description, crtc.object, 24),
+            Some(0x7300_0001),
+            "the different refresh receives a new MODE_ID blob"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(token),
+            "same dimensions with a different refresh are not idempotent"
+        );
+    }
+
+    #[test]
+    fn c0_3bi_topology_work_is_typed() {
+        use crate::kms::owner::{
+            admission::{Admission, Admitted, ReadinessSnapshot, Tier},
+            lifecycle::{ClientModesetTag, LifecycleTransitionId, TopologyWork, TransitionTag},
+        };
+
+        let (mut backend, device, output_id, connector) = c0_3bi_client_modeset_backend(
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+        );
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+        );
+        let client_tag = backend.lifecycle_drivers[&device]
+            .client_modeset
+            .as_ref()
+            .expect("client modeset slot")
+            .tag;
+        assert!(backend.client_modeset_tag_current(device, client_tag));
+        let stale_generation = ClientModesetTag {
+            topology_generation: client_tag.topology_generation + 1,
+            ..client_tag
+        };
+        assert!(
+            !backend.client_modeset_tag_current(device, stale_generation),
+            "the result boundary checks the client's captured topology generation"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .unwrap()
+                .token,
+            token
+        );
+
+        let transition_work = TopologyWork::Transition(TransitionTag::new(
+            client_tag.incarnation,
+            client_tag.lifecycle_epoch,
+            LifecycleTransitionId::from_raw(99),
+        ));
+        let client_work = TopologyWork::ClientModeset(client_tag);
+        let snapshot = ReadinessSnapshot::new(0, 0);
+        let mut transition_admission = Admission::new();
+        transition_admission
+            .request_topology(transition_work)
+            .unwrap();
+        let transition_decision = transition_admission.decide(&snapshot).unwrap();
+        assert_eq!(transition_decision.tier, Tier::Topology);
+        assert_eq!(
+            transition_decision.admitted,
+            Admitted::Topology {
+                work: transition_work,
+            }
+        );
+
+        let mut client_admission = Admission::new();
+        client_admission.request_topology(client_work).unwrap();
+        let client_decision = client_admission.decide(&snapshot).unwrap();
+        assert_eq!(client_decision.tier, Tier::Topology);
+        assert_eq!(
+            client_decision.admitted,
+            Admitted::Topology { work: client_work }
+        );
+        let client_is_transition = matches!(
+            client_decision.admitted,
+            Admitted::Topology {
+                work: TopologyWork::Transition(_)
+            }
+        );
+        assert!(!client_is_transition, "client results are variant-matched");
+        assert_eq!(client_tag.modeset.get(), 1);
+    }
+
+    #[test]
+    fn c0_3bi_modeset_waits_for_the_active_transition() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::{clock::ProbeState, lifecycle::LifecycleKind},
+        };
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::AcceptProbeAfterCalls {
+            sequence: 303,
+            delay: std::time::Duration::from_millis(250),
+        });
+        let clock_key = c0_3bi_install_unprobed_clock_epoch(&mut backend, device);
+        let (dpms_validation_before, dpms_live_before, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+
+        Backend::set_dpms_power(&mut backend, 3).expect("begin DPMS-off transition");
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .map(|transition| transition.kind),
+            Some(LifecycleKind::DPMS),
+            "the DPMS-off transition is active while it waits for the lit CRTC clock"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats().0,
+            dpms_validation_before,
+            "DPMS validation waits for the active CRTC's clock"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats().1,
+            dpms_live_before,
+            "no DPMS commit occupies the Owner slot yet"
+        );
+
+        backend.activate_admission_clock_probes(device);
+        assert!(matches!(
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.clock(clock_key))
+                .map(|clock| clock.probe),
+            Some(ProbeState::InFlight(_))
+        ));
+        assert!(
+            backend.device_owner_for_tests(0).live_record().is_none(),
+            "a held clock probe is not a modeset or DPMS commit in the Owner slot"
+        );
+
+        let disabled_key = OutputKey::new(device, "disabled-before");
+        let output_id = backend.randr_id_alloc.ids_for(&disabled_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, disabled_key.clone());
+        backend.client_modeset_description_source_for_tests = true;
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &disabled_key.connector_name,
+            Some(c0_3bi_changed_mode()),
+        );
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert!(
+            validation.is_empty(),
+            "active transition blocks modeset TEST_ONLY"
+        );
+        assert!(
+            live.is_empty(),
+            "active transition blocks modeset live dispatch"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.phase),
+            Some(crate::kms::render::admission::ClientModesetPhase::Queued)
+        );
+        assert_eq!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("modeset remains pending during the transition")
+                .kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a modeset begun during DPMS is pending, not failed"
+        );
+        // The stub's clock reply is ready, but it has not crossed the backend
+        // result boundary until this production executor-readable path runs.
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        for _ in 0..4 {
+            let (_, live_sends, ..) = backend.lifecycle_drivers[&device].topology_test_stats();
+            if live_sends.len() > dpms_live_before.len() {
+                break;
+            }
+            wait_lifecycle_executor_readable(&backend, device);
+            Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        }
+        let (dpms_validation, dpms_live, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(dpms_validation.len(), dpms_validation_before.len() + 1);
+        assert_eq!(dpms_live.len(), dpms_live_before.len() + 1);
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .is_empty(),
+            "the DPMS commit dispatches before modeset validation"
+        );
+
+        let dpms_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("DPMS-off commit dispatched after clock reply")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, dpms_commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(
+            backend.device_owner_for_tests(0).slot().is_idle(),
+            "synthetic DPMS completion retires its commit before routing: {:?}; live={:?}",
+            backend.device_owner_for_tests(0).slot(),
+            backend.device_owner_for_tests(0).live_record(),
+        );
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::Scripted(
+                crate::kms::executor::test_support::ScriptedReply::Accepted { mask: 0, fds: 0 },
+            ),
+        );
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .is_none(),
+            "the DPMS result crossed its boundary"
+        );
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(
+            validation.len(),
+            1,
+            "modeset starts after the DPMS boundary; validation={validation:?}, phase={:?}",
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.phase),
+        );
+        assert!(live.is_empty(), "modeset TEST_ONLY has not completed yet");
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(token)
+        );
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation.len(), 1, "modeset validation was sent once");
+        assert_eq!(
+            live.len(),
+            1,
+            "accepted validation dispatched the live modeset"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.phase),
+            Some(crate::kms::render::admission::ClientModesetPhase::Dispatched)
+        );
+
+        let modeset_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("client modeset live record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, modeset_commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(backend.lifecycle_drivers[&device].client_modeset.is_none());
+        assert!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect("client modeset result announced after completion")
+        );
+    }
+
+    #[test]
+    fn c0_3bi_rec4_supersedes_before_dispatch() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        let _dpms_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .is_empty()
+        );
+
+        Backend::set_dpms_power(&mut backend, 0).expect("new REC-4 DPMS request");
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .transition()
+                .is_some()
+        );
+        assert!(backend.lifecycle_drivers[&device].client_modeset.is_none());
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert!(
+            validation.is_empty(),
+            "superseded queued work sent no TEST_ONLY"
+        );
+        assert!(
+            live.is_empty(),
+            "superseded queued work sent no live commit"
+        );
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("superseded client request returns Failed");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(
+                crate::kms::render::admission::ClientModesetFailure::Superseded(
+                    crate::kms::owner::lifecycle::LifecycleKind::DPMS
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn c0_3bi_rec4_waits_after_dispatch() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }));
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+        );
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation.len(), 1);
+        assert_eq!(live.len(), 1, "TEST_ONLY passed and live dispatch started");
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.phase),
+            Some(crate::kms::render::admission::ClientModesetPhase::Dispatched)
+        );
+
+        Backend::set_dpms_power(&mut backend, 3).expect("REC-4 arrives after dispatch");
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .transition()
+                .is_none()
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.phase),
+            Some(crate::kms::render::admission::ClientModesetPhase::Dispatched),
+            "the dispatched slot remains owned through its result boundary"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1,
+            live
+        );
+
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("client modeset live record")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        c0_3aii_replace_owner_executor(&mut backend, StubBehaviour::NeverReply);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(backend.lifecycle_drivers[&device].client_modeset.is_none());
+        assert!(
+            Backend::finish_crtc_config(&mut backend, token).expect("client modeset completed")
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .map(|transition| transition.kind),
+            Some(crate::kms::owner::lifecycle::LifecycleKind::DPMS),
+            "DPMS transition starts after the modeset result crossed the boundary"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .0
+                .len(),
+            1,
+            "the waiting DPMS transition sends its first validation only afterward"
+        );
+    }
+
+    #[test]
+    fn c0_3bi_seat_released_refuses_every_form() {
+        use crate::vt::state::VtState;
+
+        let (mut backend, device, active_id, active_connector) = c0_3bi_client_modeset_backend(
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+        );
+        let disabled_key = OutputKey::new(device, "disabled-test");
+        let disabled_ids = backend.randr_id_alloc.ids_for(&disabled_key);
+        backend
+            .output_key_by_id
+            .insert(disabled_ids.output_id, disabled_key);
+        backend.vt_state = VtState::Suspended;
+
+        let assert_seat_refused = |error: &std::io::Error| {
+            assert_eq!(
+                c0_3bi_client_modeset_failure(error),
+                Some(
+                    crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
+                        crate::kms::render::admission::ClientModesetRefusal::SeatReleased,
+                    )
+                )
+            );
+        };
+        let enable_error = Backend::begin_crtc_config(
+            &mut backend,
+            disabled_ids.output_id,
+            "disabled-test",
+            Some(c0_3bi_changed_mode()),
+            0,
+            0,
+        )
+        .expect_err("enable refuses released seat");
+        assert_seat_refused(&enable_error);
+
+        let mode_change_error = Backend::begin_crtc_config(
+            &mut backend,
+            active_id,
+            &active_connector,
+            Some(c0_3bi_changed_mode()),
+            0,
+            0,
+        )
+        .expect_err("mode change refuses released seat");
+        assert_seat_refused(&mode_change_error);
+
+        let disable_error =
+            Backend::begin_crtc_config(&mut backend, active_id, &active_connector, None, 0, 0)
+                .expect_err("disable refuses released seat");
+        assert_seat_refused(&disable_error);
+
+        let idempotent = Backend::begin_crtc_config(
+            &mut backend,
+            disabled_ids.output_id,
+            "disabled-test",
+            None,
+            0,
+            0,
+        )
+        .expect("idempotent request retains Legacy result");
+        assert_eq!(idempotent, CrtcConfigApply::Applied(false));
+
+        assert!(backend.lifecycle_drivers[&device].client_modeset.is_none());
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert!(validation.is_empty());
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn c0_3bi_second_modeset_on_occupied_slot() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        let first = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+        );
+        let first_tag = backend.lifecycle_drivers[&device]
+            .client_modeset
+            .as_ref()
+            .expect("first client modeset owns slot")
+            .tag;
+        let second_error = Backend::begin_crtc_config(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+            0,
+            0,
+        )
+        .expect_err("second client request is refused");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&second_error),
+            Some(
+                crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
+                    crate::kms::render::admission::ClientModesetRefusal::SlotOccupied,
+                )
+            )
+        );
+        let slot = backend.lifecycle_drivers[&device]
+            .client_modeset
+            .as_ref()
+            .expect("first client modeset remains in slot");
+        assert_eq!(slot.tag, first_tag);
+        assert_eq!(slot.token, first);
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0,
+            vec![first_tag],
+            "second begin sent nothing"
+        );
+    }
+
+    #[test]
+    fn c0_3bi_dark_crtc_needs_no_clock_to_light() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        c0_3aii_apply_dpms_transition(&mut backend, device, 3);
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&false)
+        );
+
+        let key = c0_3bi_install_fresh_clock_epoch(&mut backend, device);
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::Unresolved);
+        assert_eq!(clock.probe, ProbeState::NotStarted);
+        assert!(
+            !backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .has_clock_probe_in_flight()
+        );
+
+        let commit = c0_3bi_begin_dpms_transition(&mut backend, device, 0);
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::Unresolved);
+        assert_eq!(clock.probe, ProbeState::NotStarted);
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .map(|record| record.commit_id()),
+            Some(commit),
+            "the dark-to-lit lifecycle commit is live before any clock probe"
+        );
+
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn c0_3bi_lit_crtc_still_waits_for_its_clock() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::AcceptCallsWith(303));
+        let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+        let key = c0_3bi_install_unprobed_clock_epoch(&mut backend, device);
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(key)
+                .unwrap()
+                .probe,
+            ProbeState::NotStarted
+        );
+        assert!(
+            !backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .has_clock_probe_in_flight()
+        );
+
+        let (validation_before, live_before, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS off request");
+        let tag = lifecycle_test_tag(&backend, device);
+        let (validation_waiting, live_waiting, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(validation_waiting, validation_before);
+        assert_eq!(live_waiting, live_before);
+
+        backend.activate_admission_clock_probes(device);
+        assert!(matches!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(key)
+                .unwrap()
+                .probe,
+            ProbeState::InFlight(_)
+        ));
+        let (validation_waiting, live_waiting, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(validation_waiting, validation_before);
+        assert_eq!(live_waiting, live_before);
+
+        for _ in 0..4 {
+            let (_, live_sends, ..) = backend.lifecycle_drivers[&device].topology_test_stats();
+            if live_sends.iter().filter(|sent| **sent == tag).count() == 1 {
+                break;
+            }
+            wait_lifecycle_executor_readable(&backend, device);
+            Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        }
+
+        let (validation_sends, live_sends, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(
+            validation_sends.iter().filter(|sent| **sent == tag).count(),
+            1
+        );
+        assert_eq!(live_sends.iter().filter(|sent| **sent == tag).count(), 1);
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        let current_key = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .unwrap();
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(current_key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::KernelSequence);
+        assert_eq!(clock.probe, ProbeState::Succeeded);
+    }
+
+    #[test]
+    fn c0_3bi_no_probe_to_an_inactive_crtc() {
+        use crate::kms::{
+            executor::{ObservedOutcome, test_support::StubBehaviour},
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        c0_3aii_apply_dpms_transition(&mut backend, device, 3);
+        let _ = backend.drained_host_call_events_for_tests();
+        let key = c0_3bi_install_fresh_clock_epoch(&mut backend, device);
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::Unresolved);
+        assert_eq!(clock.probe, ProbeState::NotStarted);
+        assert!(
+            !backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .has_clock_probe_in_flight()
+        );
+        assert!(backend.drained_host_call_events_for_tests().is_empty());
+
+        let commit = c0_3bi_begin_dpms_transition(&mut backend, device, 0);
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(key)
+                .unwrap()
+                .probe,
+            ProbeState::NotStarted,
+            "the unresolved epoch remains unprobed until DPMS-on completes"
+        );
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .map(|record| record.commit_id()),
+            Some(commit)
+        );
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::AcceptProbeWith(304));
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+        assert!(matches!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(key)
+                .unwrap()
+                .probe,
+            ProbeState::InFlight(_)
+        ));
+
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let observations = backend.drained_host_call_events_for_tests();
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| matches!(
+                    observation.kind,
+                    ObservedOutcome::ProbeAccepted { sequence: 304 }
+                ))
+                .count(),
+            1,
+            "DPMS-on completion sends exactly one probe for the newly lit epoch"
+        );
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::KernelSequence);
+        assert_eq!(clock.probe, ProbeState::Succeeded);
+    }
+
     fn c0_3aii_compose_from_scene(backend: &mut super::KmsBackend, output_idx: usize) {
         backend.scene.mark_scene_structure_damage_rect(
             output_idx,
@@ -62637,7 +64112,7 @@ mod tests {
         assert!(live_sends.is_empty(), "DPMS waits before commit dispatch");
         assert_eq!(
             backend.admission_conductors[&device].admission.topology(),
-            Some(tag),
+            Some(crate::kms::owner::lifecycle::TopologyWork::Transition(tag)),
             "the lifecycle topology remains queued"
         );
         assert_eq!(c0_2b_dpms_disposition(&backend, device), None);
@@ -63071,7 +64546,10 @@ mod tests {
             .admission_conductors
             .get(&device)
             .expect("Owner conductor");
-        assert_eq!(conductor.admission.topology(), Some(tag));
+        assert_eq!(
+            conductor.admission.topology(),
+            Some(crate::kms::owner::lifecycle::TopologyWork::Transition(tag))
+        );
         assert!(conductor.admission.is_locked());
         assert_eq!(
             backend

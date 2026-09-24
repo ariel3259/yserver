@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{AdmissionError, CrtcId};
 use crate::kms::owner::{
-    admission::bound::MaintenanceBound, identity::IncarnationId, lifecycle::TransitionTag,
+    admission::bound::MaintenanceBound, identity::IncarnationId, lifecycle::TopologyWork,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -78,7 +78,7 @@ pub struct Admission {
     pub(super) composed: BTreeMap<CrtcId, ComposedIntent>,
     pub(super) direct: Option<QueuedDirect>,
     pub(super) unflip: Option<UnflipBarrier>,
-    pub(super) topology: Option<TransitionTag<IncarnationId>>,
+    pub(super) topology: Option<TopologyWork<IncarnationId>>,
     pub(super) maintenance_slots: BTreeMap<MaintenanceKey, MaintenanceIntent>,
     pub(super) maintenance_current: BTreeMap<MaintenanceKey, u64>,
     pub(super) maintenance_submitted: BTreeMap<MaintenanceKey, SubmittedMaintenance>,
@@ -184,16 +184,16 @@ impl Admission {
     /// lifecycle driver validates the tag again at both executor boundaries.
     pub fn request_topology(
         &mut self,
-        tag: TransitionTag<IncarnationId>,
+        work: TopologyWork<IncarnationId>,
     ) -> Result<(), AdmissionError> {
-        self.topology = Some(tag);
+        self.topology = Some(work);
         Ok(())
     }
 
     /// Withdraw only the matching pre-submit lifecycle intent. A stale
     /// cancellation must not erase a newer transition's queued topology work.
-    pub fn cancel_topology(&mut self, tag: TransitionTag<IncarnationId>) -> bool {
-        if self.topology == Some(tag) {
+    pub fn cancel_topology(&mut self, work: TopologyWork<IncarnationId>) -> bool {
+        if self.topology == Some(work) {
             self.topology = None;
             true
         } else {
@@ -384,7 +384,7 @@ impl Admission {
         self.unflip.as_ref()
     }
 
-    pub fn topology(&self) -> Option<TransitionTag<IncarnationId>> {
+    pub fn topology(&self) -> Option<TopologyWork<IncarnationId>> {
         self.topology
     }
 

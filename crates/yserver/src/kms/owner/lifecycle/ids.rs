@@ -61,6 +61,22 @@ impl LifecycleTransitionId {
     }
 }
 
+/// Identifies one client modeset occupying an Owner device's class-1 slot.
+/// The lifecycle driver allocates these monotonically with checked
+/// exhaustion; the identity is never reused within that driver.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ClientModesetId(u64);
+
+impl ClientModesetId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Monotonic per-probe identity within an incarnation, carried by the
 /// clock-probe correlation tuple (spec 6.1).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]

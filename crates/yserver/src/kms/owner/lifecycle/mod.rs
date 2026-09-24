@@ -20,7 +20,7 @@ pub use desired::{
     DesiredField, DesiredIntent, DispositionChange, LifecycleDesired, OutputProjection,
     OutputProjectionRemoval, ProjectionResult, Representative, SeatTarget, TopologyChangeClass,
 };
-pub use ids::{ClockProbeId, LifecycleEpochId, LifecycleTransitionId};
+pub use ids::{ClientModesetId, ClockProbeId, LifecycleEpochId, LifecycleTransitionId};
 pub use recovery::{
     CompletionUnknownRow, CompletionUnknownRowKind, DpmsTarget, EventFate, IncidentInvalidation,
     IncidentOrigin, IncidentResolution, IncidentSeed, LogicalUnknownActions, PhysicalBarriers,
@@ -29,6 +29,6 @@ pub use recovery::{
     RecoveryWinner, TableFOutcome, TableUOutcome, dpms_target_for_level, table_f, table_u,
 };
 pub use values::{
-    DeviceLifecycleState, Disposition, InvalidationReason, LifecycleEventId, LifecycleKind,
-    Prerequisite, RecoveryId, TransitionTag, WorkTag,
+    ClientModesetTag, DeviceLifecycleState, Disposition, InvalidationReason, LifecycleEventId,
+    LifecycleKind, Prerequisite, RecoveryId, TopologyWork, TransitionTag, WorkTag,
 };

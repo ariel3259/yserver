@@ -96,6 +96,7 @@ pub struct AtomicCrtcClosure {
     /// show these, so the re-scan subtracts them before demanding equality.
     old_binding_only: Vec<u32>,
     expected_completion: Vec<u32>,
+    old_active: Vec<u32>,
     kernel_event: Vec<u32>,
     present_event: Vec<u32>,
     new_active: BTreeMap<u32, bool>,
@@ -112,6 +113,10 @@ impl AtomicCrtcClosure {
 
     pub fn expected_completion(&self) -> &[u32] {
         &self.expected_completion
+    }
+
+    pub fn old_active(&self) -> &[u32] {
+        &self.old_active
     }
 
     pub fn kernel_event(&self) -> &[u32] {
@@ -194,10 +199,14 @@ impl AtomicCrtcClosure {
         }
 
         let mut expected_completion = Vec::new();
+        let mut old_active = Vec::new();
         let mut new_active = BTreeMap::new();
         for id in &closure {
             let row = *power.get(id).ok_or(ClosureError::UnknownPower(*id))?;
             new_active.insert(*id, row.new_active);
+            if row.old_active {
+                old_active.push(*id);
+            }
             if row.old_active || row.new_active {
                 expected_completion.push(*id);
             } else if page_flip_event {
@@ -226,6 +235,7 @@ impl AtomicCrtcClosure {
             closure,
             old_binding_only,
             expected_completion,
+            old_active,
             kernel_event,
             present_event,
             new_active,
