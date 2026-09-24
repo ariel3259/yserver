@@ -2777,6 +2777,10 @@ pub struct PlatformBackend {
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
     #[cfg(test)]
     pub(crate) dpms_output_calls_for_tests: Option<Vec<(bool, Vec<OutputKey>)>>,
+    /// Records synchronous connector modesets without issuing a DRM commit.
+    /// Used by differential tests that exercise the production Legacy path.
+    #[cfg(test)]
+    pub(crate) modeset_calls_for_tests: Option<Vec<(OutputKey, u32)>>,
     next_scanout_render_job_id: u64,
     pub owner_completion_poller: crate::kms::render::completion_poller::CompletionPoller,
     pub owner_completion_detached: bool,
@@ -3591,6 +3595,8 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             #[cfg(test)]
             dpms_output_calls_for_tests: None,
+            #[cfg(test)]
+            modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
             owner_completion_detached: false,
@@ -3738,6 +3744,8 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             #[cfg(test)]
             dpms_output_calls_for_tests: None,
+            #[cfg(test)]
+            modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
             owner_completion_detached: false,
@@ -8098,14 +8106,34 @@ impl PlatformBackend {
         };
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
-        if new_pool_committed_framebuffer.is_none()
-            && let Err(e) = crate::drm::modeset::commit_modeset(
+        #[cfg(test)]
+        let commit_result = if new_pool_committed_framebuffer.is_none() {
+            if let Some(calls) = self.modeset_calls_for_tests.as_mut() {
+                calls.push((output_key.clone(), u32::from(fb_for_commit)));
+                Ok(())
+            } else {
+                crate::drm::modeset::commit_modeset(
+                    &device,
+                    &output,
+                    fb_for_commit,
+                    legacy_write_permitted,
+                )
+            }
+        } else {
+            Ok(())
+        };
+        #[cfg(not(test))]
+        let commit_result = if new_pool_committed_framebuffer.is_none() {
+            crate::drm::modeset::commit_modeset(
                 &device,
                 &output,
                 fb_for_commit,
                 legacy_write_permitted,
             )
-        {
+        } else {
+            Ok(())
+        };
+        if let Err(e) = commit_result {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
                 mode_spec.width,
