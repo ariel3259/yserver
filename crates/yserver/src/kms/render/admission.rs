@@ -4633,6 +4633,7 @@ impl KmsBackend {
         let old_extent = (self.platform.fb_w, self.platform.fb_h);
         let mut lit_clock = None;
         let mut staged_projection_for_promotion = None;
+        let mut retired_instance = None;
 
         if let Some(mode) = slot.mode {
             let output = prepared_set
@@ -4676,6 +4677,7 @@ impl KmsBackend {
                 .iter()
                 .position(|output| output.key == key)
             {
+                retired_instance = Some(self.platform.output_instance_ids[output_idx]);
                 let retired_pool = self.platform.scanout_pools[output_idx]
                     .take()
                     .expect("a kept Owner output has its installed scanout pool");
@@ -4764,6 +4766,12 @@ impl KmsBackend {
                 .iter()
                 .position(|output| output.key == key)
                 .expect("disable promotion retains its bound output until the boundary");
+            retired_instance = Some(self.platform.output_instance_ids[output_idx]);
+            self.commit_consumer.retire_current_for_crtc(
+                crate::kms::render::platform::CrtcKey::for_output(
+                    &self.platform.outputs[output_idx],
+                ),
+            );
             let retired_pool = self.platform.scanout_pools[output_idx]
                 .take()
                 .expect("a disabled Owner output has its installed scanout pool");
@@ -4846,6 +4854,9 @@ impl KmsBackend {
 
         self.scene
             .promote_output_identity_map(&self.platform, identity_map);
+        if let Some(instance) = retired_instance {
+            self.scene.retire_current_owner_buffer_in_bundle(instance);
+        }
         #[cfg(test)]
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.client_modeset_promotion_steps.push(Step::Scene);

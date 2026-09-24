@@ -127,6 +127,10 @@ impl CompositePoolRing {
         self.tracker.release(slot);
     }
 
+    pub(crate) fn is_idle(&self) -> bool {
+        self.tracker.in_use.iter().all(|in_use| !in_use)
+    }
+
     /// Return the raw `VkDescriptorPool` handle for `slot`. Caller
     /// uses this with `vkAllocateDescriptorSets` against the shared
     /// `descriptor_set_layout`.

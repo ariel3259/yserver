@@ -2602,6 +2602,18 @@ fn restore_primary_output_after_rebuild(
 }
 
 impl KmsBackend {
+    fn service_resource_releases_after_retired_outputs(&mut self) {
+        // Dropping a drained pool releases its Retain leases. Scanout payloads
+        // also own DRM aliases, so reap those newly ready entries through the
+        // registry after the scene has dropped the bundle.
+        if let (Some(service), Some(registry)) = (
+            self.resource_service.as_mut(),
+            self.drm_cleanup_registry.as_mut(),
+        ) {
+            let _ = service.service_ready_with_registry(registry);
+        }
+    }
+
     fn offer_scene_composed_generations(&mut self) {
         let offers = self.scene.take_owner_composed_offers();
         let mut devices = Vec::new();
@@ -23419,6 +23431,7 @@ impl Backend for KmsBackend {
         self.service_direct_framebuffer_edges(now, true);
         self.scene
             .service_retired_output_bundles(&mut self.platform, self.resource_service.as_ref());
+        self.service_resource_releases_after_retired_outputs();
     }
 
     fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -23433,6 +23446,7 @@ impl Backend for KmsBackend {
         self.service_direct_framebuffer_edges(now, true);
         self.scene
             .service_retired_output_bundles(&mut self.platform, self.resource_service.as_ref());
+        self.service_resource_releases_after_retired_outputs();
     }
 
     fn on_executor_readable(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -63382,11 +63396,11 @@ mod tests {
                 false,
             )
             .expect("environmental skip: no live Vulkan modeset fixture");
-        let key = OutputKey::new(device, connector.clone());
         let instance = backend
             .scene
             .output_instance_id_for_tests(0)
             .expect("only output instance");
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
         let old_ring_before = backend
             .scene
             .tick_diagnostics_for_tests(0)
@@ -63444,22 +63458,234 @@ mod tests {
             backend
                 .scene
                 .retired_output_release_count_for_tests(instance),
-            Some(0)
-        );
-        assert_eq!(
-            backend
-                .scene
-                .retired_output_pool_occupancy_for_tests(instance),
-            Some(old_ring_before)
+            None,
+            "the signalled fence drains and destroys the fully proven bundle"
         );
         assert!(
             backend.scene.scene_structure_dirty_for_tests(),
             "no composition tick ran while the device had no output"
         );
         assert_eq!(backend.platform.outputs.len(), 0);
-        assert_eq!(
-            backend.scene.retired_output_key_for_tests(instance),
-            Some(key)
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 0);
+        assert!(
+            !backend
+                .scene
+                .retired_output_has_instance_for_tests(instance),
+            "a signalled deferred release lets the fully proven bundle leave the list"
+        );
+        for _ in 0..3 {
+            backend.before_block();
+        }
+        assert!(old_keys.iter().all(|key| {
+            !backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+        assert_eq!(backend.scene.retired_output_key_for_tests(instance), None);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a2_bundle_is_destroyed_after_its_proofs_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output instance");
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(
+                &mut backend,
+                device,
+                token,
+                Some(StubBehaviour::NeverReply),
+            )
+            .expect("mode change completion result")
+        );
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(instance)
+        );
+        assert!(
+            old_keys.iter().all(|key| backend
+                .resource_service()
+                .is_some_and(|service| !service.has_pending_obligations(key))),
+            "Completed has discharged the old pool's KMS proof obligations"
+        );
+        for _ in 0..4 {
+            backend.before_block();
+        }
+
+        assert!(
+            !backend
+                .scene
+                .retired_output_has_instance_for_tests(instance),
+            "the retired scene and pool leave the list after GPU and KMS proofs"
+        );
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 0);
+        assert!(old_keys.iter().all(|key| {
+            !backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a2_disable_releases_the_current_front_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output instance");
+        let old_front = c0_3bi_scanout_allocation_keys(&backend, device, &connector)[0];
+        let lease = backend
+            .resource_service_mut()
+            .expect("resource service")
+            .reserve(old_front, crate::kms::render::resources::UseKind::Retain)
+            .expect("current front allocation lease");
+        let output = &backend.platform.outputs[0];
+        let member = crate::kms::render::resources::GroupMember::new(
+            crate::kms::render::platform::CrtcKey::for_output(output),
+            backend
+                .platform
+                .owner_ref(device)
+                .expect("Owner device")
+                .topology_generation(),
+            1,
+        );
+        backend.commit_consumer.current_resources.push(
+            crate::kms::render::resources::CommitResources::new(
+                vec![lease],
+                None,
+                None,
+                None,
+                vec![member],
+                Vec::new(),
+            ),
+        );
+
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, None);
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(
+                &mut backend,
+                device,
+                token,
+                Some(StubBehaviour::NeverReply),
+            )
+            .expect("disable completion result")
+        );
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .all(|resources| resources
+                    .allocations
+                    .iter()
+                    .all(|lease| lease.key() != old_front)),
+            "a completed disable removes the CRTC's old resources from Current"
+        );
+
+        for _ in 0..4 {
+            backend.before_block();
+        }
+        assert!(
+            !backend
+                .resource_service()
+                .is_some_and(|service| service.contains(&old_front)),
+            "the completed disable and its proofs release the old front allocation"
+        );
+        assert!(
+            !backend
+                .scene
+                .retired_output_has_instance_for_tests(instance)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a2_unproven_bundle_is_kept_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let output = &backend.platform.outputs[0];
+        let device = output.key.device_key;
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("output instance");
+        let managed_key = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("output pool")
+            .display_pool()
+            .bos
+            .iter()
+            .find_map(|bo| bo.managed_key())
+            .expect("managed pool allocation");
+        let member = crate::kms::render::resources::GroupMember::new(
+            crate::kms::render::platform::CrtcKey::for_output(output),
+            backend
+                .platform
+                .owner_ref(device)
+                .expect("Owner device")
+                .topology_generation(),
+            1,
+        );
+        c0_3bi_remove_output_for_promotion(backend, 0);
+
+        let pending_commit = crate::kms::owner::identity::CommitId::for_tests(0xa2c);
+        backend
+            .resource_service_mut()
+            .expect("resource service")
+            .register_kms(managed_key, pending_commit, member)
+            .expect("register outstanding KmsRelease");
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(instance)
+        );
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 1);
+        assert!(
+            backend
+                .resource_service()
+                .expect("resource service")
+                .has_pending_obligations(&managed_key)
+        );
+        assert!(
+            !backend
+                .resource_service()
+                .expect("resource service")
+                .is_releasable(&managed_key)
         );
     }
 
@@ -80216,6 +80442,16 @@ mod tests {
                 ("restore original advertised mode", current_mode),
             ] {
                 let step = format!("mode cycle {cycle}: {label}");
+                let output_idx = backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .position(|output| output.key == output_key)
+                    .expect("currently installed HDMI-2 output");
+                let retired_instance = backend
+                    .scene
+                    .output_instance_id_for_tests(output_idx)
+                    .expect("current HDMI-2 output instance");
                 let displaced = c0_hw_3b_set_crtc_config(
                     backend,
                     device,
@@ -80261,6 +80497,12 @@ mod tests {
                     &hardware_complete,
                 )
                 .unwrap_or_else(|error| panic!("{step}: displaced pool stayed live: {error}"));
+                assert!(
+                    !backend
+                        .scene
+                        .retired_output_has_instance_for_tests(retired_instance),
+                    "{step}: its retired scene and pool are destroyed after all proofs"
+                );
             }
         }
 
@@ -81389,23 +81631,12 @@ mod tests {
             &mut backend.platform,
             backend.resource_service.as_ref(),
         );
-        assert_eq!(
-            backend
-                .scene
-                .retired_output_release_count_for_tests(old_instance),
-            Some(0)
-        );
-        assert_eq!(
-            backend
-                .scene
-                .retired_output_pool_occupancy_for_tests(old_instance),
-            Some(old_ring_before)
-        );
         assert!(
-            backend
+            !backend
                 .scene
                 .retired_output_has_instance_for_tests(old_instance)
         );
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 0);
         assert_eq!(
             backend.scene.output_instance_id_for_tests(0),
             Some(new_instance)
@@ -81487,17 +81718,10 @@ mod tests {
             &mut backend.platform,
             backend.resource_service.as_ref(),
         );
-        assert_eq!(
-            backend
+        assert!(
+            !backend
                 .scene
-                .retired_output_release_count_for_tests(old_instance),
-            Some(0)
-        );
-        assert_eq!(
-            backend
-                .scene
-                .retired_output_pool_occupancy_for_tests(old_instance),
-            Some(old_ring_before)
+                .retired_output_has_instance_for_tests(old_instance)
         );
         assert_eq!(
             backend.scene.output_instance_id_for_tests(0),

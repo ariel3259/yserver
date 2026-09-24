@@ -1935,6 +1935,36 @@ impl SceneCompositor {
         self.root_overlay_clear();
     }
 
+    /// A completed client modeset has displaced the old pool's current
+    /// framebuffer. Move that scene record into the same release state used
+    /// by a composed replacement so the retired bundle can consume its KMS
+    /// proof and leave the scanout pool.
+    pub(crate) fn retire_current_owner_buffer_in_bundle(&mut self, instance: OutputInstanceId) {
+        let bundle = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.retired_outputs.get_mut(&instance.device_key))
+            .and_then(|bundles| {
+                bundles
+                    .iter_mut()
+                    .find(|bundle| bundle.instance == instance)
+            })
+            .expect("completed modeset's displaced output has a retired bundle");
+        let mut index = 0;
+        while index < bundle.scene.owner_buffers.len() {
+            if bundle.scene.owner_buffers[index].state() != OwnerBufferState::Current {
+                index += 1;
+                continue;
+            }
+            let current = bundle.scene.owner_buffers.remove(index);
+            match current.into_releasing() {
+                Ok(releasing) => bundle.scene.owner_buffers.insert(index, releasing),
+                Err(_) => panic!("current retired owner buffer must enter Releasing"),
+            }
+            index += 1;
+        }
+    }
+
     pub(crate) fn rebuild_output(
         &mut self,
         key: &OutputKey,
@@ -5817,8 +5847,8 @@ fn drain_retired_output_bundles(
     resource_service: Option<&ResourceService>,
 ) {
     let vk = Arc::clone(&inner.vk);
-    for bundles in inner.retired_outputs.values_mut() {
-        for bundle in bundles {
+    inner.retired_outputs.retain(|_, bundles| {
+        for bundle in bundles.iter_mut() {
             retire_failed_submit_bos_in_bundle(bundle, platform, vk.as_ref(), resource_service);
             retire_owner_buffers_in_bundle(bundle, resource_service);
             drain_retired_pending_pool_releases(
@@ -5827,6 +5857,50 @@ fn drain_retired_output_bundles(
                 platform,
                 resource_service,
             );
+        }
+        bundles.retain(|bundle| !retired_output_bundle_is_drained(bundle, resource_service));
+        !bundles.is_empty()
+    });
+}
+
+fn retired_output_bundle_is_drained(
+    bundle: &RetiredOutputBundle,
+    resource_service: Option<&ResourceService>,
+) -> bool {
+    let scene = &bundle.scene;
+    if !scene.owner_buffers.is_empty()
+        || !scene.pending_acks.is_empty()
+        || !scene.pool_slots.is_empty()
+        || !scene.pending_pool_releases.is_empty()
+        || !scene.failed_submit_bos.is_empty()
+        || !scene.pool_ring.is_idle()
+        || bundle
+            .pool
+            .display_pool()
+            .bos
+            .iter()
+            .any(|bo| bo.state.phase != BoPhase::Free)
+    {
+        return false;
+    }
+
+    let allocation_is_releasable = |key: Option<crate::kms::render::resources::AllocationKey>| {
+        key.is_none_or(|key| resource_service.is_some_and(|service| service.is_releasable(&key)))
+    };
+    match &bundle.pool {
+        OutputScanout::Shared(pool) => pool
+            .bos
+            .iter()
+            .all(|bo| allocation_is_releasable(bo.managed_key())),
+        OutputScanout::Copied(pool) => {
+            pool.destinations
+                .bos
+                .iter()
+                .all(|bo| allocation_is_releasable(bo.managed_key()))
+                && pool
+                    .sources
+                    .iter()
+                    .all(|source| allocation_is_releasable(source.managed_key()))
         }
     }
 }
