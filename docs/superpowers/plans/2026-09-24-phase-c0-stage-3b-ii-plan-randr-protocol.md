@@ -2,6 +2,11 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bii_`, `c0_3bi_`, `c0_3aii_`, `c0_adm` in `yserver`, and the whole `yserver-core` suite — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 7 (2026-09-24, coordinator)** — codex round 6 (1 blocking,
+`../findings/2026-09-24-stage-3b-ii-plan-review-round6.md`): the forced reprobe
+is synchronous core-thread work; design revision 12 counts it in `L` and
+carries its move off the core thread to 3c; Task 3 tests a stalled reprobe.
+
 **Revision 6 (2026-09-24, coordinator)** — codex round 5 (1 blocking,
 `../findings/2026-09-24-stage-3b-ii-plan-review-round5.md`): the plan
 contradicted the design's "queries never wait". Design revision 11 names the
@@ -175,7 +180,7 @@ dropped. `Success` is answered only from `Ok(true)` or the idempotent
 
 **Deliver:** the gate queue deadline `Q = 30 s` from each waiter's arrival,
 with a timeout wake of the core loop (the loop's next wakeup takes the
-earliest waiter deadline into account). At `Q` a parkable waiter
+earliest waiter deadline into account). After **any** synchronous core-thread work a gate member performs — a synchronous mutation or the forced reprobe (design revision 12) — every queued deadline is serviced before the next admission. At `Q` a parkable waiter
 (`SetCrtcConfig`) is taken out of the FIFO and answered **without
 state-dependent validation**: only the stateless request checks (length and
 field format) run; a request that passes them answers `Failed`
@@ -190,6 +195,7 @@ backend's (3b-i); the gate adds none.
 | `c0_3bii_waiter_expires_at_q` | A parked for longer than `Q` (the recording backend holds it); B's `SetCrtcConfig` waits: at `Q` B answers status 3 with the published timestamp, without a backend call; a timer wake, not I/O, triggers it | **G12** no timeout wake |
 | `c0_3bii_expiry_is_stateless` | B's request would be `BadMatch` against the published state but valid after A publishes: at `Q` B answers `Failed`, not `BadMatch`; a malformed B still gets `BadLength` | **G13** run state-dependent validation at expiry (design mutation 18) |
 | `c0_3bii_sync_mutation_is_never_expired` | a `SetScreenSize` waits past `Q` behind A: it is not expired and executes when A publishes | **G14** apply `Q` to synchronous mutations |
+| `c0_3bii_deadlines_first_after_a_stalled_reprobe` | *(rev 7)* a dispatched Owner modeset A completes; B's `GetScreenResources` (admitted behind it) stalls in the recording backend's reprobe past C's `Q`: C is answered on the first iteration after the reprobe returns, before any other waiter is admitted | **G15b** admit the next waiter before servicing deadlines after a reprobe |
 | `c0_3bii_deadlines_first_after_a_sync_mutation` | a synchronous mutation that stalls the loop (the recording backend sleeps inside it) past C's `Q`: C is answered on the first iteration after it returns, before any other waiter is admitted | **G15** admit the next waiter first (design mutation 20) |
 | `c0_3bii_two_waiters_expire_in_order` | B and C wait behind a slow A: each expires at its own `Q`, in arrival order | **G16** expire all at the first deadline |
 

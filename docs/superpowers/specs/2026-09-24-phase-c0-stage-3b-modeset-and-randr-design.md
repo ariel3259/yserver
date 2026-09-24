@@ -1,6 +1,6 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 11 (codex rounds
+**Status:** Revision 12 (codex rounds
 [1](../findings/2026-09-24-stage-3b-design-review-round1.md),
 [2](../findings/2026-09-24-stage-3b-design-review-round2.md),
 [3](../findings/2026-09-24-stage-3b-design-review-round3.md),
@@ -9,7 +9,7 @@
 [6](../findings/2026-09-24-stage-3b-design-review-round6.md) and
 [7](../findings/2026-09-24-stage-3b-design-review-round7.md); revision 9 corrects a
 contradiction the 3b-i-1 plan review found; revision 10 adds the generation
-reset rule and revision 11 the forced-reprobe rule the 3b-ii plan reviews found), written by the
+reset rule and revisions 11 and 12 the forced-reprobe rules the 3b-ii plan reviews found), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -717,6 +717,17 @@ Legacy executions ahead of it (bounded by Legacy's own blocking calls:
 `L = 0` on a server with no Legacy device, so the Owner-only bound is
 `Q + E`. The mixed-server case is part of stage 5's characterization of the
 mixed server (umbrella §6).
+
+*(Rev 12, 3b-ii plan round-6 B-1.)* `L` also counts the **forced connector
+reprobe** of `GetScreenResources` (section 7.1): it probes each DRM device on
+the core thread today (`reprobe_connectors`, `render/backend.rs:24457`,
+`render/platform.rs:4871`), for Legacy and Owner alike, and no timer runs while
+it does. The same rule applies — every queued deadline is serviced on the
+first iteration after it returns, before the next admission. Moving the
+reprobe off the core thread is 3c's (the reprobe becomes the executed
+`AdministrativeReprobe` transition); until then the Owner-only bound is
+`Q + E + L_reprobe`, `L_reprobe` being the kernel's connector-probe time.
+**Carried to 3c.**
 
 **Named exception — `GateExpired`.** Legacy would have executed a request
 that waited behind a slow one (it blocks the whole core loop while it

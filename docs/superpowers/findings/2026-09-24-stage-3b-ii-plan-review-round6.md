@@ -1,3 +1,21 @@
+# Stage 3b-ii plan — codex review, round 6
+
+**Target:** plan revision 6, prior review round 5.
+
+**Result:** 1 blocking, 0 major, 0 minor. Trend: r1 2B 1M, r2 1B 1M, r3 1B 1M,
+r4 0B 1M, r5 1B, r6 1B.
+
+**Reviewer:** `codex exec --sandbox read-only`, single pass
+**Instrument:** `docs/superpowers/review/` @ `0245f96b`;
+model `gpt-6-sol`; reasoning effort `xhigh`; `codex-cli 0.155.1`.
+Counts are comparable only to other reviews citing this same instrument SHA.
+
+**Author verification (2026-09-24):** B-1 CONFIRMED — the forced reprobe runs
+synchronously on the core thread (existing behaviour, Legacy and Owner).
+Design revision 12 counts it in `L`, services deadlines first after it, and
+carries its move off the core thread to 3c (`AdministrativeReprobe`); plan
+revision 7 tests a stalled reprobe.
+
 ## Verdict
 
 **1 blocking, 0 major, 0 minor**  
