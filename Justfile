@@ -1489,9 +1489,21 @@ rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,t
         --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
 
-# Run rendercheck on host
-rendercheck-yserver-hw timeout="60" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
-    tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
+# Run rendercheck against yserver on this machine's KMS, from a free TTY.
+# Tally goes to rendercheck-hw.log, the server log to yserver-hw-rendercheck.log.
+rendercheck-yserver-hw timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
+    cargo build --release --bin yserver
+    bash -c '\
+        RUST_LOG=warn RUST_BACKTRACE=1 target/release/yserver > yserver-hw-rendercheck.log 2>&1 &\
+        yserver_pid=$!;\
+        for _ in $(seq 1 150); do DISPLAY=:7 xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done;\
+        if ! DISPLAY=:7 xdpyinfo >/dev/null 2>&1; then \
+            echo "error: yserver did not come up on :7" >&2; tail -30 yserver-hw-rendercheck.log >&2;\
+            kill -TERM $yserver_pid 2>/dev/null; wait $yserver_pid 2>/dev/null; exit 2;\
+        fi;\
+        tools/rendercheck.sh :7 {{timeout}} {{tests}} > rendercheck-hw.log 2>&1; rc=$?;\
+        kill -TERM $yserver_pid 2>/dev/null; wait $yserver_pid 2>/dev/null;\
+        cat rendercheck-hw.log; exit $rc'
 
 # ============================== XTS ==============================
 
