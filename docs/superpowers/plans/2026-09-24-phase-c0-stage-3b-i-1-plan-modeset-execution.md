@@ -2,6 +2,11 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 9 (2026-09-25, coordinator)** — the first hardware run of
+`c0_hw_3b_modeset_owner_on_card1_drm` passed the four mode-change cycles and
+failed at the first disable: the displaced pool stayed live for 35 s.
+Addendum A1 (below Task 9) fixes the Task 3 defect it exposed.
+
 **Revision 8 (2026-09-25, coordinator)** — Task 8 F8 (before editing): a
 stale result keeps the 3a-ii quarantine-and-poison path with a typed `Stale`
 cause (quarantine transfer is 3d's); the failure line is emitted by the core,
@@ -440,3 +445,27 @@ frame completed after each lit step, and every displaced pool discharged.
 | `c0_3bi_value_dead_reads_routed` | for each of the four reads, an Owner fixture with `kms_outputs_active` forced to the wrong value: the Owner path behaves as the installed power says | **E43** restore each read in turn (design mutation 10; one mutation per read) |
 | `c0_3bi_modeset_differential_backend_state_vulkan` | one script — enable, mode change, refresh-only change, idempotent repeat, disable, re-enable — through `begin`/`drain`/`finish` on a Legacy and an Owner live fixture: each result's status and the resulting RANDR registry/`platform.outputs` state are equal, except the named exceptions (none of which this script reaches) | **E44** skip the registry update on Owner |
 | `c0_3bi_legacy_path_unchanged` | a Legacy fixture runs the same script with the Owner code present: every existing Legacy RANDR characterization test stays green, and a named one asserts the all-off/relight sequence still runs on Legacy | **E45** route a Legacy device through the Owner fork |
+
+## Addendum A1 — retired bundles are serviced without composition *(rev 9, found on hardware)*
+
+**Finding (2026-09-25, card1).** The only production caller of
+`drain_retired_output_bundles` is `SceneCompositor::tick` (`render/scene.rs:4186`).
+After a disable of a device's last lit output nothing composes, `tick` never
+runs, and the retired bundle — the displaced pool, its scene state and its
+pending releases — is never serviced: the pool stays live until an output is
+enabled again. The design (§5.1) assumed the scene always polls; with no
+output it does not.
+
+**Deliver:** retired-output bundles are serviced on every core-loop wake that
+services owner or resource completions, **independently of composition** —
+including with zero outputs, every output dark, the seat released or the
+renderer idle — and the loop's next wakeup accounts for a bundle that waits
+on an unsignalled fence or an outstanding proof (a poll deadline, not a
+spin). Servicing a bundle never composes, offers or submits. The composition
+tick keeps servicing them as today.
+
+| Test | Scenario | Must fail under |
+| --- | --- | --- |
+| `c0_3bi_a1_retired_bundle_drains_with_no_output_vulkan` | disable the device's only output with its old pool's fence pending: no composition tick runs; the owner/resource wake path alone releases the pool once its proofs arrive, and the next wakeup is bounded while it waits | **A1a** service bundles only from `tick` |
+| `c0_3bi_a1_idle_bundle_wakeup_is_bounded` | a retired bundle waiting on an unsignalled fence and nothing else pending: the loop's next wakeup is a finite deadline, and it does not busy-loop (at most one poll per deadline) | **A1b** omit the bundle from the next wakeup |
+
