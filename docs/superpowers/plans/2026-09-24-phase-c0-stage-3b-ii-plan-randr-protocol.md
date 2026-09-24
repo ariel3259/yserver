@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bii_`, `c0_3bi_`, `c0_3aii_`, `c0_adm` in `yserver`, and the whole `yserver-core` suite — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 3 (2026-09-24, coordinator)** — codex round 2
+(`../findings/2026-09-24-stage-3b-ii-plan-review-round2.md`: 1 blocking, 1
+major, both verified): a generation reset (and `-terminate`) waits for an
+install-capable mutation to reach its terminal result before it snapshots
+backend state (B-1, Task 2; design revision 10 §7.2); the mixed-server
+script uses three requester connections (M-1, Task 5).
+
 **Revision 2 (2026-09-24, coordinator)** — codex round 1
 (`../findings/2026-09-24-stage-3b-ii-plan-review-round1.md`: 2 blocking, 1
 major, all verified): a requester-less publication wakes the core on enqueue
@@ -102,7 +109,13 @@ path updates the gate — `disconnect_with_pending_cleanup` (`run.rs:828`) and
 the inline removal `KillClient` performs on another client (detected at
 `run.rs:884` by the client count) — either by calling the same gate cleanup
 or by pruning, before the next admission, every FIFO entry and in-flight
-requester whose client no longer exists. On disconnect the gate keeps a
+requester whose client no longer exists. *(Rev 3, B-1.)* A **generation reset** or `-terminate`
+(`core_loop/run.rs:1836`, `core_loop/reset.rs`) triggered while the gate holds
+an install-capable mutation (a `ContinuesWithoutRequester` one) is deferred
+until that mutation's terminal result — bounded by `E` — and only then
+cancels the remaining tokens and snapshots backend state for the new
+generation; the old mutation's reply and events are dropped with its
+generation. On disconnect the gate keeps a
 `ContinuesWithoutRequester` publication and stays occupied until the result;
 if installed it is published to every remaining client and only the reply is
 dropped. `Success` is answered only from `Ok(true)` or the idempotent
@@ -114,6 +127,7 @@ dropped. `Success` is answered only from `Ok(true)` or the idempotent
 | `c0_3bii_disconnect_after_dispatch_still_publishes` | A parked with `ContinuesWithoutRequester`, A disconnects, the backend completes `Ok(true)`: listener L receives the change notifications, nothing is written for A, the gate then admits the next waiter | **G7** drop the publication on disconnect (design mutation 6) |
 | `c0_3bii_disconnect_before_dispatch_cancels` | the backend answers `Cancelled`: no publication, the gate frees at once | **G8** keep the gate occupied after a cancel |
 | `c0_3bii_waiting_head_disconnects` | B is the FIFO head waiting behind A and disconnects: B leaves the FIFO, the next waiter keeps its place | **G9** leave the departed client in the FIFO |
+| `c0_3bii_reset_waits_for_an_install_capable_mutation` | *(rev 3, B-1)* the last client's dispatched modeset continues without its requester; the reset trigger fires (last client left): the reset does not cancel the token or snapshot backend state until the result is terminal; after `Ok(true)` the new generation's RANDR state is seeded from the installed topology, and nothing of the old client (reply, events) reaches the new generation; with `-terminate` the server exits only after the terminal result | **G9c** cancel the token and seed at once (today's `reset.rs` step order) |
 | `c0_3bii_killclient_removes_a_waiting_head` | A in flight, B the waiting head, C behind; D kills B with `KillClient`; A completes: C is admitted next and B's entry is gone | **G9b** clean the gate only in `disconnect_with_pending_cleanup` |
 | `c0_3bii_failed_publishes_nothing` | the backend completes `Err(..)`: reply status 3, timestamp unchanged, no notification | **G10** publish on error |
 | `c0_3bii_last_set_time_can_go_backward` | two successive changes with a decreasing client timestamp: `lastSetTime` follows the request, as Legacy | **G11** clamp `lastSetTime` monotonic |
@@ -166,7 +180,10 @@ stands in for 3c/3d.
 
 **Deliver:** umbrella §4.1 layer 1: drive the core request path with a Legacy
 and an Owner `KmsBackend` fixture (3b-i's Owner path, live Vulkan fixture),
-two client connections (requester and listener), and compare the bytes
+client connections — one requester and one listener for the single-request
+cases, and *(rev 3, M-1)* **three independent requester connections plus a
+listener** for the concurrent and mixed-server scripts, with byte assertions
+per connection — and compare the bytes
 written to each connection — reply, status, events, in order. Cases: the
 idempotent request; supersession by a `REC-4` event; two concurrent clients
 (including the MATE sequence); cross-device and cross-transport order; the

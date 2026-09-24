@@ -1,6 +1,6 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 9 (codex rounds
+**Status:** Revision 10 (codex rounds
 [1](../findings/2026-09-24-stage-3b-design-review-round1.md),
 [2](../findings/2026-09-24-stage-3b-design-review-round2.md),
 [3](../findings/2026-09-24-stage-3b-design-review-round3.md),
@@ -8,7 +8,8 @@
 [5](../findings/2026-09-24-stage-3b-design-review-round5.md),
 [6](../findings/2026-09-24-stage-3b-design-review-round6.md) and
 [7](../findings/2026-09-24-stage-3b-design-review-round7.md); revision 9 corrects a
-contradiction the 3b-i-1 plan review found), written by the
+contradiction the 3b-i-1 plan review found; revision 10 adds the generation
+reset rule the 3b-ii plan review found), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -638,6 +639,14 @@ requester disconnects while parked:
 | Legacy PRIME probe | cancelled as today (disposable, nothing installed) |
 | Owner, not dispatched | cancelled as never-submitted; nothing to publish |
 | Owner, dispatched | continues; if installed, published to every other client; only the reply is dropped. The gate stays occupied until then |
+
+**Generation reset** *(rev 10, 3b-ii plan round-2 B-1)*. When the last
+client leaves while an install-capable mutation is in flight, the generation
+reset (or `-terminate`) waits for that mutation's terminal result — bounded
+by `E` — before it cancels the remaining tokens and snapshots backend state
+for the new generation; nothing of the old request reaches the new
+generation. Otherwise a commit could install after the new generation's
+snapshot.
 
 `Success` means installed (obligation 2): a request is answered `Success`
 only from a current success at the boundary (section 4.2) or as idempotent;
