@@ -136,6 +136,10 @@ pub enum RecordedCall {
         x: i32,
         y: i32,
     },
+    SetLogicalScreenSize {
+        width: u16,
+        height: u16,
+    },
     /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
     AcquireGlxPixmapExport(u32),
     /// GLX-TFP Task 3.4: `release_glx_pixmap_export(host_xid)` called.
@@ -309,6 +313,10 @@ pub struct RecordingBackend {
     /// When set, a forced reprobe toggles the first output's connection
     /// state and emits the corresponding RANDR change notifications.
     pub reprobe_connectors_changes_state: bool,
+    /// Stall a forced reprobe for deadline-ordering tests.
+    pub reprobe_connectors_delay: std::time::Duration,
+    /// Stall a synchronous screen-size mutation for deadline-ordering tests.
+    pub set_logical_screen_size_delay: std::time::Duration,
     /// Startup input-probe model. Each inner `Vec` is one "dispatch
     /// round" the fake libinput would yield; `probe_input_devices`
     /// consumes the front round per iteration and seeds the registry,
@@ -548,6 +556,8 @@ impl RecordingBackend {
             crtc_config_requester_abandon: RequesterAbandon::Cancelled,
             reprobe_connectors_calls: 0,
             reprobe_connectors_changes_state: false,
+            reprobe_connectors_delay: std::time::Duration::ZERO,
+            set_logical_screen_size_delay: std::time::Duration::ZERO,
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
@@ -779,6 +789,7 @@ impl Backend for RecordingBackend {
 
     fn reprobe_connectors(&mut self, state: &mut crate::server::ServerState) -> io::Result<()> {
         self.reprobe_connectors_calls += 1;
+        std::thread::sleep(self.reprobe_connectors_delay);
         if self.reprobe_connectors_changes_state {
             let changed = state.randr.outputs.first_mut().map(|output| {
                 output.connected = !output.connected;
@@ -789,6 +800,12 @@ impl Backend for RecordingBackend {
                 crate::core_loop::run::emit_randr_change_notifications(state, &[changed]);
             }
         }
+        Ok(())
+    }
+
+    fn set_logical_screen_size(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.record(RecordedCall::SetLogicalScreenSize { width, height });
+        std::thread::sleep(self.set_logical_screen_size_delay);
         Ok(())
     }
 

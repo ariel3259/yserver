@@ -65,6 +65,7 @@ use crate::{
 /// This matches the `XI2_MAJOR_OPCODE` constant in nested.rs and goes
 /// away in H1 with that file.
 const XI2_MAJOR_OPCODE: u8 = 137;
+const RANDR_MAJOR_OPCODE: u8 = 128;
 /// XInput extension first-error base (matches `nested.rs::XI2_FIRST_ERROR`).
 /// `XI_BadDevice = 0`, so the wire `BadDevice` code is `XI2_FIRST_ERROR + 0`.
 const XI2_FIRST_ERROR: u8 = 157;
@@ -2822,7 +2823,6 @@ fn handle_randr_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
-    const RANDR_MAJOR_OPCODE: u8 = 128;
     fn crtc_is_leased(_state: &ServerState, _crtc: u32) -> bool {
         false
     }
@@ -4958,6 +4958,90 @@ pub(crate) fn complete_crtc_config(
         reply.byte_order,
         status,
         timestamp,
+    )
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CrtcConfigFailureCause {
+    GateExpired,
+}
+
+/// Answer a queued `RRSetCrtcConfig` whose gate deadline elapsed. The
+/// predecessor may still change every state-dependent validation result, so
+/// this path checks only the request's wire shape and field encoding.
+pub(crate) fn fail_expired_crtc_config(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::randr as x11randr;
+
+    let client = state.clients.get(&client_id.0);
+    let byte_order = client.map_or(
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        |client| client.byte_order,
+    );
+    let big_requests_enabled = client.is_some_and(|client| client.big_requests_enabled);
+    let max_length_units = if big_requests_enabled {
+        256 * 1024
+    } else {
+        u32::from(u16::MAX)
+    };
+    let total_bytes = usize::try_from(header.length_units)
+        .ok()
+        .and_then(|units| units.checked_mul(4));
+    let has_valid_framing = total_bytes
+        .and_then(|total| total.checked_sub(body.len()))
+        .is_some_and(|header_bytes| {
+            header_bytes == 4 || (big_requests_enabled && header_bytes == 8)
+        });
+    let has_valid_shape = body.len() >= 28 && (body.len() - 28).is_multiple_of(4);
+    if header.opcode != RANDR_MAJOR_OPCODE
+        || header.data != x11randr::RR_SET_CRTC_CONFIG
+        || header.length_units > max_length_units
+        || !has_valid_framing
+        || !has_valid_shape
+    {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            u16::from(header.data),
+            RANDR_MAJOR_OPCODE,
+        );
+    }
+
+    let mode = u32::from_le_bytes(body[16..20].try_into().expect("validated body length"));
+    let rotation = u16::from_le_bytes(body[20..22].try_into().expect("validated body length"));
+    if mode != 0 && !matches!(rotation & 0x000f, 1 | 2 | 4 | 8) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(rotation),
+            u16::from(header.data),
+            RANDR_MAJOR_OPCODE,
+        );
+    }
+
+    let cause = CrtcConfigFailureCause::GateExpired;
+    log::debug!(
+        "client {} #{} RANDR::SetCrtcConfig -> status=3 cause={cause:?}",
+        client_id.0,
+        sequence.0,
+    );
+    reply_set_crtc_config(
+        state,
+        client_id,
+        sequence,
+        byte_order,
+        3,
+        state.randr.timestamp,
     )
 }
 
