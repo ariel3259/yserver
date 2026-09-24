@@ -46,8 +46,29 @@ Owner route would then have no DPMS (and no other lifecycle-class commit, nor
 Present MSC timing) at all. **This is a C.0 spec-level decision, not an
 implementation defect**, and goes to the user.
 
-## Still unmeasured
+## Measured with `nvidia-drm.vblank=1` (2026-09-23)
 
-- Whether `GET_SEQUENCE` works on this device with `nvidia-drm.vblank=1`.
-- The `ACTIVE`-only DPMS shape on NVIDIA (the commit has still never reached
-  the driver).
+The user added `options nvidia-drm vblank=1` to `/etc/modprobe.d/nvidia.conf`
+and rebooted (`/sys/module/nvidia_drm/parameters/vblank = Y`). Same driver
+615.71.09, same kernel. `c0_hw_3a_dpms_owner_on_card1_drm` then **passed three
+runs in a row** (~1.1 s each):
+
+- the production `GET_SEQUENCE` probe succeeds: the clock is `KernelSequence`;
+- four `ACTIVE`-only off/on cycles: each off accepted with an out-fence that
+  is observed signalled, no vblank follows it, and the retained framebuffer
+  and allocation are unchanged; after each on a composed frame is admitted and
+  reaches `HardwareComplete` — the fourth cycle as well as the first.
+
+So with vblank enabled this device is structurally capable under C.0 and
+NVIDIA accepts the `ACTIVE`-only DPMS shape. Two test defects surfaced on the
+way and were fixed (`c0_hw_3a_…`: a held `RefCell` borrow; a bounded
+damage-history length used as a progress signal).
+
+## Open decision (user)
+
+With the driver default (`vblank=N`) the device remains structurally
+incapable under C.0 and admits no Owner traffic, which conflicts with stage 5
+removing the Legacy route. Options discussed: keep Legacy as the route of
+structurally incapable devices; require `nvidia-drm.vblank=1` (detected at
+startup, documented); or amend C.0 with a flip-driven clock (contradicts C.0's
+explicit no-software-clock decision).
