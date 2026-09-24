@@ -120,17 +120,23 @@ pub enum RequestOutcome {
 #[derive(Debug, Clone, Copy)]
 pub struct PendingCrtcConfig {
     pub token: CrtcConfigToken,
-    pub completion: CrtcConfigCompletion,
+    pub publication: CrtcConfigPublication,
+    pub reply: CrtcConfigReply,
 }
 
-/// Protocol continuation shared by synchronous and asynchronous CRTC apply
-/// paths. It contains no backend token, so immediate completion never needs a
-/// sentinel token value.
+/// RANDR state and notification work owned by the server-wide gate until the
+/// backend's result is terminal.
 #[derive(Debug, Clone, Copy)]
-pub struct CrtcConfigCompletion {
+pub struct CrtcConfigPublication {
     pub output_id: u32,
     pub set_time: u32,
     pub output_bbox_before: Option<(u16, u16)>,
+}
+
+/// The client-specific part of a CRTC completion. Dropping this does not drop
+/// the publication.
+#[derive(Debug, Clone, Copy)]
+pub struct CrtcConfigReply {
     pub byte_order: yserver_protocol::x11::ClientByteOrder,
 }
 
@@ -4661,12 +4667,12 @@ fn handle_randr_request(
                 req_timestamp
             };
             let output_bbox_before = super::run::enabled_output_bbox(state);
-            let completion = CrtcConfigCompletion {
+            let publication = CrtcConfigPublication {
                 output_id,
                 set_time,
                 output_bbox_before,
-                byte_order,
             };
+            let reply = CrtcConfigReply { byte_order };
             match backend.begin_crtc_config(
                 output_id,
                 &connector,
@@ -4680,14 +4686,16 @@ fn handle_randr_request(
                         backend,
                         client_id,
                         sequence,
-                        completion,
+                        publication,
+                        reply,
                         Ok(changed),
                     );
                 }
                 Ok(CrtcConfigApply::Pending(token)) => {
                     return Ok(RequestOutcome::PendingCrtcConfig(PendingCrtcConfig {
                         token,
-                        completion,
+                        publication,
+                        reply,
                     }));
                 }
                 Err(e) => {
@@ -4696,7 +4704,8 @@ fn handle_randr_request(
                         backend,
                         client_id,
                         sequence,
-                        completion,
+                        publication,
+                        reply,
                         Err(e),
                     );
                 }
@@ -4936,27 +4945,49 @@ pub(crate) fn complete_crtc_config(
     backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
-    completion: CrtcConfigCompletion,
+    publication: CrtcConfigPublication,
+    reply: CrtcConfigReply,
     result: io::Result<bool>,
 ) -> io::Result<RequestOutcome> {
-    let status = match result {
+    let status = publish_crtc_config(state, backend, publication, result);
+    let timestamp = state.randr.timestamp;
+    reply_set_crtc_config(
+        state,
+        client_id,
+        sequence,
+        reply.byte_order,
+        status,
+        timestamp,
+    )
+}
+
+/// Publish the server-owned half of an asynchronous CRTC configuration.
+/// There is deliberately no requester argument: an installed change remains
+/// visible after its original client disconnects.
+pub(crate) fn publish_crtc_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    publication: CrtcConfigPublication,
+    result: io::Result<bool>,
+) -> u8 {
+    match result {
         Ok(true) => {
             // Something actually changed. Single rebuild path: a CRTC set
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
-            backend.refresh_randr_state_set_time(state, completion.set_time);
+            backend.refresh_randr_state_set_time(state, publication.set_time);
             let changed: Vec<(u32, u32, u32)> = state
                 .randr
                 .outputs
                 .iter()
-                .find(|o| o.output_id == completion.output_id)
+                .find(|o| o.output_id == publication.output_id)
                 .map(|o| (o.output_id, o.crtc_id, o.mode_id))
                 .into_iter()
                 .collect();
             super::run::emit_randr_change_notifications(state, &changed);
             super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
                 state,
-                completion.output_bbox_before,
+                publication.output_bbox_before,
             );
             0
         }
@@ -4969,16 +5000,7 @@ pub(crate) fn complete_crtc_config(
             // RRSetConfigFailed=3 (a status reply, not a protocol error).
             3
         }
-    };
-    let timestamp = state.randr.timestamp;
-    reply_set_crtc_config(
-        state,
-        client_id,
-        sequence,
-        completion.byte_order,
-        status,
-        timestamp,
-    )
+    }
 }
 
 /// Build and send the 32-byte `SetCrtcConfig` reply.
@@ -4986,7 +5008,7 @@ pub(crate) fn complete_crtc_config(
 /// Wire format: `status` (data byte) + length=0 + `new_timestamp`(4) +
 /// pad(20). On success `new_timestamp` is the post-set `state.randr.timestamp`;
 /// on failure it is the unmodified existing value (caller resolves which).
-fn reply_set_crtc_config(
+pub(crate) fn reply_set_crtc_config(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
@@ -57709,7 +57731,8 @@ mod tests {
             panic!("asynchronous backend must return a pending continuation");
         };
         assert_eq!(pending.token, token);
-        assert_eq!(pending.completion.output_id, 4);
+        assert_eq!(pending.publication.output_id, 4);
+        assert_eq!(pending.reply.byte_order, ClientByteOrder::LittleEndian);
         assert!(
             read_all_available(&mut peer).is_empty(),
             "pending request must not receive a reply before completion"

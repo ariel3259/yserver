@@ -26,7 +26,7 @@ use crate::{
         AnyHandle, Backend, ClipState, CompletedPresentEvent, CrtcConfigApply, CrtcConfigToken,
         CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle, ModeSpec, OriginContext,
         PictureHandle, PixmapHandle, PresentScanoutCandidate, PresentSequenceTarget,
-        PresentSourceWait, WindowHandle,
+        PresentSourceWait, RequesterAbandon, WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
@@ -302,6 +302,8 @@ pub struct RecordingBackend {
     /// Script whether the current pending CRTC token may still install.
     /// Defaults to `false`, like backends that only park a PRIME probe.
     pub crtc_config_is_install_capable: bool,
+    /// Script what requester abandonment does for the current token.
+    pub crtc_config_requester_abandon: RequesterAbandon,
     /// Number of forced RANDR connector reprobes performed by tests.
     pub reprobe_connectors_calls: usize,
     /// When set, a forced reprobe toggles the first output's connection
@@ -543,6 +545,7 @@ impl RecordingBackend {
             finished_crtc_configs: Vec::new(),
             cancelled_crtc_configs: Vec::new(),
             crtc_config_is_install_capable: false,
+            crtc_config_requester_abandon: RequesterAbandon::Cancelled,
             reprobe_connectors_calls: 0,
             reprobe_connectors_changes_state: false,
             probe_rounds: std::collections::VecDeque::new(),
@@ -1309,8 +1312,23 @@ impl Backend for RecordingBackend {
         self.crtc_config_results.remove(&token);
     }
 
+    fn abandon_crtc_config_requester(&mut self, token: CrtcConfigToken) -> RequesterAbandon {
+        if self.crtc_config_requester_abandon == RequesterAbandon::Cancelled {
+            self.cancel_crtc_config(token);
+        }
+        self.crtc_config_requester_abandon
+    }
+
     fn crtc_config_install_capable(&self, _token: CrtcConfigToken) -> bool {
         self.crtc_config_is_install_capable
+    }
+
+    fn refresh_randr_state_set_time(
+        &mut self,
+        state: &mut crate::server::ServerState,
+        set_time: u32,
+    ) {
+        state.randr.timestamp = set_time;
     }
 
     fn set_crtc_gamma(

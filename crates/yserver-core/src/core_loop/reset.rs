@@ -29,7 +29,7 @@ use crate::{
         },
         run::{
             DeferredRequest, FairRequestQueue, LoopTelemetry, PendingBackendRequests,
-            cancel_all_pending_backend_requests,
+            RandrMutationGate, cancel_all_pending_backend_requests,
         },
         setup_thread::{self, SetupRegistry},
     },
@@ -187,6 +187,13 @@ impl ResetTrigger {
         self.drained.take()
     }
 
+    /// Whether a boundary action is latched without consuming it. The core
+    /// uses this while draining terminal backend results so old-generation
+    /// replies and notifications can be discarded before the boundary.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.forced || self.drained.is_some()
+    }
+
     /// Start a fresh generation: disarmed again, so the empty client
     /// set the reset leaves behind cannot fire a second reset.
     pub(crate) fn begin_generation(&mut self) {
@@ -283,6 +290,8 @@ pub(crate) struct GenerationLocals<'a> {
     /// Parked asynchronous CRTC configurations, indexed by token and by
     /// client.
     pub pending_backend_requests: &'a mut PendingBackendRequests,
+    /// Server-wide RANDR admission and its in-flight publication.
+    pub randr_mutation_gate: &'a mut RandrMutationGate,
     /// Per-client loop telemetry rows. Diagnostics only; see
     /// `LoopTelemetry::forget_clients` for why a reset has to clear
     /// them explicitly.
@@ -364,6 +373,7 @@ pub(crate) fn reset_generation(
     // either -- that path runs only when a completion arrives, and a
     // parked op may never deliver one.
     cancel_all_pending_backend_requests(backend, locals.pending_backend_requests);
+    locals.randr_mutation_gate.clear();
     locals.deferred_requests.clear();
     locals.server_grab_waiters.clear();
     locals.telemetry.forget_clients();
@@ -502,8 +512,8 @@ mod tests {
             composite_overlay::materialize_overlay,
             message::{BoolSetting, DeviceInfo, LibinputConfigSnapshot},
             run::{
-                FairRequestQueue, LoopTelemetry, PendingBackendRequests, deferred_request_for_test,
-                drain_ready_crtc_configs, release_server_grab_waiters,
+                FairRequestQueue, LoopTelemetry, PendingBackendRequests, RandrMutationGate,
+                deferred_request_for_test, drain_ready_crtc_configs, release_server_grab_waiters,
             },
             setup_thread,
         },
@@ -833,6 +843,7 @@ mod tests {
         deferred_requests: FairRequestQueue,
         server_grab_waiters: VecDeque<super::DeferredRequest>,
         pending_backend_requests: PendingBackendRequests,
+        randr_mutation_gate: RandrMutationGate,
         telemetry: LoopTelemetry,
     }
 
@@ -842,6 +853,7 @@ mod tests {
                 deferred_requests: FairRequestQueue::default(),
                 server_grab_waiters: VecDeque::new(),
                 pending_backend_requests: PendingBackendRequests::default(),
+                randr_mutation_gate: RandrMutationGate::default(),
                 telemetry: LoopTelemetry::default(),
             }
         }
@@ -851,6 +863,7 @@ mod tests {
                 deferred_requests: &mut self.deferred_requests,
                 server_grab_waiters: &mut self.server_grab_waiters,
                 pending_backend_requests: &mut self.pending_backend_requests,
+                randr_mutation_gate: &mut self.randr_mutation_gate,
                 telemetry: &mut self.telemetry,
             }
         }

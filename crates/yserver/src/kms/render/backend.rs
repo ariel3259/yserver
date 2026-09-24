@@ -30,8 +30,8 @@ use yserver_core::{
         AnyHandle, Backend, BackendFdKind, ClipState, CrtcConfigApply, CrtcConfigToken,
         CursorHandle, DrawState, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, FillState,
         FontHandle, GlyphSetHandle, KeymapLoad, OriginContext, PictureHandle, PixmapHandle,
-        PresentCaps, PresentScanoutCandidate, PresentSourceWait, WindowHandle, identity_ramp,
-        resample_channel,
+        PresentCaps, PresentScanoutCandidate, PresentSourceWait, RequesterAbandon, WindowHandle,
+        identity_ramp, resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -2037,6 +2037,9 @@ pub struct KmsBackend {
     pending_crtc_config_probes: HashMap<CrtcConfigToken, PendingCrtcConfigProbe>,
     ready_crtc_config_results: HashMap<CrtcConfigToken, io::Result<QualifiedScanoutPlan>>,
     ready_client_modeset_results: HashMap<CrtcConfigToken, io::Result<bool>>,
+    /// Dispatched Owner modesets remain install-capable until the core drains
+    /// their terminal result, including after the lifecycle slot resolves.
+    pub(crate) dispatched_client_modeset_tokens: HashSet<CrtcConfigToken>,
     invalidated_crtc_config_probes: HashSet<CrtcConfigToken>,
     ready_crtc_config_announcements: VecDeque<CrtcConfigToken>,
     next_crtc_config_token: u64,
@@ -6944,6 +6947,7 @@ impl KmsBackend {
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
             ready_client_modeset_results: HashMap::new(),
+            dispatched_client_modeset_tokens: HashSet::new(),
             invalidated_crtc_config_probes: HashSet::new(),
             ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
@@ -8290,6 +8294,7 @@ impl KmsBackend {
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
             ready_client_modeset_results: HashMap::new(),
+            dispatched_client_modeset_tokens: HashSet::new(),
             invalidated_crtc_config_probes: HashSet::new(),
             ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
@@ -24783,6 +24788,7 @@ impl Backend for KmsBackend {
         self.remove_crtc_config_ready_announcement(token);
         self.invalidated_crtc_config_probes.remove(&token);
         if let Some(result) = self.ready_client_modeset_results.remove(&token) {
+            self.dispatched_client_modeset_tokens.remove(&token);
             return result;
         }
         let result = match self.ready_crtc_config_results.remove(&token) {
@@ -24925,12 +24931,36 @@ impl Backend for KmsBackend {
     fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
         self.remove_crtc_config_ready_announcement(token);
         self.invalidated_crtc_config_probes.remove(&token);
+        self.dispatched_client_modeset_tokens.remove(&token);
         self.ready_client_modeset_results.remove(&token);
         self.pending_crtc_config_probes.remove(&token);
         self.ready_crtc_config_results.remove(&token);
         if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
             executor.cancel(token);
         }
+    }
+
+    fn abandon_crtc_config_requester(&mut self, token: CrtcConfigToken) -> RequesterAbandon {
+        if self.dispatched_client_modeset_tokens.contains(&token) {
+            return RequesterAbandon::ContinuesWithoutRequester;
+        }
+
+        if self.pending_crtc_config_probes.contains_key(&token) {
+            self.cancel_crtc_config(token);
+            return RequesterAbandon::Cancelled;
+        }
+
+        match self.abandon_owner_client_modeset_requester(token) {
+            Some(false) => RequesterAbandon::ContinuesWithoutRequester,
+            Some(true) | None => {
+                self.cancel_crtc_config(token);
+                RequesterAbandon::Cancelled
+            }
+        }
+    }
+
+    fn crtc_config_install_capable(&self, token: CrtcConfigToken) -> bool {
+        self.dispatched_client_modeset_tokens.contains(&token)
     }
 
     fn apply_crtc_config(
@@ -32856,6 +32886,31 @@ mod tests {
         );
         Backend::cancel_crtc_config(&mut backend, token);
         assert_eq!(state.borrow().cancelled, vec![token]);
+    }
+
+    #[test]
+    fn c0_3bii_kms_prime_probe_requester_is_cancelled() {
+        use yserver_core::backend::RequesterAbandon;
+
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            None,
+        )));
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue PRIME qualification")
+        else {
+            panic!("cross-device qualification must park");
+        };
+        assert!(!Backend::crtc_config_install_capable(&backend, token));
+        assert_eq!(
+            Backend::abandon_crtc_config_requester(&mut backend, token),
+            RequesterAbandon::Cancelled
+        );
+        assert!(!backend.pending_crtc_config_probes.contains_key(&token));
+        assert_eq!(state.borrow().cancelled, [token]);
     }
 
     #[test]
@@ -62607,6 +62662,71 @@ mod tests {
             Some(token),
             "same dimensions with a different refresh are not idempotent"
         );
+    }
+
+    #[test]
+    fn c0_3bii_kms_undispatched_owner_requester_is_cancelled() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_core::backend::RequesterAbandon;
+
+        let (mut backend, _device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+        );
+        assert!(!Backend::crtc_config_install_capable(&backend, token));
+        assert_eq!(
+            Backend::abandon_crtc_config_requester(&mut backend, token),
+            RequesterAbandon::Cancelled
+        );
+        assert!(!Backend::crtc_config_install_capable(&backend, token));
+    }
+
+    #[test]
+    fn c0_3bii_kms_dispatched_owner_requester_continues() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+        use yserver_core::backend::RequesterAbandon;
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }));
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+        );
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.phase),
+            Some(crate::kms::render::admission::ClientModesetPhase::Dispatched)
+        );
+        assert!(Backend::crtc_config_install_capable(&backend, token));
+        assert_eq!(
+            Backend::abandon_crtc_config_requester(&mut backend, token),
+            RequesterAbandon::ContinuesWithoutRequester
+        );
+
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("modeset is already dispatched")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(Backend::crtc_config_install_capable(&backend, token));
+        assert!(Backend::finish_crtc_config(&mut backend, token).expect("terminal result"));
+        assert!(!Backend::crtc_config_install_capable(&backend, token));
     }
 
     #[test]

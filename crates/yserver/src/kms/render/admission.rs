@@ -824,6 +824,65 @@ impl KmsBackend {
         Ok(())
     }
 
+    /// Retire an Owner client modeset that has not crossed the dispatch
+    /// boundary. A dispatched token stays live even after its lifecycle slot
+    /// resolves, until the core consumes its terminal result.
+    pub(crate) fn abandon_owner_client_modeset_requester(
+        &mut self,
+        token: yserver_core::backend::CrtcConfigToken,
+    ) -> Option<bool> {
+        let (device, tag, phase) = self.lifecycle_drivers.iter().find_map(|(device, driver)| {
+            driver
+                .client_modeset
+                .as_ref()
+                .filter(|slot| slot.token == token)
+                .map(|slot| (*device, slot.tag, slot.phase))
+        })?;
+        if phase == ClientModesetPhase::Dispatched {
+            return Some(false);
+        }
+
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor
+                .admission
+                .cancel_topology(TopologyWork::ClientModeset(tag));
+        }
+
+        let validation = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+            driver
+                .pending_client_modeset_validations
+                .iter_mut()
+                .find(|(_, pending)| pending.tag == tag)
+                .map(|(commit, pending)| {
+                    pending.cancelled = true;
+                    (*commit, pending.sent, pending.token.take())
+                })
+        });
+        if let Some((commit, sent, admission_token)) = validation {
+            if let Some(admission_token) = admission_token
+                && let Some(conductor) = self.admission_conductors.get_mut(&device)
+            {
+                let _ = conductor.admission.abort(admission_token);
+            }
+            if !sent {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(commit);
+                }
+                self.lifecycle_abort_client_modeset_validation(device, commit, false);
+            }
+        }
+
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+            && driver
+                .client_modeset
+                .as_ref()
+                .is_some_and(|slot| slot.tag == tag)
+        {
+            driver.client_modeset.take();
+        }
+        Some(true)
+    }
+
     fn lifecycle_queue_waiting_client_modeset(&mut self, device: DrmDeviceKey) {
         let current = self
             .lifecycle_coordinator
@@ -2679,6 +2738,7 @@ impl KmsBackend {
                 && slot.tag == tag
             {
                 slot.phase = ClientModesetPhase::Dispatched;
+                self.dispatched_client_modeset_tokens.insert(slot.token);
             }
             driver.client_modeset_commits.insert(commit, tag);
         }

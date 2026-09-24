@@ -54,6 +54,15 @@ pub enum CrtcConfigApply {
     Pending(CrtcConfigToken),
 }
 
+/// What happens to a pending CRTC operation when its requesting client leaves.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RequesterAbandon {
+    /// The backend cancelled the operation; it can no longer install.
+    Cancelled,
+    /// The operation may still install and must complete without a reply.
+    ContinuesWithoutRequester,
+}
+
 /// A pair identifying a logical Present sequence consumer and its requested
 /// sequence target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -701,6 +710,15 @@ pub trait Backend {
     /// longer waiting. Implementations must tolerate a completion racing the
     /// cancellation and must never install that cancelled result later.
     fn cancel_crtc_config(&mut self, _token: CrtcConfigToken) {}
+
+    /// Detach the requesting client from an asynchronous CRTC operation.
+    /// `Cancelled` means the backend has also cancelled the token; a
+    /// `ContinuesWithoutRequester` token remains live and must still be
+    /// drained and finished so any installed state can be published.
+    fn abandon_crtc_config_requester(&mut self, token: CrtcConfigToken) -> RequesterAbandon {
+        self.cancel_crtc_config(token);
+        RequesterAbandon::Cancelled
+    }
 
     /// Whether an outstanding CRTC configuration token has been dispatched
     /// to work that may still install. `GetScreenResources` is serialized
