@@ -962,3 +962,12 @@ from C.0 or a review finding, none reverses a decision of the session:
    the alternative — keeping every pool displaced under DPMS-off until the
    CRTC is lit — grows memory with each mode change made while the screen is
    off.
+7. **Generation reset waits** (section 7.2, rev 10): when the last client
+   leaves during a dispatched Owner modeset, the reset (or `-terminate`) waits
+   for its result (bounded by `E`) before snapshotting.
+8. **Forced reprobe** (section 7.1, rev 11): `GetScreenResources` waits behind
+   a dispatched Owner modeset; named exception 6.
+9. **Pre-C.0 oracle** (3b-ii plan Task 5): the core's existing RANDR byte
+   tests plus the stage 5 golden rerun, since the golden stays outside the
+   repository by the user's 2026-09-22 decision — no frozen transcripts in
+   the repository.
