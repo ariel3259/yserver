@@ -17,7 +17,11 @@
 //! `nested::handle_request`'s ChangeWindowAttributes path on
 //! ROOT_WINDOW pokes the container).
 
-use std::{io, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    io,
+    sync::{Arc, Mutex},
+};
 
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes};
 
@@ -26,8 +30,9 @@ use crate::{
         AnyHandle, Backend, ClipState, CompletedPresentEvent, CrtcConfigApply, CrtcConfigToken,
         CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle, ModeSpec, OriginContext,
         PictureHandle, PixmapHandle, PresentScanoutCandidate, PresentSequenceTarget,
-        PresentSourceWait, RequesterAbandon, WindowHandle,
+        PresentSourceWait, RequesterAbandon, RequesterlessPublication, WindowHandle,
     },
+    core_loop::{CoreSender, Message},
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
 
@@ -203,6 +208,25 @@ type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 /// Test double for `Backend`. Auto-allocates host xids from a private
 type BeforeBlockAction = Box<dyn FnMut(&mut RecordingBackend) + Send>;
 
+/// Test producer for backend-originated RANDR publications. Enqueueing always
+/// sends the same wake used for ready CRTC tokens, including when no token is
+/// pending.
+#[derive(Clone)]
+pub struct RequesterlessPublicationProducer {
+    publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
+    sender: CoreSender,
+}
+
+impl RequesterlessPublicationProducer {
+    pub fn enqueue(&self, publication: RequesterlessPublication) -> io::Result<()> {
+        self.publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(publication);
+        self.sender.send(Message::CrtcConfigReady)
+    }
+}
+
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
@@ -299,6 +323,7 @@ pub struct RecordingBackend {
     /// `None` preserves the synchronous `apply_crtc_config` path.
     pub pending_crtc_config: Option<CrtcConfigToken>,
     pub ready_crtc_configs: Vec<CrtcConfigToken>,
+    requesterless_publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
     pub crtc_config_results:
         std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
     pub finished_crtc_configs: Vec<CrtcConfigToken>,
@@ -549,6 +574,7 @@ impl RecordingBackend {
             provider_output_source_error: None,
             pending_crtc_config: None,
             ready_crtc_configs: Vec::new(),
+            requesterless_publications: Arc::new(Mutex::new(VecDeque::new())),
             crtc_config_results: std::collections::HashMap::new(),
             finished_crtc_configs: Vec::new(),
             cancelled_crtc_configs: Vec::new(),
@@ -613,6 +639,19 @@ impl RecordingBackend {
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
             applied_device_configs: Vec::new(),
+        }
+    }
+
+    /// Return a producer handle for tests that enqueue a requester-less
+    /// publication while the backend is owned by the core-loop thread.
+    #[must_use]
+    pub fn requesterless_publication_producer(
+        &self,
+        sender: CoreSender,
+    ) -> RequesterlessPublicationProducer {
+        RequesterlessPublicationProducer {
+            publications: Arc::clone(&self.requesterless_publications),
+            sender,
         }
     }
 
@@ -1314,6 +1353,14 @@ impl Backend for RecordingBackend {
 
     fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
         std::mem::take(&mut self.ready_crtc_configs)
+    }
+
+    fn drain_requesterless_publications(&mut self) -> Vec<RequesterlessPublication> {
+        self.requesterless_publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
     }
 
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {

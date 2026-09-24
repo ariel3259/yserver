@@ -24784,6 +24784,15 @@ impl Backend for KmsBackend {
         self.ready_crtc_config_announcements.drain(..).collect()
     }
 
+    fn drain_requesterless_publications(
+        &mut self,
+    ) -> Vec<yserver_core::backend::RequesterlessPublication> {
+        // Hotplug/VT/recovery producers are connected to the ordered gate in
+        // later phases. Until then KMS keeps the existing direct publication
+        // path and contributes no requester-less gate entries.
+        Vec::new()
+    }
+
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
         self.remove_crtc_config_ready_announcement(token);
         self.invalidated_crtc_config_probes.remove(&token);

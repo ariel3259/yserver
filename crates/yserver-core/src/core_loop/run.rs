@@ -39,7 +39,10 @@ use super::{
     xdmcp::{XDMCP_TOKEN, XdmcpOutcome, XdmcpService},
 };
 use crate::{
-    backend::{Backend, BackendFdKind, CrtcConfigToken, HostSocketStatus, RequesterAbandon},
+    backend::{
+        Backend, BackendFdKind, CrtcConfigToken, HostSocketStatus, RequesterAbandon,
+        RequesterlessPublication,
+    },
     host_x11::HostEvent,
     server::{KeyRepeatState, ServerState},
     transport::{Listener, Transport},
@@ -689,6 +692,7 @@ struct RandrGateFlight {
 pub(crate) struct RandrMutationGate {
     waiting: VecDeque<RandrGateWaiter>,
     in_flight: Option<RandrGateFlight>,
+    requesterless_publications: VecDeque<RequesterlessPublication>,
     next_ticket: u64,
 }
 
@@ -867,9 +871,21 @@ impl RandrMutationGate {
         }
     }
 
+    fn queue_requesterless_publications(
+        &mut self,
+        publications: impl IntoIterator<Item = RequesterlessPublication>,
+    ) {
+        self.requesterless_publications.extend(publications);
+    }
+
+    fn take_requesterless_publications(&mut self) -> Vec<RequesterlessPublication> {
+        self.requesterless_publications.drain(..).collect()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.waiting.clear();
         self.in_flight = None;
+        self.requesterless_publications.clear();
         self.next_ticket = 0;
     }
 
@@ -1584,6 +1600,7 @@ fn drain_ready_crtc_configs_with_gate_policy(
     reset_trigger: &mut ResetTrigger,
     publish_old_generation: bool,
 ) {
+    drain_requesterless_publications(state, backend, gate, publish_old_generation);
     for token in backend.drain_ready_crtc_configs() {
         let parked = pending.take_crtc_reply(token);
         let Some(publication) = gate.take_publication(token) else {
@@ -1591,6 +1608,7 @@ fn drain_ready_crtc_configs_with_gate_policy(
             // gate-owned publication was cancelled or otherwise superseded.
             backend.cancel_crtc_config(token);
             gate.finish_pending(token);
+            drain_requesterless_publications(state, backend, gate, publish_old_generation);
             continue;
         };
 
@@ -1601,12 +1619,33 @@ fn drain_ready_crtc_configs_with_gate_policy(
             // cancel it before the reset snapshot instead of advancing it.
             backend.cancel_crtc_config(token);
             gate.finish_pending(token);
+            drain_requesterless_publications(state, backend, gate, publish_old_generation);
             continue;
         }
 
         let result = backend.finish_crtc_config(token);
-        let outcome = if publish_old_generation {
-            let status = publish_crtc_config(state, backend, publication, result);
+        let status = if publish_old_generation {
+            Some(publish_crtc_config(state, backend, publication, result))
+        } else {
+            // The backend result is terminal, but this generation is already
+            // committed to reset/termination. The new generation snapshots
+            // the installed topology after this gate is released.
+            let _ = (publication, result);
+            None
+        };
+
+        if publish_old_generation {
+            if std::mem::take(&mut state.damage_notify_flush_pending) {
+                backend.flush_before_damage_notify();
+            }
+            backend.mark_dirty();
+        }
+        gate.finish_pending(token);
+        // A publication queued behind dispatched work is released immediately
+        // after that work's state publication and before its client reply or
+        // any waiting request can be admitted.
+        drain_requesterless_publications(state, backend, gate, publish_old_generation);
+        let outcome = if let Some(status) = status {
             let timestamp = state.randr.timestamp;
             parked.map_or(
                 RequestOutcome::Handled,
@@ -1630,20 +1669,8 @@ fn drain_ready_crtc_configs_with_gate_policy(
                 },
             )
         } else {
-            // The backend result is terminal, but this generation is already
-            // committed to reset/termination. The new generation snapshots
-            // the installed topology after this gate is released.
-            let _ = (publication, result);
             RequestOutcome::Handled
         };
-
-        if publish_old_generation {
-            if std::mem::take(&mut state.damage_notify_flush_pending) {
-                backend.flush_before_damage_notify();
-            }
-            backend.mark_dirty();
-        }
-        gate.finish_pending(token);
         match outcome {
             RequestOutcome::Disconnect(client) => {
                 disconnect_with_pending_cleanup(
@@ -1664,6 +1691,35 @@ fn drain_ready_crtc_configs_with_gate_policy(
                 unreachable!("CRTC completion cannot start a second asynchronous request")
             }
         }
+    }
+}
+
+fn drain_requesterless_publications(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    gate: &mut RandrMutationGate,
+    publish_old_generation: bool,
+) {
+    let publications = backend.drain_requesterless_publications();
+    if !publish_old_generation {
+        // Requester-less events belong to the generation whose backend state
+        // produced them. A reset/termination takes its fresh snapshot from the
+        // backend after the terminal result and must not publish old events.
+        gate.requesterless_publications.clear();
+        return;
+    }
+    gate.queue_requesterless_publications(publications);
+    if gate.active_install_capable(backend) {
+        return;
+    }
+
+    for publication in gate.take_requesterless_publications() {
+        let output_bbox_before = enabled_output_bbox(state);
+        publication.publish(state, output_bbox_before);
+        if std::mem::take(&mut state.damage_notify_flush_pending) {
+            backend.flush_before_damage_notify();
+        }
+        backend.mark_dirty();
     }
 }
 
@@ -4688,6 +4744,23 @@ mod tests {
         output.vrefresh = mode.vrefresh;
     }
 
+    fn c0_requesterless_publication(
+        mode_id: u32,
+        config_changed: bool,
+    ) -> RequesterlessPublication {
+        RequesterlessPublication::new(
+            config_changed,
+            move |state| set_c0_output_mode(state, mode_id),
+            move |state, output_bbox_before| {
+                emit_randr_change_notifications(state, &[(1, 2, mode_id)]);
+                emit_screen_resize_window_notifications_if_outputs_caught_up(
+                    state,
+                    output_bbox_before,
+                );
+            },
+        )
+    }
+
     fn install_c0_kill_target(state: &mut ServerState, owner: u32) -> u32 {
         let resource = 0x2000_0000 | owner;
         state.resources.create_window(
@@ -6430,6 +6503,287 @@ mod tests {
             "both expired waiters stay out of the backend"
         );
         assert!(read_c0_available(&mut a).is_empty());
+    }
+
+    #[test]
+    fn c0_3bii_requesterless_waits_behind_a_dispatched_modeset() {
+        use crate::{
+            backend::{CrtcConfigToken, RequesterAbandon, recording::RecordingBackend},
+            core_loop::channel,
+        };
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut requester = install_c0_client(&mut state, 1);
+        let mut listener = install_c0_client(&mut state, 2);
+        state.randr_select_masks.insert(
+            (2, crate::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let token = CrtcConfigToken(226);
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(token);
+        backend.crtc_config_is_install_capable = true;
+        backend.crtc_config_requester_abandon = RequesterAbandon::ContinuesWithoutRequester;
+        backend.crtc_config_results.insert(token, Ok(true));
+        let (_poll, sender, _rx) = channel().unwrap();
+        let producer = backend.requesterless_publication_producer(sender.clone_handle());
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_SET_CRTC_CONFIG, set_crtc_body_at(4, 555), 8),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(gate.is_busy());
+        abandon_client_randr_requests(
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            yserver_protocol::x11::ClientId(1),
+        );
+        abandon_client_randr_requests(
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            yserver_protocol::x11::ClientId(1),
+        );
+
+        producer
+            .enqueue(c0_requesterless_publication(3, true))
+            .unwrap();
+        // The publication wake is serviced while the dispatched mutation is
+        // still live, but its event remains behind that mutation.
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert!(read_c0_available(&mut listener).is_empty());
+        assert_eq!(gate.requesterless_publications.len(), 1);
+
+        // The modeset installs 1280×720 and publishes first. The backend
+        // publication then restores 1920×1080 and emits its own event.
+        set_c0_output_mode(&mut state, 4);
+        backend.ready_crtc_configs.push(token);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        let events = read_c0_available(&mut listener);
+        assert_eq!(events.len(), 64);
+        assert_eq!(
+            (events[1], events[33]),
+            (rr::NOTIFY_CRTC_CHANGE, rr::NOTIFY_CRTC_CHANGE)
+        );
+        assert_eq!(
+            [
+                u16::from_le_bytes(events[28..30].try_into().unwrap()),
+                u16::from_le_bytes(events[60..62].try_into().unwrap()),
+            ],
+            [1280, 1920],
+            "the requester-less publication follows the installed modeset publication"
+        );
+        assert!(read_c0_available(&mut requester).is_empty());
+        assert_eq!(state.randr.timestamp, 555);
+    }
+
+    #[test]
+    fn c0_3bii_requesterless_does_not_wait_for_a_superseded_one() {
+        use crate::{
+            backend::{CrtcConfigToken, RequesterlessPublication, recording::RecordingBackend},
+            core_loop::channel,
+        };
+        use std::{
+            io::Read,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut requester = install_c0_client(&mut state, 1);
+        let requester_probe = requester.try_clone().unwrap();
+        let mut listener = install_c0_client(&mut state, 2);
+        state.randr_select_masks.insert(
+            (2, crate::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let token = CrtcConfigToken(227);
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(token);
+        backend.crtc_config_is_install_capable = false;
+        backend
+            .crtc_config_results
+            .insert(token, Err(io::ErrorKind::Other));
+        let (_poll, sender, _rx) = channel().unwrap();
+        let producer = backend.requesterless_publication_producer(sender.clone_handle());
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_SET_CRTC_CONFIG, set_crtc_body(4), 8),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(gate.is_busy());
+
+        // This publication represents the REC-4 transition that supersedes
+        // the still-undispatched probe. It must publish on its wake, without
+        // waiting for that token's terminal Failed result.
+        let reply_seen_during_publication = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&reply_seen_during_publication);
+        let mut requester_probe = requester_probe;
+        requester_probe.set_nonblocking(true).unwrap();
+        producer
+            .enqueue(RequesterlessPublication::new(
+                true,
+                |state| set_c0_output_mode(state, 4),
+                move |state, output_bbox_before| {
+                    let mut byte = [0; 1];
+                    match requester_probe.read(&mut byte) {
+                        Ok(0) => {}
+                        Ok(_) => seen.store(true, Ordering::SeqCst),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("probe requester output during publication: {error}"),
+                    }
+                    emit_randr_change_notifications(state, &[(1, 2, 4)]);
+                    emit_screen_resize_window_notifications_if_outputs_caught_up(
+                        state,
+                        output_bbox_before,
+                    );
+                },
+            ))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert!(!reply_seen_during_publication.load(Ordering::SeqCst));
+        assert!(gate.is_busy(), "the CRTC result has not arrived yet");
+        let published = read_c0_available(&mut listener);
+        assert_eq!(published.len(), 32, "publication is immediate on its wake");
+
+        backend.ready_crtc_configs.push(token);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        let reply = read_c0_available(&mut requester);
+        assert_eq!(reply.len(), 32);
+        assert_eq!(reply[1], 3, "the superseded CRTC request fails");
+        assert!(read_c0_available(&mut listener).is_empty());
+    }
+
+    #[test]
+    fn c0_3bii_requesterless_on_an_idle_gate() {
+        use crate::{
+            backend::{RequesterlessPublication, recording::RecordingBackend},
+            core_loop::{Message, channel},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        };
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        state.randr.timestamp = 777;
+        state.randr.config_timestamp = 888;
+        let mut listener = install_c0_client(&mut state, 2);
+        state.randr_select_masks.insert(
+            (2, crate::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let mut backend = RecordingBackend::new();
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let producer = backend.requesterless_publication_producer(sender.clone_handle());
+        let config_time_at_notification = Arc::new(AtomicU32::new(u32::MAX));
+        let config_time_capture = Arc::clone(&config_time_at_notification);
+        let handle = std::thread::spawn(move || {
+            let mut state = state;
+            let result = run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &ClientIdAllocator::new(),
+                AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
+            );
+            (result, state, backend)
+        });
+
+        producer
+            .enqueue(RequesterlessPublication::new(
+                true,
+                |state| set_c0_output_mode(state, 4),
+                move |state, output_bbox_before| {
+                    config_time_capture.store(state.randr.config_timestamp, Ordering::SeqCst);
+                    emit_randr_change_notifications(state, &[(1, 2, 4)]);
+                    emit_screen_resize_window_notifications_if_outputs_caught_up(
+                        state,
+                        output_bbox_before,
+                    );
+                },
+            ))
+            .unwrap();
+        let event = read_c0_until(&mut listener, 32, Duration::from_secs(2));
+        sender.send(Message::Shutdown).unwrap();
+        let (result, state, backend) = handle.join().unwrap();
+        result.unwrap();
+
+        assert_eq!(
+            event.len(),
+            32,
+            "the wake publishes with no CRTC token ready"
+        );
+        assert_eq!(event[1], rr::NOTIFY_CRTC_CHANGE);
+        assert_eq!(u16::from_le_bytes(event[28..30].try_into().unwrap()), 1280);
+        assert_eq!(state.randr.timestamp, 777, "lastSetTime is unchanged");
+        assert_ne!(state.randr.config_timestamp, 888, "lastConfigTime advances");
+        assert_eq!(
+            state.randr.config_timestamp,
+            config_time_at_notification.load(Ordering::SeqCst),
+            "notifications carry the updated lastConfigTime"
+        );
+        assert!(backend.finished_crtc_configs.is_empty());
     }
 
     #[test]
