@@ -1,10 +1,11 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 5 (codex rounds
+**Status:** Revision 6 (codex rounds
 [1](../findings/2026-09-24-stage-3b-design-review-round1.md),
 [2](../findings/2026-09-24-stage-3b-design-review-round2.md),
-[3](../findings/2026-09-24-stage-3b-design-review-round3.md) and
-[4](../findings/2026-09-24-stage-3b-design-review-round4.md)), written by the
+[3](../findings/2026-09-24-stage-3b-design-review-round3.md),
+[4](../findings/2026-09-24-stage-3b-design-review-round4.md) and
+[5](../findings/2026-09-24-stage-3b-design-review-round5.md)), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -197,7 +198,15 @@ mode and its pool, and no plane `SRC`/`CRTC` rectangle changes. The Owner
 therefore runs a position-only request as a **logical transaction with no
 commit**: it takes the device's client-modeset slot (so it is ordered with
 real modesets and superseded like them before promotion) and promotes
-(section 4.2) without a `Tier::Topology` dispatch. *(Rev 5, round-4 B-1.)* It
+(section 4.2) without a KMS dispatch. *(Rev 6, round-5 B-1.)* It is still
+class-1 work and passes the **same class-1 barrier** as a real modeset: it is
+admitted on `Tier::Topology` and promotes only when the device slot holds no
+`Submitting` or accepted record (C.0 §9.2 — topology work never overtakes
+one); the admission carries an empty description and sends nothing to the
+executor. Its promotion advances the device's topology generation, so a
+composed intent queued for the old origin and not yet dispatched is
+invalidated and recomposed; a frame already accepted completed before the
+promotion. *(Rev 5, round-4 B-1.)* It
 does **not** replace the output's scene state: the existing
 `OutputSceneState` is updated in place — its origin, and full damage — so its
 composition ring, pending releases, pending acknowledgements and owner
@@ -426,6 +435,19 @@ the disable therefore cannot redirect a retired resource to another output,
 and the copied route's source-side resources retire with their bundle under
 2c-iii's copied-route rules.
 
+**In-flight work follows identity, not position** *(rev 6, round-5 M-1)*.
+Asynchronous render work that completes later — a copied-route copy job, a
+composition submit, a deferred release — is correlated today by output index
+(the copied completion path looks up `pending_acks` by index and may go on to
+`submit_copied_scanout`, `scene.rs:4531`, `:4557`). After promotion every
+such completion is resolved through its job's identity: to a kept output by
+its `OutputKey` (whatever its new position), or to the retired-output bundle
+that owns the job. A completion routed to a bundle only services proofs — the
+fence, the source/sink ownership returns, the release obligations — and then
+terminalizes its old work; it never offers a generation, never submits to KMS
+and never touches the new pool. Queued intents of the older topology
+generation are invalidated as C.0 §9.2 requires.
+
 The scene state and `platform.scanout_pools` are indexed **by position** in
 `platform.outputs`. Adding or removing an output shifts the positions of the
 others, including those of other devices. The per-device rebuild re-associates
@@ -482,7 +504,7 @@ server with no Owner device behaves exactly as today.
 | Preparation: discovery, unadvertised mode, route, allocation, `TEST_ONLY` | prepared set released; old topology authoritative; device stays `Ready` | `Failed` |
 | Superseded by a `REC-4` event before dispatch | same | `Failed` |
 | Real commit rejected with `EBUSY` *(rev 2, round-1 B-1)* | C.0 §9.4: the owner never dispatches while its own record occupies the slot, so `EBUSY` is an ownership invariant failure, not a scheduling signal — no retry. The prepared set is released, the foreign/internal-busy evidence recorded, readiness closed, and the device enters the bounded topology/recovery path (its exit is 3c/3d's) | `Failed` |
-| Real commit explicitly rejected (other errno) | `FailedBeforeSubmit`: nothing became current, prepared set released, no poison. An `EINVAL`/`EOPNOTSUPP` attributable to the object combination latches **the requested topology** (C.0 §10 latch scopes): the latch key is `(installed topology generation, requested configuration of the device)`; an identical request under the same installed generation answers `Failed` (`Latched`) without dispatch; any installed-generation change clears it; the installed topology stays `Ready` | `Failed` |
+| Real commit explicitly rejected (other errno) | `FailedBeforeSubmit`: nothing became current, prepared set released, and every `KmsRelease` the commit registered on the old pool at dispatch is cancelled exactly once (`ResourceService::cancel`, `resources/mod.rs:920`) — the old pool stays current and its obligations must not outlive the rejected commit *(rev 6, round-5 M-2)*; no poison. An `EINVAL`/`EOPNOTSUPP` attributable to the object combination latches **the requested topology** (C.0 §10 latch scopes): the latch key is `(installed topology generation, requested configuration of the device)`; an identical request under the same installed generation answers `Failed` (`Latched`) without dispatch; any installed-generation change clears it; the installed topology stays `Ready` | `Failed` |
 | Completion loss: missing/invalid/error fence, deadline, contradiction | `CompletionUnknown` → `Poisoned`, both state sets quarantined (3a-ii) | `Failed`, nothing published |
 | Stale result (accepted after its identity stopped being current) | accepted-stale: fds adopted or closed once, quarantine retained by the winning transition, nothing installed | `Failed` |
 | Renderer device loss at any point | existing `renderer_failed` clean shutdown (global render-device policy, unchanged) | none — the server exits cleanly |
@@ -706,6 +728,17 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   commit, survives acceptance, is discharged only by that commit's
   `CompletionRetired`, and is destroyed only once its GPU/FOREIGN proofs also
   hold; under `CompletionUnknown` it stays quarantined.
+- **Rejection cancels the displacement:** a rejected modeset followed by a
+  successful one: the rejected commit's `KmsRelease` registrations are
+  cancelled once, the old pool is discharged by the successful commit's
+  retirement, and nothing waits for a device barrier.
+- **Position-only behind an accepted flip:** an accepted composed flip held
+  through a position-only request: promotion and the reply wait until it
+  completes; a composed intent queued for the old origin is invalidated.
+- **Late copy completion:** a copied-route copy job completes after its
+  output was disabled (and after an index shift), and after a mode change:
+  its proofs are serviced from the bundle, nothing is offered or submitted,
+  and the new pool is untouched.
 - **Dark CRTC:** three mode changes and then a disable under DPMS-off: each
   displaced pool is discharged by `DarkCrtcDisplacement` at its successor's
   `Completed`; with an unproven off (the off commit made `CompletionUnknown`
@@ -787,6 +820,12 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
 22. A position-only change replacing the scene state → the in-place test
     fails.
 23. A retired resource addressed by output index → the retired-bundle test
+    fails.
+24. A position-only promotion that does not wait for the device slot → the
+    accepted-flip test fails.
+25. A late completion routed by index, or allowed to offer or submit → the
+    late-copy test fails.
+26. A rejected commit's `KmsRelease` left registered → the rejection test
     fails.
 15. A `REC-4` event held at the gate → the section 7.5 sequence fails.
 16. Gate admission in ready-ring order instead of arrival order, or `Q`
