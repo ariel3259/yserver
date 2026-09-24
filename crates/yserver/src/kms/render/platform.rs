@@ -53,7 +53,7 @@ use crate::{
     drm,
     kms::{
         backend::{
-            ActiveOutput, OutputKey, PlatformInit, PlatformInitOutput,
+            ActiveOutput, OutputInstanceId, OutputKey, PlatformInit, PlatformInitOutput,
             platform_init as core_platform_init,
         },
         render::{
@@ -694,6 +694,7 @@ pub(crate) enum ScanoutRenderCompletionStage {
 struct PendingScanoutRenderCompletion {
     job_id: u64,
     output_key: OutputKey,
+    output_instance_id: OutputInstanceId,
     bo_idx: usize,
     stage: ScanoutRenderCompletionStage,
     /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
@@ -1036,6 +1037,7 @@ pub(crate) fn finish_copied_route_latency_for_tests()
 pub(crate) struct ReadyScanoutRenderCompletion {
     pub(crate) job_id: u64,
     pub(crate) output_key: OutputKey,
+    pub(crate) output_instance_id: OutputInstanceId,
     pub(crate) bo_idx: usize,
     pub(crate) stage: ScanoutRenderCompletionStage,
     pub(crate) fd: Option<OwnedFd>,
@@ -1582,6 +1584,28 @@ fn retain_initialized_scanout_pools<T>(pools: &mut [Option<T>]) {
     for pool in pools.iter_mut().filter_map(Option::take) {
         std::mem::forget(pool);
     }
+}
+
+fn initial_output_instance_ids(
+    outputs: &[ActiveOutput],
+) -> io::Result<(
+    Vec<OutputInstanceId>,
+    HashMap<crate::platform::drm::DrmDeviceKey, u64>,
+)> {
+    let mut ids = Vec::with_capacity(outputs.len());
+    let mut next_ids = HashMap::new();
+    for output in outputs {
+        let next = next_ids.entry(output.key.device_key).or_insert(1u64);
+        let serial = *next;
+        *next = serial
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("output instance id exhausted"))?;
+        ids.push(OutputInstanceId {
+            device_key: output.key.device_key,
+            serial,
+        });
+    }
+    Ok((ids, next_ids))
 }
 
 fn retain_startup_gpu_owners<A, B, C>(ops: A, fences: B, pixmaps: C) {
@@ -2694,6 +2718,10 @@ pub struct PlatformBackend {
     pub(crate) render_devices: Vec<RenderDevice>,
     pub(crate) selected_render_device: Option<RenderDeviceId>,
     pub(crate) outputs: Vec<ActiveOutput>,
+    /// Identity of the `OutputScanout` paired with each output. This vector is
+    /// moved with the output and pool through topology changes.
+    pub(crate) output_instance_ids: Vec<OutputInstanceId>,
+    next_output_instance_ids: HashMap<crate::platform::drm::DrmDeviceKey, u64>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     /// Latest general kernel `(msc, ust_micros)` per device-qualified CRTC, updated
@@ -3534,6 +3562,8 @@ impl PlatformBackend {
             .zip(scanout_routes)
             .map(|(layout, route)| layout.qualify(route))
             .collect::<Vec<_>>();
+        let (output_instance_ids, next_output_instance_ids) =
+            initial_output_instance_ids(&outputs)?;
         debug_assert!(outputs.iter().zip(&scanout_pools).all(|(output, pool)| {
             pool.as_ref()
                 .is_none_or(|pool| pool.route() == output.scanout_route)
@@ -3545,6 +3575,8 @@ impl PlatformBackend {
             render_devices,
             selected_render_device: Some(selected_render_device),
             outputs,
+            output_instance_ids,
+            next_output_instance_ids,
             fb_w,
             fb_h,
             ust_msc: std::collections::HashMap::new(),
@@ -3687,6 +3719,11 @@ impl PlatformBackend {
                 0,
                 0,
             )],
+            output_instance_ids: vec![OutputInstanceId {
+                device_key,
+                serial: 1,
+            }],
+            next_output_instance_ids: HashMap::from([(device_key, 2)]),
             fb_w: 800,
             fb_h: 600,
             ust_msc: std::collections::HashMap::new(),
@@ -3755,6 +3792,24 @@ impl PlatformBackend {
         self.transport_gates.insert(gate.device(), gate);
     }
 
+    pub(crate) fn allocate_output_instance_id(
+        &mut self,
+        key: &OutputKey,
+    ) -> io::Result<OutputInstanceId> {
+        let next = self
+            .next_output_instance_ids
+            .entry(key.device_key)
+            .or_insert(1);
+        let serial = *next;
+        *next = serial
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("output instance id exhausted"))?;
+        Ok(OutputInstanceId {
+            device_key: key.device_key,
+            serial,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn append_test_output_without_scanout_pool(&mut self, connector_name: &str) {
         let device_key = self
@@ -3774,6 +3829,11 @@ impl PlatformBackend {
         output.output.crtc = ::drm::control::from_u32(raw_crtc).expect("test CRTC");
         output.output.plane = ::drm::control::from_u32(raw_crtc).expect("test plane");
         self.outputs.push(output);
+        let output_key = self.outputs.last().expect("appended output").key.clone();
+        let instance_id = self
+            .allocate_output_instance_id(&output_key)
+            .expect("test output instance id does not overflow");
+        self.output_instance_ids.push(instance_id);
         self.scanout_pools.push(None);
         self.bo_generations.push(Vec::new());
         self.first_pageflip_logged.push(false);
@@ -3791,7 +3851,26 @@ impl PlatformBackend {
     ) -> io::Result<()> {
         self.append_test_output_without_scanout_pool(connector_name);
         let output_idx = self.outputs.len().saturating_sub(1);
-        let layout = &self.outputs[output_idx];
+        let pool = self.allocate_test_output_scanout(vk, output_idx)?;
+        self.scanout_pools[output_idx] = Some(pool);
+        self.bo_generations[output_idx] = self.scanout_pools[output_idx]
+            .as_ref()
+            .map_or_else(Vec::new, |pool| {
+                vec![BoGenerationEntry::default(); pool.display_pool().bos.len()]
+            });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocate_test_output_scanout(
+        &self,
+        vk: std::sync::Arc<crate::kms::vk::device::VkContext>,
+        output_idx: usize,
+    ) -> io::Result<OutputScanout> {
+        let layout = self
+            .outputs
+            .get(output_idx)
+            .ok_or_else(|| io::Error::other("test output index out of range"))?;
         let kms_device = self
             .device_for_key(layout.key.device_key)
             .ok_or_else(|| io::Error::other("test output has no KMS device"))?;
@@ -3805,13 +3884,7 @@ impl PlatformBackend {
             &layout.output.scanout_modifiers,
         )
         .map_err(|error| io::Error::other(format!("test output scanout pool: {error}")))?;
-        self.scanout_pools[output_idx] = Some(OutputScanout::Shared(pool));
-        self.bo_generations[output_idx] = self.scanout_pools[output_idx]
-            .as_ref()
-            .map_or_else(Vec::new, |pool| {
-                vec![BoGenerationEntry::default(); pool.display_pool().bos.len()]
-            });
-        Ok(())
+        Ok(OutputScanout::Shared(pool))
     }
 
     /// Install a transport gate after checking the complete device route.
@@ -5342,6 +5415,7 @@ impl PlatformBackend {
     pub(crate) fn register_scanout_render_completion(
         &mut self,
         output_key: OutputKey,
+        output_instance_id: OutputInstanceId,
         bo_idx: usize,
         stage: ScanoutRenderCompletionStage,
         fd: Option<OwnedFd>,
@@ -5359,6 +5433,7 @@ impl PlatformBackend {
             .push_back(PendingScanoutRenderCompletion {
                 job_id,
                 output_key,
+                output_instance_id,
                 bo_idx,
                 stage,
                 fd,
@@ -5417,6 +5492,7 @@ impl PlatformBackend {
             ready.push(ReadyScanoutRenderCompletion {
                 job_id: pending.job_id,
                 output_key: pending.output_key,
+                output_instance_id: pending.output_instance_id,
                 bo_idx: pending.bo_idx,
                 stage: pending.stage,
                 fd: pending.fd,
@@ -7366,6 +7442,9 @@ impl PlatformBackend {
         if idx < self.first_pageflip_logged.len() {
             self.first_pageflip_logged.remove(idx);
         }
+        if idx < self.output_instance_ids.len() {
+            self.output_instance_ids.remove(idx);
+        }
         self.outputs.remove(idx);
 
         // Recompute the virtual framebuffer extent from surviving outputs.
@@ -7945,6 +8024,15 @@ impl PlatformBackend {
                 })?
         };
 
+        // Reserve a fresh id for every newly installed pool instance before
+        // the real modeset commit. An id may be skipped after a rejected
+        // commit, but it is never reused.
+        let new_output_instance_id = if existing_idx.is_none() || needs_pool_realloc {
+            Some(self.allocate_output_instance_id(output_key)?)
+        } else {
+            None
+        };
+
         // Commit the modeset.  On failure, pool is freed (dropped below).
         if new_pool_committed_framebuffer.is_none()
             && let Err(e) = crate::drm::modeset::commit_modeset(
@@ -8009,6 +8097,8 @@ impl PlatformBackend {
             self.outputs[idx].height = h;
             if let Some(pool) = new_pool {
                 self.scanout_pools[idx] = pool;
+                self.output_instance_ids[idx] = new_output_instance_id
+                    .expect("a replacement pool reserves a new output instance id");
                 self.bo_generations[idx] = self.scanout_pools[idx]
                     .as_ref()
                     .map(|pool| vec![BoGenerationEntry::default(); pool.display_pool().bos.len()])
@@ -8029,6 +8119,8 @@ impl PlatformBackend {
                 .map(|p| vec![BoGenerationEntry::default(); p.display_pool().bos.len()])
                 .unwrap_or_default();
             self.scanout_pools.push(pool);
+            self.output_instance_ids
+                .push(new_output_instance_id.expect("a new output reserves an instance id"));
             self.bo_generations.push(gens);
             self.first_pageflip_logged.push(false);
         }
@@ -8661,6 +8753,9 @@ impl PlatformBackend {
             }
             if idx < self.first_pageflip_logged.len() {
                 self.first_pageflip_logged.remove(idx);
+            }
+            if idx < self.output_instance_ids.len() {
+                self.output_instance_ids.remove(idx);
             }
         }
 
@@ -9407,7 +9502,11 @@ mod tests {
                 .into();
         platform
             .register_scanout_render_completion(
-                output_key,
+                output_key.clone(),
+                OutputInstanceId {
+                    device_key: output_key.device_key,
+                    serial: 1,
+                },
                 1,
                 ScanoutRenderCompletionStage::Render,
                 Some(ready),
@@ -9441,6 +9540,10 @@ mod tests {
         let first_job = platform
             .register_scanout_render_completion(
                 output_key.clone(),
+                OutputInstanceId {
+                    device_key: output_key.device_key,
+                    serial: 1,
+                },
                 0,
                 ScanoutRenderCompletionStage::Render,
                 Some(blocked),
@@ -9449,6 +9552,10 @@ mod tests {
         let second_job = platform
             .register_scanout_render_completion(
                 output_key.clone(),
+                OutputInstanceId {
+                    device_key: output_key.device_key,
+                    serial: 2,
+                },
                 1,
                 ScanoutRenderCompletionStage::Render,
                 Some(ready),
@@ -9459,6 +9566,7 @@ mod tests {
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].job_id, second_job);
         assert_eq!(completions[0].output_key, output_key);
+        assert_eq!(completions[0].output_instance_id.serial, 2);
         assert_eq!(completions[0].bo_idx, 1);
         assert_eq!(
             platform.pending_scanout_render_completions[0].job_id, first_job,
@@ -9476,6 +9584,10 @@ mod tests {
         let job = platform
             .register_scanout_render_completion(
                 output_key.clone(),
+                OutputInstanceId {
+                    device_key: output_key.device_key,
+                    serial: 1,
+                },
                 2,
                 ScanoutRenderCompletionStage::Render,
                 None,
@@ -9777,6 +9889,7 @@ mod tests {
     fn unqualified_initial_scanout_rollback_guard_fires_and_can_be_disarmed() {
         let mut platform = PlatformBackend::for_tests();
         let active = platform.outputs.remove(0);
+        platform.output_instance_ids.remove(0);
         let mut initial_outputs = [PlatformInitOutput {
             key: active.key,
             output: active.output,
@@ -9834,6 +9947,7 @@ mod tests {
         let mut platform = PlatformBackend::for_tests();
         platform.devices.clear();
         platform.outputs.clear();
+        platform.output_instance_ids.clear();
 
         assert!(platform.primary_device().is_none());
         assert!(
@@ -9978,6 +10092,10 @@ mod tests {
         output.height = height;
         let key = output.key.clone();
         platform.outputs.push(output);
+        let instance_id = platform
+            .allocate_output_instance_id(&key)
+            .expect("test output instance id does not overflow");
+        platform.output_instance_ids.push(instance_id);
         platform.scanout_pools.push(None);
         platform.bo_generations.push(Vec::new());
         platform.first_pageflip_logged.push(false);
@@ -9986,6 +10104,7 @@ mod tests {
 
     fn clear_test_outputs(platform: &mut PlatformBackend) {
         platform.outputs.clear();
+        platform.output_instance_ids.clear();
         platform.scanout_pools.clear();
         platform.bo_generations.clear();
         platform.first_pageflip_logged.clear();
@@ -10551,6 +10670,11 @@ mod tests {
             "secondary",
             u32::from(raw_crtc),
         ));
+        let secondary_output_key = platform.outputs.last().unwrap().key.clone();
+        let secondary_instance_id = platform
+            .allocate_output_instance_id(&secondary_output_key)
+            .expect("secondary output instance id");
+        platform.output_instance_ids.push(secondary_instance_id);
 
         let calls = Cell::new(0_u32);
         assert!(platform.initialize_headless_cursor_for_device_with(
@@ -10579,6 +10703,7 @@ mod tests {
     fn failed_enable_never_reaches_deferred_cursor_factory() {
         let mut platform = PlatformBackend::for_tests();
         let active = platform.outputs.remove(0);
+        platform.output_instance_ids.remove(0);
         let output_key = active.key;
         let output = active.output;
         platform.scanout_pools.clear();
@@ -10750,6 +10875,7 @@ mod tests {
         let mut platform = PlatformBackend::for_tests();
         let key = platform.outputs[0].key.clone();
         platform.outputs.clear();
+        platform.output_instance_ids.clear();
         platform.scanout_pools.clear();
         platform.bo_generations.clear();
         platform.first_pageflip_logged.clear();

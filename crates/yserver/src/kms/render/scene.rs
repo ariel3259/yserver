@@ -90,7 +90,7 @@ use super::{
     telemetry::Telemetry,
 };
 use crate::kms::{
-    backend::OutputKey,
+    backend::{OutputInstanceId, OutputKey},
     core::KmsCore,
     render::composite_pool_ring::CompositePoolRing,
     vk::{
@@ -484,6 +484,8 @@ impl BufferAgeRing {
 
 struct OutputSceneState {
     output_idx: usize,
+    output_key: OutputKey,
+    output_instance_id: OutputInstanceId,
     damage_audit: Option<OutputDamageAudit>,
     pool_ring: CompositePoolRing,
     /// Slots map: pending_ack[i] is using descriptor-pool slot
@@ -598,6 +600,83 @@ struct OutputSceneState {
     /// (startup, `rebuild_outputs`) starts empty, and a drawable in NO output's
     /// set is treated as unknown ⇒ every output walks — conservative.
     last_pieces: std::collections::HashSet<super::store::DrawableId>,
+}
+
+/// A retired output has no index. Its scene state and old scanout pool stay
+/// paired until the state has no outstanding GPU or KMS proof debt.
+pub(crate) struct RetiredOutputBundle {
+    pub(crate) key: OutputKey,
+    pub(crate) instance: OutputInstanceId,
+    scene: OutputSceneState,
+    pool: OutputScanout,
+}
+
+pub(crate) struct StagedOutputSceneState {
+    scene: OutputSceneState,
+}
+
+enum OutputPromotionEntry {
+    Keep(OutputInstanceId),
+    Replace {
+        old_instance: OutputInstanceId,
+        staged: Box<StagedOutputSceneState>,
+        retired_pool: Box<OutputScanout>,
+    },
+    Insert(Box<StagedOutputSceneState>),
+    Remove {
+        old_instance: OutputInstanceId,
+        retired_pool: Box<OutputScanout>,
+    },
+}
+
+/// Prepared mapping from stable output keys to kept or staged scene states.
+pub(crate) struct StagedOutputIdentityMap {
+    entries: HashMap<OutputKey, OutputPromotionEntry>,
+}
+
+impl StagedOutputIdentityMap {
+    pub(crate) fn replace(
+        &mut self,
+        key: &OutputKey,
+        staged: StagedOutputSceneState,
+        retired_pool: OutputScanout,
+    ) {
+        let old_instance = match self.entries.remove(key) {
+            Some(OutputPromotionEntry::Keep(instance)) => instance,
+            _ => panic!("replacement must be staged from a kept output"),
+        };
+        self.entries.insert(
+            key.clone(),
+            OutputPromotionEntry::Replace {
+                old_instance,
+                staged: Box::new(staged),
+                retired_pool: Box::new(retired_pool),
+            },
+        );
+    }
+
+    pub(crate) fn insert(&mut self, key: OutputKey, staged: StagedOutputSceneState) {
+        assert!(
+            !self.entries.contains_key(&key),
+            "inserted output must not already have a staged entry"
+        );
+        self.entries
+            .insert(key, OutputPromotionEntry::Insert(Box::new(staged)));
+    }
+
+    pub(crate) fn remove(&mut self, key: &OutputKey, retired_pool: OutputScanout) {
+        let old_instance = match self.entries.remove(key) {
+            Some(OutputPromotionEntry::Keep(instance)) => instance,
+            _ => panic!("removed output must be staged from a kept output"),
+        };
+        self.entries.insert(
+            key.clone(),
+            OutputPromotionEntry::Remove {
+                old_instance,
+                retired_pool: Box::new(retired_pool),
+            },
+        );
+    }
 }
 
 struct OutputDamageAudit {
@@ -1214,6 +1293,7 @@ struct SceneCompositorInner {
     /// the depth-24 scanout.
     overlay_xor_cache: crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache,
     outputs: Vec<OutputSceneState>,
+    retired_outputs: HashMap<crate::platform::drm::DrmDeviceKey, Vec<RetiredOutputBundle>>,
     damage_audit_ledger: VecDeque<DamageAuditLedgerEntry>,
     damage_audit_next_event_id: u64,
     /// Stage 3f.8: software cursor sprite. Registered once at
@@ -1578,6 +1658,7 @@ impl SceneCompositor {
                 pipeline,
                 overlay_xor_cache,
                 outputs,
+                retired_outputs: HashMap::new(),
                 damage_audit_ledger: VecDeque::new(),
                 damage_audit_next_event_id: 0,
                 cursor: None,
@@ -1611,6 +1692,8 @@ impl SceneCompositor {
             .unwrap_or(3);
         Ok(OutputSceneState {
             output_idx: i,
+            output_key: layout.key.clone(),
+            output_instance_id: platform.output_instance_ids[i],
             damage_audit: build_output_damage_audit(
                 vk,
                 vk::Extent2D {
@@ -1656,6 +1739,157 @@ impl SceneCompositor {
                 },
             ),
         })
+    }
+
+    pub(crate) fn stage_output_scene_state(
+        &self,
+        platform: &PlatformBackend,
+        output_idx: usize,
+        output_instance_id: OutputInstanceId,
+    ) -> Result<StagedOutputSceneState, SceneError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Err(SceneError::NoVk);
+        };
+        let mut scene = Self::build_output_state(&inner.vk, platform, output_idx)?;
+        scene.output_instance_id = output_instance_id;
+        Ok(StagedOutputSceneState { scene })
+    }
+
+    pub(crate) fn stage_output_identity_map(&self) -> StagedOutputIdentityMap {
+        let entries = self
+            .inner
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .outputs
+                    .iter()
+                    .map(|state| {
+                        (
+                            state.output_key.clone(),
+                            OutputPromotionEntry::Keep(state.output_instance_id),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        StagedOutputIdentityMap { entries }
+    }
+
+    /// Commit a prepared topology-to-scene identity map. Every kept scene
+    /// state is moved by `OutputKey`; replaced and removed states leave the
+    /// indexed vector together with their old pool in a retired bundle.
+    /// All fallible construction and ownership transfer belongs before this
+    /// promotion boundary.
+    pub(crate) fn promote_output_identity_map(
+        &mut self,
+        platform: &PlatformBackend,
+        mut identity_map: StagedOutputIdentityMap,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        assert_eq!(
+            platform.outputs.len(),
+            platform.output_instance_ids.len(),
+            "promoted output and pool identities must remain parallel"
+        );
+        let mut old_states = std::mem::take(&mut inner.outputs)
+            .into_iter()
+            .map(|state| (state.output_instance_id, state))
+            .collect::<HashMap<_, _>>();
+        let mut next_outputs = Vec::with_capacity(platform.outputs.len());
+        let mut retired = Vec::new();
+
+        for (output_idx, (layout, &instance_id)) in platform
+            .outputs
+            .iter()
+            .zip(&platform.output_instance_ids)
+            .enumerate()
+        {
+            let entry = identity_map
+                .entries
+                .remove(&layout.key)
+                .expect("every promoted output has a staged identity-map entry");
+            let mut state = match entry {
+                OutputPromotionEntry::Keep(kept_instance) => {
+                    assert_eq!(kept_instance, instance_id);
+                    old_states
+                        .remove(&kept_instance)
+                        .expect("kept output state is present by instance id")
+                }
+                OutputPromotionEntry::Replace {
+                    old_instance,
+                    staged,
+                    retired_pool,
+                } => {
+                    let old = old_states
+                        .remove(&old_instance)
+                        .expect("replaced output state is present by instance id");
+                    retired.push(RetiredOutputBundle {
+                        key: old.output_key.clone(),
+                        instance: old.output_instance_id,
+                        scene: old,
+                        pool: *retired_pool,
+                    });
+                    staged.scene
+                }
+                OutputPromotionEntry::Insert(staged) => staged.scene,
+                OutputPromotionEntry::Remove { .. } => {
+                    panic!("removed output cannot appear in the promoted topology")
+                }
+            };
+            assert_eq!(state.output_key, layout.key);
+            assert_eq!(state.output_instance_id, instance_id);
+            state.output_idx = output_idx;
+            next_outputs.push(state);
+        }
+
+        for (key, entry) in identity_map.entries {
+            match entry {
+                OutputPromotionEntry::Remove {
+                    old_instance,
+                    retired_pool,
+                } => {
+                    let old = old_states
+                        .remove(&old_instance)
+                        .expect("removed output state is present by instance id");
+                    assert_eq!(old.output_key, key);
+                    retired.push(RetiredOutputBundle {
+                        key: old.output_key.clone(),
+                        instance: old.output_instance_id,
+                        scene: old,
+                        pool: *retired_pool,
+                    });
+                }
+                _ => panic!("staged output identity map contains an unpromoted output"),
+            }
+        }
+        assert!(
+            old_states.is_empty(),
+            "every old output has a promotion entry"
+        );
+        inner.outputs = next_outputs;
+        for bundle in retired {
+            inner
+                .retired_outputs
+                .entry(bundle.instance.device_key)
+                .or_default()
+                .push(bundle);
+        }
+        self.scene_structure_dirty = true;
+        self.root_overlay_clear();
+    }
+
+    pub(crate) fn rebuild_output(
+        &mut self,
+        key: &OutputKey,
+        staged_state: StagedOutputSceneState,
+        retired_pool: OutputScanout,
+        platform: &PlatformBackend,
+    ) {
+        let mut identity_map = self.stage_output_identity_map();
+        identity_map.replace(key, staged_state, retired_pool);
+        self.promote_output_identity_map(platform, identity_map);
     }
 
     /// Step 3 — mark every output's scanout BOs wholly stale.
@@ -2838,6 +3072,175 @@ impl SceneCompositor {
     }
 
     #[cfg(test)]
+    pub(crate) fn output_instance_id_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<OutputInstanceId> {
+        self.inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)
+            .map(|state| state.output_instance_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_buffer_count_for_tests(&self, output_idx: usize) -> usize {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map_or(0, |state| state.owner_buffers.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_buffer_states_for_tests(&self, output_idx: usize) -> Vec<OwnerBufferState> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map(|state| state.owner_buffers.iter().map(OwnerBuffer::state).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_output_count_for_tests(&self) -> usize {
+        self.inner.as_ref().map_or(0, |inner| {
+            inner.retired_outputs.values().map(Vec::len).sum()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_output_has_instance_for_tests(&self, instance: OutputInstanceId) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner
+                .retired_outputs
+                .get(&instance.device_key)
+                .into_iter()
+                .flatten()
+                .any(|bundle| bundle.instance == instance)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_output_key_for_tests(
+        &self,
+        instance: OutputInstanceId,
+    ) -> Option<OutputKey> {
+        self.inner
+            .as_ref()?
+            .retired_outputs
+            .get(&instance.device_key)?
+            .iter()
+            .find(|bundle| bundle.instance == instance)
+            .map(|bundle| bundle.key.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_output_owner_buffer_count_for_tests(
+        &self,
+        instance: OutputInstanceId,
+    ) -> Option<usize> {
+        self.inner
+            .as_ref()?
+            .retired_outputs
+            .get(&instance.device_key)?
+            .iter()
+            .find(|bundle| bundle.instance == instance)
+            .map(|bundle| bundle.scene.owner_buffers.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_output_owner_buffer_states_for_tests(
+        &self,
+        instance: OutputInstanceId,
+    ) -> Option<Vec<OwnerBufferState>> {
+        self.inner
+            .as_ref()?
+            .retired_outputs
+            .get(&instance.device_key)?
+            .iter()
+            .find(|bundle| bundle.instance == instance)
+            .map(|bundle| {
+                bundle
+                    .scene
+                    .owner_buffers
+                    .iter()
+                    .map(OwnerBuffer::state)
+                    .collect()
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_output_pool_occupancy_for_tests(
+        &self,
+        instance: OutputInstanceId,
+    ) -> Option<(usize, usize)> {
+        self.inner
+            .as_ref()?
+            .retired_outputs
+            .get(&instance.device_key)?
+            .iter()
+            .find(|bundle| bundle.instance == instance)
+            .map(|bundle| bundle.scene.pool_ring.occupancy_for_tests())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_output_release_count_for_tests(
+        &self,
+        instance: OutputInstanceId,
+    ) -> Option<usize> {
+        self.inner
+            .as_ref()?
+            .retired_outputs
+            .get(&instance.device_key)?
+            .iter()
+            .find(|bundle| bundle.instance == instance)
+            .map(|bundle| bundle.scene.pending_pool_releases.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_retired_pool_release_for_tests(
+        &mut self,
+        instance: OutputInstanceId,
+        ticket: FenceTicket,
+    ) -> Option<usize> {
+        let bundle = self
+            .inner
+            .as_mut()?
+            .retired_outputs
+            .get_mut(&instance.device_key)?
+            .iter_mut()
+            .find(|bundle| bundle.instance == instance)?;
+        let slot = bundle.scene.pool_ring.acquire()?;
+        bundle
+            .scene
+            .pending_pool_releases
+            .push_back((slot, ticket, None));
+        Some(slot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_current_pool_release_for_tests(
+        &mut self,
+        output_idx: usize,
+        ticket: FenceTicket,
+    ) -> Option<usize> {
+        let state = self.inner.as_mut()?.outputs.get_mut(output_idx)?;
+        let slot = state.pool_ring.acquire()?;
+        state.pending_pool_releases.push_back((slot, ticket, None));
+        Some(slot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_retired_outputs_for_tests(
+        &mut self,
+        platform: &mut PlatformBackend,
+        resource_service: Option<&ResourceService>,
+    ) {
+        if let Some(inner) = self.inner.as_mut() {
+            drain_retired_output_bundles(inner, platform, resource_service);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn owner_state_for_tests(
         &self,
         output_idx: usize,
@@ -3714,6 +4117,10 @@ impl SceneCompositor {
         if platform.renderer_failed {
             return Ok(Vec::new());
         }
+        drain_retired_output_bundles(inner, platform, resource_service.as_deref());
+        if platform.renderer_failed {
+            return Ok(Vec::new());
+        }
         debug_assert_eq!(
             inner.outputs.len(),
             platform.outputs.len(),
@@ -4202,18 +4609,33 @@ fn handle_scanout_render_completion_inner(
     let ReadyScanoutRenderCompletion {
         job_id,
         output_key,
+        output_instance_id,
         bo_idx,
         stage: completion_stage,
         fd,
     } = completion;
-    let Some(output_idx) = platform
-        .outputs
-        .iter()
-        .position(|output| output.key == output_key)
-    else {
+    let Some(output_idx) = inner.outputs.iter().position(|state| {
+        state.output_instance_id == output_instance_id && state.output_key == output_key
+    }) else {
+        if let Some(bundle) = inner
+            .retired_outputs
+            .get_mut(&output_instance_id.device_key)
+            .into_iter()
+            .flatten()
+            .find(|bundle| bundle.instance == output_instance_id && bundle.key == output_key)
+        {
+            return handle_retired_scanout_render_completion(
+                bundle,
+                job_id,
+                bo_idx,
+                completion_stage,
+                fd,
+                resource_service,
+            );
+        }
         log::debug!(
-            "render copied scanout: completion job {job_id} targeted removed output \
-                 {output_key:?}",
+            "render scanout: completion job {job_id} targeted unknown output instance \
+                 {output_instance_id:?} ({output_key:?})",
         );
         return false;
     };
@@ -4288,6 +4710,7 @@ fn handle_scanout_render_completion_inner(
                             &mut pool,
                             platform,
                             output_key.clone(),
+                            output_instance_id,
                             bo_idx,
                             fd,
                             service,
@@ -4618,6 +5041,69 @@ fn handle_scanout_render_completion_inner(
             false
         }
     }
+}
+
+/// Complete old render work without offering it to the current topology.
+/// The old scene, pool and owner ledger remain together in the bundle until
+/// their independent fence and KMS proofs have been consumed.
+fn handle_retired_scanout_render_completion(
+    bundle: &mut RetiredOutputBundle,
+    job_id: u64,
+    bo_idx: usize,
+    completion_stage: ScanoutRenderCompletionStage,
+    fd: Option<std::os::fd::OwnedFd>,
+    resource_service: Option<&mut ResourceService>,
+) -> bool {
+    if completion_stage != ScanoutRenderCompletionStage::Render {
+        // Copied-route completion retirement is owned by 3b-i-2. Keep the
+        // bundle rooted until that path services its source/sink receipts.
+        drop(fd);
+        return false;
+    }
+    let Some(index) = bundle.scene.owner_buffers.iter().position(|buffer| {
+        buffer.identity().bo_idx == bo_idx
+            && buffer
+                .pending_ack()
+                .is_some_and(|ack| ack.stage.matches_owner_render_completion(job_id))
+    }) else {
+        drop(fd);
+        return false;
+    };
+    let Some(service) = resource_service else {
+        log::error!("render retired output: completion arrived without ResourceService");
+        drop(fd);
+        return false;
+    };
+    let mut buffer = bundle.scene.owner_buffers.remove(index);
+    let Some(batch) = buffer
+        .pending_ack_mut()
+        .and_then(|ack| ack.managed_batch.take())
+    else {
+        log::error!(
+            "render retired output: generation {} had no GPU batch",
+            buffer.identity().generation
+        );
+        bundle.scene.owner_buffers.insert(index, buffer);
+        drop(fd);
+        return false;
+    };
+    service.register_batch(batch);
+    if let Err(error) = service.service_completions(std::time::Instant::now()) {
+        log::warn!("render retired output: completion service failed: {error:?}");
+    }
+    if buffer.state() == OwnerBufferState::Rendering {
+        match buffer.into_displaced() {
+            Ok(displaced) => buffer = displaced,
+            Err(buffer) => {
+                bundle.scene.owner_buffers.insert(index, *buffer);
+                drop(fd);
+                return false;
+            }
+        }
+    }
+    bundle.scene.owner_buffers.insert(index, buffer);
+    drop(fd);
+    true
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -5057,6 +5543,197 @@ fn retire_failed_submit_bos(
         }
     }
     state.failed_submit_bos = remaining;
+}
+
+fn retire_failed_submit_bos_in_bundle(
+    bundle: &mut RetiredOutputBundle,
+    platform: &mut PlatformBackend,
+    vk: &crate::kms::vk::device::VkContext,
+    resource_service: Option<&ResourceService>,
+) {
+    let mut remaining = VecDeque::with_capacity(bundle.scene.failed_submit_bos.len());
+    while let Some(failed) = bundle.scene.failed_submit_bos.pop_front() {
+        match failed.ticket.poll_signaled_result(vk) {
+            Ok(true) => {
+                let managed_key = bundle
+                    .pool
+                    .display_pool()
+                    .bos
+                    .get(failed.bo_idx)
+                    .and_then(|bo| bo.managed_key());
+                if let Some(key) = managed_key.as_ref()
+                    && !resource_service.is_some_and(|service| service.is_releasable(key))
+                {
+                    remaining.push_back(failed);
+                    continue;
+                }
+                let recovery = match &mut bundle.pool {
+                    OutputScanout::Shared(pool) => pool
+                        .bos
+                        .get_mut(failed.bo_idx)
+                        .ok_or_else(|| io::Error::other("retired scanout BO disappeared"))
+                        .and_then(|bo| {
+                            bo.rearm_export_semaphore_after_quiescence()
+                                .map_err(|result| {
+                                    io::Error::other(format!(
+                                        "rearm retired scanout semaphore: {result:?}"
+                                    ))
+                                })?;
+                            bo.state = BoState::default();
+                            Ok(())
+                        }),
+                    OutputScanout::Copied(pool) => pool
+                        .sources
+                        .get_mut(failed.bo_idx)
+                        .ok_or_else(|| io::Error::other("retired copied source disappeared"))
+                        .and_then(|source| source.recover_failed_cycle_after_renderer_quiescence())
+                        .and_then(|()| {
+                            let destination = pool
+                                .destinations
+                                .bos
+                                .get_mut(failed.bo_idx)
+                                .ok_or_else(|| {
+                                    io::Error::other("retired copied destination disappeared")
+                                })?;
+                            destination.state = BoState::default();
+                            Ok(())
+                        }),
+                };
+                match recovery {
+                    Ok(()) => bundle.scene.pool_ring.release(failed.pool_slot),
+                    Err(error) => {
+                        log::error!(
+                            "render retired output: failed-submit recovery failed: {error}"
+                        );
+                        platform.renderer_failed = true;
+                        remaining.push_back(failed);
+                    }
+                }
+            }
+            Ok(false) => remaining.push_back(failed),
+            Err(error) => {
+                log::error!("render retired output: failed-submit fence status failed: {error:?}");
+                platform.renderer_failed = true;
+                remaining.push_back(failed);
+            }
+        }
+    }
+    bundle.scene.failed_submit_bos = remaining;
+}
+
+fn leave_owner_buffer_from_scanout(scanout: &mut OutputScanout, bo_idx: usize) -> bool {
+    match scanout {
+        OutputScanout::Shared(pool) => pool
+            .bos
+            .get_mut(bo_idx)
+            .is_some_and(|bo| bo.state.transition_to_free_after_owner()),
+        OutputScanout::Copied(pool) => {
+            if pool
+                .destinations
+                .bos
+                .get(bo_idx)
+                .is_none_or(|bo| bo.state.phase != BoPhase::Owner)
+            {
+                return false;
+            }
+            if let Err(error) = pool.note_kms_retired(bo_idx) {
+                log::error!("render retired copied output: KMS retirement failed: {error}");
+                return false;
+            }
+            pool.destinations.bos[bo_idx]
+                .state
+                .transition_to_free_after_owner()
+        }
+    }
+}
+
+fn retire_owner_buffers_in_bundle(
+    bundle: &mut RetiredOutputBundle,
+    resource_service: Option<&ResourceService>,
+) {
+    let Some(service) = resource_service else {
+        return;
+    };
+    let mut index = 0;
+    while index < bundle.scene.owner_buffers.len() {
+        let releasable_state = matches!(
+            bundle.scene.owner_buffers[index].state(),
+            OwnerBufferState::Displaced | OwnerBufferState::Releasing
+        );
+        let ready = releasable_state
+            && bundle.scene.owner_buffers[index]
+                .pending_ack()
+                .is_some_and(|ack| ack.managed_batch.is_none())
+            && service.is_releasable(&bundle.scene.owner_buffers[index].identity().managed_key);
+        if !ready {
+            index += 1;
+            continue;
+        }
+        let mut buffer = bundle.scene.owner_buffers.remove(index);
+        let bo_idx = buffer.identity().bo_idx;
+        if !leave_owner_buffer_from_scanout(&mut bundle.pool, bo_idx) {
+            bundle.scene.owner_buffers.insert(index, buffer);
+            index += 1;
+            continue;
+        }
+        let pool_slot = buffer.take_descriptor_slot();
+        if let Err(buffer) = buffer.into_free() {
+            log::error!("render retired output: owner buffer {bo_idx} was not freeable");
+            bundle.scene.owner_buffers.insert(index, *buffer);
+            index += 1;
+            continue;
+        }
+        if let Some(pool_slot) = pool_slot {
+            bundle.scene.pool_ring.release(pool_slot);
+        }
+    }
+}
+
+fn drain_retired_output_bundles(
+    inner: &mut SceneCompositorInner,
+    platform: &mut PlatformBackend,
+    resource_service: Option<&ResourceService>,
+) {
+    let vk = Arc::clone(&inner.vk);
+    for bundles in inner.retired_outputs.values_mut() {
+        for bundle in bundles {
+            retire_failed_submit_bos_in_bundle(bundle, platform, vk.as_ref(), resource_service);
+            retire_owner_buffers_in_bundle(bundle, resource_service);
+            drain_retired_pending_pool_releases(
+                &mut bundle.scene,
+                vk.as_ref(),
+                platform,
+                resource_service,
+            );
+        }
+    }
+}
+
+fn drain_retired_pending_pool_releases(
+    state: &mut OutputSceneState,
+    vk: &crate::kms::vk::device::VkContext,
+    platform: &mut PlatformBackend,
+    resource_service: Option<&ResourceService>,
+) {
+    let mut remaining = VecDeque::with_capacity(state.pending_pool_releases.len());
+    while let Some((slot, ticket, managed_key)) = state.pending_pool_releases.pop_front() {
+        if let Some(key) = managed_key.as_ref()
+            && !resource_service.is_some_and(|service| service.is_releasable(key))
+        {
+            remaining.push_back((slot, ticket, managed_key));
+            continue;
+        }
+        match ticket.poll_signaled_result(vk) {
+            Ok(true) => state.pool_ring.release(slot),
+            Ok(false) => remaining.push_back((slot, ticket, managed_key)),
+            Err(error) => {
+                log::error!("render retired output: deferred pool fence status failed: {error:?}");
+                platform.renderer_failed = true;
+                remaining.push_back((slot, ticket, managed_key));
+            }
+        }
+    }
+    state.pending_pool_releases = remaining;
 }
 
 fn retire_owner_displaced(
@@ -7247,6 +7924,7 @@ fn tick_one_output(
         Ok(Some(completion)) => platform
             .register_scanout_render_completion(
                 output_key.clone(),
+                inner.outputs[output_idx].output_instance_id,
                 bo_idx,
                 ScanoutRenderCompletionStage::Render,
                 completion,

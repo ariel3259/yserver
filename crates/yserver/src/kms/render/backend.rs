@@ -34859,6 +34859,7 @@ mod tests {
         let mut backend = KmsBackend::for_tests();
         backend.platform.devices.clear();
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.randr_id_alloc = RandrIdAllocator::default();
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
         backend.platform.render_devices = vec![test_render_device(render_id, None)];
@@ -34971,6 +34972,7 @@ mod tests {
         let mut backend = KmsBackend::for_tests();
         backend.platform.devices.clear();
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.randr_id_alloc = RandrIdAllocator::default();
         let render_id = RenderDeviceId::UnverifiedFallback;
         backend.platform.render_devices = vec![test_render_device(render_id, None)];
@@ -35001,6 +35003,7 @@ mod tests {
         let mut backend = KmsBackend::for_tests();
         backend.platform.devices.clear();
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.platform.render_devices.clear();
         backend.platform.selected_render_device = None;
         backend.randr_id_alloc = RandrIdAllocator::default();
@@ -35217,6 +35220,11 @@ mod tests {
         );
         let key = active.key.clone();
         b.platform.outputs.push(active);
+        let instance_id = b
+            .platform
+            .allocate_output_instance_id(&key)
+            .expect("test output instance id");
+        b.platform.output_instance_ids.push(instance_id);
         b.platform.scanout_pools.push(None);
         b.platform.bo_generations.push(Vec::new());
         b.platform.first_pageflip_logged.push(false);
@@ -35235,6 +35243,7 @@ mod tests {
 
     fn clear_test_outputs(b: &mut super::KmsBackend) {
         b.platform.outputs.clear();
+        b.platform.output_instance_ids.clear();
         b.platform.scanout_pools.clear();
         b.platform.bo_generations.clear();
         b.platform.first_pageflip_logged.clear();
@@ -36018,6 +36027,7 @@ mod tests {
         // registry's Off config prevents a stale platform row from reviving
         // it; clearing the row is the production apply's corresponding side.
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.rebuild_randr_state(&mut state, None, false);
         assert_eq!(state.randr.timestamp, 41);
         assert_eq!(state.randr.config_timestamp, light_config_timestamp);
@@ -36120,6 +36130,7 @@ mod tests {
         );
 
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.rebuild_randr_state(&mut state, None, heavy_delta.config_changed);
         assert_eq!(
             (state.randr.timestamp, state.randr.config_timestamp),
@@ -48088,6 +48099,7 @@ mod tests {
     fn make_vt_fixture_headless(b: &mut KmsBackend) {
         b.platform.devices.clear();
         b.platform.outputs.clear();
+        b.platform.output_instance_ids.clear();
         b.platform.scanout_pools.clear();
         b.platform.bo_generations.clear();
         b.platform.first_pageflip_logged.clear();
@@ -48480,6 +48492,7 @@ mod tests {
         // B departs for good: no reservation, so the extent shrinks.
         b.randr_id_alloc.entry_mut(&departing).last_enabled = None;
         b.platform.outputs.pop();
+        b.platform.output_instance_ids.pop();
         b.platform.scanout_pools.pop();
         b.platform.bo_generations.pop();
         b.platform.first_pageflip_logged.pop();
@@ -49190,8 +49203,10 @@ mod tests {
         assert!(backend.sequence_queue_failed(key, old_epoch));
 
         let output = backend.platform.outputs.pop().unwrap();
+        let instance_id = backend.platform.output_instance_ids.pop().unwrap();
         backend.refresh_present_crtc_clock_epochs();
         backend.platform.outputs.push(output);
+        backend.platform.output_instance_ids.push(instance_id);
         backend.refresh_present_crtc_clock_epochs();
         let new_epoch = backend.clock_epoch_for_crtc_key(key);
         assert_ne!(new_epoch, old_epoch);
@@ -49229,8 +49244,10 @@ mod tests {
         let stale_epoch = backend.clock_epoch_for_crtc_key(key);
 
         let output = backend.platform.outputs.pop().unwrap();
+        let instance_id = backend.platform.output_instance_ids.pop().unwrap();
         backend.refresh_present_crtc_clock_epochs();
         backend.platform.outputs.push(output);
+        backend.platform.output_instance_ids.push(instance_id);
         backend.refresh_present_crtc_clock_epochs();
         let current_epoch = backend.clock_epoch_for_crtc_key(key);
 
@@ -49614,10 +49631,16 @@ mod tests {
         assert_eq!(b.present_crtc_clock_epoch(crtc_id), first);
 
         let output = b.platform.outputs.pop().expect("fixture output");
+        let instance_id = b
+            .platform
+            .output_instance_ids
+            .pop()
+            .expect("fixture output instance");
         b.refresh_present_crtc_clock_epochs();
         assert_eq!(b.present_crtc_clock_epoch(crtc_id), 0);
 
         b.platform.outputs.push(output);
+        b.platform.output_instance_ids.push(instance_id);
         b.refresh_present_crtc_clock_epochs();
         let second = b.present_crtc_clock_epoch(crtc_id);
         assert_ne!(second, 0);
@@ -50093,6 +50116,12 @@ mod tests {
             800,
             0,
         ));
+        let output_key = b.platform.outputs.last().expect("new output").key.clone();
+        let instance_id = b
+            .platform
+            .allocate_output_instance_id(&output_key)
+            .expect("new test output instance");
+        b.platform.output_instance_ids.push(instance_id);
     }
 
     fn install_direct_frame_for_target_test(
@@ -51185,6 +51214,7 @@ mod tests {
     fn headless_output_inventory_keeps_present_in_blackout() {
         let mut b = super::KmsBackend::for_tests();
         b.platform.outputs.clear();
+        b.platform.output_instance_ids.clear();
         b.kms_outputs_active = !b.platform.outputs.is_empty();
 
         assert!(b.scanout_allowed(), "the fixture VT remains active");
@@ -51199,6 +51229,7 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         b.platform.devices.clear();
         b.platform.outputs.clear();
+        b.platform.output_instance_ids.clear();
         b.kms_outputs_active = false;
 
         assert!(b.platform.primary_device().is_none());
@@ -55256,6 +55287,11 @@ mod tests {
             })?;
         backend.platform.devices[0].key = device;
         backend.platform.outputs[0].key.device_key = device;
+        let first_output_key = backend.platform.outputs[0].key.clone();
+        backend.platform.output_instance_ids[0] = backend
+            .platform
+            .allocate_output_instance_id(&first_output_key)
+            .expect("rekey live fixture output instance");
         backend.platform.reap_executors_on_drop_for_tests();
         backend.resource_cleanup_on_drop_for_tests = true;
         if output_count > 1 {
@@ -55281,6 +55317,13 @@ mod tests {
                 .rebuild_outputs(&backend.platform)
                 .map_err(|error| {
                     std::io::Error::other(format!("rebuild multi-output scene: {error:?}"))
+                })?;
+        } else {
+            backend
+                .scene
+                .rebuild_outputs(&backend.platform)
+                .map_err(|error| {
+                    std::io::Error::other(format!("rebuild single-output scene: {error:?}"))
                 })?;
         }
         finish_owner_live_fixture(backend, extra_missing_output)
@@ -71905,6 +71948,18 @@ mod tests {
             output.x,
             output.y,
         ));
+        let output_key = backend
+            .platform
+            .outputs
+            .last()
+            .expect("new output")
+            .key
+            .clone();
+        let instance_id = backend
+            .platform
+            .allocate_output_instance_id(&output_key)
+            .expect("new test output instance");
+        backend.platform.output_instance_ids.push(instance_id);
         backend.platform.scanout_pools.push(None);
         backend.platform.bo_generations.push(Vec::new());
         backend.platform.first_pageflip_logged.push(false);
@@ -77030,6 +77085,430 @@ mod tests {
             owner.len(),
             4,
             "one latency sample is required per Owner copied frame"
+        );
+    }
+
+    fn c0_3bi_scanout_images(backend: &KmsBackend, output_idx: usize) -> Vec<ash::vk::Image> {
+        backend.platform.scanout_pools[output_idx]
+            .as_ref()
+            .expect("output scanout pool")
+            .display_pool()
+            .bos
+            .iter()
+            .map(|bo| bo.vk_image)
+            .collect()
+    }
+
+    fn c0_3bi_remove_output_for_promotion(backend: &mut KmsBackend, output_idx: usize) {
+        let key = backend.platform.outputs[output_idx].key.clone();
+        let pool = backend.platform.scanout_pools[output_idx]
+            .take()
+            .expect("removed output scanout pool");
+        let mut identity_map = backend.scene.stage_output_identity_map();
+        identity_map.remove(&key, pool);
+        backend.platform.outputs.remove(output_idx);
+        backend.platform.output_instance_ids.remove(output_idx);
+        backend.platform.scanout_pools.remove(output_idx);
+        backend.platform.bo_generations.remove(output_idx);
+        backend.platform.first_pageflip_logged.remove(output_idx);
+        backend
+            .scene
+            .promote_output_identity_map(&backend.platform, identity_map);
+    }
+
+    fn c0_3bi_replace_output_for_promotion(
+        backend: &mut KmsBackend,
+        output_idx: usize,
+    ) -> crate::kms::backend::OutputInstanceId {
+        let key = backend.platform.outputs[output_idx].key.clone();
+        let vk = backend
+            .platform
+            .vk
+            .as_ref()
+            .cloned()
+            .expect("live Vulkan context");
+        let new_pool = backend
+            .platform
+            .allocate_test_output_scanout(vk, output_idx)
+            .expect("allocate replacement scanout pool");
+        let bo_count = new_pool.display_pool().bos.len();
+        let new_instance = backend
+            .platform
+            .allocate_output_instance_id(&key)
+            .expect("allocate fresh output instance id");
+        let retired_pool = backend.platform.scanout_pools[output_idx]
+            .replace(new_pool)
+            .expect("current scanout pool");
+        backend.platform.output_instance_ids[output_idx] = new_instance;
+        backend.platform.bo_generations[output_idx] =
+            vec![crate::kms::render::platform::BoGenerationEntry::default(); bo_count];
+        let staged = backend
+            .scene
+            .stage_output_scene_state(&backend.platform, output_idx, new_instance)
+            .expect("stage replacement output scene");
+        backend
+            .scene
+            .rebuild_output(&key, staged, retired_pool, &backend.platform);
+        new_instance
+    }
+
+    fn c0_3bi_compose_and_drain(backend: &mut KmsBackend) {
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_index_shift_keeps_other_outputs_vulkan() {
+        let mut fixture = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        c0_3bi_compose_and_drain(backend);
+
+        let kept_key = backend.platform.outputs[2].key.clone();
+        let kept_instance = backend
+            .scene
+            .output_instance_id_for_tests(2)
+            .expect("third output instance");
+        let kept_images = c0_3bi_scanout_images(backend, 2);
+        let kept_owner_states = backend.scene.owner_buffer_states_for_tests(2);
+        let kept_owner_count = backend.scene.owner_buffer_count_for_tests(2);
+        let kept_prepared = backend.scene.owner_prepared_for_tests(2);
+        let kept_pending_acks = backend.scene.pending_ack_count_for_tests(2);
+        assert!(
+            kept_prepared.is_some(),
+            "third output has an owner generation"
+        );
+
+        c0_3bi_remove_output_for_promotion(backend, 1);
+
+        assert_eq!(backend.platform.outputs[1].key, kept_key);
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(1),
+            Some(kept_instance),
+            "the scene follows output identity when its vector index shifts"
+        );
+        assert_eq!(c0_3bi_scanout_images(backend, 1), kept_images);
+        assert_eq!(
+            backend.scene.owner_buffer_states_for_tests(1),
+            kept_owner_states
+        );
+        assert_eq!(
+            backend.scene.owner_buffer_count_for_tests(1),
+            kept_owner_count
+        );
+        assert_eq!(backend.scene.owner_prepared_for_tests(1), kept_prepared);
+        assert_eq!(
+            backend.scene.pending_ack_count_for_tests(1),
+            kept_pending_acks
+        );
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 1);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_retired_bundle_waits_for_its_fence_vulkan() {
+        let mut fixture =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        let key = backend.platform.outputs[0].key.clone();
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output instance");
+        let old_images = c0_3bi_scanout_images(backend, 0);
+        let new_instance = c0_3bi_replace_output_for_promotion(backend, 0);
+        assert_ne!(old_instance, new_instance);
+        assert_ne!(c0_3bi_scanout_images(backend, 0), old_images);
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(old_instance),
+            Some(key)
+        );
+        let old_ring_before = backend
+            .scene
+            .retired_output_pool_occupancy_for_tests(old_instance)
+            .expect("retired old scene ring");
+        let new_ring_before = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("replacement scene diagnostics")
+            .pool_occupancy;
+
+        let ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live fence pool")
+            .acquire()
+            .expect("acquire unsignaled Vulkan fence");
+        assert_eq!(
+            backend
+                .scene
+                .defer_retired_pool_release_for_tests(old_instance, ticket.clone()),
+            Some(0)
+        );
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(1)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(old_instance),
+            Some((old_ring_before.0 + 1, old_ring_before.1))
+        );
+        assert_eq!(
+            backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .map(|d| d.pool_occupancy),
+            Some(new_ring_before)
+        );
+
+        ticket.test_signal();
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(0)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(old_instance),
+            Some(old_ring_before)
+        );
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(old_instance)
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(new_instance)
+        );
+        assert_ne!(c0_3bi_scanout_images(backend, 0), old_images);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_retired_bundle_survives_index_shift_vulkan() {
+        let mut fixture = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("first output instance");
+        let shifted_instance = backend
+            .scene
+            .output_instance_id_for_tests(1)
+            .expect("second output instance");
+        let shifted_images = c0_3bi_scanout_images(backend, 1);
+        let old_ring_before = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("first output diagnostics")
+            .pool_occupancy;
+        let shifted_ring_before = backend
+            .scene
+            .tick_diagnostics_for_tests(1)
+            .expect("second output diagnostics")
+            .pool_occupancy;
+        let ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live fence pool")
+            .acquire()
+            .expect("acquire unsignaled Vulkan fence");
+        assert_eq!(
+            backend
+                .scene
+                .defer_current_pool_release_for_tests(0, ticket.clone()),
+            Some(0)
+        );
+
+        c0_3bi_remove_output_for_promotion(backend, 0);
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(shifted_instance)
+        );
+        assert_eq!(c0_3bi_scanout_images(backend, 0), shifted_images);
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(1)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(old_instance),
+            Some((old_ring_before.0 + 1, old_ring_before.1))
+        );
+        assert_eq!(
+            backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .map(|d| d.pool_occupancy),
+            Some(shifted_ring_before)
+        );
+
+        ticket.test_signal();
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(0)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(old_instance),
+            Some(old_ring_before)
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(shifted_instance)
+        );
+        assert_eq!(c0_3bi_scanout_images(backend, 0), shifted_images);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_late_completion_routes_by_identity_vulkan() {
+        let mut fixture = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+
+        let removed_key = backend.platform.outputs[1].key.clone();
+        let removed_crtc = u32::from(backend.platform.outputs[1].output.crtc);
+        let kept_crtc = u32::from(backend.platform.outputs[2].output.crtc);
+        let kept_instance = backend
+            .scene
+            .output_instance_id_for_tests(2)
+            .expect("third output instance");
+        c0_3bi_remove_output_for_promotion(backend, 1);
+
+        let completions = backend.platform.drain_scanout_render_completions();
+        assert_eq!(completions.len(), 3, "all three GPU completions are ready");
+        let mut handled = 0;
+        for completion in completions {
+            if backend.scene.handle_scanout_render_completion(
+                completion,
+                &mut backend.platform,
+                backend.resource_service.as_mut(),
+            ) {
+                handled += 1;
+            }
+        }
+        assert_eq!(handled, 3, "active and retired completions are consumed");
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(1),
+            Some(kept_instance)
+        );
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(
+                backend
+                    .scene
+                    .output_instance_id_for_tests(0)
+                    .expect("first output instance")
+            ),
+            None,
+            "a current instance is not present in the retired list"
+        );
+        let offers = backend.scene.take_owner_composed_offers();
+        assert!(offers.iter().any(|offer| offer.crtc == kept_crtc));
+        assert!(
+            offers.iter().all(|offer| offer.crtc != removed_crtc),
+            "the removed output's late completion never offers its retired generation"
+        );
+        assert!(backend.scene.retired_output_count_for_tests() >= 1);
+        assert_ne!(removed_key, backend.platform.outputs[1].key);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_late_completion_across_same_key_replacements_vulkan() {
+        let mut fixture =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        let completion = backend
+            .platform
+            .drain_scanout_render_completions()
+            .into_iter()
+            .next()
+            .expect("first output render completion");
+        let first_instance = completion.output_instance_id;
+        let key = completion.output_key.clone();
+
+        let second_instance = c0_3bi_replace_output_for_promotion(backend, 0);
+        let third_instance = c0_3bi_replace_output_for_promotion(backend, 0);
+        assert_ne!(first_instance, second_instance);
+        assert_ne!(second_instance, third_instance);
+        assert_ne!(first_instance, third_instance);
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 2);
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(first_instance),
+            Some(key.clone())
+        );
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(second_instance),
+            Some(key)
+        );
+
+        assert!(backend.scene.handle_scanout_render_completion(
+            completion,
+            &mut backend.platform,
+            backend.resource_service.as_mut(),
+        ));
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_owner_buffer_states_for_tests(first_instance),
+            Some(vec![
+                crate::kms::render::owner_buffer::OwnerBufferState::Displaced
+            ]),
+            "the completion mutates only the exact first retired instance"
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_owner_buffer_count_for_tests(second_instance),
+            Some(0)
+        );
+        assert_eq!(backend.scene.owner_buffer_count_for_tests(0), 0);
+        assert!(backend.scene.take_owner_composed_offers().is_empty());
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(third_instance)
         );
     }
 

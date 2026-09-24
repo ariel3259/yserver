@@ -704,6 +704,15 @@ pub(crate) struct OutputKey {
     pub(crate) connector_name: String,
 }
 
+/// Identity of one installed scene and scanout-pool instance. The serial is
+/// monotonic within its KMS device; replacing an output under the same key
+/// always receives a different instance id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct OutputInstanceId {
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) serial: u64,
+}
+
 impl OutputKey {
     pub(crate) fn new(
         device_key: crate::platform::drm::DrmDeviceKey,
