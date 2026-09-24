@@ -59,6 +59,37 @@ impl GroupMember {
     }
 }
 
+/// One allocation's KMS-release registration for an owner commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KmsReleaseObligation {
+    pub(crate) allocation: AllocationKey,
+    pub(crate) obligation: ObligationId,
+    pub(crate) member: GroupMember,
+    pub(crate) commit: CommitId,
+}
+
+/// Proof that an inactive CRTC remained dark while a later commit displaced
+/// the old framebuffer. The issuer checks the installed-power chain before
+/// constructing this value; its fields are deliberately limited to the
+/// evidence named by design §4.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DarkCrtcDisplacement {
+    pub(crate) off_commit: CommitId,
+    pub(crate) crtc: CrtcKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsReleaseProof {
+    CompletionRetired {
+        through_commit: CommitId,
+        crtc: CrtcKey,
+    },
+    DarkCrtcDisplacement {
+        through_commit: CommitId,
+        proof: DarkCrtcDisplacement,
+    },
+}
+
 pub struct PresentRelease {
     pub(crate) event: yserver_core::backend::CompletedPresentEvent,
     pub(crate) wake: Option<crate::kms::render::present_completion::PinnedWake>,
@@ -681,6 +712,37 @@ fn freeze_resource_allocations(res: &CommitResources, service: &mut ResourceServ
     for &(key, _, _) in &res.kms_obligations {
         let _ = service.freeze(key);
     }
+}
+
+pub(crate) fn register_kms_displacements(
+    commit: CommitId,
+    member: GroupMember,
+    allocations: &[AllocationKey],
+    service: &mut ResourceService,
+) -> Result<Vec<KmsReleaseObligation>, ResourceError> {
+    let mut unique = HashSet::new();
+    if allocations.iter().any(|key| !unique.insert(*key)) {
+        return Err(ResourceError::InvalidProof);
+    }
+
+    let mut registrations = Vec::with_capacity(allocations.len());
+    for &allocation in allocations {
+        match service.register_kms(allocation, commit, member) {
+            Ok(obligation) => registrations.push(KmsReleaseObligation {
+                allocation,
+                obligation,
+                member,
+                commit,
+            }),
+            Err(error) => {
+                for registration in registrations.drain(..) {
+                    let _ = service.cancel(registration.allocation, registration.obligation);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(registrations)
 }
 
 pub(crate) fn register_commit_dependencies(

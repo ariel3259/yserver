@@ -2,6 +2,16 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 8 (2026-09-25, coordinator)** — Task 8 F8 (before editing): a
+stale result keeps the 3a-ii quarantine-and-poison path with a typed `Stale`
+cause (quarantine transfer is 3d's); the failure line is emitted by the core,
+which has the client and sequence.
+
+**Revision 7 (2026-09-25, coordinator)** — Task 7 F8: an unproven dark CRTC
+is unreachable in 3b (an unknown off poisons the device; a fresh incarnation
+after recovery is 3d's), so its test uses a seam; E30 belongs to the negative
+test, and the positive test gets E30b.
+
 **Revision 6 (2026-09-24, coordinator)** — the 3b-i-2 plan review (M-1):
 kept outputs repaint on a root storage change (Task 6).
 
@@ -344,8 +354,8 @@ discharged.
 | --- | --- | --- |
 | `c0_3bi_displaced_pool_waits_for_retirement_vulkan` | mode change on a lit CRTC: the old allocations hold `KmsRelease` after acceptance, discharged only by `CompletionRetired`, destroyed only after the GPU/FOREIGN proofs | **E28** discharge at acceptance |
 | `c0_3bi_rejection_cancels_the_displacement_vulkan` | a rejected mode change then a successful one: the rejected registrations are cancelled once, the old pool is discharged by the successful commit | **E29** leave the rejected registrations (design mutation 26) |
-| `c0_3bi_dark_crtc_displacement_vulkan` | DPMS-off, then three mode changes and a disable: each displaced pool is discharged by `DarkCrtcDisplacement` at its successor's `Completed` | **E30** issue the dark proof without a proven off (design mutation 21) |
-| `c0_3bi_unproven_off_issues_no_dark_proof_vulkan` | the off commit made `CompletionUnknown` in the fixture, then a mode change: no dark proof; the pool stays retained | **E31** treat an absent fence as a proof |
+| `c0_3bi_dark_crtc_displacement_vulkan` | DPMS-off, then three mode changes and a disable: each displaced pool is discharged by `DarkCrtcDisplacement` at its successor's `Completed` | **E30b** *(rev 7)* withhold the dark proof when the off is proven |
+| `c0_3bi_unproven_off_issues_no_dark_proof_vulkan` | *(rev 7, Task 7 F8)* the CRTC's installed-power proof absent while the device stays `Ready` — set by a test seam: `CompletionUnknown` on the off would poison the device, and the production way to reach an unproven dark CRTC with an old pool (a new incarnation after recovery) is 3d's — then a mode change: no dark proof; the pool stays retained | **E30** issue the dark proof without a proven off (design mutation 21); **E31** treat an absent fence as a proof |
 
 ## Task 8 — the failure table and the typed cause
 
@@ -366,6 +376,23 @@ unclassified errno close readiness (C.0 §10, line 1985). Completion loss →
 client, request sequence, output, requested mode and position, device,
 modeset id and cause; each success logs the same at `debug`. The owner never
 synthesizes an errno.
+
+*(Rev 8, Task 8 F8.)* **Where the line is emitted.** `begin_crtc_config` does
+not receive the client or the request sequence, and the trait is not
+changed for it: the core's failure line (`complete_crtc_config`'s warn and
+the parked-completion path) gains the client id and sequence for every
+backend — log text, not protocol — and the Owner error's `Display` carries
+the output, requested mode and position, device, modeset id and typed cause.
+One line per failure results. **A stale result.** Today a stale `Completed`
+becomes `CompletionUnknown(ContradictoryEvidence)` with the device `Poisoned`
+and the record quarantined (`lifecycle_resource_terminal_state`,
+`render/admission.rs:4610`, asserted at `render/backend.rs:67238`). In 3b a
+stale client-modeset result is reachable only through an incarnation change
+(3c/3d): the arbiter defers every transition until a dispatched modeset's
+result crosses the boundary. Task 8 keeps that conservative path unchanged
+and only types the request's cause as `Stale` (answer `Failed`, nothing
+published); relaxing it to the design's quarantine-without-poison handoff to
+the winning transition is 3d's, which owns quarantine transfer.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |

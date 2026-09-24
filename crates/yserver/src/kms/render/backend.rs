@@ -2040,6 +2040,9 @@ pub struct KmsBackend {
     /// Dispatched Owner modesets remain install-capable until the core drains
     /// their terminal result, including after the lifecycle slot resolves.
     pub(crate) dispatched_client_modeset_tokens: HashSet<CrtcConfigToken>,
+    /// A dispatched Owner modeset whose core token was explicitly cancelled.
+    /// The transaction still promotes, but its terminal result is discarded.
+    detached_client_modeset_tokens: HashSet<CrtcConfigToken>,
     invalidated_crtc_config_probes: HashSet<CrtcConfigToken>,
     ready_crtc_config_announcements: VecDeque<CrtcConfigToken>,
     next_crtc_config_token: u64,
@@ -2050,14 +2053,22 @@ pub struct KmsBackend {
     /// the fd-less DRM fixture. Production always performs live discovery.
     #[cfg(test)]
     crtc_config_discovery_override: Option<crate::platform::drm::Output>,
-    /// Test-only source for Owner client modeset descriptions. Production has
-    /// no corresponding field or path; Task 4 replaces this with preparation.
+    /// Test-only target route override for the bound-CRTC preparation guard.
     #[cfg(test)]
-    pub(crate) client_modeset_description_source_for_tests: bool,
+    pub(crate) client_modeset_discovery_route_override_for_tests: Option<(u32, u32)>,
+    #[cfg(test)]
+    pub(crate) client_modeset_force_allocation_failure_for_tests: bool,
+    #[cfg(test)]
+    pub(crate) client_modeset_stale_before_validation_for_tests: bool,
+    #[cfg(test)]
+    pub(crate) client_modeset_released_allocation_keys_for_tests:
+        Vec<crate::kms::render::resources::AllocationKey>,
+    #[cfg(test)]
+    pub(crate) client_modeset_released_framebuffers_for_tests: Vec<u32>,
     /// Direct-mode input-thread control channel. Used by VT release /
     /// acquire to pause and resume the dedicated input thread.
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
-    randr_id_alloc: RandrIdAllocator,
+    pub(super) randr_id_alloc: RandrIdAllocator,
     /// Session-persistent PRIME Output Source policy, keyed by the KMS sink.
     ///
     /// Values use the provider's tagged endpoint identity rather than a DRM
@@ -2090,12 +2101,16 @@ pub struct KmsBackend {
     /// first projection adopt the activation clock while a re-added XID gets
     /// a genuinely fresh epoch.
     retired_present_crtc_ids: HashSet<u32>,
-    next_present_crtc_clock_epoch: u64,
+    pub(super) next_present_crtc_clock_epoch: u64,
     /// Installed clock epochs waiting for the device's shared slot.
     waiting_clock_probes: HashMap<
         crate::platform::drm::DrmDeviceKey,
         std::collections::BTreeSet<crate::kms::owner::clock::ClockKey>,
     >,
+    /// Successful modesets prove their new active CRTC lit independently of
+    /// the device-wide DPMS cache. Preserve those probes across a busy shared
+    /// host-call slot until the sequence request can start.
+    pub(super) modeset_lit_clock_probes: HashSet<(DrmDeviceKey, u32, u64)>,
     hotplug_rescan_deadline: Option<std::time::Instant>,
     gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
 
@@ -2130,6 +2145,27 @@ pub struct KmsBackend {
 #[cfg(test)]
 impl Drop for KmsBackend {
     fn drop(&mut self) {
+        let client_modeset_slots = self
+            .lifecycle_drivers
+            .values_mut()
+            .filter_map(|driver| driver.client_modeset.take())
+            .collect::<Vec<_>>();
+        for mut slot in client_modeset_slots {
+            if let Some(prepared) = slot.prepared.take() {
+                match (
+                    self.resource_service.as_mut(),
+                    self.drm_cleanup_registry.as_mut(),
+                ) {
+                    (Some(service), Some(registry)) => {
+                        prepared.prepared_set.release(service, registry)
+                    }
+                    _ => log::error!(
+                        "prepared client modeset {:?} lost its 2c-i service during teardown",
+                        slot.tag
+                    ),
+                }
+            }
+        }
         if !self.resource_cleanup_on_drop_for_tests {
             return;
         }
@@ -2685,6 +2721,14 @@ impl KmsBackend {
                     .map(|output| output.key.device_key)
             });
         frame_device.or_else(|| self.platform.primary_device().map(|device| device.key))
+    }
+
+    pub(crate) fn direct_scanout_active_for_device(&self, device: DrmDeviceKey) -> bool {
+        self.scanout_m2.active() && self.direct_scanout_device_for_unflip() == Some(device)
+    }
+
+    pub(crate) fn output_key_for_id(&self, output_id: u32) -> Option<&OutputKey> {
+        self.output_key_by_id.get(&output_id)
     }
 
     /// Whether every frame direct scanout holds (on screen, submitted, or
@@ -3540,7 +3584,10 @@ impl KmsBackend {
         if !self.scanout_m2.active() {
             return Ok(false);
         }
-        let relight = self.kms_outputs_active;
+        let relight = self
+            .direct_scanout_device_for_unflip()
+            .map(|device| self.device_outputs_powered_on(device))
+            .unwrap_or(self.kms_outputs_active);
         self.materialize_direct_shadow_for_unflip()?;
         if let Err(error) = self.platform.dpms_set_outputs_active(false) {
             log::error!(
@@ -4300,7 +4347,28 @@ impl KmsBackend {
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.scanout_m1_topology_signature().hash(&mut hasher);
-        self.kms_outputs_active.hash(&mut hasher);
+        let has_owner_power_state = self
+            .owner_dpms_installed_active
+            .keys()
+            .any(|device| self.device_is_owner(*device));
+        let has_legacy_outputs = self
+            .platform
+            .outputs
+            .iter()
+            .any(|output| !self.device_is_owner(output.key.device_key));
+        if has_owner_power_state {
+            let mut installed_owner_power = self
+                .owner_dpms_installed_active
+                .iter()
+                .filter(|(device, _)| self.device_is_owner(**device))
+                .map(|(device, active)| (*device, *active))
+                .collect::<Vec<_>>();
+            installed_owner_power.sort_unstable_by_key(|(device, _)| *device);
+            installed_owner_power.hash(&mut hasher);
+        }
+        if !has_owner_power_state || has_legacy_outputs {
+            self.kms_outputs_active.hash(&mut hasher);
+        }
         for (index, output) in self.platform.outputs.iter().enumerate() {
             output.key.hash(&mut hasher);
             output.scanout_route.hash(&mut hasher);
@@ -4422,6 +4490,10 @@ impl KmsBackend {
         token: CrtcConfigToken,
         result: io::Result<bool>,
     ) {
+        if self.detached_client_modeset_tokens.remove(&token) {
+            self.dispatched_client_modeset_tokens.remove(&token);
+            return;
+        }
         if self
             .ready_client_modeset_results
             .insert(token, result)
@@ -4444,6 +4516,7 @@ impl KmsBackend {
             if !self.pending_crtc_config_probes.contains_key(&token)
                 && !self.ready_crtc_config_results.contains_key(&token)
                 && !self.ready_client_modeset_results.contains_key(&token)
+                && !self.detached_client_modeset_tokens.contains(&token)
                 && !self.lifecycle_drivers.values().any(|driver| {
                     driver
                         .client_modeset
@@ -4501,6 +4574,7 @@ impl KmsBackend {
             ));
         }
         let token = self.next_crtc_config_token();
+        let was_active = self.device_outputs_powered_on(output_key.device_key);
         let kms_fd = self
             .platform
             .device_for_output(&output_key)
@@ -4556,7 +4630,7 @@ impl KmsBackend {
             topology_signature: self.crtc_config_topology_signature(),
             topology_epoch: self.crtc_config_topology_epoch,
             vt_state: self.vt_state,
-            was_active: self.kms_outputs_active,
+            was_active,
         };
         self.pending_crtc_config_probes.insert(token, pending);
         let enqueue_result = self
@@ -6948,6 +7022,7 @@ impl KmsBackend {
             ready_crtc_config_results: HashMap::new(),
             ready_client_modeset_results: HashMap::new(),
             dispatched_client_modeset_tokens: HashSet::new(),
+            detached_client_modeset_tokens: HashSet::new(),
             invalidated_crtc_config_probes: HashSet::new(),
             ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
@@ -6955,7 +7030,15 @@ impl KmsBackend {
             #[cfg(test)]
             crtc_config_discovery_override: None,
             #[cfg(test)]
-            client_modeset_description_source_for_tests: false,
+            client_modeset_discovery_route_override_for_tests: None,
+            #[cfg(test)]
+            client_modeset_force_allocation_failure_for_tests: false,
+            #[cfg(test)]
+            client_modeset_stale_before_validation_for_tests: false,
+            #[cfg(test)]
+            client_modeset_released_allocation_keys_for_tests: Vec::new(),
+            #[cfg(test)]
+            client_modeset_released_framebuffers_for_tests: Vec::new(),
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             provider_output_sources: HashMap::new(),
@@ -6966,6 +7049,7 @@ impl KmsBackend {
             retired_present_crtc_ids: HashSet::new(),
             next_present_crtc_clock_epoch: 1,
             waiting_clock_probes: HashMap::new(),
+            modeset_lit_clock_probes: HashSet::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -8295,6 +8379,7 @@ impl KmsBackend {
             ready_crtc_config_results: HashMap::new(),
             ready_client_modeset_results: HashMap::new(),
             dispatched_client_modeset_tokens: HashSet::new(),
+            detached_client_modeset_tokens: HashSet::new(),
             invalidated_crtc_config_probes: HashSet::new(),
             ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
@@ -8302,7 +8387,15 @@ impl KmsBackend {
             #[cfg(test)]
             crtc_config_discovery_override: None,
             #[cfg(test)]
-            client_modeset_description_source_for_tests: false,
+            client_modeset_discovery_route_override_for_tests: None,
+            #[cfg(test)]
+            client_modeset_force_allocation_failure_for_tests: false,
+            #[cfg(test)]
+            client_modeset_stale_before_validation_for_tests: false,
+            #[cfg(test)]
+            client_modeset_released_allocation_keys_for_tests: Vec::new(),
+            #[cfg(test)]
+            client_modeset_released_framebuffers_for_tests: Vec::new(),
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             provider_output_sources: HashMap::new(),
@@ -8313,6 +8406,7 @@ impl KmsBackend {
             retired_present_crtc_ids: HashSet::new(),
             next_present_crtc_clock_epoch: 1,
             waiting_clock_probes: HashMap::new(),
+            modeset_lit_clock_probes: HashSet::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -13210,7 +13304,7 @@ impl KmsBackend {
     ///
     /// The input-event accumulator lives on the dedicated input thread; send
     /// the new extent via `InputThreadControl::push_resize`.
-    fn update_input_extent(&mut self, fb_w: u16, fb_h: u16) {
+    pub(super) fn update_input_extent(&mut self, fb_w: u16, fb_h: u16) {
         let w = u32::from(fb_w);
         let h = u32::from(fb_h);
         if let Some(ctrl) = self.input_thread_control.as_ref() {
@@ -20794,7 +20888,7 @@ impl KmsBackend {
         self.promote_waiting_clock_probe(device);
     }
 
-    fn retain_waiting_clock_probe(
+    pub(super) fn retain_waiting_clock_probe(
         &mut self,
         device: DrmDeviceKey,
         key: crate::kms::owner::clock::ClockKey,
@@ -20842,7 +20936,16 @@ impl KmsBackend {
             else {
                 return;
             };
-            if !self.owner_outputs_powered_on(device) {
+            let crtc_is_live = self.platform.outputs.iter().any(|output| {
+                output.key.device_key == device
+                    && u32::from(output.output.crtc) == key.hardware_crtc
+            });
+            let lit_by_modeset = self.modeset_lit_clock_probes.contains(&(
+                device,
+                key.hardware_crtc,
+                key.epoch.get(),
+            ));
+            if !crtc_is_live || (!self.owner_outputs_powered_on(device) && !lit_by_modeset) {
                 self.remove_waiting_clock_probe(device, key);
                 continue;
             }
@@ -20907,6 +21010,8 @@ impl KmsBackend {
         } else {
             false
         };
+        self.modeset_lit_clock_probes
+            .remove(&(device, key.hardware_crtc, key.epoch.get()));
         if empty {
             self.waiting_clock_probes.remove(&device);
         }
@@ -21787,6 +21892,13 @@ impl KmsBackend {
                 let commit_key = crate::kms::render::resources::CommitKey::new(device_key, commit);
                 let resource_terminal =
                     self.lifecycle_resource_terminal_state(device_key, commit, terminal);
+                if matches!(
+                    resource_terminal,
+                    crate::kms::owner::record::TerminalState::FailedBeforeSubmit(_)
+                ) {
+                    self.lifecycle_cancel_kms_displacements(device_key, commit);
+                }
+                self.lifecycle_update_installed_crtc_power(device_key, commit, resource_terminal);
                 let completion_unknown = matches!(
                     resource_terminal,
                     crate::kms::owner::record::TerminalState::CompletionUnknown(_)
@@ -21832,6 +21944,13 @@ impl KmsBackend {
             }
             crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, resources } => {
                 let commit_key = crate::kms::render::resources::CommitKey::new(device_key, commit);
+                let retired_members = resources
+                    .old()
+                    .iter()
+                    .chain(resources.new())
+                    .flat_map(|resources| resources.crtcs.iter().copied())
+                    .collect::<Vec<_>>();
+                self.lifecycle_complete_kms_displacements(device_key, commit, &retired_members);
                 let admission_active = self.admission_is_active(device_key);
                 let conductor_installed = self.admission_conductors.contains_key(&device_key);
                 let maintenance_only = self
@@ -22723,6 +22842,38 @@ impl KmsBackend {
                 .apply_crtc_config(output_id, connector, mode, x, y)
                 .map(CrtcConfigApply::Applied);
         }
+        if let (
+            ConnectorConfig::Enabled {
+                mode_w,
+                mode_h,
+                vrefresh,
+                ..
+            },
+            Some(mode),
+        ) = (current, mode)
+            && mode_w == mode.width
+            && mode_h == mode.height
+            && vrefresh == mode.vrefresh
+        {
+            let modeset = self.admission_reserve_client_modeset_id(output_key.device_key)?;
+            return Err(crate::kms::render::admission::ClientModesetError {
+                diagnostic: crate::kms::render::admission::ClientModesetDiagnostic {
+                    device: output_key.device_key,
+                    modeset,
+                    output_id,
+                    output: connector.to_string(),
+                    requested_mode: Some(mode),
+                    x,
+                    y,
+                },
+                failure: crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
+                    crate::kms::render::admission::OwnerRefusal::NotYetSupported(
+                        crate::kms::render::admission::ClientModesetUnsupportedFeature::PositionOnly,
+                    ),
+                ),
+            }
+            .into_io_error());
+        }
         if mode.is_some()
             && self
                 .platform
@@ -22737,46 +22888,36 @@ impl KmsBackend {
                  YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
             )));
         }
+        let modeset = self.admission_reserve_client_modeset_id(output_key.device_key)?;
+        let diagnostic = crate::kms::render::admission::ClientModesetDiagnostic {
+            device: output_key.device_key,
+            modeset,
+            output_id,
+            output: connector.to_string(),
+            requested_mode: mode,
+            x,
+            y,
+        };
         if self.vt_state != crate::vt::state::VtState::Active {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                    crate::kms::render::admission::ClientModesetRefusal::SeatReleased,
-                ),
-            ));
+            return Err(crate::kms::render::admission::ClientModesetError {
+                diagnostic,
+                failure: crate::kms::render::admission::ClientModesetFailure::SeatReleased,
+            }
+            .into_io_error());
         }
 
-        #[cfg(test)]
-        if !self.client_modeset_description_source_for_tests {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                    crate::kms::render::admission::ClientModesetRefusal::NotYetSupported,
-                ),
-            ));
-        }
-        #[cfg(not(test))]
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                crate::kms::render::admission::ClientModesetRefusal::NotYetSupported,
-            ),
-        ));
-
-        #[cfg(test)]
-        {
-            let token = self.next_crtc_config_token();
-            self.admission_start_client_modeset(
-                output_key.device_key,
-                token,
-                output_id,
-                connector.to_string(),
-                mode,
-                x,
-                y,
-            )?;
-            Ok(CrtcConfigApply::Pending(token))
-        }
+        let token = self.next_crtc_config_token();
+        self.admission_start_client_modeset(
+            output_key.device_key,
+            modeset,
+            token,
+            output_id,
+            connector.to_string(),
+            mode,
+            x,
+            y,
+        )?;
+        Ok(CrtcConfigApply::Pending(token))
     }
 }
 
@@ -24938,9 +25079,51 @@ impl Backend for KmsBackend {
     }
 
     fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
+        let owner_phase = self.lifecycle_drivers.values().find_map(|driver| {
+            driver
+                .client_modeset
+                .as_ref()
+                .filter(|slot| slot.token == token)
+                .map(|slot| slot.phase)
+        });
+        let owner_was_dispatched = self.dispatched_client_modeset_tokens.contains(&token)
+            || owner_phase == Some(crate::kms::render::admission::ClientModesetPhase::Dispatched);
+
+        if owner_was_dispatched {
+            self.remove_crtc_config_ready_announcement(token);
+            self.invalidated_crtc_config_probes.remove(&token);
+            self.pending_crtc_config_probes.remove(&token);
+            self.ready_crtc_config_results.remove(&token);
+            if self.ready_client_modeset_results.remove(&token).is_some() {
+                // The event already crossed promotion. Discard its publication
+                // and retire the install-capable marker with the token.
+                self.dispatched_client_modeset_tokens.remove(&token);
+                self.detached_client_modeset_tokens.remove(&token);
+            } else {
+                // Keep the dispatch marker until the transaction reaches its
+                // result boundary. Its installed state must still be promoted.
+                self.dispatched_client_modeset_tokens.insert(token);
+                self.detached_client_modeset_tokens.insert(token);
+            }
+            return;
+        }
+
+        if owner_phase.is_some() {
+            // Before dispatch, abandonment cancels any queued validation and
+            // releases the prepared set owned by the lifecycle slot.
+            let _ = self.abandon_owner_client_modeset_requester(token);
+            self.remove_crtc_config_ready_announcement(token);
+            self.invalidated_crtc_config_probes.remove(&token);
+            self.ready_client_modeset_results.remove(&token);
+            self.dispatched_client_modeset_tokens.remove(&token);
+            self.detached_client_modeset_tokens.remove(&token);
+            return;
+        }
+
         self.remove_crtc_config_ready_announcement(token);
         self.invalidated_crtc_config_probes.remove(&token);
         self.dispatched_client_modeset_tokens.remove(&token);
+        self.detached_client_modeset_tokens.remove(&token);
         self.ready_client_modeset_results.remove(&token);
         self.pending_crtc_config_probes.remove(&token);
         self.ready_crtc_config_results.remove(&token);
@@ -25150,7 +25333,7 @@ impl Backend for KmsBackend {
         // they are always legal after drain_all.  After rebuild_outputs
         // the scene's `pending_acks` is fresh-empty for every output, so
         // the subsequent `wake_for_damage` tick is EBUSY-safe.
-        let restore_old_on_failure = self.kms_outputs_active;
+        let restore_old_on_failure = self.device_outputs_powered_on(output_key.device_key);
         self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
 
         match mode {
@@ -32592,7 +32775,7 @@ mod tests {
     };
     use std::{
         cell::RefCell,
-        collections::{HashMap, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         io,
         os::fd::AsFd,
         rc::Rc,
@@ -34859,6 +35042,7 @@ mod tests {
         let mut backend = KmsBackend::for_tests();
         backend.platform.devices.clear();
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.randr_id_alloc = RandrIdAllocator::default();
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
         backend.platform.render_devices = vec![test_render_device(render_id, None)];
@@ -34971,6 +35155,7 @@ mod tests {
         let mut backend = KmsBackend::for_tests();
         backend.platform.devices.clear();
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.randr_id_alloc = RandrIdAllocator::default();
         let render_id = RenderDeviceId::UnverifiedFallback;
         backend.platform.render_devices = vec![test_render_device(render_id, None)];
@@ -35001,6 +35186,7 @@ mod tests {
         let mut backend = KmsBackend::for_tests();
         backend.platform.devices.clear();
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.platform.render_devices.clear();
         backend.platform.selected_render_device = None;
         backend.randr_id_alloc = RandrIdAllocator::default();
@@ -35217,6 +35403,11 @@ mod tests {
         );
         let key = active.key.clone();
         b.platform.outputs.push(active);
+        let instance_id = b
+            .platform
+            .allocate_output_instance_id(&key)
+            .expect("test output instance id");
+        b.platform.output_instance_ids.push(instance_id);
         b.platform.scanout_pools.push(None);
         b.platform.bo_generations.push(Vec::new());
         b.platform.first_pageflip_logged.push(false);
@@ -35235,6 +35426,7 @@ mod tests {
 
     fn clear_test_outputs(b: &mut super::KmsBackend) {
         b.platform.outputs.clear();
+        b.platform.output_instance_ids.clear();
         b.platform.scanout_pools.clear();
         b.platform.bo_generations.clear();
         b.platform.first_pageflip_logged.clear();
@@ -36018,6 +36210,7 @@ mod tests {
         // registry's Off config prevents a stale platform row from reviving
         // it; clearing the row is the production apply's corresponding side.
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.rebuild_randr_state(&mut state, None, false);
         assert_eq!(state.randr.timestamp, 41);
         assert_eq!(state.randr.config_timestamp, light_config_timestamp);
@@ -36120,6 +36313,7 @@ mod tests {
         );
 
         backend.platform.outputs.clear();
+        backend.platform.output_instance_ids.clear();
         backend.rebuild_randr_state(&mut state, None, heavy_delta.config_changed);
         assert_eq!(
             (state.randr.timestamp, state.randr.config_timestamp),
@@ -48088,6 +48282,7 @@ mod tests {
     fn make_vt_fixture_headless(b: &mut KmsBackend) {
         b.platform.devices.clear();
         b.platform.outputs.clear();
+        b.platform.output_instance_ids.clear();
         b.platform.scanout_pools.clear();
         b.platform.bo_generations.clear();
         b.platform.first_pageflip_logged.clear();
@@ -48480,6 +48675,7 @@ mod tests {
         // B departs for good: no reservation, so the extent shrinks.
         b.randr_id_alloc.entry_mut(&departing).last_enabled = None;
         b.platform.outputs.pop();
+        b.platform.output_instance_ids.pop();
         b.platform.scanout_pools.pop();
         b.platform.bo_generations.pop();
         b.platform.first_pageflip_logged.pop();
@@ -49190,8 +49386,10 @@ mod tests {
         assert!(backend.sequence_queue_failed(key, old_epoch));
 
         let output = backend.platform.outputs.pop().unwrap();
+        let instance_id = backend.platform.output_instance_ids.pop().unwrap();
         backend.refresh_present_crtc_clock_epochs();
         backend.platform.outputs.push(output);
+        backend.platform.output_instance_ids.push(instance_id);
         backend.refresh_present_crtc_clock_epochs();
         let new_epoch = backend.clock_epoch_for_crtc_key(key);
         assert_ne!(new_epoch, old_epoch);
@@ -49229,8 +49427,10 @@ mod tests {
         let stale_epoch = backend.clock_epoch_for_crtc_key(key);
 
         let output = backend.platform.outputs.pop().unwrap();
+        let instance_id = backend.platform.output_instance_ids.pop().unwrap();
         backend.refresh_present_crtc_clock_epochs();
         backend.platform.outputs.push(output);
+        backend.platform.output_instance_ids.push(instance_id);
         backend.refresh_present_crtc_clock_epochs();
         let current_epoch = backend.clock_epoch_for_crtc_key(key);
 
@@ -49614,10 +49814,16 @@ mod tests {
         assert_eq!(b.present_crtc_clock_epoch(crtc_id), first);
 
         let output = b.platform.outputs.pop().expect("fixture output");
+        let instance_id = b
+            .platform
+            .output_instance_ids
+            .pop()
+            .expect("fixture output instance");
         b.refresh_present_crtc_clock_epochs();
         assert_eq!(b.present_crtc_clock_epoch(crtc_id), 0);
 
         b.platform.outputs.push(output);
+        b.platform.output_instance_ids.push(instance_id);
         b.refresh_present_crtc_clock_epochs();
         let second = b.present_crtc_clock_epoch(crtc_id);
         assert_ne!(second, 0);
@@ -50093,6 +50299,12 @@ mod tests {
             800,
             0,
         ));
+        let output_key = b.platform.outputs.last().expect("new output").key.clone();
+        let instance_id = b
+            .platform
+            .allocate_output_instance_id(&output_key)
+            .expect("new test output instance");
+        b.platform.output_instance_ids.push(instance_id);
     }
 
     fn install_direct_frame_for_target_test(
@@ -51185,6 +51397,7 @@ mod tests {
     fn headless_output_inventory_keeps_present_in_blackout() {
         let mut b = super::KmsBackend::for_tests();
         b.platform.outputs.clear();
+        b.platform.output_instance_ids.clear();
         b.kms_outputs_active = !b.platform.outputs.is_empty();
 
         assert!(b.scanout_allowed(), "the fixture VT remains active");
@@ -51199,6 +51412,7 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         b.platform.devices.clear();
         b.platform.outputs.clear();
+        b.platform.output_instance_ids.clear();
         b.kms_outputs_active = false;
 
         assert!(b.platform.primary_device().is_none());
@@ -55256,6 +55470,11 @@ mod tests {
             })?;
         backend.platform.devices[0].key = device;
         backend.platform.outputs[0].key.device_key = device;
+        let first_output_key = backend.platform.outputs[0].key.clone();
+        backend.platform.output_instance_ids[0] = backend
+            .platform
+            .allocate_output_instance_id(&first_output_key)
+            .expect("rekey live fixture output instance");
         backend.platform.reap_executors_on_drop_for_tests();
         backend.resource_cleanup_on_drop_for_tests = true;
         if output_count > 1 {
@@ -55282,13 +55501,28 @@ mod tests {
                 .map_err(|error| {
                     std::io::Error::other(format!("rebuild multi-output scene: {error:?}"))
                 })?;
+        } else {
+            backend
+                .scene
+                .rebuild_outputs(&backend.platform)
+                .map_err(|error| {
+                    std::io::Error::other(format!("rebuild single-output scene: {error:?}"))
+                })?;
         }
         finish_owner_live_fixture(backend, extra_missing_output)
     }
 
     fn finish_owner_live_fixture(
+        backend: super::KmsBackend,
+        extra_missing_output: bool,
+    ) -> Result<OwnerLiveFixture, std::io::Error> {
+        finish_owner_live_fixture_with_properties(backend, extra_missing_output, true)
+    }
+
+    fn finish_owner_live_fixture_with_properties(
         mut backend: super::KmsBackend,
         extra_missing_output: bool,
+        seed_test_properties: bool,
     ) -> Result<OwnerLiveFixture, std::io::Error> {
         use crate::kms::render::resources::{
             DrmCleanupRegistry, ResourceService, tests::MockCleanupIo,
@@ -55300,20 +55534,22 @@ mod tests {
         // The owner executor is a stub and never issues this description to
         // that fd, so seed the persistent property ids that the production
         // discovery cache would have obtained for a real output.
-        for (output_idx, output) in backend.platform.outputs.iter_mut().enumerate() {
-            let crtc = u32::from(output.output.crtc);
-            output.output.plane =
-                ::drm::control::from_u32(10 + u32::try_from(output_idx).unwrap_or(u32::MAX))
-                    .expect("fixture primary plane");
-            output.output.plane_fb_id_prop =
-                ::drm::control::from_u32(19).expect("fixture FB_ID property");
-            output.output.plane_crtc_id_prop =
-                ::drm::control::from_u32(20).expect("fixture CRTC_ID property");
-            output.output.crtc_out_fence_ptr_prop =
-                Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
-            backend.platform.devices[0]
-                .active_property_cache
-                .insert_for_tests(crtc, 21);
+        if seed_test_properties {
+            for (output_idx, output) in backend.platform.outputs.iter_mut().enumerate() {
+                let crtc = u32::from(output.output.crtc);
+                output.output.plane =
+                    ::drm::control::from_u32(10 + u32::try_from(output_idx).unwrap_or(u32::MAX))
+                        .expect("fixture primary plane");
+                output.output.plane_fb_id_prop =
+                    ::drm::control::from_u32(19).expect("fixture FB_ID property");
+                output.output.plane_crtc_id_prop =
+                    ::drm::control::from_u32(20).expect("fixture CRTC_ID property");
+                output.output.crtc_out_fence_ptr_prop =
+                    Some(::drm::control::from_u32(22).expect("fixture OUT_FENCE_PTR property"));
+                backend.platform.devices[0]
+                    .active_property_cache
+                    .insert_for_tests(crtc, 21);
+            }
         }
         let executor = crate::kms::executor::test_support::spawn_stub_helper(
             crate::kms::executor::test_support::StubBehaviour::AcceptProbesThenNeverReply(1000),
@@ -62263,8 +62499,318 @@ mod tests {
         backend
             .output_key_by_id
             .insert(ids.output_id, output_key.clone());
-        backend.client_modeset_description_source_for_tests = true;
         (backend, device, ids.output_id, output_key.connector_name)
+    }
+
+    fn c0_3bi_live_modeset_backend(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+        with_other_output: bool,
+    ) -> Result<
+        (
+            OwnerLiveFixture,
+            DrmDeviceKey,
+            u32,
+            String,
+            yserver_core::backend::ModeSpec,
+        ),
+        std::io::Error,
+    > {
+        use crate::kms::backend::ActiveOutput;
+        use ::drm::{ClientCapability, Device as _};
+        use std::sync::Arc;
+
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        let device_key = backend
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .ok_or_else(|| std::io::Error::other("live modeset fixture has no DRM identity"))?;
+        backend.platform.devices[0].key = device_key;
+        backend.platform.outputs[0].key.device_key = device_key;
+        backend.platform.outputs[0].scanout_route.kms_device_key = device_key;
+        let drm_device = Rc::clone(&backend.platform.devices[0].device);
+        for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
+            let _ = drm_device.set_client_capability(capability, true);
+        }
+
+        if with_other_output {
+            let vk = backend
+                .platform
+                .vk
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("live modeset fixture has no Vulkan"))?;
+            backend
+                .platform
+                .append_test_output_with_scanout_pool(Arc::clone(&vk), "test-output-1")?;
+            // This unrelated fixture output reserves an object tuple which
+            // cannot collide with a real device assignment discovered below.
+            let other = &mut backend.platform.outputs[1].output;
+            other.encoder = ::drm::control::from_u32(0xefff_ff01).unwrap();
+            other.crtc = ::drm::control::from_u32(0xefff_ff02).unwrap();
+            other.plane = ::drm::control::from_u32(0xefff_ff03).unwrap();
+        }
+
+        let candidates = crate::drm::modeset::discover_outputs(&drm_device)?;
+        let selected = candidates
+            .iter()
+            .find_map(|candidate| {
+                candidate
+                    .modes
+                    .iter()
+                    .find(|mode| {
+                        mode.width == candidate.picked.width
+                            && mode.height == candidate.picked.height
+                            && mode.vrefresh != candidate.picked.vrefresh
+                    })
+                    .map(|mode| (candidate.connector_name.clone(), mode.clone()))
+            })
+            .or_else(|| {
+                candidates.iter().find_map(|candidate| {
+                    candidate
+                        .modes
+                        .iter()
+                        .find(|mode| {
+                            mode.width != candidate.picked.width
+                                || mode.height != candidate.picked.height
+                                || mode.vrefresh != candidate.picked.vrefresh
+                        })
+                        .map(|mode| (candidate.connector_name.clone(), mode.clone()))
+                })
+            });
+        let (connector, target_mode) = selected.ok_or_else(|| {
+            std::io::Error::other(
+                "live modeset fixture needs a connected connector with two advertised modes",
+            )
+        })?;
+        let output_key = OutputKey::new(device_key, connector.clone());
+        backend.platform.outputs[0].key = output_key.clone();
+        backend.platform.outputs[0].output.connector_name = connector.clone();
+        let reserved_routes = backend
+            .platform
+            .outputs
+            .iter()
+            .skip(1)
+            .map(|layout| {
+                (
+                    layout.output.encoder,
+                    layout.output.crtc,
+                    layout.output.plane,
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = crate::drm::modeset::discover_output_for_connector(
+            &drm_device,
+            &connector,
+            &reserved_routes,
+        )?;
+        let target_mode = output
+            .modes
+            .iter()
+            .find(|mode| {
+                mode.width == output.picked.width
+                    && mode.height == output.picked.height
+                    && mode.vrefresh != output.picked.vrefresh
+            })
+            .cloned()
+            .unwrap_or(target_mode);
+        let target_mode = yserver_core::backend::ModeSpec {
+            width: target_mode.width,
+            height: target_mode.height,
+            vrefresh: target_mode.vrefresh,
+        };
+        let route = backend.platform.scanout_route_for_kms(device_key)?;
+        let vk = backend
+            .platform
+            .vk
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("live modeset fixture has no Vulkan"))?;
+        let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
+            Arc::clone(&vk),
+            Rc::clone(&drm_device),
+            route,
+            u32::from(output.picked.width),
+            u32::from(output.picked.height),
+            crate::kms::render::platform::SCANOUT_POOL_DEPTH,
+            &output.scanout_modifiers,
+        )
+        .map_err(|error| std::io::Error::other(format!("fixture scanout pool: {error}")))?;
+        backend.platform.outputs[0] = ActiveOutput::new(
+            route,
+            output,
+            crate::drm::Swapchain::empty_for_tests(),
+            0,
+            0,
+        );
+        backend.platform.scanout_pools[0] =
+            Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
+        let pool_depth = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("new live modeset pool")
+            .display_pool()
+            .bos
+            .len();
+        backend.platform.bo_generations[0] = vec![Default::default(); pool_depth];
+        backend.platform.output_instance_ids[0] = backend
+            .platform
+            .allocate_output_instance_id(&output_key)
+            .map_err(|error| std::io::Error::other(format!("fixture output instance: {error}")))?;
+
+        if with_other_output {
+            backend.platform.outputs[1].x = i32::from(backend.platform.outputs[0].width);
+        }
+        let framebuffer_width = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| layout.x.saturating_add(i32::from(layout.width)))
+            .max()
+            .unwrap_or(backend.platform.outputs[0].width.into())
+            .clamp(1, i32::from(u16::MAX));
+        let framebuffer_width =
+            u16::try_from(framebuffer_width).expect("clamped live fixture width fits in u16");
+        let framebuffer_height = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| layout.y.saturating_add(i32::from(layout.height)))
+            .max()
+            .unwrap_or(backend.platform.outputs[0].height.into())
+            .clamp(1, i32::from(u16::MAX));
+        let framebuffer_height =
+            u16::try_from(framebuffer_height).expect("clamped live fixture height fits in u16");
+        backend.apply_virtual_screen_extent(framebuffer_width, framebuffer_height)?;
+        backend
+            .scene
+            .rebuild_outputs(&backend.platform)
+            .map_err(|error| std::io::Error::other(format!("fixture scene rebuild: {error:?}")))?;
+
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&output_key);
+            entry.connected = true;
+            entry.config = super::ConnectorConfig::Enabled {
+                mode_w: backend.platform.outputs[0].width,
+                mode_h: backend.platform.outputs[0].height,
+                vrefresh: backend.platform.outputs[0].output.picked.vrefresh,
+                x: 0,
+                y: 0,
+            };
+            entry.modes = backend.platform.outputs[0].output.modes.clone();
+            entry.edid = backend.platform.outputs[0].output.edid.clone();
+            entry.mm_width = backend.platform.outputs[0].output.mm_width;
+            entry.mm_height = backend.platform.outputs[0].output.mm_height;
+            entry.connector_type = backend.platform.outputs[0].output.connector_type.clone();
+        }
+        backend
+            .output_key_by_id
+            .insert(ids.output_id, output_key.clone());
+        let mut fixture = finish_owner_live_fixture_with_properties(backend, false, false)?;
+        c0_3aii_replace_owner_executor(&mut fixture.backend, behaviour);
+        Ok((fixture, device_key, ids.output_id, connector, target_mode))
+    }
+
+    fn c0_3bi_live_disabled_modeset_backend(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> Result<
+        (
+            OwnerLiveFixture,
+            DrmDeviceKey,
+            u32,
+            String,
+            yserver_core::backend::ModeSpec,
+        ),
+        std::io::Error,
+    > {
+        use super::ConnectorConfig;
+        use ::drm::{ClientCapability, Device as _};
+
+        let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
+        let device_key = backend
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .ok_or_else(|| std::io::Error::other("live modeset fixture has no DRM identity"))?;
+        backend.platform.devices[0].key = device_key;
+        backend.platform.outputs[0].key.device_key = device_key;
+        backend.platform.outputs[0].scanout_route.kms_device_key = device_key;
+        let drm_device = Rc::clone(&backend.platform.devices[0].device);
+        for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
+            let _ = drm_device.set_client_capability(capability, true);
+        }
+        // Keep the synthetic output as the old lit topology while making its
+        // reserved object tuple disjoint from the real connector selected below.
+        backend.platform.outputs[0].output.encoder = ::drm::control::from_u32(0xefff_ff01).unwrap();
+        backend.platform.outputs[0].output.crtc = ::drm::control::from_u32(0xefff_ff02).unwrap();
+        backend.platform.outputs[0].output.plane = ::drm::control::from_u32(0xefff_ff03).unwrap();
+        backend
+            .scene
+            .rebuild_outputs(&backend.platform)
+            .map_err(|error| {
+                std::io::Error::other(format!("rebuild disabled fixture scene: {error:?}"))
+            })?;
+
+        let mut fixture = finish_owner_live_fixture(backend, false)?;
+        let drm_device = Rc::clone(&fixture.backend.platform.devices[0].device);
+        let reserved_routes = fixture
+            .backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| layout.key.device_key == device_key)
+            .map(|layout| {
+                (
+                    layout.output.encoder,
+                    layout.output.crtc,
+                    layout.output.plane,
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = crate::drm::modeset::probe_connector_snapshots(&drm_device)?
+            .into_iter()
+            .filter(|candidate| !candidate.modes.is_empty())
+            .find_map(|candidate| {
+                crate::drm::modeset::discover_output_for_connector(
+                    &drm_device,
+                    &candidate.connector_name,
+                    &reserved_routes,
+                )
+                .ok()
+            })
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "live disabled-output fixture needs a connected connector with an unreserved route",
+                )
+            })?;
+        let connector = output.connector_name.clone();
+        let output_key = OutputKey::new(device_key, connector.clone());
+        let mode = yserver_core::backend::ModeSpec {
+            width: output.picked.width,
+            height: output.picked.height,
+            vrefresh: output.picked.vrefresh,
+        };
+        let ids = fixture.backend.randr_id_alloc.ids_for(&output_key);
+        {
+            let entry = fixture.backend.randr_id_alloc.entry_mut(&output_key);
+            entry.connected = true;
+            entry.config = ConnectorConfig::Off;
+            entry.modes = output.modes;
+            entry.edid = output.edid;
+            entry.mm_width = output.mm_width;
+            entry.mm_height = output.mm_height;
+            entry.connector_type = output.connector_type;
+        }
+        fixture
+            .backend
+            .output_key_by_id
+            .insert(ids.output_id, output_key);
+        c0_3aii_replace_owner_executor(&mut fixture.backend, behaviour);
+        Ok((fixture, device_key, ids.output_id, connector, mode))
     }
 
     fn c0_3bi_begin_client_modeset(
@@ -62279,6 +62825,961 @@ mod tests {
             panic!("non-idempotent Owner request must occupy the asynchronous slot")
         };
         token
+    }
+
+    fn c0_3bi_accept_and_finish_client_modeset(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        token: yserver_core::backend::CrtcConfigToken,
+        next_executor: Option<crate::kms::executor::test_support::StubBehaviour>,
+    ) -> std::io::Result<bool> {
+        wait_lifecycle_executor_readable(backend, device);
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("validated modeset is dispatched")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        if let Some(behaviour) = next_executor {
+            c0_3aii_replace_owner_executor(backend, behaviour);
+        }
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        Backend::finish_crtc_config(backend, token)
+    }
+
+    fn c0_3bi_dispatch_client_modeset(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::identity::CommitId {
+        wait_lifecycle_executor_readable(backend, device);
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+        backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("validated client modeset is dispatched")
+            .commit_id()
+    }
+
+    fn c0_3bi_reject_live_client_modeset(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        token: yserver_core::backend::CrtcConfigToken,
+        errno: i32,
+    ) -> std::io::Result<bool> {
+        use crate::kms::executor::{HostCallEvent, HostCallOutcome};
+
+        c0_3bi_dispatch_client_modeset(backend, device);
+        let correlation = *backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("live client modeset record")
+            .correlation();
+        let events = backend.platform.devices[0]
+            .owner
+            .as_mut()
+            .expect("Owner device")
+            .apply_host_call_event(HostCallEvent::Outcome {
+                correlation,
+                outcome: HostCallOutcome::Rejected {
+                    errno,
+                    helper_duration_ns: 0,
+                    round_trip_ns: 0,
+                    unexpected_fence_output: false,
+                },
+            });
+        assert!(backend.route_owner_event_batch(device, events, std::time::Instant::now()));
+        Backend::finish_crtc_config(backend, token)
+    }
+
+    fn c0_3bi_reject_test_only_client_modeset(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        token: yserver_core::backend::CrtcConfigToken,
+    ) -> std::io::Result<bool> {
+        wait_lifecycle_executor_readable(backend, device);
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+        Backend::finish_crtc_config(backend, token)
+    }
+
+    fn c0_3bi_scanout_allocation_keys(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        connector: &str,
+    ) -> Vec<crate::kms::render::resources::AllocationKey> {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == OutputKey::new(device, connector))
+            .expect("installed output for modeset");
+        backend.platform.scanout_pools[output_idx]
+            .as_ref()
+            .expect("installed output scanout pool")
+            .display_pool()
+            .bos
+            .iter()
+            .map(|bo| bo.managed_key().expect("managed installed BO"))
+            .collect()
+    }
+
+    fn c0_3bi_kms_displacements(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+    ) -> Vec<crate::kms::render::resources::KmsReleaseObligation> {
+        backend.lifecycle_drivers[&device].kms_displacements_for_tests(commit)
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_mode_change_promotes_vulkan() {
+        use crate::kms::{
+            executor::{
+                ObservedOutcome,
+                test_support::{ScriptedReply, StubBehaviour},
+            },
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (
+            OwnerLiveFixture {
+                mut backend,
+                cleanup_calls,
+                ..
+            },
+            device,
+            output_id,
+            connector,
+            mode,
+        ) = c0_3bi_live_modeset_backend(
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+            false,
+        )
+        .expect("environmental skip: no live Vulkan modeset fixture");
+        let key = OutputKey::new(device, connector.clone());
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output scene instance");
+        let old_keys = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("old output scanout pool")
+            .display_pool()
+            .bos
+            .iter()
+            .map(|bo| bo.managed_key().expect("managed old pool BO"))
+            .collect::<Vec<_>>();
+        let old_clock = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .clock_key_for_hardware_crtc(u32::from(backend.platform.outputs[0].output.crtc))
+            .expect("old CRTC clock");
+        let input_control = std::sync::Arc::new(
+            crate::input_thread::InputThreadControl::new().expect("input resize control"),
+        );
+        backend.set_input_thread_control(std::sync::Arc::clone(&input_control));
+        let _ = backend.drained_host_call_events_for_tests();
+
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(
+                &mut backend,
+                device,
+                token,
+                Some(StubBehaviour::AcceptProbeWith(304)),
+            )
+            .expect("modeset completion result")
+        );
+
+        let output = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.key == key)
+            .expect("mode-changed output remains installed");
+        assert_eq!((output.width, output.height), (mode.width, mode.height));
+        assert_eq!(
+            (backend.platform.fb_w, backend.platform.fb_h),
+            crate::kms::render::platform::recompute_fb_extent_from(
+                &backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| (output.x, output.y, output.width, output.height))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        assert_ne!(
+            (backend.platform.fb_w, backend.platform.fb_h),
+            (0, 0),
+            "the root extent follows the installed output layout"
+        );
+        assert_eq!(
+            input_control.take_resize(),
+            Some((
+                u32::from(backend.platform.fb_w),
+                u32::from(backend.platform.fb_h)
+            )),
+            "the input extent follows the promoted root extent"
+        );
+        let registry = backend
+            .randr_id_alloc
+            .entry(&key)
+            .expect("known RandR registry entry");
+        assert_eq!(
+            registry.config,
+            super::ConnectorConfig::Enabled {
+                mode_w: mode.width,
+                mode_h: mode.height,
+                vrefresh: mode.vrefresh,
+                x: 0,
+                y: 0,
+            }
+        );
+        assert!(registry.crtc_associated);
+        assert!(registry.client_configured);
+        assert!(registry.connected);
+        assert_eq!(registry.last_enabled, None);
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 1);
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(old_instance),
+            Some(key.clone()),
+            "the old scene and pool stay together in the retired bundle"
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(0),
+            "Task 6 retains the old pool; Task 7 owns its KMS release"
+        );
+        assert!(
+            old_keys
+                .iter()
+                .all(|allocation| backend.resource_service().unwrap().contains(allocation))
+        );
+        assert!(cleanup_calls.borrow().is_empty());
+
+        let new_clock = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .clock_key_for_hardware_crtc(old_clock.hardware_crtc)
+            .expect("new mode clock epoch");
+        assert!(new_clock.epoch > old_clock.epoch);
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let probes = backend
+            .drained_host_call_events_for_tests()
+            .into_iter()
+            .filter(|event| matches!(event.kind, ObservedOutcome::ProbeAccepted { sequence: 304 }))
+            .count();
+        assert_eq!(probes, 1, "the active CRTC's new epoch is probed once");
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(new_clock)
+            .expect("new CRTC clock");
+        assert_eq!(clock.source, ClockSource::KernelSequence);
+        assert_eq!(clock.probe, ProbeState::Succeeded);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_enable_from_headless_device_vulkan() {
+        use crate::kms::{
+            executor::{
+                ObservedOutcome,
+                test_support::{ScriptedReply, StubBehaviour},
+            },
+            owner::clock::ProbeState,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_disabled_modeset_backend(StubBehaviour::Scripted(
+                ScriptedReply::Accepted { mask: 0, fds: 0 },
+            ))
+            .expect("environmental skip: no live disabled-output fixture");
+        let old_key = backend.platform.outputs[0].key.clone();
+        backend
+            .lifecycle_register_owner_device(device)
+            .expect("register headless fixture lifecycle projection");
+        c0_3bi_remove_output_for_promotion(&mut backend, 0);
+        backend
+            .lifecycle_coordinator
+            .remove_protocol_output(&device, &old_key)
+            .expect("headless fixture removes the old projection");
+        backend.platform.fb_w = 0;
+        backend.platform.fb_h = 0;
+        backend.owner_dpms_installed_active.insert(device, false);
+        assert!(backend.platform.outputs.is_empty());
+        let input_control = std::sync::Arc::new(
+            crate::input_thread::InputThreadControl::new().expect("input resize control"),
+        );
+        backend.set_input_thread_control(std::sync::Arc::clone(&input_control));
+        let _ = backend.drained_host_call_events_for_tests();
+
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(
+                &mut backend,
+                device,
+                token,
+                Some(StubBehaviour::AcceptProbeWith(305)),
+            )
+            .expect("headless enable completion result")
+        );
+
+        assert_eq!(backend.platform.outputs.len(), 1);
+        assert_eq!(
+            backend.platform.outputs[0].key,
+            OutputKey::new(device, connector)
+        );
+        assert_eq!(
+            (backend.platform.fb_w, backend.platform.fb_h),
+            (mode.width, mode.height),
+            "the first lit output establishes the device root extent"
+        );
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+        assert_eq!(
+            input_control.take_resize(),
+            Some((u32::from(mode.width), u32::from(mode.height)))
+        );
+        let clock_key = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock_key_for_hardware_crtc(u32::from(backend.platform.outputs[0].output.crtc))
+            .expect("newly lit CRTC clock");
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let probes = backend
+            .drained_host_call_events_for_tests()
+            .into_iter()
+            .filter(|event| matches!(event.kind, ObservedOutcome::ProbeAccepted { sequence: 305 }))
+            .count();
+        assert_eq!(probes, 1, "the newly lit CRTC receives its own clock probe");
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(clock_key)
+                .unwrap()
+                .probe,
+            ProbeState::Succeeded
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_disable_promotes_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let key = OutputKey::new(device, connector.clone());
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output instance");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, None);
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(&mut backend, device, token, None,)
+                .expect("disable completion result")
+        );
+
+        assert!(
+            backend
+                .platform
+                .outputs
+                .iter()
+                .all(|output| output.key != key)
+        );
+        assert!(backend.platform.scanout_pools.iter().all(Option::is_some));
+        assert!(
+            !backend
+                .lifecycle_coordinator
+                .device(&device)
+                .expect("lifecycle device")
+                .desired()
+                .dpms_targets()
+                .contains_key(&key)
+        );
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 1);
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(instance),
+            Some(key),
+            "the disabled scene and its old pool are retained together"
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(instance),
+            Some(0)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_displaced_pool_waits_for_retirement_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (
+            OwnerLiveFixture {
+                mut backend,
+                cleanup_calls,
+                ..
+            },
+            device,
+            output_id,
+            connector,
+            mode,
+        ) = c0_3bi_live_modeset_backend(
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+            false,
+        )
+        .expect("environmental skip: no live Vulkan modeset fixture");
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let commit = c0_3bi_dispatch_client_modeset(&mut backend, device);
+        let registrations = c0_3bi_kms_displacements(&backend, device, commit);
+        assert_eq!(
+            registrations
+                .iter()
+                .map(|registration| registration.allocation)
+                .collect::<HashSet<_>>(),
+            old_keys.iter().copied().collect(),
+            "dispatch registers every allocation in the displaced old pool"
+        );
+        for registration in &registrations {
+            assert!(
+                backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&registration.allocation)
+            );
+        }
+
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        assert!(
+            registrations.iter().all(|registration| backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligations(&registration.allocation)),
+            "acceptance alone does not discharge the old pool's KMS obligations"
+        );
+
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(
+            registrations.iter().all(|registration| !backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligations(&registration.allocation)),
+            "CompletionRetired discharges the old pool's KMS obligations"
+        );
+        assert!(
+            old_keys
+                .iter()
+                .all(|allocation| backend.resource_service().unwrap().contains(allocation)),
+            "GPU, FOREIGN and pool-retain ownership still hold the allocations"
+        );
+        assert!(cleanup_calls.borrow().is_empty());
+        assert!(Backend::finish_crtc_config(&mut backend, token).expect("modeset result"));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_rejection_cancels_the_displacement_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::resources::KmsDisposition,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+
+        let rejected_token =
+            c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let rejected_commit = c0_3bi_dispatch_client_modeset(&mut backend, device);
+        let rejected = c0_3bi_kms_displacements(&backend, device, rejected_commit);
+        assert_eq!(rejected.len(), old_keys.len());
+        let correlation = *backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("dispatched rejected modeset")
+            .correlation();
+        let events = backend.platform.devices[0]
+            .owner
+            .as_mut()
+            .expect("Owner")
+            .apply_host_call_event(crate::kms::executor::HostCallEvent::Outcome {
+                correlation,
+                outcome: crate::kms::executor::HostCallOutcome::Rejected {
+                    errno: libc::EINVAL,
+                    helper_duration_ns: 0,
+                    round_trip_ns: 0,
+                    unexpected_fence_output: false,
+                },
+            });
+        assert!(backend.route_owner_event_batch(device, events, std::time::Instant::now()));
+        assert!(Backend::finish_crtc_config(&mut backend, rejected_token).is_err());
+        for registration in &rejected {
+            assert_eq!(
+                backend
+                    .resource_service()
+                    .unwrap()
+                    .kms_disposition(registration.allocation, registration.obligation),
+                Some(KmsDisposition::Cancelled),
+                "explicit rejection cancels each old-pool registration"
+            );
+        }
+
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        // The rejected configuration is latched for this installed
+        // generation. Keep this retirement scenario's successful follow-up
+        // distinct by changing its requested position.
+        let accepted_token =
+            match Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 1, 0)
+                .expect("a distinct configuration is not latched")
+            {
+                CrtcConfigApply::Pending(token) => token,
+                other => panic!("distinct non-idempotent request was not pending: {other:?}"),
+            };
+        let accepted_commit = c0_3bi_dispatch_client_modeset(&mut backend, device);
+        let accepted = c0_3bi_kms_displacements(&backend, device, accepted_commit);
+        assert_eq!(accepted.len(), old_keys.len());
+        assert!(
+            accepted
+                .iter()
+                .all(|registration| old_keys.contains(&registration.allocation))
+        );
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, accepted_commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(Backend::finish_crtc_config(&mut backend, accepted_token).expect("modeset result"));
+        assert!(
+            accepted.iter().all(|registration| !backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligations(&registration.allocation)),
+            "the next successful displacement retires the old pool"
+        );
+        assert!(rejected.iter().all(|registration| {
+            backend
+                .resource_service()
+                .unwrap()
+                .kms_disposition(registration.allocation, registration.obligation)
+                == Some(KmsDisposition::Cancelled)
+        }));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_dark_crtc_displacement_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, alternate_mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let output = &backend.platform.outputs[0];
+        let original_mode = yserver_core::backend::ModeSpec {
+            width: output.width,
+            height: output.height,
+            vrefresh: output.output.picked.vrefresh,
+        };
+        assert_ne!(alternate_mode, original_mode);
+        let crtc = u32::from(output.output.crtc);
+        let off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        assert!(matches!(
+            backend.lifecycle_drivers[&device].installed_crtc_power_for_tests(crtc),
+            Some(crate::kms::render::admission::InstalledCrtcPower::InactiveProven {
+                off_commit: proven_off,
+                ..
+            }) if proven_off == off_commit
+        ));
+
+        for mode in [alternate_mode, original_mode, alternate_mode] {
+            c0_3aii_replace_owner_executor(
+                &mut backend,
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+            );
+            let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let commit = c0_3bi_dispatch_client_modeset(&mut backend, device);
+            let registrations = c0_3bi_kms_displacements(&backend, device, commit);
+            assert_eq!(registrations.len(), old_keys.len());
+            assert!(
+                registrations
+                    .iter()
+                    .all(|registration| registration.member.crtc.crtc
+                        == ::drm::control::from_u32(crtc).unwrap())
+            );
+            c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+            let completion = backend.complete_owner_for_tests(0);
+            assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+            assert!(Backend::finish_crtc_config(&mut backend, token).expect("dark modeset result"));
+            assert!(
+                registrations.iter().all(|registration| !backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&registration.allocation)),
+                "a proven dark displacement retires each old pool at its Completed boundary"
+            );
+            assert!(matches!(
+                backend.lifecycle_drivers[&device].installed_crtc_power_for_tests(crtc),
+                Some(crate::kms::render::admission::InstalledCrtcPower::InactiveProven {
+                    off_commit: proven_off,
+                    ..
+                }) if proven_off == off_commit
+            ));
+        }
+
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, None);
+        let commit = c0_3bi_dispatch_client_modeset(&mut backend, device);
+        let registrations = c0_3bi_kms_displacements(&backend, device, commit);
+        assert_eq!(registrations.len(), old_keys.len());
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(Backend::finish_crtc_config(&mut backend, token).expect("dark disable result"));
+        assert!(registrations.iter().all(|registration| {
+            !backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligations(&registration.allocation)
+        }));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_unproven_off_issues_no_dark_proof_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let _off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .incarnation();
+        backend
+            .lifecycle_drivers
+            .get_mut(&device)
+            .unwrap()
+            .make_crtc_power_unproven_for_tests(crtc, incarnation);
+
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let commit = c0_3bi_dispatch_client_modeset(&mut backend, device);
+        let registrations = c0_3bi_kms_displacements(&backend, device, commit);
+        assert_eq!(registrations.len(), old_keys.len());
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(Backend::finish_crtc_config(&mut backend, token).expect("dark modeset result"));
+        assert!(
+            registrations.iter().all(|registration| backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligations(&registration.allocation)),
+            "CompletionRetired with no fence and no proven off must retain the pool"
+        );
+        assert!(matches!(
+            backend.lifecycle_drivers[&device].installed_crtc_power_for_tests(crtc),
+            Some(crate::kms::render::admission::InstalledCrtcPower::InactiveUnproven {
+                incarnation: unproven_incarnation,
+            }) if unproven_incarnation == incarnation
+        ));
+
+        let _on_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 0);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        assert!(
+            registrations.iter().all(|registration| !backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligations(&registration.allocation)),
+            "the later lit commit's successful out-fence retires the pending pool"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_enable_repaints_kept_outputs_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_disabled_modeset_backend(StubBehaviour::Scripted(
+                ScriptedReply::Accepted { mask: 0, fds: 0 },
+            ))
+            .expect("environmental skip: no live disabled-output fixture");
+        let vk = backend.platform.vk.as_ref().cloned().expect("live Vulkan");
+        let first_width = backend.platform.outputs[0].width;
+        for output_idx in 1..3 {
+            backend
+                .platform
+                .append_test_output_with_scanout_pool(
+                    std::sync::Arc::clone(&vk),
+                    &format!("c0-3bi-kept-{output_idx}"),
+                )
+                .expect("append kept test output pool");
+            let output = &mut backend.platform.outputs[output_idx];
+            let fake_object = 0xefff_ff00 + u32::try_from(output_idx).unwrap();
+            output.output.encoder = ::drm::control::from_u32(fake_object).unwrap();
+            output.output.crtc = ::drm::control::from_u32(fake_object + 0x10).unwrap();
+            output.output.plane = ::drm::control::from_u32(fake_object + 0x20).unwrap();
+            output.output.plane_fb_id_prop = ::drm::control::from_u32(19).unwrap();
+            output.output.plane_crtc_id_prop = ::drm::control::from_u32(20).unwrap();
+            output.output.crtc_out_fence_ptr_prop = Some(::drm::control::from_u32(22).unwrap());
+            output.x = i32::from(first_width) * i32::try_from(output_idx).unwrap();
+            let crtc = u32::from(output.output.crtc);
+            backend.platform.devices[0]
+                .active_property_cache
+                .insert_for_tests(crtc, 21);
+        }
+        for output_idx in 1..3 {
+            let bo_count = backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .expect("appended scanout pool")
+                .display_pool()
+                .bos
+                .len();
+            let platform = &mut backend.platform;
+            let service = backend.resource_service.as_mut().expect("resource service");
+            let registry = backend
+                .drm_cleanup_registry
+                .as_mut()
+                .expect("DRM cleanup registry");
+            for bo_idx in 0..bo_count {
+                platform
+                    .register_managed_scanout_bo(service, registry, output_idx, bo_idx)
+                    .expect("adopt appended output BO");
+            }
+        }
+        for output_idx in 0..3 {
+            let sample = yserver_core::backend::PresentClockSample {
+                msc: 1_100 + u64::try_from(output_idx).unwrap(),
+                ust: 1_100_000 + u64::try_from(output_idx).unwrap(),
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            };
+            c0_conv_cii_prepare_owner_clock(&mut backend, device, output_idx, sample);
+        }
+        let initial_width = first_width.saturating_mul(3);
+        backend
+            .apply_virtual_screen_extent(initial_width, backend.platform.outputs[0].height)
+            .expect("size root storage around three kept outputs");
+        backend
+            .scene
+            .rebuild_outputs(&backend.platform)
+            .expect("rebuild three kept scene states");
+
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let baseline_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("baseline composed frame for all kept outputs")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, baseline_commit);
+        let baseline_completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(
+            device,
+            baseline_completion,
+            std::time::Instant::now()
+        ));
+        for output_idx in 0..3 {
+            let (pending, _, staged) = backend
+                .scene
+                .scanout_damage_signature_for_tests(output_idx)
+                .expect("kept output damage signature");
+            assert_eq!(pending, 0, "baseline leaves kept output {output_idx} clean");
+            let _ = staged;
+        }
+        let old_width = backend.platform.fb_w;
+        let topology_sends_before = backend.lifecycle_drivers[&device].topology_test_stats();
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        let token = match Backend::begin_crtc_config(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(mode),
+            i32::from(old_width),
+            0,
+        )
+        .expect("enable fourth output")
+        {
+            CrtcConfigApply::Pending(token) => token,
+            other => panic!("fourth Owner output must be pending, got {other:?}"),
+        };
+        let (shared_plane_crtc_id_prop, shared_active_prop, prepared_crtc, shared_out_fence_prop) =
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .and_then(|slot| slot.prepared.as_ref())
+                .and_then(|prepared| {
+                    let output = prepared.prepared_set.output.as_ref()?;
+                    Some((
+                        output.plane_crtc_id_prop,
+                        prepared.description.property_ids.active,
+                        u32::from(output.crtc),
+                        output.crtc_out_fence_ptr_prop,
+                    ))
+                })
+                .expect("prepared output properties for the new CRTC");
+        for output in &mut backend.platform.outputs {
+            output.output.plane_crtc_id_prop = shared_plane_crtc_id_prop;
+            output.output.crtc_out_fence_ptr_prop = shared_out_fence_prop;
+            backend.platform.devices[0]
+                .active_property_cache
+                .insert_for_tests(u32::from(output.output.crtc), shared_active_prop);
+        }
+        backend.platform.devices[0]
+            .active_property_cache
+            .insert_for_tests(prepared_crtc, shared_active_prop);
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(
+                &mut backend,
+                device,
+                token,
+                Some(StubBehaviour::AcceptProbeWith(306)),
+            )
+            .expect("fourth output completion result")
+        );
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        c0_3aii_replace_owner_executor(&mut backend, StubBehaviour::NeverReply);
+        assert_eq!(backend.platform.outputs.len(), 4);
+        assert!(backend.platform.fb_w > old_width);
+        for output_idx in 0..3 {
+            let full_area = u64::from(backend.platform.outputs[output_idx].width)
+                * u64::from(backend.platform.outputs[output_idx].height);
+            let (pending, missing, staged) = backend
+                .scene
+                .scanout_damage_signature_for_tests(output_idx)
+                .expect("kept output damage after root growth");
+            assert_eq!(
+                pending, full_area,
+                "kept output {output_idx} owes full damage"
+            );
+            assert!(
+                missing.iter().all(|area| *area == full_area),
+                "every kept scanout BO is stale for output {output_idx}"
+            );
+            assert!(
+                !staged,
+                "invalidation cancels staged frame for output {output_idx}"
+            );
+        }
+
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("ordinary composed repaint commit follows root growth");
+        assert_eq!(
+            record.completion_context().class,
+            crate::kms::owner::completion::CompletionClass::FastUpdate,
+            "kept outputs repaint through ordinary composed work"
+        );
+        for output in backend.platform.outputs.iter().take(3) {
+            assert!(
+                record
+                    .closure()
+                    .expected_completion()
+                    .contains(&u32::from(output.output.crtc))
+            );
+        }
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats(),
+            topology_sends_before,
+            "repainting kept outputs sends no lifecycle commit"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_promotion_has_no_fallible_call() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::{ClientModesetPromotionStep, ClientModesetSlot},
+        };
+
+        let promotion: fn(&mut super::KmsBackend, DrmDeviceKey, ClientModesetSlot) =
+            super::KmsBackend::lifecycle_promote_client_modeset;
+        let _signature_proof = promotion;
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(
+                &mut backend,
+                device,
+                token,
+                Some(StubBehaviour::NeverReply),
+            )
+            .expect("accepted modeset result")
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].client_modeset_promotion_steps,
+            vec![
+                ClientModesetPromotionStep::KmsState,
+                ClientModesetPromotionStep::Projection,
+                ClientModesetPromotionStep::Scene,
+            ],
+            "accepted result runs KMS, projection and scene promotion in order"
+        );
     }
 
     #[test]
@@ -62321,7 +63822,6 @@ mod tests {
                 .expect("detach inactive sink")
         );
         assert!(!backend.provider_output_source_allows(sink_key));
-        backend.client_modeset_description_source_for_tests = true;
 
         let mode = Some(c0_3bi_changed_mode());
         let legacy_error = Backend::apply_crtc_config(
@@ -62363,12 +63863,16 @@ mod tests {
     fn c0_3bi_client_modeset_failure(
         error: &std::io::Error,
     ) -> Option<crate::kms::render::admission::ClientModesetFailure> {
-        error
-            .get_ref()
-            .and_then(|source| {
-                source.downcast_ref::<crate::kms::render::admission::ClientModesetFailure>()
-            })
-            .copied()
+        error.get_ref().and_then(|source| {
+            source
+                .downcast_ref::<crate::kms::render::admission::ClientModesetError>()
+                .map(|error| error.failure)
+                .or_else(|| {
+                    source
+                        .downcast_ref::<crate::kms::render::admission::ClientModesetFailure>()
+                        .copied()
+                })
+        })
     }
 
     fn c0_3bi_changed_mode() -> yserver_core::backend::ModeSpec {
@@ -62386,6 +63890,75 @@ mod tests {
         backend.lifecycle_drivers[&device]
             .pending_client_modeset_description_for_tests()
             .expect("client modeset description is held through TEST_ONLY")
+    }
+
+    fn c0_3bi_pending_prepared_pool_allocations(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> (Vec<crate::kms::render::resources::AllocationKey>, Vec<u32>) {
+        let prepared = backend.lifecycle_drivers[&device]
+            .client_modeset
+            .as_ref()
+            .and_then(|slot| slot.prepared.as_ref())
+            .expect("prepared client modeset remains in its slot");
+        let scanout = prepared
+            .prepared_set
+            .scanout
+            .as_ref()
+            .expect("prepared output owns its scanout pool");
+        let bo_keys = scanout
+            .display_pool()
+            .bos
+            .iter()
+            .map(|bo| bo.managed_key().expect("prepared BO is service-managed"))
+            .collect::<Vec<_>>();
+        let framebuffers = prepared.prepared_set.framebuffer_handles_for_tests.clone();
+        assert_eq!(prepared.prepared_set.allocation_keys, bo_keys);
+        (bo_keys, framebuffers)
+    }
+
+    fn c0_3bi_assert_prepared_pool_released(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        keys: &[crate::kms::render::resources::AllocationKey],
+        framebuffers: &[u32],
+        cleanup_calls: &std::rc::Rc<
+            std::cell::RefCell<Vec<crate::kms::render::resources::tests::CleanupCall>>,
+        >,
+    ) {
+        assert!(
+            backend
+                .lifecycle_drivers
+                .get(&device)
+                .is_none_or(|driver| driver.client_modeset.is_none())
+        );
+        assert_eq!(
+            backend.client_modeset_released_allocation_keys_for_tests, keys,
+            "each prepared allocation is released once by the lifecycle slot"
+        );
+        assert_eq!(
+            backend.client_modeset_released_framebuffers_for_tests, framebuffers,
+            "each prepared framebuffer crosses the release path once"
+        );
+        let service = backend
+            .resource_service
+            .as_ref()
+            .expect("live Owner fixture resource service");
+        assert!(
+            keys.iter().all(|key| !service.contains(key)),
+            "released prepared allocations leave no ResourceService entries"
+        );
+        let calls = cleanup_calls.borrow();
+        for framebuffer in framebuffers {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| matches!(call, crate::kms::render::resources::tests::CleanupCall::RemoveFb(fb) if fb == framebuffer))
+                    .count(),
+                1,
+                "prepared framebuffer {framebuffer} is cleaned exactly once"
+            );
+        }
     }
 
     fn c0_3bi_description_property(
@@ -62407,19 +63980,16 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_description_is_minimal() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_description_is_minimal_vulkan() {
         use crate::kms::executor::test_support::StubBehaviour;
 
-        let (mut backend, device, output_id, connector) =
-            c0_3bi_client_modeset_backend_with_output_count(StubBehaviour::NeverReply, 2);
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, true)
+                .expect("environmental skip: no live Vulkan modeset fixture");
         let first_crtc = u32::from(backend.platform.outputs[0].output.crtc);
         let second_crtc = u32::from(backend.platform.outputs[1].output.crtc);
-        let token = c0_3bi_begin_client_modeset(
-            &mut backend,
-            output_id,
-            &connector,
-            Some(c0_3bi_changed_mode()),
-        );
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         let description = c0_3bi_pending_client_description(&backend, device);
 
         assert_eq!(description.objects.len(), 3);
@@ -62461,25 +64031,996 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_modeset_under_dpms_off_is_dark() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_mode_change_keeps_the_bound_crtc() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::closure::ObjectKind,
+            render::admission::{ClientModesetFailure, PreparationStage},
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let bound_crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let bound_plane = u32::from(backend.platform.outputs[0].output.plane);
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let description = c0_3bi_pending_client_description(&backend, device);
+        assert_eq!(
+            description
+                .objects
+                .iter()
+                .find(|object| object.kind == ObjectKind::Crtc)
+                .map(|object| object.object),
+            Some(bound_crtc),
+            "mode changes retain the currently bound CRTC"
+        );
+        assert_eq!(
+            description
+                .objects
+                .iter()
+                .find(|object| object.kind == ObjectKind::Plane)
+                .map(|object| object.object),
+            Some(bound_plane),
+            "mode changes retain the currently bound primary plane"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(token)
+        );
+        drop(backend);
+
+        let (OwnerLiveFixture { mut backend, .. }, _device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let bound_crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        backend.client_modeset_discovery_route_override_for_tests =
+            Some((bound_crtc.saturating_add(0x100), 0xefff_fffe));
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("a changed CRTC assignment is refused during preparation");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::Preparation(PreparationStage::Route))
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_preparation_keeps_old_topology_lit_vulkan() {
         use crate::kms::executor::test_support::StubBehaviour;
 
-        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
-        let _off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
-        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
-        backend.client_modeset_description_source_for_tests = true;
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old scene instance");
+        let images = c0_3bi_scanout_images(&backend, 0);
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let drain_count = backend.scene.drain_all_calls_for_tests();
+        backend.scene.take_owner_composed_offers();
 
-        let disabled_key = OutputKey::new(device, "disabled-before");
-        let output_id = backend.randr_id_alloc.ids_for(&disabled_key).output_id;
-        backend
-            .output_key_by_id
-            .insert(output_id, disabled_key.clone());
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation.len(), 1, "preparation reaches TEST_ONLY");
+        assert!(live.is_empty(), "the live modeset is not dispatched yet");
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.phase),
+            Some(crate::kms::render::admission::ClientModesetPhase::Validating)
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(instance)
+        );
+        assert_eq!(c0_3bi_scanout_images(&backend, 0), images);
+        assert_eq!(
+            backend.scene.drain_all_calls_for_tests(),
+            drain_count,
+            "preparation leaves the old scene undrained"
+        );
+
+        let frame_before = backend.engine_frame_seq_for_tests();
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        assert!(
+            backend.engine_frame_seq_for_tests() > frame_before,
+            "the old scene continues composing while TEST_ONLY is pending"
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(instance)
+        );
+        assert_eq!(c0_3bi_scanout_images(&backend, 0), images);
+        let _ = backend.scene.take_owner_composed_offers();
+        assert_eq!(
+            u32::from(backend.platform.outputs[0].output.crtc),
+            crtc,
+            "the old CRTC stays installed while composition advances"
+        );
+        assert!(
+            backend.scene.drain_all_calls_for_tests() == drain_count,
+            "composition did not drain the old topology"
+        );
+        assert_eq!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("the test-only executor has not replied")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_new_pool_goes_through_resource_ownership_vulkan() {
+        use crate::kms::{executor::test_support::StubBehaviour, owner::closure::ObjectKind};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
+        assert_eq!(keys.len(), crate::kms::render::platform::SCANOUT_POOL_DEPTH);
+        let service = backend
+            .resource_service
+            .as_ref()
+            .expect("Owner resource service");
+        assert!(keys.iter().all(|key| service.contains(key)));
+        let prepared = backend.lifecycle_drivers[&device]
+            .client_modeset
+            .as_ref()
+            .and_then(|slot| slot.prepared.as_ref())
+            .expect("prepared set remains held through TEST_ONLY");
+        assert!(prepared.prepared_set.output.is_some());
+        assert!(prepared.prepared_set.output_instance_id.is_some());
+        assert!(prepared.prepared_set.scene.is_some());
+        assert!(prepared.prepared_set.mode_blob.is_some());
+        let description = c0_3bi_pending_client_description(&backend, device);
+        let plane = description
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Plane)
+            .expect("prepared primary plane");
+        assert!(
+            plane
+                .props
+                .iter()
+                .any(|(_, value)| *value == u64::from(framebuffers[0])),
+            "the first pool BO is the uncomposed TEST_ONLY framebuffer"
+        );
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation.len(), 1, "resource adoption precedes TEST_ONLY");
+        assert!(live.is_empty());
+        assert_eq!(
+            backend.client_modeset_released_allocation_keys_for_tests,
+            Vec::<crate::kms::render::resources::AllocationKey>::new(),
+            "an installable prepared set has not been released"
+        );
+        let _ = token;
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_prepared_set_released_once_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::{ClientModesetFailure, PreparationStage},
+        };
+
+        // Discovery failure: a mapped but absent connector reaches preparation
+        // and terminates before it can allocate a pool.
+        let (OwnerLiveFixture { mut backend, .. }, device, _, _, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let missing = OutputKey::new(device, "missing-c0-connector");
+        let missing_id = backend.randr_id_alloc.ids_for(&missing).output_id;
+        backend.output_key_by_id.insert(missing_id, missing.clone());
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            missing_id,
+            &missing.connector_name,
+            Some(mode),
+        );
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("absent connector fails preparation");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::Discovery
+            ))
+        );
+        assert!(
+            backend
+                .client_modeset_released_allocation_keys_for_tests
+                .is_empty()
+        );
+
+        // An unadvertised mode also fails before pool allocation.
+        let (OwnerLiveFixture { mut backend, .. }, _, output_id, connector, _) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
         let token = c0_3bi_begin_client_modeset(
             &mut backend,
             output_id,
-            &disabled_key.connector_name,
-            Some(c0_3bi_changed_mode()),
+            &connector,
+            Some(yserver_core::backend::ModeSpec {
+                width: 1,
+                height: 1,
+                vrefresh: 1,
+            }),
         );
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("unadvertised mode fails preparation");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::Preparation(PreparationStage::Mode))
+        );
+        assert!(
+            backend
+                .client_modeset_released_allocation_keys_for_tests
+                .is_empty()
+        );
+
+        // Injected allocation failure drops the already-created mode blob and
+        // leaves no ResourceService entry behind.
+        let (OwnerLiveFixture { mut backend, .. }, _, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        backend.client_modeset_force_allocation_failure_for_tests = true;
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("injected pool allocation failure is terminal");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::Allocation
+            ))
+        );
+        assert!(
+            backend
+                .client_modeset_released_allocation_keys_for_tests
+                .is_empty()
+        );
+
+        // TEST_ONLY EINVAL releases every adopted BO and framebuffer.
+        let (
+            OwnerLiveFixture {
+                mut backend,
+                cleanup_calls,
+                ..
+            },
+            device,
+            output_id,
+            connector,
+            mode,
+        ) = c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(libc::EINVAL), false)
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let validation_error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("TEST_ONLY returned EINVAL");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&validation_error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::TestOnly {
+                    errno: libc::EINVAL
+                }
+            ))
+        );
+        c0_3bi_assert_prepared_pool_released(
+            &backend,
+            device,
+            &keys,
+            &framebuffers,
+            &cleanup_calls,
+        );
+
+        // A DPMS event after staging supersedes the pending TEST_ONLY result.
+        let (
+            OwnerLiveFixture {
+                mut backend,
+                cleanup_calls,
+                ..
+            },
+            device,
+            output_id,
+            connector,
+            mode,
+        ) = c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let _off = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::AcceptAfter(std::time::Duration::from_millis(100)),
+        );
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
+        Backend::set_dpms_power(&mut backend, 0).expect("DPMS-on supersedes staged request");
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        assert!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("superseded prepared request")
+                .to_string()
+                .contains("Superseded(DPMS)")
+        );
+        c0_3bi_assert_prepared_pool_released(
+            &backend,
+            device,
+            &keys,
+            &framebuffers,
+            &cleanup_calls,
+        );
+
+        // A topology invalidation before validation supersedes the queued
+        // request and releases the prepared set.
+        let (
+            OwnerLiveFixture {
+                mut backend,
+                cleanup_calls,
+                ..
+            },
+            device,
+            output_id,
+            connector,
+            mode,
+        ) = c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        backend.client_modeset_stale_before_validation_for_tests = true;
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let keys = backend
+            .client_modeset_released_allocation_keys_for_tests
+            .clone();
+        let framebuffers = backend
+            .client_modeset_released_framebuffers_for_tests
+            .clone();
+        assert!(!keys.is_empty(), "stale preparation had a managed pool");
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .is_empty()
+        );
+        let stale_error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("the topology invalidation supersedes the queued request");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&stale_error),
+            Some(ClientModesetFailure::Superseded(
+                crate::kms::owner::lifecycle::LifecycleKind::DPMS
+            ))
+        );
+        c0_3bi_assert_prepared_pool_released(
+            &backend,
+            device,
+            &keys,
+            &framebuffers,
+            &cleanup_calls,
+        );
+
+        // Explicit rejection of the dispatched live request also releases the
+        // same prepared set. The executor remains a stub throughout.
+        let (
+            OwnerLiveFixture {
+                mut backend,
+                cleanup_calls,
+                ..
+            },
+            device,
+            output_id,
+            connector,
+            mode,
+        ) = c0_3bi_live_modeset_backend(
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+            false,
+        )
+        .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let correlation = *backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("live modeset record")
+            .correlation();
+        let rejection = backend.platform.devices[0]
+            .owner
+            .as_mut()
+            .expect("Owner device")
+            .apply_host_call_event(crate::kms::executor::HostCallEvent::Outcome {
+                correlation,
+                outcome: crate::kms::executor::HostCallOutcome::Rejected {
+                    errno: libc::EINVAL,
+                    helper_duration_ns: 0,
+                    round_trip_ns: 0,
+                    unexpected_fence_output: false,
+                },
+            });
+        assert!(backend.route_owner_event_batch(device, rejection, std::time::Instant::now()));
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("live commit was explicitly rejected");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(
+                crate::kms::render::admission::ClientModesetFailure::KernelRejected {
+                    errno: libc::EINVAL,
+                }
+            ),
+            "{error:?}"
+        );
+        c0_3bi_assert_prepared_pool_released(
+            &backend,
+            device,
+            &keys,
+            &framebuffers,
+            &cleanup_calls,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_each_failure_has_its_cause_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::{ClientModesetFailure, OwnerRefusal, PreparationStage},
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, _, _, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let missing = OutputKey::new(device, "failure-table-missing-output");
+        let missing_id = backend.randr_id_alloc.ids_for(&missing).output_id;
+        backend.output_key_by_id.insert(missing_id, missing.clone());
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            missing_id,
+            &missing.connector_name,
+            Some(mode),
+        );
+        let discovery_error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("missing connector is a discovery preparation failure");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&discovery_error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::Discovery
+            ))
+        );
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(libc::EINVAL), false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let validation_error = c0_3bi_reject_test_only_client_modeset(&mut backend, device, token)
+            .expect_err("TEST_ONLY EINVAL is a preparation failure");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&validation_error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::TestOnly {
+                    errno: libc::EINVAL,
+                }
+            ))
+        );
+        let diagnostic = validation_error.to_string();
+        assert!(diagnostic.contains(&connector), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&format!("mode Some({mode:?})")),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("position (0, 0)"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&format!("device {device}")),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("modeset 1"), "{diagnostic}");
+        assert!(diagnostic.contains("Preparation(TestOnly"), "{diagnostic}");
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let first = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let slot_error =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect_err("the occupied Owner slot refuses the second request");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&slot_error),
+            Some(ClientModesetFailure::OwnerRefused(
+                OwnerRefusal::SlotOccupied
+            ))
+        );
+        assert!(
+            slot_error
+                .to_string()
+                .contains("OwnerRefused(SlotOccupied)")
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(first)
+        );
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let rejection =
+            c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EINVAL)
+                .expect_err("real commit EINVAL is a kernel rejection");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&rejection),
+            Some(ClientModesetFailure::KernelRejected {
+                errno: libc::EINVAL,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_ebusy_is_not_retried_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            owner::{
+                lifecycle::DeviceLifecycleState,
+                record::{FailureCause, TerminalState},
+            },
+            render::admission::{ClientModesetFailure, OwnerRefusal},
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let error = c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EBUSY)
+            .expect_err("atomic EBUSY is a terminal rejection");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::KernelRejected { errno: libc::EBUSY })
+        );
+
+        let driver = &backend.lifecycle_drivers[&device];
+        assert_eq!(driver.client_modeset_test_stats().1.len(), 1);
+        assert!(
+            driver.client_modeset_foreign_busy,
+            "EBUSY evidence is retained"
+        );
+        assert!(matches!(
+            backend
+                .device_owner_for_tests(0)
+                .tombstones()
+                .back()
+                .unwrap()
+                .terminal,
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno: libc::EBUSY })
+        ));
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Quiescing
+        );
+        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert_eq!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+        );
+        let following =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect_err("readiness remains closed after EBUSY");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&following),
+            Some(ClientModesetFailure::OwnerRefused(
+                OwnerRefusal::ReadinessClosed
+            ))
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_errno_classification_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            owner::lifecycle::DeviceLifecycleState,
+            render::admission::{ClientModesetFailure, OwnerRefusal, PreparationStage},
+        };
+
+        for errno in [libc::EACCES, libc::ENOENT, libc::EIO] {
+            let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+                c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(errno), false)
+                    .expect("environmental skip: no live Vulkan modeset fixture");
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let error = c0_3bi_reject_test_only_client_modeset(&mut backend, device, token)
+                .expect_err("unclassified TEST_ONLY errors close readiness");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(ClientModesetFailure::Preparation(
+                    PreparationStage::TestOnly { errno }
+                ))
+            );
+            assert_eq!(
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .unwrap()
+                    .state(),
+                DeviceLifecycleState::Quiescing
+            );
+            assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+            assert_eq!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+            );
+            let validations = backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len();
+            let following =
+                Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                    .expect_err("following modeset is refused after TEST_ONLY readiness loss");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&following),
+                Some(ClientModesetFailure::OwnerRefused(
+                    OwnerRefusal::ReadinessClosed
+                ))
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .0
+                    .len(),
+                validations
+            );
+            let crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+            backend
+                .admission_offer_composed(device, crtc, 1)
+                .expect("offer a composed frame after TEST_ONLY readiness loss");
+            let live_sends = backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len();
+            assert_eq!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::NothingAdmissible,
+                "a following composed frame is refused after TEST_ONLY readiness loss"
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .1
+                    .len(),
+                live_sends,
+                "the refused composed frame sends no live commit"
+            );
+        }
+
+        for errno in [libc::EACCES, libc::ENOENT, libc::EIO] {
+            let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+                c0_3bi_live_modeset_backend(
+                    StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                    false,
+                )
+                .expect("environmental skip: no live Vulkan modeset fixture");
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let error = c0_3bi_reject_live_client_modeset(&mut backend, device, token, errno)
+                .expect_err("unclassified real-commit errors close readiness");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(ClientModesetFailure::KernelRejected { errno })
+            );
+            assert_eq!(
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .unwrap()
+                    .state(),
+                DeviceLifecycleState::Quiescing
+            );
+            assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+            assert_eq!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+            );
+            let following =
+                Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                    .expect_err("following modeset is refused after live readiness loss");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&following),
+                Some(ClientModesetFailure::OwnerRefused(
+                    OwnerRefusal::ReadinessClosed
+                ))
+            );
+            let crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+            backend
+                .admission_offer_composed(device, crtc, 1)
+                .expect("offer a composed frame after real-commit readiness loss");
+            let live_sends = backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len();
+            assert_eq!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::NothingAdmissible,
+                "a following composed frame is refused after real-commit readiness loss"
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .1
+                    .len(),
+                live_sends,
+                "the refused composed frame sends no live commit"
+            );
+        }
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(libc::EINVAL), false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let error = c0_3bi_reject_test_only_client_modeset(&mut backend, device, token)
+            .expect_err("TEST_ONLY EINVAL rejects this candidate only");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::TestOnly {
+                    errno: libc::EINVAL,
+                }
+            ))
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Ready
+        );
+        let second =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect("a candidate EINVAL does not close readiness");
+        assert!(matches!(second, CrtcConfigApply::Pending(_)));
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_latch_is_keyed_by_generation_and_request_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::ClientModesetFailure,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let error = c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EINVAL)
+            .expect_err("real-commit EINVAL is latched");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::KernelRejected {
+                errno: libc::EINVAL,
+            })
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_latch
+                .is_some()
+        );
+        let live_sends = backend.lifecycle_drivers[&device]
+            .client_modeset_test_stats()
+            .1
+            .len();
+
+        let repeated =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect_err("identical configuration is latched for this generation");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&repeated),
+            Some(ClientModesetFailure::Latched)
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len(),
+            live_sends,
+            "the latched request sends no live commit"
+        );
+
+        let different = Backend::begin_crtc_config(&mut backend, output_id, &connector, None, 0, 0)
+            .expect("a different requested configuration is not latched");
+        assert!(matches!(different, CrtcConfigApply::Pending(_)));
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            2
+        );
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let _ = c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EINVAL)
+            .expect_err("real-commit EINVAL installs a latch");
+        let current_generation = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner device")
+            .topology_generation();
+        backend
+            .lifecycle_drivers
+            .get_mut(&device)
+            .unwrap()
+            .client_modeset_latch
+            .as_mut()
+            .expect("installed-generation latch")
+            .topology_generation = current_generation.saturating_sub(1);
+        let after_generation_change =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect("an old-generation latch is cleared");
+        assert!(matches!(
+            after_generation_change,
+            CrtcConfigApply::Pending(_)
+        ));
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_latch
+                .is_none()
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_rejection_answers_failed_not_success_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::ClientModesetFailure,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let result = c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EINVAL);
+        let error = result.expect_err("a rejected commit is never reported as success");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::KernelRejected {
+                errno: libc::EINVAL,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_host_call_timeout_poisons_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::{
+                lifecycle::DeviceLifecycleState,
+                record::{TerminalState, UnknownCause},
+            },
+            render::admission::ClientModesetFailure,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptValidationThenNeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let original_width = backend.platform.outputs[0].width;
+        let original_instance = backend.scene.output_instance_id_for_tests(0);
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        c0_3bi_dispatch_client_modeset(&mut backend, device);
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        let deadline = backend.platform.devices[0]
+            .executor
+            .as_ref()
+            .expect("Owner executor")
+            .next_deadline()
+            .expect("live host call watchdog is armed");
+        let events = backend
+            .platform
+            .tick_executors(deadline + std::time::Duration::from_millis(1));
+        backend.record_host_call_events(events);
+
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("the watchdog turns a missing host reply into request failure");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::CompletionUnknown)
+        );
+        assert_eq!(backend.platform.outputs[0].width, original_width);
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            original_instance
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert!(matches!(
+            backend
+                .device_owner_for_tests(0)
+                .tombstones()
+                .back()
+                .unwrap()
+                .terminal,
+            TerminalState::CompletionUnknown(UnknownCause::HostCall(
+                crate::kms::executor::UnknownReason::WatchdogExpired
+            ))
+        ));
+        assert!(backend.lifecycle_drivers[&device].client_modeset.is_none());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_modeset_under_dpms_off_is_dark_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_disabled_modeset_backend(StubBehaviour::NeverReply)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let _off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         let description = c0_3bi_pending_client_description(&backend, device);
         let crtc = description
             .objects
@@ -62514,7 +65055,7 @@ mod tests {
         let staged = backend.lifecycle_drivers[&device]
             .pending_client_modeset_projection_for_tests()
             .expect("the DPMS projection is staged before validation");
-        assert_eq!(staged.output, disabled_key);
+        assert_eq!(staged.output, OutputKey::new(device, connector.clone()));
         assert_eq!(staged.level, 3);
         assert_eq!(staged.target, crate::kms::owner::lifecycle::DpmsTarget::Off);
         assert_eq!(staged.epoch, backend.lifecycle_coordinator.dpms_epoch());
@@ -62528,39 +65069,32 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_dpms_change_after_staging_supersedes() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_dpms_change_after_staging_supersedes_vulkan() {
         use crate::kms::executor::test_support::StubBehaviour;
 
-        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_disabled_modeset_backend(StubBehaviour::NeverReply)
+                .expect("environmental skip: no live Vulkan modeset fixture");
         let _off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
         c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
-        backend.client_modeset_description_source_for_tests = true;
-
-        let disabled_key = OutputKey::new(device, "disabled-before");
-        let output_id = backend.randr_id_alloc.ids_for(&disabled_key).output_id;
-        backend
-            .output_key_by_id
-            .insert(output_id, disabled_key.clone());
         c0_3aii_replace_owner_executor(
             &mut backend,
             StubBehaviour::AcceptAfter(std::time::Duration::from_millis(400)),
         );
-        let token = c0_3bi_begin_client_modeset(
-            &mut backend,
-            output_id,
-            &disabled_key.connector_name,
-            Some(c0_3bi_changed_mode()),
-        );
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let description = c0_3bi_pending_client_description(&backend, device);
+        let crtc = description
+            .objects
+            .iter()
+            .find(|object| object.kind == crate::kms::owner::closure::ObjectKind::Crtc)
+            .expect("target CRTC row");
         let staged = backend.lifecycle_drivers[&device]
             .pending_client_modeset_projection_for_tests()
             .expect("off projection staged before TEST_ONLY reply");
         assert_eq!(staged.target, crate::kms::owner::lifecycle::DpmsTarget::Off);
         assert_eq!(
-            c0_3bi_description_property(
-                c0_3bi_pending_client_description(&backend, device),
-                u32::from(backend.platform.outputs[0].output.crtc),
-                21,
-            ),
+            c0_3bi_description_property(description, crtc.object, description.property_ids.active,),
             Some(0)
         );
 
@@ -62595,11 +65129,41 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_disable_description() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_disable_description_vulkan() {
         use crate::kms::{executor::test_support::StubBehaviour, owner::closure::ObjectKind};
 
-        let (mut backend, device, output_id, connector) =
-            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let output = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.output.connector_name == connector)
+            .expect("live output for the selected connector");
+        let drm_device = backend
+            .platform
+            .devices
+            .iter()
+            .find(|entry| entry.key == device)
+            .expect("live KMS device")
+            .device
+            .as_ref();
+        let connector_crtc_id = u32::from(
+            crate::drm::modeset::PropMap::for_object(drm_device, output.output.connector)
+                .expect("connector properties")
+                .id("CRTC_ID")
+                .expect("connector CRTC_ID property"),
+        );
+        let crtc_mode_id = u32::from(
+            crate::drm::modeset::PropMap::for_object(drm_device, output.output.crtc)
+                .expect("CRTC properties")
+                .id("MODE_ID")
+                .expect("CRTC MODE_ID property"),
+        );
+        let plane_fb_id = u32::from(output.output.plane_fb_id_prop);
+        let plane_crtc_id = u32::from(output.output.plane_crtc_id_prop);
         c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, None);
         let description = c0_3bi_pending_client_description(&backend, device);
         let connector_row = description
@@ -62617,9 +65181,12 @@ mod tests {
             .iter()
             .find(|object| object.kind == ObjectKind::Plane)
             .expect("target primary plane row");
-        assert_eq!(connector_row.props, vec![(23, 0)]);
-        assert_eq!(crtc_row.props, vec![(24, 0), (21, 0)]);
-        assert_eq!(plane_row.props, vec![(19, 0), (20, 0)]);
+        assert_eq!(connector_row.props, vec![(connector_crtc_id, 0)]);
+        assert_eq!(crtc_row.props.len(), 2);
+        assert_eq!(crtc_row.props[0], (crtc_mode_id, 0));
+        assert_eq!(crtc_row.props[1], (description.property_ids.active, 0));
+        assert_eq!(plane_row.props.len(), 2);
+        assert_eq!(plane_row.props, vec![(plane_fb_id, 0), (plane_crtc_id, 0)]);
         assert_eq!(
             description.crtc_state,
             vec![crate::kms::owner::closure::CrtcPower {
@@ -62640,18 +65207,53 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_refresh_only_change_is_a_modeset() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_refresh_only_change_is_a_modeset_vulkan() {
         use crate::kms::executor::test_support::StubBehaviour;
 
-        let (mut backend, device, output_id, connector) =
-            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
-        let refresh_only = yserver_core::backend::ModeSpec {
-            width: backend.platform.outputs[0].width,
-            height: backend.platform.outputs[0].height,
-            vrefresh: backend.platform.outputs[0].output.picked.vrefresh + 15,
-        };
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let current = &backend.platform.outputs[0];
+        let crtc_mode_id = u32::from(
+            crate::drm::modeset::PropMap::for_object(
+                backend.platform.devices[0].device.as_ref(),
+                current.output.crtc,
+            )
+            .expect("CRTC properties")
+            .id("MODE_ID")
+            .expect("CRTC MODE_ID property"),
+        );
+        let refresh_only = current
+            .output
+            .modes
+            .iter()
+            .find(|mode| {
+                mode.width == current.width
+                    && mode.height == current.height
+                    && mode.vrefresh != current.output.picked.vrefresh
+            })
+            .map(|mode| yserver_core::backend::ModeSpec {
+                width: mode.width,
+                height: mode.height,
+                vrefresh: mode.vrefresh,
+            })
+            .expect("live connector advertises a refresh-only alternative");
         let token =
             c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(refresh_only));
+        let mode_blob = backend.lifecycle_drivers[&device]
+            .client_modeset
+            .as_ref()
+            .expect("prepared client modeset")
+            .prepared
+            .as_ref()
+            .expect("prepared description")
+            .prepared_set
+            .mode_blob
+            .as_ref()
+            .expect("owned MODE_ID blob")
+            .raw_for_tests()
+            .expect("live MODE_ID blob handle");
         let description = c0_3bi_pending_client_description(&backend, device);
         let crtc = description
             .objects
@@ -62659,10 +65261,16 @@ mod tests {
             .find(|object| object.kind == crate::kms::owner::closure::ObjectKind::Crtc)
             .expect("modeset CRTC row");
         assert_eq!(
-            c0_3bi_description_property(description, crtc.object, 24),
-            Some(0x7300_0001),
+            crtc.props.len(),
+            2,
+            "only MODE_ID and ACTIVE are serialized"
+        );
+        assert_eq!(crtc.props[0], (crtc_mode_id, mode_blob));
+        assert_ne!(
+            mode_blob, 0,
             "the different refresh receives a new MODE_ID blob"
         );
+        assert_eq!(crtc.props[1], (description.property_ids.active, 1));
         assert_eq!(
             backend.lifecycle_drivers[&device]
                 .client_modeset
@@ -62695,21 +65303,18 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bii_kms_dispatched_owner_requester_continues() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bii_kms_dispatched_owner_requester_continues_vulkan() {
         use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
         use yserver_core::backend::RequesterAbandon;
 
-        let (mut backend, device, output_id, connector) =
-            c0_3bi_client_modeset_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
-                mask: 0,
-                fds: 0,
-            }));
-        let token = c0_3bi_begin_client_modeset(
-            &mut backend,
-            output_id,
-            &connector,
-            Some(c0_3bi_changed_mode()),
-        );
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         wait_lifecycle_executor_readable(&backend, device);
         Backend::on_executor_readable(&mut backend, &mut ServerState::new());
         assert_eq!(
@@ -62739,21 +65344,20 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_topology_work_is_typed() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_topology_work_is_typed_vulkan() {
         use crate::kms::owner::{
             admission::{Admission, Admitted, ReadinessSnapshot, Tier},
             lifecycle::{ClientModesetTag, LifecycleTransitionId, TopologyWork, TransitionTag},
         };
 
-        let (mut backend, device, output_id, connector) = c0_3bi_client_modeset_backend(
-            crate::kms::executor::test_support::StubBehaviour::NeverReply,
-        );
-        let token = c0_3bi_begin_client_modeset(
-            &mut backend,
-            output_id,
-            &connector,
-            Some(c0_3bi_changed_mode()),
-        );
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                crate::kms::executor::test_support::StubBehaviour::NeverReply,
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         let client_tag = backend.lifecycle_drivers[&device]
             .client_modeset
             .as_ref()
@@ -62816,16 +65420,19 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_modeset_waits_for_the_active_transition() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_modeset_waits_for_the_active_transition_vulkan() {
         use crate::kms::{
             executor::test_support::StubBehaviour,
             owner::{clock::ProbeState, lifecycle::LifecycleKind},
         };
 
-        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::AcceptProbeAfterCalls {
-            sequence: 303,
-            delay: std::time::Duration::from_millis(250),
-        });
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_disabled_modeset_backend(StubBehaviour::AcceptProbeAfterCalls {
+                sequence: 303,
+                delay: std::time::Duration::from_millis(250),
+            })
+            .expect("environmental skip: no live Vulkan modeset fixture");
         let clock_key = c0_3bi_install_unprobed_clock_epoch(&mut backend, device);
         let (dpms_validation_before, dpms_live_before, ..) =
             backend.lifecycle_drivers[&device].topology_test_stats();
@@ -62865,18 +65472,7 @@ mod tests {
             "a held clock probe is not a modeset or DPMS commit in the Owner slot"
         );
 
-        let disabled_key = OutputKey::new(device, "disabled-before");
-        let output_id = backend.randr_id_alloc.ids_for(&disabled_key).output_id;
-        backend
-            .output_key_by_id
-            .insert(output_id, disabled_key.clone());
-        backend.client_modeset_description_source_for_tests = true;
-        let token = c0_3bi_begin_client_modeset(
-            &mut backend,
-            output_id,
-            &disabled_key.connector_name,
-            Some(c0_3bi_changed_mode()),
-        );
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
         assert!(
             validation.is_empty(),
@@ -63054,20 +65650,17 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_rec4_waits_after_dispatch() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_rec4_waits_after_dispatch_vulkan() {
         use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
 
-        let (mut backend, device, output_id, connector) =
-            c0_3bi_client_modeset_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
-                mask: 0,
-                fds: 0,
-            }));
-        let token = c0_3bi_begin_client_modeset(
-            &mut backend,
-            output_id,
-            &connector,
-            Some(c0_3bi_changed_mode()),
-        );
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         wait_lifecycle_executor_readable(&backend, device);
         Backend::on_executor_readable(&mut backend, &mut ServerState::new());
         let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
@@ -63112,7 +65705,13 @@ mod tests {
             .commit_id();
         c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
         let completion = backend.complete_owner_for_tests(0);
-        c0_3aii_replace_owner_executor(&mut backend, StubBehaviour::NeverReply);
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::AcceptProbeAfterCalls {
+                sequence: 303,
+                delay: std::time::Duration::from_millis(10),
+            },
+        );
         assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
         assert!(backend.lifecycle_drivers[&device].client_modeset.is_none());
         assert!(
@@ -63127,6 +65726,18 @@ mod tests {
             Some(crate::kms::owner::lifecycle::LifecycleKind::DPMS),
             "DPMS transition starts after the modeset result crossed the boundary"
         );
+        for _ in 0..4 {
+            if backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .0
+                .len()
+                == 1
+            {
+                break;
+            }
+            wait_lifecycle_executor_readable(&backend, device);
+            Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        }
         assert_eq!(
             backend.lifecycle_drivers[&device]
                 .topology_test_stats()
@@ -63154,11 +65765,7 @@ mod tests {
         let assert_seat_refused = |error: &std::io::Error| {
             assert_eq!(
                 c0_3bi_client_modeset_failure(error),
-                Some(
-                    crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                        crate::kms::render::admission::ClientModesetRefusal::SeatReleased,
-                    )
-                )
+                Some(crate::kms::render::admission::ClientModesetFailure::SeatReleased)
             );
         };
         let enable_error = Backend::begin_crtc_config(
@@ -63206,36 +65813,27 @@ mod tests {
     }
 
     #[test]
-    fn c0_3bi_second_modeset_on_occupied_slot() {
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_second_modeset_on_occupied_slot_vulkan() {
         use crate::kms::executor::test_support::StubBehaviour;
 
-        let (mut backend, device, output_id, connector) =
-            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
-        let first = c0_3bi_begin_client_modeset(
-            &mut backend,
-            output_id,
-            &connector,
-            Some(c0_3bi_changed_mode()),
-        );
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let first = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
         let first_tag = backend.lifecycle_drivers[&device]
             .client_modeset
             .as_ref()
             .expect("first client modeset owns slot")
             .tag;
-        let second_error = Backend::begin_crtc_config(
-            &mut backend,
-            output_id,
-            &connector,
-            Some(c0_3bi_changed_mode()),
-            0,
-            0,
-        )
-        .expect_err("second client request is refused");
+        let second_error =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect_err("second client request is refused");
         assert_eq!(
             c0_3bi_client_modeset_failure(&second_error),
             Some(
                 crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                    crate::kms::render::admission::ClientModesetRefusal::SlotOccupied,
+                    crate::kms::render::admission::OwnerRefusal::SlotOccupied,
                 )
             )
         );
@@ -63481,6 +66079,570 @@ mod tests {
             .unwrap();
         assert_eq!(clock.source, ClockSource::KernelSequence);
         assert_eq!(clock.probe, ProbeState::Succeeded);
+    }
+
+    #[test]
+    fn c0_3bi_value_dead_reads_routed() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        // Direct teardown keeps the Owner device lit according to its
+        // acknowledged state even when the Legacy server-wide cache is stale.
+        let (mut direct, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        direct.owner_dpms_installed_active.insert(device, true);
+        direct.kms_outputs_active = false;
+        direct.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        direct.scanout_m2.test_force_active = true;
+        direct.scanout_m2.unflip_shadow_ready = true;
+        assert!(
+            direct
+                .teardown_direct_before_topology_requery("C.0 installed-power test")
+                .expect("test DPMS recorder avoids a hardware modeset")
+        );
+
+        // Owner power participates in topology freshness. Flipping only the
+        // stale Legacy cache must not invalidate an Owner qualification.
+        let (mut signature, signature_device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        signature
+            .owner_dpms_installed_active
+            .insert(signature_device, true);
+        signature.kms_outputs_active = false;
+        let owner_signature = signature.crtc_config_topology_signature();
+        signature.kms_outputs_active = true;
+        assert_eq!(
+            signature.crtc_config_topology_signature(),
+            owner_signature,
+            "Owner freshness ignores the Legacy cache"
+        );
+        signature
+            .owner_dpms_installed_active
+            .insert(signature_device, false);
+        assert_ne!(
+            signature.crtc_config_topology_signature(),
+            owner_signature,
+            "Owner freshness follows installed device power"
+        );
+
+        // The asynchronous qualifier's captured recovery state is also
+        // device-local. Its executor only records the job; it never probes KMS.
+        let (mut pending, pending_device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        pending
+            .owner_dpms_installed_active
+            .insert(pending_device, true);
+        pending.kms_outputs_active = false;
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        pending.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            None,
+        )));
+        let output_key = pending.output_key_by_id[&output_id].clone();
+        let prepared_output = clone_test_drm_output(&pending.platform.outputs[0].output);
+        let route = pending.platform.outputs[0].scanout_route;
+        let token = pending
+            .enqueue_prepared_crtc_config_probe(
+                output_id,
+                output_key,
+                connector,
+                c0_3bi_changed_mode(),
+                0,
+                0,
+                prepared_output,
+                route,
+            )
+            .expect("the test probe executor accepts the copied job");
+        assert!(pending.pending_crtc_config_probes[&token].was_active);
+        assert_eq!(state.borrow().enqueued, vec![token]);
+
+        // Applying a disable to one of two Owner outputs preserves the lit
+        // survivor from installed power, not the stale global cache. Both
+        // all-off and relight calls are recorded, never sent to DRM.
+        let (mut apply, apply_device, first_id, first_connector) =
+            c0_3bi_client_modeset_backend_with_output_count(StubBehaviour::NeverReply, 2);
+        apply.owner_dpms_installed_active.insert(apply_device, true);
+        apply.kms_outputs_active = false;
+        apply.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        for output in &apply.platform.outputs {
+            let ids = apply.randr_id_alloc.ids_for(&output.key);
+            apply
+                .output_key_by_id
+                .insert(ids.output_id, output.key.clone());
+        }
+        assert!(
+            apply
+                .apply_crtc_config(first_id, &first_connector, None, 0, 0)
+                .expect("the test DPMS recorder prevents hardware writes")
+        );
+        assert_eq!(apply.platform.outputs.len(), 1);
+        assert!(apply.kms_outputs_active);
+        let calls = apply
+            .platform
+            .dpms_output_calls_for_tests
+            .as_ref()
+            .expect("recorder remains installed");
+        assert_eq!(calls.len(), 2);
+        assert!(!calls[0].0, "legacy topology quiesce still goes all-off");
+        assert!(calls[1].0, "the installed-power Owner survivor is relit");
+        assert_eq!(calls[1].1, vec![apply.platform.outputs[0].key.clone()]);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_begin_on_owner_is_pending_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let result =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect("Owner begin succeeds asynchronously");
+        let CrtcConfigApply::Pending(token) = result else {
+            panic!("a non-idempotent Owner modeset must return Pending")
+        };
+
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("TEST_ONLY acceptance dispatches the real transaction")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+        assert!(Backend::finish_crtc_config(&mut backend, token).expect("promoted modeset"));
+        assert_eq!(backend.platform.outputs[0].width, mode.width);
+        assert_eq!(backend.platform.outputs[0].height, mode.height);
+        assert_eq!(
+            backend
+                .randr_id_alloc
+                .entry(&backend.output_key_by_id[&output_id])
+                .unwrap()
+                .config,
+            super::ConnectorConfig::Enabled {
+                mode_w: mode.width,
+                mode_h: mode.height,
+                vrefresh: mode.vrefresh,
+                x: 0,
+                y: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn c0_3bi_idempotent_request_dispatches_nothing() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        let output = &backend.platform.outputs[0];
+        let mode = ModeSpec {
+            width: output.width,
+            height: output.height,
+            vrefresh: output.output.picked.vrefresh,
+        };
+        let (x, y) = (output.x, output.y);
+        let output_key = backend.output_key_by_id[&output_id].clone();
+        backend.randr_id_alloc.entry_mut(&output_key).config = super::ConnectorConfig::Off;
+
+        for _ in 0..2 {
+            assert_eq!(
+                Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), x, y,)
+                    .expect("idempotent Owner reassert"),
+                CrtcConfigApply::Applied(false)
+            );
+        }
+        let (validation, live) = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert!(validation.is_empty());
+        assert!(live.is_empty());
+        assert_eq!(
+            backend.randr_id_alloc.entry(&output_key).unwrap().config,
+            super::ConnectorConfig::Enabled {
+                mode_w: mode.width,
+                mode_h: mode.height,
+                vrefresh: mode.vrefresh,
+                x,
+                y,
+            },
+            "idempotency keeps the registry synchronized with the installed layout"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_cancel_before_and_after_dispatch_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (
+            OwnerLiveFixture {
+                mut backend,
+                cleanup_calls,
+                ..
+            },
+            device,
+            output_id,
+            connector,
+            mode,
+        ) = c0_3bi_live_modeset_backend(
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+            false,
+        )
+        .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .is_empty(),
+            "the live modeset has not crossed dispatch"
+        );
+        Backend::cancel_crtc_config(&mut backend, token);
+        assert!(
+            backend.lifecycle_drivers[&device].client_modeset.is_none(),
+            "pre-dispatch cancellation releases the Owner slot"
+        );
+        c0_3bi_assert_prepared_pool_released(
+            &backend,
+            device,
+            &keys,
+            &framebuffers,
+            &cleanup_calls,
+        );
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let commit = c0_3bi_dispatch_client_modeset(&mut backend, device);
+        assert!(Backend::crtc_config_install_capable(&backend, token));
+        Backend::cancel_crtc_config(&mut backend, token);
+        assert!(
+            Backend::crtc_config_install_capable(&backend, token),
+            "dropping the token does not make a dispatched transaction cancellable"
+        );
+
+        c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        c0_3aii_replace_owner_executor(&mut backend, StubBehaviour::AcceptProbeWith(305));
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(backend.lifecycle_drivers[&device].client_modeset.is_none());
+        assert_eq!(backend.platform.outputs[0].width, mode.width);
+        assert_eq!(backend.platform.outputs[0].height, mode.height);
+        assert!(!Backend::crtc_config_install_capable(&backend, token));
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+        assert!(!backend.ready_client_modeset_results.contains_key(&token));
+    }
+
+    #[test]
+    fn c0_3bi_legacy_path_unchanged() {
+        let mut backend = KmsBackend::for_tests();
+        push_test_output(&mut backend, 2);
+        // Record the all-off/relight sequence so the test cannot issue a DRM
+        // write. This fixture has no Owner transport gate.
+        backend.kms_outputs_active = true;
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        let output_key = backend.platform.outputs[0].key.clone();
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        backend
+            .output_key_by_id
+            .insert(ids.output_id, output_key.clone());
+
+        assert_eq!(
+            Backend::begin_crtc_config(
+                &mut backend,
+                ids.output_id,
+                &output_key.connector_name,
+                None,
+                0,
+                0,
+            )
+            .expect("Legacy disable remains synchronous"),
+            CrtcConfigApply::Applied(true)
+        );
+        assert!(backend.lifecycle_drivers.is_empty());
+        let calls = backend
+            .platform
+            .dpms_output_calls_for_tests
+            .as_ref()
+            .expect("Legacy DPMS recorder");
+        assert_eq!(calls.len(), 2);
+        assert!(
+            !calls[0].0,
+            "Legacy CRTC mutation first turns all outputs off"
+        );
+        assert!(calls[1].0, "Legacy CRTC mutation relights the survivor");
+        assert_eq!(calls[1].1, vec![backend.platform.outputs[0].key.clone()]);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct C0_3biModesetState {
+        changed: bool,
+        registry: Option<(super::ConnectorConfig, bool, bool, bool)>,
+        outputs: Vec<(OutputKey, u16, u16, u32, i32, i32)>,
+        framebuffer: (u16, u16),
+    }
+
+    fn c0_3bi_modeset_state(
+        backend: &super::KmsBackend,
+        output_key: &OutputKey,
+        changed: bool,
+    ) -> C0_3biModesetState {
+        let registry = backend.randr_id_alloc.entry(output_key).map(|entry| {
+            (
+                entry.config,
+                entry.crtc_associated,
+                entry.client_configured,
+                entry.connected,
+            )
+        });
+        let outputs = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.key.clone(),
+                    output.width,
+                    output.height,
+                    output.output.picked.vrefresh,
+                    output.x,
+                    output.y,
+                )
+            })
+            .collect();
+        C0_3biModesetState {
+            changed,
+            registry,
+            outputs,
+            framebuffer: (backend.platform.fb_w, backend.platform.fb_h),
+        }
+    }
+
+    fn c0_3bi_legacy_script_step(
+        backend: &mut super::KmsBackend,
+        output_id: u32,
+        connector: &str,
+        mode: Option<ModeSpec>,
+    ) -> bool {
+        let CrtcConfigApply::Applied(changed) =
+            Backend::begin_crtc_config(backend, output_id, connector, mode, 0, 0)
+                .expect("Legacy synchronous CRTC configuration")
+        else {
+            panic!("same-device Legacy configuration must remain synchronous")
+        };
+        assert!(Backend::drain_ready_crtc_configs(backend).is_empty());
+        changed
+    }
+
+    fn c0_3bi_owner_script_step(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_id: u32,
+        connector: &str,
+        mode: Option<ModeSpec>,
+        sequence: u64,
+    ) -> bool {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        let result = Backend::begin_crtc_config(backend, output_id, connector, mode, 0, 0)
+            .expect("Owner CRTC configuration begin");
+        let CrtcConfigApply::Pending(token) = result else {
+            assert_eq!(
+                result,
+                CrtcConfigApply::Applied(false),
+                "only an idempotent Owner request returns synchronously"
+            );
+            assert!(Backend::drain_ready_crtc_configs(backend).is_empty());
+            return false;
+        };
+
+        wait_lifecycle_executor_readable(backend, device);
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("Owner validation dispatches the client transaction")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        c0_3aii_replace_owner_executor(
+            backend,
+            if mode.is_some() {
+                StubBehaviour::AcceptProbeWith(sequence)
+            } else {
+                StubBehaviour::NeverReply
+            },
+        );
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert_eq!(Backend::drain_ready_crtc_configs(backend), vec![token]);
+        assert!(Backend::drain_ready_crtc_configs(backend).is_empty());
+        let changed = Backend::finish_crtc_config(backend, token)
+            .expect("terminal Owner client modeset result");
+        if mode.is_some() {
+            wait_lifecycle_executor_readable(backend, device);
+            Backend::on_executor_readable(backend, &mut ServerState::new());
+            let observations = backend.drained_host_call_events_for_tests();
+            assert!(
+                observations.iter().any(|event| matches!(
+                    event.kind,
+                    crate::kms::executor::ObservedOutcome::ProbeAccepted { sequence: actual }
+                        if actual == sequence
+                )),
+                "lighting promotion must probe its new clock epoch"
+            );
+        }
+        changed
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_modeset_differential_backend_state_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        // Run the Legacy production entry first, with only its final DRM
+        // commit and all-off/relight calls recorded. The fixture uses real
+        // Vulkan allocations but never takes DRM master or submits a modeset.
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _fixture_mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let output_key = backend.output_key_by_id[&output_id].clone();
+        let initial_mode = {
+            let output = &backend.platform.outputs[0];
+            ModeSpec {
+                width: output.width,
+                height: output.height,
+                vrefresh: output.output.picked.vrefresh,
+            }
+        };
+        let modes = backend.platform.outputs[0]
+            .output
+            .modes
+            .iter()
+            .map(|mode| ModeSpec {
+                width: mode.width,
+                height: mode.height,
+                vrefresh: mode.vrefresh,
+            })
+            .collect::<Vec<_>>();
+        let mode_pair = modes
+            .iter()
+            .copied()
+            .filter(|mode| mode.width != initial_mode.width || mode.height != initial_mode.height)
+            .find_map(|mode_change| {
+                modes
+                    .iter()
+                    .copied()
+                    .find(|mode| {
+                        mode.width == mode_change.width
+                            && mode.height == mode_change.height
+                            && mode.vrefresh != mode_change.vrefresh
+                    })
+                    .map(|refresh_only| (mode_change, refresh_only))
+            });
+        let (mode_change, refresh_only) = mode_pair.unwrap_or_else(|| {
+            panic!(
+                "differential fixture requires a distinct-resolution mode plus a second refresh at that resolution; advertised modes: {modes:?}"
+            )
+        });
+
+        let incarnation = backend
+            .platform
+            .owner_ref(device)
+            .expect("live fixture Owner identity")
+            .incarnation();
+        backend.platform.install_transport_gate(
+            crate::kms::render::resources::TransportGate::new_legacy(
+                device,
+                incarnation,
+                Box::new(backend.direct_ownership_handle()),
+            ),
+        );
+        backend.admission_conductors.remove(&device);
+        backend.lifecycle_drivers.remove(&device);
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.modeset_calls_for_tests = Some(Vec::new());
+
+        assert!(c0_3bi_legacy_script_step(
+            &mut backend,
+            output_id,
+            &connector,
+            None,
+        ));
+        let mut legacy_steps = Vec::new();
+        for (mode, label) in [
+            (Some(initial_mode), "enable"),
+            (Some(mode_change), "mode change"),
+            (Some(refresh_only), "refresh-only change"),
+            (Some(refresh_only), "idempotent repeat"),
+            (None, "disable"),
+            (Some(initial_mode), "re-enable"),
+        ] {
+            let changed = c0_3bi_legacy_script_step(&mut backend, output_id, &connector, mode);
+            assert_eq!(changed, label != "idempotent repeat", "Legacy {label}");
+            legacy_steps.push(c0_3bi_modeset_state(&backend, &output_key, changed));
+        }
+        assert!(
+            backend
+                .platform
+                .modeset_calls_for_tests
+                .as_ref()
+                .is_some_and(|calls| calls.len() >= 4),
+            "Legacy enables and mode changes still use the synchronous modeset writer"
+        );
+        drop(backend);
+
+        // The Owner uses the same advertised modes and requests. Its live
+        // commit is accepted by the stubbed executor, so no hardware modeset
+        // can occur in this differential test.
+        let (
+            OwnerLiveFixture { mut backend, .. },
+            device,
+            output_id,
+            owner_connector,
+            _fixture_mode,
+        ) = c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        assert_eq!(owner_connector, connector);
+        let owner_key = backend.output_key_by_id[&output_id].clone();
+        let disable =
+            c0_3bi_owner_script_step(&mut backend, device, output_id, &owner_connector, None, 401);
+        assert!(disable);
+        let mut owner_steps = Vec::new();
+        for (mode, label, sequence) in [
+            (Some(initial_mode), "enable", 402),
+            (Some(mode_change), "mode change", 403),
+            (Some(refresh_only), "refresh-only change", 404),
+            (Some(refresh_only), "idempotent repeat", 405),
+            (None, "disable", 406),
+            (Some(initial_mode), "re-enable", 407),
+        ] {
+            let changed = c0_3bi_owner_script_step(
+                &mut backend,
+                device,
+                output_id,
+                &owner_connector,
+                mode,
+                sequence,
+            );
+            assert_eq!(changed, label != "idempotent repeat", "Owner {label}");
+            owner_steps.push(c0_3bi_modeset_state(&backend, &owner_key, changed));
+        }
+        assert_eq!(owner_steps, legacy_steps);
     }
 
     fn c0_3aii_compose_from_scene(backend: &mut super::KmsBackend, output_idx: usize) {
@@ -71905,6 +75067,18 @@ mod tests {
             output.x,
             output.y,
         ));
+        let output_key = backend
+            .platform
+            .outputs
+            .last()
+            .expect("new output")
+            .key
+            .clone();
+        let instance_id = backend
+            .platform
+            .allocate_output_instance_id(&output_key)
+            .expect("new test output instance");
+        backend.platform.output_instance_ids.push(instance_id);
         backend.platform.scanout_pools.push(None);
         backend.platform.bo_generations.push(Vec::new());
         backend.platform.first_pageflip_logged.push(false);
@@ -76236,6 +79410,712 @@ mod tests {
         );
     }
 
+    fn c0_hw_3b_drive_until(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<(), String> {
+        use std::{os::fd::AsRawFd, time::Instant};
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let now = Instant::now();
+            let tick_events = backend.platform.tick_executors(now);
+            backend.record_host_call_events(tick_events);
+            let executor_events = backend.platform.drain_executor_events();
+            backend.record_host_call_events(executor_events);
+
+            if let Some(service) = backend.resource_service.as_mut()
+                && let Err(error) = service.service_completions(now)
+            {
+                return Err(format!("{label}: resource service failed: {error:?}"));
+            }
+            for (device_key, events) in backend.platform.service_owner_completions(now) {
+                for event in &events {
+                    if let crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } =
+                        event
+                    {
+                        hardware_complete.borrow_mut().insert(*commit);
+                    }
+                }
+                if !backend.route_owner_event_batch(device_key, events, now) {
+                    return Err(format!("{label}: Owner completion batch was not consumed"));
+                }
+            }
+
+            let (drm_events, drain_result) = backend.platform.drain_owner_events(drm_fd, now);
+            if let Err(error) = drain_result {
+                return Err(format!("{label}: DRM event drain failed: {error}"));
+            }
+            let mut grouped = std::collections::BTreeMap::new();
+            for (device_key, event) in drm_events {
+                if let crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } = &event {
+                    hardware_complete.borrow_mut().insert(*commit);
+                }
+                grouped
+                    .entry(device_key)
+                    .or_insert_with(Vec::new)
+                    .push(event);
+            }
+            for (device_key, events) in grouped {
+                if !backend.route_owner_event_batch(device_key, events, now) {
+                    return Err(format!("{label}: DRM Owner event batch was not consumed"));
+                }
+            }
+            backend.service_direct_framebuffer_edges(now, false);
+            if done(backend) {
+                return Ok(());
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout_ms = remaining.as_millis().clamp(1, 10) as libc::c_int;
+            let helper_fd = backend
+                .platform
+                .device_for_key(device)
+                .and_then(|entry| entry.executor.as_ref())
+                .and_then(|executor| executor.control_fd())
+                .map(|fd| fd.as_raw_fd());
+            let mut poll_fds = vec![libc::pollfd {
+                fd: drm_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            if let Some(helper_fd) = helper_fd {
+                poll_fds.push(libc::pollfd {
+                    fd: helper_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            let count = libc::nfds_t::try_from(poll_fds.len())
+                .expect("hardware poll descriptor count fits nfds_t");
+            // SAFETY: both descriptors are owned by the live fixture and the
+            // poll array remains writable until libc returns.
+            let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), count, timeout_ms) };
+            if poll_result < 0
+                && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+            {
+                return Err(format!(
+                    "{label}: bounded poll failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Err(format!("{label}: timed out after {timeout:?}"))
+    }
+
+    fn c0_hw_3b_pool_allocations(
+        backend: &super::KmsBackend,
+        output_key: &OutputKey,
+    ) -> Vec<crate::kms::render::resources::AllocationKey> {
+        let Some(index) = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| &output.key == output_key)
+        else {
+            return Vec::new();
+        };
+        backend
+            .platform
+            .scanout_pools
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|scanout| {
+                scanout
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .filter_map(|bo| bo.managed_key())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn c0_hw_3b_set_crtc_config(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        output_id: u32,
+        connector: &str,
+        output_key: &OutputKey,
+        mode: Option<ModeSpec>,
+        label: &str,
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<Vec<crate::kms::render::resources::AllocationKey>, String> {
+        let current = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| &output.key == output_key);
+        let old_allocations = c0_hw_3b_pool_allocations(backend, output_key);
+        let displaces_pool = mode.is_none_or(|mode| {
+            current.is_some_and(|output| output.width != mode.width || output.height != mode.height)
+        });
+        let displaced_allocations = if displaces_pool {
+            old_allocations
+        } else {
+            Vec::new()
+        };
+        let result = Backend::begin_crtc_config(backend, output_id, connector, mode, 0, 0)
+            .map_err(|error| format!("{label}: begin failed: {error}"))?;
+        let CrtcConfigApply::Pending(token) = result else {
+            return Err(format!(
+                "{label}: non-idempotent hardware request was synchronous"
+            ));
+        };
+
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(35),
+            &|backend| backend.device_owner_for_tests(0).live_record().is_some(),
+            hardware_complete,
+        )?;
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("drive observed the modeset live record")
+            .commit_id();
+        if !displaced_allocations.is_empty() {
+            assert!(
+                !c0_3bi_kms_displacements(backend, device, commit).is_empty(),
+                "{label}: the displaced pool is registered against its modeset commit"
+            );
+        }
+
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(35),
+            &|backend| backend.ready_client_modeset_results.contains_key(&token),
+            hardware_complete,
+        )?;
+        assert_eq!(Backend::drain_ready_crtc_configs(backend), vec![token]);
+        assert!(Backend::drain_ready_crtc_configs(backend).is_empty());
+        Backend::finish_crtc_config(backend, token)
+            .map_err(|error| format!("{label}: finish failed: {error}"))?;
+        assert!(
+            c0_3bi_kms_displacements(backend, device, commit).is_empty(),
+            "{label}: CompletionRetired discharges every KmsRelease"
+        );
+        Ok(displaced_allocations)
+    }
+
+    fn c0_hw_3b_wait_for_pool_release(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        label: &str,
+        allocations: &[crate::kms::render::resources::AllocationKey],
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<(), String> {
+        if allocations.is_empty() {
+            return Ok(());
+        }
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(35),
+            &|backend| {
+                allocations.iter().all(|key| {
+                    backend
+                        .resource_service()
+                        .is_none_or(|service| !service.contains(key))
+                })
+            },
+            hardware_complete,
+        )
+    }
+
+    fn c0_hw_3b_compose_and_complete(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        output_key: &OutputKey,
+        label: &str,
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<crate::kms::owner::identity::CommitId, String> {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| &output.key == output_key)
+            .ok_or_else(|| format!("{label}: lit output is absent"))?;
+        let damage_before = backend
+            .scene
+            .damage_history_latest_generation_for_tests(output_idx);
+        let complete_before = hardware_complete.borrow().clone();
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(20),
+            &|backend| {
+                hardware_complete
+                    .borrow()
+                    .iter()
+                    .any(|commit| !complete_before.contains(commit))
+                    && backend.device_owner_for_tests(0).live_record().is_none()
+                    && backend
+                        .scene
+                        .damage_history_latest_generation_for_tests(output_idx)
+                        > damage_before
+                    && backend
+                        .commit_consumer
+                        .current_resources
+                        .iter()
+                        .any(|resources| resources.direct_role.is_none())
+            },
+            hardware_complete,
+        )?;
+        let completed = hardware_complete
+            .borrow()
+            .iter()
+            .find(|commit| !complete_before.contains(commit))
+            .copied()
+            .ok_or_else(|| format!("{label}: composed commit has no HardwareComplete"))?;
+        assert!(
+            c0_3aii_owner_current_framebuffer(backend, output_idx).is_some(),
+            "{label}: a composed frame became the retained current framebuffer"
+        );
+        Ok(completed)
+    }
+
+    fn c0_hw_3b_set_dpms(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        level: u8,
+        expected_active: bool,
+        label: &str,
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<(), String> {
+        Backend::set_dpms_power(backend, level)
+            .map_err(|error| format!("{label}: DPMS request failed: {error}"))?;
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(35),
+            &|backend| {
+                backend.owner_dpms_installed_active.get(&device) == Some(&expected_active)
+                    && backend
+                        .lifecycle_coordinator
+                        .protocol_dpms_request_applied()
+            },
+            hardware_complete,
+        )
+    }
+
+    #[test]
+    #[ignore = "needs tty, DRM master, card1 HDMI-2, Vulkan ICD, and nvidia-drm vblank=1"]
+    fn c0_hw_3b_modeset_owner_on_card1_drm() {
+        use std::{
+            os::fd::{AsFd, AsRawFd},
+            path::PathBuf,
+            rc::Rc,
+            time::Duration,
+        };
+
+        use crate::kms::render::resources::{DrmCleanupRegistry, ResourceService};
+
+        let card1 = PathBuf::from("/dev/dri/card1");
+        if let Err(error) = std::fs::metadata(&card1) {
+            eprintln!("environmental skip: /dev/dri/card1 is unavailable: {error}");
+            return;
+        }
+        let driver = std::fs::read_link("/sys/class/drm/card1/device/driver")
+            .expect("card1 must have a driver for the requested hardware test");
+        assert_eq!(
+            driver.file_name().and_then(|name| name.to_str()),
+            Some("nvidia"),
+            "the card1 modeset test requires the NVIDIA DRM driver"
+        );
+        let vblank = std::fs::read_to_string("/sys/module/nvidia_drm/parameters/vblank")
+            .expect("set nvidia-drm vblank=1 before running this hardware test");
+        assert!(
+            matches!(vblank.trim(), "Y" | "1"),
+            "nvidia-drm vblank must be enabled (the module reports {:?})",
+            vblank.trim()
+        );
+
+        let probe = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .unwrap_or_else(|error| panic!("card1 modeset preflight failed: {error}"));
+        let probe_key = probe
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .expect("Vulkan must report a primary DRM node for the card1 preflight");
+        let probe_path = super::card_path_for_key(probe_key).unwrap_or_else(|error| {
+            panic!("cannot map Vulkan primary {probe_key} to card1: {error}")
+        });
+        assert_eq!(
+            probe_path, card1,
+            "the hardware fixture must select card1 before acquiring DRM master"
+        );
+        drop(probe);
+
+        let base = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .unwrap_or_else(|error| panic!("card1 live Vulkan fixture failed: {error}"));
+        let mut fixture =
+            super::KmsBackend::for_tests_with_live_kms_from_backend(base, Some("HDMI-2"))
+                .unwrap_or_else(|error| panic!("card1 HDMI-2 live fixture failed: {error}"));
+        let backend = &mut fixture.backend;
+        backend.resource_cleanup_on_drop_for_tests = true;
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("card1 live KMS fixture has a primary device")
+            .key;
+        let device_rc = backend
+            .platform
+            .device_for_key(device)
+            .expect("card1 live fixture retains its KMS device")
+            .device
+            .clone();
+        let actual_path = super::card_path_for_key(device).unwrap_or_else(|error| {
+            panic!("cannot map live KMS primary {device} to card1: {error}")
+        });
+        assert_eq!(actual_path, card1);
+
+        let executor = crate::kms::executor::KmsIoExecutor::spawn(
+            device_rc.as_fd(),
+            crate::kms::owner::identity::IncarnationId::first(),
+        )
+        .unwrap_or_else(|error| panic!("cannot spawn card1 KMS executor: {error}"));
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+
+        let mut registry = DrmCleanupRegistry::new(Rc::clone(&device_rc), device, incarnation);
+        let mut service = ResourceService::new(device, incarnation);
+        for output_idx in 0..backend.platform.scanout_pools.len() {
+            let bo_count = backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .map_or(0, |scanout| scanout.display_pool().bos.len());
+            for bo_idx in 0..bo_count {
+                backend
+                    .platform
+                    .register_managed_scanout_bo(&mut service, &mut registry, output_idx, bo_idx)
+                    .unwrap_or_else(|error| {
+                        panic!("card1 output {output_idx} BO {bo_idx} adoption failed: {error:?}")
+                    });
+            }
+        }
+        backend.install_resource_service_with_registry(service, registry);
+        install_admission_owner_gate(backend, device);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("HDMI-2 is a card1 Owner output");
+        let output_key = backend.platform.outputs[output_idx].key.clone();
+        assert_eq!(output_key.connector_name, "HDMI-2");
+        let output_id = backend.randr_id_alloc.ids_for(&output_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, output_key.clone());
+        {
+            let output = &backend.platform.outputs[output_idx];
+            let entry = backend.randr_id_alloc.entry_mut(&output_key);
+            entry.connected = true;
+            entry.config = super::ConnectorConfig::Enabled {
+                mode_w: output.width,
+                mode_h: output.height,
+                vrefresh: output.output.picked.vrefresh,
+                x: output.x,
+                y: output.y,
+            };
+            entry.modes = output.output.modes.clone();
+            entry.edid = output.output.edid.clone();
+            entry.mm_width = output.output.mm_width;
+            entry.mm_height = output.output.mm_height;
+            entry.connector_type = output.output.connector_type.clone();
+        }
+        let current_mode = {
+            let output = &backend.platform.outputs[output_idx];
+            ModeSpec {
+                width: output.width,
+                height: output.height,
+                vrefresh: output.output.picked.vrefresh,
+            }
+        };
+        let alternate_mode = backend.platform.outputs[output_idx]
+            .output
+            .modes
+            .iter()
+            .map(|mode| ModeSpec {
+                width: mode.width,
+                height: mode.height,
+                vrefresh: mode.vrefresh,
+            })
+            .find(|mode| *mode != current_mode)
+            .expect("HDMI-2 advertises a second mode");
+
+        let drm_fd = backend
+            .platform
+            .device_for_key(device)
+            .expect("card1 KMS device")
+            .device
+            .as_fd()
+            .as_raw_fd();
+        let hardware_complete = Rc::new(std::cell::RefCell::new(std::collections::HashSet::new()));
+        let hardware_crtc =
+            u32::from(CrtcKey::for_output(&backend.platform.outputs[output_idx]).crtc);
+        let clock_key = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(hardware_crtc))
+            .expect("HDMI-2 CRTC has a production clock record");
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            "initial HDMI-2 clock probe",
+            Duration::from_secs(20),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock(clock_key))
+                    .is_some_and(|clock| {
+                        clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                    })
+            },
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("initial HDMI-2 clock probe failed: {error}"));
+
+        for cycle in 1..=4 {
+            for (label, mode) in [
+                ("alternate advertised mode", alternate_mode),
+                ("restore original advertised mode", current_mode),
+            ] {
+                let step = format!("mode cycle {cycle}: {label}");
+                let displaced = c0_hw_3b_set_crtc_config(
+                    backend,
+                    device,
+                    drm_fd,
+                    output_id,
+                    "HDMI-2",
+                    &output_key,
+                    Some(mode),
+                    &step,
+                    &hardware_complete,
+                )
+                .unwrap_or_else(|error| panic!("{step} failed: {error}"));
+                let installed = backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .find(|output| output.key == output_key)
+                    .expect("promoted HDMI-2 output");
+                assert_eq!(
+                    (installed.width, installed.height),
+                    (mode.width, mode.height)
+                );
+                assert_eq!(installed.output.picked.vrefresh, mode.vrefresh);
+                assert_eq!(
+                    backend.owner_dpms_installed_active.get(&device),
+                    Some(&true)
+                );
+                c0_hw_3b_compose_and_complete(
+                    backend,
+                    device,
+                    drm_fd,
+                    &output_key,
+                    &step,
+                    &hardware_complete,
+                )
+                .unwrap_or_else(|error| panic!("{step}: composed frame failed: {error}"));
+                c0_hw_3b_wait_for_pool_release(
+                    backend,
+                    device,
+                    drm_fd,
+                    &step,
+                    &displaced,
+                    &hardware_complete,
+                )
+                .unwrap_or_else(|error| panic!("{step}: displaced pool stayed live: {error}"));
+            }
+        }
+
+        for cycle in 1..=4 {
+            let disable = format!("disable cycle {cycle}");
+            let displaced = c0_hw_3b_set_crtc_config(
+                backend,
+                device,
+                drm_fd,
+                output_id,
+                "HDMI-2",
+                &output_key,
+                None,
+                &disable,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{disable} failed: {error}"));
+            assert!(
+                backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .all(|output| output.key != output_key)
+            );
+            assert_eq!(
+                backend.randr_id_alloc.entry(&output_key).unwrap().config,
+                super::ConnectorConfig::Off
+            );
+            assert_eq!(
+                backend.owner_dpms_installed_active.get(&device),
+                Some(&false)
+            );
+            c0_hw_3b_wait_for_pool_release(
+                backend,
+                device,
+                drm_fd,
+                &disable,
+                &displaced,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{disable}: displaced pool stayed live: {error}"));
+
+            let enable = format!("enable cycle {cycle}");
+            let displaced = c0_hw_3b_set_crtc_config(
+                backend,
+                device,
+                drm_fd,
+                output_id,
+                "HDMI-2",
+                &output_key,
+                Some(current_mode),
+                &enable,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{enable} failed: {error}"));
+            assert!(
+                displaced.is_empty(),
+                "re-enable has no old pool to displace"
+            );
+            assert_eq!(
+                backend.owner_dpms_installed_active.get(&device),
+                Some(&true)
+            );
+            c0_hw_3b_compose_and_complete(
+                backend,
+                device,
+                drm_fd,
+                &output_key,
+                &enable,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{enable}: composed frame failed: {error}"));
+        }
+
+        for cycle in 1..=4 {
+            let off = format!("DPMS-off modeset cycle {cycle}");
+            c0_hw_3b_set_dpms(backend, device, drm_fd, 3, false, &off, &hardware_complete)
+                .unwrap_or_else(|error| panic!("{off} failed: {error}"));
+
+            let mode = if cycle % 2 == 1 {
+                alternate_mode
+            } else {
+                current_mode
+            };
+            let dark_change = format!("{off}: dark mode change");
+            let displaced = c0_hw_3b_set_crtc_config(
+                backend,
+                device,
+                drm_fd,
+                output_id,
+                "HDMI-2",
+                &output_key,
+                Some(mode),
+                &dark_change,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{dark_change} failed: {error}"));
+            assert_eq!(
+                backend.owner_dpms_installed_active.get(&device),
+                Some(&false)
+            );
+            let installed = backend
+                .platform
+                .outputs
+                .iter()
+                .find(|output| output.key == output_key)
+                .expect("dark mode change preserves the HDMI-2 route");
+            assert_eq!(
+                (installed.width, installed.height),
+                (mode.width, mode.height)
+            );
+            assert_eq!(installed.output.picked.vrefresh, mode.vrefresh);
+            c0_hw_3b_wait_for_pool_release(
+                backend,
+                device,
+                drm_fd,
+                &dark_change,
+                &displaced,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{dark_change}: displaced pool stayed live: {error}"));
+
+            let on = format!("DPMS-on modeset cycle {cycle}");
+            c0_hw_3b_set_dpms(backend, device, drm_fd, 0, true, &on, &hardware_complete)
+                .unwrap_or_else(|error| panic!("{on} failed: {error}"));
+            c0_hw_3b_compose_and_complete(
+                backend,
+                device,
+                drm_fd,
+                &output_key,
+                &on,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{on}: composed frame failed: {error}"));
+        }
+
+        eprintln!(
+            "card1 HDMI-2 Owner modeset test passed: advertised mode/back ×4, disable/enable ×4, DPMS-off/mode/on ×4; every lit step composed and every displaced pool was discharged"
+        );
+    }
+
     fn hardware_drm_key(path: &str) -> Result<crate::platform::drm::DrmDeviceKey, std::io::Error> {
         use std::os::fd::AsFd;
 
@@ -77030,6 +80910,430 @@ mod tests {
             owner.len(),
             4,
             "one latency sample is required per Owner copied frame"
+        );
+    }
+
+    fn c0_3bi_scanout_images(backend: &KmsBackend, output_idx: usize) -> Vec<ash::vk::Image> {
+        backend.platform.scanout_pools[output_idx]
+            .as_ref()
+            .expect("output scanout pool")
+            .display_pool()
+            .bos
+            .iter()
+            .map(|bo| bo.vk_image)
+            .collect()
+    }
+
+    fn c0_3bi_remove_output_for_promotion(backend: &mut KmsBackend, output_idx: usize) {
+        let key = backend.platform.outputs[output_idx].key.clone();
+        let pool = backend.platform.scanout_pools[output_idx]
+            .take()
+            .expect("removed output scanout pool");
+        let mut identity_map = backend.scene.stage_output_identity_map();
+        identity_map.remove(&key, pool);
+        backend.platform.outputs.remove(output_idx);
+        backend.platform.output_instance_ids.remove(output_idx);
+        backend.platform.scanout_pools.remove(output_idx);
+        backend.platform.bo_generations.remove(output_idx);
+        backend.platform.first_pageflip_logged.remove(output_idx);
+        backend
+            .scene
+            .promote_output_identity_map(&backend.platform, identity_map);
+    }
+
+    fn c0_3bi_replace_output_for_promotion(
+        backend: &mut KmsBackend,
+        output_idx: usize,
+    ) -> crate::kms::backend::OutputInstanceId {
+        let key = backend.platform.outputs[output_idx].key.clone();
+        let vk = backend
+            .platform
+            .vk
+            .as_ref()
+            .cloned()
+            .expect("live Vulkan context");
+        let new_pool = backend
+            .platform
+            .allocate_test_output_scanout(vk, output_idx)
+            .expect("allocate replacement scanout pool");
+        let bo_count = new_pool.display_pool().bos.len();
+        let new_instance = backend
+            .platform
+            .allocate_output_instance_id(&key)
+            .expect("allocate fresh output instance id");
+        let retired_pool = backend.platform.scanout_pools[output_idx]
+            .replace(new_pool)
+            .expect("current scanout pool");
+        backend.platform.output_instance_ids[output_idx] = new_instance;
+        backend.platform.bo_generations[output_idx] =
+            vec![crate::kms::render::platform::BoGenerationEntry::default(); bo_count];
+        let staged = backend
+            .scene
+            .stage_output_scene_state(&backend.platform, output_idx, new_instance)
+            .expect("stage replacement output scene");
+        backend
+            .scene
+            .rebuild_output(&key, staged, retired_pool, &backend.platform);
+        new_instance
+    }
+
+    fn c0_3bi_compose_and_drain(backend: &mut KmsBackend) {
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_index_shift_keeps_other_outputs_vulkan() {
+        let mut fixture = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        c0_3bi_compose_and_drain(backend);
+
+        let kept_key = backend.platform.outputs[2].key.clone();
+        let kept_instance = backend
+            .scene
+            .output_instance_id_for_tests(2)
+            .expect("third output instance");
+        let kept_images = c0_3bi_scanout_images(backend, 2);
+        let kept_owner_states = backend.scene.owner_buffer_states_for_tests(2);
+        let kept_owner_count = backend.scene.owner_buffer_count_for_tests(2);
+        let kept_prepared = backend.scene.owner_prepared_for_tests(2);
+        let kept_pending_acks = backend.scene.pending_ack_count_for_tests(2);
+        assert!(
+            kept_prepared.is_some(),
+            "third output has an owner generation"
+        );
+
+        c0_3bi_remove_output_for_promotion(backend, 1);
+
+        assert_eq!(backend.platform.outputs[1].key, kept_key);
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(1),
+            Some(kept_instance),
+            "the scene follows output identity when its vector index shifts"
+        );
+        assert_eq!(c0_3bi_scanout_images(backend, 1), kept_images);
+        assert_eq!(
+            backend.scene.owner_buffer_states_for_tests(1),
+            kept_owner_states
+        );
+        assert_eq!(
+            backend.scene.owner_buffer_count_for_tests(1),
+            kept_owner_count
+        );
+        assert_eq!(backend.scene.owner_prepared_for_tests(1), kept_prepared);
+        assert_eq!(
+            backend.scene.pending_ack_count_for_tests(1),
+            kept_pending_acks
+        );
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 1);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_retired_bundle_waits_for_its_fence_vulkan() {
+        let mut fixture =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        let key = backend.platform.outputs[0].key.clone();
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output instance");
+        let old_images = c0_3bi_scanout_images(backend, 0);
+        let new_instance = c0_3bi_replace_output_for_promotion(backend, 0);
+        assert_ne!(old_instance, new_instance);
+        assert_ne!(c0_3bi_scanout_images(backend, 0), old_images);
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(old_instance),
+            Some(key)
+        );
+        let old_ring_before = backend
+            .scene
+            .retired_output_pool_occupancy_for_tests(old_instance)
+            .expect("retired old scene ring");
+        let new_ring_before = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("replacement scene diagnostics")
+            .pool_occupancy;
+
+        let ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live fence pool")
+            .acquire()
+            .expect("acquire unsignaled Vulkan fence");
+        assert_eq!(
+            backend
+                .scene
+                .defer_retired_pool_release_for_tests(old_instance, ticket.clone()),
+            Some(0)
+        );
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(1)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(old_instance),
+            Some((old_ring_before.0 + 1, old_ring_before.1))
+        );
+        assert_eq!(
+            backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .map(|d| d.pool_occupancy),
+            Some(new_ring_before)
+        );
+
+        ticket.test_signal();
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(0)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(old_instance),
+            Some(old_ring_before)
+        );
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(old_instance)
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(new_instance)
+        );
+        assert_ne!(c0_3bi_scanout_images(backend, 0), old_images);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_retired_bundle_survives_index_shift_vulkan() {
+        let mut fixture = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("first output instance");
+        let shifted_instance = backend
+            .scene
+            .output_instance_id_for_tests(1)
+            .expect("second output instance");
+        let shifted_images = c0_3bi_scanout_images(backend, 1);
+        let old_ring_before = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("first output diagnostics")
+            .pool_occupancy;
+        let shifted_ring_before = backend
+            .scene
+            .tick_diagnostics_for_tests(1)
+            .expect("second output diagnostics")
+            .pool_occupancy;
+        let ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live fence pool")
+            .acquire()
+            .expect("acquire unsignaled Vulkan fence");
+        assert_eq!(
+            backend
+                .scene
+                .defer_current_pool_release_for_tests(0, ticket.clone()),
+            Some(0)
+        );
+
+        c0_3bi_remove_output_for_promotion(backend, 0);
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(shifted_instance)
+        );
+        assert_eq!(c0_3bi_scanout_images(backend, 0), shifted_images);
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(1)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(old_instance),
+            Some((old_ring_before.0 + 1, old_ring_before.1))
+        );
+        assert_eq!(
+            backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .map(|d| d.pool_occupancy),
+            Some(shifted_ring_before)
+        );
+
+        ticket.test_signal();
+        backend.scene.poll_retired_outputs_for_tests(
+            &mut backend.platform,
+            backend.resource_service.as_ref(),
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(old_instance),
+            Some(0)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(old_instance),
+            Some(old_ring_before)
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(shifted_instance)
+        );
+        assert_eq!(c0_3bi_scanout_images(backend, 0), shifted_images);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_late_completion_routes_by_identity_vulkan() {
+        let mut fixture = owner_live_fixture_with_three_outputs()
+            .expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+
+        let removed_key = backend.platform.outputs[1].key.clone();
+        let removed_crtc = u32::from(backend.platform.outputs[1].output.crtc);
+        let kept_crtc = u32::from(backend.platform.outputs[2].output.crtc);
+        let kept_instance = backend
+            .scene
+            .output_instance_id_for_tests(2)
+            .expect("third output instance");
+        c0_3bi_remove_output_for_promotion(backend, 1);
+
+        let completions = backend.platform.drain_scanout_render_completions();
+        assert_eq!(completions.len(), 3, "all three GPU completions are ready");
+        let mut handled = 0;
+        for completion in completions {
+            if backend.scene.handle_scanout_render_completion(
+                completion,
+                &mut backend.platform,
+                backend.resource_service.as_mut(),
+            ) {
+                handled += 1;
+            }
+        }
+        assert_eq!(handled, 3, "active and retired completions are consumed");
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(1),
+            Some(kept_instance)
+        );
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(
+                backend
+                    .scene
+                    .output_instance_id_for_tests(0)
+                    .expect("first output instance")
+            ),
+            None,
+            "a current instance is not present in the retired list"
+        );
+        let offers = backend.scene.take_owner_composed_offers();
+        assert!(offers.iter().any(|offer| offer.crtc == kept_crtc));
+        assert!(
+            offers.iter().all(|offer| offer.crtc != removed_crtc),
+            "the removed output's late completion never offers its retired generation"
+        );
+        assert!(backend.scene.retired_output_count_for_tests() >= 1);
+        assert_ne!(removed_key, backend.platform.outputs[1].key);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_late_completion_across_same_key_replacements_vulkan() {
+        let mut fixture =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        let completion = backend
+            .platform
+            .drain_scanout_render_completions()
+            .into_iter()
+            .next()
+            .expect("first output render completion");
+        let first_instance = completion.output_instance_id;
+        let key = completion.output_key.clone();
+
+        let second_instance = c0_3bi_replace_output_for_promotion(backend, 0);
+        let third_instance = c0_3bi_replace_output_for_promotion(backend, 0);
+        assert_ne!(first_instance, second_instance);
+        assert_ne!(second_instance, third_instance);
+        assert_ne!(first_instance, third_instance);
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 2);
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(first_instance),
+            Some(key.clone())
+        );
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(second_instance),
+            Some(key)
+        );
+
+        assert!(backend.scene.handle_scanout_render_completion(
+            completion,
+            &mut backend.platform,
+            backend.resource_service.as_mut(),
+        ));
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_owner_buffer_states_for_tests(first_instance),
+            Some(vec![
+                crate::kms::render::owner_buffer::OwnerBufferState::Displaced
+            ]),
+            "the completion mutates only the exact first retired instance"
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_owner_buffer_count_for_tests(second_instance),
+            Some(0)
+        );
+        assert_eq!(backend.scene.owner_buffer_count_for_tests(0), 0);
+        assert!(backend.scene.take_owner_composed_offers().is_empty());
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(third_instance)
         );
     }
 

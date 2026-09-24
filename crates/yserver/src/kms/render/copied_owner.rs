@@ -20,7 +20,7 @@ use super::{
     },
 };
 use crate::kms::{
-    backend::OutputKey,
+    backend::{OutputInstanceId, OutputKey},
     vk::{
         compositor::{CompositeScene, PresentError},
         pipeline::CompositorPipeline,
@@ -313,6 +313,7 @@ pub(crate) fn prepare_owner_copy_after_render_completion(
     pool: &mut CopiedScanoutPool,
     platform: &mut PlatformBackend,
     output_key: OutputKey,
+    output_instance_id: OutputInstanceId,
     bo_idx: usize,
     render_completion: Option<OwnedFd>,
     service: &mut ResourceService,
@@ -439,6 +440,7 @@ pub(crate) fn prepare_owner_copy_after_render_completion(
     service.register_batch(batch);
     let job_id = match platform.register_scanout_render_completion(
         output_key,
+        output_instance_id,
         bo_idx,
         ScanoutRenderCompletionStage::CopiedOwnerCopy,
         completion,

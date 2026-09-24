@@ -129,7 +129,12 @@ pub struct PendingCrtcConfig {
 /// backend's result is terminal.
 #[derive(Debug, Clone, Copy)]
 pub struct CrtcConfigPublication {
+    pub client_id: ClientId,
+    pub sequence: SequenceNumber,
     pub output_id: u32,
+    pub requested_mode: Option<ModeSpec>,
+    pub x: i32,
+    pub y: i32,
     pub set_time: u32,
     pub output_bbox_before: Option<(u16, u16)>,
 }
@@ -4668,7 +4673,12 @@ fn handle_randr_request(
             };
             let output_bbox_before = super::run::enabled_output_bbox(state);
             let publication = CrtcConfigPublication {
+                client_id,
+                sequence,
                 output_id,
+                requested_mode: mode_spec,
+                x: i32::from(x),
+                y: i32::from(y),
                 set_time,
                 output_bbox_before,
             };
@@ -5056,6 +5066,15 @@ pub(crate) fn publish_crtc_config(
 ) -> u8 {
     match result {
         Ok(true) => {
+            log::debug!(
+                "RRSetCrtcConfig applied: client {} #{} output {} mode {:?} position ({}, {})",
+                publication.client_id.0,
+                publication.sequence.0,
+                publication.output_id,
+                publication.requested_mode,
+                publication.x,
+                publication.y,
+            );
             // Something actually changed. Single rebuild path: a CRTC set
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
@@ -5077,14 +5096,38 @@ pub(crate) fn publish_crtc_config(
         }
         Ok(false) => {
             // A no-op succeeds without a rebuild or change notification.
+            log::debug!(
+                "RRSetCrtcConfig applied: client {} #{} output {} mode {:?} position ({}, {}) (no-op)",
+                publication.client_id.0,
+                publication.sequence.0,
+                publication.output_id,
+                publication.requested_mode,
+                publication.x,
+                publication.y,
+            );
             0
         }
         Err(e) => {
-            log::warn!("RRSetCrtcConfig apply failed: {e}");
+            log::warn!("{}", crtc_config_failure_log_message(publication, &e));
             // RRSetConfigFailed=3 (a status reply, not a protocol error).
             3
         }
     }
+}
+
+fn crtc_config_failure_log_message(
+    publication: CrtcConfigPublication,
+    error: &io::Error,
+) -> String {
+    format!(
+        "RRSetCrtcConfig apply failed: client {} #{} output {} mode {:?} position ({}, {}): {error}",
+        publication.client_id.0,
+        publication.sequence.0,
+        publication.output_id,
+        publication.requested_mode,
+        publication.x,
+        publication.y,
+    )
 }
 
 /// Build and send the 32-byte `SetCrtcConfig` reply.
@@ -70707,6 +70750,36 @@ mod tests {
         // Stripping AsyncMayTear must NOT strip Suboptimal (0x8) or Async (0x1).
         let opts = 0x1 | 0x8 | 0x10;
         assert_eq!(opts & !0x10u32, 0x1 | 0x8);
+    }
+
+    #[test]
+    fn crtc_config_failure_log_keeps_client_sequence_and_typed_cause() {
+        let publication = CrtcConfigPublication {
+            client_id: ClientId(17),
+            sequence: SequenceNumber(93),
+            output_id: 41,
+            requested_mode: Some(ModeSpec {
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+            }),
+            x: -7,
+            y: 11,
+            set_time: 0,
+            output_bbox_before: None,
+        };
+        let error = io::Error::other(
+            "output DP-1 mode Some(1920x1080@60) position (-7, 11) device 226:0 modeset 4 failed: KernelRejected { errno: 22 }",
+        );
+
+        let line = crtc_config_failure_log_message(publication, &error);
+
+        assert!(line.contains("client 17 #93"), "{line}");
+        assert!(line.contains("output 41"), "{line}");
+        assert!(line.contains("mode Some(ModeSpec"), "{line}");
+        assert!(line.contains("position (-7, 11)"), "{line}");
+        assert!(line.contains("device 226:0 modeset 4"), "{line}");
+        assert!(line.contains("KernelRejected { errno: 22 }"), "{line}");
     }
 
     #[test]

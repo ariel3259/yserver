@@ -67,6 +67,7 @@ pub enum StubBehaviour {
     AcceptDeclaringMissingFence,
     ReplyTwiceWith(i32),
     WedgedHoldingLock,
+    AcceptValidationThenNeverReply,
 }
 
 impl StubBehaviour {
@@ -124,6 +125,9 @@ impl StubBehaviour {
             Self::AcceptDeclaringMissingFence => "accept-declaring-missing-fence".to_string(),
             Self::ReplyTwiceWith(errno) => format!("reply-twice:{errno}"),
             Self::WedgedHoldingLock => "wedged-holding-lock".to_string(),
+            Self::AcceptValidationThenNeverReply => {
+                "accept-validation-then-never-reply".to_string()
+            }
         }
     }
 
@@ -221,6 +225,8 @@ impl StubBehaviour {
             errno_str.parse::<i32>().ok().map(Self::ReplyTwiceWith)
         } else if s == "wedged-holding-lock" {
             Some(Self::WedgedHoldingLock)
+        } else if s == "accept-validation-then-never-reply" {
+            Some(Self::AcceptValidationThenNeverReply)
         } else {
             None
         }
@@ -907,6 +913,29 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
+        }
+        StubBehaviour::AcceptValidationThenNeverReply => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::Accepted {
+                    correlation: req.correlation(),
+                    helper_duration_ns: 1_000_000,
+                    out_fence_mask: 0,
+                };
+                let frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &frame)?;
+            }
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+            Ok(())
         }
     }
 }

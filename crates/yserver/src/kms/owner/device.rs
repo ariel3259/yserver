@@ -381,6 +381,39 @@ impl<R> DeviceCommitOwner<R> {
         events
     }
 
+    /// Install the clock epoch created by a completed client modeset.
+    ///
+    /// A modeset changes one CRTC's clock domain but does not invalidate the
+    /// device's completion qualification: the modeset was itself admitted
+    /// using that qualification, and the new mode uses the same DRM object
+    /// and completion properties. Existing sequence arms for the replaced
+    /// epoch are retired; the new epoch starts unresolved and must be probed
+    /// before event-bearing work uses it.
+    pub(crate) fn install_modeset_clock_epoch(&mut self, key: ClockKey) {
+        assert_ne!(key.epoch.get(), 0, "modeset clock epoch is nonzero");
+        let (lifecycle, generation) = self.clock_context();
+        let old = self.clock_key_for_hardware_crtc(key.hardware_crtc);
+        if let Some(old) = old {
+            assert!(
+                self.pending_probe
+                    .as_ref()
+                    .is_none_or(|(pending, _, _)| *pending != old),
+                "modeset result crosses the owner boundary without its CRTC probe in flight"
+            );
+            self.sequence_arms.cancel_matching_clock(old);
+            self.clocks.remove(&old);
+        }
+        assert!(
+            self.last_clock_epoch
+                .get(&key.hardware_crtc)
+                .is_none_or(|last| key.epoch > *last),
+            "modeset clock epoch advances its hardware CRTC"
+        );
+        self.last_clock_epoch.insert(key.hardware_crtc, key.epoch);
+        self.clocks
+            .insert(key, CrtcClock::new(key, lifecycle, generation));
+    }
+
     pub fn invalidate_topology(&mut self, new_generation: u64) -> Vec<OwnerEvent<R>> {
         let was_qualified = matches!(
             self.qualification,

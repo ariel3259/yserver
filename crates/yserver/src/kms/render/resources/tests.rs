@@ -3253,6 +3253,7 @@ pub(crate) fn run_sink_gamma_gate_four_states(
     }];
     let output_key = crate::kms::backend::OutputKey::new(device_key, "gamma_test_output");
     let mut output = backend.platform.outputs.remove(0);
+    backend.platform.output_instance_ids.remove(0);
     let crtc = *device
         .resource_handles()
         .expect("drm resource handles on gamma test device")
@@ -3262,6 +3263,14 @@ pub(crate) fn run_sink_gamma_gate_four_states(
     output.key = output_key.clone();
     output.output.crtc = crtc;
     backend.platform.outputs.push(output);
+    let output_instance_id = backend
+        .platform
+        .allocate_output_instance_id(&output_key)
+        .expect("gamma test output instance");
+    backend
+        .platform
+        .output_instance_ids
+        .push(output_instance_id);
 
     [
         TransportState::Legacy,
