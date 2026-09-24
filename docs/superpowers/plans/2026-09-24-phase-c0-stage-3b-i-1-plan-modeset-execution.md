@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 2 (2026-09-24, coordinator)** — codex round 1
+(`../findings/2026-09-24-stage-3b-i-1-plan-review-round1.md`: 0 blocking, 3
+major, all verified): a DPMS change before dispatch supersedes, it does not
+re-prepare (M-1; design revision 9 corrects the same contradiction); late
+work binds to an output **instance**, not a key (M-2); a released seat is
+refused at begin for enable, change and disable (M-3).
+
 **Revision 1 (2026-09-24, coordinator).**
 
 **Goal:** an `RRSetCrtcConfig` that enables, changes the mode of, or disables
@@ -14,7 +21,7 @@ devices stay `Legacy` (C0-R8).
 
 **Authority** (read before Task 1):
 - Stage 3b design `docs/superpowers/specs/2026-09-24-phase-c0-stage-3b-modeset-and-randr-design.md`
-  revision 8, whole — this plan executes §3.1–§3.5, §4, §5.1 (same-device
+  revision 9, whole — this plan executes §3.1–§3.5, §4, §5.1 (same-device
   part), §6 and §8.1's matching evidence.
 - Stage 3a design `docs/superpowers/specs/2026-09-23-phase-c0-stage-3a-arbiter-and-dpms-design.md`
   revision 6 (§3.6 freshness and the result boundary, §3.7).
@@ -120,7 +127,12 @@ report with the reason each changes; no other assertion is weakened.
 ## Task 2 — the client-modeset slot and `TopologyWork`
 
 **Deliver:** design decision 3 and 4. The driver holds at most one client
-modeset per Owner device. It is **dispatched** only while the device is
+modeset per Owner device. **Before taking the slot**, the Owner begin path
+refuses every request form — enable, mode change, disable — while the seat is
+released (`vt_state` not `Active`): `Failed` with `SeatReleased`, no slot
+taken, nothing prepared, nothing parked *(rev 2, M-3)*. Today
+`begin_crtc_config` branches on `mode = None` before its VT check
+(`render/backend.rs:24429`); the Owner fork must not inherit that order. It is **dispatched** only while the device is
 `Owner ∧ Ready`, the arbiter has **no active transition**, and every clock
 Task 1 requires is ready. A second `begin` for a device whose slot is
 occupied answers `OwnerRefused(SlotOccupied)`. **Supersession** (design
@@ -141,6 +153,7 @@ source may be used, provided no production path can reach it.
 | `c0_3bi_modeset_waits_for_the_active_transition` | DPMS-off in flight (stub `NeverReply` until released), then a modeset begin: no modeset validation is sent until the DPMS transition's result is at the boundary | **E6** dispatch the modeset while a transition is active |
 | `c0_3bi_rec4_supersedes_before_dispatch` | modeset queued, a DPMS event arrives before dispatch: the modeset ends `Superseded(DPMS)` with no validation or live send, and the DPMS transition proceeds | **E7** let the queued modeset dispatch first |
 | `c0_3bi_rec4_waits_after_dispatch` | modeset dispatched (stub holds the reply), DPMS event arrives: the modeset is not cancelled; the DPMS transition's first send happens only after the modeset's reply crossed the boundary | **E8** cancel a dispatched modeset as never-submitted (design mutation 2) |
+| `c0_3bi_seat_released_refuses_every_form` | the seat released (`vt_state` suspended): enable, mode change and disable each answer `SeatReleased` at once, take no slot and send nothing; the idempotent form keeps Legacy's answer | **E9b** check the seat only on the enable path |
 | `c0_3bi_second_modeset_on_occupied_slot` | two begins on one device: the second answers `OwnerRefused(SlotOccupied)`, the first is untouched | **E9** replace the occupant |
 
 ## Task 3 — output state addressed by identity; the retired-output bundle
@@ -155,18 +168,25 @@ indexed by position in `platform.outputs`. After this task:
 - the scene rebuild used by the Owner modeset is **per output**
   (`rebuild_output(key, staged_state)`), never `rebuild_outputs` (which stays
   for Legacy);
+- every output **instance** — one `OutputSceneState` with its pool — carries
+  an `OutputInstanceId` (monotonic per device, never reused), assigned when
+  the state is built; a replacement under the same `OutputKey` gets a new
+  one *(rev 2, M-2)*;
 - a replaced or removed output's scene state and its old pool leave the
   indexed vectors together as a `RetiredOutputBundle { key: OutputKey,
-  retirement: RetirementId, scene: OutputSceneState, pool: OutputScanout }`
+  instance: OutputInstanceId, scene: OutputSceneState, pool: OutputScanout }`
   held on a per-device retirement list; every operation on it — deferred
   release polling (`drain_deferred_scene_resources`, `scene.rs:394`),
   owner-buffer displacement and leave (`retire_owner_displaced`, `:5062`),
   `KmsRelease` handling — has a bundle-addressed form, and the index form is
   never called for a retired output;
-- every asynchronous completion that today looks up output state by index
-  (composition submits, deferred releases; the copied completion path is
-  3b-i-2's) resolves through its job's identity to a kept output's
-  `OutputKey` or to its bundle; a completion routed to a bundle only services
+- every asynchronous job records the `OutputInstanceId` it was issued for,
+  and its completion (composition submits, deferred releases; the copied
+  completion path is 3b-i-2's) resolves **by that instance**: to the current
+  state if it is still that instance, otherwise to the bundle holding it —
+  never by index and never by `OutputKey` alone (today the completion carries
+  `job_id` and `output_key` and looks up the current output by key,
+  `render/scene.rs:4202`); a completion routed to a bundle only services
   proofs and never offers a generation or submits;
 - a bundle is destroyed only after every resource in it has its own proof;
   one whose proof never arrives stays on the list (the 2c-i teardown handoff
@@ -180,7 +200,8 @@ its whole-scene rebuild.
 | `c0_3bi_index_shift_keeps_other_outputs_vulkan` | three outputs on the Owner fixture; the middle one removed through the promotion helper: the third output's scene state and pool are the same objects (pointer/identity check) now at index 1, its pending acknowledgement and owner buffers intact | **E10** re-associate by index (design mutation 3) |
 | `c0_3bi_retired_bundle_waits_for_its_fence_vulkan` | an output with a deferred pool release behind an unsignalled fence is replaced: the slot is not freed until the fence signals, the ring outlives it, the new state never receives it | **E11** drop the replaced state at promotion (design mutation 17) |
 | `c0_3bi_retired_bundle_survives_index_shift_vulkan` | disable output A with an unsignalled deferred release, then B shifts into A's index: A's release is serviced from its bundle; nothing of B is touched | **E12** call an index-addressed helper for the retired output (design mutation 23) |
-| `c0_3bi_late_completion_routes_by_identity_vulkan` | a composition submit for output B completes after an index shift: it resolves to B by key; one for a retired output resolves to its bundle and offers nothing | **E13** resolve the completion by its recorded index (design mutation 25) |
+| `c0_3bi_late_completion_routes_by_identity_vulkan` | a composition submit for output B completes after an index shift: it resolves to B's current instance; one for a retired output resolves to its bundle and offers nothing | **E13** resolve the completion by its recorded index (design mutation 25) |
+| `c0_3bi_late_completion_across_same_key_replacements_vulkan` | output A replaced twice (two mode changes) while a job of the first instance is in flight: the current state and two bundles share A's key; the late completion services the first instance's bundle only, the second bundle and the current state are untouched | **E13b** resolve by `OutputKey` alone |
 
 ## Task 4 — the transaction description and the staged projection
 
@@ -200,8 +221,9 @@ its whole-scene rebuild.
   (active before or after; inactive-to-inactive excluded, no out-fence);
 - the **staged projection**: for an output the commit adds, its target is read
   from the coordinator's current global level and epoch (a pure read) at
-  preparation and recorded in the prepared set with that epoch; the freshness
-  check treats a change of the global DPMS epoch as stale.
+  preparation and recorded in the prepared set with that epoch. A DPMS event
+  after staging supersedes the modeset (Task 2); the freshness check also
+  compares the staged DPMS epoch as a defence.
 
 A refresh-only change (same size, different `vrefresh`) is a mode change.
 
@@ -209,7 +231,7 @@ A refresh-only change (same size, different `vrefresh`) is a mode change.
 | --- | --- | --- |
 | `c0_3bi_description_is_minimal` | two outputs on one device, mode change on the first: the property list names only the first output's connector, CRTC and primary plane | **E14** restate the other output |
 | `c0_3bi_modeset_under_dpms_off_is_dark` | global DPMS-off applied, then an enable of a disabled output: the description carries `ACTIVE=0` for its CRTC and the CRTC is not in `ExpectedCompletionCrtcs` | **E15** `ACTIVE=1` regardless of `dpms_target` (design mutation 4); **E16** stage the projection at promotion only (design mutation 28) |
-| `c0_3bi_dpms_change_after_staging_is_stale` | an enable staged under DPMS-off, then DPMS-on before dispatch: the entry is stale at the pre-dispatch check and the re-prepared description carries `ACTIVE=1` | **E17** skip the DPMS epoch in freshness |
+| `c0_3bi_dpms_change_after_staging_supersedes` | an enable staged under DPMS-off, then DPMS-on before dispatch: the modeset ends `Superseded(DPMS)`, its prepared set released, nothing dispatched with the stale target *(rev 2, M-1)* | **E17** let the staged modeset dispatch after the DPMS event |
 | `c0_3bi_disable_description` | a disable: connector, plane and CRTC cleared as listed, the CRTC in `ExpectedCompletionCrtcs` when it was lit | **E18** leave the primary plane attached |
 | `c0_3bi_refresh_only_change_is_a_modeset` | same `WxH`, different refresh: a new `MODE_ID` is described; the idempotency check does not fire | **E19** compare size only |
 
