@@ -1,8 +1,9 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 3 (codex rounds
-[1](../findings/2026-09-24-stage-3b-design-review-round1.md) and
-[2](../findings/2026-09-24-stage-3b-design-review-round2.md)), written by the
+**Status:** Revision 4 (codex rounds
+[1](../findings/2026-09-24-stage-3b-design-review-round1.md),
+[2](../findings/2026-09-24-stage-3b-design-review-round2.md) and
+[3](../findings/2026-09-24-stage-3b-design-review-round3.md)), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -304,8 +305,8 @@ order:
 
 1. **KMS-state promotion — infallible.** `platform.outputs` (enable, mode
    change or removal), the output's scanout pool (the new pool installed; the
-   **old pool retires only when completion evidence proves the kernel no
-   longer scans it**, C.0 §6.3 — never at promotion), the RANDR registry entry
+   **old pool is never released at promotion** — see "The old pool's release"
+   below), the RANDR registry entry
    (`config`, `crtc_associated`, `client_configured`, `connected`,
    `last_enabled` exactly as Legacy sets them), the root extent
    (`fb_w`/`fb_h` recomputed from every layout, as Legacy), the input extent,
@@ -321,6 +322,24 @@ order:
 All three steps move data only; none has a fallible call *(rev 2, round-1
 M-2)*. Other devices can therefore never resume against positions that do
 not match their outputs.
+
+**The old pool's release** *(rev 4, round-3 M-1)*. The modeset commit — a
+mode change or a disable — is the commit that **displaces** the old pool's
+framebuffers from the primary plane. It is handled by the rule 2c already
+applies to every displacing owner commit: at dispatch, each displaced
+allocation registers a `KmsRelease` obligation against that commit and CRTC
+(`ResourceService::register_kms`, `resources/mod.rs:998`), and the
+commit's `CompletionRetired` discharges it (as for the composed allocation a
+direct entry displaces, `backend.rs:54313`). That discharges **only** the KMS
+obligation: each allocation's GPU gate and Vulkan/FOREIGN return rules remain
+separate proofs (C.0 §10.2, COMMIT-2), serviced as today. A disable is not a
+special case: its commit sets the plane's `FB_ID` to zero, so it displaces
+the old framebuffer exactly as a flip to another one does. The device-level
+teardown that C.0 COMMIT-3 reserves for a blocking or fd-family barrier —
+proving that the CRTC and its whole pipeline are shut down — is not what
+releases a buffer, and a live disable does not claim it. If the commit ends
+`CompletionUnknown` the obligation is never discharged and the pool stays in
+the record's quarantine (section 6).
 
 ### 4.3. The value-dead reads
 
@@ -547,6 +566,20 @@ reached the gate before `t` and is therefore terminal by `t + Q + E`, so the
 synchronous one executes by then. Worst case about 30 + 95 s. Each stage and
 `Q` are tested separately (section 8.2).
 
+**A synchronous Legacy mutation stops the clock** *(rev 4, round-3 B-1)*. A
+Legacy mutation runs on the core loop (`apply_crtc_config`, with its
+blocking quiesce), and while it runs no timer — `Q` included — can be
+serviced, for any client. That is Legacy's existing behaviour, which C.0
+does not change for a Legacy device. The gate therefore services every
+queued deadline **on the first loop iteration after** a synchronous
+mutation returns, before admitting the next waiter, and the stated bound for
+a request queued behind one gains `L`, the duration of the synchronous
+Legacy executions ahead of it (bounded by Legacy's own blocking calls:
+`wait_idle_bounded`, the 1 s event drain, the kernel's blocking commit).
+`L = 0` on a server with no Legacy device, so the Owner-only bound is
+`Q + E`. The mixed-server case is part of stage 5's characterization of the
+mixed server (umbrella §6).
+
 **Named exception — `GateExpired`.** Legacy would have executed a request
 that waited behind a slow one (it blocks the whole core loop while it
 modesets), answering whatever its validation and execution decided —
@@ -616,6 +649,11 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
 - **`EBUSY`:** no retry, readiness closed, evidence recorded.
 - **Unflip handoff:** each unflip outcome (retired, rejected, unknown) reaches
   the parked modeset.
+- **Old pool release:** after a disable and after a mode change, each old pool
+  allocation holds a `KmsRelease` against the modeset commit, survives
+  acceptance, is discharged only by that commit's `CompletionRetired`, and is
+  destroyed only once its GPU/FOREIGN proofs also hold; under
+  `CompletionUnknown` it stays quarantined.
 - **Two devices:** a modeset on A issues zero lifecycle commits on B and B's
   in-flight composed commits complete; enabling/removing an output shifts
   indices without moving B's buffers; A in direct plus an enable on B
@@ -640,7 +678,10 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   validation outcome answers `Failed` either way; a malformed one still gets
   its stateless error; a synchronous mutation behind it is not expired); FIFO admission order at the gate; the VT
   released; a requester-less mutation from the test producer, including the
-  section 7.5 supersession sequence. Identical except the named exceptions.
+  section 7.5 supersession sequence; the mixed-server three-request sequence
+  (Owner A in flight, Legacy B and Owner C queued, B stalled past C's `Q`: C
+  is answered on the first iteration after B returns, before any later
+  waiter is admitted). Identical except the named exceptions.
 - **Hardware:** the 3b-i sequences driven by an in-test protocol client
   (C.0 §18 forbids an environment flag selecting the Owner, so real `xrandr`,
   MATE and CS2 are stage 5's layer-3 battery).
@@ -672,6 +713,10 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
     freed before its fence → the scene-retirement test fails.
 18. `Q` expiry running state-dependent validation → the expiry case with a
     predecessor that changes the outcome fails.
+19. A displaced old pool released at acceptance or at promotion, or with no
+    `KmsRelease` registered → the old-pool test fails.
+20. Queued deadlines not serviced before the next admission after a
+    synchronous mutation → the mixed-server sequence fails.
 15. A `REC-4` event held at the gate → the section 7.5 sequence fails.
 16. Gate admission in ready-ring order instead of arrival order, or `Q`
     applied to a synchronous mutation → the gate cases fail.
