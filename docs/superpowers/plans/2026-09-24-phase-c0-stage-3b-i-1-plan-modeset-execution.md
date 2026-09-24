@@ -2,6 +2,9 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware test of Task 9 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 5 (2026-09-24, coordinator)** — Task 4 review: the one-CRTC
+description requires preparation to keep a bound output's CRTC (Task 5).
+
 **Revision 4 (2026-09-24, coordinator)** — second Task 2 F8: "never
 dispatched while a transition is active" is enforced in depth — the queue
 guard, the dispatch guard, the admission's single topology intent and the
@@ -269,6 +272,17 @@ scene state; it is released **exactly once** on every non-installing end
 explicit commit rejection) and never while installable. A device with a
 current direct frame answers `OwnerRefused(NotYetSupported(DirectActive))`
 before allocating (3b-i-2 replaces this with the unflip precondition).
+
+*(Rev 5, coordinator, from the Task 4 review.)* The Task 4 builder
+(`render/client_modeset.rs`) describes **one** CRTC. For a mode change or
+re-enable of an output that is currently bound to a CRTC, preparation must
+keep that CRTC and its primary plane (discovery reserves the device's
+**other** outputs' routes only); if discovery would select a different CRTC
+for an output that is bound, the request answers
+`Preparation(Route)` rather than build a commit that leaves the old CRTC
+active without a connector. Test `c0_3bi_mode_change_keeps_the_bound_crtc`:
+a mode change of a lit output describes the same CRTC and plane it was bound
+to; mutation **E23b** let discovery move a bound output to another CRTC.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |

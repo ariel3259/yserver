@@ -62178,7 +62178,15 @@ mod tests {
     fn c0_3bi_client_modeset_backend(
         behaviour: crate::kms::executor::test_support::StubBehaviour,
     ) -> (super::KmsBackend, DrmDeviceKey, u32, String) {
-        let (mut backend, device) = lifecycle_dpms_backend(behaviour);
+        c0_3bi_client_modeset_backend_with_output_count(behaviour, 1)
+    }
+
+    fn c0_3bi_client_modeset_backend_with_output_count(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+        output_count: usize,
+    ) -> (super::KmsBackend, DrmDeviceKey, u32, String) {
+        let (mut backend, device) =
+            lifecycle_dpms_backend_with_output_count(behaviour, output_count);
         let output_key = backend
             .platform
             .outputs
@@ -62305,6 +62313,300 @@ mod tests {
             height: 768,
             vrefresh: 75,
         }
+    }
+
+    fn c0_3bi_pending_client_description(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> &crate::kms::owner::build::CommitDescription {
+        backend.lifecycle_drivers[&device]
+            .pending_client_modeset_description_for_tests()
+            .expect("client modeset description is held through TEST_ONLY")
+    }
+
+    fn c0_3bi_description_property(
+        description: &crate::kms::owner::build::CommitDescription,
+        object: u32,
+        property: u32,
+    ) -> Option<u64> {
+        description
+            .objects
+            .iter()
+            .find(|entry| entry.object == object)
+            .and_then(|entry| {
+                entry
+                    .props
+                    .iter()
+                    .find(|(id, _)| *id == property)
+                    .map(|(_, value)| *value)
+            })
+    }
+
+    #[test]
+    fn c0_3bi_description_is_minimal() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend_with_output_count(StubBehaviour::NeverReply, 2);
+        let first_crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let second_crtc = u32::from(backend.platform.outputs[1].output.crtc);
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(c0_3bi_changed_mode()),
+        );
+        let description = c0_3bi_pending_client_description(&backend, device);
+
+        assert_eq!(description.objects.len(), 3);
+        assert_eq!(
+            description.objects[0].kind,
+            crate::kms::owner::closure::ObjectKind::Connector
+        );
+        assert_eq!(
+            description.objects[1].kind,
+            crate::kms::owner::closure::ObjectKind::Crtc
+        );
+        assert_eq!(description.objects[1].object, first_crtc);
+        assert_eq!(
+            description.objects[2].kind,
+            crate::kms::owner::closure::ObjectKind::Plane
+        );
+        assert!(
+            !description
+                .objects
+                .iter()
+                .any(|object| object.object == second_crtc),
+            "the other output's connector, CRTC and primary plane stay omitted"
+        );
+        assert_eq!(
+            description
+                .crtc_state
+                .iter()
+                .map(|power| power.crtc_id)
+                .collect::<Vec<_>>(),
+            vec![first_crtc]
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(token)
+        );
+    }
+
+    #[test]
+    fn c0_3bi_modeset_under_dpms_off_is_dark() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        let _off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        backend.client_modeset_description_source_for_tests = true;
+
+        let disabled_key = OutputKey::new(device, "disabled-before");
+        let output_id = backend.randr_id_alloc.ids_for(&disabled_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, disabled_key.clone());
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &disabled_key.connector_name,
+            Some(c0_3bi_changed_mode()),
+        );
+        let description = c0_3bi_pending_client_description(&backend, device);
+        let crtc = description
+            .objects
+            .iter()
+            .find(|object| object.kind == crate::kms::owner::closure::ObjectKind::Crtc)
+            .expect("target CRTC row");
+        assert_eq!(
+            c0_3bi_description_property(description, crtc.object, description.property_ids.active),
+            Some(0),
+            "an output added under global DPMS-off is installed dark"
+        );
+        assert_eq!(
+            description.crtc_state,
+            vec![crate::kms::owner::closure::CrtcPower {
+                crtc_id: crtc.object,
+                old_active: false,
+                new_active: false,
+            }]
+        );
+        let closure = crate::kms::owner::closure::AtomicCrtcClosure::compute(
+            &description.objects,
+            &description.crtc_state,
+            &description.property_ids,
+            false,
+            &[],
+        )
+        .expect("dark enable has a valid closure");
+        assert!(
+            closure.expected_completion().is_empty(),
+            "inactive-to-inactive target is outside ExpectedCompletionCrtcs"
+        );
+        let staged = backend.lifecycle_drivers[&device]
+            .pending_client_modeset_projection_for_tests()
+            .expect("the DPMS projection is staged before validation");
+        assert_eq!(staged.output, disabled_key);
+        assert_eq!(staged.level, 3);
+        assert_eq!(staged.target, crate::kms::owner::lifecycle::DpmsTarget::Off);
+        assert_eq!(staged.epoch, backend.lifecycle_coordinator.dpms_epoch());
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(token)
+        );
+    }
+
+    #[test]
+    fn c0_3bi_dpms_change_after_staging_supersedes() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        let _off_commit = c0_3bi_begin_dpms_transition(&mut backend, device, 3);
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        backend.client_modeset_description_source_for_tests = true;
+
+        let disabled_key = OutputKey::new(device, "disabled-before");
+        let output_id = backend.randr_id_alloc.ids_for(&disabled_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, disabled_key.clone());
+        c0_3aii_replace_owner_executor(
+            &mut backend,
+            StubBehaviour::AcceptAfter(std::time::Duration::from_millis(400)),
+        );
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            output_id,
+            &disabled_key.connector_name,
+            Some(c0_3bi_changed_mode()),
+        );
+        let staged = backend.lifecycle_drivers[&device]
+            .pending_client_modeset_projection_for_tests()
+            .expect("off projection staged before TEST_ONLY reply");
+        assert_eq!(staged.target, crate::kms::owner::lifecycle::DpmsTarget::Off);
+        assert_eq!(
+            c0_3bi_description_property(
+                c0_3bi_pending_client_description(&backend, device),
+                u32::from(backend.platform.outputs[0].output.crtc),
+                21,
+            ),
+            Some(0)
+        );
+
+        Backend::set_dpms_power(&mut backend, 0).expect("DPMS-on supersedes staged modeset");
+        let (validation_sends, live_sends) =
+            backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation_sends.len(), 1);
+        assert!(
+            live_sends.is_empty(),
+            "no stale-target live modeset was sent"
+        );
+
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let (validation_sends, live_sends) =
+            backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation_sends.len(), 1);
+        assert!(
+            live_sends.is_empty(),
+            "a late TEST_ONLY success cannot dispatch the staged dark target"
+        );
+        assert!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("superseded mode result")
+                .to_string()
+                .contains("Superseded(DPMS)")
+        );
+        let (validation_sends, live_sends) =
+            backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert_eq!(validation_sends.len(), 1);
+        assert!(live_sends.is_empty(), "late TEST_ONLY success stays stale");
+    }
+
+    #[test]
+    fn c0_3bi_disable_description() {
+        use crate::kms::{executor::test_support::StubBehaviour, owner::closure::ObjectKind};
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, None);
+        let description = c0_3bi_pending_client_description(&backend, device);
+        let connector_row = description
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Connector)
+            .expect("target connector row");
+        let crtc_row = description
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Crtc)
+            .expect("target CRTC row");
+        let plane_row = description
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Plane)
+            .expect("target primary plane row");
+        assert_eq!(connector_row.props, vec![(23, 0)]);
+        assert_eq!(crtc_row.props, vec![(24, 0), (21, 0)]);
+        assert_eq!(plane_row.props, vec![(19, 0), (20, 0)]);
+        assert_eq!(
+            description.crtc_state,
+            vec![crate::kms::owner::closure::CrtcPower {
+                crtc_id: crtc_row.object,
+                old_active: true,
+                new_active: false,
+            }]
+        );
+        let closure = crate::kms::owner::closure::AtomicCrtcClosure::compute(
+            &description.objects,
+            &description.crtc_state,
+            &description.property_ids,
+            false,
+            &[],
+        )
+        .expect("disable closure");
+        assert_eq!(closure.expected_completion(), &[crtc_row.object]);
+    }
+
+    #[test]
+    fn c0_3bi_refresh_only_change_is_a_modeset() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device, output_id, connector) =
+            c0_3bi_client_modeset_backend(StubBehaviour::NeverReply);
+        let refresh_only = yserver_core::backend::ModeSpec {
+            width: backend.platform.outputs[0].width,
+            height: backend.platform.outputs[0].height,
+            vrefresh: backend.platform.outputs[0].output.picked.vrefresh + 15,
+        };
+        let token =
+            c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(refresh_only));
+        let description = c0_3bi_pending_client_description(&backend, device);
+        let crtc = description
+            .objects
+            .iter()
+            .find(|object| object.kind == crate::kms::owner::closure::ObjectKind::Crtc)
+            .expect("modeset CRTC row");
+        assert_eq!(
+            c0_3bi_description_property(description, crtc.object, 24),
+            Some(0x7300_0001),
+            "the different refresh receives a new MODE_ID blob"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(token),
+            "same dimensions with a different refresh are not idempotent"
+        );
     }
 
     #[test]

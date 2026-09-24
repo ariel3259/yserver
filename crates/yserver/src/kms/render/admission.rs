@@ -33,6 +33,7 @@ use crate::{
             backend::{
                 DirectEligibility, KmsBackend, PreparedDirectDispatch, effective_refresh_matches,
             },
+            client_modeset::{PreparedClientModesetDescription, StagedDpmsProjection},
             platform::CrtcKey,
             resources::{
                 CommitResources, GroupMember, ResourceError, register_commit_dependencies,
@@ -41,6 +42,12 @@ use crate::{
         },
     },
     platform::drm::DrmDeviceKey,
+};
+
+#[cfg(test)]
+use crate::kms::render::client_modeset::{
+    ClientModesetDescriptionInput, ClientModesetObjects, ClientModesetOperation,
+    ClientModesetPropertyIds, build_client_modeset_description, stage_dpms_projection,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -332,6 +339,7 @@ struct PendingClientModesetValidation {
     decision: AdmissionDecision,
     token: Option<AdmissionToken>,
     description: CommitDescription,
+    staged_projection: Option<StagedDpmsProjection>,
     sent: bool,
     cancelled: bool,
 }
@@ -532,6 +540,26 @@ impl LifecycleDriver {
             self.client_validation_sends.clone(),
             self.client_live_sends.clone(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_client_modeset_description_for_tests(
+        &self,
+    ) -> Option<&CommitDescription> {
+        self.pending_client_modeset_validations
+            .values()
+            .next()
+            .map(|pending| &pending.description)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_client_modeset_projection_for_tests(
+        &self,
+    ) -> Option<StagedDpmsProjection> {
+        self.pending_client_modeset_validations
+            .values()
+            .next()
+            .and_then(|pending| pending.staged_projection.clone())
     }
 
     #[cfg(test)]
@@ -1313,6 +1341,18 @@ impl KmsBackend {
                 })
     }
 
+    fn client_modeset_projection_current(
+        &self,
+        device: DrmDeviceKey,
+        projection: Option<&StagedDpmsProjection>,
+    ) -> bool {
+        projection.is_none_or(|projection| {
+            projection.output.device_key == device
+                && self.lifecycle_coordinator.protocol_dpms_level() == projection.level
+                && self.lifecycle_coordinator.dpms_epoch() == projection.epoch
+        })
+    }
+
     fn lifecycle_superseding_kind(
         &self,
         device: DrmDeviceKey,
@@ -1466,7 +1506,7 @@ impl KmsBackend {
         &mut self,
         device: DrmDeviceKey,
         tag: ClientModesetTag<IncarnationId>,
-    ) -> Result<CommitDescription, String> {
+    ) -> Result<PreparedClientModesetDescription, String> {
         let request = self
             .lifecycle_drivers
             .get(&device)
@@ -1485,32 +1525,105 @@ impl KmsBackend {
         if request.0 == 0 || request.1.is_empty() {
             return Err("client modeset test source received an invalid request".to_string());
         }
-        let _requested_mode_and_origin = request
+
+        let output_key = crate::kms::backend::OutputKey::new(device, request.1.clone());
+        let global_level = self.lifecycle_coordinator.protocol_dpms_level();
+        let global_epoch = self.lifecycle_coordinator.dpms_epoch();
+        let device_desired = self
+            .lifecycle_coordinator
+            .device(&device)
+            .ok_or_else(|| "lifecycle device has no output projection".to_string())?
+            .desired();
+        if let Some(current) = device_desired.dpms_targets().get(&output_key)
+            && (current.level != global_level || current.epoch.unwrap_or(0) != global_epoch)
+        {
+            return Err("client modeset DPMS projection is not current".to_string());
+        }
+        let projection = request
             .2
-            .map(|mode| (mode.width, mode.height, mode.vrefresh, request.3, request.4));
-        let enables_inactive_output = request.2.is_some()
-            && !self.platform.outputs.iter().any(|output| {
+            .map(|_| {
+                stage_dpms_projection(output_key, global_level, global_epoch)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+
+        // This test source supplies only inert object/property identities and
+        // a fixture framebuffer. Production preparation will supply these
+        // values after Task 5 discovers the route and owns the new resources.
+        let (anchor_index, anchor) = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(_, output)| {
                 output.key.device_key == device && output.key.connector_name == request.1
-            });
-        let mut description = self.lifecycle_topology_description(device)?;
-        if enables_inactive_output {
-            // Task 2 needs a clock-free enable case before production client
-            // descriptions land in Task 4. Reuse the fixture's serialized
-            // CRTC object, but model its old power as Off and the requested
-            // power as On; no old CRTC clock belongs to this test request.
-            for crtc in &mut description.crtc_state {
-                crtc.old_active = false;
-                crtc.new_active = true;
-            }
-            for object in &mut description.objects {
-                for (property, value) in &mut object.props {
-                    if *property == description.property_ids.active {
-                        *value = 1;
-                    }
+            })
+            .or_else(|| {
+                self.platform
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, output)| output.key.device_key == device)
+            })
+            .ok_or_else(|| "client modeset test source has no fixture CRTC".to_string())?;
+        let crtc = u32::from(anchor.output.crtc);
+        let configured = anchor.key.connector_name == request.1;
+        let old_crtc_id = if configured { crtc } else { 0 };
+        let objects = ClientModesetObjects {
+            connector: 0x7000_0000 | (request.0 & 0x0fff_ffff),
+            crtc,
+            primary_plane: 0x7200_0000
+                | u32::try_from(anchor_index)
+                    .map_err(|_| "client modeset fixture output index overflow".to_string())?,
+            old_crtc_id,
+        };
+        let properties = ClientModesetPropertyIds {
+            connector_crtc_id: 23,
+            crtc_mode_id: 24,
+            plane_fb_id: 19,
+            plane_crtc_id: 20,
+            plane_src_x: 31,
+            plane_src_y: 32,
+            plane_src_w: 33,
+            plane_src_h: 34,
+            plane_crtc_x: 35,
+            plane_crtc_y: 36,
+            plane_crtc_w: 37,
+            plane_crtc_h: 38,
+            common: crate::kms::owner::closure::PropertyIds {
+                crtc_id: 20,
+                active: 21,
+                out_fence_ptr: 22,
+            },
+        };
+        let operation = match (request.2, projection) {
+            (Some(mode), Some(projection)) => {
+                let framebuffer: ::drm::control::framebuffer::Handle =
+                    ::drm::control::from_u32(0xface).expect("nonzero fixture framebuffer handle");
+                ClientModesetOperation::Configure {
+                    width: mode.width,
+                    height: mode.height,
+                    framebuffer: u32::from(framebuffer),
+                    mode_blob: 0x7300_0001,
+                    projection,
                 }
             }
-        }
-        Ok(description)
+            (None, None) => ClientModesetOperation::Disable,
+            _ => return Err("client modeset test source has inconsistent operation".to_string()),
+        };
+        let old_active = configured
+            && self
+                .owner_dpms_installed_active
+                .get(&device)
+                .copied()
+                .unwrap_or(true);
+        build_client_modeset_description(ClientModesetDescriptionInput {
+            objects,
+            properties,
+            old_active,
+            operation,
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn lifecycle_topology_description(
@@ -2029,7 +2142,7 @@ impl KmsBackend {
         }
 
         #[cfg(test)]
-        let description = if self.client_modeset_description_source_for_tests {
+        let prepared = if self.client_modeset_description_source_for_tests {
             self.lifecycle_client_modeset_description_for_tests(device, tag)
                 .map_err(std::io::Error::other)
         } else {
@@ -2039,18 +2152,20 @@ impl KmsBackend {
             ))
         };
         #[cfg(not(test))]
-        let description: std::io::Result<CommitDescription> = Err(std::io::Error::new(
+        let prepared: std::io::Result<PreparedClientModesetDescription> = Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             ClientModesetFailure::OwnerRefused(ClientModesetRefusal::NotYetSupported),
         ));
-        let description = match description {
-            Ok(description) => description,
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.admission_abort(device, token);
                 self.lifecycle_complete_client_modeset_without_dispatch(device, tag, Err(error));
                 return AdmissionOutcome::PreparationRefused;
             }
         };
+        let description = prepared.description;
+        let staged_projection = prepared.staged_projection;
         let required_clock_crtcs = description
             .crtc_state
             .iter()
@@ -2125,12 +2240,15 @@ impl KmsBackend {
                     decision,
                     token: Some(token),
                     description,
+                    staged_projection: staged_projection.clone(),
                     sent: false,
                     cancelled: false,
                 },
             );
         }
-        if !self.client_modeset_tag_current(device, tag) {
+        if !self.client_modeset_tag_current(device, tag)
+            || !self.client_modeset_projection_current(device, staged_projection.as_ref())
+        {
             if let Some(owner) = self.platform.owner_for(device) {
                 let _ = owner.abandon_validation(validation_commit);
             }
@@ -2306,7 +2424,10 @@ impl KmsBackend {
             return;
         };
         let tag = pending.tag;
-        if pending.cancelled || !self.client_modeset_tag_current(device, tag) {
+        if pending.cancelled
+            || !self.client_modeset_tag_current(device, tag)
+            || !self.client_modeset_projection_current(device, pending.staged_projection.as_ref())
+        {
             if let Some(owner) = self.platform.owner_for(device) {
                 let _ = owner.abandon_validation(validation_commit);
             }
@@ -2369,6 +2490,7 @@ impl KmsBackend {
     ) {
         let tag = pending.tag;
         if !self.client_modeset_tag_current(device, tag)
+            || !self.client_modeset_projection_current(device, pending.staged_projection.as_ref())
             || self
                 .lifecycle_coordinator
                 .device(&device)
@@ -2518,7 +2640,9 @@ impl KmsBackend {
             );
             return;
         }
-        if !self.client_modeset_tag_current(device, tag) {
+        if !self.client_modeset_tag_current(device, tag)
+            || !self.client_modeset_projection_current(device, pending.staged_projection.as_ref())
+        {
             if let Some(owner) = self.platform.owner_for(device) {
                 let _ = owner.cancel_live(commit);
             }
