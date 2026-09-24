@@ -20689,9 +20689,10 @@ impl KmsBackend {
         })
     }
 
-    /// Install one unresolved clock for every currently served Owner CRTC
-    /// when a conductor is activated. This is independent of the RANDR
-    /// projection; a later first projection adopts these same epochs.
+    /// Install unresolved clocks for every currently served Owner CRTC when a
+    /// conductor is activated. Dark CRTCs keep their epoch unresolved until a
+    /// later lighting promotion activates its probe. This is independent of
+    /// the RANDR projection; a later first projection adopts these epochs.
     pub(crate) fn activate_admission_clock_probes(&mut self, device: DrmDeviceKey) {
         if !self.admission_conductors.contains_key(&device) {
             return;
@@ -20803,6 +20804,10 @@ impl KmsBackend {
             else {
                 return;
             };
+            if !self.owner_outputs_powered_on(device) {
+                self.remove_waiting_clock_probe(device, key);
+                continue;
+            }
             let promotion = {
                 let Some(kms_device) = self
                     .platform
@@ -61877,6 +61882,347 @@ mod tests {
                 source: yserver_core::backend::PresentClockSource::IdleSequence,
             },
         );
+    }
+
+    fn c0_3bi_install_fresh_clock_epoch(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::clock::ClockKey {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device)
+            .expect("Owner output");
+        let hardware_crtc =
+            u32::from(CrtcKey::for_output(&backend.platform.outputs[output_idx]).crtc);
+        bind_test_randr_crtc(backend, output_idx, 0x3b01);
+        let previous = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .expect("fixture clock");
+        assert!(
+            backend
+                .platform
+                .owner_for(device)
+                .expect("Owner")
+                .invalidate_clock(previous)
+                .is_empty(),
+            "no probe is in flight while replacing the fixture epoch"
+        );
+        backend.refresh_present_crtc_clock_epochs();
+        let current = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner")
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .expect("fresh production clock epoch");
+        assert!(current.epoch > previous.epoch);
+        current
+    }
+
+    fn c0_3bi_install_unprobed_clock_epoch(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> crate::kms::owner::clock::ClockKey {
+        let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+        let owner = backend.platform.owner_for(device).expect("Owner");
+        let previous = owner
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .expect("fixture clock");
+        assert!(owner.invalidate_clock(previous).is_empty());
+        let (lifecycle, generation) = owner.clock_context();
+        let epoch = owner.next_clock_epoch_after(hardware_crtc, 1);
+        let current = crate::kms::owner::clock::ClockKey {
+            hardware_crtc,
+            epoch,
+        };
+        backend
+            .platform
+            .owner_for(device)
+            .expect("Owner")
+            .install_clock(current, lifecycle, generation)
+            .expect("fresh unresolved clock epoch");
+        current
+    }
+
+    fn c0_3bi_begin_dpms_transition(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        level: u8,
+    ) -> crate::kms::owner::identity::CommitId {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (validation_before, live_before, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        Backend::set_dpms_power(backend, level).expect("Owner DPMS request");
+        let (validation_after, ..) = backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(
+            validation_after.len(),
+            validation_before.len() + 1,
+            "lifecycle validation proceeds without waiting for a dark CRTC clock"
+        );
+        wait_executor_readable_for_tests(backend, std::time::Duration::from_secs(5));
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+
+        let (_, live_after, ..) = backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(
+            live_after.len(),
+            live_before.len() + 1,
+            "validated lifecycle commit is dispatched exactly once"
+        );
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("validated DPMS topology must dispatch")
+            .commit_id();
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        commit
+    }
+
+    fn c0_3bi_complete_dpms_transition(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        post_completion_executor: crate::kms::executor::test_support::StubBehaviour,
+    ) {
+        let completion = backend.complete_owner_for_tests(0);
+        c0_3aii_replace_owner_executor(backend, post_completion_executor);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+    }
+
+    #[test]
+    fn c0_3bi_dark_crtc_needs_no_clock_to_light() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        c0_3aii_apply_dpms_transition(&mut backend, device, 3);
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&false)
+        );
+
+        let key = c0_3bi_install_fresh_clock_epoch(&mut backend, device);
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::Unresolved);
+        assert_eq!(clock.probe, ProbeState::NotStarted);
+        assert!(
+            !backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .has_clock_probe_in_flight()
+        );
+
+        let commit = c0_3bi_begin_dpms_transition(&mut backend, device, 0);
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::Unresolved);
+        assert_eq!(clock.probe, ProbeState::NotStarted);
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .map(|record| record.commit_id()),
+            Some(commit),
+            "the dark-to-lit lifecycle commit is live before any clock probe"
+        );
+
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::NeverReply);
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn c0_3bi_lit_crtc_still_waits_for_its_clock() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::AcceptCallsWith(303));
+        let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+        let key = c0_3bi_install_unprobed_clock_epoch(&mut backend, device);
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(key)
+                .unwrap()
+                .probe,
+            ProbeState::NotStarted
+        );
+        assert!(
+            !backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .has_clock_probe_in_flight()
+        );
+
+        let (validation_before, live_before, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        Backend::set_dpms_power(&mut backend, 3).expect("DPMS off request");
+        let tag = lifecycle_test_tag(&backend, device);
+        let (validation_waiting, live_waiting, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(validation_waiting, validation_before);
+        assert_eq!(live_waiting, live_before);
+
+        backend.activate_admission_clock_probes(device);
+        assert!(matches!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(key)
+                .unwrap()
+                .probe,
+            ProbeState::InFlight(_)
+        ));
+        let (validation_waiting, live_waiting, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(validation_waiting, validation_before);
+        assert_eq!(live_waiting, live_before);
+
+        for _ in 0..4 {
+            let (_, live_sends, ..) = backend.lifecycle_drivers[&device].topology_test_stats();
+            if live_sends.iter().filter(|sent| **sent == tag).count() == 1 {
+                break;
+            }
+            wait_lifecycle_executor_readable(&backend, device);
+            Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        }
+
+        let (validation_sends, live_sends, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(
+            validation_sends.iter().filter(|sent| **sent == tag).count(),
+            1
+        );
+        assert_eq!(live_sends.iter().filter(|sent| **sent == tag).count(), 1);
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        let current_key = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .unwrap();
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(current_key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::KernelSequence);
+        assert_eq!(clock.probe, ProbeState::Succeeded);
+    }
+
+    #[test]
+    fn c0_3bi_no_probe_to_an_inactive_crtc() {
+        use crate::kms::{
+            executor::{ObservedOutcome, test_support::StubBehaviour},
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        c0_3aii_apply_dpms_transition(&mut backend, device, 3);
+        let _ = backend.drained_host_call_events_for_tests();
+        let key = c0_3bi_install_fresh_clock_epoch(&mut backend, device);
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::Unresolved);
+        assert_eq!(clock.probe, ProbeState::NotStarted);
+        assert!(
+            !backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .has_clock_probe_in_flight()
+        );
+        assert!(backend.drained_host_call_events_for_tests().is_empty());
+
+        let commit = c0_3bi_begin_dpms_transition(&mut backend, device, 0);
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(key)
+                .unwrap()
+                .probe,
+            ProbeState::NotStarted,
+            "the unresolved epoch remains unprobed until DPMS-on completes"
+        );
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .map(|record| record.commit_id()),
+            Some(commit)
+        );
+        c0_3bi_complete_dpms_transition(&mut backend, device, StubBehaviour::AcceptProbeWith(304));
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+        assert!(matches!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(key)
+                .unwrap()
+                .probe,
+            ProbeState::InFlight(_)
+        ));
+
+        wait_lifecycle_executor_readable(&backend, device);
+        Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let observations = backend.drained_host_call_events_for_tests();
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| matches!(
+                    observation.kind,
+                    ObservedOutcome::ProbeAccepted { sequence: 304 }
+                ))
+                .count(),
+            1,
+            "DPMS-on completion sends exactly one probe for the newly lit epoch"
+        );
+        let clock = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock(key)
+            .unwrap();
+        assert_eq!(clock.source, ClockSource::KernelSequence);
+        assert_eq!(clock.probe, ProbeState::Succeeded);
     }
 
     fn c0_3aii_compose_from_scene(backend: &mut super::KmsBackend, output_idx: usize) {

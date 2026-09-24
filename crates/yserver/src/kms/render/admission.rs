@@ -1203,16 +1203,16 @@ impl KmsBackend {
     fn lifecycle_clock_readiness(
         &self,
         device: DrmDeviceKey,
-        expected_crtcs: &[u32],
+        required_clock_crtcs: &[u32],
     ) -> LifecycleClockReadiness {
         let Some(owner) = self.platform.owner_ref(device) else {
             return LifecycleClockReadiness::Missing(
-                expected_crtcs.first().copied().unwrap_or_default(),
+                required_clock_crtcs.first().copied().unwrap_or_default(),
             );
         };
         let (lifecycle, generation) = owner.clock_context();
         let mut clocks = BTreeMap::new();
-        for &crtc in expected_crtcs {
+        for &crtc in required_clock_crtcs {
             let Some(key) = owner.clock_key_for_hardware_crtc(crtc) else {
                 return LifecycleClockReadiness::Missing(crtc);
             };
@@ -1384,13 +1384,13 @@ impl KmsBackend {
                 return AdmissionOutcome::PreparationRefused;
             }
         };
-        let expected_crtcs = description
+        let required_clock_crtcs = description
             .crtc_state
             .iter()
-            .filter(|state| state.old_active || state.new_active)
+            .filter(|state| state.old_active)
             .map(|state| state.crtc_id)
             .collect::<Vec<_>>();
-        match self.lifecycle_clock_readiness(device, &expected_crtcs) {
+        match self.lifecycle_clock_readiness(device, &required_clock_crtcs) {
             LifecycleClockReadiness::Ready(_) => {}
             LifecycleClockReadiness::Waiting => {
                 self.admission_abort(device, token);
@@ -1697,7 +1697,14 @@ impl KmsBackend {
             .filter(|state| state.old_active || state.new_active)
             .map(|state| state.crtc_id)
             .collect::<Vec<_>>();
-        let clocks = match self.lifecycle_clock_readiness(device, &expected_crtcs) {
+        let required_clock_crtcs = pending
+            .description
+            .crtc_state
+            .iter()
+            .filter(|state| state.old_active)
+            .map(|state| state.crtc_id)
+            .collect::<Vec<_>>();
+        let clocks = match self.lifecycle_clock_readiness(device, &required_clock_crtcs) {
             LifecycleClockReadiness::Ready(clocks) => clocks,
             LifecycleClockReadiness::Waiting => {
                 if let Some(owner) = self.platform.owner_for(device) {
@@ -1997,6 +2004,8 @@ impl KmsBackend {
             .get_mut(&device)
             .and_then(|driver| driver.topology_dpms_active.remove(&commit));
         if let Some(installed_active) = installed_dpms_active {
+            let activate_clock_probes =
+                installed_active && matches!(&terminal, TerminalState::Completed);
             match &terminal {
                 TerminalState::Completed => {
                     self.owner_dpms_installed_active
@@ -2010,6 +2019,9 @@ impl KmsBackend {
                 TerminalState::FailedBeforeSubmit(_) => {}
             }
             self.update_resource_service_activity();
+            if activate_clock_probes {
+                self.activate_admission_clock_probes(device);
+            }
         }
         let current = self.lifecycle_tag_current(device, tag);
         #[cfg(test)]

@@ -1364,7 +1364,7 @@ impl<R> DeviceCommitOwner<R> {
 
         let required_clock_crtcs: &[u32] = match context.class {
             CompletionClass::FastUpdate => closure.kernel_event(),
-            CompletionClass::LifecycleInstallRestore => closure.expected_completion(),
+            CompletionClass::LifecycleInstallRestore => closure.old_active(),
         };
 
         if context.clocks.len() != required_clock_crtcs.len() {
