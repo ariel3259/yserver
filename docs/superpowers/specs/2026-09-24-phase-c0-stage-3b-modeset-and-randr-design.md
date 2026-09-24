@@ -1,12 +1,13 @@
 # Phase C.0 stage 3b — client modeset and the RANDR protocol on the Owner
 
-**Status:** Revision 7 (codex rounds
+**Status:** Revision 8 (codex rounds
 [1](../findings/2026-09-24-stage-3b-design-review-round1.md),
 [2](../findings/2026-09-24-stage-3b-design-review-round2.md),
 [3](../findings/2026-09-24-stage-3b-design-review-round3.md),
 [4](../findings/2026-09-24-stage-3b-design-review-round4.md),
-[5](../findings/2026-09-24-stage-3b-design-review-round5.md) and
-[6](../findings/2026-09-24-stage-3b-design-review-round6.md)), written by the
+[5](../findings/2026-09-24-stage-3b-design-review-round5.md),
+[6](../findings/2026-09-24-stage-3b-design-review-round6.md) and
+[7](../findings/2026-09-24-stage-3b-design-review-round7.md)), written by the
 coordinator on 2026-09-24 from a brainstorming session with the user. Every
 decision below marked **(user decision)** was taken in that session; the rest
 elaborates them or applies the umbrella and C.0 without a new choice. Items
@@ -461,6 +462,31 @@ terminalizes its old work; it never offers a generation, never submits to KMS
 and never touches the new pool. Queued intents of the older topology
 generation are invalidated as C.0 §9.2 requires.
 
+**A retired copied pool, stage by stage** *(rev 8, round-7 M-1)*. A copied
+frame has two GPU stages: source render A on the render device, then sink
+copy B on the sink device, which alone creates the source/destination
+receipts (`prepare_owner_copy_after_render_completion`,
+`copied_owner.rs:312`). A retired bundle may hold a frame at any boundary.
+Its terminal path reuses 2c-iii's **lifecycle-quiescence normalization**
+(`reset_after_lifecycle_quiescence`, `vk/scanout.rs:1339`: every source
+ownership state becomes `RendererDiscard`, every destination state becomes a
+local discard — tested at `:7881`, `:7899`), which Legacy applies after
+draining the whole device. The bundle applies it per frame, on per-fence
+proof instead of a device wait:
+
+| Frame's stage at retirement | Proof awaited | Then |
+| --- | --- | --- |
+| A submitted, not completed | A's render completion (its fence) | as the next row |
+| A completed, B never prepared | none further: no sink queue ever acquired the source, so no foreign acquirer exists | the bundle cancels the never-started handoff (no B is prepared, no receipt created), normalizes the source to `RendererDiscard`, and the source's GPU gate releases on A's fence |
+| B prepared and submitted, not completed | B's sink fence and the receipts' read/write obligations | as the next row |
+| B completed, never submitted to KMS | B's completion; no `KmsRelease` exists because no commit displaced it | source released by `release_source_after_read_retirement` on B's read obligation (`copied_owner.rs:44`); destination normalized to local discard |
+| B submitted to KMS (current or displaced) | the displacing commit's `KmsRelease` discharge (section 4.2), then the FOREIGN return | as today's copied retirement |
+
+Only after every frame of the bundle has reached its last row does the
+bundle destroy the pool on both devices. A bundle whose proof never arrives
+(`CompletionUnknown`, device loss) stays retained under the 2c-i teardown
+handoff; it is never dropped.
+
 The scene state and `platform.scanout_pools` are indexed **by position** in
 `platform.outputs`. Adding or removing an output shifts the positions of the
 others, including those of other devices. The per-device rebuild re-associates
@@ -762,6 +788,11 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
   output was disabled (and after an index shift), and after a mode change:
   its proofs are serviced from the bundle, nothing is offered or submitted,
   and the new pool is untouched.
+- **Retired copied pool at each stage:** disable and mode change with a frame
+  (a) A in flight, (b) A completed and B never prepared, (c) B in flight,
+  (d) B completed and never submitted to KMS: each follows its row of the
+  section 5.1 table, no sink copy is ever prepared for a retired frame, and
+  the pool is destroyed on both devices only after every frame's last row.
 - **Dark CRTC:** three mode changes and then a disable under DPMS-off: each
   displaced pool is discharged by `DarkCrtcDisplacement` at its successor's
   `Completed`; with an unproven off (the off commit made `CompletionUnknown`
@@ -858,6 +889,9 @@ Every test cites a C.0 §16.1 group. Gates per umbrella §5.3, with every
 15. A `REC-4` event held at the gate → the section 7.5 sequence fails.
 16. Gate admission in ready-ring order instead of arrival order, or `Q`
     applied to a synchronous mutation → the gate cases fail.
+29. A retired copied frame whose A completed allowed to prepare its B, or the
+    bundle destroyed before every frame's proof → the retired-copied test
+    fails.
 
 ### 8.4. Named exceptions (complete list)
 
