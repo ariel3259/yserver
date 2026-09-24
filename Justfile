@@ -1056,7 +1056,7 @@ yserver-awesome-hw-audit log="info" interval="30" idle="5":
 # `grep "loop telemetry" yserver-hw-awesome.log` for the per-second rollups.
 # RUST_LOG defaults to `info` so the rollup lines come through; pass
 # `log=warn` for quieter output (but you lose the rollups — they're info!).
-# Long-run resource telemetry (vram / gpu load / pixmap pool live) only, for
+# Long-run resource telemetry (vram / vram by use / gpu load / pixmap pool live) only, for
 # leaving a session up for a day; plain `log=info` recipes grow by GB/hour.
 # Contributors send the log (`gzip -k`), they don't read it. The last sample
 # is post-teardown (pool drained): read the floor from `grep -v 'entries=0'`.

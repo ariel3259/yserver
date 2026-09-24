@@ -251,20 +251,23 @@ fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
     ))
 }
 
-/// Log target for the once-a-second resource lines (`vram`,
+/// Log target for the once-a-second resource lines (`vram`, `vram by use`,
 /// `gpu load`, `pixmap pool live`).
 ///
 /// Deliberately NOT the crate-root target. At `RUST_LOG=info` this
 /// server writes ~2.1 MB/s — MEASURED, 434 MB over 195 s on silence,
 /// which extrapolates to ~179 GB/day. A contributor asked to leave a
-/// session running for a day needs these three lines and nothing
+/// session running for a day needs these lines and nothing
 /// else, which this target makes expressible:
 ///
 /// ```text
 /// RUST_LOG=warn,yserver::resources=info
 /// ```
 ///
-/// ~3 lines/s at ~150 B is ~39 MB/day, which is a log you can keep.
+/// The other three lines run ~150 B each; `vram by use` measured 273 B of
+/// message with near-zero values, ~400 B with GiB-scale values and
+/// `untracked=`, plus ~49 B of env_logger prefix. ~0.85 KB/s is ~73 MB/day,
+/// which is a log you can keep.
 pub const RESOURCE_TELEMETRY_TARGET: &str = "yserver::resources";
 
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
@@ -322,7 +325,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         // out empty otherwise reads as a clean run.
         log::warn!(
             "resource telemetry active: 1 Hz on target `{RESOURCE_TELEMETRY_TARGET}` \
-             (vram / gpu load / pixmap pool live). For a long run filter with \
+             (vram / vram by use / gpu load / pixmap pool live). For a long run filter with \
              RUST_LOG=warn,{RESOURCE_TELEMETRY_TARGET}=info \
              — full `info` writes ~2 MB/s."
         );
@@ -589,7 +592,8 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     }
                     prev_gpu = Some((cur_gpu, now));
                 }
-                if let Some(v) = crate::kms::vk::vram::sample() {
+                let vram = crate::kms::vk::vram::sample();
+                if let Some(v) = vram {
                     // MiB at one decimal: the numbers under
                     // investigation are GiB-scale, and byte counts
                     // make a per-second log unreadable.
@@ -604,6 +608,15 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                         v.device_local_heaps,
                     );
                 }
+                // Our own allocations by use; `untracked` is heapUsage minus them.
+                log::info!(
+                    target: RESOURCE_TELEMETRY_TARGET,
+                    "{}",
+                    crate::kms::vk::mem_accounting::format_line(
+                        &crate::kms::vk::mem_accounting::snapshot(),
+                        vram.map(|v| v.device_local_usage),
+                    ),
+                );
             }
         });
     }

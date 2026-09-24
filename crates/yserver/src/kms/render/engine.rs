@@ -642,7 +642,7 @@ impl Drop for ScratchImage {
     fn drop(&mut self) {
         unsafe {
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }
@@ -674,7 +674,7 @@ impl Drop for ClipSnapshot {
         unsafe {
             self.vk.device.destroy_image_view(self.view, None);
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }
@@ -704,7 +704,7 @@ impl Drop for SampledScratchImage {
         unsafe {
             self.vk.device.destroy_image_view(self.view, None);
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }
@@ -835,7 +835,12 @@ impl StagingBuffer {
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mt);
-        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+            &vk.device,
+            &alloc_info,
+            crate::kms::vk::mem_accounting::MemCategory::Staging,
+            &mem_props,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe { vk.device.destroy_buffer(buffer, None) };
@@ -844,7 +849,7 @@ impl StagingBuffer {
         };
         if let Err(e) = unsafe { vk.device.bind_buffer_memory(buffer, memory, 0) } {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_buffer(buffer, None);
             }
             return Err(e);
@@ -856,7 +861,7 @@ impl StagingBuffer {
             Ok(p) => p,
             Err(e) => {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_buffer(buffer, None);
                 }
                 return Err(e);
@@ -940,7 +945,7 @@ impl Drop for StagingBuffer {
         unsafe {
             self.vk.device.unmap_memory(self.memory);
             self.vk.device.destroy_buffer(self.buffer, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }
@@ -1967,7 +1972,7 @@ impl RenderEngine {
                 vk.device.destroy_image(retired.image, None);
             }
             if retired.memory != vk::DeviceMemory::null() {
-                vk.device.free_memory(retired.memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, retired.memory);
             }
         }
     }
@@ -3768,6 +3773,20 @@ impl RenderEngine {
         let retired = {
             let d = store.get_mut(id).ok_or(RenderError::UnknownDrawable(id))?;
             let (exp_image, exp_memory, exp_stride, exp_size, exp_modifier) = exp.into_raw_parts();
+            // A promoted redirect backing stays distinguishable from other exports.
+            let old_memory = match d.storage.backing() {
+                StorageBacking::Legacy(alloc) => Some(alloc.memory),
+                StorageBacking::Managed(lease) => service
+                    .as_deref_mut()
+                    .and_then(|svc| svc.with_storage_read(lease, |a| a.memory).ok()),
+                StorageBacking::Detached => None,
+            };
+            crate::kms::vk::mem_accounting::recategorise(
+                exp_memory,
+                crate::kms::vk::mem_accounting::export_category_for(
+                    old_memory.and_then(crate::kms::vk::mem_accounting::category_of),
+                ),
+            );
             match d.storage.backing() {
                 StorageBacking::Legacy(_) => {
                     let legacy = d.storage.adopt_exportable(
@@ -11950,7 +11969,12 @@ fn allocate_scratch_image(
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Scratch,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_image(image, None) };
@@ -11959,7 +11983,7 @@ fn allocate_scratch_image(
     };
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(RenderError::Vk(e));
@@ -12016,7 +12040,12 @@ fn alloc_clip_snapshot(
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Scratch,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_image(image, None) };
@@ -12025,7 +12054,7 @@ fn alloc_clip_snapshot(
     };
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(RenderError::Vk(e));
@@ -12045,7 +12074,7 @@ fn alloc_clip_snapshot(
         Ok(v) => v,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(RenderError::Vk(e));
@@ -12103,7 +12132,12 @@ fn allocate_sampled_scratch_image(
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Scratch,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_image(image, None) };
@@ -12112,7 +12146,7 @@ fn allocate_sampled_scratch_image(
     };
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(RenderError::Vk(e));
@@ -12132,7 +12166,7 @@ fn allocate_sampled_scratch_image(
         Ok(v) => v,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(RenderError::Vk(e));

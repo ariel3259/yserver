@@ -60,6 +60,7 @@ Rules for keeping it current:
 | `f56dcf20`, `14391bc0`, `b757e253` | — | TFP export: unadvertised export reported as unsupported; tiling chosen by asking the driver; export semaphore kept alive until its submit retires | low — GLX texture-from-pixmap, no KMS route | GLX TFP smoke (a compositing WM on NVIDIA and on amdgpu) |
 | `36405c09` | — | a depth-24 child stays opaque in its depth-32 parent's backing | low — render | render smoke |
 | `16581ab3` | — | telemetry: VRAM, per-GPU engine load, pixmap-pool residency (`drm/fdinfo.rs`, `kms/vk/vram.rs`) | low — observability; reads fdinfo | none beyond the telemetry output existing on Owner |
+| `2282c94f` | — | telemetry: VRAM accounted by use; every `vkAllocateMemory`/`vkFreeMemory` goes through `kms/vk/mem_accounting` (clippy disallows the raw calls) | **medium** — the merge routed three raw `free_memory` calls of C.0's resource service (`resources/scanout.rs` ×2, `resources/storage.rs`) through the ledger, and the managed-storage promotion now recategorises the exportable memory from either backing (`engine.rs`); a missed free would leave phantom ledger entries, not a leak | on Owner, the `vram by use` line's `untracked` stays flat across a composed/direct/unflip cycle and a TFP promotion |
 
 ## Reproduction tooling already in the tree
 

@@ -995,6 +995,9 @@ fn c0_2ci_live_lifetime_adapters_vulkan() {
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_req.size)
             .memory_type_index(type_idx as u32);
+        // Test fixture memory, freed through the accounted path; the ledger
+        // ignores a free of a handle it never saw.
+        #[allow(clippy::disallowed_methods)]
         let mem = unsafe {
             vk_ctx
                 .device
@@ -1169,6 +1172,7 @@ fn c0_2ci_live_lifetime_adapters_vulkan() {
         let alloc_info = ash::vk::MemoryAllocateInfo::default()
             .allocation_size(shared_mem_req.size)
             .memory_type_index(type_idx as u32);
+        #[allow(clippy::disallowed_methods)]
         let shared_mem = unsafe {
             vk_ctx
                 .device

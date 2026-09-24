@@ -551,7 +551,12 @@ impl DrawableImage {
             .memory_type_index(memory_type_index)
             .push_next(&mut import_info)
             .push_next(&mut dedicated);
-        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+            &vk.device,
+            &alloc_info,
+            crate::kms::vk::mem_accounting::MemCategory::Dri3Import,
+            &mem_props,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe {
@@ -568,7 +573,7 @@ impl DrawableImage {
         // fd survives at least until DrawableImage drop.
         if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e.into());
@@ -588,7 +593,7 @@ impl DrawableImage {
             Ok(v) => v,
             Err(e) => {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e.into());
@@ -669,7 +674,12 @@ impl DrawableImage {
             .allocation_size(mem_reqs.size)
             .memory_type_index(memory_type_index)
             .push_next(&mut dedicated);
-        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+            &vk.device,
+            &alloc_info,
+            crate::kms::vk::mem_accounting::MemCategory::Other,
+            &mem_props,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe { vk.device.destroy_image(image, None) };
@@ -678,7 +688,7 @@ impl DrawableImage {
         };
         if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e.into());
@@ -698,7 +708,7 @@ impl DrawableImage {
             Ok(v) => v,
             Err(e) => {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e.into());
@@ -1179,7 +1189,7 @@ impl Drop for DrawableImage {
             match &self.backing {
                 ImageBacking::ServerOwned { vk_memory }
                 | ImageBacking::Imported { vk_memory, .. } => {
-                    self.vk.device.free_memory(*vk_memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&self.vk.device, *vk_memory);
                 }
             }
         }
@@ -1306,7 +1316,7 @@ impl Drop for ExportableImage {
         // image must be destroyed before the memory it was bound to
         unsafe {
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }
@@ -1595,7 +1605,7 @@ fn allocate_exportable_modifier(
         unsafe { modifier_ext.get_image_drm_format_modifier_properties(image, &mut mod_props) }
     {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(e);
@@ -1722,10 +1732,15 @@ fn bind_exportable_memory(
         .push_next(&mut export_alloc)
         .push_next(&mut dedicated);
 
-    let memory = unsafe { vk.device.allocate_memory(&alloc_info, None)? };
+    let memory = crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::TfpExport,
+        &mem_props,
+    )?;
 
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
-        unsafe { vk.device.free_memory(memory, None) };
+        unsafe { crate::kms::vk::mem_accounting::free_memory(&vk.device, memory) };
         return Err(e);
     }
     Ok(memory)
