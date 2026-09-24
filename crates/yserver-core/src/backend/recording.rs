@@ -114,6 +114,18 @@ pub enum RecordedCall {
         width: u16,
         height: u16,
     },
+    CopyPlane {
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        plane: u32,
+    },
+    PaintWindowBackgroundRect {
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    },
     DefineCursor {
         host_window_xid: u32,
         cursor_host_xid: u32,
@@ -451,6 +463,8 @@ pub struct RecordingBackend {
     /// result lets request-layer tests prove M2b bypasses Copy entirely.
     pub present_direct_result: bool,
     pub present_direct_candidates: Vec<PresentScanoutCandidate>,
+    /// `(event, dst_host_xid)` passed to `enqueue_present_completion`, in call order.
+    pub enqueued_present_completions: Vec<(CompletedPresentEvent, u32)>,
     /// Adversarial-review fix (arm-before-scrap): when `Some(kind)`,
     /// `arm_present_syncobj_wait` still records the call but returns
     /// `Err(io::Error::from(kind))` instead of `Ok(present_syncobj_wait)`,
@@ -558,6 +572,7 @@ impl RecordingBackend {
             fail_copy_area: false,
             present_direct_result: false,
             present_direct_candidates: Vec::new(),
+            enqueued_present_completions: Vec::new(),
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
             applied_device_configs: Vec::new(),
@@ -912,6 +927,11 @@ impl Backend for RecordingBackend {
 
     fn note_present_skip(&mut self) {
         self.present_skip_count += 1;
+    }
+
+    fn enqueue_present_completion(&mut self, event: CompletedPresentEvent, dst_host_xid: u32) {
+        self.enqueued_present_completions
+            .push((event, dst_host_xid));
     }
 
     fn try_present_direct(
@@ -1633,20 +1653,44 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
+    fn paint_window_background_rect(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::PaintWindowBackgroundRect {
+            host_xid,
+            x,
+            y,
+            width,
+            height,
+        });
+        Ok(())
+    }
+
     fn copy_plane(
         &mut self,
         _origin: Option<OriginContext>,
-        _src_host_xid: u32,
-        _dst_host_xid: u32,
+        src_host_xid: u32,
+        dst_host_xid: u32,
         _src_x: i16,
         _src_y: i16,
         _dst_x: i16,
         _dst_y: i16,
         _width: u16,
         _height: u16,
-        _plane: u32,
+        plane: u32,
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: copy_plane")
+        self.record(RecordedCall::CopyPlane {
+            src_host_xid,
+            dst_host_xid,
+            plane,
+        });
+        Ok(())
     }
 
     fn put_image(
@@ -1744,7 +1788,7 @@ impl Backend for RecordingBackend {
         _foreground: u32,
         _rectangles: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_fill_rectangle")
+        Ok(())
     }
 
     fn poly_fill_arc(

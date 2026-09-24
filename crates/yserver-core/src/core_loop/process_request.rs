@@ -10476,8 +10476,6 @@ fn execute_present_pixmap_copy(
         explicit_sync: matches!(req, PendingPresentRequest::PixmapSynced(_)),
         options: masked_options,
     };
-    backend.note_present_scanout_candidate(candidate);
-
     let completion = crate::backend::CompletedPresentEvent {
         client_id,
         serial,
@@ -10494,6 +10492,27 @@ fn execute_present_pixmap_copy(
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
     };
+
+    if window_unviewable(state, ResourceId(window)) {
+        // Xorg: flip check fails on the empty clipList and the Copy clips to nothing,
+        // but idle and CompleteModeCopy are still delivered (present_execute.c:119-156).
+        if let Some(eff) = effective_target_msc {
+            state.present_complete_gate.insert(
+                present_id,
+                crate::server::PresentCompleteGate {
+                    crtc_id,
+                    crtc_epoch,
+                    msc_offset,
+                    effective_target_msc: eff,
+                    owner: client_id,
+                    dst_window_xid: window,
+                },
+            );
+        }
+        backend.enqueue_present_completion(completion, completion_dst_host_xid);
+        return Ok(());
+    }
+    backend.note_present_scanout_candidate(candidate);
 
     // M2b attempts direct ownership before recording the fallback Copy. The
     // completion gate must exist before the backend can own the page flip;
@@ -26804,6 +26823,14 @@ fn drawable_size(state: &ServerState, id: ResourceId) -> Option<(u16, u16)> {
     state.resources.pixmap(id).map(|p| (p.width, p.height))
 }
 
+/// True for a window that is not viewable (Xorg: not realized); false for pixmaps.
+fn window_unviewable(state: &ServerState, id: ResourceId) -> bool {
+    state
+        .resources
+        .window(id)
+        .is_some_and(|w| w.map_state != crate::resources::MapState::Viewable)
+}
+
 /// Source-availability split for CopyArea/CopyPlane (X11 §CopyArea;
 /// Xorg miHandleExposures): the part of the requested source rect
 /// outside the source drawable's bounds is not copied. Returns the
@@ -26824,6 +26851,10 @@ fn copy_area_source_split(
     Option<(i16, i16, i16, i16, u16, u16)>,
     Vec<(i16, i16, u16, u16)>,
 ) {
+    if window_unviewable(state, src) {
+        // Xorg: an unrealized window's clipList is empty, so nothing copies (micopy.c:282).
+        return (None, vec![(dst_x, dst_y, width, height)]);
+    }
     let Some((sw, sh)) = drawable_size(state, src) else {
         // Unknown source geometry: keep the old conservative
         // behavior (copy as requested, no missing region).
@@ -27001,16 +27032,21 @@ fn handle_copy_area(
         // Clamp the copy to the AVAILABLE part of the source drawable
         // (X11 §CopyArea): out-of-bounds source regions are never
         // copied; they become the GraphicsExpose region below.
-        let (avail, missing) = copy_area_source_split(
-            state,
-            request.src,
-            request.src_x,
-            request.src_y,
-            request.dst_x,
-            request.dst_y,
-            request.width,
-            request.height,
-        );
+        let (avail, missing) = if window_unviewable(state, request.dst) {
+            // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
+            (None, Vec::new())
+        } else {
+            copy_area_source_split(
+                state,
+                request.src,
+                request.src_x,
+                request.src_y,
+                request.dst_x,
+                request.dst_y,
+                request.width,
+                request.height,
+            )
+        };
         let request = match avail {
             Some((sx, sy, dx, dy, w, h)) => x11::CopyAreaRequest {
                 src_x: sx,
@@ -27378,7 +27414,12 @@ fn handle_copy_plane(
         backend.apply_draw_state(origin, &st)?;
         // Clamp to the available source region (same contract as
         // CopyArea — out-of-bounds source becomes GraphicsExpose).
-        let (avail, missing) = copy_area_source_split(state, src, sx, sy, dx, dy, w, h);
+        let (avail, missing) = if window_unviewable(state, dst) {
+            // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
+            (None, Vec::new())
+        } else {
+            copy_area_source_split(state, src, sx, sy, dx, dy, w, h)
+        };
         if let Some((asx, asy, adx, ady, aw, ah)) = avail {
             backend.copy_plane(
                 origin,
@@ -43855,11 +43896,12 @@ mod tests {
             vec![present_test_output(5, CRTC, 0, 0, 1920, 1080, false)],
         );
         create_present_test_window(&mut state, WINDOW, 0, 0, 64, 64);
-        state
-            .resources
-            .window_mut(ResourceId(WINDOW))
-            .unwrap()
-            .host_xid = crate::backend::WindowHandle::from_raw(0x0040_1051);
+        {
+            let window = state.resources.window_mut(ResourceId(WINDOW)).unwrap();
+            window.host_xid = crate::backend::WindowHandle::from_raw(0x0040_1051);
+            // A Present to an unviewable window copies nothing (Xorg micopy.c:157).
+            window.map_state = crate::resources::MapState::Viewable;
+        }
         state.resources.create_pixmap(
             ClientId(1),
             CreatePixmapRequest {
@@ -48088,6 +48130,100 @@ mod tests {
             .get(&PRESENT_ID)
             .expect("direct completion gate installed before ownership handoff");
         assert_eq!(gate.effective_target_msc, TARGET_MSC);
+    }
+
+    /// Xorg: the flip check fails on the empty clipList (present_scmd.c:122),
+    /// the Copy to an unrealized window is a no-op (micopy.c:157), and idle
+    /// plus CompleteModeCopy are still sent (present_execute.c:137-156).
+    #[test]
+    fn present_to_unviewable_window_skips_copy_and_damage_but_completes() {
+        use crate::{backend::recording::RecordedCall, resources::MapState, server::DamageObject};
+
+        const PARENT: u32 = 0x0002_0021;
+        const WINDOW: u32 = 0x0002_0022;
+        const DAMAGE_XID: u32 = 0x0002_0023;
+        const PRESENT_ID: u64 = 0x45;
+        const TARGET_MSC: u64 = 600;
+
+        for (parent_state, window_state, hidden) in [
+            (MapState::Viewable, MapState::Unmapped, true),
+            (MapState::Unmapped, MapState::Unviewable, true),
+            (MapState::Viewable, MapState::Viewable, false),
+        ] {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            backend.present_direct_result = true;
+            for (xid, parent, map_state) in [
+                (PARENT, ROOT_WINDOW, parent_state),
+                (WINDOW, ResourceId(PARENT), window_state),
+            ] {
+                state.resources.create_window(
+                    ClientId(1),
+                    yserver_protocol::x11::CreateWindowRequest {
+                        depth: 24,
+                        window: ResourceId(xid),
+                        parent,
+                        width: 100,
+                        height: 100,
+                        class: 1,
+                        visual: crate::resources::ROOT_VISUAL,
+                        ..Default::default()
+                    },
+                );
+                state
+                    .resources
+                    .window_mut(ResourceId(xid))
+                    .expect("window")
+                    .map_state = map_state;
+            }
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: ResourceId(WINDOW),
+                    level: 3,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+            let pending = SupersessionFixture::new(PRESENT_ID, WINDOW)
+                .eff(Some(TARGET_MSC))
+                .geometry(0, 0, 100, 100)
+                .pending();
+
+            execute_present_pixmap_copy(&mut state, &mut backend, pending).expect("present");
+
+            let copies = backend
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, RecordedCall::CopyArea { .. }))
+                .count();
+            let damaged = !state.damage_objects[&DAMAGE_XID].rects.is_empty();
+            let gate = state.present_complete_gate.get(&PRESENT_ID).expect("gate");
+            assert_eq!(gate.effective_target_msc, TARGET_MSC);
+            if hidden {
+                assert!(
+                    backend.present_direct_candidates.is_empty(),
+                    "{window_state:?}: no direct attempt"
+                );
+                assert_eq!(copies, 0, "{window_state:?}: no copy");
+                assert!(!damaged, "{window_state:?}: no damage");
+                assert_eq!(backend.enqueued_present_completions.len(), 1);
+                let (event, _) = &backend.enqueued_present_completions[0];
+                assert_eq!(
+                    event.completion_mode,
+                    yserver_protocol::x11::present::COMPLETE_MODE_COPY
+                );
+                assert!(event.emit_idle, "{window_state:?}: idle still sent");
+                assert_eq!(event.present_id, PRESENT_ID);
+            } else {
+                // Viewable control: direct path taken as before.
+                assert_eq!(backend.present_direct_candidates.len(), 1);
+                assert!(damaged);
+                assert!(backend.enqueued_present_completions.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -61115,6 +61251,375 @@ mod tests {
             "first byte must be NoExposure (event type 14) — source \
              fully available",
         );
+    }
+
+    // ---- Unviewable CopyArea/CopyPlane sources (Xorg micopy.c / miexpose.c) ----
+
+    const UV_FRAME: u32 = 0x0010_0101;
+    const UV_CHILD: u32 = 0x0010_0102;
+    const UV_LONE: u32 = 0x0010_0103;
+    const UV_SHOWN: u32 = 0x0010_0104;
+    const UV_PIXMAP: u32 = 0x0010_0110;
+    const UV_DST_PIXMAP: u32 = 0x0010_0111;
+    const UV_GC: u32 = 0x0010_0120;
+    const UV_GC_NOEXP: u32 = 0x0010_0121;
+
+    fn uv_gc_request(gc: u32, graphics_exposures: bool) -> yserver_protocol::x11::CreateGcRequest {
+        yserver_protocol::x11::CreateGcRequest {
+            gc: ResourceId(gc),
+            drawable: ROOT_WINDOW,
+            function: None,
+            plane_mask: None,
+            foreground: None,
+            background: None,
+            line_width: None,
+            line_style: None,
+            cap_style: None,
+            join_style: None,
+            fill_style: None,
+            fill_rule: None,
+            tile: None,
+            stipple: None,
+            tile_x_origin: None,
+            tile_y_origin: None,
+            font: None,
+            subwindow_mode: None,
+            graphics_exposures: Some(graphics_exposures),
+            clip_x_origin: None,
+            clip_y_origin: None,
+            clip_mask: None,
+            dash_offset: None,
+            dashes: None,
+            arc_mode: None,
+        }
+    }
+
+    fn uv_window(
+        state: &mut ServerState,
+        xid: u32,
+        parent: ResourceId,
+        map_state: crate::resources::MapState,
+    ) {
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let w = state.resources.window_mut(ResourceId(xid)).expect("window");
+        w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+            xid | 0x0040_0000,
+        ));
+        w.map_state = map_state;
+    }
+
+    fn uv_pixmap(state: &mut ServerState, xid: u32) {
+        state.resources.create_pixmap(
+            ClientId(1),
+            yserver_protocol::x11::CreatePixmapRequest {
+                pixmap: ResourceId(xid),
+                drawable: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                depth: 24,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(xid),
+            crate::backend::PixmapHandle::from_raw_for_test(xid | 0x0040_0000),
+        );
+    }
+
+    /// Unmapped frame with a mapped (so Unviewable) child, a lone unmapped
+    /// window, a viewable window, two pixmaps and GCs with exposures on/off.
+    fn uv_fixture() -> (ServerState, UnixStream) {
+        use crate::resources::MapState;
+        let mut state = ServerState::new();
+        let peer = install_client(&mut state, 1);
+        uv_window(&mut state, UV_FRAME, ROOT_WINDOW, MapState::Unmapped);
+        uv_window(
+            &mut state,
+            UV_CHILD,
+            ResourceId(UV_FRAME),
+            MapState::Unviewable,
+        );
+        uv_window(&mut state, UV_LONE, ROOT_WINDOW, MapState::Unmapped);
+        uv_window(&mut state, UV_SHOWN, ROOT_WINDOW, MapState::Viewable);
+        uv_pixmap(&mut state, UV_PIXMAP);
+        uv_pixmap(&mut state, UV_DST_PIXMAP);
+        state
+            .resources
+            .create_gc(ClientId(1), uv_gc_request(UV_GC, true));
+        state
+            .resources
+            .create_gc(ClientId(1), uv_gc_request(UV_GC_NOEXP, false));
+        (state, peer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn uv_copy(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        opcode: u8,
+        src: u32,
+        dst: u32,
+        gc: u32,
+        src_xy: (i16, i16),
+        dst_xy: (i16, i16),
+        size: (u16, u16),
+    ) {
+        let mut body = Vec::with_capacity(28);
+        body.extend_from_slice(&src.to_le_bytes());
+        body.extend_from_slice(&dst.to_le_bytes());
+        body.extend_from_slice(&gc.to_le_bytes());
+        body.extend_from_slice(&src_xy.0.to_le_bytes());
+        body.extend_from_slice(&src_xy.1.to_le_bytes());
+        body.extend_from_slice(&dst_xy.0.to_le_bytes());
+        body.extend_from_slice(&dst_xy.1.to_le_bytes());
+        body.extend_from_slice(&size.0.to_le_bytes());
+        body.extend_from_slice(&size.1.to_le_bytes());
+        if opcode == 63 {
+            body.extend_from_slice(&1u32.to_le_bytes());
+        }
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("dispatch copy");
+    }
+
+    fn uv_copy_calls(backend: &RecordingBackend) -> usize {
+        use crate::backend::recording::RecordedCall;
+        backend
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RecordedCall::CopyArea { .. } | RecordedCall::CopyPlane { .. }
+                )
+            })
+            .count()
+    }
+
+    /// Decoded (type, drawable, x, y, w, h, count, major) per 32-byte event.
+    type UvEvent = (u8, u32, u16, u16, u16, u16, u16, u8);
+
+    fn uv_events(bytes: &[u8]) -> Vec<UvEvent> {
+        bytes
+            .chunks_exact(32)
+            .map(|e| {
+                let u16_at = |i: usize| u16::from_le_bytes([e[i], e[i + 1]]);
+                let drawable = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+                if e[0] == 13 {
+                    (
+                        13,
+                        drawable,
+                        u16_at(8),
+                        u16_at(10),
+                        u16_at(12),
+                        u16_at(14),
+                        u16_at(18),
+                        e[20],
+                    )
+                } else {
+                    (e[0], drawable, 0, 0, 0, 0, 0, e[10])
+                }
+            })
+            .collect()
+    }
+
+    /// Xorg: an unrealized source window has an empty clipList
+    /// (mivaltree.c:691-696, miwindow.c:741-744, window.c:892), so miDoCopy
+    /// copies nothing and miHandleExposures exposes the whole rect.
+    #[test]
+    fn copy_area_from_unviewable_window_exposes_whole_dest_rect() {
+        for (opcode, src) in [
+            (62u8, UV_LONE),
+            (62, UV_CHILD),
+            (63, UV_LONE),
+            (63, UV_CHILD),
+        ] {
+            let (mut state, mut peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            uv_copy(
+                &mut state,
+                &mut backend,
+                opcode,
+                src,
+                UV_DST_PIXMAP,
+                UV_GC,
+                (10, 20),
+                (5, 7),
+                (30, 40),
+            );
+            assert_eq!(
+                uv_copy_calls(&backend),
+                0,
+                "op {opcode} src 0x{src:x}: nothing copied"
+            );
+            assert_eq!(
+                uv_events(&read_all_available(&mut peer)),
+                vec![(13, UV_DST_PIXMAP, 5, 7, 30, 40, 0, opcode)],
+                "op {opcode} src 0x{src:x}: one GraphicsExpose for the dest rect, no NoExpose",
+            );
+        }
+    }
+
+    #[test]
+    fn copy_area_from_unviewable_window_without_exposures_sends_nothing() {
+        for opcode in [62u8, 63] {
+            let (mut state, mut peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            uv_copy(
+                &mut state,
+                &mut backend,
+                opcode,
+                UV_CHILD,
+                UV_DST_PIXMAP,
+                UV_GC_NOEXP,
+                (0, 0),
+                (0, 0),
+                (30, 40),
+            );
+            assert_eq!(uv_copy_calls(&backend), 0);
+            assert!(
+                read_all_available(&mut peer).is_empty(),
+                "op {opcode}: no events"
+            );
+        }
+    }
+
+    /// A pixmap or viewable window source is unchanged: copied, NoExpose.
+    #[test]
+    fn copy_area_from_pixmap_or_viewable_window_still_copies_with_no_expose() {
+        for opcode in [62u8, 63] {
+            for src in [UV_PIXMAP, UV_SHOWN] {
+                let (mut state, mut peer) = uv_fixture();
+                let mut backend = RecordingBackend::new();
+                uv_copy(
+                    &mut state,
+                    &mut backend,
+                    opcode,
+                    src,
+                    UV_DST_PIXMAP,
+                    UV_GC,
+                    (10, 20),
+                    (5, 7),
+                    (30, 40),
+                );
+                assert_eq!(uv_copy_calls(&backend), 1, "op {opcode} src 0x{src:x}");
+                assert_eq!(
+                    uv_events(&read_all_available(&mut peer)),
+                    vec![(14, UV_DST_PIXMAP, 0, 0, 0, 0, 0, opcode)],
+                    "op {opcode} src 0x{src:x}: NoExpose",
+                );
+            }
+        }
+    }
+
+    /// Xorg miDoCopy returns NULL for an unrealized destination before any
+    /// copy or exposure (micopy.c:157-160), so the requestor gets NoExpose
+    /// even when the source is unavailable.
+    #[test]
+    fn copy_area_to_unviewable_window_copies_nothing_and_sends_no_expose() {
+        for opcode in [62u8, 63] {
+            for (src, src_xy) in [(UV_PIXMAP, (0, 0)), (UV_PIXMAP, (90, 0)), (UV_LONE, (0, 0))] {
+                let (mut state, mut peer) = uv_fixture();
+                let mut backend = RecordingBackend::new();
+                uv_copy(
+                    &mut state,
+                    &mut backend,
+                    opcode,
+                    src,
+                    UV_CHILD,
+                    UV_GC,
+                    src_xy,
+                    (0, 0),
+                    (30, 40),
+                );
+                assert_eq!(uv_copy_calls(&backend), 0, "op {opcode} src 0x{src:x}");
+                assert!(
+                    !backend.calls().iter().any(|c| matches!(
+                        c,
+                        crate::backend::recording::RecordedCall::PaintWindowBackgroundRect { .. }
+                    )),
+                    "op {opcode} src 0x{src:x}: no background paint",
+                );
+                assert_eq!(
+                    uv_events(&read_all_available(&mut peer)),
+                    vec![(14, UV_CHILD, 0, 0, 0, 0, 0, opcode)],
+                    "op {opcode} src 0x{src:x} at {src_xy:?}: NoExpose",
+                );
+            }
+        }
+    }
+
+    /// Drawing to an unmapped window records no damage (Xorg damage.c:197).
+    #[test]
+    fn poly_fill_on_unmapped_window_records_no_damage() {
+        use crate::server::DamageObject;
+        const DAMAGE_XID: u32 = 0x0010_0130;
+        for (window, expect_damage) in [(UV_LONE, false), (UV_CHILD, false), (UV_SHOWN, true)] {
+            let (mut state, _peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: ResourceId(window),
+                    level: 3,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+            let body = poly_fill_rectangle_body(window, UV_GC);
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 70,
+                    data: 0,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                &body,
+                None,
+            )
+            .expect("PolyFillRectangle");
+            let dmg = state
+                .damage_objects
+                .get(&DAMAGE_XID)
+                .expect("damage object");
+            assert_eq!(
+                !dmg.rects.is_empty() || dmg.pending_notify_fired,
+                expect_damage,
+                "window 0x{window:x}: rects={:?} fired={}",
+                dmg.rects,
+                dmg.pending_notify_fired,
+            );
+        }
     }
 
     /// Stage 4d Manual-redirect CopyArea ClipByChildren fix.
