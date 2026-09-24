@@ -3345,7 +3345,7 @@ impl SceneCompositor {
     pub(crate) fn poll_retired_outputs_for_tests(
         &mut self,
         platform: &mut PlatformBackend,
-        resource_service: Option<&ResourceService>,
+        resource_service: Option<&mut ResourceService>,
     ) {
         if let Some(inner) = self.inner.as_mut() {
             drain_retired_output_bundles(inner, platform, resource_service);
@@ -3920,7 +3920,7 @@ impl SceneCompositor {
     pub(crate) fn service_retired_output_bundles(
         &mut self,
         platform: &mut PlatformBackend,
-        resource_service: Option<&ResourceService>,
+        resource_service: Option<&mut ResourceService>,
     ) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -4328,7 +4328,7 @@ impl SceneCompositor {
         if platform.renderer_failed {
             return Ok(Vec::new());
         }
-        drain_retired_output_bundles(inner, platform, resource_service.as_deref());
+        drain_retired_output_bundles(inner, platform, resource_service.as_deref_mut());
         if platform.renderer_failed {
             return Ok(Vec::new());
         }
@@ -5265,17 +5265,27 @@ fn handle_retired_scanout_render_completion(
     fd: Option<std::os::fd::OwnedFd>,
     resource_service: Option<&mut ResourceService>,
 ) -> bool {
-    if completion_stage != ScanoutRenderCompletionStage::Render {
-        // Copied-route completion retirement is owned by 3b-i-2. Keep the
-        // bundle rooted until that path services its source/sink receipts.
+    if !matches!(
+        completion_stage,
+        ScanoutRenderCompletionStage::Render | ScanoutRenderCompletionStage::CopiedOwnerCopy
+    ) {
         drop(fd);
         return false;
     }
     let Some(index) = bundle.scene.owner_buffers.iter().position(|buffer| {
-        buffer.identity().bo_idx == bo_idx
-            && buffer
-                .pending_ack()
-                .is_some_and(|ack| ack.stage.matches_owner_render_completion(job_id))
+        if buffer.identity().bo_idx != bo_idx {
+            return false;
+        }
+        buffer
+            .pending_ack()
+            .is_some_and(|ack| match completion_stage {
+                ScanoutRenderCompletionStage::Render => {
+                    ack.stage.matches_owner_render_completion(job_id)
+                }
+                ScanoutRenderCompletionStage::CopiedOwnerCopy => {
+                    ack.stage.matches_owner_copy_completion(job_id)
+                }
+            })
     }) else {
         drop(fd);
         return false;
@@ -5286,23 +5296,58 @@ fn handle_retired_scanout_render_completion(
         return false;
     };
     let mut buffer = bundle.scene.owner_buffers.remove(index);
-    let Some(batch) = buffer
-        .pending_ack_mut()
-        .and_then(|ack| ack.managed_batch.take())
-    else {
-        log::error!(
-            "render retired output: generation {} had no GPU batch",
-            buffer.identity().generation
-        );
-        bundle.scene.owner_buffers.insert(index, buffer);
-        drop(fd);
-        return false;
-    };
-    service.register_batch(batch);
+    if completion_stage == ScanoutRenderCompletionStage::CopiedOwnerCopy {
+        let Some(receipt) = buffer.pending_ack().and_then(|ack| {
+            ack.copied_receipt
+                .as_ref()
+                .map(|receipt| (receipt.destination, receipt.source))
+        }) else {
+            bundle.scene.owner_buffers.insert(index, buffer);
+            drop(fd);
+            return false;
+        };
+        let OutputScanout::Copied(pool) = &bundle.pool else {
+            bundle.scene.owner_buffers.insert(index, buffer);
+            drop(fd);
+            return false;
+        };
+        let expected_destination = pool
+            .destinations
+            .bos
+            .get(bo_idx)
+            .and_then(|bo| bo.managed_key());
+        let expected_source = pool
+            .sources
+            .get(bo_idx)
+            .and_then(|source| source.managed_key());
+        if expected_destination != Some(receipt.0.0) || expected_source != Some(receipt.1.0) {
+            bundle.scene.owner_buffers.insert(index, buffer);
+            drop(fd);
+            return false;
+        }
+    }
+    if completion_stage == ScanoutRenderCompletionStage::Render {
+        let Some(batch) = buffer
+            .pending_ack_mut()
+            .and_then(|ack| ack.managed_batch.take())
+        else {
+            log::error!(
+                "render retired output: generation {} had no GPU batch",
+                buffer.identity().generation
+            );
+            bundle.scene.owner_buffers.insert(index, buffer);
+            drop(fd);
+            return false;
+        };
+        service.register_batch(batch);
+    }
     if let Err(error) = service.service_completions(std::time::Instant::now()) {
         log::warn!("render retired output: completion service failed: {error:?}");
     }
-    if buffer.state() == OwnerBufferState::Rendering {
+    if matches!(
+        buffer.state(),
+        OwnerBufferState::Rendering | OwnerBufferState::Desired | OwnerBufferState::Submitted
+    ) {
         match buffer.into_displaced() {
             Ok(displaced) => buffer = displaced,
             Err(buffer) => {
@@ -5832,7 +5877,11 @@ fn retire_failed_submit_bos_in_bundle(
     bundle.scene.failed_submit_bos = remaining;
 }
 
-fn leave_owner_buffer_from_scanout(scanout: &mut OutputScanout, bo_idx: usize) -> bool {
+fn leave_owner_buffer_from_scanout(
+    scanout: &mut OutputScanout,
+    bo_idx: usize,
+    kms_was_submitted: bool,
+) -> bool {
     match scanout {
         OutputScanout::Shared(pool) => pool
             .bos
@@ -5847,8 +5896,15 @@ fn leave_owner_buffer_from_scanout(scanout: &mut OutputScanout, bo_idx: usize) -
             {
                 return false;
             }
-            if let Err(error) = pool.note_kms_retired(bo_idx) {
-                log::error!("render retired copied output: KMS retirement failed: {error}");
+            if kms_was_submitted {
+                if let Err(error) = pool.note_kms_retired(bo_idx) {
+                    log::error!("render retired copied output: KMS retirement failed: {error}");
+                    return false;
+                }
+            } else if let Err(error) = pool.retire_unsubmitted_destination(bo_idx) {
+                log::error!(
+                    "render retired copied output: discard unsubmitted destination failed: {error}"
+                );
                 return false;
             }
             pool.destinations.bos[bo_idx]
@@ -5888,7 +5944,7 @@ fn retire_onscreen_pool_bo_after_kms_proof(
 
 fn retire_owner_buffers_in_bundle(
     bundle: &mut RetiredOutputBundle,
-    resource_service: Option<&ResourceService>,
+    resource_service: Option<&mut ResourceService>,
 ) {
     let Some(service) = resource_service else {
         return;
@@ -5908,9 +5964,57 @@ fn retire_owner_buffers_in_bundle(
             index += 1;
             continue;
         }
+
+        let bo_idx = bundle.scene.owner_buffers[index].identity().bo_idx;
+        if let OutputScanout::Copied(pool) = &mut bundle.pool {
+            let Some(source_key) = pool
+                .sources
+                .get(bo_idx)
+                .and_then(|source| source.managed_key())
+            else {
+                index += 1;
+                continue;
+            };
+            if !service.is_releasable(&source_key) {
+                index += 1;
+                continue;
+            }
+            if let Some(source_receipt) = bundle.scene.owner_buffers[index]
+                .pending_ack()
+                .and_then(|ack| ack.copied_receipt.as_ref())
+                .map(|receipt| receipt.source)
+                && !crate::kms::render::copied_owner::release_source_after_read_retirement(
+                    pool,
+                    service,
+                    bo_idx,
+                    source_receipt,
+                )
+            {
+                index += 1;
+                continue;
+            }
+            if !service.copied_source_is_retirement_terminal(&source_key)
+                && !crate::kms::render::copied_owner::retire_source_after_completion_proof(
+                    pool, service, bo_idx,
+                )
+            {
+                index += 1;
+                continue;
+            }
+            if !service.copied_source_is_retirement_terminal(&source_key) {
+                index += 1;
+                continue;
+            }
+        }
+
         let mut buffer = bundle.scene.owner_buffers.remove(index);
-        let bo_idx = buffer.identity().bo_idx;
-        if !leave_owner_buffer_from_scanout(&mut bundle.pool, bo_idx) {
+        let kms_was_submitted = buffer.pending_ack().is_some_and(|ack| {
+            matches!(
+                ack.stage,
+                InFlightStage::OwnerSubmitted | InFlightStage::KmsFlipPending
+            )
+        });
+        if !leave_owner_buffer_from_scanout(&mut bundle.pool, bo_idx, kms_was_submitted) {
             bundle.scene.owner_buffers.insert(index, buffer);
             index += 1;
             continue;
@@ -5931,21 +6035,28 @@ fn retire_owner_buffers_in_bundle(
 fn drain_retired_output_bundles(
     inner: &mut SceneCompositorInner,
     platform: &mut PlatformBackend,
-    resource_service: Option<&ResourceService>,
+    mut resource_service: Option<&mut ResourceService>,
 ) {
     let vk = Arc::clone(&inner.vk);
     inner.retired_outputs.retain(|_, bundles| {
         for bundle in bundles.iter_mut() {
-            retire_failed_submit_bos_in_bundle(bundle, platform, vk.as_ref(), resource_service);
-            retire_owner_buffers_in_bundle(bundle, resource_service);
+            retire_failed_submit_bos_in_bundle(
+                bundle,
+                platform,
+                vk.as_ref(),
+                resource_service.as_deref(),
+            );
+            retire_owner_buffers_in_bundle(bundle, resource_service.as_deref_mut());
             drain_retired_pending_pool_releases(
                 &mut bundle.scene,
                 vk.as_ref(),
                 platform,
-                resource_service,
+                resource_service.as_deref(),
             );
         }
-        bundles.retain(|bundle| !retired_output_bundle_is_drained(bundle, resource_service));
+        bundles.retain(|bundle| {
+            !retired_output_bundle_is_drained(bundle, resource_service.as_deref())
+        });
         !bundles.is_empty()
     });
 }
@@ -5984,10 +6095,15 @@ fn retired_output_bundle_is_drained(
                 .bos
                 .iter()
                 .all(|bo| allocation_is_releasable(bo.managed_key()))
-                && pool
-                    .sources
-                    .iter()
-                    .all(|source| allocation_is_releasable(source.managed_key()))
+                && pool.sources.iter().all(|source| {
+                    let key = source.managed_key();
+                    allocation_is_releasable(key)
+                        && key.is_none_or(|key| {
+                            resource_service.is_some_and(|service| {
+                                service.copied_source_is_retirement_terminal(&key)
+                            })
+                        })
+                })
         }
     }
 }

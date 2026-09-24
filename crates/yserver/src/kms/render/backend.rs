@@ -2609,7 +2609,7 @@ impl KmsBackend {
     /// so none of them can omit a step (addenda A1, A2).
     pub(crate) fn service_retired_outputs(&mut self) {
         self.scene
-            .service_retired_output_bundles(&mut self.platform, self.resource_service.as_ref());
+            .service_retired_output_bundles(&mut self.platform, self.resource_service.as_mut());
         self.service_resource_releases_after_retired_outputs();
     }
 
@@ -53804,6 +53804,28 @@ mod tests {
         cleanup_io: crate::kms::render::resources::tests::MockCleanupIo,
     }
 
+    type CopiedOwnerLiveModeset = Result<
+        (
+            OwnerLiveFixture,
+            Option<(DrmDeviceKey, String, yserver_core::backend::ModeSpec)>,
+        ),
+        std::io::Error,
+    >;
+
+    type CopiedModesetFrameAfterA = (
+        OwnerLiveFixture,
+        usize,
+        DrmDeviceKey,
+        u32,
+        String,
+        yserver_core::backend::ModeSpec,
+        crate::kms::backend::OutputInstanceId,
+        Vec<crate::kms::render::resources::AllocationKey>,
+        crate::kms::render::resources::AllocationKey,
+        crate::kms::render::resources::AllocationKey,
+        std::sync::Arc<crate::kms::vk::device::VkContext>,
+    );
+
     fn owner_live_fixture() -> Result<OwnerLiveFixture, std::io::Error> {
         owner_live_fixture_with_output_count(1, false)
     }
@@ -55343,6 +55365,10 @@ mod tests {
     }
 
     fn copied_owner_live_fixture() -> Result<OwnerLiveFixture, std::io::Error> {
+        copied_owner_live_fixture_inner(false).map(|(fixture, _)| fixture)
+    }
+
+    fn copied_owner_live_fixture_inner(use_real_connector: bool) -> CopiedOwnerLiveModeset {
         use std::sync::Arc;
 
         let mut backend = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()?;
@@ -55413,6 +55439,91 @@ mod tests {
             sink_primary,
             crate::kms::scanout_route::RenderKmsRelationship::Different,
         );
+        let mut modeset_output = None;
+        let mut modeset_target = None;
+        if use_real_connector {
+            use ::drm::{ClientCapability, Device as _};
+
+            let drm_device = Rc::clone(
+                &backend
+                    .platform
+                    .device_for_key(sink_primary)
+                    .ok_or_else(|| std::io::Error::other("copied fixture KMS device disappeared"))?
+                    .device,
+            );
+            for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
+                let _ = drm_device.set_client_capability(capability, true);
+            }
+            let candidates = crate::drm::modeset::discover_outputs(&drm_device)?;
+            let (connector, picked_target) = candidates
+                .iter()
+                .find_map(|candidate| {
+                    candidate
+                        .modes
+                        .iter()
+                        .find(|mode| {
+                            mode.width == candidate.picked.width
+                                && mode.height == candidate.picked.height
+                                && mode.vrefresh != candidate.picked.vrefresh
+                        })
+                        .map(|mode| (candidate.connector_name.clone(), mode.clone()))
+                })
+                .or_else(|| {
+                    candidates.iter().find_map(|candidate| {
+                        candidate
+                            .modes
+                            .iter()
+                            .find(|mode| {
+                                mode.width != candidate.picked.width
+                                    || mode.height != candidate.picked.height
+                                    || mode.vrefresh != candidate.picked.vrefresh
+                            })
+                            .map(|mode| (candidate.connector_name.clone(), mode.clone()))
+                    })
+                })
+                .ok_or_else(|| {
+                    std::io::Error::other(
+                        "copied fixture needs a connected connector with two advertised modes",
+                    )
+                })?;
+            let output =
+                crate::drm::modeset::discover_output_for_connector(&drm_device, &connector, &[])?;
+            let target = output
+                .modes
+                .iter()
+                .find(|mode| {
+                    mode.width == output.picked.width
+                        && mode.height == output.picked.height
+                        && mode.vrefresh != output.picked.vrefresh
+                })
+                .cloned()
+                .unwrap_or(picked_target);
+            modeset_target = Some(yserver_core::backend::ModeSpec {
+                width: target.width,
+                height: target.height,
+                vrefresh: target.vrefresh,
+            });
+            modeset_output = Some(output);
+        }
+        if let Some(output) = modeset_output {
+            backend.platform.outputs[0] = crate::kms::backend::ActiveOutput::new(
+                route,
+                output,
+                crate::drm::Swapchain::empty_for_tests(),
+                0,
+                0,
+            );
+            backend
+                .platform
+                .rebuild_output_instance_ids_for_tests()
+                .map_err(|error| {
+                    std::io::Error::other(format!("copied fixture output instance: {error:?}"))
+                })?;
+            backend.apply_virtual_screen_extent(
+                backend.platform.outputs[0].width.max(1),
+                backend.platform.outputs[0].height.max(1),
+            )?;
+        }
         backend.platform.outputs[0].scanout_route = route;
         let destination_route = crate::kms::scanout_route::ScanoutRoute::new(
             sink_id,
@@ -55489,7 +55600,19 @@ mod tests {
             })?;
         backend.platform.reap_executors_on_drop_for_tests();
         backend.resource_cleanup_on_drop_for_tests = true;
-        finish_owner_live_fixture(backend, false)
+        let fixture =
+            finish_owner_live_fixture_with_properties(backend, false, !use_real_connector)?;
+        let modeset = modeset_target.map(|mode| {
+            (
+                sink_primary,
+                fixture.backend.platform.outputs[0]
+                    .key
+                    .connector_name
+                    .clone(),
+                mode,
+            )
+        });
+        Ok((fixture, modeset))
     }
 
     fn owner_live_fixture_with_three_outputs() -> Result<OwnerLiveFixture, std::io::Error> {
@@ -62849,6 +62972,59 @@ mod tests {
         Ok((fixture, device_key, ids.output_id, connector, target_mode))
     }
 
+    fn c0_3bi_copied_live_modeset_backend(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> Result<
+        (
+            OwnerLiveFixture,
+            DrmDeviceKey,
+            u32,
+            String,
+            yserver_core::backend::ModeSpec,
+        ),
+        std::io::Error,
+    > {
+        use ::drm::{ClientCapability, Device as _};
+
+        let (mut fixture, modeset) = copied_owner_live_fixture_inner(true)?;
+        let backend = &mut fixture.backend;
+        let (device_key, connector, target_mode) = modeset.ok_or_else(|| {
+            std::io::Error::other("copied live modeset fixture has no real connector")
+        })?;
+        let output_key = OutputKey::new(device_key, connector.clone());
+        let drm_device = Rc::clone(
+            &backend
+                .platform
+                .device_for_key(device_key)
+                .ok_or_else(|| std::io::Error::other("copied modeset KMS device disappeared"))?
+                .device,
+        );
+        for capability in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
+            let _ = drm_device.set_client_capability(capability, true);
+        }
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&output_key);
+            entry.connected = true;
+            entry.config = super::ConnectorConfig::Enabled {
+                mode_w: backend.platform.outputs[0].width,
+                mode_h: backend.platform.outputs[0].height,
+                vrefresh: backend.platform.outputs[0].output.picked.vrefresh,
+                x: 0,
+                y: 0,
+            };
+            entry.modes = backend.platform.outputs[0].output.modes.clone();
+            entry.edid = backend.platform.outputs[0].output.edid.clone();
+            entry.mm_width = backend.platform.outputs[0].output.mm_width;
+            entry.mm_height = backend.platform.outputs[0].output.mm_height;
+            entry.connector_type = backend.platform.outputs[0].output.connector_type.clone();
+        }
+        backend.output_key_by_id.insert(ids.output_id, output_key);
+        backend.initialize_provider_output_sources()?;
+        c0_3aii_replace_owner_executor(backend, behaviour);
+        Ok((fixture, device_key, ids.output_id, connector, target_mode))
+    }
+
     fn c0_3bi_live_disabled_modeset_backend(
         behaviour: crate::kms::executor::test_support::StubBehaviour,
     ) -> Result<
@@ -63060,12 +63236,1008 @@ mod tests {
             .collect()
     }
 
+    fn c0_3bi_copied_scanout_allocation_keys(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        connector: &str,
+    ) -> Vec<crate::kms::render::resources::AllocationKey> {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == OutputKey::new(device, connector))
+            .expect("installed copied output for modeset");
+        let crate::kms::vk::scanout::OutputScanout::Copied(pool) = backend.platform.scanout_pools
+            [output_idx]
+            .as_ref()
+            .expect("installed copied output scanout pool")
+        else {
+            panic!("installed output must keep its copied route");
+        };
+        pool.destinations
+            .bos
+            .iter()
+            .map(|bo| bo.managed_key().expect("managed copied destination"))
+            .chain(
+                pool.sources
+                    .iter()
+                    .map(|source| source.managed_key().expect("managed copied source")),
+            )
+            .collect()
+    }
+
+    fn c0_3bi_copied_modeset_frame_after_a() -> CopiedModesetFrameAfterA {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (mut fixture, device, output_id, connector, mode) =
+            c0_3bi_copied_live_modeset_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }))
+            .expect("environmental skip: no copied live modeset fixture");
+        let backend = &mut fixture.backend;
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old copied output instance");
+        let keys = c0_3bi_copied_scanout_allocation_keys(backend, device, &connector);
+        let (source_key, destination_key, sink_vk) = {
+            let crate::kms::vk::scanout::OutputScanout::Copied(pool) =
+                backend.platform.scanout_pools[0]
+                    .as_ref()
+                    .expect("copied scanout pool")
+            else {
+                panic!("copied modeset fixture must install copied scanout");
+            };
+            (
+                pool.sources[0]
+                    .managed_key()
+                    .expect("copied source is managed"),
+                pool.destinations.bos[0]
+                    .managed_key()
+                    .expect("copied destination is managed"),
+                pool.sink_context(),
+            )
+        };
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (bo_idx, _, rendering) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("copied Owner tick must retain its A generation");
+        assert!(
+            rendering,
+            "stage A remains in flight until its render proof"
+        );
+
+        (
+            fixture,
+            bo_idx,
+            device,
+            output_id,
+            connector,
+            mode,
+            instance,
+            keys,
+            source_key,
+            destination_key,
+            sink_vk,
+        )
+    }
+
+    fn c0_3bi_retire_copied_output_by_modeset(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        instance: crate::kms::backend::OutputInstanceId,
+    ) {
+        let token = c0_3bi_begin_client_modeset(backend, output_id, connector, mode);
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(backend, device, token, None)
+                .expect("copied output modeset completion result")
+        );
+        backend.service_retired_outputs();
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(instance),
+            "the copied pool must be rooted in its retired bundle"
+        );
+    }
+
+    fn c0_3bi_assert_managed_keys_present(
+        backend: &super::KmsBackend,
+        keys: &[crate::kms::render::resources::AllocationKey],
+    ) {
+        assert!(keys.iter().all(|key| {
+            backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+    }
+
+    fn c0_3bi_assert_managed_keys_absent(
+        backend: &super::KmsBackend,
+        keys: &[crate::kms::render::resources::AllocationKey],
+    ) {
+        let retained = keys
+            .iter()
+            .copied()
+            .filter(|key| {
+                backend
+                    .resource_service()
+                    .is_some_and(|service| service.contains(key))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            retained.is_empty(),
+            "retired copied allocations remain: {retained:?}"
+        );
+    }
+
+    fn c0_3bi_handle_retired_copied_completion(
+        backend: &mut super::KmsBackend,
+        completion: crate::kms::render::platform::ReadyScanoutRenderCompletion,
+    ) {
+        assert!(backend.scene.handle_scanout_render_completion(
+            completion,
+            &mut backend.platform,
+            backend.resource_service.as_mut(),
+        ));
+        backend.service_retired_outputs();
+    }
+
     fn c0_3bi_kms_displacements(
         backend: &super::KmsBackend,
         device: DrmDeviceKey,
         commit: crate::kms::owner::identity::CommitId,
     ) -> Vec<crate::kms::render::resources::KmsReleaseObligation> {
         backend.lifecycle_drivers[&device].kms_displacements_for_tests(commit)
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_copied_mode_change_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_copied_live_modeset_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }))
+            .expect("environmental skip: no copied live modeset fixture");
+        let output_key = OutputKey::new(device, connector.clone());
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old copied output instance");
+        let old_keys = match backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("old copied pool")
+        {
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => pool
+                .destinations
+                .bos
+                .iter()
+                .map(|bo| bo.managed_key().expect("managed old destination"))
+                .chain(
+                    pool.sources
+                        .iter()
+                        .map(|source| source.managed_key().expect("managed old source")),
+                )
+                .collect::<Vec<_>>(),
+            _ => panic!("the old output must use copied scanout"),
+        };
+
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(&mut backend, device, token, None)
+                .expect("copied modeset completion result")
+        );
+
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == output_key)
+            .expect("copied mode-changed output remains installed");
+        let output = &backend.platform.outputs[output_idx];
+        assert_eq!((output.width, output.height), (mode.width, mode.height));
+        assert_eq!(
+            output.scanout_route.relationship,
+            crate::kms::scanout_route::RenderKmsRelationship::Different
+        );
+        let new_keys = c0_3bi_copied_scanout_allocation_keys(&backend, device, &connector);
+        assert_eq!(
+            new_keys.len(),
+            6,
+            "three paired BOs are managed on both sides"
+        );
+        assert!(new_keys.iter().all(|key| {
+            backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(old_instance),
+            "the old source and destination pool stays rooted while its proofs drain"
+        );
+        for _ in 0..4 {
+            backend.before_block();
+        }
+        assert!(
+            !backend
+                .scene
+                .retired_output_has_instance_for_tests(old_instance),
+            "both halves of the retired copied pool are destroyed after the mode change"
+        );
+        assert!(old_keys.iter().all(|key| {
+            !backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_retired_copied_frame_stages_vulkan() {
+        use crate::kms::render::platform::ScanoutRenderCompletionStage;
+
+        // (a) A is in flight when the output is disabled. The old bundle
+        // waits for the renderer fence, then cancels B without making a sink
+        // receipt.
+        {
+            let (
+                mut fixture,
+                _bo_idx,
+                device,
+                output_id,
+                connector,
+                _mode,
+                instance,
+                keys,
+                source_key,
+                destination_key,
+                _sink_vk,
+            ) = c0_3bi_copied_modeset_frame_after_a();
+            let backend = &mut fixture.backend;
+            c0_3bi_retire_copied_output_by_modeset(
+                backend, device, output_id, &connector, None, instance,
+            );
+            c0_3bi_assert_managed_keys_present(backend, &keys);
+            assert!(
+                backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&source_key)
+            );
+            assert!(
+                !backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&destination_key)
+            );
+
+            backend.platform.wait_idle_bounded();
+            let completions = backend.platform.drain_scanout_render_completions();
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].stage, ScanoutRenderCompletionStage::Render);
+            assert!(backend.scene.handle_scanout_render_completion(
+                completions.into_iter().next().unwrap(),
+                &mut backend.platform,
+                backend.resource_service.as_mut(),
+            ));
+            backend.service_retired_outputs();
+            assert!(
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            );
+            c0_3bi_assert_managed_keys_absent(backend, &keys);
+            assert!(backend.scene.take_owner_composed_offers().is_empty());
+        }
+
+        // (b) A's fence is ready, but its completion has not reached the
+        // scene. Retire by mode change, then route the late A completion to
+        // the old instance. The replacement pool must not receive B.
+        {
+            let (
+                mut fixture,
+                _bo_idx,
+                device,
+                output_id,
+                connector,
+                mode,
+                instance,
+                keys,
+                source_key,
+                destination_key,
+                _sink_vk,
+            ) = c0_3bi_copied_modeset_frame_after_a();
+            let backend = &mut fixture.backend;
+            backend.platform.wait_idle_bounded();
+            let mut completions = backend.platform.drain_scanout_render_completions();
+            assert_eq!(completions.len(), 1);
+            let completion = completions.pop().unwrap();
+            assert_eq!(completion.stage, ScanoutRenderCompletionStage::Render);
+            c0_3bi_retire_copied_output_by_modeset(
+                backend,
+                device,
+                output_id,
+                &connector,
+                Some(mode),
+                instance,
+            );
+            c0_3bi_assert_managed_keys_present(backend, &keys);
+            c0_3bi_handle_retired_copied_completion(backend, completion);
+            assert!(
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            );
+            assert!(
+                !backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&source_key)
+            );
+            assert!(
+                !backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&destination_key)
+            );
+            assert!(
+                backend
+                    .resource_service()
+                    .unwrap()
+                    .pending_batches()
+                    .is_empty()
+            );
+            c0_3bi_assert_managed_keys_absent(backend, &keys);
+            assert!(backend.scene.take_owner_composed_offers().is_empty());
+            let replacement_keys =
+                c0_3bi_copied_scanout_allocation_keys(backend, device, &connector);
+            assert!(replacement_keys.iter().all(|key| !keys.contains(key)));
+            assert!(
+                backend.platform.scanout_pools[0]
+                    .as_ref()
+                    .unwrap()
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .all(|bo| bo.state.phase != crate::kms::vk::scanout::BoPhase::Owner)
+            );
+        }
+
+        // (c) A has submitted B when the output is disabled. The bundle
+        // remains after device idle alone; its exact B completion services
+        // both the sink write and source read proofs.
+        {
+            let (
+                mut fixture,
+                bo_idx,
+                device,
+                output_id,
+                connector,
+                _mode,
+                instance,
+                keys,
+                source_key,
+                destination_key,
+                sink_vk,
+            ) = c0_3bi_copied_modeset_frame_after_a();
+            let backend = &mut fixture.backend;
+            backend.platform.wait_idle_bounded();
+            backend.drain_scanout_render_completions_for_tests();
+            let receipt = backend
+                .scene
+                .copied_receipt_for_tests(0, bo_idx)
+                .expect("A completion submits B while the output is live");
+            assert_eq!(receipt.0.0, destination_key);
+            assert_eq!(receipt.1.0, source_key);
+            c0_3bi_retire_copied_output_by_modeset(
+                backend, device, output_id, &connector, None, instance,
+            );
+            c0_3bi_assert_managed_keys_present(backend, &keys);
+            backend.service_retired_outputs();
+            assert!(
+                backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            );
+            assert!(
+                backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&source_key)
+            );
+            assert!(
+                backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&destination_key)
+            );
+
+            unsafe {
+                sink_vk
+                    .device
+                    .device_wait_idle()
+                    .expect("copied sink device idle")
+            };
+            backend.service_retired_outputs();
+            assert!(
+                backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            );
+            let completions = backend.platform.drain_scanout_render_completions();
+            assert_eq!(completions.len(), 1);
+            assert_eq!(
+                completions[0].stage,
+                ScanoutRenderCompletionStage::CopiedOwnerCopy
+            );
+            c0_3bi_handle_retired_copied_completion(
+                backend,
+                completions.into_iter().next().unwrap(),
+            );
+            assert!(
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            );
+            c0_3bi_assert_managed_keys_absent(backend, &keys);
+            assert!(backend.scene.take_owner_composed_offers().is_empty());
+        }
+
+        // (d) B's fence and receipts complete, but its wake is still queued.
+        // A mode change retires the pool before that wake. The old generation
+        // is discarded locally and never offered to KMS.
+        {
+            let (
+                mut fixture,
+                bo_idx,
+                device,
+                output_id,
+                connector,
+                mode,
+                instance,
+                keys,
+                source_key,
+                destination_key,
+                sink_vk,
+            ) = c0_3bi_copied_modeset_frame_after_a();
+            let backend = &mut fixture.backend;
+            backend.platform.wait_idle_bounded();
+            backend.drain_scanout_render_completions_for_tests();
+            assert!(backend.scene.copied_receipt_for_tests(0, bo_idx).is_some());
+            unsafe {
+                sink_vk
+                    .device
+                    .device_wait_idle()
+                    .expect("copied sink device idle")
+            };
+            backend
+                .resource_service_mut()
+                .expect("resource service")
+                .service_completions(std::time::Instant::now())
+                .expect("B's sink fence retires its read and write receipts");
+            let mut completions = backend.platform.drain_scanout_render_completions();
+            assert_eq!(completions.len(), 1);
+            let completion = completions.pop().unwrap();
+            assert_eq!(
+                completion.stage,
+                ScanoutRenderCompletionStage::CopiedOwnerCopy
+            );
+            assert!(
+                !backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&source_key)
+            );
+            assert!(
+                !backend
+                    .resource_service()
+                    .unwrap()
+                    .has_pending_obligations(&destination_key)
+            );
+
+            c0_3bi_retire_copied_output_by_modeset(
+                backend,
+                device,
+                output_id,
+                &connector,
+                Some(mode),
+                instance,
+            );
+            c0_3bi_assert_managed_keys_present(backend, &keys);
+            c0_3bi_handle_retired_copied_completion(backend, completion);
+            assert!(
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            );
+            c0_3bi_assert_managed_keys_absent(backend, &keys);
+            assert!(backend.scene.take_owner_composed_offers().is_empty());
+            assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_retired_submitted_copied_frame_vulkan() {
+        use crate::kms::{
+            executor::test_support::ScriptedReply, render::resources::ObligationKind,
+        };
+
+        let (
+            mut fixture,
+            bo_idx,
+            device,
+            output_id,
+            connector,
+            _mode,
+            instance,
+            keys,
+            source_key,
+            destination_key,
+            _sink_vk,
+        ) = c0_3bi_copied_modeset_frame_after_a();
+        let backend = &mut fixture.backend;
+
+        // Drive A and B through the real producer, retire B's read/write
+        // receipts, then let the Owner conductor submit the destination on
+        // the sink device.
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        wait_copied_sink_idle(backend);
+        backend
+            .resource_service_mut()
+            .expect("resource service")
+            .service_completions(std::time::Instant::now())
+            .expect("B's sink write and source read retire");
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("copied generation is submitted through Owner")
+            .commit_id();
+        assert_eq!(
+            backend.scene.owner_state_for_tests(0, bo_idx),
+            Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted)
+        );
+        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+
+        let output = &backend.platform.outputs[0];
+        let member = crate::kms::render::resources::GroupMember::new(
+            crate::kms::render::platform::CrtcKey::for_output(output),
+            backend
+                .platform
+                .owner_ref(device)
+                .expect("sink KMS owner")
+                .topology_generation(),
+            1,
+        );
+        let held_kms_commit = crate::kms::owner::identity::CommitId::for_tests(0x3b1_602);
+        let held_kms = backend
+            .resource_service_mut()
+            .expect("resource service")
+            .register_kms(destination_key, held_kms_commit, member)
+            .expect("hold a KmsRelease proof independently");
+
+        c0_3aii_replace_owner_executor(
+            backend,
+            crate::kms::executor::test_support::StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }),
+        );
+        let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, None);
+        let displacing_commit = c0_3bi_dispatch_client_modeset(backend, device);
+        let displacements = c0_3bi_kms_displacements(backend, device, displacing_commit);
+        assert!(
+            displacements
+                .iter()
+                .any(|registration| registration.allocation == destination_key)
+        );
+        c0_conv_cii_accept_direct_owner_commit(backend, device, displacing_commit);
+        let completion = backend.complete_owner_for_tests(0);
+        assert!(backend.route_owner_event_batch(device, completion, std::time::Instant::now()));
+        assert!(Backend::finish_crtc_config(backend, token).expect("copied output disable"));
+        backend.service_retired_outputs();
+
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(instance)
+        );
+        c0_3bi_assert_managed_keys_present(backend, &keys);
+        assert!(
+            backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligation(&destination_key, held_kms)
+        );
+        assert!(displacements.iter().all(|registration| {
+            !backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligation(&registration.allocation, registration.obligation)
+        }));
+
+        // The real disable commit discharged its KmsRelease registrations.
+        // Hold the two independent postconditions in turn: a second typed
+        // release keeps the destination rooted first, then a FOREIGN return
+        // keeps the source rooted after that KMS gate is discharged.
+        let held_foreign_return = backend
+            .resource_service_mut()
+            .expect("resource service")
+            .register(source_key, ObligationKind::ForeignReturn)
+            .expect("hold the copied source FOREIGN return");
+        backend
+            .resource_service_mut()
+            .expect("resource service")
+            .discharge_kms_release(
+                crate::kms::render::resources::KmsReleaseObligation {
+                    allocation: destination_key,
+                    obligation: held_kms,
+                    member,
+                    commit: held_kms_commit,
+                },
+                crate::kms::render::resources::KmsReleaseProof::CompletionRetired {
+                    through_commit: held_kms_commit,
+                    crtc: member.crtc,
+                },
+            )
+            .expect("discharge KmsRelease while FOREIGN return is outstanding");
+        let (commit_consumer, resource_service) =
+            (&mut backend.commit_consumer, &mut backend.resource_service);
+        commit_consumer
+            .on_available(
+                &[destination_key],
+                resource_service.as_mut().expect("resource service"),
+            )
+            .expect("release commit-consumer leases after KmsRelease");
+        backend.service_retired_outputs();
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(instance)
+        );
+        assert!(
+            backend
+                .resource_service()
+                .unwrap()
+                .is_releasable(&destination_key)
+        );
+        assert!(
+            !backend
+                .resource_service()
+                .unwrap()
+                .is_releasable(&source_key)
+        );
+        c0_3bi_assert_managed_keys_present(backend, &keys);
+
+        backend
+            .resource_service_mut()
+            .expect("resource service")
+            .apply_validated_proof_for_tests(source_key, held_foreign_return)
+            .expect("discharge the source FOREIGN return");
+        backend.service_retired_outputs();
+        assert!(
+            !backend
+                .scene
+                .retired_output_has_instance_for_tests(instance)
+        );
+        c0_3bi_assert_managed_keys_absent(backend, &keys);
+        assert!(backend.scene.take_owner_composed_offers().is_empty());
+        assert!(backend.platform.outputs.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_late_copy_completion_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::platform::ScanoutRenderCompletionStage,
+        };
+        use std::sync::Arc;
+
+        let (mut fixture, device, output_id, connector, mode) =
+            c0_3bi_copied_live_modeset_backend(StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: 0,
+                fds: 0,
+            }))
+            .expect("environmental skip: no copied live modeset fixture");
+        let backend = &mut fixture.backend;
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old copied output instance");
+        let old_keys = c0_3bi_copied_scanout_allocation_keys(backend, device, &connector);
+        let (old_source_key, old_destination_key, sink_vk) = {
+            let crate::kms::vk::scanout::OutputScanout::Copied(pool) =
+                backend.platform.scanout_pools[0]
+                    .as_ref()
+                    .expect("old copied pool")
+            else {
+                panic!("late completion fixture must install copied scanout");
+            };
+            (
+                pool.sources[0]
+                    .managed_key()
+                    .expect("old copied source is managed"),
+                pool.destinations.bos[0]
+                    .managed_key()
+                    .expect("old copied destination is managed"),
+                pool.sink_context(),
+            )
+        };
+
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (bo_idx, _, rendering) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("the live copied output starts A");
+        assert!(rendering, "A remains in flight until its render proof");
+        backend.platform.wait_idle_bounded();
+        let mut render_completions = backend.platform.drain_scanout_render_completions();
+        assert_eq!(render_completions.len(), 1);
+        let render_completion = render_completions.pop().unwrap();
+        assert_eq!(render_completion.output_instance_id, old_instance);
+        assert_eq!(
+            render_completion.stage,
+            ScanoutRenderCompletionStage::Render
+        );
+        assert!(backend.scene.handle_scanout_render_completion(
+            render_completion,
+            &mut backend.platform,
+            backend.resource_service.as_mut(),
+        ));
+        assert_eq!(
+            backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            1,
+            "B is still waiting for its sink completion while topology changes"
+        );
+
+        // Add a second output after B is submitted but before its completion.
+        // It makes the old output move from index 0 to 1 during disable/enable,
+        // while keeping its own scene idle and independent of the late copy.
+        let sink_id = backend
+            .platform
+            .render_devices
+            .iter()
+            .find(|render_device| render_device.selector == sink_vk.device_selector())
+            .map(|render_device| render_device.id)
+            .expect("sink renderer remains in the render-device inventory");
+        let peer_connector = "test-copied-peer";
+        backend
+            .platform
+            .append_test_output_without_scanout_pool(peer_connector);
+        let peer_idx = backend.platform.outputs.len() - 1;
+        let peer_x = i32::from(backend.platform.outputs[0].width);
+        let peer_route = crate::kms::scanout_route::ScanoutRoute::new(
+            sink_id,
+            device,
+            crate::kms::scanout_route::RenderKmsRelationship::Same,
+        );
+        {
+            let peer = &mut backend.platform.outputs[peer_idx];
+            peer.scanout_route = peer_route;
+            let fake_object = 0xefff_ff30;
+            peer.output.encoder = ::drm::control::from_u32(fake_object).unwrap();
+            peer.output.crtc = ::drm::control::from_u32(fake_object + 1).unwrap();
+            peer.output.plane = ::drm::control::from_u32(fake_object + 2).unwrap();
+            peer.output.plane_fb_id_prop = ::drm::control::from_u32(19).unwrap();
+            peer.output.plane_crtc_id_prop = ::drm::control::from_u32(20).unwrap();
+            peer.output.crtc_out_fence_ptr_prop = Some(::drm::control::from_u32(22).unwrap());
+            peer.x = peer_x;
+        }
+        backend.platform.devices[0]
+            .active_property_cache
+            .insert_for_tests(0xefff_ff31, 21);
+        let peer_pool = backend
+            .platform
+            .allocate_test_output_scanout(Arc::clone(&sink_vk), peer_idx)
+            .expect("allocate the idle peer output pool");
+        let peer_pool_depth = peer_pool.display_pool().bos.len();
+        backend.platform.scanout_pools[peer_idx] = Some(peer_pool);
+        backend.platform.bo_generations[peer_idx] = vec![Default::default(); peer_pool_depth];
+        for bo_idx in 0..peer_pool_depth {
+            let (platform, service, registry) = (
+                &mut backend.platform,
+                backend.resource_service.as_mut().expect("resource service"),
+                backend
+                    .drm_cleanup_registry
+                    .as_mut()
+                    .expect("DRM cleanup registry"),
+            );
+            platform
+                .register_managed_scanout_bo(service, registry, peer_idx, bo_idx)
+                .expect("adopt idle peer BO");
+        }
+        c0_conv_cii_prepare_owner_clock(
+            backend,
+            device,
+            peer_idx,
+            yserver_core::backend::PresentClockSample {
+                msc: 1_301,
+                ust: 1_301_000,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+        );
+        let (fb_w, fb_h) = crate::kms::render::platform::recompute_fb_extent_from(
+            &backend
+                .platform
+                .outputs
+                .iter()
+                .map(|output| (output.x, output.y, output.width, output.height))
+                .collect::<Vec<_>>(),
+        );
+        backend
+            .apply_virtual_screen_extent(fb_w.max(1), fb_h.max(1))
+            .expect("extend root storage for peer output");
+        let peer_key = backend.platform.outputs[peer_idx].key.clone();
+        let peer_identity = backend.platform.output_instance_ids[peer_idx];
+        let staged_peer = backend
+            .scene
+            .stage_output_scene_state(&backend.platform, peer_idx, peer_identity)
+            .expect("stage idle peer scene state");
+        let mut identity_map = backend.scene.stage_output_identity_map();
+        identity_map.insert(peer_key, staged_peer);
+        backend
+            .scene
+            .promote_output_identity_map(&backend.platform, identity_map);
+        let peer_instance = backend
+            .scene
+            .output_instance_id_for_tests(peer_idx)
+            .expect("idle peer output instance");
+        let peer_images = c0_3bi_scanout_images(backend, peer_idx);
+
+        assert!(
+            backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligations(&old_source_key)
+        );
+        assert!(
+            backend
+                .resource_service()
+                .unwrap()
+                .has_pending_obligations(&old_destination_key)
+        );
+
+        c0_3bi_retire_copied_output_by_modeset(
+            backend,
+            device,
+            output_id,
+            &connector,
+            None,
+            old_instance,
+        );
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+        );
+        assert_eq!(backend.platform.outputs.len(), 1);
+        assert_eq!(
+            backend.platform.outputs[0].key.connector_name,
+            peer_connector
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(peer_instance),
+            "the unrelated output shifts by index but keeps its identity"
+        );
+        c0_3bi_assert_managed_keys_present(backend, &old_keys);
+
+        // Re-enable the disabled connector in its alternate mode. This puts a
+        // fresh copied pool at index 1 while the old copy completion remains
+        // queued against the retired output instance.
+        let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(backend, device, token, None)
+                .expect("re-enable copied output at the new mode")
+        );
+        let new_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == OutputKey::new(device, connector.clone()))
+            .expect("re-enabled copied output");
+        assert_eq!(
+            new_idx, 1,
+            "the re-enabled output is appended after the peer"
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(peer_instance)
+        );
+        let new_instance = backend
+            .scene
+            .output_instance_id_for_tests(new_idx)
+            .expect("new copied output instance");
+        assert_ne!(new_instance, old_instance);
+        let new_keys = c0_3bi_copied_scanout_allocation_keys(backend, device, &connector);
+        assert!(new_keys.iter().all(|key| !old_keys.contains(key)));
+        let new_images = c0_3bi_scanout_images(backend, new_idx);
+        let new_phases = backend.platform.scanout_pools[new_idx]
+            .as_ref()
+            .expect("new copied pool")
+            .display_pool()
+            .bos
+            .iter()
+            .map(|bo| bo.state.phase)
+            .collect::<Vec<_>>();
+        let new_owner_states = (0..new_phases.len())
+            .map(|bo_idx| backend.scene.owner_state_for_tests(new_idx, bo_idx))
+            .collect::<Vec<_>>();
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(old_instance),
+            "the old bundle remains while the copied completion is queued"
+        );
+        c0_3bi_assert_managed_keys_present(backend, &old_keys);
+
+        unsafe {
+            sink_vk
+                .device
+                .device_wait_idle()
+                .expect("old copied sink device idle after mode promotion");
+        }
+        backend.platform.wait_idle_bounded();
+        let completions = backend.platform.drain_scanout_render_completions();
+        assert_eq!(completions.len(), 1);
+        let completion = completions.into_iter().next().unwrap();
+        assert_eq!(completion.output_instance_id, old_instance);
+        assert_eq!(completion.output_key.connector_name, connector);
+        assert_eq!(completion.bo_idx, bo_idx);
+        assert_eq!(
+            completion.stage,
+            ScanoutRenderCompletionStage::CopiedOwnerCopy
+        );
+        c0_3bi_handle_retired_copied_completion(backend, completion);
+
+        assert!(
+            !backend
+                .scene
+                .retired_output_has_instance_for_tests(old_instance)
+        );
+        c0_3bi_assert_managed_keys_absent(backend, &old_keys);
+        assert_eq!(c0_3bi_scanout_images(backend, new_idx), new_images);
+        assert_eq!(
+            backend.platform.scanout_pools[new_idx]
+                .as_ref()
+                .expect("new copied pool remains installed")
+                .display_pool()
+                .bos
+                .iter()
+                .map(|bo| bo.state.phase)
+                .collect::<Vec<_>>(),
+            new_phases,
+            "late old completion leaves every new-pool BO phase unchanged"
+        );
+        assert_eq!(
+            (0..new_phases.len())
+                .map(|bo_idx| backend.scene.owner_state_for_tests(new_idx, bo_idx))
+                .collect::<Vec<_>>(),
+            new_owner_states,
+            "late old completion leaves every new-pool Owner state unchanged"
+        );
+        assert_eq!(c0_3bi_scanout_images(backend, 0), peer_images);
+        assert!(backend.scene.take_owner_composed_offers().is_empty());
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
     }
 
     #[test]
@@ -63803,7 +64975,7 @@ mod tests {
             .expect("register outstanding KmsRelease");
         backend.scene.poll_retired_outputs_for_tests(
             &mut backend.platform,
-            backend.resource_service.as_ref(),
+            backend.resource_service.as_mut(),
         );
 
         assert!(
@@ -81747,7 +82919,7 @@ mod tests {
         );
         backend.scene.poll_retired_outputs_for_tests(
             &mut backend.platform,
-            backend.resource_service.as_ref(),
+            backend.resource_service.as_mut(),
         );
         assert_eq!(
             backend
@@ -81772,7 +82944,7 @@ mod tests {
         ticket.test_signal();
         backend.scene.poll_retired_outputs_for_tests(
             &mut backend.platform,
-            backend.resource_service.as_ref(),
+            backend.resource_service.as_mut(),
         );
         assert!(
             !backend
@@ -81834,7 +83006,7 @@ mod tests {
         assert_eq!(c0_3bi_scanout_images(backend, 0), shifted_images);
         backend.scene.poll_retired_outputs_for_tests(
             &mut backend.platform,
-            backend.resource_service.as_ref(),
+            backend.resource_service.as_mut(),
         );
         assert_eq!(
             backend
@@ -81859,7 +83031,7 @@ mod tests {
         ticket.test_signal();
         backend.scene.poll_retired_outputs_for_tests(
             &mut backend.platform,
-            backend.resource_service.as_ref(),
+            backend.resource_service.as_mut(),
         );
         assert!(
             !backend

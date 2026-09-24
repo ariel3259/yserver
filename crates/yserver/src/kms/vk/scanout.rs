@@ -2825,6 +2825,29 @@ impl CopiedScanoutPool {
         Ok(())
     }
 
+    /// Return an Owner destination that completed no KMS submission to a
+    /// retired pool. Its B write has already been proven complete by the
+    /// caller; the next copied write will discard the old image contents.
+    pub(crate) fn retire_unsubmitted_destination(&mut self, bo_idx: usize) -> io::Result<()> {
+        let ownership = self
+            .destination_ownership
+            .get_mut(bo_idx)
+            .ok_or_else(|| io::Error::other("copied scanout ownership index out of range"))?;
+        match *ownership {
+            CopiedDestinationOwnership::LocalFirstUse
+            | CopiedDestinationOwnership::ForeignImportedFirstUse
+            | CopiedDestinationOwnership::ForeignPendingKmsFromSink
+            | CopiedDestinationOwnership::ForeignRetiredByKms
+            | CopiedDestinationOwnership::ReleasedButAtomicRejected => {
+                *ownership = CopiedDestinationOwnership::ReleasedButAtomicRejected;
+                Ok(())
+            }
+            CopiedDestinationOwnership::ForeignPendingKmsUninitialized => Err(io::Error::other(
+                "unsubmitted copied destination was still installed by a modeset",
+            )),
+        }
+    }
+
     /// A synchronous modeset may install a fresh destination without a prior
     /// B submission. Once it succeeds, KMS is nevertheless the external
     /// owner, so the next B write must acquire from FOREIGN.

@@ -6901,10 +6901,11 @@ impl PlatformBackend {
         Ok(display_key)
     }
 
-    /// Adopt a not-yet-installed, same-device scanout pool through the same
-    /// 2c-i ownership path as an installed output. The caller owns the pool
-    /// until promotion; a partial adoption is unwound before this returns an
-    /// error.
+    /// Adopt a not-yet-installed scanout pool through the same 2c-i ownership
+    /// path as an installed output. A copied route moves both the sink-local
+    /// framebuffer allocation and its renderer-side source into the service.
+    /// The caller owns the pool until promotion; partial adoption unwinds
+    /// before this returns an error.
     pub(crate) fn register_prepared_client_scanout_pool(
         &mut self,
         scanout: &mut OutputScanout,
@@ -6916,36 +6917,66 @@ impl PlatformBackend {
     > {
         use crate::kms::render::resources::{AllocationPayload, ResourceError, ScanoutAllocation};
 
-        if !matches!(scanout, OutputScanout::Shared(_)) || service.is_exhausted() {
-            return Err(if service.is_exhausted() {
-                ResourceError::Exhausted
-            } else {
-                ResourceError::InvalidState
-            });
+        if service.is_exhausted() {
+            return Err(ResourceError::Exhausted);
         }
 
         let bo_count = scanout.display_pool().bos.len();
-        let mut keys = Vec::with_capacity(bo_count);
+        let is_copied = scanout.copied().is_some();
+        let mut keys = Vec::with_capacity(bo_count * if is_copied { 2 } else { 1 });
         for bo_idx in 0..bo_count {
-            let bo = &mut scanout.display_pool_mut().bos[bo_idx];
+            let bo = &scanout.display_pool().bos[bo_idx];
             if bo.fb_handle.is_none() || bo.gem_handle.is_none() {
                 scanout.detach_managed_entries(Some(registry));
                 let _ = service.service_ready_with_registry(registry);
                 return Err(ResourceError::InvalidState);
             }
-            let backing = bo
+
+            let renderer_backing = if let Some(pool) = scanout.copied_mut() {
+                Some(
+                    pool.sources
+                        .get_mut(bo_idx)
+                        .ok_or(ResourceError::InvalidState)?
+                        .take_physical_backing(),
+                )
+            } else {
+                None
+            };
+            let display_backing = match scanout.display_pool_mut().bos[bo_idx]
                 .take_physical_backing()
-                .expect("a new client modeset pool has physical scanout backing");
-            let allocation = ScanoutAllocation::from_scanout_bo_backing(backing, registry)
-                .expect("framebuffer and GEM handles were validated above");
-            let lease = match service
-                .adopt_with_registry(AllocationPayload::Scanout(allocation), registry)
+            {
+                Some(backing) => backing,
+                None => {
+                    if let (Some(pool), Some(backing)) = (scanout.copied_mut(), renderer_backing) {
+                        pool.sources[bo_idx].restore_physical_backing(backing);
+                    }
+                    scanout.detach_managed_entries(Some(registry));
+                    let _ = service.service_ready_with_registry(registry);
+                    return Err(ResourceError::InvalidState);
+                }
+            };
+            let display_allocation =
+                ScanoutAllocation::from_scanout_bo_backing(display_backing, registry)
+                    .expect("framebuffer and GEM handles were validated above");
+            let renderer_allocation = renderer_backing.map(
+                crate::kms::render::resources::CopiedSourceAllocation::from_copied_render_source_backing,
+            );
+            let display_lease = match service
+                .adopt_with_registry(AllocationPayload::Scanout(display_allocation), registry)
             {
                 Ok(lease) => lease,
                 Err((error, AllocationPayload::Scanout(allocation))) => {
-                    if let Some(bo) = scanout.display_pool_mut().bos.get_mut(bo_idx) {
-                        bo.restore_physical_backing(allocation.into_scanout_bo_backing());
+                    if let Some(allocation) = renderer_allocation {
+                        scanout
+                            .copied_mut()
+                            .expect("renderer allocation belongs to a copied pool")
+                            .sources[bo_idx]
+                            .restore_physical_backing(
+                                allocation.into_copied_render_source_backing(),
+                            );
                     }
+                    scanout.display_pool_mut().bos[bo_idx]
+                        .restore_physical_backing(allocation.into_scanout_bo_backing());
                     scanout.detach_managed_entries(Some(registry));
                     let _ = service.service_ready_with_registry(registry);
                     return Err(error);
@@ -6953,16 +6984,135 @@ impl PlatformBackend {
                 Err((error, _)) => return Err(error),
             };
 
-            let key = lease.key();
+            let renderer_lease = match renderer_allocation {
+                Some(allocation) => {
+                    match service.adopt(AllocationPayload::CopiedSource(allocation)) {
+                        Ok(lease) => Some(lease),
+                        Err((error, AllocationPayload::CopiedSource(allocation))) => {
+                            scanout
+                                .copied_mut()
+                                .expect("renderer allocation belongs to a copied pool")
+                                .sources[bo_idx]
+                                .restore_physical_backing(
+                                    allocation.into_copied_render_source_backing(),
+                                );
+                            let display_key = display_lease.key();
+                            match service.release_fresh_adoption(display_lease) {
+                                Ok(AllocationPayload::Scanout(allocation)) => {
+                                    registry.unregister_payload_alias(display_key);
+                                    scanout.display_pool_mut().bos[bo_idx]
+                                        .restore_physical_backing(
+                                            allocation.into_scanout_bo_backing(),
+                                        );
+                                }
+                                Ok(_) => {
+                                    unreachable!("fresh display adoption changed payload kind")
+                                }
+                                Err(lease) => drop(lease),
+                            }
+                            scanout.detach_managed_entries(Some(registry));
+                            let _ = service.service_ready_with_registry(registry);
+                            return Err(error);
+                        }
+                        Err((error, _)) => return Err(error),
+                    }
+                }
+                None => None,
+            };
+
+            let display_key = display_lease.key();
             let bo = &mut scanout.display_pool_mut().bos[bo_idx];
-            bo.set_managed(lease);
+            bo.set_managed(display_lease);
             let alias = bo
                 .take_husk_alias()
                 .expect("managed adoption leaves a counted pool husk alias");
             bo.set_husk_registration(registry.register_pool_husk(alias));
-            keys.push(key);
+            keys.push(display_key);
+            if let Some(renderer_lease) = renderer_lease {
+                let source = scanout
+                    .copied_mut()
+                    .and_then(|pool| pool.sources.get_mut(bo_idx))
+                    .ok_or(ResourceError::InvalidState)?;
+                keys.push(renderer_lease.key());
+                source.set_managed(renderer_lease);
+            }
         }
         Ok(keys)
+    }
+
+    /// Allocate a client-modeset scanout pool using the selected route. The
+    /// copied case reuses exact-plan qualification and live replay, but leaves
+    /// the actual modeset commit to the lifecycle transaction.
+    pub(crate) fn allocate_prepared_client_scanout_pool(
+        &mut self,
+        drm_device: Rc<drm::Device>,
+        output: &crate::platform::drm::Output,
+        route: ScanoutRoute,
+        width: u32,
+        height: u32,
+    ) -> io::Result<OutputScanout> {
+        match route.relationship {
+            RenderKmsRelationship::Same => {
+                let vk = self.vk.as_ref().cloned().ok_or_else(|| {
+                    io::Error::other("client modeset has no renderer Vulkan context")
+                })?;
+                crate::kms::vk::scanout::ScanoutBoPool::allocate(
+                    vk,
+                    drm_device,
+                    route,
+                    width,
+                    height,
+                    SCANOUT_POOL_DEPTH,
+                    &output.scanout_modifiers,
+                )
+                .map(OutputScanout::Shared)
+            }
+            RenderKmsRelationship::Different => {
+                let render_vk = self.vk.as_ref().cloned().ok_or_else(|| {
+                    io::Error::other("copied client modeset has no source Vulkan context")
+                })?;
+                let (sink_id, sink_vk) = self.copied_sink_context_for_kms(route.kms_device_key)?;
+                let destination_route =
+                    ScanoutRoute::new(sink_id, route.kms_device_key, RenderKmsRelationship::Same);
+                // The enclosing client-modeset transaction sends its full
+                // mode/FB TEST_ONLY validation to the sink before acceptance.
+                // Allocate the exact source/destination candidate here so
+                // preparation itself needs no separate KMS validation ioctl.
+                let plans = crate::kms::vk::scanout::CopiedScanoutPool::exact_allocation_plans(
+                    &render_vk,
+                    &sink_vk,
+                    &drm_device,
+                    width,
+                    &output.scanout_modifiers,
+                );
+                let mut failures = Vec::new();
+                for plan in plans {
+                    match crate::kms::vk::scanout::CopiedScanoutPool::allocate_exact(
+                        Arc::clone(&render_vk),
+                        Arc::clone(&sink_vk),
+                        Rc::clone(&drm_device),
+                        route,
+                        destination_route,
+                        width,
+                        height,
+                        SCANOUT_POOL_DEPTH,
+                        &output.scanout_modifiers,
+                        plan,
+                    ) {
+                        Ok(pool) => return Ok(OutputScanout::Copied(pool)),
+                        Err(error) => failures.push(format!("{}: {error}", plan.describe())),
+                    }
+                }
+                Err(io::Error::other(format!(
+                    "every exact copied allocation plan failed for {route:?}: {}",
+                    failures.join("; ")
+                )))
+            }
+            RenderKmsRelationship::Unknown => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "client modeset scanout route is unknown",
+            )),
+        }
     }
 
     /// F2-M2 rollback helper: restores a display bo's physical backing after

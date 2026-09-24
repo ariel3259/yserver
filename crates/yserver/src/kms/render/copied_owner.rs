@@ -63,6 +63,38 @@ pub(crate) fn release_source_after_read_retirement(
     released
 }
 
+/// Terminalize a retired output's source half after the exact A or B
+/// completion batch has been serviced. This path intentionally differs from
+/// the live-output release above: there is no later A submission that can
+/// consume B's FOREIGN return payload.
+pub(crate) fn retire_source_after_completion_proof(
+    pool: &mut CopiedScanoutPool,
+    service: &mut ResourceService,
+    bo_idx: usize,
+) -> bool {
+    let Some(source_key) = pool
+        .sources
+        .get(bo_idx)
+        .and_then(|source| source.managed_key())
+    else {
+        return false;
+    };
+    if service.has_pending_obligations(&source_key) || service.is_frozen(&source_key) {
+        return false;
+    }
+    let Ok(lease) = service.reserve(source_key, super::resources::UseKind::Read) else {
+        return false;
+    };
+    let terminal = service
+        .with_copied_source(&lease, |source| source.retire_after_completion_proof())
+        .unwrap_or(false);
+    drop(lease);
+    if terminal {
+        pool.release_completed_source(bo_idx);
+    }
+    terminal
+}
+
 /// Dispose of a sink submission after its dispatch answer is known.  The
 /// service owns the cancel/freeze decision; this helper only performs the
 /// sink's established quiescence and repairs the managed source payload whose

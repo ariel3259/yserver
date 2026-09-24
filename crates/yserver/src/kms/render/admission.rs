@@ -192,7 +192,6 @@ pub(crate) enum OwnerRefusal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientModesetUnsupportedFeature {
-    CopiedRoute,
     PositionOnly,
 }
 
@@ -1708,7 +1707,11 @@ impl KmsBackend {
             .get(output_idx)
             .and_then(Option::as_ref)
             .ok_or(ResourceError::InvalidState)?;
-        if !matches!(scanout, crate::kms::vk::scanout::OutputScanout::Shared(_)) {
+        if !matches!(
+            scanout,
+            crate::kms::vk::scanout::OutputScanout::Shared(_)
+                | crate::kms::vk::scanout::OutputScanout::Copied(_)
+        ) {
             return Err(ResourceError::InvalidState);
         }
         let allocations = scanout
@@ -2317,13 +2320,8 @@ impl KmsBackend {
             .platform
             .scanout_route_for_kms(device)
             .map_err(|_| preparation_error(Stage::Route))?;
-        if scanout_route.relationship != crate::kms::scanout_route::RenderKmsRelationship::Same {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                ClientModesetFailure::OwnerRefused(OwnerRefusal::NotYetSupported(
-                    ClientModesetUnsupportedFeature::CopiedRoute,
-                )),
-            ));
+        if scanout_route.relationship == crate::kms::scanout_route::RenderKmsRelationship::Unknown {
+            return Err(preparation_error(Stage::Route));
         }
 
         let global_level = self.lifecycle_coordinator.protocol_dpms_level();
@@ -2453,22 +2451,16 @@ impl KmsBackend {
             if std::mem::take(&mut self.client_modeset_force_allocation_failure_for_tests) {
                 return Err(preparation_error(Stage::Allocation));
             }
-            let vk = self
+            let mut scanout = self
                 .platform
-                .vk()
-                .cloned()
-                .ok_or_else(|| preparation_error(Stage::Allocation))?;
-            let mut scanout = crate::kms::vk::scanout::ScanoutBoPool::allocate(
-                vk,
-                std::rc::Rc::clone(&drm_device),
-                scanout_route,
-                u32::from(mode.width),
-                u32::from(mode.height),
-                crate::kms::render::platform::SCANOUT_POOL_DEPTH,
-                &output.scanout_modifiers,
-            )
-            .map(crate::kms::vk::scanout::OutputScanout::Shared)
-            .map_err(|_| preparation_error(Stage::Allocation))?;
+                .allocate_prepared_client_scanout_pool(
+                    std::rc::Rc::clone(&drm_device),
+                    output,
+                    scanout_route,
+                    u32::from(mode.width),
+                    u32::from(mode.height),
+                )
+                .map_err(|_| preparation_error(Stage::Allocation))?;
             let framebuffer = scanout
                 .display_pool()
                 .bos
