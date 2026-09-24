@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bii_`, `c0_3bi_`, `c0_3aii_`, `c0_adm` in `yserver`, and the whole `yserver-core` suite — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 2 (2026-09-24, coordinator)** — codex round 1
+(`../findings/2026-09-24-stage-3b-ii-plan-review-round1.md`: 2 blocking, 1
+major, all verified): a requester-less publication wakes the core on enqueue
+(B-1, Task 4); every client-removal path — including `KillClient`'s inline
+removal — prunes the gate (B-2, Task 2); Task 5 carries the compound
+wire-level scripts (M-1).
+
 **Revision 1 (2026-09-24, coordinator).**
 
 **Goal:** the six RANDR obligations of the umbrella (§3b) hold for Owner and
@@ -90,7 +97,12 @@ screen-resize notifications) and the **reply** (owned by the client). The
 `fn abandon_crtc_config_requester(&mut self, token) -> RequesterAbandon` with
 `RequesterAbandon::{Cancelled, ContinuesWithoutRequester}`: the Legacy PRIME
 probe and an undispatched Owner modeset answer `Cancelled`; a dispatched Owner
-modeset answers `ContinuesWithoutRequester`. On disconnect the gate keeps a
+modeset answers `ContinuesWithoutRequester`. *(Rev 2, B-2.)* **Every** client-removal
+path updates the gate — `disconnect_with_pending_cleanup` (`run.rs:828`) and
+the inline removal `KillClient` performs on another client (detected at
+`run.rs:884` by the client count) — either by calling the same gate cleanup
+or by pruning, before the next admission, every FIFO entry and in-flight
+requester whose client no longer exists. On disconnect the gate keeps a
 `ContinuesWithoutRequester` publication and stays occupied until the result;
 if installed it is published to every remaining client and only the reply is
 dropped. `Success` is answered only from `Ok(true)` or the idempotent
@@ -102,6 +114,7 @@ dropped. `Success` is answered only from `Ok(true)` or the idempotent
 | `c0_3bii_disconnect_after_dispatch_still_publishes` | A parked with `ContinuesWithoutRequester`, A disconnects, the backend completes `Ok(true)`: listener L receives the change notifications, nothing is written for A, the gate then admits the next waiter | **G7** drop the publication on disconnect (design mutation 6) |
 | `c0_3bii_disconnect_before_dispatch_cancels` | the backend answers `Cancelled`: no publication, the gate frees at once | **G8** keep the gate occupied after a cancel |
 | `c0_3bii_waiting_head_disconnects` | B is the FIFO head waiting behind A and disconnects: B leaves the FIFO, the next waiter keeps its place | **G9** leave the departed client in the FIFO |
+| `c0_3bii_killclient_removes_a_waiting_head` | A in flight, B the waiting head, C behind; D kills B with `KillClient`; A completes: C is admitted next and B's entry is gone | **G9b** clean the gate only in `disconnect_with_pending_cleanup` |
 | `c0_3bii_failed_publishes_nothing` | the backend completes `Err(..)`: reply status 3, timestamp unchanged, no notification | **G10** publish on error |
 | `c0_3bii_last_set_time_can_go_backward` | two successive changes with a decreasing client timestamp: `lastSetTime` follows the request, as Legacy | **G11** clamp `lastSetTime` monotonic |
 
@@ -131,7 +144,11 @@ backend's (3b-i); the gate adds none.
 
 **Deliver:** the gate accepts **requester-less publications** from the
 backend (a new `Backend` drain, `fn drain_requesterless_publications(&mut self) -> Vec<RequesterlessPublication>`,
-called where the loop drains ready CRTC configs). The backend's `REC-4`
+called where the loop drains ready CRTC configs). *(Rev 2, B-1.)* The
+backend sends `Message::CrtcConfigReady` (or a dedicated publication wake)
+whenever it enqueues a requester-less publication, and the core drains
+publications on that wake even when no CRTC token is ready
+(`core_loop/run.rs:1603` today drains only tokens). The backend's `REC-4`
 events never pass through the gate. A requester-less publication waits only
 behind an in-flight mutation that can still install (a dispatched Owner
 modeset); otherwise it publishes at once, before any waiter is admitted.
@@ -143,7 +160,7 @@ stands in for 3c/3d.
 | --- | --- | --- |
 | `c0_3bii_requesterless_waits_behind_a_dispatched_modeset` | A dispatched (`ContinuesWithoutRequester` semantics), a requester-less publication arrives: it publishes after A's publication | **G17** publish it before A |
 | `c0_3bii_requesterless_does_not_wait_for_a_superseded_one` | A parked before dispatch; the producer supersedes A (A completes `Err(Superseded)`) and publishes: the requester-less publication goes out, then A's `Failed` reply, with nothing published for A | **G18** hold the event at the gate (design mutation 15) |
-| `c0_3bii_requesterless_on_an_idle_gate` | gate empty: published at once, `lastConfigTime` updated per its rule | **G19** queue it behind nothing |
+| `c0_3bii_requesterless_on_an_idle_gate` | gate empty, no CRTC token pending: the producer enqueues a publication from outside a request; the loop wakes and publishes it at once, `lastConfigTime` updated per its rule | **G19** queue it behind nothing; **G19b** drain publications only when a CRTC token is ready |
 
 ## Task 5 — the protocol-order differential and the hardware client
 
@@ -155,7 +172,14 @@ idempotent request; supersession by a `REC-4` event; two concurrent clients
 (including the MATE sequence); cross-device and cross-transport order; the
 requester disconnecting while parked; each `E` stage expired (via the stub
 executor) and `Q`; the VT released; a requester-less publication and the
-supersession sequence of design §7.5. Identical except the named exceptions
+supersession sequence of design §7.5; *(rev 2, M-1)* and the compound
+scripts of design §8.2, each at wire level: FIFO admission against ready-ring
+order; `Q` expiry behind a predecessor whose installation changes the
+waiter's validation (answer `Failed` either way), a malformed waiter (its
+stateless error), a synchronous waiter behind a slow mutation (not expired);
+and the mixed-server sequence — Owner A in flight, Legacy B and Owner C
+queued, B stalled past C's `Q`, C answered on the first iteration after B
+returns. Identical except the named exceptions
 (design §8.4), each asserted as the named difference. The hardware test of
 3b-i gains an in-test protocol client that issues the same `SetCrtcConfig`
 sequence through the core and checks its reply bytes.
