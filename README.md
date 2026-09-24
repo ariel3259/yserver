@@ -155,6 +155,10 @@ Then switch to a free console and run `starty`. yserver drives atomic KMS
 directly with no seat manager, so it needs access to `/dev/dri/*` and
 `/dev/input/event*` and a working Vulkan driver.
 
+On NVIDIA Turing or newer (driver 610+), also enable the `nvidia-drm`
+`vblank` module parameter (it is off by default) so it persists across
+reboots — see [NVIDIA: enable DRM vblank](docs/setup.md#nvidia-enable-drm-vblank-turing-or-newer).
+
 ### Packages
 
 - Arch (and derivatives): `yserver` on the AUR

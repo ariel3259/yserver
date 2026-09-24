@@ -74310,8 +74310,7 @@ mod tests {
                 },
             )
             .unwrap_or_else(|error| panic!("cycle {cycle} DPMS off failed: {error}"));
-            let off_accepts = accepted_fences.borrow();
-            let off_accepts = &off_accepts[fence_start..];
+            let off_accepts = accepted_fences.borrow()[fence_start..].to_vec();
             let (off_commit, fence_count) = off_accepts
                 .iter()
                 .find(|(_, count)| *count > 0)
@@ -74383,7 +74382,9 @@ mod tests {
                 },
             )
             .unwrap_or_else(|error| panic!("cycle {cycle} DPMS on failed: {error}"));
-            let history_before = backend.scene.damage_history_len_for_tests(output_idx);
+            let history_before = backend
+                .scene
+                .damage_history_latest_generation_for_tests(output_idx);
             backend.scene.mark_scene_structure_dirty();
             backend.tick_maybe_composite_for_tests_without_render_completion_drain();
             backend.platform.wait_idle_bounded();
@@ -74401,7 +74402,10 @@ mod tests {
                 Duration::from_secs(15),
                 &|backend| {
                     backend.device_owner_for_tests(0).live_record().is_none()
-                        && backend.scene.damage_history_len_for_tests(output_idx) > history_before
+                        && backend
+                            .scene
+                            .damage_history_latest_generation_for_tests(output_idx)
+                            > history_before
                         && backend
                             .commit_consumer
                             .current_resources
@@ -74409,9 +74413,39 @@ mod tests {
                             .any(|resources| resources.direct_role.is_none())
                 },
             )
-            .unwrap_or_else(|error| panic!("cycle {cycle}: {error}"));
+            .unwrap_or_else(|error| {
+                let live = backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .map(|record| {
+                        format!(
+                            "{:?} state={:?} milestones={:?}",
+                            record.commit_id(),
+                            record.state(),
+                            record.milestones()
+                        )
+                    });
+                let roles = backend
+                    .commit_consumer
+                    .current_resources
+                    .iter()
+                    .map(|resources| resources.direct_role.is_some())
+                    .collect::<Vec<_>>();
+                panic!(
+                    "cycle {cycle}: {error}; composed={composed_commit:?} live={live:?} \
+                     damage_generation={:?}>{history_before:?}? current_direct_roles={roles:?} \
+                     hardware_complete_has_composed={}",
+                    backend
+                        .scene
+                        .damage_history_latest_generation_for_tests(output_idx),
+                    hardware_complete.borrow().contains(&composed_commit),
+                )
+            });
             assert!(
-                backend.scene.damage_history_len_for_tests(output_idx) > history_before,
+                backend
+                    .scene
+                    .damage_history_latest_generation_for_tests(output_idx)
+                    > history_before,
                 "cycle {cycle}: composed frame was not admitted after DPMS on"
             );
             assert!(
