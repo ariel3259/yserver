@@ -142,6 +142,32 @@ Console takeover is implemented on FreeBSD `vt(4)` consoles too, so
 `Ctrl-C` in an X client is shielded from the kernel's console signal
 handling the same way it is on Linux VTs.
 
+### NVIDIA: enable DRM vblank (driver 610 or newer)
+
+yserver uses the kernel's per-CRTC vblank counters when the driver exposes
+them, and falls back to a flip-paced path when it does not. The NVIDIA
+`nvidia-drm` module exposes them only on driver branch **610 or newer**, and
+only when its `vblank` parameter is on — it is **off by default**. On those
+drivers, turn it on so it persists across reboots:
+
+```sh
+echo 'options nvidia-drm vblank=1' | sudo tee /etc/modprobe.d/nvidia-drm-vblank.conf
+```
+
+Reboot, then confirm it took effect:
+
+```sh
+cat /sys/module/nvidia_drm/parameters/vblank   # must print Y
+```
+
+If your initramfs loads the NVIDIA modules (for example with early KMS
+configured in dracut or mkinitcpio), regenerate it after adding the file, or
+the option is not seen at boot.
+
+Driver branches 580 and 595 have no such parameter and cannot expose the
+counters on current kernels; yserver uses its fallback path there and needs no
+setting. Check your branch with `cat /sys/module/nvidia/version`.
+
 ## The X11 socket directory
 
 X servers share `/tmp/.X11-unix`, which must be root-owned and sticky

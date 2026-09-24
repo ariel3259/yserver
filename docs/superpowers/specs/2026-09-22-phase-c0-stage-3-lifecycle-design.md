@@ -151,12 +151,14 @@ absent or invalid result is acceptance-unknown with the same quarantine.
 
 ### 2.5. The Legacy fork is unchanged until stage 5
 
-In production every device stays `Legacy`. The legacy lifecycle writers keep
-working behind `allows_legacy`. The Owner path is new and **must not read
-`kms_outputs_active`**; each sub-stage proves this for the paths it adds.
-Removing the boolean and the legacy writers is stage 5 work (section 6), not
-something left for after the merge. Each sub-stage turns its
-`TestWriterCoverage` field(s) to proven only with its own evidence.
+In production every device stays `Legacy` until stage 5. The legacy lifecycle
+writers keep working behind `allows_legacy`. The Owner path is new and **must
+not read `kms_outputs_active`**; each sub-stage proves this for the paths it
+adds. *(Rev 6, 2026-09-24: Legacy is no longer removed — it is the permanent
+fallback route of structurally incapable devices, section 6.)* The boolean and
+the legacy writers therefore stay, reachable only on a `Legacy` device. Each
+sub-stage turns its `TestWriterCoverage` field(s) to proven only with its own
+evidence.
 
 ### 2.6. `TransportState` and the §6.4 state are two types (approved)
 
@@ -177,8 +179,10 @@ code at the end of stage 3: production devices stay `Legacy`, and the primary
 until stage 4 converts the last of them. Removing it earlier would either strip
 production of those writers or force production to `Owner` while the legacy
 cursor is still refused there, and it would delete the Legacy oracle that the
-section 4.1 differential gate of the later sub-stages compares against. It is
-removed at the moment it is replaced: the first act of stage 5 (section 6).
+section 4.1 differential gate of the later sub-stages compares against.
+*(Rev 6, 2026-09-24.)* It is **not** removed in stage 5 any more: after
+activation it is the per-device route selection — `Owner` for a structurally
+capable device, `Legacy` for an incapable one (section 6).
 
 ## 3. Sub-stages (approved)
 
@@ -450,40 +454,49 @@ Codex `gpt-6-luna` xhigh implements; codex `gpt-6-sol` xhigh reviews specs and
 plans; the coordinator verifies, applies mutations and commits. Plans give
 interfaces, invariants, tests and mutations — not prototype code.
 
-## 6. Amendment to C.0 §18: stage 5 *(rev 2, round-1 M-5)*
+## 6. Amendment to C.0 §18: stage 5 *(rev 2, round-1 M-5; rewritten rev 6, 2026-09-24)*
 
 C.0 §18.3 assigns to stage 3 the conversion of "every use of the merged
-all-output `dpms_set_outputs_active(bool)`/`kms_outputs_active` model". This
-design keeps the Legacy uses alive behind `allows_legacy` until activation, and
-stage 4 does the same for cursor and gamma; leaving them for after the squash
-would hand the maintainer dead code. Appending a stage does not by itself
-change stage 3's exit contract, so the amendment is applied **to C.0 §18
-itself** (C.0 revision note of 2026-09-22): stage 3 converts every lifecycle
-caller's **Owner path** and proves that no Owner path reads the legacy model;
-the Legacy uses and the model itself are deleted in stage 5. A 3d exit with
-Legacy uses still present is therefore compliant with the amended §18.3, and
-not before the amendment is committed. The fifth stage inside the same PR:
+all-output `dpms_set_outputs_active(bool)`/`kms_outputs_active` model". Stage
+3 converts every lifecycle caller's **Owner path** and proves that no Owner
+path reads the legacy model; the Legacy uses stay, behind `allows_legacy`. A
+3d exit with Legacy uses present is compliant with the amended §18.3 (C.0
+revision note of 2026-09-22). The fifth stage inside the same PR:
 
-> **5. Activation and legacy removal.** Switch every device to `Owner` in
-> production. Remove the legacy lifecycle, cursor and gamma writers, the
-> `allows_legacy` gates, `kms_outputs_active` and its sites,
-> `TransportState::Legacy` and every structure that exists only for
-> Legacy/Owner coexistence, and the `TestWriterCoverage` scaffolding. Run the
-> section 4.1 layer-3 client battery, the upstream-fixes revalidation
-> (`docs/phase-c0-upstream-fixes-revalidation.md`) on Owner, and the final-tip
-> gate. Stage 5 has its own spec and plan.
->
-> Its first act, once the last legacy writer is gone, deletes `TransportState`
-> entirely — the handover (`Quiescing` → `publish_owner`, `HandoverPermit`,
-> `LegacyDrained`) and `allows_legacy` — and folds `Closed`/`force_close` into
-> the §6.4 state, which becomes the only device state.
+> **5. Activation by capability.** At startup each device is switched to
+> `Owner` **iff** its discovery makes it structurally capable (C.0 §6, §10):
+> clock probe `KernelSequence`, completion capabilities, atomic cursor
+> coverage. A structurally incapable device stays `Legacy`, which is its
+> **permanent fallback route**, and the server logs once, per device, why it
+> did not qualify; on NVIDIA driver branch 610 or later with the `nvidia-drm`
+> `vblank` parameter off, the log names `options nvidia-drm vblank=1`. The
+> decision is by ioctl behaviour, never by driver name. Legacy is **not**
+> removed: `TransportState`, `allows_legacy`, the legacy lifecycle, cursor and
+> gamma writers and `kms_outputs_active` stay, reachable only on a `Legacy`
+> device; stage 5 deletes only what is then provably unreachable (such as the
+> `TestWriterCoverage` scaffolding) and names each deletion. A server with
+> both an `Owner` and a `Legacy` device is a **production configuration**:
+> stage 5 characterizes it (the 3a-ii Task 7 note on a mixed server with its
+> Legacy outputs off becomes an obligation). Stage 5 runs the section 4.1
+> layer-3 client battery on an `Owner` device and on a `Legacy` fallback
+> device, the upstream-fixes revalidation
+> (`docs/phase-c0-upstream-fixes-revalidation.md`) on Owner, and the
+> final-tip gate. Stage 5 has its own spec and plan.
+
+*Why rewritten (user decision, 2026-09-24):* the 3a-ii hardware test showed
+that NVIDIA exposes DRM vblank only on driver branch 610+ and only with the
+`nvidia-drm` `vblank` parameter on (default off); branches 580 and 595 — the
+maintainer's GTX 1050 Ti among them — cannot enable it at all
+(`docs/superpowers/findings/2026-09-23-nvidia-get-sequence-eopnotsupp.md`).
+Removing Legacy would leave those devices with no route; C.0's
+no-software-clock rule stands.
 
 **Entry preconditions of stage 5** (owed debts, named here so they are not
 loose findings):
 
 - the managed-storage access debt, Cfb §2.5 (`backend.rs:18716`);
 - the Ci F8 stops: Legacy dormancy (upstream's, meets none of the ownership
-  tests — to be re-examined once Legacy is removed), the missing restore
+  tests — to be re-examined in stage 5, where Legacy stays as the fallback route), the missing restore
   `TerminalState`, device loss without an owner signal (3d is expected to
   close the last one);
 - coverage gaps T24, T27 and Cfb F31;
@@ -493,7 +506,7 @@ loose findings):
 ## 7. Out of scope
 
 - Cursor and gamma conversion — stage 4.
-- Production activation and legacy removal — stage 5.
+- Production activation by capability — stage 5 (Legacy stays as the fallback route).
 - Phase C.1 (including the commit-correlated completion sample for composed
   commits that plan Cp asked C.1 for).
 - **No new protocol surface.** Stage 3 adds no extension, request, event or
