@@ -1820,37 +1820,45 @@ impl KmsBackend {
             (fenced_crtcs, dark_proofs, registrations)
         };
 
-        let Some(service) = self.resource_service.as_mut() else {
-            return;
-        };
         let mut discharged = Vec::new();
-        for (registered_commit, registration) in registrations {
-            let crtc_id = u32::from(registration.member.crtc.crtc);
-            let proof = if fenced_crtcs.contains(&crtc_id) {
-                Some(
-                    crate::kms::render::resources::KmsReleaseProof::CompletionRetired {
-                        through_commit: commit,
-                        crtc: registration.member.crtc,
-                    },
-                )
-            } else {
-                dark_proofs.get(&crtc_id).copied().map(|proof| {
-                    crate::kms::render::resources::KmsReleaseProof::DarkCrtcDisplacement {
-                        through_commit: commit,
-                        proof,
-                    }
-                })
+        {
+            let Some(service) = self.resource_service.as_mut() else {
+                return;
             };
-            let Some(proof) = proof else {
-                continue;
-            };
-            match service.discharge_kms_release(registration, proof) {
-                Ok(()) => discharged.push((registered_commit, registration)),
-                Err(error) => log::error!(
-                    "Owner KMS displacement proof refused for {device:?} commit {commit:?} allocation {:?}: {error:?}",
-                    registration.allocation
-                ),
+            for (registered_commit, registration) in registrations {
+                let crtc_id = u32::from(registration.member.crtc.crtc);
+                let proof = if fenced_crtcs.contains(&crtc_id) {
+                    Some(
+                        crate::kms::render::resources::KmsReleaseProof::CompletionRetired {
+                            through_commit: commit,
+                            crtc: registration.member.crtc,
+                        },
+                    )
+                } else {
+                    dark_proofs.get(&crtc_id).copied().map(|proof| {
+                        crate::kms::render::resources::KmsReleaseProof::DarkCrtcDisplacement {
+                            through_commit: commit,
+                            proof,
+                        }
+                    })
+                };
+                let Some(proof) = proof else {
+                    continue;
+                };
+                match service.discharge_kms_release(registration, proof) {
+                    Ok(()) => discharged.push((registered_commit, registration)),
+                    Err(error) => log::error!(
+                        "Owner KMS displacement proof refused for {device:?} commit {commit:?} allocation {:?}: {error:?}",
+                        registration.allocation
+                    ),
+                }
             }
+        }
+        for (_, registration) in &discharged {
+            self.scene.retire_retired_pool_bo_after_kms_proof(
+                registration.allocation,
+                &mut self.platform,
+            );
         }
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             for (registered_commit, discharged) in discharged {

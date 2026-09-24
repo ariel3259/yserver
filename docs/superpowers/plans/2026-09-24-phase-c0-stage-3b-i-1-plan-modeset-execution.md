@@ -513,3 +513,21 @@ checked the displaced allocations, not the bundles.
 | `c0_3bi_a2_disable_releases_the_current_front_vulkan` | disable the only output: after `Completed` and the proofs, the old front buffer's allocation is gone — no second `Retain` survives | **A2b** leave the disabled CRTC's current resources in place |
 | `c0_3bi_a2_unproven_bundle_is_kept_vulkan` | a bundle with one resource still awaiting its proof is not destroyed | **A2c** destroy a bundle with an unproven resource |
 
+**A2 follow-up (coordinator hardware run after A2):** the first mode-change
+cycle now fails A2's bundle-destruction assertion after the displaced
+allocations have left the resource service. The retired bundle has no owner
+buffers or pending acknowledgements, but its former front BO remains
+`OnScreen`; a retired pool never receives the successor flip that normally
+moves that BO through `Retiring` to `Free`. Apply that transition when either
+KMS-release proof is accepted; `CompletionRetired` can arrive before the
+lifecycle terminal event promotes the old pool, so resolve the allocation in
+either the still-installed pool or its retired bundle. The same hardware dump
+reports instance device key `0:0` for an output on `226:1`. Production derives
+every instance ID from its `OutputKey`; the mismatch is confined to the
+live-KMS fixture, which replaces its synthetic output without rebuilding its
+instance IDs.
+
+| Test | Scenario | Must fail under |
+| --- | --- | --- |
+| `c0_3bi_a2_retired_front_on_screen_is_released_vulkan` | a completed composed frame reaches `OnScreen` through the production compose and page-flip path before a modeset; after its KMS proofs, the retired bundle is destroyed | **A2d** skip the retired `OnScreen` transition |
+| `c0_3bi_a2_fixture_instance_ids_match_rekeyed_outputs` | after a fixture retargets outputs to the real DRM key, every rebuilt instance ID uses its output's device key and the next ID stays in that domain | **A2e** keep the synthetic device key after fixture rekeying |

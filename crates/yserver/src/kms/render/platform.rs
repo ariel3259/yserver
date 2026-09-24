@@ -3818,6 +3818,16 @@ impl PlatformBackend {
         })
     }
 
+    /// Rebuild fixture output identities after a test replaces its synthetic
+    /// topology with outputs belonging to a real DRM device.
+    #[cfg(test)]
+    pub(crate) fn rebuild_output_instance_ids_for_tests(&mut self) -> io::Result<()> {
+        let (ids, next_ids) = initial_output_instance_ids(&self.outputs)?;
+        self.output_instance_ids = ids;
+        self.next_output_instance_ids = next_ids;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn append_test_output_without_scanout_pool(&mut self, connector_name: &str) {
         let device_key = self
@@ -11215,6 +11225,36 @@ mod tests {
         let fds = p.poll_fds();
         // No input_ctx, one DRM fd.
         assert!(fds.iter().any(|(_, k)| matches!(k, BackendFdKind::Drm)));
+    }
+
+    #[test]
+    fn c0_3bi_a2_fixture_instance_ids_match_rekeyed_outputs() {
+        let mut platform = PlatformBackend::for_tests();
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        };
+        platform.devices[0].key = device_key;
+        platform.outputs[0].key.device_key = device_key;
+        platform.outputs[0].scanout_route.kms_device_key = device_key;
+
+        platform
+            .rebuild_output_instance_ids_for_tests()
+            .expect("fixture topology instance ids");
+
+        assert_eq!(platform.output_instance_ids.len(), platform.outputs.len());
+        assert!(
+            platform
+                .outputs
+                .iter()
+                .zip(&platform.output_instance_ids)
+                .all(|(output, instance)| instance.device_key == output.key.device_key)
+        );
+        let next = platform
+            .allocate_output_instance_id(&platform.outputs[0].key.clone())
+            .expect("next instance id uses the rebuilt device domain");
+        assert_eq!(next.device_key, device_key);
+        assert_eq!(next.serial, 2);
     }
 
     #[test]

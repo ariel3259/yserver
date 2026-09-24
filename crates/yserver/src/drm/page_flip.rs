@@ -22,6 +22,34 @@ use crate::{
     platform::ioctl::{DRM_IOCTL_BASE, ioctl_readwrite, iowr},
 };
 
+#[cfg(test)]
+thread_local! {
+    static ACCEPT_PAGE_FLIPS_FOR_TESTS: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+/// Scoped test seam for exercising the production accepted-flip state
+/// transitions without issuing a DRM ioctl or acquiring DRM master.
+#[cfg(test)]
+pub(crate) struct AcceptPageFlipsForTests;
+
+#[cfg(test)]
+impl Drop for AcceptPageFlipsForTests {
+    fn drop(&mut self) {
+        ACCEPT_PAGE_FLIPS_FOR_TESTS.with(|enabled| enabled.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn accept_page_flips_for_tests() -> AcceptPageFlipsForTests {
+    assert!(
+        !ACCEPT_PAGE_FLIPS_FOR_TESTS.with(|enabled| enabled.replace(true)),
+        "test page-flip acceptance seam cannot be nested"
+    );
+    AcceptPageFlipsForTests
+}
+
 // ── DRM_IOCTL_CRTC_QUEUE_SEQUENCE plumbing ──────────────────────
 //
 // `drm` 0.15 / `drm-ffi` 0.9 do not wrap this ioctl; we issue it
@@ -144,6 +172,11 @@ pub fn submit_flip_with_fences(
     );
     if !legacy_write_permitted {
         return Err(crate::drm::transport_gate_refusal("page-flip"));
+    }
+    #[cfg(test)]
+    if ACCEPT_PAGE_FLIPS_FOR_TESTS.with(std::cell::Cell::get) {
+        *out_fence_holder = -1;
+        return Ok(());
     }
     submit_flip_inner(
         device,

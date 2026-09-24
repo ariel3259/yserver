@@ -3855,6 +3855,65 @@ impl SceneCompositor {
         })
     }
 
+    /// A KMS-release proof for a displaced allocation is the successor
+    /// boundary that its pool will never receive as a page flip. Apply the
+    /// same OnScreen -> Retiring -> Free transition used by
+    /// `handle_page_flip_complete`. The proof can precede lifecycle promotion,
+    /// so look in both the retired bundles and the still-installed pools.
+    pub(crate) fn retire_retired_pool_bo_after_kms_proof(
+        &mut self,
+        allocation: AllocationKey,
+        platform: &mut PlatformBackend,
+    ) {
+        if let Some(bundle) = self.inner.as_mut().and_then(|inner| {
+            inner.retired_outputs.values_mut().flatten().find(|bundle| {
+                bundle
+                    .pool
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .any(|bo| bo.managed_key() == Some(allocation))
+            })
+        }) {
+            if let Some(bo_idx) = bundle
+                .pool
+                .display_pool()
+                .bos
+                .iter()
+                .position(|bo| bo.managed_key() == Some(allocation))
+                && let Err(error) =
+                    retire_onscreen_pool_bo_after_kms_proof(&mut bundle.pool, bo_idx)
+            {
+                log::error!(
+                    "render retired output: KMS release proof failed for bo {bo_idx}: {error}"
+                );
+                platform.renderer_failed = true;
+            }
+            return;
+        }
+
+        // CompletionRetired may be routed before the lifecycle terminal event
+        // promotes the displaced pool into `retired_outputs`. The currently
+        // installed pool still owns the exact allocation at that point.
+        for scanout in platform.scanout_pools.iter_mut().filter_map(Option::as_mut) {
+            let Some(bo_idx) = scanout
+                .display_pool()
+                .bos
+                .iter()
+                .position(|bo| bo.managed_key() == Some(allocation))
+            else {
+                continue;
+            };
+            if let Err(error) = retire_onscreen_pool_bo_after_kms_proof(scanout, bo_idx) {
+                log::error!(
+                    "render installed output: KMS release proof failed for bo {bo_idx}: {error}"
+                );
+                platform.renderer_failed = true;
+            }
+            return;
+        }
+    }
+
     /// Service retired-output proofs without running composition. The core
     /// loop calls this after owner/resource completion servicing so a bundle
     /// continues to drain when there are no outputs to tick.
@@ -5797,6 +5856,34 @@ fn leave_owner_buffer_from_scanout(scanout: &mut OutputScanout, bo_idx: usize) -
                 .transition_to_free_after_owner()
         }
     }
+}
+
+fn retire_onscreen_pool_bo_after_kms_proof(
+    scanout: &mut OutputScanout,
+    bo_idx: usize,
+) -> io::Result<()> {
+    if scanout
+        .display_pool()
+        .bos
+        .get(bo_idx)
+        .is_none_or(|bo| bo.state.phase != BoPhase::OnScreen)
+    {
+        return Ok(());
+    }
+
+    if let Some(copied) = scanout.copied_mut() {
+        copied.note_kms_retired(bo_idx)?;
+    }
+
+    let bo = &mut scanout.display_pool_mut().bos[bo_idx];
+    bo.state.transition_to_retiring();
+    if let Some(fd) = bo.state.transition_to_free_after_retire() {
+        // SAFETY: the KMS-release proof establishes that this BO's release
+        // fence is signalled, and the transition transfers the uniquely owned
+        // fd to this caller.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
 }
 
 fn retire_owner_buffers_in_bundle(

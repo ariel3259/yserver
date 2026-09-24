@@ -8112,6 +8112,7 @@ impl KmsBackend {
             0,
             0,
         )];
+        backend.platform.rebuild_output_instance_ids_for_tests()?;
         backend.platform.fb_w = backend.platform.outputs[0].width;
         backend.platform.fb_h = backend.platform.outputs[0].height;
         backend.platform.scanout_pools =
@@ -62564,6 +62565,38 @@ mod tests {
         ),
         std::io::Error,
     > {
+        c0_3bi_live_modeset_backend_inner(behaviour, with_other_output, false)
+    }
+
+    fn c0_3bi_live_modeset_backend_with_completed_composed_front(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> Result<
+        (
+            OwnerLiveFixture,
+            DrmDeviceKey,
+            u32,
+            String,
+            yserver_core::backend::ModeSpec,
+        ),
+        std::io::Error,
+    > {
+        c0_3bi_live_modeset_backend_inner(behaviour, false, true)
+    }
+
+    fn c0_3bi_live_modeset_backend_inner(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+        with_other_output: bool,
+        complete_composed_front: bool,
+    ) -> Result<
+        (
+            OwnerLiveFixture,
+            DrmDeviceKey,
+            u32,
+            String,
+            yserver_core::backend::ModeSpec,
+        ),
+        std::io::Error,
+    > {
         use crate::kms::backend::ActiveOutput;
         use ::drm::{ClientCapability, Device as _};
         use std::sync::Arc;
@@ -62703,9 +62736,9 @@ mod tests {
             .bos
             .len();
         backend.platform.bo_generations[0] = vec![Default::default(); pool_depth];
-        backend.platform.output_instance_ids[0] = backend
+        backend
             .platform
-            .allocate_output_instance_id(&output_key)
+            .rebuild_output_instance_ids_for_tests()
             .map_err(|error| std::io::Error::other(format!("fixture output instance: {error}")))?;
 
         if with_other_output {
@@ -62757,6 +62790,53 @@ mod tests {
         backend
             .output_key_by_id
             .insert(ids.output_id, output_key.clone());
+        if complete_composed_front {
+            assert!(
+                !backend.platform.output_uses_owner_route(0),
+                "the setup frame must travel through the production Legacy compose path"
+            );
+            {
+                let _accept_flip = crate::drm::page_flip::accept_page_flips_for_tests();
+                backend.scene.mark_scene_structure_dirty();
+                backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+                backend.platform.wait_idle_bounded();
+                backend.drain_scanout_render_completions_for_tests();
+            }
+            assert!(
+                backend.scene.pending_ack_count_for_tests(0) > 0,
+                "the production compose path installed a page-flip acknowledgement"
+            );
+            let pending_bos = backend.platform.scanout_pools[0]
+                .as_ref()
+                .expect("live modeset fixture pool")
+                .display_pool()
+                .bos
+                .iter()
+                .filter(|bo| bo.state.phase == crate::kms::vk::scanout::BoPhase::Pending)
+                .count();
+            assert_eq!(pending_bos, 1, "the composed frame reached KMS Pending");
+            assert_eq!(
+                backend
+                    .simulate_scene_page_flip_complete_for_tests()
+                    .map_err(|error| {
+                        std::io::Error::other(format!("complete fixture compose: {error:?}"))
+                    })?,
+                1,
+                "the composed frame retired through the production scene path"
+            );
+            let on_screen_bos = backend.platform.scanout_pools[0]
+                .as_ref()
+                .expect("live modeset fixture pool")
+                .display_pool()
+                .bos
+                .iter()
+                .filter(|bo| bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen)
+                .count();
+            assert_eq!(
+                on_screen_bos, 1,
+                "the completed compose marks its BO OnScreen"
+            );
+        }
         let mut fixture = finish_owner_live_fixture_with_properties(backend, false, false)?;
         c0_3aii_replace_owner_executor(&mut fixture.backend, behaviour);
         Ok((fixture, device_key, ids.output_id, connector, target_mode))
@@ -63537,6 +63617,56 @@ mod tests {
             "the retired scene and pool leave the list after GPU and KMS proofs"
         );
         assert_eq!(backend.scene.retired_output_count_for_tests(), 0);
+        assert!(old_keys.iter().all(|key| {
+            !backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a2_retired_front_on_screen_is_released_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend_with_completed_composed_front(StubBehaviour::Scripted(
+                ScriptedReply::Accepted { mask: 0, fds: 0 },
+            ))
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output instance");
+        let output_key = backend.platform.outputs[0].key.clone();
+        assert_eq!(instance.device_key, output_key.device_key);
+        assert!(
+            backend.platform.scanout_pools[0]
+                .as_ref()
+                .expect("old scanout pool")
+                .display_pool()
+                .bos
+                .iter()
+                .any(|bo| bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen),
+            "the completed composed frame reaches OnScreen through the production path"
+        );
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(&mut backend, device, token, None)
+                .expect("mode change completion result")
+        );
+        for _ in 0..4 {
+            backend.before_block();
+        }
+
+        assert!(
+            !backend
+                .scene
+                .retired_output_has_instance_for_tests(instance),
+            "the KMS release proof retires the old OnScreen BO and drains its bundle"
+        );
         assert!(old_keys.iter().all(|key| {
             !backend
                 .resource_service()
@@ -80361,6 +80491,15 @@ mod tests {
             .expect("HDMI-2 is a card1 Owner output");
         let output_key = backend.platform.outputs[output_idx].key.clone();
         assert_eq!(output_key.connector_name, "HDMI-2");
+        assert_eq!(
+            backend
+                .scene
+                .output_instance_id_for_tests(output_idx)
+                .expect("live HDMI-2 output instance")
+                .device_key,
+            output_key.device_key,
+            "the live-KMS fixture rebuilds output instance ids in the real device domain"
+        );
         let output_id = backend.randr_id_alloc.ids_for(&output_key).output_id;
         backend
             .output_key_by_id
