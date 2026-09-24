@@ -2078,7 +2078,16 @@ pub struct KmsBackend {
     /// a fresh epoch on the next live projection, letting core discard raw MSC
     /// targets captured in the old counter domain.
     present_crtc_clock_epochs: HashMap<u32, (CrtcKey, u64)>,
+    /// RANDR CRTC XIDs removed since their last live projection. This lets a
+    /// first projection adopt the activation clock while a re-added XID gets
+    /// a genuinely fresh epoch.
+    retired_present_crtc_ids: HashSet<u32>,
     next_present_crtc_clock_epoch: u64,
+    /// Installed clock epochs waiting for the device's shared slot.
+    waiting_clock_probes: HashMap<
+        crate::platform::drm::DrmDeviceKey,
+        std::collections::BTreeSet<crate::kms::owner::clock::ClockKey>,
+    >,
     hotplug_rescan_deadline: Option<std::time::Instant>,
     gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
 
@@ -6919,7 +6928,9 @@ impl KmsBackend {
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
             present_crtc_clock_epochs: HashMap::new(),
+            retired_present_crtc_ids: HashSet::new(),
             next_present_crtc_clock_epoch: 1,
+            waiting_clock_probes: HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -8260,7 +8271,9 @@ impl KmsBackend {
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
             present_crtc_clock_epochs: HashMap::new(),
+            retired_present_crtc_ids: HashSet::new(),
             next_present_crtc_clock_epoch: 1,
+            waiting_clock_probes: HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -20659,6 +20672,186 @@ impl KmsBackend {
         })
     }
 
+    /// Install one unresolved clock for every currently served Owner CRTC
+    /// when a conductor is activated. This is independent of the RANDR
+    /// projection; a later first projection adopts these same epochs.
+    pub(crate) fn activate_admission_clock_probes(&mut self, device: DrmDeviceKey) {
+        if !self.admission_conductors.contains_key(&device) {
+            return;
+        }
+        let hardware_crtcs = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(CrtcKey::for_output(output).crtc))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut probe_keys = Vec::new();
+        for hardware_crtc in hardware_crtcs {
+            let Some((lifecycle, generation, current_key)) =
+                self.platform.owner_ref(device).map(|owner| {
+                    let (lifecycle, generation) = owner.clock_context();
+                    let current_key =
+                        owner
+                            .clock_key_for_hardware_crtc(hardware_crtc)
+                            .filter(|key| {
+                                owner.clock(*key).is_some_and(|clock| {
+                                    clock.lifecycle_epoch == lifecycle
+                                        && clock.topology_generation == generation
+                                })
+                            });
+                    (lifecycle, generation, current_key)
+                })
+            else {
+                continue;
+            };
+            let key = if let Some(key) = current_key {
+                key
+            } else {
+                let epoch = self
+                    .platform
+                    .owner_ref(device)
+                    .expect("owner checked above")
+                    .next_clock_epoch_after(hardware_crtc, self.next_present_crtc_clock_epoch);
+                let key = crate::kms::owner::clock::ClockKey {
+                    hardware_crtc,
+                    epoch,
+                };
+                self.platform
+                    .owner_for(device)
+                    .expect("owner checked above")
+                    .install_clock(key, lifecycle, generation)
+                    .expect("fresh activation clock identity matches its device owner");
+                self.next_present_crtc_clock_epoch = self.next_present_crtc_clock_epoch.max(
+                    key.epoch
+                        .get()
+                        .checked_add(1)
+                        .expect("clock epoch overflow"),
+                );
+                key
+            };
+            probe_keys.push(key);
+        }
+        for key in probe_keys {
+            self.retain_waiting_clock_probe(device, key);
+        }
+        self.promote_waiting_clock_probe(device);
+    }
+
+    fn retain_waiting_clock_probe(
+        &mut self,
+        device: DrmDeviceKey,
+        key: crate::kms::owner::clock::ClockKey,
+    ) {
+        if !self.admission_conductors.contains_key(&device) {
+            return;
+        }
+        let probe_not_started = self
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock(key))
+            .is_some_and(|clock| clock.probe == crate::kms::owner::clock::ProbeState::NotStarted);
+        let empty = {
+            let waiting = self.waiting_clock_probes.entry(device).or_default();
+            waiting.retain(|old| old.hardware_crtc != key.hardware_crtc || *old == key);
+            if probe_not_started {
+                waiting.insert(key);
+            }
+            waiting.is_empty()
+        };
+        if empty {
+            self.waiting_clock_probes.remove(&device);
+        }
+    }
+
+    /// Give an installed waiting probe first claim on a newly free shared
+    /// slot. The owner remains authoritative for whether the lease is free;
+    /// Legacy-permit and occupied-slot refusals simply keep the key waiting.
+    pub(crate) fn promote_waiting_clock_probe(&mut self, device: DrmDeviceKey) {
+        enum Promotion {
+            Sent,
+            Drop,
+            Wait,
+            Failed(String),
+        }
+
+        if !self.admission_conductors.contains_key(&device) {
+            return;
+        }
+        loop {
+            let Some(key) = self
+                .waiting_clock_probes
+                .get(&device)
+                .and_then(|waiting| waiting.iter().next().copied())
+            else {
+                return;
+            };
+            let promotion = {
+                let Some(kms_device) = self
+                    .platform
+                    .devices
+                    .iter_mut()
+                    .find(|kms_device| kms_device.key == device)
+                else {
+                    return;
+                };
+                let (Some(owner), Some(executor)) =
+                    (kms_device.owner.as_mut(), kms_device.executor.as_mut())
+                else {
+                    return;
+                };
+                if !owner.clock(key).is_some_and(|clock| {
+                    clock.probe == crate::kms::owner::clock::ProbeState::NotStarted
+                }) {
+                    Promotion::Drop
+                } else {
+                    match owner.begin_clock_probe(key) {
+                        Ok(_) => owner.send_clock_probe_on(executor).map_or_else(
+                            |error| Promotion::Failed(format!("{error:?}")),
+                            |_| Promotion::Sent,
+                        ),
+                        Err(crate::kms::owner::device::DispatchError::LegacyTransportActive)
+                        | Err(crate::kms::owner::device::DispatchError::Refused { .. }) => {
+                            Promotion::Wait
+                        }
+                        Err(crate::kms::owner::device::DispatchError::ClockNotReady(_)) => {
+                            Promotion::Drop
+                        }
+                        Err(error) => Promotion::Failed(format!("{error:?}")),
+                    }
+                }
+            };
+            match promotion {
+                Promotion::Sent => self.remove_waiting_clock_probe(device, key),
+                Promotion::Drop => {
+                    self.remove_waiting_clock_probe(device, key);
+                    continue;
+                }
+                Promotion::Wait => return,
+                Promotion::Failed(error) => {
+                    log::error!("could not start CRTC clock probe for {device}/{key:?}: {error}");
+                    return;
+                }
+            }
+        }
+    }
+
+    fn remove_waiting_clock_probe(
+        &mut self,
+        device: DrmDeviceKey,
+        key: crate::kms::owner::clock::ClockKey,
+    ) {
+        let empty = if let Some(waiting) = self.waiting_clock_probes.get_mut(&device) {
+            waiting.remove(&key);
+            waiting.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            self.waiting_clock_probes.remove(&device);
+        }
+    }
+
     fn refresh_present_crtc_clock_epochs(&mut self) {
         let live: Vec<(u32, CrtcKey)> = self
             .crtc_key_by_id
@@ -20669,37 +20862,81 @@ impl KmsBackend {
             })
             .collect();
         let live_ids: HashSet<u32> = live.iter().map(|(crtc_id, _)| *crtc_id).collect();
+        self.retired_present_crtc_ids.extend(
+            self.present_crtc_clock_epochs
+                .keys()
+                .filter(|crtc_id| !live_ids.contains(crtc_id))
+                .copied(),
+        );
         self.present_crtc_clock_epochs
             .retain(|crtc_id, _| live_ids.contains(crtc_id));
 
         for (crtc_id, crtc_key) in live {
-            let route_unchanged = self
-                .present_crtc_clock_epochs
-                .get(&crtc_id)
-                .is_some_and(|(old_key, _)| *old_key == crtc_key);
-            if route_unchanged {
+            let prior = self.present_crtc_clock_epochs.get(&crtc_id).copied();
+            let was_removed = self.retired_present_crtc_ids.remove(&crtc_id);
+            let route_unchanged = prior.is_some_and(|(old_key, _)| old_key == crtc_key);
+            let hardware_crtc = u32::from(crtc_key.crtc);
+            let current_key = self
+                .platform
+                .owner_ref(crtc_key.device_key)
+                .and_then(|owner| {
+                    let (lifecycle, generation) = owner.clock_context();
+                    owner
+                        .clock_key_for_hardware_crtc(hardware_crtc)
+                        .filter(|key| {
+                            owner.clock(*key).is_some_and(|clock| {
+                                clock.lifecycle_epoch == lifecycle
+                                    && clock.topology_generation == generation
+                            })
+                        })
+                });
+            if route_unchanged
+                && prior.is_some_and(|(_, epoch)| {
+                    current_key.is_some_and(|key| key.epoch.get() == epoch)
+                })
+            {
                 continue;
             }
-            let epoch = self.next_present_crtc_clock_epoch;
-            self.next_present_crtc_clock_epoch = self
-                .next_present_crtc_clock_epoch
-                .checked_add(1)
-                .expect("Present CRTC clock epoch overflow");
+            let key = if !was_removed && !prior.is_some_and(|(old_key, _)| old_key != crtc_key) {
+                current_key
+            } else {
+                None
+            };
+            let key = if let Some(key) = key {
+                key
+            } else {
+                let epoch = self
+                    .platform
+                    .owner_ref(crtc_key.device_key)
+                    .map(|owner| {
+                        owner.next_clock_epoch_after(
+                            hardware_crtc,
+                            self.next_present_crtc_clock_epoch,
+                        )
+                    })
+                    .unwrap_or_else(|| ClockEpochId::from_raw(self.next_present_crtc_clock_epoch));
+                let clock_key = crate::kms::owner::clock::ClockKey {
+                    hardware_crtc,
+                    epoch,
+                };
+                if let Some(owner) = self.platform.owner_for(crtc_key.device_key) {
+                    let (lifecycle, generation) = owner.clock_context();
+                    owner
+                        .install_clock(clock_key, lifecycle, generation)
+                        .expect("fresh Present clock identity matches its device owner");
+                }
+                self.next_present_crtc_clock_epoch = self.next_present_crtc_clock_epoch.max(
+                    epoch
+                        .get()
+                        .checked_add(1)
+                        .expect("Present CRTC clock epoch overflow"),
+                );
+                clock_key
+            };
             self.present_crtc_clock_epochs
-                .insert(crtc_id, (crtc_key, epoch));
-            if let Some(owner) = self.platform.owner_for(crtc_key.device_key) {
-                let (lifecycle, generation) = owner.clock_context();
-                owner
-                    .install_clock(
-                        crate::kms::owner::clock::ClockKey {
-                            hardware_crtc: u32::from(crtc_key.crtc),
-                            epoch: ClockEpochId::from_raw(epoch),
-                        },
-                        lifecycle,
-                        generation,
-                    )
-                    .expect("fresh Present clock identity matches its device owner");
-            }
+                .insert(crtc_id, (crtc_key, key.epoch.get()));
+            self.retain_waiting_clock_probe(crtc_key.device_key, key);
+            self.promote_waiting_clock_probe(crtc_key.device_key);
         }
     }
 
@@ -20837,6 +21074,10 @@ impl KmsBackend {
     fn should_route_owner_events(&self, device: DrmDeviceKey) -> bool {
         self.admission_conductors.contains_key(&device)
             && (self.admission_is_active(device)
+                || self
+                    .platform
+                    .owner_ref(device)
+                    .is_some_and(|owner| owner.has_clock_probe_in_flight())
                 || self
                     .admission_conductors
                     .get(&device)
@@ -21149,12 +21390,15 @@ impl KmsBackend {
                 "transport gate has already progressed past legacy for this device",
             ));
         }
-        let owner = self.platform.owner_for(key).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "device owner not found")
-        })?;
-        owner.finish_legacy_transport(proof).map_err(|err| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{err:?}"))
-        })?;
+        {
+            let owner = self.platform.owner_for(key).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "device owner not found")
+            })?;
+            owner.finish_legacy_transport(proof).map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{err:?}"))
+            })?;
+        }
+        self.activate_admission_clock_probes(key);
         Ok(())
     }
 
@@ -21178,6 +21422,7 @@ impl KmsBackend {
         >,
         now: std::time::Instant,
     ) -> bool {
+        self.promote_waiting_clock_probe(device_key);
         self.lifecycle_begin_owner_event_batch(device_key);
         let has_retirement = events.iter().any(|event| {
             matches!(
@@ -54628,7 +54873,7 @@ mod tests {
                 .insert_for_tests(crtc, 21);
         }
         let executor = crate::kms::executor::test_support::spawn_stub_helper(
-            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            crate::kms::executor::test_support::StubBehaviour::AcceptProbesThenNeverReply(1000),
         )
         .map_err(|error| std::io::Error::other(format!("stub executor: {error}")))?;
         let (incarnation, lifecycle) = executor.owner_identity();
@@ -54690,6 +54935,7 @@ mod tests {
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let source = AdmissionSourceFixture::new_source().0;
         backend.install_admission_conductor_with_backend_composed_for_tests(device_key, source);
+        c0_3aii_route_production_clock_probes(&mut backend, device_key);
         Ok(OwnerLiveFixture {
             backend,
             cleanup_calls,
@@ -56071,20 +56317,35 @@ mod tests {
         device: DrmDeviceKey,
         commit: crate::kms::owner::identity::CommitId,
     ) {
-        let count = backend
-            .device_owner_for_tests(0)
-            .live_record()
-            .expect("direct owner record")
-            .closure()
-            .expected_completion()
-            .len();
+        let (correlation, count) = {
+            let record = backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .expect("direct owner record");
+            assert_eq!(record.commit_id(), commit);
+            (
+                *record.correlation(),
+                record.closure().expected_completion().len(),
+            )
+        };
+        let out_fences = (0..count)
+            .map(|_| {
+                std::fs::File::open("/dev/null")
+                    .expect("test fence fd")
+                    .into()
+            })
+            .collect();
         backend.record_host_call_events(vec![(
             device,
-            crate::kms::owner::test_fixtures::accepted(
-                commit,
-                (1u32 << u32::try_from(count).expect("test fence count")) - 1,
-                count,
-            ),
+            crate::kms::executor::HostCallEvent::Outcome {
+                correlation,
+                outcome: crate::kms::executor::HostCallOutcome::Accepted {
+                    helper_duration_ns: 0,
+                    round_trip_ns: 0,
+                    out_fence_mask: (1u32 << u32::try_from(count).expect("test fence count")) - 1,
+                    out_fences,
+                },
+            },
         )]);
     }
 
@@ -58888,6 +59149,37 @@ mod tests {
         backend
     }
 
+    fn c0_3aii_route_production_clock_probes(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) {
+        use crate::kms::owner::clock::{ClockSource, ProbeState};
+
+        let served_crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(CrtcKey::for_output(output).crtc))
+            .collect::<std::collections::BTreeSet<_>>();
+        for _ in &served_crtcs {
+            wait_lifecycle_executor_readable(backend, device);
+            let events = backend.platform.drain_executor_events();
+            assert_eq!(events.len(), 1, "one production clock-probe reply");
+            backend.record_host_call_events(events);
+        }
+        let owner = backend.platform.owner_ref(device).expect("Owner");
+        for crtc in served_crtcs {
+            let key = owner
+                .clock_key_for_hardware_crtc(crtc)
+                .expect("production activation installed the served CRTC clock");
+            let clock = owner.clock(key).expect("production clock record");
+            assert_eq!(clock.source, ClockSource::KernelSequence);
+            assert_eq!(clock.probe, ProbeState::Succeeded);
+            assert_eq!(clock.reference, Some(1000));
+        }
+    }
+
     fn lifecycle_dpms_backend(
         behaviour: crate::kms::executor::test_support::StubBehaviour,
     ) -> (super::KmsBackend, DrmDeviceKey) {
@@ -58906,18 +59198,37 @@ mod tests {
             );
         }
         seed_direct_owner_description_properties_for_tests(&mut backend);
-        let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
-            .expect("spawn lifecycle stub executor");
-        admission_install_executor(&mut backend, executor);
+        let probe_executor = crate::kms::executor::test_support::spawn_stub_helper(
+            crate::kms::executor::test_support::StubBehaviour::AcceptProbesThenNeverReply(1000),
+        )
+        .expect("spawn lifecycle probe executor");
+        let (incarnation, lifecycle) = probe_executor.owner_identity();
         let device = backend
             .platform
             .primary_device()
             .expect("fixture device")
             .key;
+        backend.platform.devices[0].executor = Some(probe_executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            device,
+            incarnation,
+        ));
         install_admission_owner_gate(&mut backend, device);
-        for output_idx in 1..output_count {
-            c0_conv_cii_install_owner_clock(&mut backend, device, output_idx, 1000);
-        }
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+        c0_3aii_route_production_clock_probes(&mut backend, device);
+        crate::kms::executor::test_support::kill_and_reap(
+            backend.platform.devices[0].executor.as_mut().unwrap(),
+        );
+        backend.platform.devices[0].executor = Some(
+            crate::kms::executor::test_support::spawn_stub_helper(behaviour)
+                .expect("spawn lifecycle stub executor"),
+        );
         (backend, device)
     }
 
@@ -58935,16 +59246,18 @@ mod tests {
         c0_conv_ciii_id_push_output_for_device(&mut backend, owner_device, 91, "owner-test");
         seed_direct_owner_description_properties_for_tests(&mut backend);
 
-        let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
-            .expect("spawn mixed-server Owner executor");
-        let (incarnation, lifecycle) = executor.owner_identity();
+        let probe_executor = crate::kms::executor::test_support::spawn_stub_helper(
+            crate::kms::executor::test_support::StubBehaviour::AcceptProbesThenNeverReply(1000),
+        )
+        .expect("spawn mixed-server Owner probe executor");
+        let (incarnation, lifecycle) = probe_executor.owner_identity();
         let owner = backend
             .platform
             .devices
             .iter_mut()
             .find(|entry| entry.key == owner_device)
             .expect("mixed Owner device");
-        owner.executor = Some(executor);
+        owner.executor = Some(probe_executor);
         owner.owner = Some(crate::kms::owner::device::DeviceCommitOwner::new(
             incarnation,
             lifecycle,
@@ -58955,7 +59268,29 @@ mod tests {
             owner_device,
             incarnation,
         ));
-        c0_conv_cii_install_owner_clock(&mut backend, owner_device, 1, 1000);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            owner_device,
+            AdmissionSourceFixture::new_source().0,
+        );
+        c0_3aii_route_production_clock_probes(&mut backend, owner_device);
+        crate::kms::executor::test_support::kill_and_reap(
+            backend
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == owner_device)
+                .and_then(|entry| entry.executor.as_mut())
+                .unwrap(),
+        );
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
+            .expect("spawn mixed-server Owner executor");
+        backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == owner_device)
+            .expect("mixed Owner device")
+            .executor = Some(executor);
         (backend, legacy_device, owner_device)
     }
 
@@ -58974,6 +59309,749 @@ mod tests {
             fd.as_fd(),
             std::time::Duration::from_secs(5),
         );
+    }
+
+    fn c0_2b_owner_fixture(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+        output_count: usize,
+        legacy: bool,
+        install_conductor: bool,
+    ) -> (super::KmsBackend, DrmDeviceKey) {
+        let mut backend = super::KmsBackend::for_tests();
+        for index in 1..output_count {
+            push_test_output(
+                &mut backend,
+                100 + u32::try_from(index).expect("fixture output index"),
+            );
+        }
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
+            .expect("spawn 2b stub executor");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("fixture device")
+            .key;
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(if legacy {
+            crate::kms::owner::device::DeviceCommitOwner::new_legacy(incarnation, lifecycle, 1)
+        } else {
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1)
+        });
+        backend.install_resource_service(crate::kms::render::resources::ResourceService::new(
+            device,
+            incarnation,
+        ));
+        if !legacy {
+            install_admission_owner_gate(&mut backend, device);
+        }
+        if install_conductor {
+            backend.install_admission_conductor_for_tests(
+                device,
+                AdmissionSourceFixture::new_source().0,
+            );
+        }
+        (backend, device)
+    }
+
+    fn c0_2b_route_executor_reply(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
+        wait_lifecycle_executor_readable(backend, device);
+        let events = backend.platform.drain_executor_events();
+        assert_eq!(events.len(), 1, "one scripted executor reply is ready");
+        backend.record_host_call_events(events);
+    }
+
+    fn c0_2b_probe_observations(
+        backend: &super::KmsBackend,
+    ) -> Vec<crate::kms::executor::HostCallObservation> {
+        backend
+            .drained_host_call_events_for_tests()
+            .into_iter()
+            .filter(|observation| {
+                matches!(
+                    observation.correlation,
+                    crate::kms::executor::protocol::HostCallCorrelation::ClockProbe { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn c0_2b_add_clock_is_probed_on_install() {
+        use crate::kms::{
+            executor::protocol::HostCallCorrelation,
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (mut backend, device) = c0_2b_owner_fixture(
+            crate::kms::executor::test_support::StubBehaviour::AcceptCallsWith(700),
+            2,
+            false,
+            false,
+        );
+        backend.install_admission_conductor(device, AdmissionSourceFixture::new_source().0);
+        assert!(
+            backend.crtc_key_by_id.is_empty(),
+            "no RANDR projection was run"
+        );
+        let hardware_crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(CrtcKey::for_output(output).crtc))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(hardware_crtcs.len(), 2);
+        for _ in 0..hardware_crtcs.len() {
+            c0_2b_route_executor_reply(&mut backend, device);
+        }
+
+        let observations = c0_2b_probe_observations(&backend);
+        assert_eq!(observations.len(), hardware_crtcs.len());
+        let probed = observations
+            .iter()
+            .map(|observation| match observation.correlation {
+                HostCallCorrelation::ClockProbe {
+                    hardware_crtc,
+                    clock_epoch,
+                    ..
+                } => (hardware_crtc, clock_epoch),
+                _ => unreachable!("filtered to clock probes"),
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(probed.len(), hardware_crtcs.len());
+        assert_eq!(
+            probed
+                .iter()
+                .map(|(crtc, _)| *crtc)
+                .collect::<std::collections::BTreeSet<_>>(),
+            hardware_crtcs
+        );
+        for hardware_crtc in hardware_crtcs {
+            let owner = backend.platform.owner_ref(device).expect("Owner");
+            let key = owner
+                .clock_key_for_hardware_crtc(hardware_crtc)
+                .expect("activation installed each served CRTC");
+            let clock = owner.clock(key).expect("installed clock");
+            assert_eq!(clock.source, ClockSource::KernelSequence);
+            assert_eq!(clock.reference, Some(700));
+            assert_eq!(clock.probe, ProbeState::Succeeded);
+        }
+    }
+
+    #[test]
+    fn c0_2b_add_clock_exists_without_a_randr_query() {
+        use crate::kms::owner::clock::ProbeState;
+
+        let (mut backend, device) = c0_2b_owner_fixture(
+            crate::kms::executor::test_support::StubBehaviour::AcceptCallsWith(81),
+            1,
+            false,
+            false,
+        );
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device,
+            AdmissionSourceFixture::new_source().0,
+        );
+        assert!(backend.crtc_key_by_id.is_empty());
+        assert!(backend.present_crtc_clock_epochs.is_empty());
+        let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+        let owner = backend.platform.owner_ref(device).expect("Owner");
+        let key = owner
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .expect("activation installs before RANDR enumeration");
+        assert!(matches!(
+            owner.clock(key).unwrap().probe,
+            ProbeState::InFlight(_)
+        ));
+    }
+
+    #[test]
+    fn c0_2b_add_failed_probe_is_not_retried_in_the_epoch() {
+        use crate::kms::{
+            executor::{HostCallObservation, ObservedOutcome, protocol::HostCallCorrelation},
+            owner::clock::{ClockSource, ProbeState},
+        };
+
+        let (mut backend, device) = c0_2b_owner_fixture(
+            crate::kms::executor::test_support::StubBehaviour::RejectFirstProbeThenAccept {
+                sequence: 900,
+                errno: libc::EOPNOTSUPP,
+            },
+            1,
+            false,
+            true,
+        );
+        c0_2b_route_executor_reply(&mut backend, device);
+        let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+        let old_key = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .unwrap();
+        {
+            let clock = backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(old_key)
+                .unwrap();
+            assert_eq!(clock.probe, ProbeState::Failed);
+            assert_eq!(clock.source, ClockSource::Unresolved);
+        }
+        let first_observations = backend.drained_host_call_events_for_tests();
+        assert_eq!(first_observations.len(), 1);
+        assert!(matches!(
+            first_observations[0].kind,
+            ObservedOutcome::Rejected {
+                errno: libc::EOPNOTSUPP
+            }
+        ));
+        backend.promote_waiting_clock_probe(device);
+        bind_test_randr_crtc(&mut backend, 0, 0x2b01);
+        backend.refresh_present_crtc_clock_epochs();
+        assert!(
+            backend
+                .waiting_clock_probes
+                .get(&device)
+                .is_none_or(|keys| keys.is_empty())
+        );
+        assert!(
+            !backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .has_clock_probe_in_flight(),
+            "a failed probe is not retried in the same epoch"
+        );
+        assert!(backend.drained_host_call_events_for_tests().is_empty());
+
+        let invalidation = backend
+            .platform
+            .owner_for(device)
+            .unwrap()
+            .invalidate_clock(old_key);
+        assert!(invalidation.is_empty());
+        backend.refresh_present_crtc_clock_epochs();
+        let new_key = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .unwrap();
+        assert!(new_key.epoch > old_key.epoch);
+        c0_2b_route_executor_reply(&mut backend, device);
+        let observations: Vec<HostCallObservation> = c0_2b_probe_observations(&backend);
+        assert_eq!(observations.len(), 1);
+        assert!(matches!(
+            observations[0].kind,
+            ObservedOutcome::ProbeAccepted { sequence: 900 }
+        ));
+        assert!(matches!(
+            observations[0].correlation,
+            HostCallCorrelation::ClockProbe { clock_epoch, .. } if clock_epoch == new_key.epoch
+        ));
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock(new_key)
+                .unwrap()
+                .probe,
+            ProbeState::Succeeded
+        );
+    }
+
+    #[test]
+    fn c0_2b_add_new_epoch_replaces_an_in_flight_probe() {
+        use crate::kms::owner::clock::{ClockSource, ProbeState};
+
+        let (mut backend, device) = c0_2b_owner_fixture(
+            crate::kms::executor::test_support::StubBehaviour::AcceptCallsWith(404),
+            1,
+            false,
+            true,
+        );
+        let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+        let old_key = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .unwrap();
+        backend
+            .platform
+            .owner_for(device)
+            .unwrap()
+            .invalidate_clock(old_key);
+        bind_test_randr_crtc(&mut backend, 0, 0x2b02);
+        let new_key = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .unwrap();
+        assert!(new_key.epoch > old_key.epoch);
+
+        c0_2b_route_executor_reply(&mut backend, device);
+        let owner = backend.platform.owner_ref(device).unwrap();
+        assert!(matches!(
+            owner.clock(new_key).unwrap().probe,
+            ProbeState::InFlight(_)
+        ));
+        assert_eq!(
+            owner.clock(new_key).unwrap().source,
+            ClockSource::Unresolved
+        );
+        c0_2b_route_executor_reply(&mut backend, device);
+        let owner = backend.platform.owner_ref(device).unwrap();
+        assert_eq!(
+            owner.clock(new_key).unwrap().source,
+            ClockSource::KernelSequence
+        );
+        assert_eq!(owner.clock(new_key).unwrap().reference, Some(404));
+        let observations = c0_2b_probe_observations(&backend);
+        assert_eq!(observations.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_2b_add_probe_is_not_starved_by_composed_frames_vulkan() {
+        use crate::kms::render::admission::AdmissionOutcome;
+
+        let (mut backend, device) = c0_2b_owner_fixture(
+            crate::kms::executor::test_support::StubBehaviour::AcceptCallsWithOutFence(505),
+            1,
+            false,
+            true,
+        );
+        c0_2b_route_executor_reply(&mut backend, device);
+        let crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+        backend
+            .admission_offer_composed(device, crtc, 1)
+            .expect("first composed frame");
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            AdmissionOutcome::Dispatched(_)
+        ));
+        c0_2b_route_executor_reply(&mut backend, device);
+        let first_commit = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .live_record()
+            .expect("first composed frame holds the owner slot")
+            .commit_id();
+
+        push_test_output(&mut backend, 102);
+        backend.activate_admission_clock_probes(device);
+        backend
+            .admission_offer_composed(device, crtc, 2)
+            .expect("successor frame remains queued");
+        assert_eq!(
+            backend.admission_wake(device, false),
+            AdmissionOutcome::SlotBusy
+        );
+        let retirement = backend
+            .platform
+            .owner_for(device)
+            .unwrap()
+            .complete_for_tests();
+        assert!(retirement.iter().any(|event| matches!(
+            event,
+            crate::kms::owner::device::OwnerEvent::CompletionRetired { commit, .. }
+                if *commit == first_commit
+        )));
+        assert!(backend.route_owner_event_batch(device, retirement, std::time::Instant::now()));
+
+        let new_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[1]).crtc);
+        let owner = backend.platform.owner_ref(device).unwrap();
+        let new_key = owner
+            .clock_key_for_hardware_crtc(new_crtc)
+            .expect("new served output clock was installed");
+        assert!(matches!(
+            owner.clock(new_key).unwrap().probe,
+            crate::kms::owner::clock::ProbeState::InFlight(_)
+        ));
+        assert!(
+            owner.live_record().is_none(),
+            "the probe beat the successor frame"
+        );
+        assert_eq!(
+            backend.admission_wake(device, false),
+            AdmissionOutcome::BeginRefused
+        );
+    }
+
+    #[test]
+    fn c0_2b_add_probe_is_promoted_at_every_release() {
+        use crate::kms::{
+            executor::HostCallClass,
+            owner::{
+                clock::{ClockSource, ProbeState},
+                completion::{CompletionClass, CompletionContext},
+                sequence::{SequenceConsumer, SequencePurpose},
+            },
+            render::admission::AdmissionOutcome,
+        };
+
+        // (i) A rejected lifecycle validation releases its lease; the
+        // waiting probe takes the slot before a queued successor can send.
+        {
+            let (mut backend, device) = c0_2b_owner_fixture(
+                crate::kms::executor::test_support::StubBehaviour::ProbeThenRejectAtomic {
+                    sequence: 606,
+                    errno: libc::EINVAL,
+                },
+                2,
+                false,
+                true,
+            );
+            seed_direct_owner_description_properties_for_tests(&mut backend);
+            c0_2b_route_executor_reply(&mut backend, device);
+            c0_2b_route_executor_reply(&mut backend, device);
+            Backend::set_dpms_power(&mut backend, 3).expect("initial DPMS request");
+            let old_tag = lifecycle_test_tag(&backend, device);
+            let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[1]).crtc);
+            let old_key = backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock_key_for_hardware_crtc(hardware_crtc)
+                .unwrap();
+            backend
+                .platform
+                .owner_for(device)
+                .unwrap()
+                .invalidate_clock(old_key);
+            let output_key = backend.platform.outputs[1].key.clone();
+            backend.crtc_key_by_id.insert(0x2b10, output_key);
+            backend.refresh_present_crtc_clock_epochs();
+            let new_key = backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock_key_for_hardware_crtc(hardware_crtc)
+                .unwrap();
+            assert!(new_key.epoch > old_key.epoch);
+            assert!(
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .unwrap()
+                    .slot()
+                    .validation_outstanding()
+                    .is_some()
+            );
+
+            Backend::set_dpms_power(&mut backend, 0).expect("queue successor DPMS request");
+            assert_ne!(lifecycle_test_tag(&backend, device), old_tag);
+            c0_2b_route_executor_reply(&mut backend, device);
+            let owner = backend.platform.owner_ref(device).unwrap();
+            assert!(owner.slot().validation_outstanding().is_none());
+            assert!(matches!(
+                owner.clock(new_key).unwrap().probe,
+                ProbeState::InFlight(_)
+            ));
+            assert_eq!(
+                backend
+                    .lifecycle_drivers
+                    .get(&device)
+                    .unwrap()
+                    .topology_test_stats()
+                    .0
+                    .len(),
+                1,
+                "the successor did not send validation ahead of the probe"
+            );
+            c0_2b_route_executor_reply(&mut backend, device);
+            assert_eq!(
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .unwrap()
+                    .clock(new_key)
+                    .unwrap()
+                    .source,
+                ClockSource::KernelSequence
+            );
+        }
+
+        // (ii) A passed validation transfers its lease to the validated live
+        // commit; a probe on a CRTC that commit does not need waits for its
+        // retirement.
+        {
+            let (mut backend, device) = c0_2b_owner_fixture(
+                crate::kms::executor::test_support::StubBehaviour::AcceptCallsWith(707),
+                1,
+                false,
+                true,
+            );
+            c0_2b_route_executor_reply(&mut backend, device);
+            let description = crate::kms::owner::build::CommitDescription {
+                objects: vec![crate::kms::owner::test_fixtures::off_to_off_crtc(1)],
+                crtc_state: vec![crate::kms::owner::closure::CrtcPower {
+                    crtc_id: 1,
+                    old_active: false,
+                    new_active: false,
+                }],
+                present_consumers: Vec::new(),
+                page_flip_event: false,
+                property_ids: crate::kms::owner::test_fixtures::TEST_PROPERTY_IDS,
+            };
+            let validation = backend
+                .platform
+                .owner_for(device)
+                .unwrap()
+                .begin_validation_with_options(
+                    &description,
+                    HostCallClass::SeatActiveValidation,
+                    false,
+                )
+                .expect("begin lifecycle-class validation");
+            assert_eq!(
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .unwrap()
+                    .slot()
+                    .validation_outstanding(),
+                Some(validation)
+            );
+            {
+                let crate::kms::render::platform::KmsDevice {
+                    owner, executor, ..
+                } = &mut backend.platform.devices[0];
+                owner
+                    .as_mut()
+                    .unwrap()
+                    .send_validation_on(executor.as_mut().unwrap())
+                    .expect("send validation");
+            }
+            push_test_output(&mut backend, 103);
+            backend.activate_admission_clock_probes(device);
+            let new_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[1]).crtc);
+            let new_key = backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock_key_for_hardware_crtc(new_crtc)
+                .unwrap();
+            c0_2b_route_executor_reply(&mut backend, device);
+            let context = CompletionContext {
+                class: CompletionClass::FastUpdate,
+                host_class: HostCallClass::SeatActiveNonblock,
+                allow_modeset: false,
+                clocks: std::collections::BTreeMap::new(),
+                mode_periods: std::collections::BTreeMap::new(),
+                lifecycle_observed_max: None,
+            };
+            let (_commit, _) = backend
+                .platform
+                .owner_for(device)
+                .unwrap()
+                .begin_validated_with_context(
+                    &description,
+                    crate::kms::owner::ledger::Submitted::new(Vec::new(), Vec::new()),
+                    context,
+                )
+                .expect("passed validation proceeds without the other CRTC clock");
+            backend
+                .send_on_device_for_tests(0)
+                .expect("send validated live commit");
+            backend
+                .admission_offer_composed(device, 1, 1)
+                .expect("queue successor behind validated commit");
+            c0_2b_route_executor_reply(&mut backend, device);
+            assert!(
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .unwrap()
+                    .live_record()
+                    .is_some()
+            );
+            assert!(!matches!(
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .unwrap()
+                    .clock(new_key)
+                    .unwrap()
+                    .probe,
+                ProbeState::InFlight(_)
+            ));
+            let retirement = backend
+                .platform
+                .owner_for(device)
+                .unwrap()
+                .complete_for_tests();
+            assert!(backend.route_owner_event_batch(device, retirement, std::time::Instant::now()));
+            let owner = backend.platform.owner_ref(device).unwrap();
+            assert!(matches!(
+                owner.clock(new_key).unwrap().probe,
+                ProbeState::InFlight(_)
+            ));
+            assert_eq!(owner.live_record().map(|record| record.commit_id()), None);
+            assert_eq!(
+                backend.admission_wake(device, false),
+                AdmissionOutcome::BeginRefused
+            );
+        }
+
+        // (iii) Releasing a sequence-queue lease promotes its waiting probe
+        // before a composed successor can begin.
+        {
+            let (mut backend, device) = c0_2b_owner_fixture(
+                crate::kms::executor::test_support::StubBehaviour::AcceptCallsWith(808),
+                1,
+                false,
+                true,
+            );
+            c0_2b_route_executor_reply(&mut backend, device);
+            let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+            let key = backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock_key_for_hardware_crtc(hardware_crtc)
+                .unwrap();
+            let _token = backend
+                .platform
+                .owner_for(device)
+                .unwrap()
+                .reserve_arm(
+                    key,
+                    SequencePurpose::PresentTargetWake,
+                    808,
+                    &[SequenceConsumer(808)],
+                )
+                .expect("reserve sequence queue lease");
+            {
+                let crate::kms::render::platform::KmsDevice {
+                    owner, executor, ..
+                } = &mut backend.platform.devices[0];
+                owner
+                    .as_mut()
+                    .unwrap()
+                    .send_next_sequence_on(executor.as_mut().unwrap())
+                    .expect("send sequence queue");
+            }
+            push_test_output(&mut backend, 104);
+            backend.activate_admission_clock_probes(device);
+            let new_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[1]).crtc);
+            let new_key = backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock_key_for_hardware_crtc(new_crtc)
+                .unwrap();
+            backend
+                .admission_offer_composed(device, hardware_crtc, 1)
+                .expect("queue successor while sequence lease is held");
+            assert_eq!(
+                backend.admission_wake(device, false),
+                AdmissionOutcome::BeginRefused
+            );
+            c0_2b_route_executor_reply(&mut backend, device);
+            let owner = backend.platform.owner_ref(device).unwrap();
+            assert!(owner.slot().queue_outstanding().is_none());
+            assert!(matches!(
+                owner.clock(new_key).unwrap().probe,
+                ProbeState::InFlight(_)
+            ));
+            assert_eq!(owner.live_record().map(|record| record.commit_id()), None);
+            assert_eq!(
+                backend.admission_wake(device, false),
+                AdmissionOutcome::BeginRefused
+            );
+        }
+
+        // (iv) Activation under the Legacy permit retains the key. The
+        // try_finish_legacy_transport boundary clears that permit and
+        // promotes the probe through the same installer step.
+        {
+            let (mut backend, device) = c0_2b_owner_fixture(
+                crate::kms::executor::test_support::StubBehaviour::AcceptCallsWith(909),
+                1,
+                true,
+                true,
+            );
+            let owner = backend.platform.owner_ref(device).unwrap();
+            assert!(owner.has_legacy_drain_permit());
+            assert!(!owner.has_clock_probe_in_flight());
+            backend.set_stopped_admission_for_tests(true);
+            // The test backend normally uses /dev/null, whose reads return
+            // EOF. A live DRM fd with no queued events returns EAGAIN; use a
+            // nonblocking socket pair to drive that same production drain
+            // boundary without opening a DRM node or taking master.
+            let (drm_event_fd, _drm_event_peer) =
+                std::os::unix::net::UnixStream::pair().expect("event-drain socket pair");
+            drm_event_fd
+                .set_nonblocking(true)
+                .expect("make event-drain socket nonblocking");
+            let drm_event_fd: std::os::fd::OwnedFd = drm_event_fd.into();
+            backend.platform.devices[0].device = std::rc::Rc::new(
+                crate::drm::Device::from_file_for_tests(std::fs::File::from(drm_event_fd)),
+            );
+            backend
+                .try_finish_legacy_transport(device, std::time::Instant::now())
+                .expect("clear the Legacy permit through the production handoff");
+            let owner = backend.platform.owner_ref(device).unwrap();
+            assert!(!owner.has_legacy_drain_permit());
+            assert!(owner.has_clock_probe_in_flight());
+            c0_2b_route_executor_reply(&mut backend, device);
+            let hardware_crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+            let key = backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock_key_for_hardware_crtc(hardware_crtc)
+                .unwrap();
+            assert_eq!(
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .unwrap()
+                    .clock(key)
+                    .unwrap()
+                    .reference,
+                Some(909)
+            );
+        }
+    }
+
+    #[test]
+    fn c0_2b_add_legacy_device_never_probes() {
+        let (mut backend, device) = c0_2b_owner_fixture(
+            crate::kms::executor::test_support::StubBehaviour::AcceptCallsWith(52),
+            1,
+            true,
+            false,
+        );
+        let before = backend
+            .platform
+            .owner_ref(device)
+            .unwrap()
+            .clock_key_for_hardware_crtc(u32::from(
+                CrtcKey::for_output(&backend.platform.outputs[0]).crtc,
+            ));
+        backend.activate_admission_clock_probes(device);
+        backend.promote_waiting_clock_probe(device);
+        assert!(!backend.waiting_clock_probes.contains_key(&device));
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .unwrap()
+                .clock_key_for_hardware_crtc(u32::from(
+                    CrtcKey::for_output(&backend.platform.outputs[0]).crtc,
+                )),
+            before
+        );
+        assert!(backend.drained_host_call_events_for_tests().is_empty());
     }
 
     #[test]
@@ -60493,6 +61571,8 @@ mod tests {
     }
 
     fn c0_3aii_prepare_lifecycle_clock(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
+        use crate::kms::owner::clock::{ClockSource, ProbeState};
+
         let output_idx = backend
             .platform
             .outputs
@@ -60501,72 +61581,13 @@ mod tests {
             .expect("Owner lifecycle output");
         let crtc_key = CrtcKey::for_output(&backend.platform.outputs[output_idx]);
         let hardware_crtc = u32::from(crtc_key.crtc);
-        let (lifecycle, topology_generation, old_key, old_clock_current) = {
-            let owner = backend.platform.owner_ref(device).expect("Owner device");
-            let (lifecycle, topology_generation) = owner.clock_context();
-            let old_key = owner.clock_key_for_hardware_crtc(hardware_crtc);
-            let old_clock_current = old_key.is_some_and(|key| {
-                owner.clock(key).is_some_and(|clock| {
-                    clock.lifecycle_epoch == lifecycle
-                        && clock.topology_generation == topology_generation
-                })
-            });
-            (lifecycle, topology_generation, old_key, old_clock_current)
-        };
-        let clock_key = match old_key {
-            Some(key) if old_clock_current => key,
-            Some(key) => {
-                let next_epoch = crate::kms::owner::identity::ClockEpochId::from_raw(
-                    key.epoch
-                        .get()
-                        .checked_add(1)
-                        .expect("clock epoch exhausted"),
-                );
-                let events = backend
-                    .platform
-                    .owner_for(device)
-                    .expect("Owner device")
-                    .invalidate_clock(key);
-                if !events.is_empty() {
-                    assert!(backend.route_owner_event_batch(
-                        device,
-                        events,
-                        std::time::Instant::now(),
-                    ));
-                }
-                let key = crate::kms::owner::clock::ClockKey {
-                    hardware_crtc,
-                    epoch: next_epoch,
-                };
-                backend
-                    .platform
-                    .owner_for(device)
-                    .expect("Owner device")
-                    .install_clock(key, lifecycle, topology_generation)
-                    .expect("install lifecycle completion clock");
-                key
-            }
-            None => {
-                let key = crate::kms::owner::clock::ClockKey {
-                    hardware_crtc,
-                    epoch: backend.clock_epoch_for_crtc_key(crtc_key),
-                };
-                backend
-                    .platform
-                    .owner_for(device)
-                    .expect("Owner device")
-                    .install_clock(key, lifecycle, topology_generation)
-                    .expect("install lifecycle completion clock");
-                key
-            }
-        };
-        backend
-            .platform
-            .owner_for(device)
-            .expect("Owner device")
-            .clock_mut(clock_key)
-            .expect("lifecycle completion clock")
-            .install_reference(1_000);
+        let owner = backend.platform.owner_ref(device).expect("Owner device");
+        let key = owner
+            .clock_key_for_hardware_crtc(hardware_crtc)
+            .expect("lifecycle fixture uses the production-installed clock");
+        let clock = owner.clock(key).expect("production lifecycle clock");
+        assert_eq!(clock.source, ClockSource::KernelSequence);
+        assert_eq!(clock.probe, ProbeState::Succeeded);
         backend.platform.record_completion_clock(
             crtc_key,
             yserver_core::backend::PresentClockSample {
@@ -63003,7 +64024,7 @@ mod tests {
                 .insert_for_tests(crtc, 21);
         }
         let executor = crate::kms::executor::test_support::spawn_stub_helper(
-            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+            crate::kms::executor::test_support::StubBehaviour::AcceptProbesThenNeverReply(1000),
         )
         .map_err(|error| std::io::Error::other(format!("stub executor: {error}")))?;
         let (incarnation, lifecycle) = executor.owner_identity();
@@ -63020,6 +64041,7 @@ mod tests {
         backend.platform.install_transport_gate(gate);
         let (source, _, _) = AdmissionSourceFixture::new();
         backend.install_admission_conductor_for_tests(device, source);
+        c0_3aii_route_production_clock_probes(&mut backend, device);
         Ok(backend)
     }
 
@@ -65970,15 +66992,16 @@ mod tests {
     #[test]
     fn c0_adm_conductor_kernel_rejection_returns_the_primary_ledger() {
         use crate::kms::{
-            executor::test_support::StubBehaviour, owner::test_fixtures,
+            executor::{HostCallEvent, HostCallOutcome, test_support::StubBehaviour},
             render::resources::DirectRole,
         };
 
         let mut backend = backend_with_current_and_successor_for_admission_seam();
         let device = backend.platform.primary_device().unwrap().key;
-        let executor =
-            crate::kms::executor::test_support::spawn_stub_helper(StubBehaviour::NeverReply)
-                .expect("spawn stub executor");
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(
+            StubBehaviour::AcceptProbesThenNeverReply(1000),
+        )
+        .expect("spawn stub executor");
         let (incarnation, lifecycle) = executor.owner_identity();
         backend.platform.devices[0].executor = Some(executor);
         backend.platform.devices[0].owner = Some(
@@ -65988,26 +67011,36 @@ mod tests {
         let (source, _, _, _, _, _, _, composed_resource_dropped) =
             AdmissionSourceFixture::new_with_controls();
         backend.install_admission_conductor_for_tests(device, source);
+        c0_3aii_route_production_clock_probes(&mut backend, device);
         backend
             .admission_offer_composed(device, 1, 1)
             .expect("composed offer");
 
-        let commit = match backend.admission_wake(device, false) {
-            crate::kms::render::admission::AdmissionOutcome::Dispatched(_confirmed) => backend
-                .device_owner_for_tests(0)
-                .live_record()
-                .expect("live owner record")
-                .commit_id(),
+        match backend.admission_wake(device, false) {
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_) => {}
             outcome => panic!("composed admission did not dispatch: {outcome:?}"),
-        };
+        }
         assert!(backend.commit_consumer.current_resources.is_empty());
 
         // This is the real host-call ingress: the fixture crafts the executor
         // rejection, while record_host_call_events invokes the owner's
         // apply_host_call_event and routes its complete returned batch.
+        let correlation = *backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("live owner record")
+            .correlation();
         backend.record_host_call_events(vec![(
             device,
-            test_fixtures::rejected(commit, libc::EINVAL),
+            HostCallEvent::Outcome {
+                correlation,
+                outcome: HostCallOutcome::Rejected {
+                    errno: libc::EINVAL,
+                    helper_duration_ns: 0,
+                    round_trip_ns: 0,
+                    unexpected_fence_output: false,
+                },
+            },
         )]);
 
         assert_eq!(backend.commit_consumer.current_resources.len(), 1);

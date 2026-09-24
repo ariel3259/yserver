@@ -329,6 +329,19 @@ impl<R> DeviceCommitOwner<R> {
             .copied()
     }
 
+    pub(crate) fn next_clock_epoch_after(&self, hardware_crtc: u32, minimum: u64) -> ClockEpochId {
+        let last = self
+            .last_clock_epoch
+            .get(&hardware_crtc)
+            .map(|epoch| epoch.get())
+            .unwrap_or(0);
+        ClockEpochId::from_raw(minimum.max(last.saturating_add(1)).max(1))
+    }
+
+    pub(crate) fn has_clock_probe_in_flight(&self) -> bool {
+        self.probe_in_flight.is_some()
+    }
+
     #[doc(hidden)]
     pub fn clock_mut(&mut self, key: ClockKey) -> Option<&mut CrtcClock> {
         self.clocks.get_mut(&key)

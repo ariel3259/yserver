@@ -637,9 +637,9 @@ impl KmsBackend {
         self.owner_dpms_installed_active
             .entry(device)
             .or_insert(true);
-        self.admission_conductors
-            .entry(device)
-            .or_insert_with(|| AdmissionConductor::new(Box::new(LifecycleOnlyAdmissionSource)));
+        if !self.admission_conductors.contains_key(&device) {
+            self.install_admission_conductor(device, Box::new(LifecycleOnlyAdmissionSource));
+        }
         self.lifecycle_drivers
             .entry(device)
             .or_insert_with(LifecycleDriver::new);
@@ -798,11 +798,15 @@ impl KmsBackend {
             driver.drain_entries = driver.drain_entries.saturating_add(1);
         }
 
-        while let Some(work) = self
-            .lifecycle_drivers
-            .get_mut(&device)
-            .and_then(LifecycleDriver::pop)
-        {
+        loop {
+            self.promote_waiting_clock_probe(device);
+            let Some(work) = self
+                .lifecycle_drivers
+                .get_mut(&device)
+                .and_then(LifecycleDriver::pop)
+            else {
+                break;
+            };
             match work {
                 LifecycleDriverWork::Actions { requester, actions } => {
                     for action in actions {
@@ -1929,6 +1933,7 @@ impl KmsBackend {
     ) {
         self.admission_conductors
             .insert(device, AdmissionConductor::new(source));
+        self.activate_admission_clock_probes(device);
     }
 
     /// Install the fixture-only conductor. Production has no caller until
@@ -1943,6 +1948,7 @@ impl KmsBackend {
             device,
             AdmissionConductor::new_with_composed_backend(source, false),
         );
+        self.activate_admission_clock_probes(device);
     }
 
     #[cfg(test)]
@@ -1955,6 +1961,7 @@ impl KmsBackend {
             device,
             AdmissionConductor::new_with_composed_backend(source, true),
         );
+        self.activate_admission_clock_probes(device);
     }
 
     pub(crate) fn admission_offer_composed(
@@ -2648,6 +2655,7 @@ impl KmsBackend {
         device: DrmDeviceKey,
         retirement_wake: bool,
     ) -> AdmissionOutcome {
+        self.promote_waiting_clock_probe(device);
         let recovery_stopped = self
             .admission_conductors
             .get(&device)
