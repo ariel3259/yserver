@@ -573,6 +573,20 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
         Ok(entry.arbiter.client_modeset_submitting(tag))
     }
 
+    /// Refuse later ordinary work after a client modeset rejection closed the
+    /// current Owner qualification/readiness.
+    pub fn client_modeset_close_readiness(
+        &mut self,
+        device: &D,
+        tag: &ClientModesetTag<I>,
+    ) -> Result<bool, CoordinatorError> {
+        let entry = self
+            .devices
+            .get_mut(device)
+            .ok_or(CoordinatorError::UnknownDevice)?;
+        Ok(entry.arbiter.client_modeset_close_readiness(tag))
+    }
+
     /// Resolve a dispatched client modeset at the Owner result boundary and
     /// converge any REC-4 events projected while it was in flight.
     pub fn client_modeset_resolved(

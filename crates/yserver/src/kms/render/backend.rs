@@ -22820,14 +22820,24 @@ impl KmsBackend {
             && mode_h == mode.height
             && vrefresh == mode.vrefresh
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                    crate::kms::render::admission::ClientModesetRefusal::NotYetSupported(
+            let modeset = self.admission_reserve_client_modeset_id(output_key.device_key)?;
+            return Err(crate::kms::render::admission::ClientModesetError {
+                diagnostic: crate::kms::render::admission::ClientModesetDiagnostic {
+                    device: output_key.device_key,
+                    modeset,
+                    output_id,
+                    output: connector.to_string(),
+                    requested_mode: Some(mode),
+                    x,
+                    y,
+                },
+                failure: crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
+                    crate::kms::render::admission::OwnerRefusal::NotYetSupported(
                         crate::kms::render::admission::ClientModesetUnsupportedFeature::PositionOnly,
                     ),
                 ),
-            ));
+            }
+            .into_io_error());
         }
         if mode.is_some()
             && self
@@ -22843,18 +22853,28 @@ impl KmsBackend {
                  YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
             )));
         }
+        let modeset = self.admission_reserve_client_modeset_id(output_key.device_key)?;
+        let diagnostic = crate::kms::render::admission::ClientModesetDiagnostic {
+            device: output_key.device_key,
+            modeset,
+            output_id,
+            output: connector.to_string(),
+            requested_mode: mode,
+            x,
+            y,
+        };
         if self.vt_state != crate::vt::state::VtState::Active {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                    crate::kms::render::admission::ClientModesetRefusal::SeatReleased,
-                ),
-            ));
+            return Err(crate::kms::render::admission::ClientModesetError {
+                diagnostic,
+                failure: crate::kms::render::admission::ClientModesetFailure::SeatReleased,
+            }
+            .into_io_error());
         }
 
         let token = self.next_crtc_config_token();
         self.admission_start_client_modeset(
             output_key.device_key,
+            modeset,
             token,
             output_id,
             connector.to_string(),
@@ -62765,6 +62785,47 @@ mod tests {
             .commit_id()
     }
 
+    fn c0_3bi_reject_live_client_modeset(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        token: yserver_core::backend::CrtcConfigToken,
+        errno: i32,
+    ) -> std::io::Result<bool> {
+        use crate::kms::executor::{HostCallEvent, HostCallOutcome};
+
+        c0_3bi_dispatch_client_modeset(backend, device);
+        let correlation = *backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("live client modeset record")
+            .correlation();
+        let events = backend.platform.devices[0]
+            .owner
+            .as_mut()
+            .expect("Owner device")
+            .apply_host_call_event(HostCallEvent::Outcome {
+                correlation,
+                outcome: HostCallOutcome::Rejected {
+                    errno,
+                    helper_duration_ns: 0,
+                    round_trip_ns: 0,
+                    unexpected_fence_output: false,
+                },
+            });
+        assert!(backend.route_owner_event_batch(device, events, std::time::Instant::now()));
+        Backend::finish_crtc_config(backend, token)
+    }
+
+    fn c0_3bi_reject_test_only_client_modeset(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        token: yserver_core::backend::CrtcConfigToken,
+    ) -> std::io::Result<bool> {
+        wait_lifecycle_executor_readable(backend, device);
+        Backend::on_executor_readable(backend, &mut ServerState::new());
+        Backend::finish_crtc_config(backend, token)
+    }
+
     fn c0_3bi_scanout_allocation_keys(
         backend: &super::KmsBackend,
         device: DrmDeviceKey,
@@ -63218,8 +63279,16 @@ mod tests {
             &mut backend,
             StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
         );
+        // The rejected configuration is latched for this installed
+        // generation. Keep this retirement scenario's successful follow-up
+        // distinct by changing its requested position.
         let accepted_token =
-            c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            match Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 1, 0)
+                .expect("a distinct configuration is not latched")
+            {
+                CrtcConfigApply::Pending(token) => token,
+                other => panic!("distinct non-idempotent request was not pending: {other:?}"),
+            };
         let accepted_commit = c0_3bi_dispatch_client_modeset(&mut backend, device);
         let accepted = c0_3bi_kms_displacements(&backend, device, accepted_commit);
         assert_eq!(accepted.len(), old_keys.len());
@@ -63717,12 +63786,16 @@ mod tests {
     fn c0_3bi_client_modeset_failure(
         error: &std::io::Error,
     ) -> Option<crate::kms::render::admission::ClientModesetFailure> {
-        error
-            .get_ref()
-            .and_then(|source| {
-                source.downcast_ref::<crate::kms::render::admission::ClientModesetFailure>()
-            })
-            .copied()
+        error.get_ref().and_then(|source| {
+            source
+                .downcast_ref::<crate::kms::render::admission::ClientModesetError>()
+                .map(|error| error.failure)
+                .or_else(|| {
+                    source
+                        .downcast_ref::<crate::kms::render::admission::ClientModesetFailure>()
+                        .copied()
+                })
+        })
     }
 
     fn c0_3bi_changed_mode() -> yserver_core::backend::ModeSpec {
@@ -63886,7 +63959,7 @@ mod tests {
         use crate::kms::{
             executor::test_support::StubBehaviour,
             owner::closure::ObjectKind,
-            render::admission::{ClientModesetFailure, ClientModesetPreparationStage},
+            render::admission::{ClientModesetFailure, PreparationStage},
         };
 
         let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
@@ -63934,9 +64007,7 @@ mod tests {
             .expect_err("a changed CRTC assignment is refused during preparation");
         assert_eq!(
             c0_3bi_client_modeset_failure(&error),
-            Some(ClientModesetFailure::Preparation(
-                ClientModesetPreparationStage::Route
-            ))
+            Some(ClientModesetFailure::Preparation(PreparationStage::Route))
         );
     }
 
@@ -64065,7 +64136,7 @@ mod tests {
     fn c0_3bi_prepared_set_released_once_vulkan() {
         use crate::kms::{
             executor::test_support::{ScriptedReply, StubBehaviour},
-            render::admission::{ClientModesetFailure, ClientModesetPreparationStage},
+            render::admission::{ClientModesetFailure, PreparationStage},
         };
 
         // Discovery failure: a mapped but absent connector reaches preparation
@@ -64087,7 +64158,7 @@ mod tests {
         assert_eq!(
             c0_3bi_client_modeset_failure(&error),
             Some(ClientModesetFailure::Preparation(
-                ClientModesetPreparationStage::Discovery
+                PreparationStage::Discovery
             ))
         );
         assert!(
@@ -64114,9 +64185,7 @@ mod tests {
             .expect_err("unadvertised mode fails preparation");
         assert_eq!(
             c0_3bi_client_modeset_failure(&error),
-            Some(ClientModesetFailure::Preparation(
-                ClientModesetPreparationStage::Mode
-            ))
+            Some(ClientModesetFailure::Preparation(PreparationStage::Mode))
         );
         assert!(
             backend
@@ -64136,7 +64205,7 @@ mod tests {
         assert_eq!(
             c0_3bi_client_modeset_failure(&error),
             Some(ClientModesetFailure::Preparation(
-                ClientModesetPreparationStage::Allocation
+                PreparationStage::Allocation
             ))
         );
         assert!(
@@ -64162,11 +64231,15 @@ mod tests {
         let (keys, framebuffers) = c0_3bi_pending_prepared_pool_allocations(&backend, device);
         wait_lifecycle_executor_readable(&backend, device);
         Backend::on_executor_readable(&mut backend, &mut ServerState::new());
+        let validation_error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("TEST_ONLY returned EINVAL");
         assert_eq!(
-            Backend::finish_crtc_config(&mut backend, token)
-                .expect_err("TEST_ONLY returned EINVAL")
-                .raw_os_error(),
-            Some(libc::EINVAL)
+            c0_3bi_client_modeset_failure(&validation_error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::TestOnly {
+                    errno: libc::EINVAL
+                }
+            ))
         );
         c0_3bi_assert_prepared_pool_released(
             &backend,
@@ -64214,7 +64287,8 @@ mod tests {
             &cleanup_calls,
         );
 
-        // A stale generation before validation consumes and releases the set.
+        // A topology invalidation before validation supersedes the queued
+        // request and releases the prepared set.
         let (
             OwnerLiveFixture {
                 mut backend,
@@ -64242,7 +64316,14 @@ mod tests {
                 .0
                 .is_empty()
         );
-        assert!(Backend::finish_crtc_config(&mut backend, token).is_err());
+        let stale_error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("the topology invalidation supersedes the queued request");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&stale_error),
+            Some(ClientModesetFailure::Superseded(
+                crate::kms::owner::lifecycle::LifecycleKind::DPMS
+            ))
+        );
         c0_3bi_assert_prepared_pool_released(
             &backend,
             device,
@@ -64293,7 +64374,15 @@ mod tests {
         assert!(backend.route_owner_event_batch(device, rejection, std::time::Instant::now()));
         let error = Backend::finish_crtc_config(&mut backend, token)
             .expect_err("live commit was explicitly rejected");
-        assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{error:?}");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(
+                crate::kms::render::admission::ClientModesetFailure::KernelRejected {
+                    errno: libc::EINVAL,
+                }
+            ),
+            "{error:?}"
+        );
         c0_3bi_assert_prepared_pool_released(
             &backend,
             device,
@@ -64301,6 +64390,546 @@ mod tests {
             &framebuffers,
             &cleanup_calls,
         );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_each_failure_has_its_cause_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::{ClientModesetFailure, OwnerRefusal, PreparationStage},
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, _, _, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let missing = OutputKey::new(device, "failure-table-missing-output");
+        let missing_id = backend.randr_id_alloc.ids_for(&missing).output_id;
+        backend.output_key_by_id.insert(missing_id, missing.clone());
+        let token = c0_3bi_begin_client_modeset(
+            &mut backend,
+            missing_id,
+            &missing.connector_name,
+            Some(mode),
+        );
+        let discovery_error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("missing connector is a discovery preparation failure");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&discovery_error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::Discovery
+            ))
+        );
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(libc::EINVAL), false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let validation_error = c0_3bi_reject_test_only_client_modeset(&mut backend, device, token)
+            .expect_err("TEST_ONLY EINVAL is a preparation failure");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&validation_error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::TestOnly {
+                    errno: libc::EINVAL,
+                }
+            ))
+        );
+        let diagnostic = validation_error.to_string();
+        assert!(diagnostic.contains(&connector), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&format!("mode Some({mode:?})")),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("position (0, 0)"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&format!("device {device}")),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("modeset 1"), "{diagnostic}");
+        assert!(diagnostic.contains("Preparation(TestOnly"), "{diagnostic}");
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::NeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let first = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let slot_error =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect_err("the occupied Owner slot refuses the second request");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&slot_error),
+            Some(ClientModesetFailure::OwnerRefused(
+                OwnerRefusal::SlotOccupied
+            ))
+        );
+        assert!(
+            slot_error
+                .to_string()
+                .contains("OwnerRefused(SlotOccupied)")
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset
+                .as_ref()
+                .map(|slot| slot.token),
+            Some(first)
+        );
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let rejection =
+            c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EINVAL)
+                .expect_err("real commit EINVAL is a kernel rejection");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&rejection),
+            Some(ClientModesetFailure::KernelRejected {
+                errno: libc::EINVAL,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_ebusy_is_not_retried_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            owner::{
+                lifecycle::DeviceLifecycleState,
+                record::{FailureCause, TerminalState},
+            },
+            render::admission::{ClientModesetFailure, OwnerRefusal},
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let error = c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EBUSY)
+            .expect_err("atomic EBUSY is a terminal rejection");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::KernelRejected { errno: libc::EBUSY })
+        );
+
+        let driver = &backend.lifecycle_drivers[&device];
+        assert_eq!(driver.client_modeset_test_stats().1.len(), 1);
+        assert!(
+            driver.client_modeset_foreign_busy,
+            "EBUSY evidence is retained"
+        );
+        assert!(matches!(
+            backend
+                .device_owner_for_tests(0)
+                .tombstones()
+                .back()
+                .unwrap()
+                .terminal,
+            TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno: libc::EBUSY })
+        ));
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Quiescing
+        );
+        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert_eq!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+        );
+        let following =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect_err("readiness remains closed after EBUSY");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&following),
+            Some(ClientModesetFailure::OwnerRefused(
+                OwnerRefusal::ReadinessClosed
+            ))
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_errno_classification_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            owner::lifecycle::DeviceLifecycleState,
+            render::admission::{ClientModesetFailure, OwnerRefusal, PreparationStage},
+        };
+
+        for errno in [libc::EACCES, libc::ENOENT, libc::EIO] {
+            let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+                c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(errno), false)
+                    .expect("environmental skip: no live Vulkan modeset fixture");
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let error = c0_3bi_reject_test_only_client_modeset(&mut backend, device, token)
+                .expect_err("unclassified TEST_ONLY errors close readiness");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(ClientModesetFailure::Preparation(
+                    PreparationStage::TestOnly { errno }
+                ))
+            );
+            assert_eq!(
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .unwrap()
+                    .state(),
+                DeviceLifecycleState::Quiescing
+            );
+            assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+            assert_eq!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+            );
+            let validations = backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len();
+            let following =
+                Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                    .expect_err("following modeset is refused after TEST_ONLY readiness loss");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&following),
+                Some(ClientModesetFailure::OwnerRefused(
+                    OwnerRefusal::ReadinessClosed
+                ))
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .0
+                    .len(),
+                validations
+            );
+            let crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+            backend
+                .admission_offer_composed(device, crtc, 1)
+                .expect("offer a composed frame after TEST_ONLY readiness loss");
+            let live_sends = backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len();
+            assert_eq!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::NothingAdmissible,
+                "a following composed frame is refused after TEST_ONLY readiness loss"
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .1
+                    .len(),
+                live_sends,
+                "the refused composed frame sends no live commit"
+            );
+        }
+
+        for errno in [libc::EACCES, libc::ENOENT, libc::EIO] {
+            let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+                c0_3bi_live_modeset_backend(
+                    StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                    false,
+                )
+                .expect("environmental skip: no live Vulkan modeset fixture");
+            let token =
+                c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+            let error = c0_3bi_reject_live_client_modeset(&mut backend, device, token, errno)
+                .expect_err("unclassified real-commit errors close readiness");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&error),
+                Some(ClientModesetFailure::KernelRejected { errno })
+            );
+            assert_eq!(
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .unwrap()
+                    .state(),
+                DeviceLifecycleState::Quiescing
+            );
+            assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+            assert_eq!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::NothingAdmissible
+            );
+            let following =
+                Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                    .expect_err("following modeset is refused after live readiness loss");
+            assert_eq!(
+                c0_3bi_client_modeset_failure(&following),
+                Some(ClientModesetFailure::OwnerRefused(
+                    OwnerRefusal::ReadinessClosed
+                ))
+            );
+            let crtc = u32::from(CrtcKey::for_output(&backend.platform.outputs[0]).crtc);
+            backend
+                .admission_offer_composed(device, crtc, 1)
+                .expect("offer a composed frame after real-commit readiness loss");
+            let live_sends = backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len();
+            assert_eq!(
+                backend.admission_wake(device, false),
+                crate::kms::render::admission::AdmissionOutcome::NothingAdmissible,
+                "a following composed frame is refused after real-commit readiness loss"
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&device]
+                    .client_modeset_test_stats()
+                    .1
+                    .len(),
+                live_sends,
+                "the refused composed frame sends no live commit"
+            );
+        }
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::RejectWith(libc::EINVAL), false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let error = c0_3bi_reject_test_only_client_modeset(&mut backend, device, token)
+            .expect_err("TEST_ONLY EINVAL rejects this candidate only");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::Preparation(
+                PreparationStage::TestOnly {
+                    errno: libc::EINVAL,
+                }
+            ))
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Ready
+        );
+        let second =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect("a candidate EINVAL does not close readiness");
+        assert!(matches!(second, CrtcConfigApply::Pending(_)));
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_latch_is_keyed_by_generation_and_request_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::ClientModesetFailure,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let error = c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EINVAL)
+            .expect_err("real-commit EINVAL is latched");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::KernelRejected {
+                errno: libc::EINVAL,
+            })
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_latch
+                .is_some()
+        );
+        let live_sends = backend.lifecycle_drivers[&device]
+            .client_modeset_test_stats()
+            .1
+            .len();
+
+        let repeated =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect_err("identical configuration is latched for this generation");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&repeated),
+            Some(ClientModesetFailure::Latched)
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len(),
+            live_sends,
+            "the latched request sends no live commit"
+        );
+
+        let different = Backend::begin_crtc_config(&mut backend, output_id, &connector, None, 0, 0)
+            .expect("a different requested configuration is not latched");
+        assert!(matches!(different, CrtcConfigApply::Pending(_)));
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            2
+        );
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let _ = c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EINVAL)
+            .expect_err("real-commit EINVAL installs a latch");
+        let current_generation = backend
+            .platform
+            .owner_ref(device)
+            .expect("Owner device")
+            .topology_generation();
+        backend
+            .lifecycle_drivers
+            .get_mut(&device)
+            .unwrap()
+            .client_modeset_latch
+            .as_mut()
+            .expect("installed-generation latch")
+            .topology_generation = current_generation.saturating_sub(1);
+        let after_generation_change =
+            Backend::begin_crtc_config(&mut backend, output_id, &connector, Some(mode), 0, 0)
+                .expect("an old-generation latch is cleared");
+        assert!(matches!(
+            after_generation_change,
+            CrtcConfigApply::Pending(_)
+        ));
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_latch
+                .is_none()
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_rejection_answers_failed_not_success_vulkan() {
+        use crate::kms::{
+            executor::test_support::{ScriptedReply, StubBehaviour},
+            render::admission::ClientModesetFailure,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        let result = c0_3bi_reject_live_client_modeset(&mut backend, device, token, libc::EINVAL);
+        let error = result.expect_err("a rejected commit is never reported as success");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::KernelRejected {
+                errno: libc::EINVAL,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_host_call_timeout_poisons_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::{
+                lifecycle::DeviceLifecycleState,
+                record::{TerminalState, UnknownCause},
+            },
+            render::admission::ClientModesetFailure,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptValidationThenNeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let original_width = backend.platform.outputs[0].width;
+        let original_instance = backend.scene.output_instance_id_for_tests(0);
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        c0_3bi_dispatch_client_modeset(&mut backend, device);
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        let deadline = backend.platform.devices[0]
+            .executor
+            .as_ref()
+            .expect("Owner executor")
+            .next_deadline()
+            .expect("live host call watchdog is armed");
+        let events = backend
+            .platform
+            .tick_executors(deadline + std::time::Duration::from_millis(1));
+        backend.record_host_call_events(events);
+
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("the watchdog turns a missing host reply into request failure");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&error),
+            Some(ClientModesetFailure::CompletionUnknown)
+        );
+        assert_eq!(backend.platform.outputs[0].width, original_width);
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            original_instance
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::Poisoned
+        );
+        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert!(matches!(
+            backend
+                .device_owner_for_tests(0)
+                .tombstones()
+                .back()
+                .unwrap()
+                .terminal,
+            TerminalState::CompletionUnknown(UnknownCause::HostCall(
+                crate::kms::executor::UnknownReason::WatchdogExpired
+            ))
+        ));
+        assert!(backend.lifecycle_drivers[&device].client_modeset.is_none());
     }
 
     #[test]
@@ -65059,11 +65688,7 @@ mod tests {
         let assert_seat_refused = |error: &std::io::Error| {
             assert_eq!(
                 c0_3bi_client_modeset_failure(error),
-                Some(
-                    crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                        crate::kms::render::admission::ClientModesetRefusal::SeatReleased,
-                    )
-                )
+                Some(crate::kms::render::admission::ClientModesetFailure::SeatReleased)
             );
         };
         let enable_error = Backend::begin_crtc_config(
@@ -65131,7 +65756,7 @@ mod tests {
             c0_3bi_client_modeset_failure(&second_error),
             Some(
                 crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                    crate::kms::render::admission::ClientModesetRefusal::SlotOccupied,
+                    crate::kms::render::admission::OwnerRefusal::SlotOccupied,
                 )
             )
         );

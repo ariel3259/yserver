@@ -4593,7 +4593,12 @@ mod tests {
 
     fn c0_test_publication() -> CrtcConfigPublication {
         CrtcConfigPublication {
+            client_id: yserver_protocol::x11::ClientId(1),
+            sequence: yserver_protocol::x11::SequenceNumber(1),
             output_id: 1,
+            requested_mode: None,
+            x: 0,
+            y: 0,
             set_time: 0,
             output_bbox_before: None,
         }
@@ -6937,7 +6942,12 @@ mod tests {
         );
 
         let publication = CrtcConfigPublication {
+            client_id,
+            sequence: SequenceNumber(9),
             output_id: state.randr.outputs[0].output_id,
+            requested_mode: None,
+            x: 0,
+            y: 0,
             set_time: 123,
             output_bbox_before: enabled_output_bbox(&state),
         };

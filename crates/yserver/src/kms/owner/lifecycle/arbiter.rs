@@ -326,6 +326,21 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         true
     }
 
+    /// Close ordinary readiness after a client modeset rejection whose errno
+    /// invalidates the current device qualification. A pre-dispatch TEST_ONLY
+    /// refusal may also use this path; in that case no class-1 barrier is set.
+    pub fn client_modeset_close_readiness(&mut self, tag: &ClientModesetTag<I>) -> bool {
+        if tag.incarnation != self.incarnation
+            || tag.lifecycle_epoch != self.epoch
+            || self.transition.is_some() && self.client_modeset_submitting.as_ref() != Some(tag)
+        {
+            return false;
+        }
+        self.state = DeviceLifecycleState::Quiescing;
+        self.admission_open = false;
+        true
+    }
+
     /// Release the class-1 barrier at the Owner result boundary and start any
     /// REC-4 transition accumulated while the client commit was dispatched.
     pub fn client_modeset_resolved(

@@ -182,11 +182,11 @@ enum DispatchFailureRouteKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientModesetRefusal {
-    SeatReleased,
+pub(crate) enum OwnerRefusal {
     SlotOccupied,
+    ClockNotReady,
+    ReadinessClosed,
     NotYetSupported(ClientModesetUnsupportedFeature),
-    DeviceNotReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,19 +197,29 @@ pub(crate) enum ClientModesetUnsupportedFeature {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientModesetPreparationStage {
+pub(crate) enum PreparationStage {
     Discovery,
     Mode,
     Route,
     Allocation,
     SceneState,
+    #[allow(dead_code, reason = "the prepared unflip path is introduced by 3b-i-2")]
+    Unflip,
+    TestOnly {
+        errno: i32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientModesetFailure {
-    OwnerRefused(ClientModesetRefusal),
-    Preparation(ClientModesetPreparationStage),
+    Preparation(PreparationStage),
+    KernelRejected { errno: i32 },
+    OwnerRefused(OwnerRefusal),
     Superseded(crate::kms::owner::lifecycle::LifecycleKind),
+    CompletionUnknown,
+    Stale,
+    Latched,
+    SeatReleased,
 }
 
 impl std::fmt::Display for ClientModesetFailure {
@@ -219,6 +229,127 @@ impl std::fmt::Display for ClientModesetFailure {
 }
 
 impl std::error::Error for ClientModesetFailure {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClientModesetDiagnostic {
+    pub(crate) device: DrmDeviceKey,
+    pub(crate) modeset: ClientModesetId,
+    pub(crate) output_id: u32,
+    pub(crate) output: String,
+    pub(crate) requested_mode: Option<yserver_core::backend::ModeSpec>,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClientModesetError {
+    pub(crate) diagnostic: ClientModesetDiagnostic,
+    pub(crate) failure: ClientModesetFailure,
+}
+
+impl std::fmt::Display for ClientModesetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let diagnostic = &self.diagnostic;
+        write!(
+            formatter,
+            "output {} (id {}) mode {:?} position ({}, {}) device {} modeset {} failed: {}",
+            diagnostic.output,
+            diagnostic.output_id,
+            diagnostic.requested_mode,
+            diagnostic.x,
+            diagnostic.y,
+            diagnostic.device,
+            diagnostic.modeset.get(),
+            self.failure,
+        )
+    }
+}
+
+impl std::error::Error for ClientModesetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
+    }
+}
+
+impl ClientModesetError {
+    pub(crate) fn into_io_error(self) -> std::io::Error {
+        std::io::Error::other(self)
+    }
+
+    pub(crate) fn diagnostic_for_slot(
+        device: DrmDeviceKey,
+        slot: &ClientModesetSlot,
+    ) -> ClientModesetDiagnostic {
+        ClientModesetDiagnostic {
+            device,
+            modeset: slot.tag.modeset,
+            output_id: slot.output_id,
+            output: slot.connector.clone(),
+            requested_mode: slot.mode,
+            x: slot.x,
+            y: slot.y,
+        }
+    }
+}
+
+fn client_modeset_error_for_slot(
+    device: DrmDeviceKey,
+    slot: &ClientModesetSlot,
+    result: std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    result.map_err(|error| {
+        let failure = client_modeset_failure_from_error(&error).unwrap_or(
+            ClientModesetFailure::OwnerRefused(OwnerRefusal::ReadinessClosed),
+        );
+        ClientModesetError {
+            diagnostic: ClientModesetError::diagnostic_for_slot(device, slot),
+            failure,
+        }
+        .into_io_error()
+    })
+}
+
+fn client_modeset_failure_from_error(error: &std::io::Error) -> Option<ClientModesetFailure> {
+    error.get_ref().and_then(|source| {
+        source
+            .downcast_ref::<ClientModesetError>()
+            .map(|error| error.failure)
+            .or_else(|| source.downcast_ref::<ClientModesetFailure>().copied())
+    })
+}
+
+fn test_only_errno_keeps_readiness(errno: i32) -> bool {
+    errno == libc::EINVAL || errno == libc::ERANGE || errno == libc::ENOSPC
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientModesetLatch {
+    pub(crate) topology_generation: u64,
+    pub(crate) output_id: u32,
+    pub(crate) connector: String,
+    pub(crate) mode: Option<yserver_core::backend::ModeSpec>,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+}
+
+impl ClientModesetLatch {
+    fn matches_request(
+        &self,
+        topology_generation: u64,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        self.topology_generation == topology_generation
+            && self.output_id == output_id
+            && self.connector == connector
+            && self.mode == mode
+            && self.x == x
+            && self.y == y
+    }
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +547,8 @@ pub(crate) struct LifecycleDriver {
     installed_crtc_power: BTreeMap<u32, InstalledCrtcPower>,
     kms_displacements: BTreeMap<CommitId, Vec<crate::kms::render::resources::KmsReleaseObligation>>,
     pub(crate) client_modeset: Option<ClientModesetSlot>,
+    pub(crate) client_modeset_latch: Option<ClientModesetLatch>,
+    pub(crate) client_modeset_foreign_busy: bool,
     next_client_modeset_id: Option<u64>,
     #[cfg(test)]
     pub(crate) hook: Option<LifecycleTopologyTestHook>,
@@ -462,6 +595,8 @@ impl LifecycleDriver {
             installed_crtc_power: BTreeMap::new(),
             kms_displacements: BTreeMap::new(),
             client_modeset: None,
+            client_modeset_latch: None,
+            client_modeset_foreign_busy: false,
             next_client_modeset_id: Some(1),
             #[cfg(test)]
             hook: None,
@@ -831,9 +966,25 @@ impl AdmissionConductor {
 
 #[allow(dead_code)]
 impl KmsBackend {
+    pub(crate) fn admission_reserve_client_modeset_id(
+        &mut self,
+        device: DrmDeviceKey,
+    ) -> std::io::Result<ClientModesetId> {
+        self.lifecycle_register_owner_device(device)
+            .map_err(|error| {
+                std::io::Error::other(format!("Owner lifecycle unavailable: {error:?}"))
+            })?;
+        self.lifecycle_drivers
+            .get_mut(&device)
+            .expect("Owner lifecycle registration installs a driver")
+            .allocate_client_modeset_id()
+            .ok_or_else(|| std::io::Error::other("Owner client modeset identity exhausted"))
+    }
+
     pub(crate) fn admission_start_client_modeset(
         &mut self,
         device: DrmDeviceKey,
+        modeset: ClientModesetId,
         token: yserver_core::backend::CrtcConfigToken,
         output_id: u32,
         connector: String,
@@ -841,30 +992,28 @@ impl KmsBackend {
         x: i32,
         y: i32,
     ) -> std::io::Result<()> {
+        let diagnostic = ClientModesetDiagnostic {
+            device,
+            modeset,
+            output_id,
+            output: connector.clone(),
+            requested_mode: mode,
+            x,
+            y,
+        };
+        let refused = |failure| {
+            ClientModesetError {
+                diagnostic: diagnostic.clone(),
+                failure,
+            }
+            .into_io_error()
+        };
         self.lifecycle_register_owner_device(device)
-            .map_err(|error| {
-                std::io::Error::other(format!("Owner lifecycle unavailable: {error:?}"))
+            .map_err(|_error| {
+                refused(ClientModesetFailure::OwnerRefused(
+                    OwnerRefusal::ReadinessClosed,
+                ))
             })?;
-        let state = self
-            .lifecycle_coordinator
-            .device(&device)
-            .map(|arbiter| arbiter.state());
-        if state != Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Ready) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                ClientModesetFailure::OwnerRefused(ClientModesetRefusal::DeviceNotReady),
-            ));
-        }
-        if self
-            .lifecycle_drivers
-            .get(&device)
-            .is_some_and(|driver| driver.client_modeset.is_some())
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                ClientModesetFailure::OwnerRefused(ClientModesetRefusal::SlotOccupied),
-            ));
-        }
         let (incarnation, lifecycle_epoch, topology_generation) = self
             .platform
             .owner_ref(device)
@@ -875,20 +1024,57 @@ impl KmsBackend {
                     owner.topology_generation(),
                 )
             })
-            .ok_or_else(|| std::io::Error::other("Owner modeset has no device owner"))?;
-        let driver = self
+            .ok_or_else(|| {
+                refused(ClientModesetFailure::OwnerRefused(
+                    OwnerRefusal::ReadinessClosed,
+                ))
+            })?;
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+            && driver
+                .client_modeset_latch
+                .as_ref()
+                .is_some_and(|latch| latch.topology_generation != topology_generation)
+        {
+            driver.client_modeset_latch = None;
+        }
+        let state = self
+            .lifecycle_coordinator
+            .device(&device)
+            .map(|arbiter| arbiter.state());
+        if state != Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Ready) {
+            return Err(refused(ClientModesetFailure::OwnerRefused(
+                OwnerRefusal::ReadinessClosed,
+            )));
+        }
+        if self
             .lifecycle_drivers
-            .get_mut(&device)
-            .expect("Owner lifecycle registration installs a driver");
-        let modeset = driver
-            .allocate_client_modeset_id()
-            .ok_or_else(|| std::io::Error::other("Owner client modeset identity exhausted"))?;
+            .get(&device)
+            .and_then(|driver| driver.client_modeset_latch.as_ref())
+            .is_some_and(|latch| {
+                latch.matches_request(topology_generation, output_id, &connector, mode, x, y)
+            })
+        {
+            return Err(refused(ClientModesetFailure::Latched));
+        }
+        if self
+            .lifecycle_drivers
+            .get(&device)
+            .is_some_and(|driver| driver.client_modeset.is_some())
+        {
+            return Err(refused(ClientModesetFailure::OwnerRefused(
+                OwnerRefusal::SlotOccupied,
+            )));
+        }
         let tag = ClientModesetTag {
             incarnation,
             lifecycle_epoch,
             topology_generation,
             modeset,
         };
+        let driver = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .expect("Owner lifecycle registration installs a driver");
         driver.client_modeset = Some(ClientModesetSlot {
             tag,
             token,
@@ -1871,14 +2057,15 @@ impl KmsBackend {
         let slot = self.lifecycle_take_client_modeset_slot(device, tag);
         if let Some(slot) = slot {
             let token = slot.token;
-            self.lifecycle_release_client_modeset_slot(slot);
-            self.complete_owner_client_modeset(
-                token,
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    ClientModesetFailure::Superseded(kind),
-                )),
+            let result = client_modeset_error_for_slot(
+                device,
+                &slot,
+                Err(std::io::Error::other(ClientModesetFailure::Superseded(
+                    kind,
+                ))),
             );
+            self.lifecycle_release_client_modeset_slot(slot);
+            self.complete_owner_client_modeset(token, result);
         }
     }
 
@@ -1996,7 +2183,7 @@ impl KmsBackend {
         use crate::{
             drm::modeset::PropMap,
             kms::render::{
-                admission::ClientModesetPreparationStage as Stage,
+                admission::PreparationStage as Stage,
                 composed_commit::{ComposedPlane, discover_composed_property_ids},
             },
         };
@@ -2027,7 +2214,7 @@ impl KmsBackend {
         if self.direct_scanout_active_for_device(device) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                ClientModesetFailure::OwnerRefused(ClientModesetRefusal::NotYetSupported(
+                ClientModesetFailure::OwnerRefused(OwnerRefusal::NotYetSupported(
                     ClientModesetUnsupportedFeature::DirectActive,
                 )),
             ));
@@ -2133,7 +2320,7 @@ impl KmsBackend {
         if scanout_route.relationship != crate::kms::scanout_route::RenderKmsRelationship::Same {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                ClientModesetFailure::OwnerRefused(ClientModesetRefusal::NotYetSupported(
+                ClientModesetFailure::OwnerRefused(OwnerRefusal::NotYetSupported(
                     ClientModesetUnsupportedFeature::CopiedRoute,
                 )),
             ));
@@ -2980,7 +3167,7 @@ impl KmsBackend {
                     tag,
                     Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
-                        ClientModesetFailure::OwnerRefused(ClientModesetRefusal::DeviceNotReady),
+                        ClientModesetFailure::OwnerRefused(OwnerRefusal::ClockNotReady),
                     )),
                 );
                 return AdmissionOutcome::BeginRefused;
@@ -3171,8 +3358,48 @@ impl KmsBackend {
         let slot = self.lifecycle_take_client_modeset_slot(device, tag);
         if let Some(slot) = slot {
             let token = slot.token;
+            let failure = result
+                .as_ref()
+                .err()
+                .and_then(client_modeset_failure_from_error);
+            let closes_readiness = matches!(
+                failure,
+                Some(ClientModesetFailure::OwnerRefused(
+                    OwnerRefusal::ReadinessClosed
+                )) | Some(ClientModesetFailure::CompletionUnknown)
+            ) || matches!(
+                failure,
+                Some(ClientModesetFailure::Preparation(PreparationStage::TestOnly {
+                    errno,
+                })) if !test_only_errno_keeps_readiness(errno)
+            );
+            if closes_readiness {
+                self.lifecycle_close_client_modeset_readiness(device, tag);
+            }
+            let result = client_modeset_error_for_slot(device, &slot, result);
             self.lifecycle_release_client_modeset_slot(slot);
             self.complete_owner_client_modeset(token, result);
+        }
+    }
+
+    fn lifecycle_close_client_modeset_readiness(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: ClientModesetTag<IncarnationId>,
+    ) {
+        match self
+            .lifecycle_coordinator
+            .client_modeset_close_readiness(&device, &tag)
+        {
+            Ok(true) => {
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    conductor.lifecycle_admission_closed = true;
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                log::error!("client modeset readiness could not close for {device}: {error:?}")
+            }
         }
     }
 
@@ -3223,10 +3450,9 @@ impl KmsBackend {
             return;
         };
         let tag = pending.tag;
-        if pending.cancelled
-            || !self.client_modeset_tag_current(device, tag)
-            || !self.client_modeset_projection_current(device, pending.staged_projection.as_ref())
-        {
+        let stale = !self.client_modeset_tag_current(device, tag)
+            || !self.client_modeset_projection_current(device, pending.staged_projection.as_ref());
+        if pending.cancelled || stale {
             if let Some(owner) = self.platform.owner_for(device) {
                 let _ = owner.abandon_validation(validation_commit);
             }
@@ -3235,11 +3461,19 @@ impl KmsBackend {
             {
                 let _ = conductor.admission.abort(token);
             }
-            self.lifecycle_complete_queued_client_modeset(
-                device,
-                tag,
-                self.lifecycle_superseding_kind(device),
-            );
+            if stale && !pending.cancelled {
+                self.lifecycle_complete_client_modeset_without_dispatch(
+                    device,
+                    tag,
+                    Err(std::io::Error::other(ClientModesetFailure::Stale)),
+                );
+            } else {
+                self.lifecycle_complete_queued_client_modeset(
+                    device,
+                    tag,
+                    self.lifecycle_superseding_kind(device),
+                );
+            }
             return;
         }
         match outcome {
@@ -3258,10 +3492,12 @@ impl KmsBackend {
                 self.lifecycle_complete_client_modeset_without_dispatch(
                     device,
                     tag,
-                    Err(std::io::Error::from_raw_os_error(errno)),
+                    Err(std::io::Error::other(ClientModesetFailure::Preparation(
+                        PreparationStage::TestOnly { errno },
+                    ))),
                 );
             }
-            crate::kms::owner::device::ValidationOutcome::Abandoned(reason) => {
+            crate::kms::owner::device::ValidationOutcome::Abandoned(_) => {
                 if let Some(owner) = self.platform.owner_for(device) {
                     let _ = owner.abandon_validation(validation_commit);
                 }
@@ -3273,9 +3509,9 @@ impl KmsBackend {
                 self.lifecycle_complete_client_modeset_without_dispatch(
                     device,
                     tag,
-                    Err(std::io::Error::other(format!(
-                        "Owner modeset validation was abandoned: {reason:?}"
-                    ))),
+                    Err(std::io::Error::other(
+                        ClientModesetFailure::CompletionUnknown,
+                    )),
                 );
             }
         }
@@ -3409,7 +3645,7 @@ impl KmsBackend {
                     tag,
                     Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
-                        ClientModesetFailure::OwnerRefused(ClientModesetRefusal::DeviceNotReady),
+                        ClientModesetFailure::OwnerRefused(OwnerRefusal::ClockNotReady),
                     )),
                 );
                 return;
@@ -4293,33 +4529,102 @@ impl KmsBackend {
             return;
         };
         let token = slot.token;
-        let terminal = if terminal == TerminalState::Completed && !current {
+        let stale_success = terminal == TerminalState::Completed && !current;
+        let terminal = if stale_success {
             TerminalState::CompletionUnknown(
                 crate::kms::owner::record::UnknownCause::ContradictoryEvidence,
             )
         } else {
             terminal
         };
-        let result = match terminal {
+        let (result, close_readiness, completion_unknown) = match terminal {
             TerminalState::Completed => {
+                log::debug!(
+                    "Owner RRSetCrtcConfig applied: output {} mode {:?} position ({}, {}) device {} modeset {}",
+                    slot.connector,
+                    slot.mode,
+                    slot.x,
+                    slot.y,
+                    device,
+                    slot.tag.modeset.get(),
+                );
                 self.lifecycle_promote_client_modeset(device, slot);
-                Ok(true)
+                (Ok(true), false, false)
             }
             TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno }) => {
+                let failure = if !current {
+                    ClientModesetFailure::Stale
+                } else {
+                    ClientModesetFailure::KernelRejected { errno }
+                };
+                let close_readiness = if current {
+                    if errno == libc::EBUSY
+                        && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+                    {
+                        driver.client_modeset_foreign_busy = true;
+                    }
+                    if (errno == libc::EINVAL || errno == libc::EOPNOTSUPP)
+                        && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+                    {
+                        driver.client_modeset_latch = Some(ClientModesetLatch {
+                            topology_generation: tag.topology_generation,
+                            output_id: slot.output_id,
+                            connector: slot.connector.clone(),
+                            mode: slot.mode,
+                            x: slot.x,
+                            y: slot.y,
+                        });
+                    }
+                    !matches!(
+                        errno,
+                        libc::EINVAL | libc::EOPNOTSUPP | libc::ERANGE | libc::ENOSPC
+                    )
+                } else {
+                    false
+                };
+                let result = client_modeset_error_for_slot(
+                    device,
+                    &slot,
+                    Err(std::io::Error::other(failure)),
+                );
                 self.lifecycle_release_client_modeset_slot(slot);
-                Err(std::io::Error::from_raw_os_error(errno))
+                (result, close_readiness, false)
             }
-            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(cause)) => Err({
+            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(_cause)) => {
+                let failure = if current {
+                    ClientModesetFailure::OwnerRefused(OwnerRefusal::ReadinessClosed)
+                } else {
+                    ClientModesetFailure::Stale
+                };
+                let result = client_modeset_error_for_slot(
+                    device,
+                    &slot,
+                    Err(std::io::Error::other(failure)),
+                );
                 self.lifecycle_release_client_modeset_slot(slot);
-                std::io::Error::other(format!("Owner modeset was not dispatched: {cause:?}"))
-            }),
-            TerminalState::CompletionUnknown(cause) => {
+                (result, current, false)
+            }
+            TerminalState::CompletionUnknown(_cause) => {
+                let failure = if current {
+                    ClientModesetFailure::CompletionUnknown
+                } else {
+                    ClientModesetFailure::Stale
+                };
+                let result = client_modeset_error_for_slot(
+                    device,
+                    &slot,
+                    Err(std::io::Error::other(failure)),
+                );
                 self.lifecycle_release_client_modeset_slot(slot);
-                Err(std::io::Error::other(format!(
-                    "Owner modeset completion is unknown: {cause:?}"
-                )))
+                (result, false, true)
             }
         };
+        if close_readiness {
+            self.lifecycle_close_client_modeset_readiness(device, tag);
+        }
+        if completion_unknown {
+            self.lifecycle_report_completion_loss(device);
+        }
         match self
             .lifecycle_coordinator
             .client_modeset_resolved(&device, &tag)
