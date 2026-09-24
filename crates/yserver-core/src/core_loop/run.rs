@@ -537,6 +537,7 @@ pub(crate) struct DeferredRequest {
     id: yserver_protocol::x11::ClientId,
     sequence: yserver_protocol::x11::SequenceNumber,
     accepted_at: Option<Instant>,
+    randr_gate_ticket: Option<u64>,
     header: yserver_protocol::x11::RequestHeader,
     body: Vec<u8>,
     attached_fd: Option<OwnedFd>,
@@ -630,6 +631,198 @@ impl PendingBackendRequests {
     }
 }
 
+/// The RANDR extension's major opcode, as `process_request.rs` fixes it.
+const RANDR_MAJOR_OPCODE: u8 = 128;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RandrRequestClass {
+    NonGate,
+    Mutation,
+    ForcedReprobe,
+}
+
+/// Classify every RANDR minor opcode without consulting request contents.
+/// Unknown and reserved minors are non-gating because they cannot change
+/// configuration in `handle_randr_request`.
+fn classify_randr_minor(minor: u8) -> RandrRequestClass {
+    use yserver_protocol::x11::randr as rr;
+
+    match minor {
+        rr::RR_SET_SCREEN_CONFIG
+        | rr::RR_SET_SCREEN_SIZE
+        | rr::RR_SET_CRTC_CONFIG
+        | rr::RR_SET_OUTPUT_PRIMARY
+        | rr::RR_SET_PROVIDER_OUTPUT_SOURCE
+        | rr::RR_SET_PROVIDER_OFFLOAD_SINK
+        | rr::RR_SET_PANNING
+        | rr::RR_SET_CRTC_TRANSFORM => RandrRequestClass::Mutation,
+        rr::RR_GET_SCREEN_RESOURCES => RandrRequestClass::ForcedReprobe,
+        _ => RandrRequestClass::NonGate,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RandrGateWaiter {
+    ticket: u64,
+    client_id: yserver_protocol::x11::ClientId,
+    class: RandrRequestClass,
+    arrived_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RandrGateFlight {
+    token: Option<CrtcConfigToken>,
+}
+
+/// Server-wide serial admission for configuration-changing RANDR requests.
+/// Requests receive a ticket when accepted from the core channel, preserving
+/// their cross-client arrival order independently of the fair ready ring.
+#[derive(Default)]
+pub(crate) struct RandrMutationGate {
+    waiting: VecDeque<RandrGateWaiter>,
+    in_flight: Option<RandrGateFlight>,
+    next_ticket: u64,
+}
+
+impl RandrMutationGate {
+    fn active_install_capable(&self, backend: &dyn Backend) -> bool {
+        self.in_flight
+            .and_then(|flight| flight.token)
+            .is_some_and(|token| backend.crtc_config_install_capable(token))
+    }
+
+    fn register_request(&mut self, req: &mut DeferredRequest, backend: &dyn Backend) {
+        if req.header.opcode != RANDR_MAJOR_OPCODE || req.randr_gate_ticket.is_some() {
+            return;
+        }
+        let class = classify_randr_minor(req.header.data);
+        if class == RandrRequestClass::NonGate {
+            return;
+        }
+        if class == RandrRequestClass::ForcedReprobe && !self.active_install_capable(backend) {
+            return;
+        }
+
+        let ticket = self.next_ticket;
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        req.randr_gate_ticket = Some(ticket);
+        self.waiting.push_back(RandrGateWaiter {
+            ticket,
+            client_id: req.id,
+            class,
+            arrived_at: req.accepted_at.unwrap_or_else(Instant::now),
+        });
+    }
+
+    fn request_is_runnable(&self, req: &DeferredRequest, backend: &dyn Backend) -> bool {
+        let Some(ticket) = req.randr_gate_ticket else {
+            return !(req.header.opcode == RANDR_MAJOR_OPCODE
+                && classify_randr_minor(req.header.data) == RandrRequestClass::ForcedReprobe
+                && self.active_install_capable(backend));
+        };
+        let Some(waiter) = self.waiting.iter().find(|waiter| waiter.ticket == ticket) else {
+            return true;
+        };
+        match waiter.class {
+            RandrRequestClass::Mutation => {
+                self.in_flight.is_none()
+                    && self
+                        .waiting
+                        .front()
+                        .is_some_and(|head| head.ticket == ticket)
+            }
+            RandrRequestClass::ForcedReprobe => match self.in_flight {
+                Some(_) if self.active_install_capable(backend) => false,
+                Some(_) => true,
+                None => self
+                    .waiting
+                    .front()
+                    .is_some_and(|head| head.ticket == ticket),
+            },
+            RandrRequestClass::NonGate => true,
+        }
+    }
+
+    /// Consume a gate request immediately before it is dispatched. `true`
+    /// means this request owns the gate through its synchronous completion or
+    /// pending CRTC publication. A forced reprobe only waits behind an
+    /// install-capable mutation; the reprobe itself is synchronous core-thread
+    /// work and does not occupy the gate.
+    fn admit(&mut self, req: &DeferredRequest, backend: &dyn Backend) -> bool {
+        let Some(ticket) = req.randr_gate_ticket else {
+            return false;
+        };
+        let Some(index) = self
+            .waiting
+            .iter()
+            .position(|waiter| waiter.ticket == ticket)
+        else {
+            return false;
+        };
+        let waiter = self.waiting[index];
+        debug_assert_eq!(waiter.client_id, req.id);
+        debug_assert!(waiter.arrived_at <= Instant::now());
+
+        match waiter.class {
+            RandrRequestClass::Mutation => {
+                if self.in_flight.is_some()
+                    || self
+                        .waiting
+                        .front()
+                        .is_none_or(|head| head.ticket != ticket)
+                {
+                    return false;
+                }
+                self.waiting.pop_front();
+                self.in_flight = Some(RandrGateFlight { token: None });
+                true
+            }
+            RandrRequestClass::ForcedReprobe => {
+                if self.active_install_capable(backend) {
+                    return false;
+                }
+                if self.in_flight.is_none()
+                    && self
+                        .waiting
+                        .front()
+                        .is_none_or(|head| head.ticket != ticket)
+                {
+                    return false;
+                }
+                self.waiting.remove(index);
+                false
+            }
+            RandrRequestClass::NonGate => false,
+        }
+    }
+
+    fn mark_pending(&mut self, token: CrtcConfigToken) {
+        let Some(flight) = self.in_flight.as_mut() else {
+            debug_assert!(false, "pending CRTC config without a RANDR gate owner");
+            return;
+        };
+        flight.token = Some(token);
+    }
+
+    fn finish_synchronous(&mut self) {
+        self.in_flight = None;
+    }
+
+    fn finish_pending(&mut self, token: CrtcConfigToken) {
+        if self
+            .in_flight
+            .is_some_and(|flight| flight.token == Some(token))
+        {
+            self.in_flight = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn is_busy(&self) -> bool {
+        self.in_flight.is_some()
+    }
+}
+
 /// Per-client FIFO queues behind a round-robin ready ring.
 ///
 /// Request order is preserved within each client, as required by X11, while a
@@ -693,22 +886,65 @@ impl FairRequestQueue {
 
     #[cfg(test)]
     fn pop_front(&mut self) -> Option<DeferredRequest> {
-        self.pop_front_if(|_| true)
+        self.pop_front_if(|_, _| true)
     }
 
+    #[cfg(test)]
     fn has_runnable(&self, pending: &PendingBackendRequests) -> bool {
         self.ready
             .iter()
             .any(|client| !pending.client_is_blocked(*client))
     }
 
+    fn has_runnable_with_gate(
+        &self,
+        pending: &PendingBackendRequests,
+        gate: &RandrMutationGate,
+        backend: &dyn Backend,
+    ) -> bool {
+        self.ready.iter().any(|client| {
+            if pending.client_is_blocked(*client) {
+                return false;
+            }
+            self.by_client
+                .get(client)
+                .and_then(VecDeque::front)
+                .is_some_and(|req| gate.request_is_runnable(req, backend))
+        })
+    }
+
+    fn register_front_gate_heads(&mut self, gate: &mut RandrMutationGate, backend: &dyn Backend) {
+        let clients: Vec<_> = self.ready.iter().copied().collect();
+        for client in clients {
+            if let Some(req) = self
+                .by_client
+                .get_mut(&client)
+                .and_then(VecDeque::front_mut)
+            {
+                gate.register_request(req, backend);
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn pop_front_unblocked(&mut self, pending: &PendingBackendRequests) -> Option<DeferredRequest> {
-        self.pop_front_if(|client| !pending.client_is_blocked(client))
+        self.pop_front_if(|client, _| !pending.client_is_blocked(client))
+    }
+
+    fn pop_front_runnable(
+        &mut self,
+        pending: &PendingBackendRequests,
+        gate: &RandrMutationGate,
+        backend: &dyn Backend,
+    ) -> Option<DeferredRequest> {
+        self.pop_front_if(|client, req| {
+            !pending.client_is_blocked(client) && gate.request_is_runnable(req, backend)
+        })
     }
 
     fn pop_front_if(
         &mut self,
-        mut is_runnable: impl FnMut(yserver_protocol::x11::ClientId) -> bool,
+        mut is_runnable: impl FnMut(yserver_protocol::x11::ClientId, &DeferredRequest) -> bool,
     ) -> Option<DeferredRequest> {
         // Inspect each currently-ready client at most once. Blocked clients
         // retain their position in the ring while other clients keep moving.
@@ -717,7 +953,11 @@ impl FairRequestQueue {
             let Some(client) = self.ready.pop_front() else {
                 break;
             };
-            if !is_runnable(client) {
+            let Some(front) = self.by_client.get(&client).and_then(VecDeque::front) else {
+                self.by_client.remove(&client);
+                continue;
+            };
+            if !is_runnable(client, front) {
                 self.ready.push_back(client);
                 continue;
             }
@@ -752,6 +992,7 @@ pub(crate) fn deferred_request_for_test(id: u32) -> DeferredRequest {
         id: yserver_protocol::x11::ClientId(id),
         sequence: yserver_protocol::x11::SequenceNumber(1),
         accepted_at: None,
+        randr_gate_ticket: None,
         header: yserver_protocol::x11::RequestHeader {
             opcode: 127,
             data: 0,
@@ -829,11 +1070,13 @@ fn disconnect_with_pending_cleanup(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
     reset_trigger: &mut ResetTrigger,
     client: yserver_protocol::x11::ClientId,
 ) {
     if let Some(token) = pending.take_client_crtc(client) {
         backend.cancel_crtc_config(token);
+        gate.finish_pending(token);
     }
     crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
     reset_trigger.note_client_departed(state.clients.len());
@@ -853,9 +1096,11 @@ fn process_one_request(
     backend: &mut dyn Backend,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
     reset_trigger: &mut ResetTrigger,
     requests_this_iter: &mut u32,
     request_budget: &mut usize,
+    gate_mutation: bool,
     req: DeferredRequest,
 ) {
     let req_opcode = req.header.opcode;
@@ -907,10 +1152,11 @@ fn process_one_request(
     }
     *requests_this_iter += 1;
     *request_budget -= 1;
+    let mut pending_gate_mutation = false;
     match outcome {
         RequestOutcome::Handled => grant_request_credit(state, req_client, req_wire_bytes),
         RequestOutcome::Disconnect(disc_id) => {
-            disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, disc_id);
+            disconnect_with_pending_cleanup(state, backend, pending, gate, reset_trigger, disc_id);
         }
         RequestOutcome::PendingCrtcConfig(continuation) => {
             let token = continuation.token;
@@ -934,9 +1180,22 @@ fn process_one_request(
                 // An ordering/token contract violation cannot be replied to
                 // safely without overtaking an earlier request from this
                 // client. Disconnect it and cancel any older parked work.
-                disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, req_client);
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    gate,
+                    reset_trigger,
+                    req_client,
+                );
+            } else if gate_mutation {
+                gate.mark_pending(token);
+                pending_gate_mutation = true;
             }
         }
+    }
+    if gate_mutation && !pending_gate_mutation {
+        gate.finish_synchronous();
     }
 }
 
@@ -945,6 +1204,7 @@ fn drain_pending_requests(
     backend: &mut dyn Backend,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
     reset_trigger: &mut ResetTrigger,
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
@@ -953,7 +1213,8 @@ fn drain_pending_requests(
     drain_start: Instant,
 ) {
     while !budget_exhausted(*request_budget, drain_start.elapsed()) {
-        let Some(req) = deferred_requests.pop_front_unblocked(pending) else {
+        deferred_requests.register_front_gate_heads(gate, backend);
+        let Some(req) = deferred_requests.pop_front_runnable(pending, gate, backend) else {
             break;
         };
         telemetry.record_deferred_pop(req.id);
@@ -961,14 +1222,17 @@ fn drain_pending_requests(
             server_grab_waiters.push_back(req);
             continue;
         }
+        let gate_mutation = gate.admit(&req, backend);
         process_one_request(
             state,
             backend,
             telemetry,
             pending,
+            gate,
             reset_trigger,
             requests_this_iter,
             request_budget,
+            gate_mutation,
             req,
         );
         if state.server_grab_owner.is_none() {
@@ -1052,10 +1316,27 @@ fn process_request_inline(
 /// Resume every asynchronous CRTC request whose backend result is ready.
 /// `finish_crtc_config` is called only while the originating client is still
 /// waiting, so a late worker completion can never install a cancelled mode.
+#[cfg(test)]
 pub(crate) fn drain_ready_crtc_configs(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
+) {
+    drain_ready_crtc_configs_with_gate(
+        state,
+        backend,
+        pending,
+        &mut RandrMutationGate::default(),
+        reset_trigger,
+    );
+}
+
+pub(crate) fn drain_ready_crtc_configs_with_gate(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    gate: &mut RandrMutationGate,
     reset_trigger: &mut ResetTrigger,
 ) {
     for token in backend.drain_ready_crtc_configs() {
@@ -1063,10 +1344,12 @@ pub(crate) fn drain_ready_crtc_configs(
             // Cancellation may race a worker completion. Discard the backend
             // result and keep the operation from becoming visible later.
             backend.cancel_crtc_config(token);
+            gate.finish_pending(token);
             continue;
         };
         if !state.clients.contains_key(&parked.client_id.0) {
             backend.cancel_crtc_config(token);
+            gate.finish_pending(token);
             continue;
         }
 
@@ -1094,9 +1377,17 @@ pub(crate) fn drain_ready_crtc_configs(
             backend.flush_before_damage_notify();
         }
         backend.mark_dirty();
+        gate.finish_pending(token);
         match outcome {
             RequestOutcome::Disconnect(client) => {
-                disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, client);
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    gate,
+                    reset_trigger,
+                    client,
+                );
             }
             RequestOutcome::Handled => {
                 grant_request_credit(state, parked.client_id, parked.request_wire_bytes)
@@ -1236,6 +1527,7 @@ pub fn run_core(
     let mut deferred_requests = FairRequestQueue::default();
     let mut server_grab_waiters: VecDeque<DeferredRequest> = VecDeque::new();
     let mut pending_backend_requests = PendingBackendRequests::default();
+    let mut randr_mutation_gate = RandrMutationGate::default();
     // Process-lifetime, not per-generation — see `input_inventory`'s
     // module docs. Populated below on every `HostInput` device event;
     // nothing consumes it yet (step 1 of the server-reset plan).
@@ -1266,8 +1558,11 @@ pub fn run_core(
         // Compute poll timeout. If there are runnable deferred requests, do
         // not block: drain them immediately. Otherwise, blocking could wait for
         // a fresh fd event, leaving the backlog stranded.
-        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests)
-            || listener_readiness.has_pending()
+        let poll_timeout = if deferred_requests.has_runnable_with_gate(
+            &pending_backend_requests,
+            &randr_mutation_gate,
+            backend,
+        ) || listener_readiness.has_pending()
         {
             Some(Duration::ZERO)
         } else {
@@ -1339,6 +1634,7 @@ pub fn run_core(
             backend,
             &mut telemetry,
             &mut pending_backend_requests,
+            &mut randr_mutation_gate,
             &mut reset_trigger,
             &mut deferred_requests,
             &mut server_grab_waiters,
@@ -1478,6 +1774,7 @@ pub fn run_core(
                                     id,
                                     sequence,
                                     accepted_at,
+                                    randr_gate_ticket: None,
                                     header,
                                     body,
                                     attached_fd,
@@ -1490,6 +1787,8 @@ pub fn run_core(
                                 // for this client. Sending them directly to
                                 // `server_grab_waiters` lets new arrivals jump
                                 // ahead of that remaining suffix on release.
+                                let mut req = req;
+                                randr_mutation_gate.register_request(&mut req, backend);
                                 telemetry.record_deferred_push(req.id);
                                 deferred_requests.push_back(req);
                             }
@@ -1525,6 +1824,7 @@ pub fn run_core(
                                         state,
                                         backend,
                                         &mut pending_backend_requests,
+                                        &mut randr_mutation_gate,
                                         &mut reset_trigger,
                                         id,
                                     );
@@ -1558,6 +1858,7 @@ pub fn run_core(
                                             state,
                                             backend,
                                             &mut pending_backend_requests,
+                                            &mut randr_mutation_gate,
                                             &mut reset_trigger,
                                             id,
                                         );
@@ -1573,6 +1874,7 @@ pub fn run_core(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
+                                    &mut randr_mutation_gate,
                                     &mut reset_trigger,
                                     id,
                                 );
@@ -1601,10 +1903,11 @@ pub fn run_core(
                                 backend.mark_dirty();
                             }
                             Message::CrtcConfigReady => {
-                                drain_ready_crtc_configs(
+                                drain_ready_crtc_configs_with_gate(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
+                                    &mut randr_mutation_gate,
                                     &mut reset_trigger,
                                 );
                             }
@@ -1645,6 +1948,7 @@ pub fn run_core(
                         backend,
                         &mut telemetry,
                         &mut pending_backend_requests,
+                        &mut randr_mutation_gate,
                         &mut reset_trigger,
                         &mut deferred_requests,
                         &mut server_grab_waiters,
@@ -1683,6 +1987,7 @@ pub fn run_core(
                                 state,
                                 backend,
                                 &mut pending_backend_requests,
+                                &mut randr_mutation_gate,
                                 &mut reset_trigger,
                                 client_id,
                             );
@@ -1771,6 +2076,7 @@ pub fn run_core(
                 state,
                 backend,
                 &mut pending_backend_requests,
+                &mut randr_mutation_gate,
                 &mut reset_trigger,
                 disc_id,
             );
@@ -3893,6 +4199,7 @@ mod tests {
             id: yserver_protocol::x11::ClientId(id),
             sequence: yserver_protocol::x11::SequenceNumber(1),
             accepted_at: None,
+            randr_gate_ticket: None,
             header: yserver_protocol::x11::RequestHeader {
                 opcode,
                 data: 0,
@@ -3901,6 +4208,611 @@ mod tests {
             body: Vec::new(),
             attached_fd: None,
         }
+    }
+
+    fn c0_randr_request(
+        client: u32,
+        sequence: u16,
+        minor: u8,
+        body: Vec<u8>,
+        length_units: u32,
+    ) -> DeferredRequest {
+        DeferredRequest {
+            id: yserver_protocol::x11::ClientId(client),
+            sequence: yserver_protocol::x11::SequenceNumber(sequence),
+            accepted_at: Some(Instant::now()),
+            randr_gate_ticket: None,
+            header: yserver_protocol::x11::RequestHeader {
+                opcode: 128,
+                data: minor,
+                length_units,
+            },
+            body,
+            attached_fd: None,
+        }
+    }
+
+    fn accept_c0_request(
+        backend: &dyn Backend,
+        gate: &mut RandrMutationGate,
+        queue: &mut FairRequestQueue,
+        mut request: DeferredRequest,
+    ) {
+        gate.register_request(&mut request, backend);
+        queue.push_back(request);
+    }
+
+    fn make_c0_randr_state() -> ServerState {
+        use crate::randr::{RandrMode, RandrOutput, RandrState};
+
+        let output = RandrOutput {
+            name: "HDMI-2".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3, 4],
+            num_preferred: 1,
+        };
+        let modes = vec![
+            RandrMode {
+                mode_id: 3,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                timing: None,
+            },
+            RandrMode {
+                mode_id: 4,
+                width: 1280,
+                height: 720,
+                vrefresh: 60,
+                timing: None,
+            },
+        ];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs_with_modes(1, vec![output], modes);
+        state
+    }
+
+    fn install_c0_client(state: &mut ServerState, id: u32) -> UnixStream {
+        use crate::{resources::ROOT_WINDOW, server::ClientState, transport::Transport};
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_protocol::x11::ClientByteOrder;
+
+        let (writer, peer) = UnixStream::pair().unwrap();
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(Transport::Unix(writer))),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+                is_local: true,
+                fd_passing: true,
+            },
+        );
+        peer
+    }
+
+    fn set_crtc_body(mode: u32) -> Vec<u8> {
+        let mut body = Vec::with_capacity(28);
+        body.extend_from_slice(&2u32.to_le_bytes()); // crtc
+        body.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        body.extend_from_slice(&0u32.to_le_bytes()); // config timestamp
+        body.extend_from_slice(&0i16.to_le_bytes()); // x
+        body.extend_from_slice(&0i16.to_le_bytes()); // y
+        body.extend_from_slice(&mode.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // RR_Rotate_0
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&1u32.to_le_bytes()); // output
+        body
+    }
+
+    fn drain_c0_requests(
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+        pending: &mut PendingBackendRequests,
+        gate: &mut RandrMutationGate,
+        queue: &mut FairRequestQueue,
+    ) {
+        let mut telemetry = LoopTelemetry::default();
+        let mut reset = ResetTrigger::new(ResetPolicy::NoReset);
+        let mut server_grab_waiters = VecDeque::new();
+        let mut requests_this_iter = 0;
+        let mut request_budget = 64;
+        drain_pending_requests(
+            state,
+            backend,
+            &mut telemetry,
+            pending,
+            gate,
+            &mut reset,
+            queue,
+            &mut server_grab_waiters,
+            &mut requests_this_iter,
+            &mut request_budget,
+            Instant::now(),
+        );
+        assert!(server_grab_waiters.is_empty());
+    }
+
+    fn read_c0_available(peer: &mut UnixStream) -> Vec<u8> {
+        use std::io::Read;
+
+        peer.set_nonblocking(true).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("read test client output: {error}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn c0_3bii_every_opcode_classified() {
+        use yserver_protocol::x11::randr as rr;
+
+        let mutations = [
+            rr::RR_SET_SCREEN_CONFIG,
+            rr::RR_SET_SCREEN_SIZE,
+            rr::RR_SET_CRTC_CONFIG,
+            rr::RR_SET_OUTPUT_PRIMARY,
+            rr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+            rr::RR_SET_PROVIDER_OFFLOAD_SINK,
+            rr::RR_SET_PANNING,
+            rr::RR_SET_CRTC_TRANSFORM,
+        ];
+        for minor in 0..=47 {
+            let expected = if minor == rr::RR_GET_SCREEN_RESOURCES {
+                RandrRequestClass::ForcedReprobe
+            } else if mutations.contains(&minor) {
+                RandrRequestClass::Mutation
+            } else {
+                RandrRequestClass::NonGate
+            };
+            assert_eq!(classify_randr_minor(minor), expected, "minor {minor}");
+        }
+        assert_eq!(
+            classify_randr_minor(rr::RR_SET_CRTC_GAMMA),
+            RandrRequestClass::NonGate,
+            "gamma is a color request, outside the configuration gate"
+        );
+        assert_eq!(
+            classify_randr_minor(rr::RR_CHANGE_OUTPUT_PROPERTY),
+            RandrRequestClass::NonGate
+        );
+        assert_eq!(
+            classify_randr_minor(rr::RR_CHANGE_PROVIDER_PROPERTY),
+            RandrRequestClass::NonGate
+        );
+    }
+
+    #[test]
+    fn c0_3bii_one_mutation_in_flight() {
+        use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
+
+        let mut backend = RecordingBackend::new();
+        backend.crtc_config_is_install_capable = true;
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, 21, Vec::new(), 7),
+        );
+        let first = queue
+            .pop_front_runnable(&PendingBackendRequests::default(), &gate, &backend)
+            .unwrap();
+        assert!(gate.admit(&first, &backend));
+        let token = CrtcConfigToken(101);
+        gate.mark_pending(token);
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 1, 21, Vec::new(), 7),
+        );
+        assert!(
+            queue
+                .pop_front_runnable(&PendingBackendRequests::default(), &gate, &backend)
+                .is_none()
+        );
+        assert!(gate.is_busy());
+        gate.finish_pending(token);
+        let second = queue
+            .pop_front_runnable(&PendingBackendRequests::default(), &gate, &backend)
+            .unwrap();
+        assert_eq!(second.id.0, 2);
+        assert!(gate.admit(&second, &backend));
+    }
+
+    #[test]
+    fn c0_3bii_gate_is_fifo_by_arrival() {
+        use crate::backend::recording::RecordingBackend;
+
+        let backend = RecordingBackend::new();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+        let mut first_arrival = c0_randr_request(3, 1, 21, Vec::new(), 7);
+        let mut second_arrival = c0_randr_request(2, 1, 21, Vec::new(), 7);
+        gate.register_request(&mut first_arrival, &backend);
+        gate.register_request(&mut second_arrival, &backend);
+        queue.push_back(second_arrival);
+        queue.push_back(first_arrival);
+
+        let admitted = queue
+            .pop_front_runnable(&PendingBackendRequests::default(), &gate, &backend)
+            .expect("the first gate arrival is runnable");
+        assert_eq!(
+            admitted.id.0, 3,
+            "ready-ring order must not replace gate FIFO"
+        );
+        assert!(gate.admit(&admitted, &backend));
+    }
+
+    #[test]
+    fn c0_3bii_gate_blocks_only_the_mutating_client() {
+        use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
+
+        let backend = RecordingBackend::new();
+        let mut gate = RandrMutationGate::default();
+        let mut active = c0_randr_request(1, 1, 21, Vec::new(), 7);
+        gate.register_request(&mut active, &backend);
+        assert!(gate.admit(&active, &backend));
+        gate.mark_pending(CrtcConfigToken(102));
+
+        let mut queue = FairRequestQueue::default();
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 1, 21, Vec::new(), 7),
+        );
+        queue.push_back(c0_randr_request(
+            2,
+            2,
+            25,
+            crate::resources::ROOT_WINDOW.0.to_le_bytes().to_vec(),
+            2,
+        )); // GetScreenResourcesCurrent behind the mutation
+        queue.push_back(c0_randr_request(
+            4,
+            1,
+            25,
+            crate::resources::ROOT_WINDOW.0.to_le_bytes().to_vec(),
+            2,
+        )); // unrelated client's query
+
+        let runnable = queue
+            .pop_front_runnable(&PendingBackendRequests::default(), &gate, &backend)
+            .expect("an unrelated client's query remains runnable");
+        assert_eq!(runnable.id.0, 4);
+        assert!(
+            queue
+                .pop_front_runnable(&PendingBackendRequests::default(), &gate, &backend)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn c0_3bii_queries_read_published_state() {
+        use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
+
+        let mut state = make_c0_randr_state();
+        let _a = install_c0_client(&mut state, 1);
+        let mut b = install_c0_client(&mut state, 2);
+        let published_mode = state.randr.outputs[0].mode_id;
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(CrtcConfigToken(103));
+        backend.crtc_config_is_install_capable = true;
+        backend
+            .crtc_config_results
+            .insert(CrtcConfigToken(103), Ok(true));
+        let mut installed_output = state.randr.outputs[0].clone();
+        installed_output.mode_id = 4;
+        installed_output.width = 1280;
+        installed_output.height = 720;
+        backend.randr_outputs = vec![installed_output];
+        let mut gate = RandrMutationGate::default();
+        let mut pending = PendingBackendRequests::default();
+        let mut queue = FairRequestQueue::default();
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, 21, set_crtc_body(4), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(gate.is_busy());
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        queue.push_back(c0_randr_request(2, 2, 20, body, 3));
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+
+        let reply = read_c0_available(&mut b);
+        assert_eq!(reply.len(), 40);
+        assert_eq!(
+            u32::from_le_bytes(reply[20..24].try_into().unwrap()),
+            published_mode
+        );
+        assert_eq!(state.randr.outputs[0].mode_id, published_mode);
+    }
+
+    #[test]
+    fn c0_3bii_mate_reassert_behind_a_change() {
+        use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
+
+        let mut state = make_c0_randr_state();
+        let mut a = install_c0_client(&mut state, 1);
+        let mut b = install_c0_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(CrtcConfigToken(104));
+        backend.crtc_config_is_install_capable = true;
+        backend
+            .crtc_config_results
+            .insert(CrtcConfigToken(104), Ok(true));
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, 21, set_crtc_body(4), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(gate.is_busy());
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 1, 21, set_crtc_body(3), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(
+            read_c0_available(&mut b).is_empty(),
+            "B must remain unprocessed"
+        );
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|call| matches!(
+                    call,
+                    crate::backend::recording::RecordedCall::ApplyCrtcConfig { .. }
+                ))
+                .count(),
+            1
+        );
+
+        // Simulate the state rebuild that completes A's publication before
+        // allowing B to validate its re-assert against the newly published
+        // 1280x720 mode.
+        let output = &mut state.randr.outputs[0];
+        output.mode_id = 4;
+        output.width = 1280;
+        output.height = 720;
+        backend.ready_crtc_configs.push(CrtcConfigToken(104));
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+
+        let calls = backend.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(
+                    call,
+                    crate::backend::recording::RecordedCall::ApplyCrtcConfig { .. }
+                ))
+                .count(),
+            2,
+            "B's 1920x1080 re-assert is a real change after A publishes"
+        );
+        assert_eq!(read_c0_available(&mut a).len(), 32);
+        assert_eq!(read_c0_available(&mut b).len(), 32);
+    }
+
+    #[test]
+    fn c0_3bii_forced_reprobe_waits_for_the_gate() {
+        use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
+
+        let mut state = make_c0_randr_state();
+        let mut a = install_c0_client(&mut state, 1);
+        let mut b = install_c0_client(&mut state, 2);
+        let mut c = install_c0_client(&mut state, 3);
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(CrtcConfigToken(105));
+        backend.reprobe_connectors_changes_state = true;
+        backend
+            .crtc_config_results
+            .insert(CrtcConfigToken(105), Ok(true));
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, 21, set_crtc_body(4), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+
+        let mut resources_body = Vec::new();
+        resources_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 1, 8, resources_body, 2),
+        );
+        // A backend may move a pending token from a cancellable prerequisite
+        // into an install-capable dispatched modeset after `Pending` was
+        // returned. The gate reads this signal at the forced reprobe's head.
+        backend.crtc_config_is_install_capable = true;
+        let mut current_body = Vec::new();
+        current_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        queue.push_back(c0_randr_request(3, 1, 25, current_body, 2));
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(backend.reprobe_connectors_calls, 0);
+        assert!(state.randr.outputs[0].connected);
+        assert_eq!(read_c0_available(&mut c).len(), 124);
+        assert!(read_c0_available(&mut b).is_empty());
+
+        backend.ready_crtc_configs.push(CrtcConfigToken(105));
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(backend.reprobe_connectors_calls, 1);
+        assert!(!state.randr.outputs[0].connected);
+        assert_eq!(read_c0_available(&mut a).len(), 32);
+        assert!(read_c0_available(&mut b).len() >= 32);
+    }
+
+    #[test]
+    fn c0_3bii_forced_reprobe_does_not_wait_for_a_prime_probe() {
+        use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
+
+        let mut state = make_c0_randr_state();
+        let _a = install_c0_client(&mut state, 1);
+        let mut b = install_c0_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(CrtcConfigToken(106));
+        backend.reprobe_connectors_changes_state = true;
+        backend
+            .crtc_config_results
+            .insert(CrtcConfigToken(106), Ok(true));
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, 21, set_crtc_body(4), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(gate.is_busy());
+
+        let mut resources_body = Vec::new();
+        resources_body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 1, 8, resources_body, 2),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(backend.reprobe_connectors_calls, 1);
+        assert!(!state.randr.outputs[0].connected);
+        assert_eq!(read_c0_available(&mut b).len(), 124);
+        assert!(gate.is_busy(), "the PRIME probe remains pending");
     }
 
     #[test]
@@ -4114,6 +5026,7 @@ mod tests {
             &mut state,
             &mut backend,
             &mut pending,
+            &mut RandrMutationGate::default(),
             &mut ResetTrigger::new(ResetPolicy::NoReset),
             client_id,
         );

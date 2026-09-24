@@ -702,6 +702,15 @@ pub trait Backend {
     /// cancellation and must never install that cancelled result later.
     fn cancel_crtc_config(&mut self, _token: CrtcConfigToken) {}
 
+    /// Whether an outstanding CRTC configuration token has been dispatched
+    /// to work that may still install. `GetScreenResources` is serialized
+    /// behind such work because its forced connector reprobe can publish
+    /// RANDR state. Backends that only expose cancellable prerequisite work
+    /// (including the Legacy PRIME probe) keep the default `false` behavior.
+    fn crtc_config_install_capable(&self, _token: CrtcConfigToken) -> bool {
+        false
+    }
+
     /// Number of entries in the RANDR CRTC's hardware gamma LUT (`0` = gamma
     /// unsupported). The XID, rather than a connector name, preserves device
     /// identity when multiple providers expose identically named connectors.

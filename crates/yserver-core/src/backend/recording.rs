@@ -299,6 +299,14 @@ pub struct RecordingBackend {
         std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
     pub finished_crtc_configs: Vec<CrtcConfigToken>,
     pub cancelled_crtc_configs: Vec<CrtcConfigToken>,
+    /// Script whether the current pending CRTC token may still install.
+    /// Defaults to `false`, like backends that only park a PRIME probe.
+    pub crtc_config_is_install_capable: bool,
+    /// Number of forced RANDR connector reprobes performed by tests.
+    pub reprobe_connectors_calls: usize,
+    /// When set, a forced reprobe toggles the first output's connection
+    /// state and emits the corresponding RANDR change notifications.
+    pub reprobe_connectors_changes_state: bool,
     /// Startup input-probe model. Each inner `Vec` is one "dispatch
     /// round" the fake libinput would yield; `probe_input_devices`
     /// consumes the front round per iteration and seeds the registry,
@@ -534,6 +542,9 @@ impl RecordingBackend {
             crtc_config_results: std::collections::HashMap::new(),
             finished_crtc_configs: Vec::new(),
             cancelled_crtc_configs: Vec::new(),
+            crtc_config_is_install_capable: false,
+            reprobe_connectors_calls: 0,
+            reprobe_connectors_changes_state: false,
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
@@ -761,6 +772,21 @@ impl Backend for RecordingBackend {
 
     fn window_id(&self) -> u32 {
         self.fake_window_id
+    }
+
+    fn reprobe_connectors(&mut self, state: &mut crate::server::ServerState) -> io::Result<()> {
+        self.reprobe_connectors_calls += 1;
+        if self.reprobe_connectors_changes_state {
+            let changed = state.randr.outputs.first_mut().map(|output| {
+                output.connected = !output.connected;
+                (output.output_id, output.crtc_id, output.mode_id)
+            });
+            if let Some(changed) = changed {
+                state.randr.config_timestamp = state.randr.config_timestamp.wrapping_add(1);
+                crate::core_loop::run::emit_randr_change_notifications(state, &[changed]);
+            }
+        }
+        Ok(())
     }
 
     fn root_visual_xid(&self) -> u32 {
@@ -1281,6 +1307,10 @@ impl Backend for RecordingBackend {
     fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
         self.cancelled_crtc_configs.push(token);
         self.crtc_config_results.remove(&token);
+    }
+
+    fn crtc_config_install_capable(&self, _token: CrtcConfigToken) -> bool {
+        self.crtc_config_is_install_capable
     }
 
     fn set_crtc_gamma(
