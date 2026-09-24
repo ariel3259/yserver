@@ -79749,6 +79749,12 @@ mod tests {
                 }
             }
             backend.service_direct_framebuffer_edges(now, false);
+            // As `before_block` does on every core-loop iteration
+            // (addendum A1): retired bundles drain without composition.
+            backend.scene.service_retired_output_bundles(
+                &mut backend.platform,
+                backend.resource_service.as_ref(),
+            );
             if done(backend) {
                 return Ok(());
             }
