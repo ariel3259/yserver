@@ -460,12 +460,15 @@ output it does not.
 services owner or resource completions, **independently of composition** —
 including with zero outputs, every output dark, the seat released or the
 renderer idle — and the loop's next wakeup accounts for a bundle that waits
-on an unsignalled fence or an outstanding proof (a poll deadline, not a
-spin). Servicing a bundle never composes, offers or submits. The composition
-tick keeps servicing them as today.
+on a fence-gated wait without a readiness event (a poll deadline, not a spin).
+Only pending pool releases, failed submit BOs and fence-gated pending
+acknowledgements need that deadline. Owner buffers and pool slots waiting on
+KMS or resource proofs add no deadline; those proofs wake the loop and service
+the bundle directly. Servicing a bundle never composes, offers or submits. The
+composition tick keeps servicing them as today.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3bi_a1_retired_bundle_drains_with_no_output_vulkan` | disable the device's only output with its old pool's fence pending: no composition tick runs; the owner/resource wake path alone releases the pool once its proofs arrive, and the next wakeup is bounded while it waits | **A1a** service bundles only from `tick` |
 | `c0_3bi_a1_idle_bundle_wakeup_is_bounded` | a retired bundle waiting on an unsignalled fence and nothing else pending: the loop's next wakeup is a finite deadline, and it does not busy-loop (at most one poll per deadline) | **A1b** omit the bundle from the next wakeup |
-
+| `c0_3bi_a1_quarantined_bundle_adds_no_wakeup_vulkan` | a retired bundle's only outstanding item is a quarantined owner buffer whose `KmsRelease` is never discharged: it adds no retired-bundle wakeup deadline | **A1c** count `owner_buffers` as poll work |

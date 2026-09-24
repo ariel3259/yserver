@@ -23417,6 +23417,8 @@ impl Backend for KmsBackend {
             self.route_owner_event_batch(device_key, events, now);
         }
         self.service_direct_framebuffer_edges(now, true);
+        self.scene
+            .service_retired_output_bundles(&mut self.platform, self.resource_service.as_ref());
     }
 
     fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -23429,6 +23431,8 @@ impl Backend for KmsBackend {
             self.route_owner_event_batch(device_key, events, now);
         }
         self.service_direct_framebuffer_edges(now, true);
+        self.scene
+            .service_retired_output_bundles(&mut self.platform, self.resource_service.as_ref());
     }
 
     fn on_executor_readable(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -23492,12 +23496,17 @@ impl Backend for KmsBackend {
         } else {
             None
         };
+        let retired_output_deadline = self
+            .scene
+            .retired_output_work_pending()
+            .then(|| now + std::time::Duration::from_millis(1));
         let rescan_deadline = self
             .hotplug_rescan_deadline
             .map(|until| if now >= until { now } else { until });
         scene_deadline
             .into_iter()
             .chain(present_deadline)
+            .chain(retired_output_deadline)
             .chain(rescan_deadline)
             .chain(
                 allow_kms_timers
@@ -63254,6 +63263,251 @@ mod tests {
                 .scene
                 .retired_output_release_count_for_tests(instance),
             Some(0)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a1_quarantined_bundle_adds_no_wakeup_vulkan() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let output = &backend.platform.outputs[0];
+        let output_key = output.key.clone();
+        let device = output.key.device_key;
+        let crtc = u32::from(output.output.crtc);
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("only output instance");
+        let (bo_idx, managed_key) = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("live scanout pool")
+            .display_pool()
+            .bos
+            .iter()
+            .enumerate()
+            .find_map(|(bo_idx, bo)| bo.managed_key().map(|key| (bo_idx, key)))
+            .expect("managed scanout allocation");
+        let commit = crate::kms::owner::identity::CommitId::for_tests(0xa1c);
+        let member = crate::kms::render::resources::GroupMember::new(
+            crate::kms::render::platform::CrtcKey::for_output(output),
+            backend
+                .platform
+                .owner_ref(device)
+                .expect("Owner device")
+                .topology_generation(),
+            1,
+        );
+
+        c0_3bi_remove_output_for_promotion(backend, 0);
+        assert!(backend.platform.outputs.is_empty());
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_owner_buffer_count_for_tests(instance),
+            Some(0)
+        );
+        let wakeup_without_retired_owner = backend.next_wakeup();
+
+        backend
+            .resource_service_mut()
+            .expect("resource service")
+            .register_kms(managed_key, commit, member)
+            .expect("register an unreleased KmsRelease");
+        assert!(
+            backend
+                .resource_service()
+                .expect("resource service")
+                .has_pending_obligations(&managed_key),
+            "the quarantined owner buffer must still have an unresolved resource obligation"
+        );
+        assert_eq!(
+            backend
+                .resource_service()
+                .expect("resource service")
+                .kms_commit_for_tests(managed_key),
+            Some(commit),
+            "the outstanding resource obligation must specifically be KmsRelease"
+        );
+        assert!(
+            backend
+                .scene
+                .add_quarantined_retired_owner_buffer_for_tests(
+                    instance,
+                    crate::kms::render::owner_buffer::OwnerBufferIdentity {
+                        output_key,
+                        crtc,
+                        bo_idx,
+                        generation: 1,
+                        managed_key,
+                    },
+                )
+        );
+
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_owner_buffer_states_for_tests(instance),
+            Some(vec![
+                crate::kms::render::owner_buffer::OwnerBufferState::Quarantined
+            ]),
+            "the retired bundle's only outstanding item is the quarantined owner buffer"
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(instance),
+            Some(0),
+            "there is no fence-gated pending pool release"
+        );
+        assert!(
+            !backend.scene.retired_output_work_pending(),
+            "an owner buffer waiting on an event-driven KmsRelease must not request fence polling"
+        );
+        assert_eq!(
+            backend.next_wakeup(),
+            wakeup_without_retired_owner,
+            "the KmsRelease adds no retired-bundle poll deadline"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a1_retired_bundle_drains_with_no_output_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _) =
+            c0_3bi_live_modeset_backend(
+                StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 0, fds: 0 }),
+                false,
+            )
+            .expect("environmental skip: no live Vulkan modeset fixture");
+        let key = OutputKey::new(device, connector.clone());
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("only output instance");
+        let old_ring_before = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("only output diagnostics")
+            .pool_occupancy;
+        let ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live fence pool")
+            .acquire()
+            .expect("acquire unsignaled Vulkan fence");
+        assert_eq!(
+            backend
+                .scene
+                .defer_current_pool_release_for_tests(0, ticket.clone()),
+            Some(0)
+        );
+
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, None);
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(&mut backend, device, token, None)
+                .expect("disable completion result")
+        );
+        assert!(
+            backend.platform.outputs.is_empty(),
+            "the only output was disabled"
+        );
+        assert_eq!(backend.scene.retired_output_count_for_tests(), 1);
+        assert!(
+            backend
+                .scene
+                .retired_output_has_instance_for_tests(instance)
+        );
+
+        // The core-loop completion hook polls the old scene without a scene
+        // tick. An unsignaled fence remains owned by the retired bundle.
+        backend.before_block();
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(instance),
+            Some(1)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(instance),
+            Some((old_ring_before.0 + 1, old_ring_before.1))
+        );
+
+        ticket.test_signal();
+        backend.before_block();
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_release_count_for_tests(instance),
+            Some(0)
+        );
+        assert_eq!(
+            backend
+                .scene
+                .retired_output_pool_occupancy_for_tests(instance),
+            Some(old_ring_before)
+        );
+        assert!(
+            backend.scene.scene_structure_dirty_for_tests(),
+            "no composition tick ran while the device had no output"
+        );
+        assert_eq!(backend.platform.outputs.len(), 0);
+        assert_eq!(
+            backend.scene.retired_output_key_for_tests(instance),
+            Some(key)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a1_idle_bundle_wakeup_is_bounded() {
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live fence pool")
+            .acquire()
+            .expect("acquire unsignaled Vulkan fence");
+        assert_eq!(
+            backend
+                .scene
+                .defer_current_pool_release_for_tests(0, ticket),
+            Some(0)
+        );
+        c0_3bi_remove_output_for_promotion(backend, 0);
+        assert!(backend.platform.outputs.is_empty());
+
+        let before = std::time::Instant::now();
+        let first_deadline = backend
+            .next_wakeup()
+            .expect("retired bundle must arm a poll deadline");
+        assert!(
+            first_deadline > before,
+            "retired fence polling must not spin"
+        );
+        assert!(
+            first_deadline <= before + std::time::Duration::from_millis(10),
+            "retired fence polling deadline must be bounded"
+        );
+
+        // One idle completion pass consumes at most one scheduled poll. The
+        // next deadline remains in the future while the proof is outstanding.
+        backend.before_block();
+        let after_poll = std::time::Instant::now();
+        let next_deadline = backend
+            .next_wakeup()
+            .expect("unsignaled retired fence still needs polling");
+        assert!(next_deadline > after_poll, "polling must not busy-loop");
+        assert!(
+            next_deadline <= after_poll + std::time::Duration::from_millis(10),
+            "the next retired-fence poll must remain bounded"
         );
     }
 
