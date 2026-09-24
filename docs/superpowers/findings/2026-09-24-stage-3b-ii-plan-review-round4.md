@@ -1,3 +1,19 @@
+# Stage 3b-ii plan — codex review, round 4
+
+**Target:** the plan as committed at round 4 — **revision 3 text** (the
+coordinator's revision 4 edits had not applied), prior review round 3.
+
+**Result:** 0 blocking, 1 major, 0 minor. Trend: r1 2B 1M, r2 1B 1M, r3 1B 1M, r4 0B 1M.
+
+**Reviewer:** `codex exec --sandbox read-only`, single pass
+**Instrument:** `docs/superpowers/review/` @ `0245f96b`;
+model `gpt-6-sol`; reasoning effort `xhigh`; `codex-cli 0.155.1`.
+Counts are comparable only to other reviews citing this same instrument SHA.
+
+**Author verification (2026-09-24):** M-1 CONFIRMED and applied in plan revision 5,
+together with the revision 4 edits. Because round 4 did not see the revision 4
+text, a round 5 reviews revisions 4 and 5.
+
 ## Verdict
 
 **0 blocking, 1 major, 0 minor**  

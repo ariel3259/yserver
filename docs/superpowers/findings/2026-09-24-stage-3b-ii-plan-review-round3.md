@@ -1,3 +1,24 @@
+# Stage 3b-ii plan — codex review, round 3
+
+**Target:** `docs/superpowers/plans/2026-09-24-phase-c0-stage-3b-ii-plan-randr-protocol.md`
+revision 3, prior review round 2.
+
+**Result:** 1 blocking, 1 major, 0 minor. Trend: r1 2B 1M, r2 1B 1M, r3 1B 1M.
+
+**Reviewer:** `codex exec --sandbox read-only`, single pass
+**Instrument:** `docs/superpowers/review/` @ `0245f96b`;
+model `gpt-6-sol`; reasoning effort `xhigh`; `codex-cli 0.155.1`.
+Counts are comparable only to other reviews citing this same instrument SHA.
+
+**Author verification (2026-09-24):** B-1 CONFIRMED (`GetScreenResources` reprobes
+and can publish before its reply); applied in plan revision 4 (it joins the
+gate as a synchronous member). M-1 PARTIALLY ACCEPTED: frozen pre-C.0
+transcripts in the repository would contradict the user's 2026-09-22 decision
+to keep the golden outside it; the oracle is the existing core byte tests
+(unchangeable in 3b-ii) plus the stage 5 golden rerun — left for the user to
+confirm. (The revision 4 edits first failed to apply; round 4 therefore saw
+revision 3; they were re-applied with revision 5.)
+
 ## Verdict
 
 **1 blocking, 1 major, 0 minor**  

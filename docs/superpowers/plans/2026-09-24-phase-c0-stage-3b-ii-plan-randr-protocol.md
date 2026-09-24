@@ -2,6 +2,21 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bii_`, `c0_3bi_`, `c0_3aii_`, `c0_adm` in `yserver`, and the whole `yserver-core` suite — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 5 (2026-09-24, coordinator)** — codex round 4 (0 blocking, 1
+major, `../findings/2026-09-24-stage-3b-ii-plan-review-round4.md`):
+`KillClient`'s inline removal of an **in-flight** requester applies the same
+abandonment as a disconnect (Task 2). Round 4 reviewed revision 3 again: the
+coordinator's revision 4 edits had failed to apply and were re-applied here
+together. Review loop closed at the first round without a blocking finding.
+
+**Revision 4 (2026-09-24, coordinator)** — codex round 3
+(`../findings/2026-09-24-stage-3b-ii-plan-review-round3.md`: 1 blocking, 1
+major): `GetScreenResources`, which forces a connector reprobe that can
+publish, joins the gate as a synchronous member (B-1, Task 1); the pre-C.0
+oracle is the core's existing RANDR byte tests, which 3b-ii may not change,
+plus stage 5's golden rerun — the user decided on 2026-09-22 that the
+captured golden stays outside the repository (M-1, Task 5).
+
 **Revision 3 (2026-09-24, coordinator)** — codex round 2
 (`../findings/2026-09-24-stage-3b-ii-plan-review-round2.md`: 1 blocking, 1
 major, both verified): a generation reset (and `-terminate`) waits for an
@@ -79,6 +94,14 @@ relationship — at least `SetScreenConfig`, `SetScreenSize`, `SetCrtcConfig`,
 `SetPanning`, `SetCrtcTransform`; `SetCrtcGamma` and the output/provider
 property requests are excluded unless their arm changes configuration. The
 implementer states the decision for **every** RANDR opcode in the report.
+*(Rev 4, B-1.)* `GetScreenResources` forces a connector reprobe
+(`reprobe_connectors`, `process_request.rs:2939`) that can rebuild RANDR state
+and emit notifications before its reply (`render/backend.rs:24457`,
+`:10348`). It is therefore a **synchronous gate member**: while a mutation is
+in flight it waits in the FIFO like a synchronous mutation (never expired), so
+its probe and any publication it makes happen after the in-flight mutation's
+publication — Legacy's serial order. `GetScreenResourcesCurrent` and the other
+queries stay pure queries.
 Validation of an admitted mutation runs only after admission, against the
 published state. A mutation leaves the gate when its publication completes,
 or at once when it ends without one. The pure-Legacy server has nothing in
@@ -92,6 +115,7 @@ named exception (the concurrent PRIME probe no longer goes stale).
 | `c0_3bii_gate_blocks_only_the_mutating_client` | A in flight; B's next request is a mutation with a `GetScreenResources` behind it; D sends only queries: D is served at once, B's query waits behind B's mutation | **G3** block every client |
 | `c0_3bii_queries_read_published_state` | A in flight (installed in the backend but not yet published): a `GetCrtcInfo` from B answers the published, old state | **G4** publish at backend completion instead of in the gate |
 | `c0_3bii_mate_reassert_behind_a_change` | A changes HDMI-2 to 1280x720 (parked); B sends the 1920x1080 re-assert: after A publishes, B is evaluated as a real change back (not idempotent) and its events follow A's | **G5** validate or compare B before A publishes |
+| `c0_3bii_forced_reprobe_waits_for_the_gate` | *(rev 4)* A's modeset in flight; B sends `GetScreenResources` while the recording backend's reprobe would report a changed connector: B's reply and the reprobe's notifications come after A's publication; a `GetScreenResourcesCurrent` from C is served at once from the published state | **G6b** treat `GetScreenResources` as a pure query |
 | `c0_3bii_every_opcode_classified` | a table test over every RANDR minor opcode asserting its mutation/query classification as reported | **G6** drop one mutation from the set |
 
 ## Task 2 — publication outlives the requester (obligation 3)
@@ -109,7 +133,10 @@ path updates the gate — `disconnect_with_pending_cleanup` (`run.rs:828`) and
 the inline removal `KillClient` performs on another client (detected at
 `run.rs:884` by the client count) — either by calling the same gate cleanup
 or by pruning, before the next admission, every FIFO entry and in-flight
-requester whose client no longer exists. *(Rev 3, B-1.)* A **generation reset** or `-terminate`
+requester whose client no longer exists. For an in-flight requester the prune
+applies **the same abandonment** as a disconnect
+(`abandon_crtc_config_requester`): only the reply attachment is removed, and a
+`ContinuesWithoutRequester` publication stays in the gate *(rev 5)*. *(Rev 3, B-1.)* A **generation reset** or `-terminate`
 (`core_loop/run.rs:1836`, `core_loop/reset.rs`) triggered while the gate holds
 an install-capable mutation (a `ContinuesWithoutRequester` one) is deferred
 until that mutation's terminal result — bounded by `E` — and only then
@@ -128,6 +155,7 @@ dropped. `Success` is answered only from `Ok(true)` or the idempotent
 | `c0_3bii_disconnect_before_dispatch_cancels` | the backend answers `Cancelled`: no publication, the gate frees at once | **G8** keep the gate occupied after a cancel |
 | `c0_3bii_waiting_head_disconnects` | B is the FIFO head waiting behind A and disconnects: B leaves the FIFO, the next waiter keeps its place | **G9** leave the departed client in the FIFO |
 | `c0_3bii_reset_waits_for_an_install_capable_mutation` | *(rev 3, B-1)* the last client's dispatched modeset continues without its requester; the reset trigger fires (last client left): the reset does not cancel the token or snapshot backend state until the result is terminal; after `Ok(true)` the new generation's RANDR state is seeded from the installed topology, and nothing of the old client (reply, events) reaches the new generation; with `-terminate` the server exits only after the terminal result | **G9c** cancel the token and seed at once (today's `reset.rs` step order) |
+| `c0_3bii_killclient_of_a_dispatched_requester_still_publishes` | *(rev 5)* A's modeset dispatched (`ContinuesWithoutRequester`); D kills A with `KillClient`; the backend completes `Ok(true)`: the listener receives A's change notifications, nothing is written for A, and the next waiter is admitted after the publication | **G9d** prune the whole in-flight entry on inline removal |
 | `c0_3bii_killclient_removes_a_waiting_head` | A in flight, B the waiting head, C behind; D kills B with `KillClient`; A completes: C is admitted next and B's entry is gone | **G9b** clean the gate only in `disconnect_with_pending_cleanup` |
 | `c0_3bii_failed_publishes_nothing` | the backend completes `Err(..)`: reply status 3, timestamp unchanged, no notification | **G10** publish on error |
 | `c0_3bii_last_set_time_can_go_backward` | two successive changes with a decreasing client timestamp: `lastSetTime` follows the request, as Legacy | **G11** clamp `lastSetTime` monotonic |
@@ -196,7 +224,13 @@ waiter's validation (answer `Failed` either way), a malformed waiter (its
 stateless error), a synchronous waiter behind a slow mutation (not expired);
 and the mixed-server sequence — Owner A in flight, Legacy B and Owner C
 queued, B stalled past C's `Q`, C answered on the first iteration after B
-returns. Identical except the named exceptions
+returns. *(Rev 4, M-1.)* Relative parity between the two fixtures is not enough
+on its own: both run the modified core. The pre-C.0 oracle is (a) the
+existing `yserver-core` tests that assert RANDR reply and event bytes (the
+implementer lists them) — 3b-ii may not change any of them, and a needed
+change is an F8 — and (b) stage 5's layer-3 rerun against the user's golden
+capture, which by the user's decision of 2026-09-22 stays outside the
+repository. Identical except the named exceptions
 (design §8.4), each asserted as the named difference. The hardware test of
 3b-i gains an in-test protocol client that issues the same `SetCrtcConfig`
 sequence through the core and checks its reply bytes.
