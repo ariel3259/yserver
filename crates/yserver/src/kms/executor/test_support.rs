@@ -46,6 +46,17 @@ pub enum StubBehaviour {
     AcceptLifecycleWithPendingFence,
     AcceptProbeWith(u64),
     RejectProbeWith(i32),
+    AcceptCallsWith(u64),
+    AcceptCallsWithOutFence(u64),
+    AcceptProbesThenNeverReply(u64),
+    RejectFirstProbeThenAccept {
+        sequence: u64,
+        errno: i32,
+    },
+    ProbeThenRejectAtomic {
+        sequence: u64,
+        errno: i32,
+    },
     AcceptQueueWith(u64),
     RejectQueueWith(i32),
     ReplyWithWrongFamily,
@@ -89,6 +100,17 @@ impl StubBehaviour {
             Self::AcceptLifecycleWithPendingFence => "accept-lifecycle-pending-fence".to_string(),
             Self::AcceptProbeWith(seq) => format!("accept-probe:{seq}"),
             Self::RejectProbeWith(errno) => format!("reject-probe:{errno}"),
+            Self::AcceptCallsWith(seq) => format!("accept-calls:{seq}"),
+            Self::AcceptCallsWithOutFence(seq) => format!("accept-calls-out-fence:{seq}"),
+            Self::AcceptProbesThenNeverReply(seq) => {
+                format!("accept-probes-then-never-reply:{seq}")
+            }
+            Self::RejectFirstProbeThenAccept { sequence, errno } => {
+                format!("reject-first-probe:{sequence}:{errno}")
+            }
+            Self::ProbeThenRejectAtomic { sequence, errno } => {
+                format!("probe-then-reject-atomic:{sequence}:{errno}")
+            }
             Self::AcceptQueueWith(seq) => format!("accept-queue:{seq}"),
             Self::RejectQueueWith(errno) => format!("reject-queue:{errno}"),
             Self::ReplyWithWrongFamily => "reply-wrong-family".to_string(),
@@ -150,6 +172,30 @@ impl StubBehaviour {
             seq_str.parse::<u64>().ok().map(Self::AcceptProbeWith)
         } else if let Some(errno_str) = s.strip_prefix("reject-probe:") {
             errno_str.parse::<i32>().ok().map(Self::RejectProbeWith)
+        } else if let Some(seq_str) = s.strip_prefix("accept-calls-out-fence:") {
+            seq_str
+                .parse::<u64>()
+                .ok()
+                .map(Self::AcceptCallsWithOutFence)
+        } else if let Some(seq_str) = s.strip_prefix("accept-calls:") {
+            seq_str.parse::<u64>().ok().map(Self::AcceptCallsWith)
+        } else if let Some(seq_str) = s.strip_prefix("accept-probes-then-never-reply:") {
+            seq_str
+                .parse::<u64>()
+                .ok()
+                .map(Self::AcceptProbesThenNeverReply)
+        } else if let Some(rest) = s.strip_prefix("reject-first-probe:") {
+            let (sequence, errno) = rest.split_once(':')?;
+            Some(Self::RejectFirstProbeThenAccept {
+                sequence: sequence.parse::<u64>().ok()?,
+                errno: errno.parse::<i32>().ok()?,
+            })
+        } else if let Some(rest) = s.strip_prefix("probe-then-reject-atomic:") {
+            let (sequence, errno) = rest.split_once(':')?;
+            Some(Self::ProbeThenRejectAtomic {
+                sequence: sequence.parse::<u64>().ok()?,
+                errno: errno.parse::<i32>().ok()?,
+            })
         } else if let Some(seq_str) = s.strip_prefix("accept-queue:") {
             seq_str.parse::<u64>().ok().map(Self::AcceptQueueWith)
         } else if let Some(errno_str) = s.strip_prefix("reject-queue:") {
@@ -676,6 +722,21 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             let _ = std::io::Read::read(&mut &control, &mut sink);
             Ok(())
         }
+        StubBehaviour::AcceptCallsWith(sequence) => {
+            serve_call_families(&control, sequence, false, None, None)
+        }
+        StubBehaviour::AcceptCallsWithOutFence(sequence) => {
+            serve_call_families(&control, sequence, true, None, None)
+        }
+        StubBehaviour::AcceptProbesThenNeverReply(sequence) => {
+            serve_probes_then_wait(&control, sequence)
+        }
+        StubBehaviour::RejectFirstProbeThenAccept { sequence, errno } => {
+            serve_call_families(&control, sequence, false, None, Some(errno))
+        }
+        StubBehaviour::ProbeThenRejectAtomic { sequence, errno } => {
+            serve_call_families(&control, sequence, false, Some(errno), None)
+        }
         StubBehaviour::AcceptQueueWith(sequence) => {
             let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
             let received = transport::recv_frame(&control, &mut req_buf)?;
@@ -807,6 +868,105 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                 std::thread::sleep(Duration::from_secs(3600));
             }
         }
+    }
+}
+
+fn serve_probes_then_wait(control: &UnixStream, sequence: u64) -> io::Result<()> {
+    let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+    loop {
+        let received = transport::recv_frame(control, &mut req_buf)?;
+        if received.len == 0 {
+            return Ok(());
+        }
+        let request = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+        })?;
+        let correlation = request.correlation();
+        if !matches!(&request, protocol::HostCallRequest::ClockProbe(_)) {
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &*control, &mut sink);
+            return Ok(());
+        }
+        let reply = protocol::HostCallReply::ProbeAccepted {
+            correlation,
+            sequence,
+            helper_duration_ns: 1_000_000,
+        };
+        transport::send_frame(control, &protocol::encode_reply(&reply))?;
+    }
+}
+
+fn serve_call_families(
+    control: &UnixStream,
+    sequence: u64,
+    accept_atomic_out_fence: bool,
+    reject_atomic: Option<i32>,
+    reject_first_probe: Option<i32>,
+) -> io::Result<()> {
+    let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+    let mut rejected_probe = false;
+    loop {
+        let received = transport::recv_frame(control, &mut req_buf)?;
+        if received.len == 0 {
+            return Ok(());
+        }
+        let request = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+        })?;
+        let correlation = request.correlation();
+        let (reply, fence_count) = match request {
+            protocol::HostCallRequest::Atomic(_) => match reject_atomic {
+                Some(errno) => (
+                    protocol::HostCallReply::Rejected {
+                        correlation,
+                        errno,
+                        helper_duration_ns: 1_000_000,
+                        unexpected_fence_output: false,
+                    },
+                    0,
+                ),
+                None => (
+                    protocol::HostCallReply::Accepted {
+                        correlation,
+                        helper_duration_ns: 1_000_000,
+                        out_fence_mask: u32::from(accept_atomic_out_fence),
+                    },
+                    usize::from(accept_atomic_out_fence),
+                ),
+            },
+            protocol::HostCallRequest::ClockProbe(_) => (
+                match reject_first_probe {
+                    Some(errno) if !rejected_probe => {
+                        rejected_probe = true;
+                        protocol::HostCallReply::ProbeRejected {
+                            correlation,
+                            errno,
+                            helper_duration_ns: 1_000_000,
+                        }
+                    }
+                    _ => protocol::HostCallReply::ProbeAccepted {
+                        correlation,
+                        sequence,
+                        helper_duration_ns: 1_000_000,
+                    },
+                },
+                0,
+            ),
+            protocol::HostCallRequest::SequenceQueue(_) => (
+                protocol::HostCallReply::QueueAccepted {
+                    correlation,
+                    sequence,
+                    helper_duration_ns: 1_000_000,
+                },
+                0,
+            ),
+        };
+        let frame = protocol::encode_reply(&reply);
+        let dummy_files = (0..fence_count)
+            .map(|_| std::fs::File::open("/dev/null"))
+            .collect::<io::Result<Vec<_>>>()?;
+        let fence_refs: Vec<BorrowedFd<'_>> = dummy_files.iter().map(|file| file.as_fd()).collect();
+        transport::send_reply_with_fences(control, &frame, &fence_refs)?;
     }
 }
 
