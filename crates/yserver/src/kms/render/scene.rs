@@ -2754,13 +2754,30 @@ impl SceneCompositor {
             return;
         };
         loop {
-            let Some((output_idx, index)) =
-                inner
-                    .outputs
-                    .iter()
-                    .enumerate()
-                    .find_map(|(output_idx, state)| {
-                        state
+            let active = inner
+                .outputs
+                .iter()
+                .enumerate()
+                .find_map(|(output_idx, state)| {
+                    state
+                        .owner_buffers
+                        .iter()
+                        .position(|buffer| {
+                            buffer.commit_id() == Some(commit.commit)
+                                && buffer.identity().output_key.device_key == commit.device
+                                && buffer.state() == OwnerBufferState::Submitted
+                        })
+                        .map(|index| (output_idx, index))
+                });
+            let Some((output_idx, index)) = active else {
+                let retired = inner
+                    .retired_outputs
+                    .get_mut(&commit.device)
+                    .into_iter()
+                    .flatten()
+                    .find_map(|bundle| {
+                        bundle
+                            .scene
                             .owner_buffers
                             .iter()
                             .position(|buffer| {
@@ -2768,10 +2785,17 @@ impl SceneCompositor {
                                     && buffer.identity().output_key.device_key == commit.device
                                     && buffer.state() == OwnerBufferState::Submitted
                             })
-                            .map(|index| (output_idx, index))
-                    })
-            else {
-                return;
+                            .map(|index| (&mut bundle.scene.owner_buffers, index))
+                    });
+                let Some((owner_buffers, index)) = retired else {
+                    return;
+                };
+                let buffer = owner_buffers.remove(index);
+                match buffer.into_accepted() {
+                    Ok(buffer) => owner_buffers.insert(index, buffer),
+                    Err(buffer) => owner_buffers.insert(index, *buffer),
+                }
+                continue;
             };
             let state = &mut inner.outputs[output_idx];
             let buffer = state.owner_buffers.remove(index);
@@ -2881,24 +2905,73 @@ impl SceneCompositor {
         // A bundled owner commit has one CompletionRetired event carrying the
         // bundle's resources. Resolve every scene member keyed by this commit.
         loop {
-            let Some((output_idx, index)) =
-                inner
-                    .outputs
-                    .iter()
-                    .enumerate()
-                    .find_map(|(output_idx, state)| {
-                        state
+            let active = inner
+                .outputs
+                .iter()
+                .enumerate()
+                .find_map(|(output_idx, state)| {
+                    state
+                        .owner_buffers
+                        .iter()
+                        .position(|buffer| {
+                            buffer.commit_id() == Some(commit.commit)
+                                && buffer.identity().output_key.device_key == commit.device
+                                && buffer.state() == OwnerBufferState::Accepted
+                        })
+                        .map(|index| (output_idx, index))
+                });
+            let Some((output_idx, index)) = active else {
+                let retired = inner
+                    .retired_outputs
+                    .get_mut(&commit.device)
+                    .into_iter()
+                    .flatten()
+                    .find_map(|bundle| {
+                        bundle
+                            .scene
                             .owner_buffers
                             .iter()
                             .position(|buffer| {
                                 buffer.commit_id() == Some(commit.commit)
                                     && buffer.identity().output_key.device_key == commit.device
-                                    && buffer.state() == OwnerBufferState::Accepted
+                                    && matches!(
+                                        buffer.state(),
+                                        OwnerBufferState::Submitted | OwnerBufferState::Accepted
+                                    )
                             })
-                            .map(|index| (output_idx, index))
-                    })
-            else {
-                return;
+                            .map(|index| (&mut bundle.scene.owner_buffers, index))
+                    });
+                let Some((owner_buffers, index)) = retired else {
+                    return;
+                };
+                let buffer = owner_buffers.remove(index);
+                let buffer = match buffer.state() {
+                    OwnerBufferState::Submitted => match buffer.into_accepted() {
+                        Ok(buffer) => buffer,
+                        Err(buffer) => {
+                            owner_buffers.insert(index, *buffer);
+                            return;
+                        }
+                    },
+                    OwnerBufferState::Accepted => buffer,
+                    _ => unreachable!("retired owner-buffer selector restricts its state"),
+                };
+                let buffer = match buffer.into_current() {
+                    Ok(buffer) => buffer,
+                    Err(buffer) => {
+                        owner_buffers.insert(index, *buffer);
+                        return;
+                    }
+                };
+                let buffer = match buffer.into_releasing() {
+                    Ok(buffer) => buffer,
+                    Err(buffer) => {
+                        owner_buffers.insert(index, *buffer);
+                        return;
+                    }
+                };
+                owner_buffers.insert(index, buffer);
+                continue;
             };
             let state = &mut inner.outputs[output_idx];
             let old_index = Self::owner_current_index(state);
@@ -3023,6 +3096,35 @@ impl SceneCompositor {
                 .iter()
                 .position(|output| output.key == member.output_key)
             else {
+                let retired_bundle = inner
+                    .retired_outputs
+                    .get_mut(&commit.device)
+                    .into_iter()
+                    .flatten()
+                    .find(|bundle| bundle.key == member.output_key);
+                if let Some(bundle) = retired_bundle {
+                    let submitted = member.accepted
+                        && bundle.scene.owner_buffers.iter().any(|buffer| {
+                            buffer.identity().output_key == member.output_key
+                                && buffer.identity().bo_idx == member.bo_idx
+                                && buffer.identity().generation == member.generation
+                                && matches!(
+                                    buffer.state(),
+                                    OwnerBufferState::Submitted | OwnerBufferState::Accepted
+                                )
+                                && buffer
+                                    .pending_ack()
+                                    .is_some_and(|ack| ack.stage == InFlightStage::OwnerSubmitted)
+                        });
+                    if submitted {
+                        for snapshot in member.drawable_snapshots {
+                            store.ack_presentation_damage(snapshot);
+                        }
+                        bundle.scene.damage.retire_success();
+                    } else {
+                        bundle.scene.damage.invalidate();
+                    }
+                }
                 continue;
             };
             let submitted = inner.outputs.get(output_idx).is_some_and(|state| {

@@ -260,6 +260,27 @@ impl CommitResourceConsumer {
         self.current_resources = retained;
     }
 
+    /// A commit can retire after its output has already left the installed
+    /// topology. Such resources must not become current for an absent CRTC;
+    /// move only complete resource groups whose members all lack a live
+    /// output holder into the ordinary release path.
+    pub(crate) fn retire_current_without_live_crtcs(&mut self, live_crtcs: &HashSet<CrtcKey>) {
+        let current = std::mem::take(&mut self.current_resources);
+        let mut retained = Vec::with_capacity(current.len());
+        for resources in current {
+            if resources
+                .crtcs
+                .iter()
+                .all(|member| !live_crtcs.contains(&member.crtc))
+            {
+                self.releasing_resources.push(resources);
+            } else {
+                retained.push(resources);
+            }
+        }
+        self.current_resources = retained;
+    }
+
     pub(crate) fn take_released_presents(&mut self) -> Vec<PresentRelease> {
         std::mem::take(&mut self.released_presents)
     }
