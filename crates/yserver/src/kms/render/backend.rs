@@ -21559,8 +21559,12 @@ impl Backend for KmsBackend {
         // alias_registry; if this was the final ref, free the
         // underlying pixmap. Mirrors the alias-aware branch of
         // `free_pixmap` for consistency.
+        let export_id = self.store.lookup(backing.as_raw());
         if self.core.alias_registry.decref(backing) {
             self.free_pixmap(origin, backing.as_raw())?;
+        } else if let Some(id) = export_id {
+            // An alias left this backing: an export-only entry (glx_refs == 0) goes, as at FreePixmap.
+            self.maybe_teardown_export(id);
         }
         Ok(())
     }

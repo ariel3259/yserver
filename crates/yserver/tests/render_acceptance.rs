@@ -12527,14 +12527,10 @@ struct ProtoFixture {
 
 impl ProtoFixture {
     fn new() -> Option<Self> {
-        use std::{
-            collections::{HashMap, HashSet, VecDeque},
-            os::unix::net::UnixStream,
-            sync::{Arc, Mutex, atomic::AtomicU16},
-        };
+        use std::os::unix::net::UnixStream;
         use yserver_core::{
             resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
-            server::{ClientState, ServerState},
+            server::ServerState,
         };
 
         let backend = KmsBackend::for_tests_with_vk().ok()?;
@@ -12554,34 +12550,47 @@ impl ProtoFixture {
         }
 
         let (a, b) = UnixStream::pair().ok()?;
-        state.clients.insert(
-            1,
-            ClientState {
-                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
-                byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0,
-                resource_id_mask: u32::MAX,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: VecDeque::new(),
-                watching_writable: false,
-                focused_window: ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
+        state.clients.insert(1, Self::client_state(a));
         Some(Self {
             state,
             backend,
             _peer: b,
             seq: 0,
         })
+    }
+
+    fn client_state(a: std::os::unix::net::UnixStream) -> yserver_core::server::ClientState {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::{resources::ROOT_WINDOW, server::ClientState};
+        ClientState {
+            writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            watching_writable: false,
+            focused_window: ROOT_WINDOW,
+            reader_control: None,
+            is_local: true,
+            fd_passing: true,
+        }
+    }
+
+    /// A second client, for tests where the compositor and the app are different clients.
+    fn add_client(&mut self, id: u32) -> std::os::unix::net::UnixStream {
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        self.state.clients.insert(id, Self::client_state(a));
+        b
     }
 
     /// The host xid the backend allocated for a core window resource.
@@ -12606,6 +12615,11 @@ impl ProtoFixture {
 
     /// Dispatch one request. `body` excludes the 4-byte header.
     fn req(&mut self, opcode: u8, data: u8, body: &[u8]) {
+        self.req_as(1, opcode, data, body);
+    }
+
+    /// [`Self::req`] from client `client`.
+    fn req_as(&mut self, client: u32, opcode: u8, data: u8, body: &[u8]) {
         use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
         assert!(
             body.len().is_multiple_of(4),
@@ -12620,7 +12634,7 @@ impl ProtoFixture {
         yserver_core::core_loop::process_request::process_request(
             &mut self.state,
             &mut self.backend,
-            ClientId(1),
+            ClientId(client),
             SequenceNumber(self.seq),
             header,
             body,
@@ -15379,4 +15393,193 @@ fn bg_none_window_is_seeded_from_its_parent_on_remap() {
         or_bgr(RED),
         "the remap seeds from the parent"
     );
+}
+
+/// How a TFP compositor holds the named backing of a window that is then resized.
+#[derive(Clone, Copy, Debug)]
+enum TfpHold {
+    NameOnly,
+    Glx,
+    GlxAndDri3,
+    Dri3Only,
+}
+
+/// How that compositor lets go of it.
+#[derive(Clone, Copy, Debug)]
+enum TfpTeardown {
+    DestroyGlxThenFree,
+    FreeThenDestroyGlx,
+    DestroyWindowFirst,
+    Disconnect,
+}
+
+/// Every backing the window ever had is gone: no export entry, alias hold or store entry.
+fn assert_backings_released(f: &ProtoFixture, backings: &[u32], what: &str) {
+    for &b in backings {
+        assert!(
+            !f.backend.has_export_entry(b),
+            "{what}: export entry on 0x{b:x} leaked"
+        );
+        assert!(
+            f.backend.test_alias_registry_get(b).is_none(),
+            "{what}: alias hold on 0x{b:x} leaked: {:?}",
+            f.backend.test_alias_registry_get(b),
+        );
+        assert!(
+            !f.backend.store_drawable_exists_for_tests(b),
+            "{what}: store entry for 0x{b:x} leaked"
+        );
+    }
+}
+
+/// picom-glx: NameWindowPixmap + glXCreatePixmap, then resizes rotate the backing.
+/// The GLX pixmap is retargeted onto each new backing (110f1a90); its export ref must follow.
+/// Client 1 is the compositor, client 2 owns the window.
+fn tfp_resize_scenario(hold: TfpHold, resizes: i32, teardown: TfpTeardown) -> bool {
+    const APP: u32 = 2;
+    const WIN: u32 = 0x0078_0001;
+    const PIX: u32 = 0x0078_0002;
+    const GLXPIX: u32 = 0x0078_0003;
+    let what = format!("{hold:?} resizes={resizes} {teardown:?}");
+    let Some(mut f) = ProtoFixture::new() else {
+        return false;
+    };
+    let _app_peer = f.add_client(APP);
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let mut cw = Vec::new();
+    cw.extend_from_slice(&WIN.to_le_bytes());
+    cw.extend_from_slice(&root.to_le_bytes());
+    cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+    cw.extend_from_slice(&100u16.to_le_bytes());
+    cw.extend_from_slice(&50u16.to_le_bytes());
+    cw.extend_from_slice(&0u16.to_le_bytes()); // border
+    cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+    cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+    cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+    f.req_as(APP, 1, 24, &cw);
+    let mut redirect = root.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    f.req(144, 2, &redirect);
+    f.req_as(APP, 8, 0, &WIN.to_le_bytes()); // MapWindow
+    let mut name = WIN.to_le_bytes().to_vec();
+    name.extend_from_slice(&PIX.to_le_bytes());
+    f.req(144, 6, &name); // NameWindowPixmap
+    let named = |f: &ProtoFixture| {
+        f.state
+            .resources
+            .pixmap(yserver_protocol::x11::ResourceId(PIX))
+            .and_then(|p| p.host_xid)
+            .map(|h| h.as_raw())
+            .expect("named pixmap")
+    };
+    let mut backings = vec![named(&f)];
+    let glx = matches!(hold, TfpHold::Glx | TfpHold::GlxAndDri3);
+    if glx {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        body.extend_from_slice(&PIX.to_le_bytes());
+        body.extend_from_slice(&GLXPIX.to_le_bytes());
+        f.req(148, yserver_protocol::x11::glx::CREATE_PIXMAP, &body);
+    }
+    if matches!(hold, TfpHold::GlxAndDri3 | TfpHold::Dri3Only) {
+        match f.backend.dri3_export_pixmap_buffers(backings[0]) {
+            Ok(export) => drop(export.fd), // the client's own fd; ours is the entry's dup
+            Err(err) => {
+                eprintln!("{what}: skipping, this ICD cannot export the backing: {err}");
+                return true;
+            }
+        }
+    }
+    assert_eq!(
+        f.backend.has_export_entry(backings[0]),
+        !matches!(hold, TfpHold::NameOnly),
+        "{what}: export entry on the named backing"
+    );
+    for i in 1..=resizes {
+        let mut cfg = WIN.to_le_bytes().to_vec();
+        cfg.extend_from_slice(&0x0cu16.to_le_bytes());
+        cfg.extend_from_slice(&0u16.to_le_bytes());
+        cfg.extend_from_slice(&(100 + 10 * i).to_le_bytes());
+        cfg.extend_from_slice(&(50 + 10 * i).to_le_bytes());
+        f.req_as(APP, 12, 0, &cfg);
+        let current = named(&f);
+        assert!(!backings.contains(&current), "{what}: resize {i} rotated");
+        backings.push(current);
+    }
+    let destroy_glx = |f: &mut ProtoFixture| {
+        if glx {
+            f.req(
+                148,
+                yserver_protocol::x11::glx::DESTROY_PIXMAP,
+                &GLXPIX.to_le_bytes(),
+            );
+        }
+    };
+    let free = |f: &mut ProtoFixture| f.req(54, 0, &PIX.to_le_bytes());
+    let destroy_win = |f: &mut ProtoFixture| f.req_as(APP, 4, 0, &WIN.to_le_bytes());
+    match teardown {
+        TfpTeardown::DestroyGlxThenFree => {
+            destroy_glx(&mut f);
+            free(&mut f);
+            destroy_win(&mut f);
+        }
+        TfpTeardown::FreeThenDestroyGlx => {
+            free(&mut f);
+            destroy_glx(&mut f);
+            destroy_win(&mut f);
+        }
+        TfpTeardown::DestroyWindowFirst => {
+            destroy_win(&mut f);
+            destroy_glx(&mut f);
+            free(&mut f);
+        }
+        TfpTeardown::Disconnect => {
+            yserver_core::core_loop::process_disconnect::process_disconnect(
+                &mut f.state,
+                &mut f.backend,
+                yserver_protocol::x11::ClientId(1),
+            );
+            destroy_win(&mut f);
+        }
+    }
+    for _ in 0..200 {
+        f.backend.for_tests_poll_retired();
+        if backings
+            .iter()
+            .all(|&b| !f.backend.store_drawable_exists_for_tests(b))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_backings_released(&f, &backings, &what);
+    true
+}
+
+/// A resize must not strand the pre-resize backing behind a GLX/DRI3 export ref.
+/// The DRI3 holds need an exporting ICD (RADV); lavapipe cannot export and skips them.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_resized_tfp_backing_is_freed_once_the_compositor_lets_go() {
+    for hold in [
+        TfpHold::NameOnly,
+        TfpHold::Glx,
+        TfpHold::GlxAndDri3,
+        TfpHold::Dri3Only,
+    ] {
+        for resizes in [0, 1, 2] {
+            for teardown in [
+                TfpTeardown::DestroyGlxThenFree,
+                TfpTeardown::FreeThenDestroyGlx,
+                TfpTeardown::DestroyWindowFirst,
+                TfpTeardown::Disconnect,
+            ] {
+                if !tfp_resize_scenario(hold, resizes, teardown) {
+                    eprintln!("skipping: no Vk");
+                    return;
+                }
+            }
+        }
+    }
 }

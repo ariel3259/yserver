@@ -1118,6 +1118,26 @@ fn flip_redirect_target_mode(
     }
 }
 
+/// Point GLX pixmap `glx_xid` at `new_host`, moving its export-lifetime ref along (acquire NEW, release OLD).
+fn retarget_glx_pixmap_export(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    glx_xid: u32,
+    new_host: u32,
+) {
+    let Some(drawable) = state.glx_drawables.get_mut(&glx_xid) else {
+        return;
+    };
+    let old_host = drawable.glx_export_host_xid.replace(new_host);
+    if old_host == Some(new_host) {
+        return;
+    }
+    backend.acquire_glx_pixmap_export(new_host);
+    if let Some(old_host) = old_host {
+        backend.release_glx_pixmap_export(old_host);
+    }
+}
+
 /// A window that just became viewable under an existing redirect (its own
 /// `RedirectWindow`, or its parent's `RedirectSubwindows`) gets a fresh
 /// backing, as Xorg's `compRealizeWindow` → `compCheckRedirect` →
@@ -1477,10 +1497,14 @@ fn rotate_redirected_backing_on_resize(
             new_height,
             depth,
         );
-        for drawable in state.glx_drawables.values_mut() {
-            if drawable.x_drawable == alias.client_pixmap.0 {
-                drawable.glx_export_host_xid = Some(new_backing.as_raw());
-            }
+        let glx_pixmaps: Vec<u32> = state
+            .glx_drawables
+            .iter()
+            .filter(|(_, d)| d.x_drawable == alias.client_pixmap.0)
+            .map(|(xid, _)| *xid)
+            .collect();
+        for glx_xid in glx_pixmaps {
+            retarget_glx_pixmap_export(state, backend, glx_xid, new_backing.as_raw());
         }
     }
     if let Some(w) = state.resources.window_mut(window) {
@@ -15125,9 +15149,13 @@ fn handle_glx_request(
                         let host_xid_for_export = current_host_xid.or(stored_host_xid);
                         if let Some(current_host_xid) = current_host_xid
                             && stored_host_xid != Some(current_host_xid)
-                            && let Some(d_mut) = state.glx_drawables.get_mut(&glx_drawable)
                         {
-                            d_mut.glx_export_host_xid = Some(current_host_xid);
+                            retarget_glx_pixmap_export(
+                                state,
+                                backend,
+                                glx_drawable,
+                                current_host_xid,
+                            );
                         }
                         // Ensure the backing is promoted to exportable storage so
                         // indirect GL texture sampling can read live content.
@@ -51228,6 +51256,195 @@ mod tests {
         assert_eq!(backing.width, 100);
         assert_eq!(backing.height, 75);
         assert_eq!(backing.depth, 32);
+    }
+
+    /// How a GLX-TFP compositor lets go of a named, resized window.
+    #[derive(Clone, Copy, Debug)]
+    enum GlxTeardown {
+        DestroyGlxThenFree,
+        FreeThenDestroyGlx,
+        DestroyWindowFirst,
+        Disconnect,
+    }
+
+    fn drive(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units,
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    /// picom-glx under a WM: NameWindowPixmap + glXCreatePixmap, `resizes` resizes, then teardown.
+    fn glx_export_ref_after_resizes(resizes: u16, teardown: GlxTeardown) -> RecordingBackend {
+        use yserver_protocol::x11::glx as x11glx;
+        const WIN: u32 = 0x0077_0001;
+        const PIX: u32 = 0x0077_0002;
+        const GLXPIX: u32 = 0x0077_0003;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new()
+            .with_composite_support()
+            .with_redirect_activation();
+        let mut cw = Vec::new();
+        cw.extend_from_slice(&WIN.to_le_bytes());
+        cw.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+        cw.extend_from_slice(&100u16.to_le_bytes());
+        cw.extend_from_slice(&50u16.to_le_bytes());
+        cw.extend_from_slice(&0u16.to_le_bytes()); // border
+        cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+        cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+        cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+        drive(&mut state, &mut backend, 1, 0, &cw);
+        let mut redirect = ROOT_WINDOW.0.to_le_bytes().to_vec();
+        redirect.extend_from_slice(&[1, 0, 0, 0]); // Manual
+        drive(
+            &mut state,
+            &mut backend,
+            144,
+            yserver_protocol::x11::composite::REDIRECT_SUBWINDOWS,
+            &redirect,
+        );
+        drive(&mut state, &mut backend, 8, 0, &WIN.to_le_bytes());
+        let mut name = WIN.to_le_bytes().to_vec();
+        name.extend_from_slice(&PIX.to_le_bytes());
+        drive(
+            &mut state,
+            &mut backend,
+            144,
+            yserver_protocol::x11::composite::NAME_WINDOW_PIXMAP,
+            &name,
+        );
+        let mut glx = Vec::new();
+        glx.extend_from_slice(&0u32.to_le_bytes()); // screen
+        glx.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        glx.extend_from_slice(&PIX.to_le_bytes());
+        glx.extend_from_slice(&GLXPIX.to_le_bytes());
+        drive(&mut state, &mut backend, 148, x11glx::CREATE_PIXMAP, &glx);
+        let first = state
+            .resources
+            .pixmap(ResourceId(PIX))
+            .and_then(|p| p.host_xid)
+            .expect("named pixmap")
+            .as_raw();
+        assert_eq!(
+            backend.glx_pixmap_exports.get(&first),
+            Some(&1),
+            "glXCreatePixmap holds one export ref on the named backing",
+        );
+
+        for i in 1..=resizes {
+            let mut cfg = WIN.to_le_bytes().to_vec();
+            cfg.extend_from_slice(&0x0cu16.to_le_bytes());
+            cfg.extend_from_slice(&0u16.to_le_bytes());
+            cfg.extend_from_slice(&u32::from(100 + 10 * i).to_le_bytes());
+            cfg.extend_from_slice(&u32::from(50 + 10 * i).to_le_bytes());
+            drive(&mut state, &mut backend, 12, 0, &cfg);
+            let current = state
+                .resources
+                .window(ResourceId(WIN))
+                .and_then(|w| w.redirected_backing)
+                .expect("redirected backing")
+                .host_pixmap
+                .as_raw();
+            assert_ne!(current, first, "resize {i} rotated the backing");
+            assert_eq!(
+                state
+                    .glx_drawables
+                    .get(&GLXPIX)
+                    .and_then(|d| d.glx_export_host_xid),
+                Some(current),
+                "resize {i}: the GLX pixmap follows the retargeted alias",
+            );
+            assert_eq!(
+                backend
+                    .glx_pixmap_exports
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                vec![(current, 1)],
+                "resize {i}: the export ref lives on the backing the GLX pixmap names",
+            );
+        }
+
+        let destroy_glx = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(
+                state,
+                backend,
+                148,
+                x11glx::DESTROY_PIXMAP,
+                &GLXPIX.to_le_bytes(),
+            );
+        };
+        let free = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(state, backend, 54, 0, &PIX.to_le_bytes());
+        };
+        let destroy_win = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(state, backend, 4, 0, &WIN.to_le_bytes());
+        };
+        match teardown {
+            GlxTeardown::DestroyGlxThenFree => {
+                destroy_glx(&mut state, &mut backend);
+                free(&mut state, &mut backend);
+                destroy_win(&mut state, &mut backend);
+            }
+            GlxTeardown::FreeThenDestroyGlx => {
+                free(&mut state, &mut backend);
+                destroy_glx(&mut state, &mut backend);
+                destroy_win(&mut state, &mut backend);
+            }
+            GlxTeardown::DestroyWindowFirst => {
+                destroy_win(&mut state, &mut backend);
+                destroy_glx(&mut state, &mut backend);
+                free(&mut state, &mut backend);
+            }
+            GlxTeardown::Disconnect => {
+                crate::core_loop::process_disconnect::process_disconnect(
+                    &mut state,
+                    &mut backend,
+                    ClientId(1),
+                );
+            }
+        }
+        backend
+    }
+
+    /// A resize retargets picom's GLX pixmap; the export ref must move with it, or OLD leaks.
+    #[test]
+    fn glx_pixmap_export_ref_follows_the_resize_retarget() {
+        for resizes in [0, 1, 2] {
+            for teardown in [
+                GlxTeardown::DestroyGlxThenFree,
+                GlxTeardown::FreeThenDestroyGlx,
+                GlxTeardown::DestroyWindowFirst,
+                GlxTeardown::Disconnect,
+            ] {
+                let backend = glx_export_ref_after_resizes(resizes, teardown);
+                assert!(
+                    backend.glx_pixmap_exports.is_empty(),
+                    "resizes={resizes} {teardown:?}: export refs left behind: {:?}",
+                    backend.glx_pixmap_exports,
+                );
+            }
+        }
     }
 
     // compCopyWindow analog: when a redirected window resizes, the
