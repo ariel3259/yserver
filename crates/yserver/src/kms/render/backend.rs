@@ -1437,6 +1437,9 @@ pub struct KmsBackend {
     /// materialized.
     pending_picture_drawable_refs: HashMap<u32, u32>,
 
+    /// Paces the root-readback warning, which a client reading the root while no output is lit repeats thousands of times a second.
+    root_readback_warn: WarnThrottle,
+
     /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
     /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
     /// futex) for idle/sync fences; the mmap'd mapping lets us
@@ -5234,6 +5237,7 @@ impl KmsBackend {
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             picture_drawable_ids: HashMap::new(),
             pending_picture_drawable_refs: HashMap::new(),
+            root_readback_warn: WarnThrottle::default(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -6185,6 +6189,7 @@ impl KmsBackend {
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             picture_drawable_ids: HashMap::new(),
             pending_picture_drawable_refs: HashMap::new(),
+            root_readback_warn: WarnThrottle::default(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -7434,10 +7439,12 @@ impl KmsBackend {
             match read_scanout_region(self, rect, ScanoutReadSelection::OnScreenOnly) {
                 Ok(bytes) => Some(bytes),
                 Err(error) => {
-                    log::warn!(
-                        "render root scanout readback: {rect:?} unreadable, \
-                         zero-filling that piece: {error}"
-                    );
+                    if let Some(held) = self.root_readback_warn.check(std::time::Instant::now()) {
+                        log::warn!(
+                            "render root scanout readback: {rect:?} unreadable, \
+                             zero-filling that piece: {error} ({held} more since the last report)"
+                        );
+                    }
                     None
                 }
             }
@@ -27840,8 +27847,45 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
     result
 }
 
+/// Logs at most once per [`WarnThrottle::PERIOD`], counting what it held back.
+#[derive(Debug, Default)]
+struct WarnThrottle {
+    last: Option<std::time::Instant>,
+    held: u64,
+}
+
+impl WarnThrottle {
+    const PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// `Some(n)` when a warning should be logged now, `n` being how many were held back since the last one.
+    fn check(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < Self::PERIOD)
+        {
+            self.held += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.held))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn warn_throttle_logs_once_per_period_and_counts_the_rest() {
+        use super::WarnThrottle;
+        let t0 = std::time::Instant::now();
+        let mut w = WarnThrottle::default();
+        assert_eq!(w.check(t0), Some(0));
+        for i in 1..=5 {
+            assert_eq!(w.check(t0 + std::time::Duration::from_millis(i)), None);
+        }
+        assert_eq!(w.check(t0 + WarnThrottle::PERIOD), Some(5));
+        assert_eq!(w.check(t0 + WarnThrottle::PERIOD), None);
+    }
+
     use super::{
         CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
         PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint,
