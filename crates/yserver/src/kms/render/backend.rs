@@ -63872,6 +63872,26 @@ mod tests {
         done: &dyn Fn(&super::KmsBackend) -> bool,
         hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
     ) -> Result<(), String> {
+        c0_3bi_core_driver_until_mode(backend, label, timeout, done, hardware_complete, false)
+    }
+
+    fn c0_3bi_core_driver_until_before_crtc_result(
+        backend: &mut super::KmsBackend,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+    ) -> Result<(), String> {
+        c0_3bi_core_driver_until_mode(backend, label, timeout, done, None, true)
+    }
+
+    fn c0_3bi_core_driver_until_mode(
+        backend: &mut super::KmsBackend,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+        hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
+        stop_when_done_before_crtc_result: bool,
+    ) -> Result<(), String> {
         use std::time::Instant;
         let mut state = ServerState::new();
         let end = Instant::now() + timeout;
@@ -63882,6 +63902,13 @@ mod tests {
                 observed.borrow_mut().extend(std::mem::take(
                     &mut backend.core_driver_hardware_completes_for_tests,
                 ));
+            }
+            if stop_when_done_before_crtc_result
+                && backend.core_driver_script_notification_count_for_tests == 0
+                && done(backend)
+            {
+                let _bounded_wait = Backend::next_wakeup(backend);
+                return Ok(());
             }
             // A test backend has no CoreSender. Treat the queued notification
             // as the same CrtcConfigReady message that wakes
@@ -64124,6 +64151,35 @@ mod tests {
             std::time::Duration::from_secs(2),
             &|backend| backend.core_driver_owner_events_for_tests.is_empty(),
             None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        backend
+            .core_driver_owner_batch_results_for_tests
+            .pop()
+            .unwrap_or(false)
+    }
+
+    fn c0_3bi_drive_owner_batch_before_crtc_result(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        events: Vec<
+            crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
+        >,
+        label: &str,
+    ) -> bool {
+        // This shim supplies test Owner milestones directly. It does not
+        // reproduce the kernel's page-flip event or out-fence signaling.
+        // Stop after the core Owner-completion entry consumes the batch so the
+        // caller can inspect install capability before taking the queued CRTC
+        // result, as the test does at the Backend boundary.
+        backend
+            .core_driver_owner_events_for_tests
+            .push_back((device, events));
+        c0_3bi_core_driver_until_before_crtc_result(
+            backend,
+            label,
+            std::time::Duration::from_secs(2),
+            &|backend| backend.core_driver_owner_events_for_tests.is_empty(),
         )
         .unwrap_or_else(|error| panic!("{error}"));
         backend
@@ -69130,7 +69186,7 @@ mod tests {
             .commit_id();
         c0_conv_cii_accept_direct_owner_commit(&mut backend, device, commit);
         let completion = backend.complete_owner_for_tests(0);
-        assert!(c0_3bi_drive_owner_batch(
+        assert!(c0_3bi_drive_owner_batch_before_crtc_result(
             &mut backend,
             device,
             completion,
