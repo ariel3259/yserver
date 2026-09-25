@@ -70405,11 +70405,16 @@ mod tests {
         );
         assert!(calls[1].0, "Legacy CRTC mutation relights the survivor");
         assert_eq!(calls[1].1, vec![backend.platform.outputs[0].key.clone()]);
+        let surviving_output = calls[1]
+            .1
+            .first()
+            .cloned()
+            .expect("the scenario asserts one surviving installed output");
 
         c0_3bi_assert_end_state(
             &backend,
             "c0_3bi_legacy_path_unchanged",
-            &c0_3bi_expected_end_state([OutputKey::new(backend.platform.devices[0].key, "test")]),
+            &c0_3bi_expected_end_state([surviving_output]),
         );
     }
 
@@ -85128,10 +85133,50 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_3bi_index_shift_keeps_other_outputs_vulkan() {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
         let mut fixture = owner_live_fixture_with_three_outputs()
             .expect("environmental skip: no live Vulkan ICD available");
         let backend = &mut fixture.backend;
+        let device = backend.platform.outputs[0].key.device_key;
+        // The default fixture stub accepts clock probes but never answers
+        // atomic calls. This scenario needs the first composed owner commit
+        // to reach its completion milestone so its OwnerBuffer proof can be
+        // discharged below. The scripted reply uses placeholder /dev/null
+        // fence fds; detach fence polling because this test supplies the
+        // fixture's HardwareComplete event directly through the core driver.
+        backend.platform.owner_completion_detached = true;
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 7, fds: 3 }),
+        );
         c0_3bi_compose_and_drain(backend);
+        let owner_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("first composed owner commit remains live")
+            .commit_id();
+        c0_3bi_core_driver_until(
+            backend,
+            "accept first composed owner commit",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .is_some_and(|record| {
+                        record.commit_id() == owner_commit && record.milestones().accepted
+                    })
+            },
+            None,
+        )
+        .expect("scripted executor accepts owner commit 1 through the core driver");
+        c0_3aii_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            owner_commit,
+            "complete first composed owner commit before output removal",
+        );
 
         let removed_instance = backend
             .scene
@@ -85159,11 +85204,20 @@ mod tests {
         let kept_prepared = backend.scene.owner_prepared_for_tests(2);
         let kept_pending_acks = backend.scene.pending_ack_count_for_tests(2);
         assert!(
-            kept_prepared.is_some(),
-            "third output has an owner generation"
+            kept_owner_states
+                .contains(&crate::kms::render::owner_buffer::OwnerBufferState::Current),
+            "third output has a completed current owner generation: states={kept_owner_states:?}, count={kept_owner_count}, prepared={kept_prepared:?}"
         );
 
+        // Production disable promotion removes the CRTC's current resource
+        // lease before moving its scene and pool into the retired bundle.
+        backend.commit_consumer.retire_current_for_crtc(
+            crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[1]),
+        );
         c0_3bi_remove_output_for_promotion(backend, 1);
+        backend
+            .scene
+            .retire_current_owner_buffer_in_bundle(removed_instance);
 
         assert_eq!(backend.platform.outputs[1].key, kept_key);
         assert_eq!(
@@ -85186,7 +85240,6 @@ mod tests {
             kept_pending_acks
         );
         assert_eq!(backend.scene.retired_output_count_for_tests(), 1);
-        let device = backend.platform.outputs[0].key.device_key;
         c0_3bi_core_driver_iteration(
             backend,
             "service index-shift retirement while KMS proof is withheld",
@@ -85201,7 +85254,10 @@ mod tests {
                 ],
                 retained_bundles: vec![C0ExpectedRetiredBundle {
                     instance: removed_instance,
-                    proofs: vec![C0RetiredProofKind::KmsRelease],
+                    proofs: vec![
+                        C0RetiredProofKind::KmsRelease,
+                        C0RetiredProofKind::OwnerBuffer,
+                    ],
                 }],
                 ..C0EndStateExpectation::default()
             },
@@ -85735,23 +85791,110 @@ mod tests {
         commit
     }
 
+    fn c0_3bi_prepare_owner_unflip_reply(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
+        use crate::kms::executor::test_support::{ScriptedReply, StubBehaviour};
+
+        let fence_count = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .count();
+        assert!(fence_count > 0 && fence_count < 32);
+        let fence_mask = (1u32 << u32::try_from(fence_count).expect("fence count fits")) - 1;
+
+        // This /dev/null fixture does not execute a DRM atomic commit. Give
+        // the unflip a real executor reply so KmsIoExecutor releases its
+        // in-flight request just as the helper's Accepted reply does in the
+        // production path. The returned /dev/null fences cannot be polled as
+        // real fences, so the retirement helper supplies HardwareComplete.
+        backend.platform.owner_completion_detached = true;
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::Scripted(ScriptedReply::Accepted {
+                mask: fence_mask,
+                fds: fence_count,
+            }),
+        );
+    }
+
     fn c0_3bi_retire_owner_unflip(
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
         commit: crate::kms::owner::identity::CommitId,
         next_executor: Option<crate::kms::executor::test_support::StubBehaviour>,
     ) {
-        c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
-        let completion = backend.complete_owner_for_tests(0);
+        let accepted = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .is_some_and(|record| record.commit_id() == commit && record.milestones().accepted);
+        if !accepted {
+            // Other scenarios use a synthetic Owner reply and do not inspect
+            // the executor slot after retirement. The regression scenario
+            // below instead routes the reply through KmsIoExecutor.
+            c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
+        }
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .filter(|record| record.commit_id() == commit && record.milestones().accepted)
+            .expect("accepted Owner unflip remains live until hardware completion");
+        assert!(record.closure().kernel_event().is_empty());
+        assert!(record.closure().present_event().is_empty());
         if let Some(behaviour) = next_executor {
             c0_3aii_replace_owner_executor(backend, behaviour);
         }
-        assert!(c0_3bi_drive_owner_batch(
+        // The composed unflip has an OUT_FENCE_PTR but deliberately no DRM
+        // PageFlip/Present event. Supply the fence's HardwareComplete outcome
+        // through the core driver; CompletionRetired then frees the owner
+        // record and device slot.
+        c0_3aii_complete_owner_commit_through_core_driver(
             backend,
             device,
-            completion,
-            "retire Owner unflip"
-        ));
+            commit,
+            "retire Owner unflip",
+        );
+    }
+
+    fn c0_3bi_page_flip_owner_commit_through_core_driver(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        commit: crate::kms::owner::identity::CommitId,
+        crtc_id: u32,
+        label: &str,
+    ) {
+        let (incarnation, event, kernel_event, present_event) = {
+            let owner = backend.platform.owner_ref(device).expect("Owner");
+            let record = owner
+                .live_record()
+                .filter(|record| record.commit_id() == commit)
+                .expect("page-flip commit remains live until Presented");
+            (
+                owner.incarnation(),
+                crate::drm::event_stream::DrmEventRecord::PageFlip {
+                    crtc_id,
+                    sequence: 1_001,
+                    tv_sec: 1,
+                    tv_usec: 1_000,
+                    user_data: record.event_token().as_user_data(),
+                },
+                record.closure().kernel_event().to_vec(),
+                record.closure().present_event().to_vec(),
+            )
+        };
+        // The /dev/null DRM fd in these fixtures cannot produce a kernel
+        // PageFlip event. Apply the synthetic event to Owner, then route its
+        // resulting milestone batch through the core-entry driver.
+        let events = backend
+            .platform
+            .owner_for(device)
+            .expect("Owner")
+            .apply_drm_event(incarnation, event, std::time::Instant::now());
+        assert!(
+            kernel_event.contains(&crtc_id) && present_event.contains(&crtc_id),
+            "the synthetic PageFlip must cover the direct Present CRTC"
+        );
+        assert!(c0_3bi_drive_owner_batch(backend, device, events, label));
     }
 
     fn c0_3bi_repaint_after_owner_unflip(backend: &mut super::KmsBackend, device: DrmDeviceKey) {
@@ -85808,6 +85951,7 @@ mod tests {
             .client_modeset_test_stats()
             .0
             .len();
+        c0_3bi_prepare_owner_unflip_reply(backend, device);
         let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
         let unflip = c0_3bi_owner_unflip_commit(backend, device);
         assert_eq!(
@@ -85827,7 +85971,27 @@ mod tests {
                 )
         );
 
-        c0_3bi_retire_owner_unflip(backend, device, unflip, None);
+        c0_3bi_core_driver_until(
+            backend,
+            "receive Owner unflip Accepted reply",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .is_some_and(|record| {
+                        record.commit_id() == unflip && record.milestones().accepted
+                    })
+            },
+            None,
+        )
+        .expect("the Owner unflip's executor reply releases its in-flight request");
+        c0_3bi_retire_owner_unflip(
+            backend,
+            device,
+            unflip,
+            Some(crate::kms::executor::test_support::StubBehaviour::NeverReply),
+        );
         assert_eq!(
             backend.lifecycle_drivers[&device]
                 .client_modeset_test_stats()
@@ -85866,6 +86030,7 @@ mod tests {
                 )
                 .expect("environmental skip: live Vulkan direct modeset fixture");
             let backend = &mut fixture.backend;
+            let direct_allocation = c0_3aii_current_direct_allocation(backend);
             let token = c0_3bi_begin_client_modeset(backend, output_id, &connector, Some(mode));
             let _unflip = c0_3bi_owner_unflip_commit(backend, device);
             let correlation = *backend
@@ -85941,10 +86106,15 @@ mod tests {
                 0,
                 "a failed unflip sends no client modeset commit"
             );
+            let mut expected =
+                c0_3bi_expected_end_state([OutputKey::new(device, connector.clone())]);
+            // The client-owned direct source pixmap remains allocated through
+            // either failed outcome; rejection also leaves it current.
+            expected.other_live_allocations.push(direct_allocation);
             c0_3bi_assert_end_state(
                 backend,
                 "c0_3bi_unflip_outcomes_reach_the_modeset_vulkan per unflip outcome",
-                &c0_3bi_expected_end_state([OutputKey::new(device, connector.clone())]),
+                &expected,
             );
         }
     }
@@ -86038,10 +86208,36 @@ mod tests {
         c0_3aii_replace_owner_executor(backend, StubBehaviour::NeverReply);
         c0_3bi_repaint_after_owner_unflip(backend, device);
         c0_3bi_assert_direct_reentry_probation(backend, &direct);
+        let direct_reentry_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct re-entry commit dispatched after probation")
+            .commit_id();
+        // Direct acceptance below uses placeholder /dev/null fences. The
+        // fixture supplies HardwareComplete and PageFlip through the driver.
+        backend.platform.owner_completion_detached = true;
+        c0_conv_cii_accept_direct_owner_commit(backend, device, direct_reentry_commit);
+        c0_3bi_page_flip_owner_commit_through_core_driver(
+            backend,
+            device,
+            direct_reentry_commit,
+            direct.candidate.crtc_id,
+            "present direct re-entry after TEST_ONLY rejection",
+        );
+        c0_3aii_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            direct_reentry_commit,
+            "complete direct re-entry after TEST_ONLY rejection",
+        );
+        let mut expected = c0_3bi_expected_end_state([OutputKey::new(device, connector.clone())]);
+        expected
+            .other_live_allocations
+            .push(c0_3aii_current_direct_allocation(backend));
         c0_3bi_assert_end_state(
             backend,
             "c0_3bi_direct_hold_released_on_every_end_vulkan after TEST_ONLY rejection",
-            &c0_3bi_expected_end_state([OutputKey::new(device, connector.clone())]),
+            &expected,
         );
 
         let (mut fixture, device, output_id, connector, mode, direct) =
@@ -86067,6 +86263,37 @@ mod tests {
         c0_3bi_repaint_after_owner_unflip(backend, device);
         c0_3aii_replace_owner_executor(backend, StubBehaviour::NeverReply);
         c0_3bi_assert_direct_reentry_probation(backend, &direct);
+        let direct_reentry_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("direct re-entry commit dispatched after DPMS supersession")
+            .commit_id();
+        // Direct acceptance below uses placeholder /dev/null fences. The
+        // fixture supplies HardwareComplete and PageFlip through the driver.
+        backend.platform.owner_completion_detached = true;
+        c0_conv_cii_accept_direct_owner_commit(backend, device, direct_reentry_commit);
+        c0_3bi_page_flip_owner_commit_through_core_driver(
+            backend,
+            device,
+            direct_reentry_commit,
+            direct.candidate.crtc_id,
+            "present direct re-entry after DPMS supersession",
+        );
+        c0_3aii_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            direct_reentry_commit,
+            "complete direct re-entry after DPMS supersession",
+        );
+        let mut expected = c0_3bi_expected_end_state([OutputKey::new(device, connector)]);
+        expected
+            .other_live_allocations
+            .push(c0_3aii_current_direct_allocation(backend));
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3bi_direct_hold_released_on_every_end_vulkan after DPMS supersession",
+            &expected,
+        );
     }
 
     #[test]

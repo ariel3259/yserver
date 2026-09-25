@@ -3261,10 +3261,6 @@ impl KmsBackend {
         }) {
             pending.sent = true;
         }
-        #[cfg(test)]
-        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
-            driver.client_validation_sends.push(tag);
-        }
         let send_result = self
             .platform
             .devices
@@ -3276,7 +3272,15 @@ impl KmsBackend {
                 Some(owner.send_validation_on(executor))
             });
         match send_result {
-            Some(Ok(_events)) => AdmissionOutcome::NothingAdmissible,
+            Some(Ok(_events)) => {
+                // Only a validation the owner actually sent to the executor
+                // counts; a refusal (for example AlreadyInFlight) re-queues.
+                #[cfg(test)]
+                if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+                    driver.client_validation_sends.push(tag);
+                }
+                AdmissionOutcome::NothingAdmissible
+            }
             Some(Err(error @ DispatchError::Refused { .. })) => {
                 let cause = match error {
                     DispatchError::Refused { cause, .. } => cause,
