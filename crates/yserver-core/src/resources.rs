@@ -1450,6 +1450,14 @@ impl ResourceTable {
         self.windows.get_mut(&id.0)
     }
 
+    pub fn windows_iter(&self) -> impl Iterator<Item = &Window> {
+        self.windows.values()
+    }
+
+    pub fn pixmaps_iter(&self) -> impl Iterator<Item = &Pixmap> {
+        self.pixmaps.values()
+    }
+
     pub fn children(&self, parent: ResourceId) -> &[ResourceId] {
         self.windows
             .get(&parent.0)

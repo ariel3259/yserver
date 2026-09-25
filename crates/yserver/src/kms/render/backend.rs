@@ -1666,6 +1666,9 @@ pub struct KmsBackend {
     /// set and the GLX extension string advertises
     /// `GLX_EXT_texture_from_pixmap`.
     dmabuf_export_supported: bool,
+
+    /// Last `export holders` report, for change detection.
+    export_holders: crate::kms::render::export_holders::ExportHoldersReporter,
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.
@@ -5282,6 +5285,7 @@ impl KmsBackend {
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
+            export_holders: Default::default(),
         };
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
@@ -6231,6 +6235,7 @@ impl KmsBackend {
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
+            export_holders: Default::default(),
         };
         let live: Vec<_> = backend
             .platform
@@ -9300,6 +9305,78 @@ impl KmsBackend {
         }
     }
 
+    /// `export holders` rows: drawables in exportable memory or with an export entry, plus orphaned entries.
+    pub(crate) fn export_holder_rows(&self) -> Vec<crate::kms::render::export_holders::HolderRow> {
+        use crate::kms::{
+            render::export_holders::{ExportRow, HolderRow, StoreRow},
+            vk::mem_accounting::{self, MemCategory},
+        };
+        let export_row = |e: &ExportedBacking| ExportRow {
+            glx_refs: e.glx_refs,
+            dri3_fd: e.fd.is_some(),
+            lifetime_held: e.lifetime_ref_held,
+            lifetime_via_alias: e.lifetime_via_alias,
+        };
+        let mut pictures: HashMap<crate::kms::render::store::DrawableId, u32> = HashMap::new();
+        for id in self.picture_drawable_ids.values() {
+            *pictures.entry(*id).or_default() += 1;
+        }
+        let redirect_of: HashMap<u32, u32> = self
+            .core
+            .host_window_to_backing
+            .iter()
+            .map(|(&w, b)| (b.as_raw(), w))
+            .collect();
+        let mut rows = Vec::new();
+        for d in self.store.drawables() {
+            let entry = mem_accounting::entry_of(d.storage.memory);
+            let export = self.exported_dmabufs.get(&d.id);
+            let export_mem = matches!(
+                entry,
+                Some((_, MemCategory::RedirectExport | MemCategory::TfpExport))
+            );
+            if !export_mem && export.is_none() {
+                continue;
+            }
+            let attached = self.store.lookup(d.xid) == Some(d.id);
+            let handle = PixmapHandle::from_raw(d.xid);
+            rows.push(HolderRow {
+                host_xid: d.xid,
+                store: Some(StoreRow {
+                    drawable_id: d.id.as_u64(),
+                    category: entry.map(|(_, c)| c),
+                    width: d.storage.extent.width,
+                    height: d.storage.extent.height,
+                    bytes: entry.map_or(0, |(b, _)| b),
+                    refcount: d.refcount,
+                    pending_retire: self.store.is_pending_retire(d.id),
+                    xid_attached: attached,
+                    pictures: pictures.get(&d.id).copied().unwrap_or(0),
+                }),
+                alias_refcount: handle
+                    .filter(|_| attached)
+                    .and_then(|h| self.core.alias_registry.get(h))
+                    .map(|a| a.refcount),
+                export: export.map(export_row),
+                sync_dup: self.store.is_exported(d.id),
+                redirect_of: redirect_of.get(&d.xid).copied().filter(|_| attached),
+            });
+        }
+        for (id, e) in &self.exported_dmabufs {
+            if self.store.get(*id).is_none() {
+                rows.push(HolderRow {
+                    host_xid: e.backing.as_raw(),
+                    store: None,
+                    alias_refcount: None,
+                    export: Some(export_row(e)),
+                    sync_dup: self.store.is_exported(*id),
+                    redirect_of: None,
+                });
+            }
+        }
+        rows
+    }
+
     /// GLX-TFP (Task 3.4 callers): record that a GLXPixmap now references
     /// the export of `host_xid`. Creates the entry (+ lifetime ref) if
     /// this is the first arrival. Public so the GLX protocol surface can
@@ -10051,6 +10128,17 @@ impl KmsBackend {
     /// panicking on lookup.
     pub fn store_drawable_exists_for_tests(&self, host_xid: u32) -> bool {
         self.store.get_by_xid(host_xid).is_some()
+    }
+
+    /// The `export holders` report for the current state, without change detection.
+    #[doc(hidden)]
+    pub fn export_holders_report_for_tests(
+        &self,
+        core: &yserver_core::backend::export_holders::CoreHolders,
+    ) -> Vec<String> {
+        let mut r = crate::kms::render::export_holders::ExportHoldersReporter::default();
+        r.observe(self.export_holder_rows());
+        crate::kms::render::export_holders::format_report(r.rows(), core)
     }
 
     /// Phase A T7: simulate the pageflip-retire frame-boundary flush
@@ -18998,6 +19086,23 @@ impl Backend for KmsBackend {
         if let Err(e) = do_dump_scanout(self) {
             log::warn!("render dump_scanout: {e}");
         }
+    }
+
+    fn report_export_holders(
+        &mut self,
+        core: &dyn Fn() -> yserver_core::backend::export_holders::CoreHolders,
+    ) -> bool {
+        let rows = self.export_holder_rows();
+        if !self.export_holders.observe(rows) {
+            return false;
+        }
+        let core = core();
+        for line in
+            crate::kms::render::export_holders::format_report(self.export_holders.rows(), &core)
+        {
+            log::info!(target: crate::RESOURCE_TELEMETRY_TARGET, "{line}");
+        }
+        true
     }
 
     fn dump_drawables(&mut self) {

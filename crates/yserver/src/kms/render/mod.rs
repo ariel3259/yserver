@@ -12,6 +12,7 @@ pub(crate) mod composite_pool_ring;
 pub(crate) mod cursor;
 pub(crate) mod descriptor_pool_ring;
 pub(crate) mod engine;
+pub(crate) mod export_holders;
 pub(crate) mod frame_builder;
 pub(crate) mod glyph_atlas;
 pub(crate) mod glyph_pixels;

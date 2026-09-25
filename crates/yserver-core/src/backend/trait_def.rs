@@ -859,6 +859,14 @@ pub trait Backend {
     /// `RecordingBackend`).
     fn dump_drawables(&mut self) {}
 
+    /// Diagnostic: log exported backings joined with `core()`'s holders if they changed; returns whether they did.
+    fn report_export_holders(
+        &mut self,
+        _core: &dyn Fn() -> crate::backend::export_holders::CoreHolders,
+    ) -> bool {
+        false
+    }
+
     /// Notify the backend that a window property changed or was
     /// deleted. KMS uses this to re-evaluate EWMH stack hints
     /// (`_NET_WM_WINDOW_TYPE`, `_NET_WM_STATE`, `WM_TRANSIENT_FOR`).

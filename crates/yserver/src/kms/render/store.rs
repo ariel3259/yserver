@@ -984,6 +984,16 @@ impl DrawableStore {
         self.by_xid.iter().map(|(&xid, &id)| (xid, id))
     }
 
+    /// Diagnostic-only: every live drawable, including ones detached from their xid.
+    pub(crate) fn drawables(&self) -> impl Iterator<Item = &Drawable> + '_ {
+        self.entries.values()
+    }
+
+    /// Diagnostic-only: whether `id` is parked waiting for its fence.
+    pub(crate) fn is_pending_retire(&self, id: DrawableId) -> bool {
+        self.pending_retire.contains(&id)
+    }
+
     /// Shutdown-only: destroy every remaining drawable's Vk
     /// storage. The runtime release path (`destroy_now`) walks
     /// from `decref` → `poll_pending_retire`, so any drawable

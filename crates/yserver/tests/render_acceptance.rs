@@ -15710,3 +15710,110 @@ fn a_redirect_backing_is_released_when_its_app_or_compositor_disconnects() {
         }
     }
 }
+
+/// The export-holders report shows a named GLX-bound redirect backing until it is released.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn export_holders_report_tracks_a_named_glx_backing_until_release() {
+    use yserver_core::backend::export_holders::collect_core_holders;
+    const APP: u32 = 2;
+    const WIN: u32 = 0x007a_0001;
+    const PIX: u32 = 0x007a_0002;
+    const GLXPIX: u32 = 0x007a_0003;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let _app_peer = f.add_client(APP);
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let mut cw = Vec::new();
+    cw.extend_from_slice(&WIN.to_le_bytes());
+    cw.extend_from_slice(&root.to_le_bytes());
+    cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+    cw.extend_from_slice(&100u16.to_le_bytes());
+    cw.extend_from_slice(&50u16.to_le_bytes());
+    cw.extend_from_slice(&0u16.to_le_bytes()); // border
+    cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+    cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+    cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+    f.req_as(APP, 1, 24, &cw);
+    let mut redirect = root.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    f.req(144, 2, &redirect);
+    f.req_as(APP, 8, 0, &WIN.to_le_bytes()); // MapWindow
+    let mut name = WIN.to_le_bytes().to_vec();
+    name.extend_from_slice(&PIX.to_le_bytes());
+    f.req(144, 6, &name); // NameWindowPixmap
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u32.to_le_bytes()); // screen
+    body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+    body.extend_from_slice(&PIX.to_le_bytes());
+    body.extend_from_slice(&GLXPIX.to_le_bytes());
+    f.req(148, yserver_protocol::x11::glx::CREATE_PIXMAP, &body);
+    let backing = f
+        .state
+        .resources
+        .pixmap(yserver_protocol::x11::ResourceId(PIX))
+        .and_then(|p| p.host_xid)
+        .map(|h| h.as_raw())
+        .expect("named pixmap");
+    let report = f
+        .backend
+        .export_holders_report_for_tests(&collect_core_holders(&f.state));
+    eprintln!("{}", report.join("\n"));
+    let line = report
+        .iter()
+        .find(|l| l.starts_with(&format!("  0x{backing:x} ")))
+        .unwrap_or_else(|| panic!("backing 0x{backing:x} missing from {report:#?}"));
+    // Redirect hold + named alias + the GLX export's lifetime ref.
+    assert!(line.contains(" alias_rc=3 "), "{line}");
+    assert!(
+        line.contains(" export=[glx_refs=1 dri3_fd=n lifetime=alias] sync_dup=n "),
+        "{line}"
+    );
+    assert!(line.contains(" xid=attached "), "{line}");
+    assert!(line.contains(" redirect_of=0x"), "{line}");
+    assert!(
+        line.contains(&format!(
+            "c1:named 0x{PIX:x}(win 0x{WIN:x}) c1:glxpixmap 0x{GLXPIX:x}(of 0x{PIX:x}) \
+             c2:redirect-of win 0x{WIN:x}]"
+        )),
+        "{line}"
+    );
+    assert!(
+        f.backend
+            .report_export_holders(&|| collect_core_holders(&f.state))
+    );
+    assert!(
+        !f.backend
+            .report_export_holders(&|| collect_core_holders(&f.state))
+    );
+
+    f.req(
+        148,
+        yserver_protocol::x11::glx::DESTROY_PIXMAP,
+        &GLXPIX.to_le_bytes(),
+    );
+    f.req(54, 0, &PIX.to_le_bytes()); // FreePixmap
+    f.req_as(APP, 4, 0, &WIN.to_le_bytes()); // DestroyWindow
+    for _ in 0..200 {
+        f.backend.for_tests_poll_retired();
+        if !f.backend.store_drawable_exists_for_tests(backing) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let report = f
+        .backend
+        .export_holders_report_for_tests(&collect_core_holders(&f.state));
+    assert!(
+        !report
+            .iter()
+            .any(|l| l.starts_with(&format!("  0x{backing:x} "))),
+        "{report:#?}"
+    );
+    assert!(
+        f.backend
+            .report_export_holders(&|| collect_core_holders(&f.state))
+    );
+}
