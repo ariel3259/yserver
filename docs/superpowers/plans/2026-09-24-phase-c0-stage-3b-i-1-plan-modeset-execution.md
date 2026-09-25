@@ -531,3 +531,35 @@ instance IDs.
 | --- | --- | --- |
 | `c0_3bi_a2_retired_front_on_screen_is_released_vulkan` | a completed composed frame reaches `OnScreen` through the production compose and page-flip path before a modeset; after its KMS proofs, the retired bundle is destroyed | **A2d** skip the retired `OnScreen` transition |
 | `c0_3bi_a2_fixture_instance_ids_match_rekeyed_outputs` | after a fixture retargets outputs to the real DRM key, every rebuilt instance ID uses its output's device key and the next ID stays in that domain | **A2e** keep the synthetic device key after fixture rekeying |
+
+## Addendum A3 — never-submitted composed work of a retired output is terminalized *(rev 11, found on hardware 2026-09-25)*
+
+**Evidence.** With Task H's faithful core-loop driver (the iteration tail
+composes every iteration, as production does), `c0_hw_3b_modeset_owner_on_card1_drm`
+fails at mode cycle 1: the retired bundle is never destroyed. A temporary dump
+on card1 showed its only outstanding item: `owner_buffers=[(generation 7, BO 1,
+Desired)]`, BO 1 in phase `Owner`, the composition ring not idle. The scene had
+composed a frame for the old output instance that was never dispatched before
+the modeset promoted; once the output is retired that frame can never be
+offered or submitted, and nothing terminates it. The old hand-rolled loops
+composed only when the test asked, which hid it. Fixture findings with the same
+shape: `c0_3bi_dark_crtc_displacement`, `c0_3bi_unproven_off_issues_no_dark_proof`,
+`c0_3bi_index_shift_keeps_other_outputs` (its `Desired` buffer),
+`c0_3bi_rejection_cancels_the_displacement`.
+
+**Deliver:** at promotion (and on every path that moves an output instance into
+a retired bundle), the instance's composed work that has not been dispatched —
+owner buffers in `Desired` or `Prepared` (or any pre-submit state), their
+admission offers or queued composed intents for that CRTC and instance, and
+their descriptor slots — is terminalized as never-submitted: the offer or
+intent is withdrawn exactly once, the render's GPU fence is awaited (as a
+proof the bundle waits for, never a blocking wait), then the BO returns to
+`Free` and the slot to the ring, so the bundle drains and is destroyed. Work
+already dispatched keeps its current rules (KMS proof, then release). Nothing
+is released before its GPU fence.
+
+| Test | Scenario | Must fail under |
+| --- | --- | --- |
+| `c0_3bi_a3_desired_frame_of_a_retired_output_is_released_vulkan` | with the full driver, a mode change while the old output has a composed frame prepared but not dispatched: after the modeset's proofs and the frame's GPU fence the bundle is destroyed, its BOs Free, its allocations gone, and no offer for the old instance remains in admission | **A3a** leave a Desired buffer in the bundle |
+| `c0_3bi_a3_desired_frame_waits_for_its_render_fence_vulkan` | the same with the frame's render fence withheld: the bundle stays until the fence signals, then drains | **A3b** release the BO before its GPU fence |
+
