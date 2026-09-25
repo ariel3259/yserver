@@ -611,6 +611,17 @@ pub(crate) struct RetiredOutputBundle {
     pool: OutputScanout,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct RetiredOutputEndStateForTests {
+    pub(crate) key: OutputKey,
+    pub(crate) instance: OutputInstanceId,
+    pub(crate) allocation_keys: Vec<AllocationKey>,
+    pub(crate) phases: Vec<BoPhase>,
+    pub(crate) owner_buffers: Vec<(usize, OwnerBufferState)>,
+    pub(crate) gpu_fence_proofs: usize,
+}
+
 pub(crate) struct StagedOutputSceneState {
     scene: OutputSceneState,
 }
@@ -3192,6 +3203,169 @@ impl SceneCompositor {
         self.inner.as_ref().map_or(0, |inner| {
             inner.retired_outputs.values().map(Vec::len).sum()
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_output_end_states_for_tests(&self) -> Vec<RetiredOutputEndStateForTests> {
+        self.inner
+            .as_ref()
+            .into_iter()
+            .flat_map(|inner| inner.retired_outputs.values().flatten())
+            .map(|bundle| RetiredOutputEndStateForTests {
+                key: bundle.key.clone(),
+                instance: bundle.instance,
+                allocation_keys: bundle
+                    .pool
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .filter_map(|bo| bo.managed_key())
+                    .chain(bundle.pool.copied().into_iter().flat_map(|pool| {
+                        pool.sources
+                            .iter()
+                            .filter_map(|source| source.managed_key())
+                    }))
+                    .collect(),
+                phases: bundle
+                    .pool
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .map(|bo| bo.state.phase)
+                    .collect(),
+                owner_buffers: bundle
+                    .scene
+                    .owner_buffers
+                    .iter()
+                    .map(|buffer| (buffer.identity().bo_idx, buffer.state()))
+                    .collect(),
+                gpu_fence_proofs: bundle
+                    .scene
+                    .pending_acks
+                    .iter()
+                    .filter(|ack| ack.ticket.is_some())
+                    .count()
+                    + bundle.scene.pending_pool_releases.len()
+                    + bundle.scene.failed_submit_bos.len(),
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_buffer_identities_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Vec<OwnerBufferIdentity> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map(|state| {
+                state
+                    .owner_buffers
+                    .iter()
+                    .map(|buffer| buffer.identity().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bo_has_pending_proof_for_tests(
+        &self,
+        instance: OutputInstanceId,
+        bo_idx: usize,
+    ) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        let scene = inner
+            .outputs
+            .iter()
+            .find(|state| state.output_instance_id == instance)
+            .or_else(|| {
+                inner
+                    .retired_outputs
+                    .get(&instance.device_key)
+                    .into_iter()
+                    .flatten()
+                    .find(|bundle| bundle.instance == instance)
+                    .map(|bundle| &bundle.scene)
+            });
+        scene.is_some_and(|scene| {
+            scene.pending_acks.iter().any(|ack| ack.bo_idx == bo_idx)
+                || scene
+                    .failed_submit_bos
+                    .iter()
+                    .any(|failed| failed.bo_idx == bo_idx)
+                || !scene.pending_pool_releases.is_empty()
+                || scene
+                    .owner_buffers
+                    .iter()
+                    .any(|buffer| buffer.identity().bo_idx == bo_idx)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_pending_ack_for_tests(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(state) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+        else {
+            return false;
+        };
+        let Some(slot) = state.pool_ring.acquire() else {
+            return false;
+        };
+        state.pool_slots.push_back(slot);
+        state.pending_acks.push_back(PendingAck {
+            bo_idx,
+            generation: 1,
+            stage: InFlightStage::KmsFlipPending,
+            drawable_snapshots: Vec::new(),
+            ticket: Some(FenceTicket::for_tests_stub()),
+            submitted_output_damage: RegionSet::new(),
+            stage_complete: true,
+            stage_repaint: Region::new(),
+            stage_painted: Region::new(),
+            submitted_participants: Vec::new(),
+            submitted_scene_structure_damage: RegionSet::new(),
+            submitted_failed_repaint: RegionSet::new(),
+            cursor_transition: None,
+            cursor_prev_pos_after_retire: None,
+            cursor_mode_after_retire: OutputCursorMode::Hidden,
+            last_present_cursor_rect_after_retire: None,
+            last_present_cursor_version_after_retire: None,
+            managed_batch: None,
+            copied_receipt: None,
+        });
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_retired_output_bo_phase_for_tests(
+        &mut self,
+        instance: OutputInstanceId,
+        bo_idx: usize,
+        phase: BoPhase,
+    ) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        let Some(bundle) = inner
+            .retired_outputs
+            .get_mut(&instance.device_key)
+            .into_iter()
+            .flatten()
+            .find(|bundle| bundle.instance == instance)
+        else {
+            return false;
+        };
+        let Some(bo) = bundle.pool.display_pool_mut().bos.get_mut(bo_idx) else {
+            return false;
+        };
+        bo.state.phase = phase;
+        true
     }
 
     #[cfg(test)]

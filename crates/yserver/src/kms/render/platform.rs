@@ -2776,6 +2776,11 @@ pub struct PlatformBackend {
     scanout_render_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
     #[cfg(test)]
+    pub(crate) ready_scanout_render_completions_for_tests:
+        std::collections::VecDeque<ReadyScanoutRenderCompletion>,
+    #[cfg(test)]
+    held_scanout_render_completions_for_tests: HashSet<u64>,
+    #[cfg(test)]
     pub(crate) dpms_output_calls_for_tests: Option<Vec<(bool, Vec<OutputKey>)>>,
     /// Records synchronous connector modesets without issuing a DRM commit.
     /// Used by differential tests that exercise the production Legacy path.
@@ -2784,6 +2789,11 @@ pub struct PlatformBackend {
     next_scanout_render_job_id: u64,
     pub owner_completion_poller: crate::kms::render::completion_poller::CompletionPoller,
     pub owner_completion_detached: bool,
+    #[cfg(test)]
+    owner_host_call_observations_for_tests: Vec<(
+        crate::platform::drm::DrmDeviceKey,
+        crate::kms::executor::HostCallObservation,
+    )>,
 
     // Vulkan side. `Option` only to support test fixtures that
     // skip Vk init (`for_tests`). Production `open_with_commit`
@@ -3594,12 +3604,18 @@ impl PlatformBackend {
             scanout_render_completion_epfd,
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             #[cfg(test)]
+            ready_scanout_render_completions_for_tests: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            held_scanout_render_completions_for_tests: HashSet::new(),
+            #[cfg(test)]
             dpms_output_calls_for_tests: None,
             #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
             owner_completion_detached: false,
+            #[cfg(test)]
+            owner_host_call_observations_for_tests: Vec::new(),
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
@@ -3743,12 +3759,18 @@ impl PlatformBackend {
             scanout_render_completion_epfd,
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             #[cfg(test)]
+            ready_scanout_render_completions_for_tests: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            held_scanout_render_completions_for_tests: HashSet::new(),
+            #[cfg(test)]
             dpms_output_calls_for_tests: None,
             #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
             owner_completion_detached: false,
+            #[cfg(test)]
+            owner_host_call_observations_for_tests: Vec::new(),
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
@@ -5111,6 +5133,8 @@ impl PlatformBackend {
         crate::platform::drm::DrmDeviceKey,
         Vec<crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>>,
     )> {
+        #[cfg(test)]
+        let host_call_observations = &mut self.owner_host_call_observations_for_tests;
         let mut batches = Vec::new();
         let Self {
             devices,
@@ -5132,6 +5156,11 @@ impl PlatformBackend {
                     events.extend(owner.apply_host_call_event_at(tick_ev, now));
                 }
                 while let Some(reply_ev) = executor.poll_reply() {
+                    #[cfg(test)]
+                    host_call_observations.push((
+                        key,
+                        crate::kms::executor::HostCallObservation::of(&reply_ev),
+                    ));
                     events.extend(owner.apply_host_call_event_at(reply_ev, now));
                 }
             }
@@ -5165,6 +5194,16 @@ impl PlatformBackend {
             }
         }
         batches
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_owner_host_call_observations_for_tests(
+        &mut self,
+    ) -> Vec<(
+        crate::platform::drm::DrmDeviceKey,
+        crate::kms::executor::HostCallObservation,
+    )> {
+        std::mem::take(&mut self.owner_host_call_observations_for_tests)
     }
 
     #[doc(hidden)]
@@ -5465,9 +5504,23 @@ impl PlatformBackend {
     pub(crate) fn drain_scanout_render_completions(&mut self) -> Vec<ReadyScanoutRenderCompletion> {
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
+        #[cfg(test)]
+        let mut ready: Vec<ReadyScanoutRenderCompletion> =
+            std::mem::take(&mut self.ready_scanout_render_completions_for_tests)
+                .into_iter()
+                .collect();
+        #[cfg(not(test))]
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.pending_scanout_render_completions.len() {
+            #[cfg(test)]
+            if self
+                .held_scanout_render_completions_for_tests
+                .contains(&self.pending_scanout_render_completions[index].job_id)
+            {
+                index += 1;
+                continue;
+            }
             let is_ready = {
                 let pending = &self.pending_scanout_render_completions[index];
                 if let Some(fd) = pending.fd.as_ref() {
@@ -5502,6 +5555,9 @@ impl PlatformBackend {
                 .pending_scanout_render_completions
                 .remove(index)
                 .expect("scanout completion index was checked");
+            #[cfg(test)]
+            self.held_scanout_render_completions_for_tests
+                .remove(&pending.job_id);
             if let Some(fd) = pending.fd.as_ref()
                 && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
             {
@@ -5519,6 +5575,71 @@ impl PlatformBackend {
         ready
     }
 
+    #[cfg(test)]
+    pub(crate) fn queue_ready_scanout_render_completion_for_tests(
+        &mut self,
+        completion: ReadyScanoutRenderCompletion,
+    ) {
+        self.ready_scanout_render_completions_for_tests
+            .push_back(completion);
+    }
+
+    /// Withhold one renderer sync-file notification while the test advances
+    /// unrelated core-loop work. Re-registering on release preserves the
+    /// real fence readiness edge, including one that arrived during the hold.
+    #[cfg(test)]
+    pub(crate) fn hold_scanout_render_completion_for_tests(
+        &mut self,
+        output_instance_id: OutputInstanceId,
+        stage: ScanoutRenderCompletionStage,
+    ) -> io::Result<u64> {
+        let pending = self
+            .pending_scanout_render_completions
+            .iter()
+            .find(|pending| {
+                pending.output_instance_id == output_instance_id && pending.stage == stage
+            })
+            .ok_or_else(|| io::Error::other("scanout completion to hold was not pending"))?;
+        let job_id = pending.job_id;
+        if !self
+            .held_scanout_render_completions_for_tests
+            .insert(job_id)
+        {
+            return Err(io::Error::other("scanout completion is already held"));
+        }
+        if let Some(fd) = pending.fd.as_ref()
+            && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+        {
+            self.held_scanout_render_completions_for_tests
+                .remove(&job_id);
+            return Err(error);
+        }
+        Ok(job_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_scanout_render_completion_for_tests(
+        &mut self,
+        job_id: u64,
+    ) -> io::Result<()> {
+        if !self
+            .held_scanout_render_completions_for_tests
+            .remove(&job_id)
+        {
+            return Err(io::Error::other("scanout completion was not held"));
+        }
+        let pending = self
+            .pending_scanout_render_completions
+            .iter()
+            .find(|pending| pending.job_id == job_id)
+            .ok_or_else(|| io::Error::other("held scanout completion disappeared"))?;
+        if let Some(fd) = pending.fd.as_ref() {
+            self.scanout_render_completion_epfd
+                .register(fd.as_fd(), job_id)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn cancel_scanout_render_completions_for_output(&mut self, output_key: &OutputKey) {
         let mut index = 0;
         while index < self.pending_scanout_render_completions.len() {
@@ -5530,6 +5651,9 @@ impl PlatformBackend {
                 .pending_scanout_render_completions
                 .remove(index)
                 .expect("scanout completion index was checked");
+            #[cfg(test)]
+            self.held_scanout_render_completions_for_tests
+                .remove(&pending.job_id);
             if let Some(fd) = pending.fd.as_ref()
                 && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
             {
@@ -5556,6 +5680,9 @@ impl PlatformBackend {
                 .pending_scanout_render_completions
                 .remove(index)
                 .expect("scanout completion index was checked");
+            #[cfg(test)]
+            self.held_scanout_render_completions_for_tests
+                .remove(&pending.job_id);
             if let Some(fd) = pending.fd.as_ref()
                 && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
             {
@@ -5566,6 +5693,9 @@ impl PlatformBackend {
 
     pub(crate) fn clear_scanout_render_completions(&mut self) {
         while let Some(pending) = self.pending_scanout_render_completions.pop_front() {
+            #[cfg(test)]
+            self.held_scanout_render_completions_for_tests
+                .remove(&pending.job_id);
             if let Some(fd) = pending.fd.as_ref()
                 && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
             {
