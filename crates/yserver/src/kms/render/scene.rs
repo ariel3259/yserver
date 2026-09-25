@@ -1230,6 +1230,7 @@ pub(crate) struct ComposedOffer {
     pub(crate) device: crate::platform::drm::DrmDeviceKey,
     pub(crate) crtc: u32,
     pub(crate) generation: u64,
+    pub(crate) output_instance_id: OutputInstanceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3546,6 +3547,24 @@ impl SceneCompositor {
     }
 
     #[cfg(test)]
+    pub(crate) fn owner_state_for_generation_for_tests(
+        &self,
+        output_idx: usize,
+        generation: u64,
+    ) -> Option<OwnerBufferState> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .and_then(|state| {
+                state
+                    .owner_buffers
+                    .iter()
+                    .find(|buffer| buffer.identity().generation == generation)
+            })
+            .map(OwnerBuffer::state)
+    }
+
+    #[cfg(test)]
     pub(crate) fn owner_displaced_len_for_tests(&self, output_idx: usize) -> usize {
         self.inner
             .as_ref()
@@ -5192,6 +5211,7 @@ fn handle_scanout_render_completion_inner(
             device: output_key.device_key,
             crtc: u32::from(platform.outputs[output_idx].output.crtc),
             generation,
+            output_instance_id: state.output_instance_id,
         });
         // `fd` is intentionally dropped here. Owner carries no producer fd
         // through an ioctl; the drain owns and closes the notification.
@@ -5327,6 +5347,7 @@ fn handle_scanout_render_completion_inner(
                 device: output_key.device_key,
                 crtc: u32::from(platform.outputs[output_idx].output.crtc),
                 generation,
+                output_instance_id: state.output_instance_id,
             });
             #[cfg(test)]
             println!(

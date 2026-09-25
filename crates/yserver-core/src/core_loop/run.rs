@@ -2582,6 +2582,17 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
     arm_present_idle_vblanks(state, backend);
 }
 
+/// Invoke the production loop-body tail from an external test harness.
+///
+/// The core loop calls [`run_iteration_tail`] after readiness handling and
+/// request processing. KMS integration tests use this entry to keep their
+/// bounded driver on the same tail path without exposing the core loop's
+/// private request queues.
+#[doc(hidden)]
+pub fn run_iteration_tail_for_tests(state: &mut ServerState, backend: &mut dyn Backend) {
+    run_iteration_tail(state, backend);
+}
+
 /// Idle vblank arming for parked Present work — MUST run after
 /// `maybe_composite`, not folded back into the pre-compose drain. KMS's
 /// completion arm hard-gates on `present_completion_is_idle()`

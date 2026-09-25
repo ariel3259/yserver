@@ -629,6 +629,16 @@ impl LifecycleDriver {
     }
 
     #[cfg(test)]
+    pub(crate) fn client_modeset_commit_for_tests(
+        &self,
+        tag: ClientModesetTag<IncarnationId>,
+    ) -> Option<CommitId> {
+        self.client_modeset_commits
+            .iter()
+            .find_map(|(commit, tracked_tag)| (*tracked_tag == tag).then_some(*commit))
+    }
+
+    #[cfg(test)]
     pub(crate) fn kms_displacements_for_tests(
         &self,
         commit: CommitId,
