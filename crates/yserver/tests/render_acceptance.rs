@@ -15583,3 +15583,130 @@ fn a_resized_tfp_backing_is_freed_once_the_compositor_lets_go() {
         }
     }
 }
+
+/// Who ends a redirected toplevel's life, and how.
+#[derive(Clone, Copy, Debug)]
+enum RedirectTeardown {
+    AppDestroyWindow,
+    AppDisconnect,
+    CompositorDisconnect,
+    CompositorThenAppDisconnect,
+}
+
+/// picom's RedirectSubwindows(root, Manual) over an app toplevel with a child; client 1 is the
+/// compositor, client 2 the app. Every teardown must release the toplevel's redirect backing.
+fn redirect_teardown_scenario(named: bool, teardown: RedirectTeardown) -> bool {
+    use yserver_protocol::x11::{ClientId, ResourceId};
+    const COMP: u32 = 1;
+    const APP: u32 = 2;
+    const WIN: u32 = 0x0079_0001;
+    const CHILD: u32 = 0x0079_0002;
+    const PIX: u32 = 0x0079_0003;
+    let what = format!("named={named} {teardown:?}");
+    let Some(mut f) = ProtoFixture::new() else {
+        return false;
+    };
+    let _app_peer = f.add_client(APP);
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let create = |f: &mut ProtoFixture, wid: u32, parent: u32, w: u16, h: u16| {
+        let mut cw = Vec::new();
+        cw.extend_from_slice(&wid.to_le_bytes());
+        cw.extend_from_slice(&parent.to_le_bytes());
+        cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+        cw.extend_from_slice(&w.to_le_bytes());
+        cw.extend_from_slice(&h.to_le_bytes());
+        cw.extend_from_slice(&0u16.to_le_bytes()); // border
+        cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+        cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+        cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+        f.req_as(APP, 1, 24, &cw);
+    };
+    let mut redirect = root.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    f.req_as(COMP, 144, 2, &redirect);
+    create(&mut f, WIN, root, 100, 50);
+    create(&mut f, CHILD, WIN, 20, 10);
+    f.req_as(APP, 8, 0, &CHILD.to_le_bytes()); // MapWindow
+    f.req_as(APP, 8, 0, &WIN.to_le_bytes());
+    let backing = f
+        .state
+        .resources
+        .window(ResourceId(WIN))
+        .and_then(|w| w.redirected_backing.as_ref())
+        .map(|b| b.host_pixmap.as_raw())
+        .expect("mapped redirected toplevel has a backing");
+    if named {
+        let mut name = WIN.to_le_bytes().to_vec();
+        name.extend_from_slice(&PIX.to_le_bytes());
+        f.req_as(COMP, 144, 6, &name); // NameWindowPixmap
+    }
+    let disconnect = |f: &mut ProtoFixture, client: u32| {
+        yserver_core::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(client),
+        );
+    };
+    let assert_held = |f: &ProtoFixture| {
+        assert!(
+            f.backend.store_drawable_exists_for_tests(backing),
+            "{what}: the named pixmap still holds the backing"
+        );
+    };
+    match teardown {
+        RedirectTeardown::AppDestroyWindow | RedirectTeardown::AppDisconnect => {
+            if matches!(teardown, RedirectTeardown::AppDestroyWindow) {
+                f.req_as(APP, 4, 0, &WIN.to_le_bytes()); // DestroyWindow
+            } else {
+                disconnect(&mut f, APP);
+            }
+            if named {
+                assert_held(&f);
+                f.req_as(COMP, 54, 0, &PIX.to_le_bytes()); // FreePixmap
+            }
+        }
+        RedirectTeardown::CompositorDisconnect | RedirectTeardown::CompositorThenAppDisconnect => {
+            disconnect(&mut f, COMP);
+            assert!(
+                f.state.composite_redirects.is_empty(),
+                "{what}: the compositor's redirect survived it"
+            );
+            let win = f.state.resources.window(ResourceId(WIN));
+            assert!(
+                win.is_some_and(|w| w.redirected_backing.is_none()),
+                "{what}: the app's window must survive, unredirected"
+            );
+            if matches!(teardown, RedirectTeardown::CompositorThenAppDisconnect) {
+                disconnect(&mut f, APP);
+            }
+        }
+    }
+    for _ in 0..200 {
+        f.backend.for_tests_poll_retired();
+        if !f.backend.store_drawable_exists_for_tests(backing) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_backings_released(&f, &[backing], &what);
+    true
+}
+
+/// A redirected toplevel's backing is released however its app or its compositor goes away.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_redirect_backing_is_released_when_its_app_or_compositor_disconnects() {
+    for named in [false, true] {
+        for teardown in [
+            RedirectTeardown::AppDestroyWindow,
+            RedirectTeardown::AppDisconnect,
+            RedirectTeardown::CompositorDisconnect,
+            RedirectTeardown::CompositorThenAppDisconnect,
+        ] {
+            if !redirect_teardown_scenario(named, teardown) {
+                eprintln!("skipping: no Vk");
+                return;
+            }
+        }
+    }
+}

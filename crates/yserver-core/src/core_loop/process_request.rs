@@ -1841,6 +1841,25 @@ pub(crate) fn free_pictures_on_destroyed_windows(
     }
 }
 
+/// Release each doomed window's redirect backing and drop every redirect record keyed on it,
+/// while the window records still exist (Xorg `compDestroyWindow`, `composite/compwindow.c:600`).
+/// Surviving `NameWindowPixmap` aliases keep the backing alive until their `FreePixmap`.
+pub(crate) fn release_redirects_on_destroyed_windows(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    windows: &[ResourceId],
+) {
+    for window in windows {
+        crate::core_loop::process_disconnect::unrealize_redirect_backing(
+            state, backend, origin, *window,
+        );
+    }
+    state
+        .composite_redirects
+        .retain(|(window, _), _| !windows.contains(window));
+}
+
 fn destroy_window_subtree(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -1889,37 +1908,7 @@ fn destroy_window_subtree(
     let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
     free_pictures_on_destroyed_windows(state, backend, origin, &order);
     purge_present_for_destroyed_windows(state, backend, &order);
-    // L2 plan B.15 — release the reason-1 hold on each destroyed
-    // window's redirected backing. Surviving `NameWindowPixmap`
-    // aliases keep the backing alive; their `client_pixmap`
-    // resources remain valid X protocol pixmaps until the client's
-    // `FreePixmap` (or the disconnect cleanup).
-    let redirect_backings: Vec<crate::backend::PixmapHandle> = order
-        .iter()
-        .filter_map(|w| {
-            state
-                .resources
-                .window(*w)
-                .and_then(|win| win.redirected_backing.as_ref().map(|b| b.host_pixmap))
-        })
-        .collect();
-    for backing in redirect_backings {
-        if let Err(err) = backend.release_redirected_backing(origin, backing) {
-            log::warn!(
-                "DestroyWindow: release_redirected_backing(0x{:x}) failed: {err}",
-                backing.as_raw()
-            );
-        }
-    }
-    // Drop any COMPOSITE redirect records still keyed against the
-    // destroyed windows. The actual backing teardown happened
-    // above; this just keeps `composite_redirects` clean so a
-    // future REDIRECT_WINDOW on a new XID with the same numeric
-    // value (after the X11 ID allocator wraps) doesn't see a
-    // stale entry.
-    state
-        .composite_redirects
-        .retain(|(window, _), _| !order.contains(window));
+    release_redirects_on_destroyed_windows(state, backend, origin, &order);
     // Audit #9 — selections owned by any destroyed window in this
     // subtree must fire `XFixesSelectionNotify(SelectionWindowDestroy)`
     // and clear ownership (Xorg `xfixes/select.c` registers a

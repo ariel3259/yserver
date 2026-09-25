@@ -262,6 +262,9 @@ pub fn process_disconnect_reporting(
         crate::core_loop::process_request::free_pictures_on_destroyed_windows(
             state, backend, None, &order,
         );
+        crate::core_loop::process_request::release_redirects_on_destroyed_windows(
+            state, backend, None, &order,
+        );
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }
@@ -740,6 +743,9 @@ pub fn destroy_zombie_resources_reporting(
         }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
         crate::core_loop::process_request::free_pictures_on_destroyed_windows(
+            state, backend, None, &order,
+        );
+        crate::core_loop::process_request::release_redirects_on_destroyed_windows(
             state, backend, None, &order,
         );
         let _ = state.resources.destroy_window(root);
@@ -1605,6 +1611,66 @@ mod tests {
         assert!(
             release_idx < restore_idx,
             "release must precede participation restore; calls={calls:#?}",
+        );
+    }
+
+    #[test]
+    fn disconnect_of_a_redirected_windows_owner_releases_its_backing() {
+        // The app exits without DestroyWindow under the compositor's RedirectSubwindows(root).
+        let mut state = ServerState::new();
+        let compositor = 9;
+        let app = 10;
+        install_client(&mut state, compositor);
+        install_client(&mut state, app);
+        let window_id = ResourceId(0x00a0_0001);
+        let backing_xid: u32 = 0xBA51_0001;
+        state.resources.create_window(
+            ClientId(app),
+            CreateWindowRequest {
+                depth: 24,
+                window: window_id,
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(window_id);
+        state
+            .resources
+            .window_mut(window_id)
+            .unwrap()
+            .redirected_backing = Some(crate::resources::RedirectedBacking {
+            host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(backing_xid),
+            width: 100,
+            height: 100,
+            depth: 24,
+        });
+        let record = RedirectRecord {
+            mode: CompositeRedirectMode::Manual,
+            owner: ClientId(compositor),
+        };
+        state
+            .composite_redirects
+            .insert((ROOT_WINDOW, true), record);
+        state.composite_redirects.insert((window_id, false), record);
+
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(app));
+
+        let releases = backend
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::ReleaseRedirectedBacking(x) if *x == backing_xid))
+            .count();
+        assert_eq!(releases, 1, "calls={:#?}", backend.calls());
+        assert!(state.resources.window(window_id).is_none());
+        assert!(!state.composite_redirects.contains_key(&(window_id, false)));
+        assert!(
+            state.composite_redirects.contains_key(&(ROOT_WINDOW, true)),
+            "the compositor's root redirect outlives the app"
         );
     }
 
