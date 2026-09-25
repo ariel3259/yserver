@@ -230,6 +230,8 @@ struct FenceTicketInner {
     /// submission fence's lifetime rather than being destroyed
     /// immediately after submit.
     imported_wait_semaphores: RefCell<Vec<vk::Semaphore>>,
+    #[cfg(test)]
+    poll_held_for_tests: Cell<bool>,
 }
 
 impl std::fmt::Debug for FenceTicketInner {
@@ -272,6 +274,10 @@ impl FenceTicket {
     /// context to query has no business asking whether a real submission
     /// signaled.
     pub(crate) fn poll_signaled_result(&self, vk: &VkContext) -> Result<bool, vk::Result> {
+        #[cfg(test)]
+        if self.inner.poll_held_for_tests.get() {
+            return Ok(false);
+        }
         if self.inner.signaled_cache.get() {
             return Ok(true);
         }
@@ -365,6 +371,7 @@ impl FenceTicket {
                 pool: Weak::<RefCell<FencePoolInner>>::new(),
                 vk: None,
                 imported_wait_semaphores: RefCell::new(Vec::new()),
+                poll_held_for_tests: Cell::new(false),
             }),
         }
     }
@@ -379,6 +386,7 @@ impl FenceTicket {
                 pool: Weak::<RefCell<FencePoolInner>>::new(),
                 vk: None,
                 imported_wait_semaphores: RefCell::new(Vec::new()),
+                poll_held_for_tests: Cell::new(false),
             }),
         }
     }
@@ -387,6 +395,16 @@ impl FenceTicket {
     #[cfg(test)]
     pub(crate) fn test_signal(&self) {
         self.inner.signaled_cache.set(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_polling_for_tests(&self) {
+        self.inner.poll_held_for_tests.set(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_polling_for_tests(&self) {
+        self.inner.poll_held_for_tests.set(false);
     }
 }
 
@@ -583,6 +601,8 @@ impl FencePool {
                 pool: Rc::downgrade(&self.inner),
                 vk: Some(vk),
                 imported_wait_semaphores: RefCell::new(Vec::new()),
+                #[cfg(test)]
+                poll_held_for_tests: Cell::new(false),
             }),
         })
     }
@@ -5629,7 +5649,11 @@ impl PlatformBackend {
             .pending_scanout_render_completions
             .iter()
             .find(|pending| {
-                pending.output_instance_id == output_instance_id && pending.stage == stage
+                pending.output_instance_id == output_instance_id
+                    && pending.stage == stage
+                    && !self
+                        .held_scanout_render_completions_for_tests
+                        .contains(&pending.job_id)
             })
             .ok_or_else(|| io::Error::other("scanout completion to hold was not pending"))?;
         let job_id = pending.job_id;
@@ -5647,6 +5671,34 @@ impl PlatformBackend {
             return Err(error);
         }
         Ok(job_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_scanout_render_completions_for_output_stage_for_tests(
+        &mut self,
+        output_instance_id: OutputInstanceId,
+        stage: ScanoutRenderCompletionStage,
+    ) -> io::Result<Vec<u64>> {
+        let mut held = Vec::new();
+        while self
+            .pending_scanout_render_completions
+            .iter()
+            .any(|pending| {
+                pending.output_instance_id == output_instance_id
+                    && pending.stage == stage
+                    && !self
+                        .held_scanout_render_completions_for_tests
+                        .contains(&pending.job_id)
+            })
+        {
+            held.push(self.hold_scanout_render_completion_for_tests(output_instance_id, stage)?);
+        }
+        if held.is_empty() {
+            return Err(io::Error::other(
+                "scanout completions to hold were not pending",
+            ));
+        }
+        Ok(held)
     }
 
     #[cfg(test)]

@@ -2670,9 +2670,12 @@ impl KmsBackend {
             }));
         let mut devices = Vec::new();
         for offer in offers {
-            if let Err(error) =
-                self.admission_offer_composed(offer.device, offer.crtc, offer.generation)
-            {
+            if let Err(error) = self.admission_offer_composed_for_instance(
+                offer.device,
+                offer.crtc,
+                offer.generation,
+                Some(offer.output_instance_id),
+            ) {
                 log::warn!(
                     "render Owner scanout: could not offer composed generation {} for CRTC {}: {error:?}",
                     offer.generation,
@@ -54535,6 +54538,11 @@ mod tests {
             completion.stage,
             crate::kms::render::platform::ScanoutRenderCompletionStage::Render
         );
+        // The full core-loop driver runs the ordinary compose tail after the
+        // readiness callback. Exhaust the spare slots so that this assertion
+        // observes A while B's receipt is pending, before an unrelated later
+        // frame can displace it.
+        let held_slots = fixture.backend.scene.exhaust_descriptor_ring_for_tests(0);
         c0_3bi_handle_retired_copied_completion(&mut fixture.backend, completion);
 
         let (_, destination_obligation) = fixture
@@ -54553,6 +54561,10 @@ mod tests {
             Some(crate::kms::render::owner_buffer::OwnerBufferState::Rendering),
             "a prepared copied generation remains Rendering while B's receipt is pending"
         );
+        fixture
+            .backend
+            .scene
+            .release_descriptor_slots_for_tests(0, &held_slots);
     }
 
     #[test]
@@ -62858,13 +62870,50 @@ mod tests {
         let commit = record.commit_id();
         c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
         let completion = backend.complete_owner_for_tests(0);
-        c0_3aii_replace_owner_executor(backend, StubBehaviour::NeverReply);
+        if level == 0
+            && backend
+                .admission_conductors
+                .get(&device)
+                .is_some_and(|conductor| conductor.admission.unflip().is_some())
+        {
+            // The full core-loop tail may dispatch the retained unflip as
+            // soon as DPMS-on reopens admission. Give that next request a
+            // live, non-replying executor instead of exhausting the one-shot
+            // scripted DPMS reply and spuriously refusing the unflip.
+            c0_3aii_replace_owner_executor(backend, StubBehaviour::NeverReply);
+        }
         assert!(c0_3bi_drive_owner_batch(
             backend,
             device,
             completion,
             "complete Owner DPMS transition"
         ));
+
+        let expected_active = level == 0;
+        c0_3bi_core_driver_until(
+            backend,
+            "route Owner DPMS completion through the core iteration tail",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                backend.owner_dpms_installed_active.get(&device).copied() == Some(expected_active)
+                    && backend
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .is_some_and(|arbiter| {
+                            arbiter.state()
+                                == crate::kms::owner::lifecycle::DeviceLifecycleState::Ready
+                        })
+                    && (backend.device_owner_for_tests(0).live_record().is_none()
+                        || backend.scanout_m2.owner_unflip_return.is_some())
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        if backend.scanout_m2.owner_unflip_return.is_none() {
+            // Keep the helper executor available for an explicit compose
+            // requested by a test after the lifecycle transition returns.
+            c0_3aii_replace_owner_executor(backend, StubBehaviour::NeverReply);
+        }
 
         assert_eq!(
             backend.owner_dpms_installed_active.get(&device).copied(),
@@ -65261,11 +65310,14 @@ mod tests {
                     .retired_output_has_instance_for_tests(instance)
             );
             c0_3bi_release_kms_hold(backend, &held);
-            for (job_id, _) in &held_copy_completions {
-                if *job_id != held_copy_completion {
+            for (job_id, _) in backend.platform.held_scanout_render_completions_for_tests(
+                instance,
+                ScanoutRenderCompletionStage::CopiedOwnerCopy,
+            ) {
+                if job_id != held_copy_completion {
                     backend
                         .platform
-                        .release_scanout_render_completion_for_tests(*job_id)
+                        .release_scanout_render_completion_for_tests(job_id)
                         .expect("release the later copied frame after retiring B");
                 }
             }
@@ -65429,11 +65481,14 @@ mod tests {
                     .retired_output_has_instance_for_tests(instance)
             );
             c0_3bi_release_kms_hold(backend, &held);
-            for (job_id, _) in &held_copy_completions {
-                if *job_id != held_copy_completion {
+            for (job_id, _) in backend.platform.held_scanout_render_completions_for_tests(
+                instance,
+                ScanoutRenderCompletionStage::CopiedOwnerCopy,
+            ) {
+                if job_id != held_copy_completion {
                     backend
                         .platform
-                        .release_scanout_render_completion_for_tests(*job_id)
+                        .release_scanout_render_completion_for_tests(job_id)
                         .expect("release the later copied frame after retiring B");
                 }
             }
@@ -65507,6 +65562,10 @@ mod tests {
             _sink_vk,
         ) = c0_3bi_copied_modeset_frame_after_a();
         let backend = &mut fixture.backend;
+        // The full core-loop tail can compose another frame after routing A
+        // or B. Reserve the spare descriptor slots until A reaches Owner so
+        // an unrelated successor cannot displace the generation under test.
+        let held_descriptor_slots = backend.scene.exhaust_descriptor_ring_for_tests(0);
         let target_generation = backend
             .scene
             .owner_buffer_identities_for_tests(0)
@@ -65626,6 +65685,9 @@ mod tests {
             backend.scene.owner_state_for_tests(0, bo_idx),
             Some(crate::kms::render::owner_buffer::OwnerBufferState::Submitted)
         );
+        backend
+            .scene
+            .release_descriptor_slots_for_tests(0, &held_descriptor_slots);
         c0_conv_cii_accept_direct_owner_commit(backend, device, commit);
         let completion = backend.complete_owner_for_tests(0);
         assert!(c0_3bi_drive_owner_batch(
@@ -65776,7 +65838,18 @@ mod tests {
             .expect("resource service")
             .apply_validated_proof_for_tests(source_key, held_foreign_return)
             .expect("discharge the source FOREIGN return");
-        c0_3bi_core_driver_iteration(backend, "destroy copied bundle after FOREIGN return");
+        c0_3bi_core_driver_until(
+            backend,
+            "destroy copied bundle after FOREIGN return and GPU completion",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            },
+            None,
+        )
+        .expect("core driver consumes the final retired copied-frame proof");
         assert!(
             !backend
                 .scene
@@ -65876,9 +65949,10 @@ mod tests {
             .expect("stage idle peer scene state");
         let mut identity_map = backend.scene.stage_output_identity_map();
         identity_map.insert(peer_key, staged_peer);
-        backend
+        let retired_offers = backend
             .scene
             .promote_output_identity_map(&backend.platform, identity_map);
+        backend.withdraw_retired_composed_offers(retired_offers);
         let peer_instance = backend
             .scene
             .output_instance_id_for_tests(peer_idx)
@@ -66062,6 +66136,13 @@ mod tests {
             .output_instance_id_for_tests(new_idx)
             .expect("new copied output instance");
         assert_ne!(new_instance, old_instance);
+        let held_new_render_completions = backend
+            .platform
+            .hold_scanout_render_completions_for_output_stage_for_tests(
+                new_instance,
+                ScanoutRenderCompletionStage::Render,
+            )
+            .expect("hold unrelated replacement-pool render notifications while routing old B");
         let new_keys = c0_3bi_copied_scanout_allocation_keys(backend, device, &connector);
         assert!(new_keys.iter().all(|key| !old_keys.contains(key)));
         let new_images = c0_3bi_scanout_images(backend, new_idx);
@@ -66156,6 +66237,12 @@ mod tests {
                 OutputKey::new(device, connector),
             ]),
         );
+        for job_id in held_new_render_completions {
+            backend
+                .platform
+                .release_scanout_render_completion_for_tests(job_id)
+                .expect("restore replacement-pool render notification after old B assertions");
+        }
     }
 
     #[test]
@@ -67155,6 +67242,432 @@ mod tests {
             backend,
             "c0_3bi_a2_unproven_bundle_is_kept_vulkan after KMS proof",
             &c0_3bi_expected_end_state([]),
+        );
+    }
+
+    fn c0_3bi_prepare_unsubmitted_desired_frame(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> (crate::kms::backend::OutputInstanceId, u32, usize, u64) {
+        use crate::kms::render::owner_buffer::OwnerBufferState;
+
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output instance");
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("active admission conductor")
+            .lifecycle_admission_closed = true;
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until(
+            backend,
+            "compose and queue a Desired frame through the core iteration tail",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .admission_conductors
+                    .get(&device)
+                    .is_some_and(|conductor| conductor.admission.composed(crtc).is_some())
+                    && backend
+                        .scene
+                        .owner_buffer_states_for_tests(0)
+                        .contains(&OwnerBufferState::Desired)
+            },
+            None,
+        )
+        .expect("core iteration prepares an unsubmitted composed frame");
+
+        let conductor = &backend.admission_conductors[&device];
+        let intent = conductor
+            .admission
+            .composed(crtc)
+            .expect("ordinary admission remains queued for the retiring output");
+        assert_eq!(
+            conductor.composed_output_instances.get(&crtc),
+            Some(&Some(instance)),
+            "the queued offer carries the exact output instance"
+        );
+        let generation = intent.generation;
+        let owner = backend
+            .scene
+            .owner_buffer_identities_for_tests(0)
+            .into_iter()
+            .find(|owner| owner.generation == generation)
+            .expect("the queued generation remains in the owner ledger");
+        assert_eq!(
+            backend
+                .scene
+                .owner_state_for_generation_for_tests(0, generation),
+            Some(OwnerBufferState::Desired),
+            "the queued generation has completed rendering but was not dispatched"
+        );
+        assert_eq!(owner.output_key.device_key, device);
+        assert_eq!(owner.crtc, crtc);
+        (instance, crtc, owner.bo_idx, generation)
+    }
+
+    fn c0_3bi_assert_no_retired_instance_offer(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        crtc: u32,
+        instance: crate::kms::backend::OutputInstanceId,
+        generation: u64,
+    ) {
+        let conductor = &backend.admission_conductors[&device];
+        assert!(
+            conductor
+                .composed_output_instances
+                .values()
+                .all(|offered_instance| *offered_instance != Some(instance)),
+            "admission has no composed offer for retired instance {instance:?}"
+        );
+        assert_ne!(
+            conductor
+                .admission
+                .composed(crtc)
+                .map(|intent| intent.generation),
+            Some(generation),
+            "the retired generation is absent from the CRTC's composed intent"
+        );
+    }
+
+    #[test]
+    fn c0_3bi_a3c_retired_offer_withdrawal_preserves_unflip_and_replacement() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let retired_instance = backend.platform.output_instance_ids[0];
+        let replacement_instance = crate::kms::backend::OutputInstanceId {
+            device_key: device,
+            serial: retired_instance
+                .serial
+                .checked_add(1)
+                .expect("test output instance serial"),
+        };
+        c0_3aii_apply_dpms_transition(&mut backend, device, 3);
+        backend.scanout_m2.test_force_active = true;
+        let retired_offer = crate::kms::render::scene::ComposedOffer {
+            device,
+            crtc,
+            generation: 17,
+            output_instance_id: retired_instance,
+        };
+        let crtcs = std::collections::BTreeSet::from([crtc]);
+
+        backend
+            .admission_offer_composed_for_instance(
+                device,
+                crtc,
+                retired_offer.generation,
+                Some(retired_instance),
+            )
+            .expect("offer the retired instance's pre-submit Desired frame");
+        backend
+            .admission_request_unflip(device, crtcs.clone())
+            .expect("retain the direct unflip intent while DPMS is off");
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_some()
+        );
+        c0_3aii_apply_dpms_transition(&mut backend, device, 0);
+        assert!(
+            backend.admission_conductors[&device]
+                .admission
+                .unflip()
+                .is_some(),
+            "DPMS-on retains an unflip blocked on its composed return"
+        );
+        assert_eq!(
+            backend
+                .admission_snapshot(device, false)
+                .expect("DPMS-on admission snapshot")
+                .readiness(crate::kms::owner::admission::IntentKey::Unflip),
+            Some(crate::kms::owner::admission::Readiness::Waiting(
+                crate::kms::owner::admission::WaitReason::ComposedReturnNotEstablished,
+            )),
+        );
+        backend.withdraw_retired_composed_offers([retired_offer]);
+
+        let conductor = &backend.admission_conductors[&device];
+        assert_eq!(conductor.admission.composed(crtc), None);
+        assert_eq!(conductor.composed.get(&crtc), None);
+        assert_eq!(
+            conductor.admission.unflip().map(|barrier| &barrier.crtcs),
+            Some(&crtcs),
+            "withdrawing retired composed work must preserve the retained unflip intent"
+        );
+
+        // Reuse the generation on a different output instance. A stale
+        // retirement notice for the old instance must not withdraw it.
+        backend
+            .admission_offer_composed_for_instance(
+                device,
+                crtc,
+                retired_offer.generation,
+                Some(replacement_instance),
+            )
+            .expect("offer the replacement instance's same-numbered frame");
+        backend.withdraw_retired_composed_offers([retired_offer]);
+
+        let conductor = &backend.admission_conductors[&device];
+        let replacement = conductor
+            .admission
+            .composed(crtc)
+            .expect("the replacement instance's frame stays queued");
+        assert_eq!(replacement.generation, retired_offer.generation);
+        assert_eq!(replacement.output_instance_id, Some(replacement_instance));
+        assert_eq!(
+            conductor.composed.get(&crtc),
+            Some(&retired_offer.generation)
+        );
+        assert_eq!(
+            conductor.admission.unflip().map(|barrier| &barrier.crtcs),
+            Some(&crtcs),
+            "a stale retirement notice must not affect the retained unflip"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a3_desired_frame_of_a_retired_output_is_released_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            render::resources::ObligationKind,
+            vk::scanout::{BoPhase, OutputScanout},
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptValidationThenNeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let (instance, crtc, bo_idx, generation) =
+            c0_3bi_prepare_unsubmitted_desired_frame(&mut backend, device);
+        let output_key = OutputKey::new(device, connector.clone());
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+
+        // Keep a different, unused pool allocation rooted temporarily so the
+        // driver can observe the cancelled BO returning to Free and its slot
+        // returning to the ring before checking final bundle destruction.
+        let held_key = match backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("old scanout pool")
+        {
+            OutputScanout::Shared(pool) => pool
+                .bos
+                .iter()
+                .enumerate()
+                .find(|(idx, bo)| *idx != bo_idx && bo.state.phase == BoPhase::Free)
+                .and_then(|(_, bo)| bo.managed_key()),
+            OutputScanout::Copied(pool) => pool
+                .destinations
+                .bos
+                .iter()
+                .enumerate()
+                .find(|(idx, bo)| *idx != bo_idx && bo.state.phase == BoPhase::Free)
+                .and_then(|(idx, _)| pool.sources[idx].managed_key()),
+        }
+        .expect("a different free allocation keeps the bundle observable");
+        let held_obligation = backend
+            .resource_service_mut()
+            .expect("resource service")
+            .register(held_key, ObligationKind::Gpu)
+            .expect("hold another pool allocation for the intermediate check");
+
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(&mut backend, device, token, None)
+                .expect("mode change completion result")
+        );
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "free never-submitted retired frame after its render fence",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .scene
+                    .retired_output_end_states_for_tests()
+                    .into_iter()
+                    .find(|bundle| bundle.instance == instance)
+                    .is_some_and(|bundle| {
+                        bundle.owner_buffers.is_empty()
+                            && bundle.phases.iter().all(|phase| *phase == BoPhase::Free)
+                            && bundle.gpu_fence_proofs == 0
+                    })
+            },
+            None,
+        )
+        .expect("the frame BO and descriptor slot retire without blocking");
+
+        let retired = backend
+            .scene
+            .retired_output_end_states_for_tests()
+            .into_iter()
+            .find(|bundle| bundle.instance == instance)
+            .expect("the unrelated resource proof keeps the bundle observable");
+        assert!(retired.owner_buffers.is_empty());
+        assert!(retired.phases.iter().all(|phase| *phase == BoPhase::Free));
+        let (used_slots, capacity) = backend
+            .scene
+            .retired_output_pool_occupancy_for_tests(instance)
+            .expect("retired descriptor ring");
+        assert_eq!(used_slots, 0, "the cancelled slot is back in the ring");
+        assert!(capacity > 0);
+        c0_3bi_assert_no_retired_instance_offer(&backend, device, crtc, instance, generation);
+        assert_eq!(
+            backend
+                .resource_service()
+                .expect("resource service")
+                .allocation_end_state_for_tests()
+                .into_iter()
+                .find(|allocation| allocation.key == held_key)
+                .map(|allocation| allocation.pending_obligations),
+            Some(vec![ObligationKind::Gpu]),
+            "the test's separate hold is the only remaining proof"
+        );
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_a3_desired_frame_of_a_retired_output_is_released_vulkan before unrelated proof",
+            &C0EndStateExpectation {
+                installed_outputs: vec![output_key.clone()],
+                retained_bundles: vec![C0ExpectedRetiredBundle {
+                    instance,
+                    proofs: vec![C0RetiredProofKind::ResourceProof],
+                }],
+                ..C0EndStateExpectation::default()
+            },
+        );
+
+        backend
+            .resource_service_mut()
+            .expect("resource service")
+            .apply_validated_proof_for_tests(held_key, held_obligation)
+            .expect("release the unrelated pool-allocation hold");
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "destroy retired bundle after frame and modeset proofs",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            },
+            None,
+        )
+        .expect("the fully proven bundle leaves the retirement list");
+        assert!(old_keys.iter().all(|key| {
+            !backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+        assert!(
+            backend
+                .scene
+                .owner_buffer_identities_for_tests(0)
+                .iter()
+                .all(|owner| !old_keys.contains(&owner.managed_key)),
+            "the retired pool has no owner buffers in the installed scene"
+        );
+        c0_3bi_assert_no_retired_instance_offer(&backend, device, crtc, instance, generation);
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_a3_desired_frame_of_a_retired_output_is_released_vulkan",
+            &c0_3bi_expected_end_state([output_key]),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_a3_desired_frame_waits_for_its_render_fence_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour, render::owner_buffer::OwnerBufferState,
+            vk::scanout::BoPhase,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptValidationThenNeverReply, false)
+                .expect("environmental skip: no live Vulkan modeset fixture");
+        let (instance, crtc, bo_idx, generation) =
+            c0_3bi_prepare_unsubmitted_desired_frame(&mut backend, device);
+        let output_key = OutputKey::new(device, connector.clone());
+        let old_keys = c0_3bi_scanout_allocation_keys(&backend, device, &connector);
+        let render_fence = backend
+            .scene
+            .hold_owner_render_fence_for_tests(0, generation)
+            .expect("the queued Desired frame retains its real render fence");
+
+        let token = c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(mode));
+        assert!(
+            c0_3bi_accept_and_finish_client_modeset(&mut backend, device, token, None)
+                .expect("mode change completion result")
+        );
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "service retired frame while its render fence is withheld",
+            std::time::Duration::from_secs(1),
+            &|backend| {
+                backend
+                    .scene
+                    .retired_output_end_states_for_tests()
+                    .iter()
+                    .any(|bundle| bundle.instance == instance)
+            },
+            None,
+        )
+        .expect("retired bundle remains while the render-fence proof is withheld");
+        let retired = backend
+            .scene
+            .retired_output_end_states_for_tests()
+            .into_iter()
+            .find(|bundle| bundle.instance == instance)
+            .expect("the unsignalled render fence retains the bundle");
+        assert_eq!(
+            retired.owner_buffers,
+            vec![(bo_idx, OwnerBufferState::Displaced)]
+        );
+        assert_eq!(retired.phases[bo_idx], BoPhase::Owner);
+        assert_eq!(retired.gpu_fence_proofs, 1);
+        c0_3bi_assert_no_retired_instance_offer(&backend, device, crtc, instance, generation);
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_a3_desired_frame_waits_for_its_render_fence_vulkan while withheld",
+            &C0EndStateExpectation {
+                installed_outputs: vec![output_key.clone()],
+                retained_bundles: vec![C0ExpectedRetiredBundle {
+                    instance,
+                    proofs: vec![C0RetiredProofKind::GpuFence],
+                }],
+                ..C0EndStateExpectation::default()
+            },
+        );
+
+        render_fence.release_polling_for_tests();
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "drain retired frame after its render fence signals",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            },
+            None,
+        )
+        .expect("the core loop observes the render fence and frees the retired frame");
+        assert!(old_keys.iter().all(|key| {
+            !backend
+                .resource_service()
+                .is_some_and(|service| service.contains(key))
+        }));
+        c0_3bi_assert_no_retired_instance_offer(&backend, device, crtc, instance, generation);
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_a3_desired_frame_waits_for_its_render_fence_vulkan after signal",
+            &c0_3bi_expected_end_state([output_key]),
         );
     }
 
@@ -85777,9 +86290,10 @@ mod tests {
         backend.platform.scanout_pools.remove(output_idx);
         backend.platform.bo_generations.remove(output_idx);
         backend.platform.first_pageflip_logged.remove(output_idx);
-        backend
+        let retired_offers = backend
             .scene
             .promote_output_identity_map(&backend.platform, identity_map);
+        backend.withdraw_retired_composed_offers(retired_offers);
     }
 
     fn c0_3bi_replace_output_for_promotion(
@@ -85812,9 +86326,11 @@ mod tests {
             .scene
             .stage_output_scene_state(&backend.platform, output_idx, new_instance)
             .expect("stage replacement output scene");
-        backend
-            .scene
-            .rebuild_output(&key, staged, retired_pool, &backend.platform);
+        let retired_offers =
+            backend
+                .scene
+                .rebuild_output(&key, staged, retired_pool, &backend.platform);
+        backend.withdraw_retired_composed_offers(retired_offers);
         new_instance
     }
 

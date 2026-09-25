@@ -46,6 +46,7 @@ pub struct PrimaryOrdinal(u64);
 pub struct ComposedIntent {
     pub generation: u64,
     pub ordinal: PrimaryOrdinal,
+    pub(crate) output_instance_id: Option<crate::kms::backend::OutputInstanceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +99,15 @@ impl Admission {
     }
 
     pub fn set_composed(&mut self, crtc: CrtcId, generation: u64) -> Result<(), AdmissionError> {
+        self.set_composed_for_instance(crtc, generation, None)
+    }
+
+    pub(crate) fn set_composed_for_instance(
+        &mut self,
+        crtc: CrtcId,
+        generation: u64,
+        output_instance_id: Option<crate::kms::backend::OutputInstanceId>,
+    ) -> Result<(), AdmissionError> {
         if let Some(current) = self.composed.get(&crtc)
             && generation <= current.generation
         {
@@ -117,9 +127,29 @@ impl Admission {
             ComposedIntent {
                 generation,
                 ordinal,
+                output_instance_id,
             },
         );
         Ok(())
+    }
+
+    /// Withdraw a composed generation only while that exact generation is
+    /// still queued. A generation already dispatched has left this map and
+    /// keeps the owner's normal completion rules.
+    pub(crate) fn withdraw_composed_for_instance(
+        &mut self,
+        crtc: CrtcId,
+        generation: u64,
+        output_instance_id: crate::kms::backend::OutputInstanceId,
+    ) -> bool {
+        if self.composed.get(&crtc).is_some_and(|intent| {
+            intent.generation == generation && intent.output_instance_id == Some(output_instance_id)
+        }) {
+            self.composed.remove(&crtc);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn set_direct_successor(

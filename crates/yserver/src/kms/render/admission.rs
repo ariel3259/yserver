@@ -905,6 +905,8 @@ pub(crate) struct AdmissionConductor {
     pub(crate) layout_generation: u64,
     pub(crate) next_direct_source_generation: u64,
     pub(crate) composed: BTreeMap<CrtcId, u64>,
+    pub(crate) composed_output_instances:
+        BTreeMap<CrtcId, Option<crate::kms::backend::OutputInstanceId>>,
     pub(crate) maintenance: MaintenanceStore,
     pub(crate) receipts: BTreeMap<CommitId, AdmissionReceipt>,
     pub(crate) recovery_stopped: bool,
@@ -932,6 +934,7 @@ impl AdmissionConductor {
             layout_generation: 0,
             next_direct_source_generation: 1,
             composed: BTreeMap::new(),
+            composed_output_instances: BTreeMap::new(),
             maintenance: MaintenanceStore::default(),
             receipts: BTreeMap::new(),
             recovery_stopped: false,
@@ -958,6 +961,7 @@ impl AdmissionConductor {
             layout_generation: 0,
             next_direct_source_generation: 1,
             composed: BTreeMap::new(),
+            composed_output_instances: BTreeMap::new(),
             maintenance: MaintenanceStore::default(),
             receipts: BTreeMap::new(),
             recovery_stopped: false,
@@ -4866,8 +4870,10 @@ impl KmsBackend {
                 .invalidate_staged_protocol_output(&device, &key);
         }
 
-        self.scene
+        let retired_composed_offers = self
+            .scene
             .promote_output_identity_map(&self.platform, identity_map);
+        self.withdraw_retired_composed_offers(retired_composed_offers);
         if let Some(instance) = retired_instance {
             self.scene.retire_current_owner_buffer_in_bundle(instance);
         }
@@ -5440,6 +5446,16 @@ impl KmsBackend {
         crtc: CrtcId,
         generation: u64,
     ) -> Result<(), AdmissionError> {
+        self.admission_offer_composed_for_instance(device, crtc, generation, None)
+    }
+
+    pub(crate) fn admission_offer_composed_for_instance(
+        &mut self,
+        device: DrmDeviceKey,
+        crtc: CrtcId,
+        generation: u64,
+        output_instance_id: Option<crate::kms::backend::OutputInstanceId>,
+    ) -> Result<(), AdmissionError> {
         if !self.admission_is_active(device) {
             return Ok(());
         }
@@ -5447,9 +5463,39 @@ impl KmsBackend {
             .admission_conductors
             .get_mut(&device)
             .expect("active admission conductor");
-        conductor.admission.set_composed(crtc, generation)?;
+        conductor
+            .admission
+            .set_composed_for_instance(crtc, generation, output_instance_id)?;
         conductor.composed.insert(crtc, generation);
+        conductor
+            .composed_output_instances
+            .insert(crtc, output_instance_id);
         Ok(())
+    }
+
+    pub(crate) fn withdraw_retired_composed_offers(
+        &mut self,
+        offers: impl IntoIterator<Item = crate::kms::render::scene::ComposedOffer>,
+    ) {
+        for offer in offers {
+            let Some(conductor) = self.admission_conductors.get_mut(&offer.device) else {
+                continue;
+            };
+            let matches_retired_offer = conductor.composed.get(&offer.crtc)
+                == Some(&offer.generation)
+                && conductor.composed_output_instances.get(&offer.crtc)
+                    == Some(&Some(offer.output_instance_id));
+            if matches_retired_offer
+                && conductor.admission.withdraw_composed_for_instance(
+                    offer.crtc,
+                    offer.generation,
+                    offer.output_instance_id,
+                )
+            {
+                conductor.composed.remove(&offer.crtc);
+                conductor.composed_output_instances.remove(&offer.crtc);
+            }
+        }
     }
 
     fn composed_output_index(&self, device: DrmDeviceKey, crtc: CrtcId) -> Option<usize> {
@@ -7112,6 +7158,7 @@ impl KmsBackend {
                     && conductor.composed.get(crtc) == Some(generation)
                 {
                     conductor.composed.remove(crtc);
+                    conductor.composed_output_instances.remove(crtc);
                 }
             }
             Some(Admitted::Bundle { members }) => {
@@ -7121,6 +7168,7 @@ impl KmsBackend {
                             && conductor.composed.get(crtc) == Some(generation)
                         {
                             conductor.composed.remove(crtc);
+                            conductor.composed_output_instances.remove(crtc);
                         }
                     }
                 }
@@ -7437,6 +7485,7 @@ impl KmsBackend {
                 .set_composed(crtc, next)
                 .expect("test mismatch offer");
             conductor.composed.insert(crtc, next);
+            conductor.composed_output_instances.insert(crtc, None);
         }
     }
 
