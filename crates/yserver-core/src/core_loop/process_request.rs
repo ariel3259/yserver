@@ -1946,6 +1946,7 @@ fn destroy_window_subtree(
             continue;
         }
         let _ = backend.free_pixmap(origin, *xid);
+        state.resources.host_pixmap_freed(*xid);
     }
     for entry in pending {
         if let Some(xid) = entry.host_xid {
@@ -7523,6 +7524,7 @@ fn handle_composite_request(
                 },
             );
             let _ = state.resources.set_pixmap_host_xid(pixmap, host_pixmap_xid);
+            state.resources.mark_pixmap_composite_name(pixmap);
             if let Some(w) = state.resources.window_mut(window) {
                 w.composite_named_pixmaps
                     .push(crate::resources::NamedCompositePixmap {
@@ -21434,6 +21436,7 @@ fn handle_change_window_attributes(
     for old_host_xid in released_hosts {
         if !state.resources.host_xid_still_referenced(old_host_xid) {
             let _ = backend.free_pixmap(origin, old_host_xid.as_raw());
+            state.resources.host_pixmap_freed(old_host_xid.as_raw());
         }
     }
 
@@ -28028,6 +28031,28 @@ fn handle_free_pixmap(
             FREE_PIXMAP_OPCODE,
         );
     };
+    if removed.composite_name {
+        // A name owns its own alias ref: a sibling name sharing the backing must not hide it.
+        let names: Vec<_> = removed.host_xid.into_iter().collect();
+        let last = crate::core_loop::process_disconnect::release_removed_names(
+            state, backend, origin, &names,
+        );
+        crate::core_loop::process_disconnect::free_orphaned_host_pixmaps(
+            state,
+            backend,
+            last.clone(),
+            &last,
+            None,
+        );
+        debug!(
+            "client {} #{} FreePixmap pixmap=0x{:x} (window name) host_xid={:?}",
+            client_id.0,
+            sequence.0,
+            pixmap.0,
+            removed.host_xid.map(crate::backend::PixmapHandle::as_raw),
+        );
+        return Ok(RequestOutcome::Handled);
+    }
     let still_referenced = removed
         .host_xid
         // The BORDER reference is as load-bearing as the background one:

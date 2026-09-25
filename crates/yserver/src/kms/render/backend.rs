@@ -21674,6 +21674,22 @@ impl Backend for KmsBackend {
         Ok(())
     }
 
+    fn release_window_pixmap_name(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        // A name owns exactly one alias ref; an untracked backing has none left to drop.
+        if self.core.alias_registry.get(backing).is_none() {
+            log::warn!(
+                "render release_window_pixmap_name: 0x{:x} not in alias_registry — no-op",
+                backing.as_raw(),
+            );
+            return Ok(());
+        }
+        self.drop_backing_storage(origin, backing)
+    }
+
     fn release_redirected_backing(
         &mut self,
         origin: Option<OriginContext>,

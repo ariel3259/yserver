@@ -1301,6 +1301,15 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Drop exactly the one alias ref a freed name held; host-X11 names own a host pixmap each.
+    fn release_window_pixmap_name(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        self.free_pixmap(origin, backing.as_raw())
+    }
+
     /// Returns whether the existing redirected backing storage already
     /// IS `(width, height, depth)`, so a resize can keep it without
     /// reallocating the underlying pixmap. `width`/`height` are the

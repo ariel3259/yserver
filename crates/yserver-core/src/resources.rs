@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use yserver_protocol::x11::{
     AtomId, ChangeWindowAttributesRequest, ClientId, ClipRectangles, ConfigureWindowRequest,
@@ -22,6 +22,8 @@ pub const SERVER_OWNER: ClientId = ClientId(0);
 pub struct ClientRemovedResources {
     pub closed_fonts: Vec<u32>,
     pub freed_pixmaps: Vec<u32>,
+    /// One host backing per removed `NameWindowPixmap` name, NOT deduplicated: each owns a ref.
+    pub freed_names: Vec<crate::backend::PixmapHandle>,
     pub freed_pictures: Vec<(u32, Option<u32>)>,
     pub freed_glyphsets: Vec<u32>,
     pub freed_cursors: Vec<u32>,
@@ -247,6 +249,8 @@ pub struct ResourceTable {
     /// backend, but the XIDs belong to the ordinary global X resource
     /// namespace and obey close-down retention semantics.
     dri3_syncobjs: HashMap<u32, ClientId>,
+    /// Backings whose last freed name's alias ref waits for a background/border/GC release site.
+    deferred_name_refs: HashSet<u32>,
 }
 
 impl Default for ResourceTable {
@@ -379,6 +383,7 @@ impl Default for ResourceTable {
             visuals,
             colormaps,
             dri3_syncobjs: HashMap::new(),
+            deferred_name_refs: HashSet::new(),
         }
     }
 }
@@ -1860,12 +1865,56 @@ impl ResourceTable {
                 depth: request.depth,
                 owner,
                 host_xid: None,
+                composite_name: false,
             },
         );
     }
 
+    /// Mark `id` as a `NameWindowPixmap` name: it owns one alias ref on its host backing.
+    pub fn mark_pixmap_composite_name(&mut self, id: ResourceId) {
+        if let Some(p) = self.pixmaps.get_mut(&id.0) {
+            p.composite_name = true;
+        }
+    }
+
     pub fn free_pixmap(&mut self, id: ResourceId) -> Option<Pixmap> {
-        self.pixmaps.remove(&id.0)
+        let removed = self.pixmaps.remove(&id.0)?;
+        if removed.composite_name {
+            self.forget_composite_names(&[id]);
+        }
+        Some(removed)
+    }
+
+    /// Drop freed names from their windows' alias lists, so a resize never retargets a dead name.
+    fn forget_composite_names(&mut self, names: &[ResourceId]) {
+        for w in self.windows.values_mut() {
+            w.composite_named_pixmaps
+                .retain(|alias| !names.contains(&alias.client_pixmap));
+        }
+    }
+
+    /// True iff a live `NameWindowPixmap` name still aliases `host_xid`.
+    #[must_use]
+    pub fn host_xid_named_by_pixmap(&self, host_xid: crate::backend::PixmapHandle) -> bool {
+        self.pixmaps
+            .values()
+            .any(|p| p.composite_name && p.host_xid == Some(host_xid))
+    }
+
+    /// True iff a freed name's alias ref on `host_xid` is waiting for an attribute release site.
+    #[must_use]
+    pub fn has_deferred_name_ref(&self, host_xid: crate::backend::PixmapHandle) -> bool {
+        self.deferred_name_refs.contains(&host_xid.as_raw())
+    }
+
+    /// Record that a freed name's alias ref on `host_xid` is left to the attribute release sites.
+    pub fn defer_name_ref(&mut self, host_xid: crate::backend::PixmapHandle) {
+        self.deferred_name_refs.insert(host_xid.as_raw());
+    }
+
+    /// An orphan-rule site freed `host_xid`: any deferred name ref on it is now dropped.
+    pub fn host_pixmap_freed(&mut self, host_xid: u32) {
+        self.deferred_name_refs.remove(&host_xid);
     }
 
     pub fn pixmap(&self, id: ResourceId) -> Option<&Pixmap> {
@@ -2861,9 +2910,14 @@ impl ResourceTable {
         client: ClientId,
     ) -> ClientRemovedResources {
         let mut freed_pixmaps = Vec::new();
+        let mut freed_names = Vec::new();
+        let mut name_ids = Vec::new();
         self.pixmaps.retain(|_, p| {
             if p.owner == client {
-                if let Some(xid) = p.host_xid {
+                if p.composite_name {
+                    name_ids.push(p.id);
+                    freed_names.extend(p.host_xid);
+                } else if let Some(xid) = p.host_xid {
                     freed_pixmaps.push(xid.as_raw());
                 }
                 false
@@ -2871,6 +2925,9 @@ impl ResourceTable {
                 true
             }
         });
+        if !name_ids.is_empty() {
+            self.forget_composite_names(&name_ids);
+        }
         self.gcs.retain(|_, g| g.owner != client);
         let mut freed_colormaps = Vec::new();
         self.colormaps.retain(|_, c| {
@@ -2933,6 +2990,7 @@ impl ResourceTable {
         ClientRemovedResources {
             closed_fonts,
             freed_pixmaps,
+            freed_names,
             freed_pictures,
             freed_glyphsets,
             freed_cursors,
@@ -3429,6 +3487,8 @@ pub struct Pixmap {
     pub depth: u8,
     pub owner: ClientId,
     pub host_xid: Option<crate::backend::PixmapHandle>,
+    /// A `NameWindowPixmap` name: owns one alias ref on its backing (Xorg `compext.c:260`).
+    pub composite_name: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3807,6 +3867,7 @@ mod tests {
                 depth: 24,
                 owner,
                 host_xid: Some(PixmapHandle::from_raw_for_test(0xb01)),
+                composite_name: false,
             },
         );
 
@@ -3852,6 +3913,7 @@ mod tests {
                 depth: 24,
                 owner,
                 host_xid: Some(PixmapHandle::from_raw_for_test(0xa01)),
+                composite_name: false,
             },
         );
 

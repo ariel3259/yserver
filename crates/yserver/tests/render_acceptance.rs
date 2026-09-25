@@ -15817,3 +15817,296 @@ fn export_holders_report_tracks_a_named_glx_backing_until_release() {
             .report_export_holders(&|| collect_core_holders(&f.state))
     );
 }
+
+/// How a compositor overlaps its `NameWindowPixmap` names on one backing.
+#[derive(Clone, Copy, Debug)]
+enum NameOverlap {
+    TwoNamesFreedInOrder,
+    HundredRenames,
+    GlxOnEachName,
+    NamesOutliveWindow,
+    CompositorDisconnect,
+    NameAsBackground,
+    RenameWhileBackgroundDeferred,
+    ResizeAfterAFreedName,
+}
+
+/// Each name owns one alias ref (Xorg `compext.c:260`); each FreePixmap drops one (`dispatch.c:1540`).
+fn name_overlap_scenario(overlap: NameOverlap) -> bool {
+    use yserver_core::backend::export_holders::collect_core_holders;
+    use yserver_protocol::x11::{ClientId, ResourceId};
+    const COMP: u32 = 1;
+    const APP: u32 = 2;
+    const WIN: u32 = 0x007b_0001;
+    const BG_WIN: u32 = 0x007b_0002;
+    const PIX0: u32 = 0x007c_0000;
+    const GLX0: u32 = 0x007d_0000;
+    let what = format!("{overlap:?}");
+    let Some(mut f) = ProtoFixture::new() else {
+        return false;
+    };
+    let _app_peer = f.add_client(APP);
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let create = |f: &mut ProtoFixture, wid: u32| {
+        let mut cw = Vec::new();
+        cw.extend_from_slice(&wid.to_le_bytes());
+        cw.extend_from_slice(&root.to_le_bytes());
+        cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+        cw.extend_from_slice(&100u16.to_le_bytes());
+        cw.extend_from_slice(&50u16.to_le_bytes());
+        cw.extend_from_slice(&0u16.to_le_bytes()); // border
+        cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+        cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+        cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+        f.req_as(APP, 1, 24, &cw);
+    };
+    let mut redirect = root.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    f.req_as(COMP, 144, 2, &redirect);
+    create(&mut f, WIN);
+    create(&mut f, BG_WIN); // left unmapped: no backing of its own
+    f.req_as(APP, 8, 0, &WIN.to_le_bytes()); // MapWindow
+    let backing = f
+        .state
+        .resources
+        .window(ResourceId(WIN))
+        .and_then(|w| w.redirected_backing.as_ref())
+        .map(|b| b.host_pixmap.as_raw())
+        .expect("mapped redirected toplevel has a backing");
+    let name = |f: &mut ProtoFixture, i: u32| {
+        let mut body = WIN.to_le_bytes().to_vec();
+        body.extend_from_slice(&(PIX0 + i).to_le_bytes());
+        f.req_as(COMP, 144, 6, &body); // NameWindowPixmap
+        let host = f
+            .state
+            .resources
+            .pixmap(ResourceId(PIX0 + i))
+            .and_then(|p| p.host_xid)
+            .map(|h| h.as_raw());
+        assert!(host.is_some(), "name {i} aliases a backing");
+    };
+    let free = |f: &mut ProtoFixture, i: u32| f.req_as(COMP, 54, 0, &(PIX0 + i).to_le_bytes());
+    let glx_create = |f: &mut ProtoFixture, i: u32| {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        body.extend_from_slice(&(PIX0 + i).to_le_bytes());
+        body.extend_from_slice(&(GLX0 + i).to_le_bytes());
+        f.req_as(COMP, 148, yserver_protocol::x11::glx::CREATE_PIXMAP, &body);
+    };
+    let glx_destroy = |f: &mut ProtoFixture, i: u32| {
+        f.req_as(
+            COMP,
+            148,
+            yserver_protocol::x11::glx::DESTROY_PIXMAP,
+            &(GLX0 + i).to_le_bytes(),
+        );
+    };
+    let set_bg = |f: &mut ProtoFixture, pixmap: u32| {
+        let mut body = BG_WIN.to_le_bytes().to_vec();
+        body.extend_from_slice(&1u32.to_le_bytes()); // CWBackPixmap
+        body.extend_from_slice(&pixmap.to_le_bytes());
+        f.req_as(APP, 2, 0, &body); // ChangeWindowAttributes
+    };
+    let destroy_win = |f: &mut ProtoFixture| f.req_as(APP, 4, 0, &WIN.to_le_bytes());
+    let mut backings = vec![backing];
+    let settle = |f: &mut ProtoFixture, backings: &[u32]| {
+        for _ in 0..200 {
+            f.backend.for_tests_poll_retired();
+            if backings
+                .iter()
+                .all(|&b| !f.backend.store_drawable_exists_for_tests(b))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let assert_held = |f: &ProtoFixture, why: &str| {
+        assert!(
+            f.backend.store_drawable_exists_for_tests(backing),
+            "{what}: {why} must keep the backing alive"
+        );
+    };
+    match overlap {
+        NameOverlap::TwoNamesFreedInOrder => {
+            name(&mut f, 1);
+            name(&mut f, 2);
+            free(&mut f, 1);
+            free(&mut f, 2);
+            destroy_win(&mut f);
+        }
+        NameOverlap::HundredRenames => {
+            name(&mut f, 0);
+            for i in 1..100 {
+                name(&mut f, i);
+                free(&mut f, i - 1);
+            }
+            free(&mut f, 99);
+            destroy_win(&mut f);
+        }
+        NameOverlap::GlxOnEachName => {
+            name(&mut f, 0);
+            glx_create(&mut f, 0);
+            for i in 1..5 {
+                name(&mut f, i);
+                glx_create(&mut f, i);
+                glx_destroy(&mut f, i - 1);
+                free(&mut f, i - 1);
+            }
+            glx_destroy(&mut f, 4);
+            free(&mut f, 4);
+            destroy_win(&mut f);
+        }
+        NameOverlap::NamesOutliveWindow => {
+            for i in 0..3 {
+                name(&mut f, i);
+            }
+            destroy_win(&mut f);
+            assert_held(&f, "outstanding names");
+            for i in 0..3 {
+                free(&mut f, i);
+            }
+        }
+        NameOverlap::CompositorDisconnect => {
+            for i in 0..3 {
+                name(&mut f, i);
+            }
+            glx_create(&mut f, 2);
+            yserver_core::core_loop::process_disconnect::process_disconnect(
+                &mut f.state,
+                &mut f.backend,
+                ClientId(COMP),
+            );
+            destroy_win(&mut f);
+        }
+        NameOverlap::NameAsBackground => {
+            name(&mut f, 1);
+            name(&mut f, 2);
+            set_bg(&mut f, PIX0 + 2);
+            free(&mut f, 1);
+            free(&mut f, 2);
+            destroy_win(&mut f);
+            settle(&mut f, &backings);
+            assert_held(&f, "a window background naming it");
+            set_bg(&mut f, 0); // None
+        }
+        NameOverlap::RenameWhileBackgroundDeferred => {
+            name(&mut f, 1);
+            set_bg(&mut f, PIX0 + 1);
+            free(&mut f, 1);
+            name(&mut f, 2);
+            free(&mut f, 2);
+            destroy_win(&mut f);
+            settle(&mut f, &backings);
+            assert_held(&f, "a window background naming it");
+            set_bg(&mut f, 0); // None
+        }
+        NameOverlap::ResizeAfterAFreedName => {
+            name(&mut f, 1);
+            name(&mut f, 2);
+            free(&mut f, 1);
+            let mut cfg = WIN.to_le_bytes().to_vec();
+            cfg.extend_from_slice(&0x0cu16.to_le_bytes()); // width | height
+            cfg.extend_from_slice(&0u16.to_le_bytes());
+            cfg.extend_from_slice(&120u32.to_le_bytes());
+            cfg.extend_from_slice(&70u32.to_le_bytes());
+            f.req_as(APP, 12, 0, &cfg); // ConfigureWindow
+            let rotated = f
+                .state
+                .resources
+                .pixmap(ResourceId(PIX0 + 2))
+                .and_then(|p| p.host_xid)
+                .map(|h| h.as_raw())
+                .expect("live name");
+            assert_ne!(rotated, backing, "{what}: resize rotated the backing");
+            backings.push(rotated);
+            free(&mut f, 2);
+            destroy_win(&mut f);
+        }
+    }
+    settle(&mut f, &backings);
+    assert_backings_released(&f, &backings, &what);
+    let report = f
+        .backend
+        .export_holders_report_for_tests(&collect_core_holders(&f.state));
+    for b in &backings {
+        assert!(
+            !report.iter().any(|l| l.starts_with(&format!("  0x{b:x} "))),
+            "{what}: {report:#?}"
+        );
+    }
+    true
+}
+
+/// Name twice, free both, destroy: the backing goes.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn two_overlapping_names_freed_in_order_release_the_backing() {
+    if !name_overlap_scenario(NameOverlap::TwoNamesFreedInOrder) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// picom's rename-before-free, 100 times (hardware saw alias_rc=172).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_hundred_overlapping_renames_release_the_backing() {
+    if !name_overlap_scenario(NameOverlap::HundredRenames) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// picom glx: every name carries its own GLXPixmap.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn overlapping_names_each_with_a_glx_pixmap_release_the_backing() {
+    if !name_overlap_scenario(NameOverlap::GlxOnEachName) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// The window dies first; its names keep the backing until freed.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn overlapping_names_that_outlive_the_window_release_the_backing() {
+    if !name_overlap_scenario(NameOverlap::NamesOutliveWindow) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// The compositor exits with several names outstanding.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_compositor_disconnect_releases_every_outstanding_name() {
+    if !name_overlap_scenario(NameOverlap::CompositorDisconnect) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// A freed name that is still a window background defers until it is replaced.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_name_used_as_a_background_is_held_until_the_background_changes() {
+    if !name_overlap_scenario(NameOverlap::NameAsBackground) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// A resize retargets only live names; a freed one must not move a ref onto the new backing.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_resize_after_a_freed_name_releases_both_backings() {
+    if !name_overlap_scenario(NameOverlap::ResizeAfterAFreedName) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// A second name freed while a background holds the first deferred ref.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_rename_while_a_background_holds_the_backing_does_not_leak() {
+    if !name_overlap_scenario(NameOverlap::RenameWhileBackgroundDeferred) {
+        eprintln!("skipping: no Vk");
+    }
+}

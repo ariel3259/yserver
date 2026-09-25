@@ -81,10 +81,12 @@ pub struct HostPixmapFrees {
 /// candidates through here so the decision stays
 /// `ResourceTable::host_xid_still_referenced` and never a per-call-site
 /// subset — the omissions were the #133 use-after-free/leak pair.
-fn free_orphaned_host_pixmaps(
-    state: &ServerState,
+/// `last_names` carry a freed name's last alias ref; a deferred one is recorded.
+pub(crate) fn free_orphaned_host_pixmaps(
+    state: &mut ServerState,
     backend: &mut dyn Backend,
     mut candidates: Vec<u32>,
+    last_names: &[u32],
     mut report: Option<&mut HostPixmapFrees>,
 ) {
     // Deduplicated, because a tile can arrive from more than one source — a
@@ -99,19 +101,62 @@ fn free_orphaned_host_pixmaps(
     candidates.sort_unstable();
     candidates.dedup();
     for xid in candidates {
-        if crate::backend::PixmapHandle::from_raw(xid)
-            .is_some_and(|handle| state.resources.host_xid_still_referenced(handle))
+        if let Some(handle) = crate::backend::PixmapHandle::from_raw(xid)
+            && state.resources.host_xid_still_referenced(handle)
         {
+            if last_names.contains(&xid) {
+                state.resources.defer_name_ref(handle);
+            }
             if let Some(report) = report.as_deref_mut() {
                 report.deferred.push(xid);
             }
             continue;
         }
-        let _ = backend.free_pixmap(None, xid);
+        match crate::backend::PixmapHandle::from_raw(xid) {
+            Some(handle) if last_names.contains(&xid) => {
+                let _ = backend.release_window_pixmap_name(None, handle);
+            }
+            _ => {
+                let _ = backend.free_pixmap(None, xid);
+            }
+        }
+        state.resources.host_pixmap_freed(xid);
         if let Some(report) = report.as_deref_mut() {
             report.freed.push(xid);
         }
     }
+}
+
+/// One alias ref per removed name (Xorg `compext.c:260`); each LAST ref goes to the orphan gate.
+pub(crate) fn release_removed_names(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<crate::backend::OriginContext>,
+    names: &[crate::backend::PixmapHandle],
+) -> Vec<u32> {
+    let mut per_backing: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for name in names {
+        *per_backing.entry(name.as_raw()).or_default() += 1;
+    }
+    let mut last = Vec::new();
+    for (xid, mut refs) in per_backing {
+        let Some(handle) = crate::backend::PixmapHandle::from_raw(xid) else {
+            continue;
+        };
+        // Another live name, or an already-deferred ref, keeps the backing alive for the gate.
+        if !state.resources.host_xid_named_by_pixmap(handle)
+            && !state.resources.has_deferred_name_ref(handle)
+        {
+            refs -= 1;
+            last.push(xid);
+        }
+        for _ in 0..refs {
+            if let Err(err) = backend.release_window_pixmap_name(origin, handle) {
+                log::warn!("release_window_pixmap_name(0x{xid:x}) failed: {err}");
+            }
+        }
+    }
+    last
 }
 
 /// Drop every server-side resource owned by `client_id` and free the
@@ -548,9 +593,11 @@ pub fn process_disconnect_reporting(
     // `A` creating a tile, `B` bordering with it and `A` disconnecting left
     // `B` sampling freed GPU storage (#133). The client's own windows and GCs
     // are gone by this point, so the gate sees only survivors.
+    let last_names = release_removed_names(state, backend, None, &removed.freed_names);
     let mut freeable = removed.freed_pixmaps;
     freeable.extend(attr_pixmap_xids);
-    free_orphaned_host_pixmaps(state, backend, freeable, host_pixmap_frees);
+    freeable.extend(&last_names);
+    free_orphaned_host_pixmaps(state, backend, freeable, &last_names, host_pixmap_frees);
     for (pic_xid, owned_pix) in removed.freed_pictures {
         let _ = backend.render_free_picture(None, pic_xid);
         if let Some(pix_xid) = owned_pix {
@@ -784,9 +831,11 @@ pub fn destroy_zombie_resources_reporting(
     // `A` creating a tile, `B` bordering with it and `A` disconnecting left
     // `B` sampling freed GPU storage (#133). The client's own windows and GCs
     // are gone by this point, so the gate sees only survivors.
+    let last_names = release_removed_names(state, backend, None, &removed.freed_names);
     let mut freeable = removed.freed_pixmaps;
     freeable.extend(attr_pixmap_xids);
-    free_orphaned_host_pixmaps(state, backend, freeable, host_pixmap_frees);
+    freeable.extend(&last_names);
+    free_orphaned_host_pixmaps(state, backend, freeable, &last_names, host_pixmap_frees);
     for (pic_xid, owned_pix) in removed.freed_pictures {
         let _ = backend.render_free_picture(None, pic_xid);
         if let Some(pix_xid) = owned_pix {
@@ -1182,6 +1231,63 @@ mod tests {
                 .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE))),
             "an unreferenced tile must still be freed on disconnect"
         );
+    }
+
+    /// A disconnect releases one ref per name on a shared backing; a background defers only the last.
+    #[test]
+    fn disconnect_releases_one_ref_per_window_pixmap_name() {
+        for as_background in [false, true] {
+            const HOST: u32 = 0x9999_0051;
+            let host = crate::backend::PixmapHandle::from_raw(HOST).expect("non-zero");
+            let names = [0x0070_0051, 0x0070_0052, 0x0070_0053].map(ResourceId);
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            install_client(&mut state, 7);
+            install_client(&mut state, 8);
+            for name in names {
+                state.resources.create_pixmap(
+                    ClientId(7),
+                    CreatePixmapRequest {
+                        pixmap: name,
+                        drawable: ROOT_WINDOW,
+                        width: 16,
+                        height: 16,
+                        depth: 24,
+                    },
+                );
+                assert!(state.resources.set_pixmap_host_xid(name, host));
+                state.resources.mark_pixmap_composite_name(name);
+            }
+            if as_background {
+                state.resources.create_window(
+                    ClientId(8),
+                    CreateWindowRequest {
+                        depth: 24,
+                        window: ResourceId(0x0080_0001),
+                        parent: ROOT_WINDOW,
+                        width: 10,
+                        height: 10,
+                        class: 1,
+                        visual: crate::resources::ROOT_VISUAL,
+                        background_pixmap: Some(names[1]),
+                        ..Default::default()
+                    },
+                );
+                assert!(state.resources.host_xid_still_referenced(host));
+            }
+            let frees = |backend: &RecordingBackend| {
+                backend
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, RecordedCall::FreePixmap(HOST)))
+                    .count()
+            };
+            process_disconnect(&mut state, &mut backend, ClientId(7));
+            let held = usize::from(as_background);
+            assert_eq!(frees(&backend), 3 - held, "background={as_background}");
+            process_disconnect(&mut state, &mut backend, ClientId(8));
+            assert_eq!(frees(&backend), 3, "background={as_background}");
+        }
     }
 
     /// #133: the leak on the other side of the same gate. A tile kept alive
