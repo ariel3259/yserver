@@ -1,6 +1,13 @@
 # Stage 3c-i — VT switching on the Owner
 
-> **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3ci_`, `c0_3bi_`, `c0_3bii_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm`, `c0_merge_` — with `--include-ignored --skip _drm` only when the prompt records the user's GPU approval; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, a VT switch, or anything that performs a modeset or takes DRM master: the hardware test of Task 10 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
+> **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3ci_`, `c0_3bi_`, `c0_3bii_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm`, `c0_merge_` — with `--include-ignored --skip _drm` only when the prompt records the user's GPU approval; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, a VT switch, or anything that performs a modeset or takes DRM master: the hardware test of Task 8 is **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
+
+**Revision 2 (2026-09-26, coordinator)** — codex round 1 (2 blocking, 2 major,
+all confirmed, `../findings/2026-09-26-stage-3c-i-plan-review-round1.md`): a
+per-device acquire probe (B-1); the hand-off and the unknown-outcome closure
+co-delivered, the mixed-server scoping moved into Task 1, the urgent
+withdrawal its own task before them, 8 tasks (B-2); the `AcquireEpisode`
+owner (M-1); core-level gate tests for the urgent withdrawal (M-2).
 
 **Goal:** a VT switch on an Owner device is a `VTRelease`/`VTAcquire` lifecycle
 transition executed through the executor, with prompt obligations that never
@@ -53,24 +60,24 @@ revision 5 — §3 (all), §5 exceptions 1, 3, 4, 5, §6 (VT half). Umbrella:
 6. Spec §6.1 tests that move between the two plans: `c0_3ci_acquire_skips_a_removed_device`
    and `c0_3ci_acquire_probe_no_reply_withdraws_owner_device` go to **3c-ii**
    (they need device removal and the asynchronous probe);
-   `urgent_withdrawal_hides_unpublished_modeset` comes **here** (Task 4) as
-   `c0_3ci_urgent_withdrawal_hides_unpublished_modeset_vulkan`, because the
-   mechanism lands here. 3c-ii's plan lists the first two.
+   `urgent_withdrawal_hides_unpublished_modeset` comes **here** as
+   `c0_3ci_core_withdrawal_only_subtracts` (Task 2), because the mechanism
+   lands here. 3c-ii's plan lists the first two.
 
 ## Review Focus
 
 1. A release while a client modeset is dispatched on the same device, with
-   a client reading `GetScreenResources` in between (Task 1, Task 4).
+   a client reading `GetScreenResources` in between (Tasks 1, 2).
 2. A release commit that never answers — the helper stuck in the ioctl —
-   and a later VT return (Task 4 `c0_3ci_unknown_release_closes_the_incarnation`).
-3. Ctrl-Alt-F2, F1, F2 in quick succession (Task 8).
-4. A two-GPU box where one Owner device's acquire probe fails (Task 7
+   and a later VT return (Task 3 `c0_3ci_unknown_release_closes_the_incarnation_vulkan`).
+3. Ctrl-Alt-F2, F1, F2 in quick succession (Task 7).
+4. A two-GPU box where one Owner device's acquire probe fails (Task 6
    `c0_3ci_acquire_mixed_success_vulkan`).
-5. A mixed server whose Legacy suspend runs long (Task 9).
+5. A mixed server whose Legacy suspend runs long (Task 3).
 
 ---
 
-## Task 1 — `VTRelease` enters the arbiter; prompt obligations at once (spec §3.1 step 1)
+## Task 1 — `VTRelease` enters the arbiter; prompt obligations; scoped Legacy suspend (spec §3.1 steps 1, 3)
 
 **Deliver:** on a server with at least one Owner device, `on_vt_release`
 calls the coordinator's `set_seat_target(Released)` and queues the
@@ -81,24 +88,56 @@ commit in the device slot: pause input; synthesize held key/button releases;
 DPMS protocol level 0 and `last_activity` reset (as `run_suspend`); close
 admission on every Owner device (Presents answered through 3a's per-CRTC
 blackout); pause the resource service's serviced-time budget. `VtState`
-becomes `Suspending`. A Legacy-only server keeps today's path byte for byte.
-
-**Invariants:** no prompt obligation depends on an executor reply or on the
-device slot; the Legacy-only path is unchanged.
+becomes `Suspending`. *(Rev 2, B-2.)* On a **mixed** server the Legacy devices
+run today's suspend **scoped** to them (`_for_devices` helpers) in this same
+task, so no task leaves a mixed release unscoped; its budget cap arrives with
+the hand-off (Task 3). Until Task 3 lands, the remainder of today's release sequence runs
+unchanged after the prompt obligations, so every intermediate tree is as
+safe as today's. A Legacy-only server
+keeps today's path byte for byte.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3ci_prompt_obligations_never_wait_vulkan` | an Owner device with a **dispatched** client modeset (3b) and no executor reply; `on_vt_release`: input paused, held keys released, seat `Released` in the coordinator, admission closed, a Present answered by blackout — all before the executor answers | **V1** gate the prompt obligations on the device slot being idle |
 | `c0_3ci_legacy_only_release_unchanged` | a Legacy-only server: the call sequence of `on_vt_release` equals today's (recorded seam) | **V2** route a Legacy-only server through `set_seat_target` |
+| `c0_3ci_mixed_server_release_scopes_legacy_vulkan` | Legacy + Owner: the Legacy all-off touches only the Legacy device; the Owner device receives no Legacy write | **V24** run the unscoped Legacy suspend |
 
-## Task 2 — the release commit (spec §3.1 step 2)
+## Task 2 — the urgent withdrawal publication (spec §4.1 rev 5)
 
-**Deliver:** per Owner device, the `VTRelease` transition's physical step is
+**Deliver** (yserver-core + the backend's emitter): a new requester-less
+publication kind, **urgent withdrawal**, that the core publishes at once,
+**bypassing the `RandrMutationGate` FIFO** even while an install-capable
+mutation holds it, and that only **subtracts** the named outputs and CRTCs
+from the **published** projection and emits the notifications for that
+removal — it never rebuilds from the backend model. Every other publication
+keeps being built from the backend model. The driver executes
+`LifecycleAction::WithdrawOutputs` by withdrawing the device's outputs from
+the backend model and emitting one urgent withdrawal. No caller raises it yet
+in production except through Task 3; this task's tests raise it through the
+driver action.
+
+*(Rev 2, M-2.)* Two test layers: the **core** layer uses the existing
+`yserver-core` core-loop gate tests (`c0_3bii_` in `core_loop/run.rs`, e.g.
+`c0_3bii_queries_read_published_state`) — a real `RandrMutationGate` holding
+a mutation, a retained `ServerState` and client reads; the **backend** layer
+uses the core-entry driver and proves the backend emits the urgent kind with
+the right outputs.
+
+| Test | Scenario | Must fail under |
+| --- | --- | --- |
+| `c0_3ci_core_withdrawal_bypasses_the_gate` (yserver-core) | the gate holds an install-capable mutation; an urgent withdrawal arrives: the listener receives the withdrawal's notifications before the mutation's reply | **V11** queue the withdrawal behind the gate |
+| `c0_3ci_core_withdrawal_only_subtracts` (yserver-core) | the backend model already holds another mutation's promoted-but-unpublished change; a client reads between the withdrawal and that mutation's publication: it sees the withdrawal and not the change; after the publication, both | **V10** build the withdrawal publication from the backend model |
+| `c0_3ci_withdraw_outputs_emits_urgent_withdrawal_vulkan` | the driver executes `WithdrawOutputs` for an Owner device: its outputs leave the backend model and exactly one urgent withdrawal naming them is emitted | **V27** emit an ordinary requester-less publication |
+
+## Task 3 — the release commit, the bounded hand-off and the release outcomes (spec §3.1 steps 2–6)
+
+**Deliver — the commit:** per Owner device, the `VTRelease` transition's physical step is
 one lifecycle commit with 3a's DPMS-off shape: `ACTIVE=0` on every lit CRTC,
 MODE_ID and the primary plane untouched, every turned-off CRTC in
 `ExpectedCompletionCrtcs` with a required out-fence. When the slot holds a
 dispatched commit, the release commit is queued behind it (no preemption). A
-poisoned or already-dark device issues none.
+poisoned or already-dark device issues none. Dispatched **before** the scoped
+Legacy suspend of a mixed server (spec rev 4, B-3).
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
@@ -106,46 +145,37 @@ poisoned or already-dark device issues none.
 | `c0_3ci_release_commit_waits_behind_dispatched_modeset_vulkan` | release while a client modeset is dispatched: the release commit is sent only after the modeset's terminal result | **V4** send the release commit while the slot is occupied |
 | `c0_3ci_dark_device_contributes_no_commit_vulkan` | DPMS already off: no release commit | **V5** send `ACTIVE=0` to dark CRTCs |
 
-## Task 3 — the bounded hand-off (spec §3.1 step 4)
+**Deliver — the hand-off and the outcomes:**
 
-**Deliver:** the release deadline (release signal + 1 s) is armed as a
-`next_wakeup` deadline. The hand-off — `drmDropMaster` on every device, then
-`VT_RELDISP(1)`, then `VtState::Suspended` — happens at the first of "every
-Owner device's release commit is terminal" and the deadline, from the
-completion path or the wakeup, never by polling.
+- The release deadline (release signal + 1 s, absolute) is a `next_wakeup`
+  deadline. The hand-off — `drmDropMaster` on every device, then
+  `VT_RELDISP(1)`, then `VtState::Suspended` — happens at the first of "every
+  Owner device's release commit is terminal" and the deadline, from the
+  completion path or the wakeup, never by polling.
+- On a mixed server, every bounded wait of the scoped Legacy suspend (its
+  DRM-event drain, GPU idle) is capped at the **remaining** budget; a blocking
+  Legacy ioctl is the named limitation (spec §5.5) and nothing tries to bound it.
+- *Known outcome* (completed, or rejected with known completion): the
+  incarnation stays healthy.
+- *Unknown outcome* (`CompletionUnknown`, in flight at the deadline, executor
+  dead): C.0 §10 VT-release row — `StopAliasCreation`, request executor/helper
+  termination, record the `REC-6` invalidation, retain any unreaped executor
+  and the complete fd set in `ExecutorStalled`, quarantine; the incarnation is
+  **closed forever**; `WithdrawOutputs` (Task 2) withdraws its outputs.
+- Late results of the dead epoch change nothing.
+- **At acquire, a closed incarnation is never submitted to**: until Task 5,
+  `on_vt_acquire` skips closed Owner devices (they stay withdrawn) and keeps
+  today's resume for the rest.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3ci_release_hands_off_after_commit_vulkan` | the commit completes at 100 ms (driver time): drop master + `VT_RELDISP(1)` right after, in that order | **V6** send `VT_RELDISP` before the commit's terminal result |
 | `c0_3ci_release_hands_off_at_the_bound_vulkan` | the executor never answers: hand-off at exactly the deadline through `next_wakeup` | **V7** do not arm the deadline as a wakeup |
-
-## Task 4 — release outcomes; urgent withdrawal (spec §3.1 step 5, §4.1 rev 5)
-
-**Deliver:**
-- *Known outcome* (completed, or rejected with known completion): the
-  incarnation stays healthy; acquire reinstalls on it.
-- *Unknown outcome* (`CompletionUnknown`, in flight at the deadline, executor
-  dead): C.0 §10 VT-release row — `StopAliasCreation`, request executor/helper
-  termination, record the `REC-6` invalidation, retain any unreaped executor
-  and the complete fd set in `ExecutorStalled`, quarantine; the incarnation is
-  closed forever; the driver executes `WithdrawOutputs` as an **urgent
-  withdrawal**.
-- **Urgent withdrawal publication** (yserver-core): a new requester-less
-  publication kind that bypasses the `RandrMutationGate` FIFO even while an
-  install-capable mutation holds it, and that only **subtracts** the device's
-  outputs and CRTCs from the published projection and emits the notifications
-  for that removal. Every other publication keeps being built from the
-  backend model (which already excludes the withdrawn device).
-- Late results of the dead epoch change nothing (3a/3b rule).
-
-| Test | Scenario | Must fail under |
-| --- | --- | --- |
-| `c0_3ci_unknown_release_closes_the_incarnation_vulkan` | the release commit is in flight at the deadline: helper termination requested, `ExecutorStalled`, outputs withdrawn and published once; after a later acquire, no submission reaches the old incarnation | **V8** reinstall on the old incarnation at acquire |
+| `c0_3ci_unknown_release_closes_the_incarnation_vulkan` | the release commit is in flight at the deadline: helper termination requested, `ExecutorStalled`, outputs withdrawn by one urgent withdrawal; after a later acquire, no submission reaches the old incarnation | **V8** submit to the old incarnation at acquire |
 | `c0_3ci_late_release_result_changes_nothing_vulkan` | the release commit's completion arrives after the hand-off: installed state, pools and publication unchanged | **V9** apply the late completion |
-| `c0_3ci_urgent_withdrawal_hides_unpublished_modeset_vulkan` | two Owner devices; A's client modeset is promoted but not yet published; B's release is unknown: a client reading between B's withdrawal and A's publication sees B withdrawn and A unchanged; after A's publication, both | **V10** build the withdrawal publication from the backend model |
-| `c0_3ci_withdrawal_bypasses_the_gate_vulkan` | an unrelated install-capable mutation holds the gate: the withdrawal reaches the listener before that mutation's reply | **V11** queue the withdrawal behind the gate |
+| `c0_3ci_mixed_release_legacy_suspend_consumes_the_budget_vulkan` | the Legacy drain is made to use its whole allowance (a fixture seam on the drain's clock): the hand-off still happens at the absolute deadline | **V25** give the Legacy drain a fixed 1 s |
 
-## Task 5 — while released (spec §3.2)
+## Task 4 — while released (spec §3.2)
 
 **Deliver:** `RRSetCrtcConfig` answers `Failed` (`SeatReleased`, existing);
 `DPMSForceLevel` updates the protocol level, hardware
@@ -159,16 +189,20 @@ recorded, not probed; lifecycle events below `VTRelease` in precedence are
 | `c0_3ci_requests_while_released_match_legacy_vulkan` | Legacy vs Owner, while released: `SetCrtcConfig` bytes, `DPMSForceLevel` + `DPMSInfo` bytes, no executor send on Owner | **V12** dispatch a request to KMS while released |
 | `c0_3ci_dpms_while_released_applies_at_acquire_vulkan` | DPMS off while released, then acquire: the reinstall installs `ACTIVE=0` | **V13** drop the deferred DPMS level |
 
-## Task 6 — acquire: master, probe, order, input (spec §3.3 opening, rev 3–4)
+## Task 5 — acquire: master, probe, order, input (spec §3.3 opening, rev 3–4)
 
 **Deliver:** `on_vt_acquire` on a server with an Owner device: `VT_ACKACQ`;
 bounded `drmSetMaster` over the devices still present (a present device that
-fails keeps today's exit); the synchronous combined probe over every device;
+fails keeps today's exit); *(rev 2, B-1)* a synchronous **per-device** probe:
+a new platform entry returns one result per open device, keyed by
+`DrmDeviceKey` (`Ok(snapshot)` or `Err`), probing every device even after one
+fails — today's `probe_connector_snapshot` stops at the first error and keeps
+its behaviour for the Legacy-only path;
 then, in this order: scoped Legacy resume for the Legacy devices (today's
 `run_resume` steps through `_for_devices` helpers); the per-participant
 dispositions of spec §3.3's table (a healthy Owner device with a good probe
-starts its `VTAcquire` transition — Task 7; an Owner device whose probe
-failed is closed and **urgently withdrawn** with Task 4's publication; a
+starts its `VTAcquire` transition — Task 6; an Owner device whose probe
+failed is closed and **urgently withdrawn** with Task 2's publication; a
 Legacy device whose probe failed keeps today's exit); then `VtState::Active`,
 input resumes, xkb resyncs — **not** waiting for any Owner commit.
 `set_seat_target(Owned)` is the arbiter entry.
@@ -177,9 +211,10 @@ input resumes, xkb resyncs — **not** waiting for any Owner commit.
 | --- | --- | --- |
 | `c0_3ci_mixed_server_acquire_runs_scoped_legacy_resume_vulkan` | Legacy + Owner: the Legacy device relights (recorded calls) before input resumes; the Owner device's reinstall starts | **V14** skip the scoped Legacy resume |
 | `c0_3ci_acquire_probe_error_withdraws_owner_device_vulkan` | the Owner device's probe fails: it is closed and withdrawn (one urgent publication); the server continues | **V15** keep today's exit for an Owner device |
+| `c0_3ci_per_device_probe_collects_every_result` | three devices, the second fails: the first and third results are returned, the second is `Err` | **V28** stop at the first error |
 | `c0_3ci_input_resumes_before_owner_reinstall_vulkan` | the reinstall commit is not answered: input is already resumed and `VtState` is `Active` | **V16** resume input only at the reinstall's `Applied` |
 
-## Task 7 — the reinstall (spec §3.3 steps 3–6)
+## Task 6 — the reinstall (spec §3.3 steps 3–6)
 
 **Deliver:** per healthy Owner device, one `ALLOW_MODESET` lifecycle commit
 that installs the desired topology from scratch with 3b's execution (fresh
@@ -192,15 +227,26 @@ survive (composed primaries installed). If the topology changed while away,
 one publication for the acquire episode, requester-less, with Legacy
 `run_resume`'s events for the same difference; no publication otherwise.
 
+*(Rev 2, M-1.)* **The acquire episode has an owner:** an `AcquireEpisode`
+record in the backend, created by `on_vt_acquire`, holding the participant
+set (healthy Owner devices that started a reinstall; Legacy devices are
+terminal once their scoped resume returns; urgently withdrawn devices leave
+it). It takes one requester-less gate turn from the first reinstall dispatch
+to its publication, marks each participant terminal on its reinstall's
+terminal result (`Applied`, rejected, unknown — the spec §4.1 outcome table),
+and publishes **once**, when every remaining participant is terminal; a
+release arriving first ends the episode without a publication (Task 7).
+
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3ci_acquire_reinstalls_from_scratch_vulkan` | the pre-release installed state is altered in the fixture (as another master would): the reinstall's commit description is identical to the one built from the desired topology alone | **V17** build the reinstall from the pre-release installed state |
 | `c0_3ci_acquire_honours_dpms_off_vulkan` | protocol DPMS off at acquire: the reinstall installs `ACTIVE=0` and no frame is admitted | **V18** reinstall lit regardless of DPMS |
 | `c0_3ci_acquire_mixed_success_vulkan` | two Owner devices, B's probe fails: A reinstalls and composes; B is withdrawn urgently; the acquire publication covers A only | **V19** skip A's reinstall because B failed |
+| `c0_3ci_acquire_episode_waits_for_every_participant_vulkan` | two healthy Owner devices, the topology changed while away; A's reinstall is `Applied`, B's is held in flight: no publication; when B is terminal, exactly one | **V29** publish when the first participant applies |
 | `c0_3ci_direct_does_not_survive_the_switch_vulkan` | direct current at release: after acquire the primary is composed; a later Present re-enters direct through eligibility | **V20** reinstall the direct buffer |
 | `c0_3ci_vt_switch_emits_nothing_vulkan` | release + acquire with no topology change: zero bytes to every connection, Legacy vs Owner | **V21** publish at acquire unconditionally |
 
-## Task 8 — rapid switching (spec §3.4)
+## Task 7 — rapid switching (spec §3.4)
 
 **Deliver:** `VTRelease` outranks `VTAcquire`. A release arriving while an
 acquire's reinstall is not yet dispatched supersedes it (`REC-4`, nothing is
@@ -212,22 +258,7 @@ bound.
 | `c0_3ci_release_supersedes_undispatched_acquire_vulkan` | acquire then release before the reinstall is dispatched: no reinstall commit reaches the executor; hand-off as Task 3 | **V22** dispatch the superseded reinstall |
 | `c0_3ci_release_after_dispatched_reinstall_vulkan` | the reinstall is dispatched: the release commit follows its terminal result, hand-off inside the bound | **V23** preempt the dispatched reinstall |
 
-## Task 9 — mixed-server release (spec §3.1 step 3, rev 4–5)
-
-**Deliver:** on a mixed server the Owner release commits are dispatched
-**first**, then the scoped Legacy suspend runs on the core with every bounded
-wait (its DRM-event drain, GPU idle) capped at the **remaining** budget of the
-absolute deadline; then the delivered Owner completions are drained and the
-hand-off happens at the first of "all Owner terminal" and the deadline. A
-blocking Legacy KMS ioctl is the named limitation (spec §5.5): no code tries
-to bound it.
-
-| Test | Scenario | Must fail under |
-| --- | --- | --- |
-| `c0_3ci_mixed_server_release_scopes_legacy_vulkan` | Legacy + Owner: the Legacy all-off touches only the Legacy device; the Owner device receives only its release commit | **V24** run the unscoped Legacy suspend |
-| `c0_3ci_mixed_release_legacy_suspend_consumes_the_budget_vulkan` | the Legacy drain is made to use its whole allowance (a fixture seam on the drain's clock): the hand-off still happens at the absolute deadline | **V25** give the Legacy drain a fixed 1 s |
-
-## Task 10 — coverage, differential and the hardware test (spec §6.3, §6.5)
+## Task 8 — coverage, differential and the hardware test (spec §6.3, §6.5)
 
 **Deliver:** the `vt` writer-coverage evidence flips to proven, citing this
 plan's tests and naming the deferred rows (it claims nothing for them). The
@@ -244,7 +275,7 @@ skips with a logged reason when stdin is not a VT.
 | `c0_3ci_vt_writer_coverage_proven` | the coverage evidence reports `vt` proven, citing the tests; the deferred rows are named, not claimed | **V26** leave `vt` unproven while claiming the evidence |
 
 Coordinator (C): runs `c0_hw_3c_vt_switch_on_card1_drm` × 3 from a tty with
-the user's approval after Tasks 2, 3, 7 and 10.
+the user's approval after Tasks 3, 6 and 8.
 
 ## Gate (every task)
 
