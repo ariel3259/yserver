@@ -469,11 +469,18 @@ pub struct KmsIoExecutor {
     in_flight: Option<InFlight>,
     queued_terminal_event: Option<HostCallEvent>,
     helper_pid: Option<libc::pid_t>,
+    #[cfg(test)]
+    sent_requests_for_tests: usize,
 }
 
 impl KmsIoExecutor {
     pub(crate) fn owner_identity(&self) -> (IncarnationId, LifecycleEpochId) {
         (self.incarnation, self.lifecycle_epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sent_requests_for_tests(&self) -> usize {
+        self.sent_requests_for_tests
     }
 
     #[allow(dead_code)]
@@ -853,6 +860,12 @@ impl KmsIoExecutor {
             let reason = self.classify_channel_loss(Some(&err));
             self.queued_terminal_event = self.terminalize_unknown(reason);
             return Err(SendError::Ipc);
+        }
+        #[cfg(test)]
+        {
+            // Count every request frame that crossed the executor socket,
+            // including probes and queued sequence work.
+            self.sent_requests_for_tests = self.sent_requests_for_tests.saturating_add(1);
         }
         Ok(())
     }
@@ -1522,6 +1535,8 @@ pub(crate) fn spawn_internal_full(
         in_flight: None,
         queued_terminal_event: None,
         helper_pid: None,
+        #[cfg(test)]
+        sent_requests_for_tests: 0,
     })
 }
 

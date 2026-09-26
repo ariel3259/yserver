@@ -1982,6 +1982,86 @@ impl SceneCompositor {
         retired_offers
     }
 
+    /// Apply a logical output move without replacing its scene state. A root
+    /// storage replacement makes every output's previous scanout contents
+    /// stale; otherwise only the moved output needs to be repainted.
+    pub(crate) fn promote_output_position(
+        &mut self,
+        key: &OutputKey,
+        x: i32,
+        y: i32,
+        root_storage_changed: bool,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some(target_idx) = inner
+            .outputs
+            .iter()
+            .position(|state| state.output_key == *key)
+        else {
+            return;
+        };
+        inner.outputs[target_idx].output_origin = (x, y);
+        for (output_idx, state) in inner.outputs.iter_mut().enumerate() {
+            if output_idx == target_idx || root_storage_changed {
+                state.damage.invalidate();
+                state.scene_structure_damage.add(vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: state.output_extent,
+                });
+            }
+        }
+        self.scene_structure_dirty = true;
+        self.root_overlay_clear();
+    }
+
+    /// A layout promotion may withdraw an owner-composed offer that has not
+    /// crossed the executor boundary. Keep the scene's buffer owner until its
+    /// render/copy proof is ready, but make it impossible to dispatch pixels
+    /// composed for the old layout.
+    pub(crate) fn invalidate_queued_owner_offer(&mut self, offer: ComposedOffer) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        let Some(output_idx) = inner.outputs.iter().position(|state| {
+            state.output_key.device_key == offer.device
+                && state.output_instance_id == offer.output_instance_id
+        }) else {
+            return false;
+        };
+        {
+            let state = &mut inner.outputs[output_idx];
+            let Some(index) = state.owner_buffers.iter().position(|buffer| {
+                buffer.identity().crtc == offer.crtc
+                    && buffer.identity().generation == offer.generation
+                    && matches!(
+                        buffer.state(),
+                        OwnerBufferState::Rendering
+                            | OwnerBufferState::Desired
+                            | OwnerBufferState::Displaced
+                    )
+            }) else {
+                return false;
+            };
+            if matches!(
+                state.owner_buffers[index].state(),
+                OwnerBufferState::Rendering | OwnerBufferState::Desired
+            ) {
+                let buffer = state.owner_buffers.remove(index);
+                match buffer.into_displaced() {
+                    Ok(buffer) => state.owner_buffers.insert(index, buffer),
+                    Err(buffer) => {
+                        state.owner_buffers.insert(index, *buffer);
+                        return false;
+                    }
+                }
+            }
+        }
+        inner.owner_offers.retain(|candidate| *candidate != offer);
+        true
+    }
+
     /// A completed client modeset has displaced the old pool's current
     /// framebuffer. Move that scene record into the same release state used
     /// by a composed replacement so the retired bundle can consume its KMS
@@ -2153,6 +2233,20 @@ impl SceneCompositor {
             .as_mut()
             .map(|inner| inner.owner_offers.drain(..).collect())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn queued_owner_offers_for_outputs(
+        &self,
+        outputs: &HashSet<(crate::platform::drm::DrmDeviceKey, OutputInstanceId)>,
+    ) -> Vec<ComposedOffer> {
+        self.inner.as_ref().map_or_else(Vec::new, |inner| {
+            inner
+                .owner_offers
+                .iter()
+                .copied()
+                .filter(|offer| outputs.contains(&(offer.device, offer.output_instance_id)))
+                .collect()
+        })
     }
 
     fn owner_buffer_index(state: &OutputSceneState, bo_idx: usize) -> Option<usize> {
@@ -3317,6 +3411,32 @@ impl SceneCompositor {
             .outputs
             .get(output_idx)
             .map(|state| state.output_instance_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_scene_identity_for_tests(&self, output_idx: usize) -> Option<usize> {
+        self.inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)
+            .map(|state| std::ptr::from_ref(state) as usize)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_origin_for_tests(&self, output_idx: usize) -> Option<(i32, i32)> {
+        self.inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)
+            .map(|state| state.output_origin)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_pool_release_count_for_tests(&self, output_idx: usize) -> usize {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map_or(0, |state| state.pending_pool_releases.len())
     }
 
     #[cfg(test)]
