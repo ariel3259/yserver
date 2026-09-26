@@ -33,6 +33,54 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-25 SetModifierMapping edits the real keymap (#171 phase 3,
+  branch `feat/171-xkb-keymap-mutation`):** core `SetModifierMapping` and XI1
+  `SetDeviceModifierMapping` share Xorg's `change_modmap` in the core loop
+  (BadValue for a duplicate keycode, value 0, or a keycode < 8, the lowest;
+  MappingBusy when a new or old modifier key is held, Xorg's off-by-one on 255
+  kept), then `Backend::set_modifier_mapping` rewrites the keymap's
+  `modifier_map` and reinstalls it. `modifier_mapping_override` /
+  `xi1_modifier_map` stay only as the fallback for backends without an XKB
+  keymap. New `kms::xkb_derive` replays Xorg's `XkbApplyCompatMapToKey` /
+  `XkbUpdateDescActions` / `XkbApplyVirtualModChanges` over the V1 dump: GetMap
+  now sends Xorg's per-key modifier actions and vmodmap and the vmod table in
+  Xorg's indices (was guessed from keysym names; the IndicatorMap/NamedIndicator
+  vmod divergence is gone), and MapNotify carries Xorg's exact action / vmodmap /
+  type / vmod ranges, quirks included, for SetModifierMapping and now also
+  ChangeKeyboardMapping (was a fixed `0x0012` over the requested keys, wrong for
+  mixed keys). Xorg keeps the mapping of a vmod no key names any more; the edit
+  pins it in `virtual_modifiers` so cooking matches. The vmodmap Xorg keeps on
+  keys no interpret matches lives in `KmsCore::xkb_stale_vmodmap`.
+  IndicatorMapNotify encoder added. Per-key repeat is derived with Xorg's rule
+  (fixes the startup bits of `<ALT>`/`<META>`/`<SUPR>`, golden
+  `xorg-per-key-repeat.txt`); a keymap load keeps it, as Xorg's
+  `XkbCopyControls` does (captured). Found on the way: libxkbcommon ≥ 1.12
+  drops unused interprets/types from `get_as_string`, which lost e.g.
+  `Any+Exactly(Lock)` on every edit; edits now dump with
+  `XKB_KEYMAP_SERIALIZE_KEEP_UNUSED` (`xkb_edit::keymap_text`). GetModifierMapping
+  reports kpm 0 for an empty map. Golden: `xorg-xkb-set-modifier-mapping.txt`
+  (40 cases), test `xkb_view_of_set_modifier_mapping_matches_xorg`; caps-as-control
+  end to end in `xmodmap_caps_as_control_reaches_key_cooking`. Phase 4 (XKB
+  SetMap & co) next.
+
+- **2026-09-25 ChangeKeyboardMapping edits the real keymap (#171 phase 2,
+  branch `feat/171-xkb-keymap-mutation`):** core `ChangeKeyboardMapping` and
+  XI1 `ChangeDeviceKeyMapping` no longer write the `core_map_overrides`
+  overlay (removed). `xkb::core_mapping_change` (the `XkbUpdateKeyTypesFromCore`
+  port) yields each changed key's groups with explicit type names;
+  `xkb_edit::set_key` writes them into the live keymap text, which is
+  recompiled and installed. Cooking, XKB GetMap and GetKeyboardMapping read
+  the one keymap. Xorg's explicit-type mask lives in `KmsCore` (taken from
+  the loaded keymap, kept across edits); implicitly typed protected groups
+  get their type name from a probe compile. XKB `MapNotify(0x0012)` →
+  core `MappingNotify` → `ControlsNotify(PerKeyRepeat)` in Xorg's order; the
+  per-key repeat is seeded from the keymap at startup (Xorg
+  `XkbFinishInit`), re-derived for changed keys, and GetControls reports it.
+  The XKB keycode range is 8..=255 (was xkbcommon's lowest named keycode, 9).
+  Golden: `xorg-xkb-change-keyboard-mapping.txt`, test
+  `xkb_view_of_change_keyboard_mapping_matches_xorg`. Phase 3
+  (SetModifierMapping) next.
+
 - **2026-09-17 on-screen reads follow the directly-flipped buffer:** while a
   CRTC scans out a client buffer directly, the compositor's pool BOs are not
   painted at all (`retire_direct_output` calls `invalidate_all_scanout_damage`
