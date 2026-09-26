@@ -51,7 +51,10 @@ use crate::{
         pointer_fanout::replay_frozen_pointer_event_to_state,
     },
     properties,
-    resources::{BorderSource, COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
+    resources::{
+        BorderSource, COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, ViewabilityDelta,
+        Window,
+    },
     server::{
         PendingPresentPixmap, PendingPresentRequest, ScreenSaverActive, ServerState, XI_FIRST_EVENT,
     },
@@ -360,7 +363,7 @@ pub fn process_request(
         91 => handle_query_colors(state, client_id, sequence, body),
         92 => handle_lookup_color(state, client_id, sequence, body),
         // ── keyboard mapping (server-wide MappingNotify + backend proxy) ──
-        100 => handle_change_keyboard_mapping(state, client_id, sequence, header, body),
+        100 => handle_change_keyboard_mapping(state, backend, client_id, sequence, header, body),
         101 => handle_get_keyboard_mapping(state, backend, origin, client_id, sequence, body),
         // ── save-set + cursor lifecycle ──
         6 => handle_change_save_set(state, client_id, sequence, header, body),
@@ -911,6 +914,14 @@ fn activate_redirect_backing_for(
     if window == COMPOSITE_OVERLAY_WINDOW {
         return;
     }
+    // compCheckRedirect allocates only for a realized window (compwindow.c:162); realize does it later.
+    if state
+        .resources
+        .window(window)
+        .is_none_or(|w| w.map_state != MapState::Viewable)
+    {
+        return;
+    }
     // Mode-flip on an existing redirect is routed through
     // `flip_redirect_target_mode` upstream — don't reallocate
     // here (Xorg preserves the backing per
@@ -1119,53 +1130,119 @@ fn flip_redirect_target_mode(
     }
 }
 
-/// Stage 4b.7: post-hook for `handle_map_window` /
-/// `handle_map_subwindows`. When a child window is mapped under a
-/// parent that has `RedirectSubwindows(mode)` recorded, the child
-/// inherits the redirect and needs its own backing — per Composite
-/// spec ("redirected hierarchy pixels are available whenever it is
-/// viewable", `compositeproto.txt:44-48`) and Xorg's compositional
-/// realize at `xserver/composite/compwindow.c:267`.
+/// Point GLX pixmap `glx_xid` at `new_host`, moving its export-lifetime ref along (acquire NEW, release OLD).
+fn retarget_glx_pixmap_export(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    glx_xid: u32,
+    new_host: u32,
+) {
+    let Some(drawable) = state.glx_drawables.get_mut(&glx_xid) else {
+        return;
+    };
+    let old_host = drawable.glx_export_host_xid.replace(new_host);
+    if old_host == Some(new_host) {
+        return;
+    }
+    backend.acquire_glx_pixmap_export(new_host);
+    if let Some(old_host) = old_host {
+        backend.release_glx_pixmap_export(old_host);
+    }
+}
+
+/// A window that just became viewable under an existing redirect (its own
+/// `RedirectWindow`, or its parent's `RedirectSubwindows`) gets a fresh
+/// backing, as Xorg's `compRealizeWindow` → `compCheckRedirect` →
+/// `compAllocPixmap` does (`composite/compwindow.c:274`, `:173-174`).
 ///
-/// Must be called AFTER `backend.map_subwindow`. The v2 backend's
-/// `map_subwindow` unconditionally sets `scene_participating = true`
-/// (it doesn't know about the parent's redirect record). Running
-/// activation AFTER lets `set_window_scene_participation(W, false)`
-/// (Manual mode) win over `map_subwindow`'s blind flip — the
-/// codex-round-6 ordering decision.
-///
-/// Gated on `backend.supports_redirect_activation()`; no-op on v1
-/// and the host-X11 test backends.
-fn maybe_activate_child_under_redirected_parent(
+/// Must be called AFTER `backend.map_subwindow`: `map_subwindow` blindly
+/// sets `scene_participating = true`, and the Manual participation flip
+/// inside `activate_redirect_backing_for` must land last. Callers walk the
+/// delta's `became_viewable` parent first, so the seed finds the parent's
+/// storage (or backing) already in place.
+fn realize_redirect_backing(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
-    child: ResourceId,
+    window: ResourceId,
 ) {
     if !backend.supports_redirect_activation() {
         return;
     }
-    let Some(parent) = state.resources.window(child).map(|w| w.parent) else {
-        return;
-    };
-    // Already redirected? `activate_redirect_backing_for` is
-    // idempotent on this case (the v2 backend's
-    // `allocate_redirected_backing` returns the existing handle
-    // unchanged), but we skip up front to avoid the wasted call.
-    let already_redirected = state
+    if state
         .resources
-        .window(child)
-        .is_some_and(|w| w.redirected_backing.is_some());
-    if already_redirected {
+        .window(window)
+        .is_none_or(|w| w.redirected_backing.is_some())
+    {
         return;
     }
-    // Look up `(parent, subwindows = true)` in
-    // `composite_redirects`. The single-window `RedirectWindow(parent)`
-    // doesn't auto-redirect children; only `RedirectSubwindows` does.
-    let Some(record) = state.composite_redirects.get(&(parent, true)).copied() else {
+    let Some(mode) = effective_redirect_mode_for_window(state, window) else {
         return;
     };
-    activate_redirect_backing_for(state, backend, origin, child, record.mode);
+    activate_redirect_backing_for(state, backend, origin, window, mode);
+}
+
+/// Apply a viewability delta to COMPOSITE backings: the windows that became
+/// unviewable (child first) drop theirs, those that became viewable (parent
+/// first) get a fresh one. The redirect records are untouched.
+fn apply_viewability_delta_to_redirects(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_unviewable {
+        let _ = crate::core_loop::process_disconnect::unrealize_redirect_backing(
+            state, backend, origin, *window,
+        );
+    }
+    for window in &delta.became_viewable {
+        realize_redirect_backing(state, backend, origin, *window);
+    }
+}
+
+/// Host xid of a window whose storage follows its viewability; the root and the COW own theirs.
+fn storage_lifecycle_host_xid(state: &ServerState, window: ResourceId) -> Option<u32> {
+    if window == ROOT_WINDOW || window == COMPOSITE_OVERLAY_WINDOW {
+        return None;
+    }
+    state
+        .resources
+        .window(window)
+        .and_then(|w| w.host_xid)
+        .map(|h| h.as_raw())
+}
+
+/// Windows that became viewable get storage, parent first; call before their redirect backings.
+fn realize_storage_for_delta(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_viewable {
+        if let Some(xid) = storage_lifecycle_host_xid(state, *window)
+            && let Err(err) = backend.realize_window_storage(origin, xid)
+        {
+            log::warn!("realize_window_storage(0x{xid:x}) failed: {err}");
+        }
+    }
+}
+
+/// Windows that became unviewable drop storage, child first; call after their redirect backings.
+fn release_storage_for_delta(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_unviewable {
+        if let Some(xid) = storage_lifecycle_host_xid(state, *window)
+            && let Err(err) = backend.release_window_storage(origin, xid)
+        {
+            log::warn!("release_window_storage(0x{xid:x}) failed: {err}");
+        }
+    }
 }
 
 /// Re-apply a window's effective COMPOSITE redirect mode after a
@@ -1432,10 +1509,14 @@ fn rotate_redirected_backing_on_resize(
             new_height,
             depth,
         );
-        for drawable in state.glx_drawables.values_mut() {
-            if drawable.x_drawable == alias.client_pixmap.0 {
-                drawable.glx_export_host_xid = Some(new_backing.as_raw());
-            }
+        let glx_pixmaps: Vec<u32> = state
+            .glx_drawables
+            .iter()
+            .filter(|(_, d)| d.x_drawable == alias.client_pixmap.0)
+            .map(|(xid, _)| *xid)
+            .collect();
+        for glx_xid in glx_pixmaps {
+            retarget_glx_pixmap_export(state, backend, glx_xid, new_backing.as_raw());
         }
     }
     if let Some(w) = state.resources.window_mut(window) {
@@ -1762,6 +1843,41 @@ pub(crate) fn purge_present_for_destroyed_windows(
 /// Common subtree-destroy used by both DestroyWindow (root = the
 /// requested window) and DestroySubwindows (each child of the
 /// requested parent).
+/// Free every Picture on the doomed `windows`, whichever client owns it, while the
+/// window records still exist (Xorg `PictureDestroyWindow`, `render/picture.c:67`).
+pub(crate) fn free_pictures_on_destroyed_windows(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    windows: &[ResourceId],
+) {
+    for (pic_xid, owned_pix) in state.resources.remove_pictures_on_windows(windows) {
+        let _ = backend.render_free_picture(origin, pic_xid);
+        if let Some(pix_xid) = owned_pix {
+            let _ = backend.free_pixmap(origin, pix_xid);
+        }
+    }
+}
+
+/// Release each doomed window's redirect backing and drop every redirect record keyed on it,
+/// while the window records still exist (Xorg `compDestroyWindow`, `composite/compwindow.c:600`).
+/// Surviving `NameWindowPixmap` aliases keep the backing alive until their `FreePixmap`.
+pub(crate) fn release_redirects_on_destroyed_windows(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    windows: &[ResourceId],
+) {
+    for window in windows {
+        crate::core_loop::process_disconnect::unrealize_redirect_backing(
+            state, backend, origin, *window,
+        );
+    }
+    state
+        .composite_redirects
+        .retain(|(window, _), _| !windows.contains(window));
+}
+
 fn destroy_window_subtree(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -1808,38 +1924,9 @@ fn destroy_window_subtree(
         });
     }
     let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
+    free_pictures_on_destroyed_windows(state, backend, origin, &order);
     purge_present_for_destroyed_windows(state, backend, &order);
-    // L2 plan B.15 — release the reason-1 hold on each destroyed
-    // window's redirected backing. Surviving `NameWindowPixmap`
-    // aliases keep the backing alive; their `client_pixmap`
-    // resources remain valid X protocol pixmaps until the client's
-    // `FreePixmap` (or the disconnect cleanup).
-    let redirect_backings: Vec<crate::backend::PixmapHandle> = order
-        .iter()
-        .filter_map(|w| {
-            state
-                .resources
-                .window(*w)
-                .and_then(|win| win.redirected_backing.as_ref().map(|b| b.host_pixmap))
-        })
-        .collect();
-    for backing in redirect_backings {
-        if let Err(err) = backend.release_redirected_backing(origin, backing) {
-            log::warn!(
-                "DestroyWindow: release_redirected_backing(0x{:x}) failed: {err}",
-                backing.as_raw()
-            );
-        }
-    }
-    // Drop any COMPOSITE redirect records still keyed against the
-    // destroyed windows. The actual backing teardown happened
-    // above; this just keeps `composite_redirects` clean so a
-    // future REDIRECT_WINDOW on a new XID with the same numeric
-    // value (after the X11 ID allocator wraps) doesn't see a
-    // stale entry.
-    state
-        .composite_redirects
-        .retain(|(window, _), _| !order.contains(window));
+    release_redirects_on_destroyed_windows(state, backend, origin, &order);
     // Audit #9 — selections owned by any destroyed window in this
     // subtree must fire `XFixesSelectionNotify(SelectionWindowDestroy)`
     // and clear ownership (Xorg `xfixes/select.c` registers a
@@ -1877,6 +1964,7 @@ fn destroy_window_subtree(
             continue;
         }
         let _ = backend.free_pixmap(origin, *xid);
+        state.resources.host_pixmap_freed(*xid);
     }
     for entry in pending {
         if let Some(xid) = entry.host_xid {
@@ -1923,6 +2011,22 @@ fn handle_render_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    // RenderErrBase + BadPicture for the first unknown Picture, in Xorg's per-request order.
+    macro_rules! verify_pictures {
+        ($($id:expr),+) => {
+            if let Some(bad) = first_missing_picture(state, &[$($id),+]) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::RENDER_FIRST_ERROR + 1,
+                    bad.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+        };
+    }
     match minor {
         0 => {
             let (major, minor_ver) = backend.render_query_version(origin).unwrap_or((0, 11));
@@ -1965,16 +2069,50 @@ fn handle_render_request(
             let Some(req) = x11::render_create_picture_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            // Xorg dixLookupDrawable (render.c:575): BadDrawable if unknown, BadMatch for
+            // an InputOnly window (dix/dixutils.c:208-213).
+            let input_only = match state.resources.window(req.drawable) {
+                Some(w) => w.class == crate::resources::WindowClass::InputOnly,
+                None if state.resources.pixmap(req.drawable).is_some() => false,
+                None => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        req.drawable.0,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+            };
+            if input_only {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    req.drawable.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let damage_drawable = render_picture_damage_drawable(state, req.drawable);
             let drawable_origin = state
                 .resources
                 .window(req.drawable)
                 .map(|w| (w.x, w.y))
                 .unwrap_or((0, 0));
-            let host_drawable_handle = state
-                .resources
-                .host_drawable_target(req.drawable)
-                .map(|t| t.host_handle());
+            // A window Picture names the window itself, never its redirect backing: the
+            // backend resolves the window's current storage or backing at each use.
+            let picture_window = state.resources.window(req.drawable).map(|_| req.drawable);
+            let host_drawable_handle = match state.resources.window(req.drawable) {
+                Some(w) => w.host_xid.map(crate::backend::AnyHandle::Window),
+                None => state
+                    .resources
+                    .host_drawable_target(req.drawable)
+                    .map(|t| t.host_handle()),
+            };
             let host_pic = host_drawable_handle.and_then(|host_drawable| {
                 backend
                     .render_create_picture(
@@ -1987,25 +2125,32 @@ fn handle_render_request(
                     .ok()
                     .flatten()
             });
-            if let Some(host_pic) = host_pic {
-                backend.set_picture_drawable_origin(host_pic.as_raw(), drawable_origin);
-                state.resources.create_picture(
-                    req.picture,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Drawable,
-                        drawable: Some(damage_drawable),
-                    },
-                );
+            // Core's registry is authoritative: no X error was sent, so the Picture exists.
+            match host_pic {
+                Some(hp) => backend.set_picture_drawable_origin(hp.as_raw(), drawable_origin),
+                None => debug!(
+                    "client {} #{} RENDER::CreatePicture 0x{:x}: backend could not back it; ops on it are no-ops",
+                    client_id.0, sequence.0, req.picture.0
+                ),
             }
+            state.resources.create_picture(
+                req.picture,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Drawable,
+                    drawable: Some(damage_drawable),
+                    window: picture_window,
+                },
+            );
         }
         5 => {
             if body.len() < 8 {
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             let translated = change_picture_translate_xids(value_mask, &body[8..], |attr, xid| {
                 let resource = ResourceId(xid);
@@ -2018,7 +2163,8 @@ fn handle_render_request(
                     ChangePictureAttr::AlphaMap => state
                         .resources
                         .picture(resource)
-                        .map(|p| p.host_picture_xid.as_raw()),
+                        .and_then(|p| p.host_picture_xid)
+                        .map(|h| h.as_raw()),
                 }
             });
             let Some(translated_values) = translated else {
@@ -2030,7 +2176,8 @@ fn handle_render_request(
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_change_picture(origin, hp, &patched);
             }
@@ -2040,10 +2187,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_clip_rectangles(origin, hp, body);
             }
@@ -2052,9 +2201,12 @@ fn handle_render_request(
             let Some(pic_id) = x11::render_free_resource_id(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(pic_id);
             let st = state.resources.free_picture(pic_id);
             if let Some(st) = st {
-                let _ = backend.render_free_picture(origin, st.host_picture_xid.as_raw());
+                if let Some(hp) = st.host_picture_xid {
+                    let _ = backend.render_free_picture(origin, hp.as_raw());
+                }
                 if let Some(pix) = st.host_owned_pixmap {
                     let _ = backend.free_pixmap(origin, pix.as_raw());
                 }
@@ -2064,6 +2216,7 @@ fn handle_render_request(
             let Some(req) = x11::render_composite_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2075,22 +2228,32 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            verify_pictures!(req.src);
+            if req.mask.0 != 0 {
+                verify_pictures!(req.mask);
+            }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(req.src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_mask = if req.mask.0 == 0 {
                 Some(0)
             } else {
                 state
                     .resources
                     .picture(req.mask)
-                    .map(|p| p.host_picture_xid.as_raw())
+                    .and_then(|p| p.host_picture_xid)
+                    .map(|h| h.as_raw())
             };
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let (Some(host_src), Some(host_mask), Some(host_dst)) =
                 (host_src, host_mask, host_dst)
             {
@@ -2130,6 +2293,7 @@ fn handle_render_request(
             let src_x = i16::from_le_bytes([body[16], body[17]]);
             let src_y = i16::from_le_bytes([body[18], body[19]]);
             let primitives = &body[20..];
+            verify_pictures!(src, dst);
             if dst_picture_is_sourceless(state, dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2141,14 +2305,19 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_dst = state
                 .resources
                 .picture(dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_mask_format = if ynest_mask_format == 0 {
                 Some(0u32)
             } else {
@@ -2274,6 +2443,7 @@ fn handle_render_request(
                 );
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.src, req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2285,14 +2455,19 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(req.src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_gs = state
                 .resources
                 .glyphset(req.glyphset)
@@ -2362,6 +2537,7 @@ fn handle_render_request(
             let Some(req) = x11::render_fill_rectangles_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2373,10 +2549,14 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(host_dst) = host_dst {
                 // ClipByChildren: a FillRectangles op=Clear on a window
                 // fully covered by a mapped child (mate-panel systray
@@ -2415,12 +2595,13 @@ fn handle_render_request(
             }
             let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
             let src_pic_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            verify_pictures!(src_pic_id);
             let x = u16::from_le_bytes([body[8], body[9]]);
             let y = u16::from_le_bytes([body[10], body[11]]);
             let host_src = state
                 .resources
                 .picture(src_pic_id)
-                .map(|p| p.host_picture_xid);
+                .and_then(|p| p.host_picture_xid);
             if let Some(host_src) = host_src
                 && let Some(cursor_handle) = backend
                     .render_create_cursor(origin, host_src, x, y)
@@ -2438,10 +2619,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_transform(origin, hp, body);
             }
@@ -2460,10 +2643,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_filter(origin, hp, body);
             }
@@ -2476,18 +2661,17 @@ fn handle_render_request(
                 .render_create_solid_fill(origin, color)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         34 => {
             if body.len() < 24 {
@@ -2498,18 +2682,17 @@ fn handle_render_request(
                 .render_create_linear_gradient(origin, body)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         35 => {
             if body.len() < 32 {
@@ -2520,18 +2703,17 @@ fn handle_render_request(
                 .render_create_radial_gradient(origin, body)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         31 => {
             // RENDER::CreateAnimCursor — body: cid(4), [cursor(4),
@@ -2692,7 +2874,23 @@ fn handle_render_request(
             }
         }
         36 => {
-            // CreateConicalGradient — stub.
+            // CreateConicalGradient: registered so the client can name it; rendering with it
+            // is not implemented, so ops that use it stay no-ops.
+            if body.len() < 4 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: None,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         32 => {
             // AddTraps — backend dispatch is a stub, but match the
@@ -2704,6 +2902,7 @@ fn handle_render_request(
             // y_off(2) then variable trapezoid list.
             if body.len() >= 4 {
                 let pic = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                verify_pictures!(pic);
                 if let Some(dst_drawable) = state.resources.picture(pic).and_then(|p| p.drawable) {
                     let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
@@ -6695,9 +6894,12 @@ fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
-                let Some(client_clip) =
-                    backend.picture_client_clip_rects(picture_state.host_picture_xid.as_raw())
-                else {
+                // An unbacked Picture has no clip set, like a fresh one.
+                let client_clip = match picture_state.host_picture_xid {
+                    Some(hp) => backend.picture_client_clip_rects(hp.as_raw()),
+                    None => Some(None),
+                };
+                let Some(client_clip) = client_clip else {
                     return emit_x11_error(
                         state,
                         client_id,
@@ -6961,7 +7163,8 @@ fn handle_xfixes_request(
                 let host_pic = state
                     .resources
                     .picture(pic_id)
-                    .map(|p| p.host_picture_xid.as_raw());
+                    .and_then(|p| p.host_picture_xid)
+                    .map(|h| h.as_raw());
                 if let Some(hp) = host_pic {
                     if req.region == 0 {
                         // RENDER CPClipMask = 0x40; value=None clears the clip.
@@ -7476,6 +7679,7 @@ fn handle_composite_request(
                 },
             );
             let _ = state.resources.set_pixmap_host_xid(pixmap, host_pixmap_xid);
+            state.resources.mark_pixmap_composite_name(pixmap);
             if let Some(w) = state.resources.window_mut(window) {
                 w.composite_named_pixmaps
                     .push(crate::resources::NamedCompositePixmap {
@@ -10656,8 +10860,6 @@ fn execute_present_pixmap_copy(
         explicit_sync: matches!(req, PendingPresentRequest::PixmapSynced(_)),
         options: masked_options,
     };
-    backend.note_present_scanout_candidate(candidate);
-
     let completion = crate::backend::CompletedPresentEvent {
         client_id,
         serial,
@@ -10674,6 +10876,27 @@ fn execute_present_pixmap_copy(
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
     };
+
+    if window_unviewable(state, ResourceId(window)) {
+        // Xorg: flip check fails on the empty clipList and the Copy clips to nothing,
+        // but idle and CompleteModeCopy are still delivered (present_execute.c:119-156).
+        if let Some(eff) = effective_target_msc {
+            state.present_complete_gate.insert(
+                present_id,
+                crate::server::PresentCompleteGate {
+                    crtc_id,
+                    crtc_epoch,
+                    msc_offset,
+                    effective_target_msc: eff,
+                    owner: client_id,
+                    dst_window_xid: window,
+                },
+            );
+        }
+        backend.enqueue_present_completion(completion, completion_dst_host_xid);
+        return Ok(());
+    }
+    backend.note_present_scanout_candidate(candidate);
 
     // M2b attempts direct ownership before recording the fallback Copy. The
     // completion gate must exist before the backend can own the page flip;
@@ -15119,9 +15342,13 @@ fn handle_glx_request(
                         let host_xid_for_export = current_host_xid.or(stored_host_xid);
                         if let Some(current_host_xid) = current_host_xid
                             && stored_host_xid != Some(current_host_xid)
-                            && let Some(d_mut) = state.glx_drawables.get_mut(&glx_drawable)
                         {
-                            d_mut.glx_export_host_xid = Some(current_host_xid);
+                            retarget_glx_pixmap_export(
+                                state,
+                                backend,
+                                glx_drawable,
+                                current_host_xid,
+                            );
                         }
                         // Ensure the backing is promoted to exportable storage so
                         // indirect GL texture sampling can read live content.
@@ -19427,7 +19654,14 @@ fn handle_xi2_request(
             // Without this the round-trip silently dropped the change
             // (XTS XChangeDeviceKeyMapping-3).
             let kpk = *body.get(2).unwrap_or(&0);
-            store_keymap_overrides(state, first, kpk, count, &body[4.min(body.len())..]);
+            apply_keymap_change(
+                state,
+                backend,
+                first,
+                kpk,
+                count,
+                &body[4.min(body.len())..],
+            );
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
             // request_kind=1 = MappingKeyboard.
@@ -20637,7 +20871,7 @@ fn handle_reparent_window(
         subscribers_by_id(state, result.new_parent, 0x0008_0000)
     };
     debug!(
-        "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?} map_state={:?}->{:?}",
+        "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?} map_state={:?}->{:?} viewable+{} viewable-{}",
         client_id.0,
         sequence.0,
         result.window.0,
@@ -20648,6 +20882,8 @@ fn handle_reparent_window(
         result.host_xid,
         result.old_map_state,
         result.new_map_state,
+        result.delta.became_viewable.len(),
+        result.delta.became_unviewable.len(),
     );
     if let Some(xid) = result.host_xid {
         let new_host_parent = if result.new_parent == ROOT_WINDOW {
@@ -20708,6 +20944,8 @@ fn handle_reparent_window(
             backend.sync_top_level_order(state);
         }
     }
+    // Before the reconcile below, so a GRANT backing finds the leaf that carries its route.
+    realize_storage_for_delta(state, backend, origin, &result.delta);
     let window = result.window;
     let new_parent = result.new_parent;
     let old_parent = result.old_parent;
@@ -20761,7 +20999,7 @@ fn handle_reparent_window(
             new_parent.0,
         );
         if !directly_redirected {
-            if old_parent_redirects_subwindows && !new_parent_redirects_subwindows && had_backing {
+            if old_parent_redirects_subwindows && !new_parent_redirects_subwindows {
                 log::debug!(
                     "reparent reconcile: REVOKE window=0x{:x} (left redirected subtree)",
                     window.0,
@@ -20822,6 +21060,9 @@ fn handle_reparent_window(
             );
         }
     }
+    // After the reconcile, so a revoke still sees the backing it tears down.
+    apply_viewability_delta_to_redirects(state, backend, origin, &result.delta);
+    release_storage_for_delta(state, backend, origin, &result.delta);
     let _dropped = fanout_event_to_clients(state, &on_window, |buf, seq, order| {
         x11::encode_reparent_notify_event(
             buf,
@@ -21404,6 +21645,7 @@ fn handle_change_window_attributes(
     for old_host_xid in released_hosts {
         if !state.resources.host_xid_still_referenced(old_host_xid) {
             let _ = backend.free_pixmap(origin, old_host_xid.as_raw());
+            state.resources.host_pixmap_freed(old_host_xid.as_raw());
         }
     }
 
@@ -24842,10 +25084,9 @@ fn handle_map_window(
         return Ok(RequestOutcome::Handled);
     }
 
-    let (was_unmapped, promoted_descendants) =
-        state.resources.map_window_with_promoted_descendants(window);
+    let transition = state.resources.map_window(window);
     debug_assert!(
-        was_unmapped,
+        transition.mapping_changed,
         "current_map_state == Unmapped guard above was checked; \
          map_window should now transition",
     );
@@ -24856,17 +25097,16 @@ fn handle_map_window(
         .map(|w| (w.parent, w.override_redirect));
     if let Some(xid) = host_xid {
         let _ = backend.map_subwindow(origin, xid.as_raw());
-        // Stage 4b.7: if the window's parent has a
-        // `RedirectSubwindows(mode)` record, the newly-mapped child
-        // needs its own backing (per Composite spec: "redirected
-        // hierarchy pixels are available whenever it is viewable",
-        // and Xorg activates on realize at `compwindow.c:267`).
-        // AFTER `map_subwindow` per the plan's codex-round-6
-        // ordering fix — `map_subwindow` blindly flips
-        // `scene_participating = true`, so the Manual
-        // participation flip inside `activate_redirect_backing_for`
-        // (sets it back to false) must land last.
-        maybe_activate_child_under_redirected_parent(state, backend, origin, window);
+    }
+    realize_storage_for_delta(state, backend, origin, &transition.delta);
+    // Every window that became viewable under a redirect (its own, or its
+    // parent's RedirectSubwindows) gets a backing, as Xorg allocates on
+    // realize (`compwindow.c:274`). AFTER `map_subwindow` per the plan's
+    // codex-round-6 ordering fix — `map_subwindow` blindly flips
+    // `scene_participating = true`, so the Manual participation flip
+    // inside `activate_redirect_backing_for` must land last.
+    apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+    if host_xid.is_some() {
         reapply_redirect_mode_after_map(state, backend, origin, window);
     }
 
@@ -24938,14 +25178,23 @@ fn handle_map_window(
     // mate-xorg.xtrace lines 5164→5173.
     if host_xid.is_some() {
         let _dropped = accumulate_damage_full_to_state(state, window);
-        for promoted in &promoted_descendants {
+        // The mapped window itself keeps its just-fired notify cycle.
+        for promoted in transition
+            .delta
+            .became_viewable
+            .iter()
+            .filter(|w| **w != window)
+        {
             reset_damage_notify_cycle_for_drawable(state, *promoted);
         }
         accumulate_damage_viewable_descendants_to_state(state, window);
     }
     debug!(
-        "client {} #{} MapWindow 0x{:x}",
-        client_id.0, sequence.0, window.0
+        "client {} #{} MapWindow 0x{:x} viewable+{}",
+        client_id.0,
+        sequence.0,
+        window.0,
+        transition.delta.became_viewable.len()
     );
     Ok(RequestOutcome::Handled)
 }
@@ -24971,8 +25220,22 @@ fn handle_map_subwindows(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    map_subwindows_with_delta(state, backend, origin, client_id, sequence, body)
+        .map(|(outcome, _delta)| outcome)
+}
+
+/// MapSubwindows; also returns the union of the children's viewability deltas.
+fn map_subwindows_with_delta(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<(RequestOutcome, ViewabilityDelta)> {
+    let mut delta = ViewabilityDelta::default();
     let Some(parent) = x11::map_window_id(body) else {
-        return Ok(RequestOutcome::Handled);
+        return Ok((RequestOutcome::Handled, delta));
     };
     if state.resources.window(parent).is_none() {
         // Xorg `dix/dispatch.c::ProcMapSubwindows` returns BadWindow
@@ -24985,11 +25248,13 @@ fn handle_map_subwindows(
             x11::error::BAD_WINDOW,
             parent.0,
             9,
-        );
+        )
+        .map(|outcome| (outcome, delta));
     }
     let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
     for child in children {
-        let was_unmapped = state.resources.map_window(child);
+        let transition = state.resources.map_window(child);
+        let was_unmapped = transition.mapping_changed;
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
         let extents = state.resources.window(child).map(|w| (w.width, w.height));
         let override_redirect = state
@@ -24998,10 +25263,12 @@ fn handle_map_subwindows(
             .is_some_and(|w| w.override_redirect);
         if let Some(xid) = host_xid {
             let _ = backend.map_subwindow(origin, xid.as_raw());
-            // Stage 4b.7: same post-hook as `handle_map_window`.
-            // Activation MUST run AFTER `map_subwindow` per the
-            // plan's round-6 ordering fix.
-            maybe_activate_child_under_redirected_parent(state, backend, origin, child);
+        }
+        realize_storage_for_delta(state, backend, origin, &transition.delta);
+        // Same post-hook as `handle_map_window`: AFTER `map_subwindow`.
+        apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+        delta.extend(transition.delta);
+        if host_xid.is_some() {
             reapply_redirect_mode_after_map(state, backend, origin, child);
             // Audit #11: see `handle_map_window` for the rationale.
             // Mirror the damage bump so MapSubwindows-driven mass
@@ -25045,8 +25312,13 @@ fn handle_map_subwindows(
             let _dropped = emit_expose_subtree_to_state(state, child);
         }
     }
-    debug!("client {} #{} MapSubwindows", client_id.0, sequence.0);
-    Ok(RequestOutcome::Handled)
+    debug!(
+        "client {} #{} MapSubwindows viewable+{}",
+        client_id.0,
+        sequence.0,
+        delta.became_viewable.len()
+    );
+    Ok((RequestOutcome::Handled, delta))
 }
 
 fn handle_unmap_window(
@@ -25072,7 +25344,8 @@ fn handle_unmap_window(
             );
         }
         let host_xid = state.resources.window(window).and_then(|w| w.host_xid);
-        let was_mapped = state.resources.unmap_window(window);
+        let transition = state.resources.unmap_window(window);
+        let was_mapped = transition.mapping_changed;
         let parent = if was_mapped {
             state
                 .resources
@@ -25084,6 +25357,9 @@ fn handle_unmap_window(
         if let Some(xid) = host_xid {
             let _ = backend.unmap_subwindow(origin, xid.as_raw());
         }
+        // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
+        apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+        release_storage_for_delta(state, backend, origin, &transition.delta);
         // XI1: an active device grab is released automatically when its
         // grab window becomes not viewable (XTS XGrabDeviceKey-9; Xorg
         // DeactivateGrabsOnWindowUnmap shape).
@@ -25141,8 +25417,22 @@ fn handle_unmap_subwindows(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body)
+        .map(|(outcome, _delta)| outcome)
+}
+
+/// UnmapSubwindows; also returns the union of the children's viewability deltas.
+fn unmap_subwindows_with_delta(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<(RequestOutcome, ViewabilityDelta)> {
+    let mut delta = ViewabilityDelta::default();
     let Some(parent) = x11::map_window_id(body) else {
-        return Ok(RequestOutcome::Handled);
+        return Ok((RequestOutcome::Handled, delta));
     };
     struct PendingUnmap {
         child: ResourceId,
@@ -25156,14 +25446,17 @@ fn handle_unmap_subwindows(
             x11::error::BAD_WINDOW,
             parent.0,
             11,
-        );
+        )
+        .map(|outcome| (outcome, delta));
     };
     // Snapshot mapping order + collect host xids; unmap each in the
     // resource table.
     let mut pending: Vec<PendingUnmap> = Vec::new();
     for child in children {
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
-        if state.resources.unmap_window(child) {
+        let transition = state.resources.unmap_window(child);
+        delta.extend(transition.delta);
+        if transition.mapping_changed {
             pending.push(PendingUnmap { child, host_xid });
         }
     }
@@ -25179,11 +25472,19 @@ fn handle_unmap_subwindows(
             x11::encode_unmap_notify_event(buf, seq, order, parent, child, false);
         });
     }
+    // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
+    apply_viewability_delta_to_redirects(state, backend, origin, &delta);
+    release_storage_for_delta(state, backend, origin, &delta);
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
-    debug!("client {} #{} UnmapSubwindows", client_id.0, sequence.0);
-    Ok(RequestOutcome::Handled)
+    debug!(
+        "client {} #{} UnmapSubwindows viewable-{}",
+        client_id.0,
+        sequence.0,
+        delta.became_unviewable.len()
+    );
+    Ok((RequestOutcome::Handled, delta))
 }
 
 fn handle_ge_request(
@@ -26948,6 +27249,33 @@ fn drawable_size(state: &ServerState, id: ResourceId) -> Option<(u16, u16)> {
     state.resources.pixmap(id).map(|p| (p.width, p.height))
 }
 
+/// Xorg VERIFY_PICTURE (`render/picturestr.h:363`, error value set at
+/// `render/render.c:252`): the first of `ids` that names no Picture.
+fn first_missing_picture(state: &ServerState, ids: &[ResourceId]) -> Option<ResourceId> {
+    ids.iter()
+        .copied()
+        .find(|id| state.resources.picture(*id).is_none())
+}
+
+/// A RENDER destination Picture on an unviewable window: Xorg's composite clip is the
+/// window's clipList/borderClip (`render/mipict.c:114-118`), emptied when it stops being
+/// viewable (`mi/mivaltree.c:690-695`, `mi/miwindow.c:738-745`), so nothing is drawn.
+fn dst_picture_window_unviewable(state: &ServerState, pic: ResourceId) -> bool {
+    state
+        .resources
+        .picture(pic)
+        .and_then(|p| p.window)
+        .is_some_and(|w| window_unviewable(state, w))
+}
+
+/// True for a window that is not viewable (Xorg: not realized); false for pixmaps.
+fn window_unviewable(state: &ServerState, id: ResourceId) -> bool {
+    state
+        .resources
+        .window(id)
+        .is_some_and(|w| w.map_state != crate::resources::MapState::Viewable)
+}
+
 /// Source-availability split for CopyArea/CopyPlane (X11 §CopyArea;
 /// Xorg miHandleExposures): the part of the requested source rect
 /// outside the source drawable's bounds is not copied. Returns the
@@ -26968,6 +27296,10 @@ fn copy_area_source_split(
     Option<(i16, i16, i16, i16, u16, u16)>,
     Vec<(i16, i16, u16, u16)>,
 ) {
+    if window_unviewable(state, src) {
+        // Xorg: an unrealized window's clipList is empty, so nothing copies (micopy.c:282).
+        return (None, vec![(dst_x, dst_y, width, height)]);
+    }
     let Some((sw, sh)) = drawable_size(state, src) else {
         // Unknown source geometry: keep the old conservative
         // behavior (copy as requested, no missing region).
@@ -27145,16 +27477,21 @@ fn handle_copy_area(
         // Clamp the copy to the AVAILABLE part of the source drawable
         // (X11 §CopyArea): out-of-bounds source regions are never
         // copied; they become the GraphicsExpose region below.
-        let (avail, missing) = copy_area_source_split(
-            state,
-            request.src,
-            request.src_x,
-            request.src_y,
-            request.dst_x,
-            request.dst_y,
-            request.width,
-            request.height,
-        );
+        let (avail, missing) = if window_unviewable(state, request.dst) {
+            // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
+            (None, Vec::new())
+        } else {
+            copy_area_source_split(
+                state,
+                request.src,
+                request.src_x,
+                request.src_y,
+                request.dst_x,
+                request.dst_y,
+                request.width,
+                request.height,
+            )
+        };
         let request = match avail {
             Some((sx, sy, dx, dy, w, h)) => x11::CopyAreaRequest {
                 src_x: sx,
@@ -27522,7 +27859,12 @@ fn handle_copy_plane(
         backend.apply_draw_state(origin, &st)?;
         // Clamp to the available source region (same contract as
         // CopyArea — out-of-bounds source becomes GraphicsExpose).
-        let (avail, missing) = copy_area_source_split(state, src, sx, sy, dx, dy, w, h);
+        let (avail, missing) = if window_unviewable(state, dst) {
+            // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
+            (None, Vec::new())
+        } else {
+            copy_area_source_split(state, src, sx, sy, dx, dy, w, h)
+        };
         if let Some((asx, asy, adx, ady, aw, ah)) = avail {
             backend.copy_plane(
                 origin,
@@ -27898,6 +28240,28 @@ fn handle_free_pixmap(
             FREE_PIXMAP_OPCODE,
         );
     };
+    if removed.composite_name {
+        // A name owns its own alias ref: a sibling name sharing the backing must not hide it.
+        let names: Vec<_> = removed.host_xid.into_iter().collect();
+        let last = crate::core_loop::process_disconnect::release_removed_names(
+            state, backend, origin, &names,
+        );
+        crate::core_loop::process_disconnect::free_orphaned_host_pixmaps(
+            state,
+            backend,
+            last.clone(),
+            &last,
+            None,
+        );
+        debug!(
+            "client {} #{} FreePixmap pixmap=0x{:x} (window name) host_xid={:?}",
+            client_id.0,
+            sequence.0,
+            pixmap.0,
+            removed.host_xid.map(crate::backend::PixmapHandle::as_raw),
+        );
+        return Ok(RequestOutcome::Handled);
+    }
     let still_referenced = removed
         .host_xid
         // The BORDER reference is as load-bearing as the background one:
@@ -28017,15 +28381,16 @@ fn handle_list_fonts_with_info(
 
 fn handle_change_keyboard_mapping(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let first_keycode = body.first().copied().unwrap_or(8);
+    let kpk = body.get(1).copied().unwrap_or(0);
     let count = header.data;
-    // Xorg ProcChangeKeyboardMapping: first_keycode < min_keycode →
-    // BadValue; first + count - 1 > max_keycode → BadValue.
+    // Xorg ProcChangeKeyboardMapping (dix/devices.c); BadLength is checked at dispatch.
     if first_keycode < 8 {
         return emit_x11_error(
             state,
@@ -28036,20 +28401,30 @@ fn handle_change_keyboard_mapping(
             100,
         );
     }
-    if u32::from(first_keycode) + u32::from(count) > 256 {
+    // Xorg reports keySymsPerKeyCode as the error value for both conditions.
+    if u32::from(first_keycode) + u32::from(count) > 256 || kpk == 0 {
         return emit_x11_error(
             state,
             client_id,
             sequence,
             x11::error::BAD_VALUE,
-            u32::from(first_keycode) + u32::from(count) - 1,
+            u32::from(kpk),
             100,
         );
     }
-    // Store the keysym rows: body = first_keycode(1)
-    // keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
-    let kpk = body.get(1).copied().unwrap_or(0);
-    store_keymap_overrides(state, first_keycode, kpk, count, &body[4.min(body.len())..]);
+    // XkbApplyMappingChange changes nothing (and notifies nothing) for zero keys.
+    if count == 0 {
+        return Ok(RequestOutcome::Handled);
+    }
+    // Body: first_keycode(1) keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
+    apply_keymap_change(
+        state,
+        backend,
+        first_keycode,
+        kpk,
+        count,
+        &body[4.min(body.len())..],
+    );
     // Server-wide MappingNotify fanout: every connected client sees the
     // same keymap change. We collect ids first to avoid an &/&mut overlap
     // through `state.clients`.
@@ -28062,6 +28437,26 @@ fn handle_change_keyboard_mapping(
         client_id.0, sequence.0
     );
     Ok(RequestOutcome::Handled)
+}
+
+/// Hand the rows to the backend's Xorg-style conversion, else to `state.keymap_overrides`.
+fn apply_keymap_change(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    first_keycode: u8,
+    kpk: u8,
+    count: u8,
+    syms: &[u8],
+) {
+    let n = usize::from(count) * usize::from(kpk);
+    let keysyms: Vec<u32> = syms
+        .chunks_exact(4)
+        .take(n)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    if !backend.change_keyboard_mapping(first_keycode, kpk, &keysyms) {
+        store_keymap_overrides(state, first_keycode, kpk, count, syms);
+    }
 }
 
 /// Install `count` keysym rows starting at `first_keycode` into
@@ -41012,7 +41407,12 @@ mod tests {
             let mut peer = install_client(&mut state, CLIENT);
             make(&mut state, WIN_A);
             make(&mut state, WIN_B);
-            assert!(state.resources.map_window(ResourceId(WIN_B)));
+            assert!(
+                state
+                    .resources
+                    .map_window(ResourceId(WIN_B))
+                    .mapping_changed
+            );
             {
                 let c = state.clients.get_mut(&CLIENT).unwrap();
                 c.event_masks.insert(ResourceId(WIN_A), FOCUS_CHANGE_MASK);
@@ -43994,11 +44394,12 @@ mod tests {
             vec![present_test_output(5, CRTC, 0, 0, 1920, 1080, false)],
         );
         create_present_test_window(&mut state, WINDOW, 0, 0, 64, 64);
-        state
-            .resources
-            .window_mut(ResourceId(WINDOW))
-            .unwrap()
-            .host_xid = crate::backend::WindowHandle::from_raw(0x0040_1051);
+        {
+            let window = state.resources.window_mut(ResourceId(WINDOW)).unwrap();
+            window.host_xid = crate::backend::WindowHandle::from_raw(0x0040_1051);
+            // A Present to an unviewable window copies nothing (Xorg micopy.c:157).
+            window.map_state = crate::resources::MapState::Viewable;
+        }
         state.resources.create_pixmap(
             ClientId(1),
             CreatePixmapRequest {
@@ -48940,6 +49341,100 @@ mod tests {
         assert_eq!(gate.effective_target_msc, TARGET_MSC);
     }
 
+    /// Xorg: the flip check fails on the empty clipList (present_scmd.c:122),
+    /// the Copy to an unrealized window is a no-op (micopy.c:157), and idle
+    /// plus CompleteModeCopy are still sent (present_execute.c:137-156).
+    #[test]
+    fn present_to_unviewable_window_skips_copy_and_damage_but_completes() {
+        use crate::{backend::recording::RecordedCall, resources::MapState, server::DamageObject};
+
+        const PARENT: u32 = 0x0002_0021;
+        const WINDOW: u32 = 0x0002_0022;
+        const DAMAGE_XID: u32 = 0x0002_0023;
+        const PRESENT_ID: u64 = 0x45;
+        const TARGET_MSC: u64 = 600;
+
+        for (parent_state, window_state, hidden) in [
+            (MapState::Viewable, MapState::Unmapped, true),
+            (MapState::Unmapped, MapState::Unviewable, true),
+            (MapState::Viewable, MapState::Viewable, false),
+        ] {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            backend.present_direct_result = true;
+            for (xid, parent, map_state) in [
+                (PARENT, ROOT_WINDOW, parent_state),
+                (WINDOW, ResourceId(PARENT), window_state),
+            ] {
+                state.resources.create_window(
+                    ClientId(1),
+                    yserver_protocol::x11::CreateWindowRequest {
+                        depth: 24,
+                        window: ResourceId(xid),
+                        parent,
+                        width: 100,
+                        height: 100,
+                        class: 1,
+                        visual: crate::resources::ROOT_VISUAL,
+                        ..Default::default()
+                    },
+                );
+                state
+                    .resources
+                    .window_mut(ResourceId(xid))
+                    .expect("window")
+                    .map_state = map_state;
+            }
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: ResourceId(WINDOW),
+                    level: 3,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+            let pending = SupersessionFixture::new(PRESENT_ID, WINDOW)
+                .eff(Some(TARGET_MSC))
+                .geometry(0, 0, 100, 100)
+                .pending();
+
+            execute_present_pixmap_copy(&mut state, &mut backend, pending).expect("present");
+
+            let copies = backend
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, RecordedCall::CopyArea { .. }))
+                .count();
+            let damaged = !state.damage_objects[&DAMAGE_XID].rects.is_empty();
+            let gate = state.present_complete_gate.get(&PRESENT_ID).expect("gate");
+            assert_eq!(gate.effective_target_msc, TARGET_MSC);
+            if hidden {
+                assert!(
+                    backend.present_direct_candidates.is_empty(),
+                    "{window_state:?}: no direct attempt"
+                );
+                assert_eq!(copies, 0, "{window_state:?}: no copy");
+                assert!(!damaged, "{window_state:?}: no damage");
+                assert_eq!(backend.enqueued_present_completions.len(), 1);
+                let (event, _) = &backend.enqueued_present_completions[0];
+                assert_eq!(
+                    event.completion_mode,
+                    yserver_protocol::x11::present::COMPLETE_MODE_COPY
+                );
+                assert!(event.emit_idle, "{window_state:?}: idle still sent");
+                assert_eq!(event.present_id, PRESENT_ID);
+            } else {
+                // Viewable control: direct path taken as before.
+                assert_eq!(backend.present_direct_candidates.len(), 1);
+                assert!(damaged);
+                assert!(backend.enqueued_present_completions.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn damage_unresolvable_region_with_update_flag_accumulates_full_extent() {
         // Failing test first (plan Task 13 Step 3): an `update != 0` +
@@ -50634,7 +51129,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(state.resources.map_window(WINDOW));
+        assert!(state.resources.map_window(WINDOW).mapping_changed);
         let window = state
             .resources
             .window_mut(WINDOW)
@@ -51734,6 +52229,195 @@ mod tests {
         assert_eq!(backing.depth, 32);
     }
 
+    /// How a GLX-TFP compositor lets go of a named, resized window.
+    #[derive(Clone, Copy, Debug)]
+    enum GlxTeardown {
+        DestroyGlxThenFree,
+        FreeThenDestroyGlx,
+        DestroyWindowFirst,
+        Disconnect,
+    }
+
+    fn drive(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units,
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    /// picom-glx under a WM: NameWindowPixmap + glXCreatePixmap, `resizes` resizes, then teardown.
+    fn glx_export_ref_after_resizes(resizes: u16, teardown: GlxTeardown) -> RecordingBackend {
+        use yserver_protocol::x11::glx as x11glx;
+        const WIN: u32 = 0x0077_0001;
+        const PIX: u32 = 0x0077_0002;
+        const GLXPIX: u32 = 0x0077_0003;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new()
+            .with_composite_support()
+            .with_redirect_activation();
+        let mut cw = Vec::new();
+        cw.extend_from_slice(&WIN.to_le_bytes());
+        cw.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+        cw.extend_from_slice(&100u16.to_le_bytes());
+        cw.extend_from_slice(&50u16.to_le_bytes());
+        cw.extend_from_slice(&0u16.to_le_bytes()); // border
+        cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+        cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+        cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+        drive(&mut state, &mut backend, 1, 0, &cw);
+        let mut redirect = ROOT_WINDOW.0.to_le_bytes().to_vec();
+        redirect.extend_from_slice(&[1, 0, 0, 0]); // Manual
+        drive(
+            &mut state,
+            &mut backend,
+            144,
+            yserver_protocol::x11::composite::REDIRECT_SUBWINDOWS,
+            &redirect,
+        );
+        drive(&mut state, &mut backend, 8, 0, &WIN.to_le_bytes());
+        let mut name = WIN.to_le_bytes().to_vec();
+        name.extend_from_slice(&PIX.to_le_bytes());
+        drive(
+            &mut state,
+            &mut backend,
+            144,
+            yserver_protocol::x11::composite::NAME_WINDOW_PIXMAP,
+            &name,
+        );
+        let mut glx = Vec::new();
+        glx.extend_from_slice(&0u32.to_le_bytes()); // screen
+        glx.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        glx.extend_from_slice(&PIX.to_le_bytes());
+        glx.extend_from_slice(&GLXPIX.to_le_bytes());
+        drive(&mut state, &mut backend, 148, x11glx::CREATE_PIXMAP, &glx);
+        let first = state
+            .resources
+            .pixmap(ResourceId(PIX))
+            .and_then(|p| p.host_xid)
+            .expect("named pixmap")
+            .as_raw();
+        assert_eq!(
+            backend.glx_pixmap_exports.get(&first),
+            Some(&1),
+            "glXCreatePixmap holds one export ref on the named backing",
+        );
+
+        for i in 1..=resizes {
+            let mut cfg = WIN.to_le_bytes().to_vec();
+            cfg.extend_from_slice(&0x0cu16.to_le_bytes());
+            cfg.extend_from_slice(&0u16.to_le_bytes());
+            cfg.extend_from_slice(&u32::from(100 + 10 * i).to_le_bytes());
+            cfg.extend_from_slice(&u32::from(50 + 10 * i).to_le_bytes());
+            drive(&mut state, &mut backend, 12, 0, &cfg);
+            let current = state
+                .resources
+                .window(ResourceId(WIN))
+                .and_then(|w| w.redirected_backing)
+                .expect("redirected backing")
+                .host_pixmap
+                .as_raw();
+            assert_ne!(current, first, "resize {i} rotated the backing");
+            assert_eq!(
+                state
+                    .glx_drawables
+                    .get(&GLXPIX)
+                    .and_then(|d| d.glx_export_host_xid),
+                Some(current),
+                "resize {i}: the GLX pixmap follows the retargeted alias",
+            );
+            assert_eq!(
+                backend
+                    .glx_pixmap_exports
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                vec![(current, 1)],
+                "resize {i}: the export ref lives on the backing the GLX pixmap names",
+            );
+        }
+
+        let destroy_glx = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(
+                state,
+                backend,
+                148,
+                x11glx::DESTROY_PIXMAP,
+                &GLXPIX.to_le_bytes(),
+            );
+        };
+        let free = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(state, backend, 54, 0, &PIX.to_le_bytes());
+        };
+        let destroy_win = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(state, backend, 4, 0, &WIN.to_le_bytes());
+        };
+        match teardown {
+            GlxTeardown::DestroyGlxThenFree => {
+                destroy_glx(&mut state, &mut backend);
+                free(&mut state, &mut backend);
+                destroy_win(&mut state, &mut backend);
+            }
+            GlxTeardown::FreeThenDestroyGlx => {
+                free(&mut state, &mut backend);
+                destroy_glx(&mut state, &mut backend);
+                destroy_win(&mut state, &mut backend);
+            }
+            GlxTeardown::DestroyWindowFirst => {
+                destroy_win(&mut state, &mut backend);
+                destroy_glx(&mut state, &mut backend);
+                free(&mut state, &mut backend);
+            }
+            GlxTeardown::Disconnect => {
+                crate::core_loop::process_disconnect::process_disconnect(
+                    &mut state,
+                    &mut backend,
+                    ClientId(1),
+                );
+            }
+        }
+        backend
+    }
+
+    /// A resize retargets picom's GLX pixmap; the export ref must move with it, or OLD leaks.
+    #[test]
+    fn glx_pixmap_export_ref_follows_the_resize_retarget() {
+        for resizes in [0, 1, 2] {
+            for teardown in [
+                GlxTeardown::DestroyGlxThenFree,
+                GlxTeardown::FreeThenDestroyGlx,
+                GlxTeardown::DestroyWindowFirst,
+                GlxTeardown::Disconnect,
+            ] {
+                let backend = glx_export_ref_after_resizes(resizes, teardown);
+                assert!(
+                    backend.glx_pixmap_exports.is_empty(),
+                    "resizes={resizes} {teardown:?}: export refs left behind: {:?}",
+                    backend.glx_pixmap_exports,
+                );
+            }
+        }
+    }
+
     // compCopyWindow analog: when a redirected window resizes, the
     // pre-existing backing's contents must be carried over into the new
     // backing for the overlap region — otherwise any compositor that
@@ -52312,6 +52996,8 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
+        // Viewable: Xorg allocates a redirect backing only for a realized window.
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
         state.composite_redirects.insert(
             (ResourceId(WINDOW_XID), false),
             crate::server::RedirectRecord {
@@ -52462,6 +53148,8 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
+        // Viewable: Xorg allocates a redirect backing only for a realized window.
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
         state.composite_redirects.insert(
             (ResourceId(WINDOW_XID), false),
             crate::server::RedirectRecord {
@@ -58367,11 +59055,251 @@ mod tests {
         );
     }
 
+    /// F{ A{ A1 }, B{ B1 }, C }: F viewable, A and B unmapped with their
+    /// child mapped (Unviewable), C mapped.
+    fn subwindows_delta_fixture(state: &mut ServerState) -> [ResourceId; 6] {
+        let [f, a, a1, b, b1, c] = [
+            0x0010_0200,
+            0x0010_0201,
+            0x0010_0202,
+            0x0010_0203,
+            0x0010_0204,
+            0x0010_0205,
+        ]
+        .map(ResourceId);
+        for (id, parent) in [(f, ROOT_WINDOW), (a, f), (a1, a), (b, f), (b1, b), (c, f)] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: id,
+                    parent,
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        for w in [a1, b1, f, c] {
+            let _ = state.resources.map_window(w);
+        }
+        [f, a, a1, b, b1, c]
+    }
+
+    /// Window storage follows the delta: realize parent first, release child first, never the COW.
+    #[test]
+    fn window_storage_follows_viewability_delta_in_order() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, c] = subwindows_delta_fixture(&mut state);
+        for w in [f, a, a1, b, b1, c] {
+            state.resources.window_mut(w).expect("window").host_xid =
+                Some(crate::backend::WindowHandle::from_raw_for_test(w.0));
+        }
+        let _ = state.resources.map_window(a);
+        let _ = state.resources.map_window(b);
+        let storage_calls = |backend: &RecordingBackend, from: usize| -> Vec<RecordedCall> {
+            backend
+                .calls()
+                .into_iter()
+                .skip(from)
+                .filter(|c| {
+                    matches!(
+                        c,
+                        RecordedCall::RealizeWindowStorage(_)
+                            | RecordedCall::ReleaseWindowStorage(_)
+                    )
+                })
+                .collect()
+        };
+        let unmap = |state: &mut ServerState, backend: &mut RecordingBackend, w: ResourceId| {
+            handle_unmap_window(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(1),
+                &w.0.to_le_bytes(),
+            )
+            .expect("UnmapWindow");
+        };
+        let map = |state: &mut ServerState, backend: &mut RecordingBackend, w: ResourceId| {
+            handle_map_window(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(2),
+                &w.0.to_le_bytes(),
+            )
+            .expect("MapWindow");
+        };
+
+        unmap(&mut state, &mut backend, f);
+        assert_eq!(
+            storage_calls(&backend, 0),
+            [a1, a, b1, b, c, f].map(|w| RecordedCall::ReleaseWindowStorage(w.0)),
+            "the whole subtree releases, child first",
+        );
+        let from = backend.calls().len();
+        map(&mut state, &mut backend, f);
+        assert_eq!(
+            storage_calls(&backend, from),
+            [f, a, a1, b, b1, c].map(|w| RecordedCall::RealizeWindowStorage(w.0)),
+            "the whole subtree realizes, parent first",
+        );
+        let realize_at = backend
+            .calls()
+            .iter()
+            .skip(from)
+            .position(|c| matches!(c, RecordedCall::RealizeWindowStorage(_)))
+            .expect("realize recorded");
+        let map_at = backend
+            .calls()
+            .iter()
+            .skip(from)
+            .position(|c| matches!(c, RecordedCall::MapSubwindow(_)))
+            .expect("map recorded");
+        assert!(
+            map_at < realize_at,
+            "map_subwindow flips `mapped` before realize reads it"
+        );
+
+        // A mapped window under an unmapped parent gets nothing; the root and the COW never do.
+        unmap(&mut state, &mut backend, a);
+        let _ = state.resources.unmap_window(a1);
+        let from = backend.calls().len();
+        map(&mut state, &mut backend, a1);
+        assert!(
+            storage_calls(&backend, from).is_empty(),
+            "Unmapped -> Unviewable is no transition"
+        );
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(
+                COMPOSITE_OVERLAY_WINDOW.0,
+            ));
+        let from = backend.calls().len();
+        unmap(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW);
+        map(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW);
+        assert!(
+            storage_calls(&backend, from).is_empty(),
+            "the COW is outside the lifecycle"
+        );
+        assert_eq!(storage_lifecycle_host_xid(&state, ROOT_WINDOW), None);
+        assert_eq!(
+            storage_lifecycle_host_xid(&state, COMPOSITE_OVERLAY_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn map_subwindows_delta_includes_promoted_grandchildren() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, _c] = subwindows_delta_fixture(&mut state);
+
+        let (_, delta) = map_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &f.0.to_le_bytes(),
+        )
+        .expect("MapSubwindows");
+        // C was already viewable; A and B each bring their grandchild.
+        assert_eq!(delta.became_viewable, vec![a, a1, b, b1]);
+        assert!(delta.became_unviewable.is_empty());
+    }
+
+    #[test]
+    fn unmap_subwindows_delta_is_union_in_post_order() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, c] = subwindows_delta_fixture(&mut state);
+        let _ = state.resources.map_window(a);
+        let _ = state.resources.map_window(b);
+
+        let (_, delta) = unmap_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &f.0.to_le_bytes(),
+        )
+        .expect("UnmapSubwindows");
+        assert!(delta.became_viewable.is_empty());
+        assert_eq!(delta.became_unviewable, vec![a1, a, b1, b, c]);
+    }
+
+    #[test]
+    fn map_and_unmap_under_unmapped_parent_still_send_notify() {
+        const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [_f, _a, a1, ..] = subwindows_delta_fixture(&mut state);
+        let _ = state.resources.unmap_window(a1);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .event_masks
+            .insert(a1, STRUCTURE_NOTIFY);
+        let notified = |bytes: &[u8], code: u8| {
+            bytes.chunks_exact(32).any(|evt| {
+                evt[0] == code && u32::from_le_bytes([evt[8], evt[9], evt[10], evt[11]]) == a1.0
+            })
+        };
+
+        // A1 under unmapped A: Unmapped -> Unviewable, still MapNotify.
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &a1.0.to_le_bytes(),
+        )
+        .expect("MapWindow");
+        assert_eq!(
+            state.resources.window(a1).map(|w| w.map_state),
+            Some(MapState::Unviewable)
+        );
+        assert!(notified(&read_all_available(&mut peer), 19), "MapNotify");
+
+        // Unviewable -> Unmapped, still UnmapNotify.
+        handle_unmap_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            &a1.0.to_le_bytes(),
+        )
+        .expect("UnmapWindow");
+        assert_eq!(
+            state.resources.window(a1).map(|w| w.map_state),
+            Some(MapState::Unmapped)
+        );
+        assert!(notified(&read_all_available(&mut peer), 18), "UnmapNotify");
+    }
+
     #[test]
     fn map_subwindows_exposes_grandchild_promoted_by_viewability_cascade() {
         // MapSubwindows(parent) maps parent's direct children. When a
         // child transitions Unmapped -> Viewable, the viewability cascade
-        // (map_window_with_promoted_descendants) also promotes any of the
+        // (map_window) also promotes any of the
         // child's descendants that were sitting Unviewable (mapped while
         // their ancestor was unmapped) to Viewable. Xorg fires Expose on
         // every newly-viewable window, not just the directly-mapped child.
@@ -60662,10 +61590,11 @@ mod tests {
             ResourceId(PICTURE_XID),
             crate::resources::PictureState {
                 client: ClientId(APP),
-                host_picture_xid: crate::backend::PictureHandle::from_raw_for_test(0x42),
+                host_picture_xid: Some(crate::backend::PictureHandle::from_raw_for_test(0x42)),
                 host_owned_pixmap: None,
                 kind: crate::resources::PictureKind::Sourceless,
                 drawable: None,
+                window: None,
             },
         );
 
@@ -61842,6 +62771,375 @@ mod tests {
         );
     }
 
+    // ---- Unviewable CopyArea/CopyPlane sources (Xorg micopy.c / miexpose.c) ----
+
+    const UV_FRAME: u32 = 0x0010_0101;
+    const UV_CHILD: u32 = 0x0010_0102;
+    const UV_LONE: u32 = 0x0010_0103;
+    const UV_SHOWN: u32 = 0x0010_0104;
+    const UV_PIXMAP: u32 = 0x0010_0110;
+    const UV_DST_PIXMAP: u32 = 0x0010_0111;
+    const UV_GC: u32 = 0x0010_0120;
+    const UV_GC_NOEXP: u32 = 0x0010_0121;
+
+    fn uv_gc_request(gc: u32, graphics_exposures: bool) -> yserver_protocol::x11::CreateGcRequest {
+        yserver_protocol::x11::CreateGcRequest {
+            gc: ResourceId(gc),
+            drawable: ROOT_WINDOW,
+            function: None,
+            plane_mask: None,
+            foreground: None,
+            background: None,
+            line_width: None,
+            line_style: None,
+            cap_style: None,
+            join_style: None,
+            fill_style: None,
+            fill_rule: None,
+            tile: None,
+            stipple: None,
+            tile_x_origin: None,
+            tile_y_origin: None,
+            font: None,
+            subwindow_mode: None,
+            graphics_exposures: Some(graphics_exposures),
+            clip_x_origin: None,
+            clip_y_origin: None,
+            clip_mask: None,
+            dash_offset: None,
+            dashes: None,
+            arc_mode: None,
+        }
+    }
+
+    fn uv_window(
+        state: &mut ServerState,
+        xid: u32,
+        parent: ResourceId,
+        map_state: crate::resources::MapState,
+    ) {
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let w = state.resources.window_mut(ResourceId(xid)).expect("window");
+        w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+            xid | 0x0040_0000,
+        ));
+        w.map_state = map_state;
+    }
+
+    fn uv_pixmap(state: &mut ServerState, xid: u32) {
+        state.resources.create_pixmap(
+            ClientId(1),
+            yserver_protocol::x11::CreatePixmapRequest {
+                pixmap: ResourceId(xid),
+                drawable: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                depth: 24,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(xid),
+            crate::backend::PixmapHandle::from_raw_for_test(xid | 0x0040_0000),
+        );
+    }
+
+    /// Unmapped frame with a mapped (so Unviewable) child, a lone unmapped
+    /// window, a viewable window, two pixmaps and GCs with exposures on/off.
+    fn uv_fixture() -> (ServerState, UnixStream) {
+        use crate::resources::MapState;
+        let mut state = ServerState::new();
+        let peer = install_client(&mut state, 1);
+        uv_window(&mut state, UV_FRAME, ROOT_WINDOW, MapState::Unmapped);
+        uv_window(
+            &mut state,
+            UV_CHILD,
+            ResourceId(UV_FRAME),
+            MapState::Unviewable,
+        );
+        uv_window(&mut state, UV_LONE, ROOT_WINDOW, MapState::Unmapped);
+        uv_window(&mut state, UV_SHOWN, ROOT_WINDOW, MapState::Viewable);
+        uv_pixmap(&mut state, UV_PIXMAP);
+        uv_pixmap(&mut state, UV_DST_PIXMAP);
+        state
+            .resources
+            .create_gc(ClientId(1), uv_gc_request(UV_GC, true));
+        state
+            .resources
+            .create_gc(ClientId(1), uv_gc_request(UV_GC_NOEXP, false));
+        (state, peer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn uv_copy(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        opcode: u8,
+        src: u32,
+        dst: u32,
+        gc: u32,
+        src_xy: (i16, i16),
+        dst_xy: (i16, i16),
+        size: (u16, u16),
+    ) {
+        let mut body = Vec::with_capacity(28);
+        body.extend_from_slice(&src.to_le_bytes());
+        body.extend_from_slice(&dst.to_le_bytes());
+        body.extend_from_slice(&gc.to_le_bytes());
+        body.extend_from_slice(&src_xy.0.to_le_bytes());
+        body.extend_from_slice(&src_xy.1.to_le_bytes());
+        body.extend_from_slice(&dst_xy.0.to_le_bytes());
+        body.extend_from_slice(&dst_xy.1.to_le_bytes());
+        body.extend_from_slice(&size.0.to_le_bytes());
+        body.extend_from_slice(&size.1.to_le_bytes());
+        if opcode == 63 {
+            body.extend_from_slice(&1u32.to_le_bytes());
+        }
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("dispatch copy");
+    }
+
+    fn uv_copy_calls(backend: &RecordingBackend) -> usize {
+        use crate::backend::recording::RecordedCall;
+        backend
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RecordedCall::CopyArea { .. } | RecordedCall::CopyPlane { .. }
+                )
+            })
+            .count()
+    }
+
+    /// Decoded (type, drawable, x, y, w, h, count, major) per 32-byte event.
+    type UvEvent = (u8, u32, u16, u16, u16, u16, u16, u8);
+
+    fn uv_events(bytes: &[u8]) -> Vec<UvEvent> {
+        bytes
+            .chunks_exact(32)
+            .map(|e| {
+                let u16_at = |i: usize| u16::from_le_bytes([e[i], e[i + 1]]);
+                let drawable = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+                if e[0] == 13 {
+                    (
+                        13,
+                        drawable,
+                        u16_at(8),
+                        u16_at(10),
+                        u16_at(12),
+                        u16_at(14),
+                        u16_at(18),
+                        e[20],
+                    )
+                } else {
+                    (e[0], drawable, 0, 0, 0, 0, 0, e[10])
+                }
+            })
+            .collect()
+    }
+
+    /// Xorg: an unrealized source window has an empty clipList
+    /// (mivaltree.c:691-696, miwindow.c:741-744, window.c:892), so miDoCopy
+    /// copies nothing and miHandleExposures exposes the whole rect.
+    #[test]
+    fn copy_area_from_unviewable_window_exposes_whole_dest_rect() {
+        for (opcode, src) in [
+            (62u8, UV_LONE),
+            (62, UV_CHILD),
+            (63, UV_LONE),
+            (63, UV_CHILD),
+        ] {
+            let (mut state, mut peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            uv_copy(
+                &mut state,
+                &mut backend,
+                opcode,
+                src,
+                UV_DST_PIXMAP,
+                UV_GC,
+                (10, 20),
+                (5, 7),
+                (30, 40),
+            );
+            assert_eq!(
+                uv_copy_calls(&backend),
+                0,
+                "op {opcode} src 0x{src:x}: nothing copied"
+            );
+            assert_eq!(
+                uv_events(&read_all_available(&mut peer)),
+                vec![(13, UV_DST_PIXMAP, 5, 7, 30, 40, 0, opcode)],
+                "op {opcode} src 0x{src:x}: one GraphicsExpose for the dest rect, no NoExpose",
+            );
+        }
+    }
+
+    #[test]
+    fn copy_area_from_unviewable_window_without_exposures_sends_nothing() {
+        for opcode in [62u8, 63] {
+            let (mut state, mut peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            uv_copy(
+                &mut state,
+                &mut backend,
+                opcode,
+                UV_CHILD,
+                UV_DST_PIXMAP,
+                UV_GC_NOEXP,
+                (0, 0),
+                (0, 0),
+                (30, 40),
+            );
+            assert_eq!(uv_copy_calls(&backend), 0);
+            assert!(
+                read_all_available(&mut peer).is_empty(),
+                "op {opcode}: no events"
+            );
+        }
+    }
+
+    /// A pixmap or viewable window source is unchanged: copied, NoExpose.
+    #[test]
+    fn copy_area_from_pixmap_or_viewable_window_still_copies_with_no_expose() {
+        for opcode in [62u8, 63] {
+            for src in [UV_PIXMAP, UV_SHOWN] {
+                let (mut state, mut peer) = uv_fixture();
+                let mut backend = RecordingBackend::new();
+                uv_copy(
+                    &mut state,
+                    &mut backend,
+                    opcode,
+                    src,
+                    UV_DST_PIXMAP,
+                    UV_GC,
+                    (10, 20),
+                    (5, 7),
+                    (30, 40),
+                );
+                assert_eq!(uv_copy_calls(&backend), 1, "op {opcode} src 0x{src:x}");
+                assert_eq!(
+                    uv_events(&read_all_available(&mut peer)),
+                    vec![(14, UV_DST_PIXMAP, 0, 0, 0, 0, 0, opcode)],
+                    "op {opcode} src 0x{src:x}: NoExpose",
+                );
+            }
+        }
+    }
+
+    /// Xorg miDoCopy returns NULL for an unrealized destination before any
+    /// copy or exposure (micopy.c:157-160), so the requestor gets NoExpose
+    /// even when the source is unavailable.
+    #[test]
+    fn copy_area_to_unviewable_window_copies_nothing_and_sends_no_expose() {
+        for opcode in [62u8, 63] {
+            for (src, src_xy) in [(UV_PIXMAP, (0, 0)), (UV_PIXMAP, (90, 0)), (UV_LONE, (0, 0))] {
+                let (mut state, mut peer) = uv_fixture();
+                let mut backend = RecordingBackend::new();
+                uv_copy(
+                    &mut state,
+                    &mut backend,
+                    opcode,
+                    src,
+                    UV_CHILD,
+                    UV_GC,
+                    src_xy,
+                    (0, 0),
+                    (30, 40),
+                );
+                assert_eq!(uv_copy_calls(&backend), 0, "op {opcode} src 0x{src:x}");
+                assert!(
+                    !backend.calls().iter().any(|c| matches!(
+                        c,
+                        crate::backend::recording::RecordedCall::PaintWindowBackgroundRect { .. }
+                    )),
+                    "op {opcode} src 0x{src:x}: no background paint",
+                );
+                assert_eq!(
+                    uv_events(&read_all_available(&mut peer)),
+                    vec![(14, UV_CHILD, 0, 0, 0, 0, 0, opcode)],
+                    "op {opcode} src 0x{src:x} at {src_xy:?}: NoExpose",
+                );
+            }
+        }
+    }
+
+    /// Drawing to an unmapped window records no damage (Xorg damage.c:197).
+    #[test]
+    fn poly_fill_on_unmapped_window_records_no_damage() {
+        use crate::server::DamageObject;
+        const DAMAGE_XID: u32 = 0x0010_0130;
+        for (window, expect_damage) in [(UV_LONE, false), (UV_CHILD, false), (UV_SHOWN, true)] {
+            let (mut state, _peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: ResourceId(window),
+                    level: 3,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+            let body = poly_fill_rectangle_body(window, UV_GC);
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 70,
+                    data: 0,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                &body,
+                None,
+            )
+            .expect("PolyFillRectangle");
+            let dmg = state
+                .damage_objects
+                .get(&DAMAGE_XID)
+                .expect("damage object");
+            assert_eq!(
+                !dmg.rects.is_empty() || dmg.pending_notify_fired,
+                expect_damage,
+                "window 0x{window:x}: rects={:?} fired={}",
+                dmg.rects,
+                dmg.pending_notify_fired,
+            );
+        }
+    }
+
     /// Stage 4d Manual-redirect CopyArea ClipByChildren fix.
     ///
     /// Scenario (matches marco's failing #6886 / #7450 CopyArea on
@@ -62405,20 +63703,22 @@ mod tests {
             ResourceId(SRC_PIC_XID),
             PictureState {
                 client: ClientId(COMPOSITOR),
-                host_picture_xid: PictureHandle::from_raw_for_test(HOST_SRC),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(HOST_SRC)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Drawable,
                 drawable: Some(ResourceId(WIN_XID)),
+                window: None,
             },
         );
         state.resources.create_picture(
             ResourceId(DST_PIC_XID),
             PictureState {
                 client: ClientId(COMPOSITOR),
-                host_picture_xid: PictureHandle::from_raw_for_test(HOST_DST),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(HOST_DST)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Drawable,
                 drawable: Some(ResourceId(WIN_XID)),
+                window: None,
             },
         );
         // The dst window must be MAPPED for these tests to describe a real
@@ -62998,6 +64298,10 @@ mod tests {
         seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
         seed_window(&mut state, unredirected_parent_xid, root_xid, 100, 100);
         seed_window(&mut state, target_xid, unredirected_parent_xid, 50, 50);
+        // Viewable throughout: an unviewable window gets its backing at realize instead.
+        for w in [mate_panel_xid, unredirected_parent_xid, target_xid] {
+            let _ = state.resources.map_window(w);
+        }
 
         assert!(
             state
@@ -63081,6 +64385,391 @@ mod tests {
         assert_eq!(
             backing_before, backing_after,
             "RedirectWindow(W) survives reparent"
+        );
+    }
+
+    // Window-storage step 4: a redirect backing follows viewability (Xorg
+    // compRealizeWindow / compUnrealizeWindow → compCheckRedirect); the
+    // redirect itself survives until Unredirect or destruction.
+
+    fn storage_req(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request must succeed");
+    }
+
+    fn storage_redirect(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        minor: u8,
+        window: ResourceId,
+    ) {
+        let mut body = window.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&[1, 0, 0, 0]); // Manual
+        storage_req(state, backend, 144, minor, &body);
+    }
+
+    fn storage_window_req(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        opcode: u8,
+        window: ResourceId,
+    ) {
+        storage_req(state, backend, opcode, 0, &window.0.to_le_bytes());
+    }
+
+    fn drain_calls(
+        backend: &crate::backend::recording::RecordingBackend,
+    ) -> Vec<crate::backend::recording::RecordedCall> {
+        std::mem::take(&mut *backend.calls.lock().unwrap())
+    }
+
+    const MAP_WINDOW: u8 = 8;
+    const MAP_SUBWINDOWS: u8 = 9;
+    const UNMAP_WINDOW: u8 = 10;
+    const UNMAP_SUBWINDOWS: u8 = 11;
+
+    fn backing_of(state: &ServerState, window: ResourceId) -> Option<u32> {
+        state
+            .resources
+            .window(window)
+            .and_then(|w| w.redirected_backing.as_ref())
+            .map(|b| b.host_pixmap.as_raw())
+    }
+
+    fn storage_host(window: ResourceId) -> u32 {
+        0x8000_0000 | window.0
+    }
+
+    fn released(calls: &[crate::backend::recording::RecordedCall], backing: u32) -> bool {
+        calls.iter().any(|c| {
+            matches!(c, crate::backend::recording::RecordedCall::ReleaseRedirectedBacking(b) if *b == backing)
+        })
+    }
+
+    fn allocations_for(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> usize {
+        calls
+            .iter()
+            .filter(|c| {
+                matches!(c, crate::backend::recording::RecordedCall::AllocateRedirectedBacking { host_window, .. } if *host_window == storage_host(window))
+            })
+            .count()
+    }
+
+    fn participation_restored(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> bool {
+        calls.iter().any(|c| {
+            matches!(c, crate::backend::recording::RecordedCall::SetWindowSceneParticipation { host_window, participating: true } if *host_window == storage_host(window))
+        })
+    }
+
+    fn last_participation(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> Option<bool> {
+        calls.iter().rev().find_map(|c| match c {
+            crate::backend::recording::RecordedCall::SetWindowSceneParticipation {
+                host_window,
+                participating,
+            } if *host_window == storage_host(window) => Some(*participating),
+            _ => None,
+        })
+    }
+
+    /// A mapped top-level `W`, Manual-redirected through the dispatcher.
+    fn storage_redirected_top_level() -> (
+        ServerState,
+        crate::backend::recording::RecordingBackend,
+        ResourceId,
+        u32,
+    ) {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let window = ResourceId(0x0600_0001);
+        seed_window(&mut state, window, crate::resources::ROOT_WINDOW, 64, 48);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        let backing = backing_of(&state, window).expect("viewable redirected window has a backing");
+        (state, backend, window, backing)
+    }
+
+    #[test]
+    fn unmap_of_redirected_window_frees_backing_keeps_redirect_and_exclusion() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        let calls = drain_calls(&backend);
+        assert!(
+            released(&calls, backing),
+            "unmap releases the backing; calls={calls:#?}"
+        );
+        assert_eq!(backing_of(&state, window), None);
+        assert!(
+            state.composite_redirects.contains_key(&(window, false)),
+            "redirect record kept"
+        );
+        assert!(
+            !participation_restored(&calls, window),
+            "window stays out of the scene"
+        );
+    }
+
+    #[test]
+    fn remap_of_redirected_window_allocates_a_fresh_backing() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, window), 1);
+        let fresh = backing_of(&state, window).expect("remap re-creates the backing");
+        assert_ne!(fresh, backing);
+        assert_eq!(
+            last_participation(&calls, window),
+            Some(false),
+            "Manual stays excluded"
+        );
+    }
+
+    #[test]
+    fn redirect_of_unviewable_window_allocates_at_map() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let window = ResourceId(0x0600_0001);
+        seed_window(&mut state, window, crate::resources::ROOT_WINDOW, 64, 48);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        assert_eq!(
+            allocations_for(&drain_calls(&backend), window),
+            0,
+            "Xorg: not realized, no pixmap"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 1);
+        assert!(backing_of(&state, window).is_some());
+    }
+
+    #[test]
+    fn ancestor_unmap_frees_redirected_descendant_backing_and_remap_restores_it() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let frame = ResourceId(0x0600_0010);
+        let window = ResourceId(0x0600_0011);
+        seed_window(&mut state, frame, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, window, frame, 32, 24);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        let backing = backing_of(&state, window).expect("backing");
+        drain_calls(&backend);
+
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, frame);
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(state.composite_redirects.contains_key(&(window, false)));
+        assert!(!participation_restored(&calls, window));
+
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        let calls = drain_calls(&backend);
+        assert_eq!(
+            allocations_for(&calls, window),
+            1,
+            "descendant realized with its ancestor"
+        );
+        assert_ne!(backing_of(&state, window), Some(backing));
+        assert!(backing_of(&state, window).is_some());
+        assert_eq!(last_participation(&calls, window), Some(false));
+    }
+
+    #[test]
+    fn redirect_subwindows_children_follow_viewability() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let parent = ResourceId(0x0600_0020);
+        let shown = ResourceId(0x0600_0021);
+        let hidden = ResourceId(0x0600_0022);
+        seed_window(&mut state, parent, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, shown, parent, 16, 16);
+        seed_window(&mut state, hidden, parent, 16, 16);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, parent);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, shown);
+        storage_redirect(&mut state, &mut backend, 2, parent); // RedirectSubwindows
+        let shown_backing = backing_of(&state, shown).expect("viewable child redirected");
+        assert_eq!(
+            backing_of(&state, hidden),
+            None,
+            "unmapped child has no backing"
+        );
+        assert_eq!(
+            backing_of(&state, parent),
+            None,
+            "the parent itself is not redirected"
+        );
+
+        storage_window_req(&mut state, &mut backend, UNMAP_SUBWINDOWS, parent);
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, shown_backing));
+        assert_eq!(backing_of(&state, shown), None);
+        assert!(state.composite_redirects.contains_key(&(parent, true)));
+        assert!(!participation_restored(&calls, shown));
+
+        storage_window_req(&mut state, &mut backend, MAP_SUBWINDOWS, parent);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, shown), 1);
+        assert_eq!(allocations_for(&calls, hidden), 1);
+        assert_eq!(last_participation(&calls, shown), Some(false));
+        assert_eq!(last_participation(&calls, hidden), Some(false));
+
+        let (a, b) = (
+            backing_of(&state, shown).unwrap(),
+            backing_of(&state, hidden).unwrap(),
+        );
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, parent);
+        let calls = drain_calls(&backend);
+        assert!(
+            released(&calls, a) && released(&calls, b),
+            "ancestor unmap frees every child"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, parent);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, shown), 1);
+        assert_eq!(allocations_for(&calls, hidden), 1);
+    }
+
+    #[test]
+    fn unredirect_window_still_tears_down_and_restores_participation() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_redirect(&mut state, &mut backend, 3, window); // UnredirectWindow
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(!state.composite_redirects.contains_key(&(window, false)));
+        assert_eq!(last_participation(&calls, window), Some(true));
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        assert_eq!(
+            allocations_for(&drain_calls(&backend), window),
+            0,
+            "no redirect, no backing"
+        );
+    }
+
+    #[test]
+    fn unredirect_of_hidden_mapped_window_restores_participation_without_backing() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let frame = ResourceId(0x0600_0030);
+        let window = ResourceId(0x0600_0031);
+        seed_window(&mut state, frame, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, window, frame, 32, 24);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, frame);
+        drain_calls(&backend);
+        storage_redirect(&mut state, &mut backend, 3, window);
+        let calls = drain_calls(&backend);
+        assert_eq!(
+            last_participation(&calls, window),
+            Some(true),
+            "mapped window rejoins the scene"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 0);
+    }
+
+    #[test]
+    fn destroy_of_redirected_window_still_releases_backing_and_record() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, 4, window); // DestroyWindow
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert!(!state.composite_redirects.contains_key(&(window, false)));
+    }
+
+    #[test]
+    fn destroy_of_unmapped_redirected_window_drops_the_record() {
+        let (mut state, mut backend, window, _backing) = storage_redirected_top_level();
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, 4, window);
+        assert!(!state.composite_redirects.contains_key(&(window, false)));
+    }
+
+    #[test]
+    fn reparent_under_unmapped_parent_frees_backing_keeps_redirect() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        let hidden_parent = ResourceId(0x0600_0040);
+        seed_window(
+            &mut state,
+            hidden_parent,
+            crate::resources::ROOT_WINDOW,
+            64,
+            48,
+        );
+        drain_calls(&backend);
+        dispatch_reparent_window(&mut state, &mut backend, window, hidden_parent, 0, 0);
+        assert!(released(&drain_calls(&backend), backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(state.composite_redirects.contains_key(&(window, false)));
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, hidden_parent);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 1);
+    }
+
+    #[test]
+    fn unmap_severs_named_pixmaps_from_the_window() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        let named = ResourceId(0x0600_0050);
+        if let Some(w) = state.resources.window_mut(window) {
+            w.composite_named_pixmaps
+                .push(crate::resources::NamedCompositePixmap {
+                    client_pixmap: named,
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(backing),
+                    width: 64,
+                    height: 48,
+                });
+        }
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        assert!(
+            state
+                .resources
+                .window(window)
+                .unwrap()
+                .composite_named_pixmaps
+                .is_empty()
+        );
+        assert_eq!(
+            render_picture_damage_drawable(&state, named),
+            named,
+            "no longer the window's"
         );
     }
 
@@ -65716,7 +67405,10 @@ mod tests {
         if let Some(w) = state.resources.window_mut(win) {
             w.border_width = 2;
         }
-        assert!(state.resources.map_window(win), "window must map");
+        assert!(
+            state.resources.map_window(win).mapping_changed,
+            "window must map"
+        );
         // Raw level: `area` on the wire then carries the real rect
         // instead of the NonEmpty full-extent substitute, so the test
         // can prove the negative origin survives the i16 encoding.
@@ -65823,7 +67515,10 @@ mod tests {
                 w.border_width = bw;
             }
             if map {
-                assert!(state.resources.map_window(win), "window must map");
+                assert!(
+                    state.resources.map_window(win).mapping_changed,
+                    "window must map"
+                );
             }
             state.damage_objects.insert(
                 DAMAGE_XID,
@@ -65896,7 +67591,10 @@ mod tests {
                     depth: 24,
                 });
             }
-            assert!(state.resources.map_window(win), "window must map");
+            assert!(
+                state.resources.map_window(win).mapping_changed,
+                "window must map"
+            );
             state.composite_redirects.insert(
                 (win, false),
                 RedirectRecord {
@@ -66034,7 +67732,10 @@ mod tests {
                 });
             }
             if map {
-                assert!(state.resources.map_window(win), "window must map");
+                assert!(
+                    state.resources.map_window(win).mapping_changed,
+                    "window must map"
+                );
             }
             state.composite_redirects.insert(
                 (win, false),
@@ -70855,5 +72556,468 @@ mod tests {
             keyboard_mapping_notify.is_some(),
             "expected a MappingNotify with request=Keyboard(1): {bytes:02x?}"
         );
+    }
+
+    // ── Step 3 (window-storage lifecycle): Pictures on windows ──────────
+
+    const PIC_A: u32 = 0x0030_0000;
+    const PIC_B: u32 = 0x0040_0000;
+    const PIC_WIN: u32 = PIC_A | 1;
+    const PIC_WIN_HOST: u32 = 0x00E0_0001;
+    const PIC_ON_WIN: u32 = PIC_B | 1;
+    const PIC_PIXMAP: u32 = PIC_B | 2;
+    const PIC_ON_PIXMAP: u32 = PIC_B | 3;
+
+    fn picture_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// `(error code, bad value)` of every error queued on `peer`.
+    fn drain_errors(peer: &mut UnixStream) -> Vec<(u8, u32)> {
+        peer.set_nonblocking(true).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 32];
+        while peer.read_exact(&mut buf).is_ok() {
+            if buf[0] == 0 {
+                out.push((buf[1], u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])));
+            }
+        }
+        out
+    }
+
+    fn create_render_picture(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        pic: u32,
+        drawable: u32,
+    ) {
+        let mut body = Vec::new();
+        for v in [pic, drawable, 0, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        picture_request(state, backend, client, 133, 4, &body);
+    }
+
+    fn render_fill(state: &mut ServerState, backend: &mut RecordingBackend, client: u32, dst: u32) {
+        let mut body = vec![1u8, 0, 0, 0];
+        body.extend_from_slice(&dst.to_le_bytes());
+        body.extend_from_slice(&[0xff; 8]);
+        for v in [0i16, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [8u16, 8] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        picture_request(state, backend, client, 133, 26, &body);
+    }
+
+    fn render_composite_pics(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        src: u32,
+        dst: u32,
+    ) {
+        let mut body = vec![0u8; 32];
+        body[0] = 3;
+        body[4..8].copy_from_slice(&src.to_le_bytes());
+        body[12..16].copy_from_slice(&dst.to_le_bytes());
+        body[28..30].copy_from_slice(&8u16.to_le_bytes());
+        body[30..32].copy_from_slice(&8u16.to_le_bytes());
+        picture_request(state, backend, client, 133, 8, &body);
+    }
+
+    fn render_free(state: &mut ServerState, backend: &mut RecordingBackend, client: u32, pic: u32) {
+        picture_request(state, backend, client, 133, 7, &pic.to_le_bytes());
+    }
+
+    fn host_pic_of(state: &ServerState, pic: u32) -> u32 {
+        state
+            .resources
+            .picture(ResourceId(pic))
+            .expect("picture exists")
+            .host_picture_xid
+            .expect("backed picture")
+            .as_raw()
+    }
+
+    fn render_paints(backend: &RecordingBackend) -> Vec<RecordedCall> {
+        backend
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RecordedCall::RenderComposite { .. }
+                        | RecordedCall::RenderFillRectangles { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// Client A owns a mapped top-level `PIC_WIN`; client B holds a Picture on it and
+    /// one on its own pixmap.
+    fn cross_client_picture_fixture() -> (ServerState, RecordingBackend, UnixStream, UnixStream) {
+        let mut state = ServerState::new();
+        let peer_a = install_client(&mut state, 1);
+        let peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        state.resources.create_pixmap(
+            ClientId(2),
+            CreatePixmapRequest {
+                pixmap: ResourceId(PIC_PIXMAP),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(PIC_PIXMAP),
+            crate::backend::PixmapHandle::from_raw_for_test(0x00E0_0100),
+        ));
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_WIN);
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_PIXMAP, PIC_PIXMAP);
+        (state, backend, peer_a, peer_b)
+    }
+
+    fn create_pic_test_window(state: &mut ServerState, xid: u32, host: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: ROOT_WINDOW,
+                width: 64,
+                height: 64,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(xid))
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(host));
+        let _ = state.resources.map_window(ResourceId(xid));
+    }
+
+    /// B's Picture on A's window is dead once the window is gone: every use and
+    /// its FreePicture are BadPicture, its pixmap Picture is untouched, and a new
+    /// window on the same xid and host storage does not revive it.
+    fn assert_window_picture_dead_after(
+        destroy: impl FnOnce(&mut ServerState, &mut RecordingBackend),
+    ) {
+        let bad_picture = crate::nested::RENDER_FIRST_ERROR + 1;
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        let host_on_win = host_pic_of(&state, PIC_ON_WIN);
+        let host_on_pixmap = host_pic_of(&state, PIC_ON_PIXMAP);
+
+        destroy(&mut state, &mut backend);
+
+        assert!(state.resources.picture(ResourceId(PIC_ON_WIN)).is_none());
+        let freed: Vec<u32> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::RenderFreePicture { host_pic } => Some(host_pic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            freed,
+            vec![host_on_win],
+            "only the window Picture's backend record is freed"
+        );
+        assert_eq!(host_pic_of(&state, PIC_ON_PIXMAP), host_on_pixmap);
+        backend.calls.lock().unwrap().clear();
+
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_ON_PIXMAP);
+        render_free(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(bad_picture, PIC_ON_WIN); 3],
+            "FillRectangles, Composite and FreePicture on the dead Picture",
+        );
+        assert!(render_paints(&backend).is_empty());
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::RenderFreePicture { .. }))
+        );
+
+        render_fill(&mut state, &mut backend, 2, PIC_ON_PIXMAP);
+        assert_eq!(
+            render_paints(&backend),
+            vec![RecordedCall::RenderFillRectangles {
+                host_dst: host_on_pixmap
+            }],
+        );
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    #[test]
+    fn destroy_window_frees_other_clients_pictures_on_it() {
+        assert_window_picture_dead_after(|state, backend| {
+            picture_request(state, backend, 1, 4, 0, &PIC_WIN.to_le_bytes());
+        });
+    }
+
+    #[test]
+    fn owner_disconnect_frees_other_clients_pictures_on_its_windows() {
+        assert_window_picture_dead_after(|state, backend| {
+            crate::core_loop::process_disconnect::process_disconnect(state, backend, ClientId(1));
+            let _peer = install_client(state, 1);
+        });
+    }
+
+    #[test]
+    fn destroying_a_parent_frees_pictures_on_its_descendants() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const CHILD: u32 = PIC_A | 2;
+        const PIC_ON_CHILD: u32 = PIC_B | 4;
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD),
+                parent: ResourceId(PIC_WIN),
+                width: 8,
+                height: 8,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(CHILD))
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(0x00E0_0002));
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_CHILD, CHILD);
+        assert!(state.resources.picture(ResourceId(PIC_ON_CHILD)).is_some());
+
+        picture_request(&mut state, &mut backend, 1, 4, 0, &PIC_WIN.to_le_bytes());
+
+        assert!(state.resources.picture(ResourceId(PIC_ON_CHILD)).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_ON_WIN)).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_ON_PIXMAP)).is_some());
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// Xorg: an unviewable window's clipList is empty, so a Picture on it as the
+    /// destination draws nothing; the same Picture draws again after remap.
+    #[test]
+    fn window_picture_draws_nothing_while_unmapped_and_again_after_remap() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        let host_on_win = host_pic_of(&state, PIC_ON_WIN);
+        let host_on_pixmap = host_pic_of(&state, PIC_ON_PIXMAP);
+        let fill = RecordedCall::RenderFillRectangles {
+            host_dst: host_on_win,
+        };
+
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(render_paints(&backend), vec![fill.clone()]);
+        backend.calls.lock().unwrap().clear();
+
+        picture_request(&mut state, &mut backend, 1, 10, 0, &PIC_WIN.to_le_bytes());
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_PIXMAP, PIC_ON_WIN);
+        assert!(
+            render_paints(&backend).is_empty(),
+            "unmapped: nothing drawn"
+        );
+        // As a source the hidden window's contents are undefined, not an error.
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_ON_PIXMAP);
+        assert_eq!(
+            render_paints(&backend),
+            vec![RecordedCall::RenderComposite {
+                host_src: host_on_win,
+                host_dst: host_on_pixmap,
+            }],
+        );
+        backend.calls.lock().unwrap().clear();
+
+        picture_request(&mut state, &mut backend, 1, 8, 0, &PIC_WIN.to_le_bytes());
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(render_paints(&backend), vec![fill]);
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// A Picture on a redirected window names the window, not the backing it
+    /// has at creation time, so it follows backing rotations.
+    #[test]
+    fn create_picture_on_redirected_window_names_the_window() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        state
+            .resources
+            .window_mut(ResourceId(PIC_WIN))
+            .unwrap()
+            .redirected_backing = Some(crate::resources::RedirectedBacking {
+            host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(0x00E0_0200),
+            width: 64,
+            height: 64,
+            depth: 24,
+        });
+        create_render_picture(&mut state, &mut backend, 1, PIC_A | 5, PIC_WIN);
+        let host_drawables: Vec<crate::backend::AnyHandle> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::RenderCreatePicture { host_drawable, .. } => Some(host_drawable),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            host_drawables,
+            vec![crate::backend::AnyHandle::Window(
+                crate::backend::WindowHandle::from_raw_for_test(PIC_WIN_HOST)
+            )],
+        );
+        assert_eq!(
+            state
+                .resources
+                .picture(ResourceId(PIC_A | 5))
+                .unwrap()
+                .window,
+            Some(ResourceId(PIC_WIN)),
+        );
+    }
+
+    /// Xorg `compDestroyOverlayWindow` frees the overlay through DeleteWindow, so
+    /// Pictures on it are freed with it (`composite/compoverlay.c:167-172`).
+    #[test]
+    fn overlay_release_frees_pictures_on_the_overlay() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        drain_errors(&mut peer);
+        create_render_picture(&mut state, &mut backend, 1, PIC_A | 6, cow.0);
+        assert!(state.resources.picture(ResourceId(PIC_A | 6)).is_some());
+        body[0..4].copy_from_slice(&cow.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &body,
+        );
+        assert!(state.resources.window(cow).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_A | 6)).is_none());
+    }
+
+    /// CreateConicalGradient registers a Picture: usable as a source without an
+    /// error (drawing with it stays unimplemented) and freeable.
+    #[test]
+    fn conical_gradient_picture_is_usable_as_source_and_freeable() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const CONICAL: u32 = PIC_B | 9;
+        let mut body = Vec::new();
+        body.extend_from_slice(&CONICAL.to_le_bytes());
+        body.extend_from_slice(&[0u8; 16]); // center, angle, nstops = 0
+        picture_request(&mut state, &mut backend, 2, 133, 36, &body);
+        assert!(state.resources.picture(ResourceId(CONICAL)).is_some());
+        backend.calls.lock().unwrap().clear();
+        render_composite_pics(&mut state, &mut backend, 2, CONICAL, PIC_ON_PIXMAP);
+        assert!(
+            render_paints(&backend).is_empty(),
+            "unbacked source draws nothing"
+        );
+        render_free(&mut state, &mut backend, 2, CONICAL);
+        assert!(state.resources.picture(ResourceId(CONICAL)).is_none());
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// A CreatePicture the backend could not back still succeeds at protocol level:
+    /// ops on the Picture are silent no-ops and FreePicture is valid. An id that was
+    /// never created is still BadPicture.
+    #[test]
+    fn unbacked_picture_ops_are_silent_no_ops() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const UNBACKED: u32 = PIC_B | 10;
+        backend.render_create_picture_fails = true;
+        create_render_picture(&mut state, &mut backend, 2, UNBACKED, PIC_PIXMAP);
+        backend.render_create_picture_fails = false;
+        let st = state
+            .resources
+            .picture(ResourceId(UNBACKED))
+            .expect("registered");
+        assert!(st.host_picture_xid.is_none());
+        backend.calls.lock().unwrap().clear();
+
+        render_fill(&mut state, &mut backend, 2, UNBACKED);
+        render_composite_pics(&mut state, &mut backend, 2, UNBACKED, PIC_ON_PIXMAP);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_PIXMAP, UNBACKED);
+        render_free(&mut state, &mut backend, 2, UNBACKED);
+        assert!(drain_errors(&mut peer_b).is_empty());
+        assert!(state.resources.picture(ResourceId(UNBACKED)).is_none());
+        assert!(backend.calls().iter().all(|c| !matches!(
+            c,
+            RecordedCall::RenderComposite { .. }
+                | RecordedCall::RenderFillRectangles { .. }
+                | RecordedCall::RenderFreePicture { .. }
+        )));
+
+        const NEVER: u32 = PIC_B | 11;
+        render_fill(&mut state, &mut backend, 2, NEVER);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(crate::nested::RENDER_FIRST_ERROR + 1, NEVER)],
+        );
+    }
+
+    /// Xorg dixLookupDrawable: CreatePicture on an unknown drawable is BadDrawable
+    /// and registers nothing.
+    #[test]
+    fn create_picture_on_unknown_drawable_is_bad_drawable() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const PIC: u32 = PIC_B | 12;
+        create_render_picture(&mut state, &mut backend, 2, PIC, 0x00DE_AD00);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(x11::error::BAD_DRAWABLE, 0x00DE_AD00)],
+        );
+        assert!(state.resources.picture(ResourceId(PIC)).is_none());
     }
 }

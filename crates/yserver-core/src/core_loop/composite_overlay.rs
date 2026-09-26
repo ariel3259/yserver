@@ -84,6 +84,13 @@ pub(crate) fn teardown_overlay(
         // `materialize_cow_resource`.
         return Ok(());
     }
+    // Xorg frees the overlay through DeleteWindow, so its Pictures die with it.
+    crate::core_loop::process_request::free_pictures_on_destroyed_windows(
+        state,
+        backend,
+        origin,
+        &[COMPOSITE_OVERLAY_WINDOW],
+    );
     crate::core_loop::process_request::purge_present_for_destroyed_windows(
         state,
         backend,

@@ -53,6 +53,8 @@ pub enum RecordedCall {
     DestroySubwindow(u32),
     MapSubwindow(u32),
     UnmapSubwindow(u32),
+    RealizeWindowStorage(u32),
+    ReleaseWindowStorage(u32),
     ConfigureSubwindow {
         host_xid: u32,
         config: HostSubwindowConfig,
@@ -117,6 +119,32 @@ pub enum RecordedCall {
         src_y: i16,
         dst_x: i16,
         dst_y: i16,
+        width: u16,
+        height: u16,
+    },
+    RenderCreatePicture {
+        host_drawable: AnyHandle,
+        host_pic: u32,
+    },
+    RenderFreePicture {
+        host_pic: u32,
+    },
+    RenderComposite {
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderFillRectangles {
+        host_dst: u32,
+    },
+    CopyPlane {
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        plane: u32,
+    },
+    PaintWindowBackgroundRect {
+        host_xid: u32,
+        x: i16,
+        y: i16,
         width: u16,
         height: u16,
     },
@@ -379,6 +407,8 @@ pub struct RecordingBackend {
     /// Configurable region returned by RENDER paint methods so core
     /// tests can assert exact damage plumbing without a real backend.
     pub render_return_region: Vec<xfixes::RegionRect>,
+    /// When true, `render_create_picture` cannot back the Picture (returns `Ok(None)`).
+    pub render_create_picture_fails: bool,
     /// Test controls for the asynchronous Present source-wait bridge.
     pub present_source_wait: PresentSourceWait,
     pub present_syncobj_wait: PresentSourceWait,
@@ -511,6 +541,8 @@ pub struct RecordingBackend {
     /// result lets request-layer tests prove M2b bypasses Copy entirely.
     pub present_direct_result: bool,
     pub present_direct_candidates: Vec<PresentScanoutCandidate>,
+    /// `(event, dst_host_xid)` passed to `enqueue_present_completion`, in call order.
+    pub enqueued_present_completions: Vec<(CompletedPresentEvent, u32)>,
     /// Adversarial-review fix (arm-before-scrap): when `Some(kind)`,
     /// `arm_present_syncobj_wait` still records the call but returns
     /// `Err(io::Error::from(kind))` instead of `Ok(present_syncobj_wait)`,
@@ -593,6 +625,7 @@ impl RecordingBackend {
             kbd_by_name_result: None,
             xkb_mods: (0, 0, 0, 0),
             render_return_region: Vec::new(),
+            render_create_picture_fails: false,
             present_source_wait: PresentSourceWait::Ready,
             present_syncobj_wait: PresentSourceWait::Ready,
             armed_present_syncobj_waits: Vec::new(),
@@ -636,6 +669,7 @@ impl RecordingBackend {
             fail_copy_area: false,
             present_direct_result: false,
             present_direct_candidates: Vec::new(),
+            enqueued_present_completions: Vec::new(),
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
             applied_device_configs: Vec::new(),
@@ -1091,6 +1125,11 @@ impl Backend for RecordingBackend {
         self.present_skip_count += 1;
     }
 
+    fn enqueue_present_completion(&mut self, event: CompletedPresentEvent, dst_host_xid: u32) {
+        self.enqueued_present_completions
+            .push((event, dst_host_xid));
+    }
+
     fn try_present_direct(
         &mut self,
         candidate: PresentScanoutCandidate,
@@ -1507,6 +1546,24 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
+    fn realize_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::RealizeWindowStorage(host_xid));
+        Ok(())
+    }
+
+    fn release_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::ReleaseWindowStorage(host_xid));
+        Ok(())
+    }
+
     fn configure_subwindow(
         &mut self,
         _origin: Option<OriginContext>,
@@ -1890,20 +1947,44 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
+    fn paint_window_background_rect(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::PaintWindowBackgroundRect {
+            host_xid,
+            x,
+            y,
+            width,
+            height,
+        });
+        Ok(())
+    }
+
     fn copy_plane(
         &mut self,
         _origin: Option<OriginContext>,
-        _src_host_xid: u32,
-        _dst_host_xid: u32,
+        src_host_xid: u32,
+        dst_host_xid: u32,
         _src_x: i16,
         _src_y: i16,
         _dst_x: i16,
         _dst_y: i16,
         _width: u16,
         _height: u16,
-        _plane: u32,
+        plane: u32,
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: copy_plane")
+        self.record(RecordedCall::CopyPlane {
+            src_host_xid,
+            dst_host_xid,
+            plane,
+        });
+        Ok(())
     }
 
     fn put_image(
@@ -2001,7 +2082,7 @@ impl Backend for RecordingBackend {
         _foreground: u32,
         _rectangles: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_fill_rectangle")
+        Ok(())
     }
 
     fn poly_fill_arc(
@@ -2094,18 +2175,26 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: image_text16")
     }
 
-    // RENDER — `unimplemented!()`; render_opcode() returns None so call
-    // sites fast-path out before reaching these.
+    // RENDER — Picture create/free and the Composite/FillRectangles paints are recorded;
+    // the rest are no-ops.
 
     fn render_create_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_drawable: AnyHandle,
+        host_drawable: AnyHandle,
         _ynest_format: u32,
         _value_mask: u32,
         _values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        Ok(None)
+        if self.render_create_picture_fails {
+            return Ok(None);
+        }
+        let host_pic = self.allocate_handle();
+        self.record(RecordedCall::RenderCreatePicture {
+            host_drawable,
+            host_pic,
+        });
+        Ok(PictureHandle::from_raw(host_pic))
     }
 
     fn render_change_picture(
@@ -2120,8 +2209,9 @@ impl Backend for RecordingBackend {
     fn render_free_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreePicture { host_pic });
         Ok(())
     }
 
@@ -2163,9 +2253,9 @@ impl Backend for RecordingBackend {
         &mut self,
         _origin: Option<OriginContext>,
         _op: u8,
-        _host_src: u32,
+        host_src: u32,
         _host_mask: u32,
-        _host_dst: u32,
+        host_dst: u32,
         _src_x: i16,
         _src_y: i16,
         _mask_x: i16,
@@ -2175,6 +2265,7 @@ impl Backend for RecordingBackend {
         _width: u16,
         _height: u16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderComposite { host_src, host_dst });
         Ok(self.render_return_region.clone())
     }
 
@@ -2199,13 +2290,14 @@ impl Backend for RecordingBackend {
     fn render_fill_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_dst: u32,
+        host_dst: u32,
         _op: u8,
         _color: [u8; 8],
         _rects: &[u8],
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFillRectangles { host_dst });
         Ok(())
     }
 
