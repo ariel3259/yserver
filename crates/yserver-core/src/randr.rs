@@ -446,6 +446,52 @@ impl RandrState {
         self.output_crtc_associations = associations.into_iter().collect();
     }
 
+    /// Remove withdrawn protocol outputs and CRTCs from the published
+    /// projection. The returned tuples preserve the pre-removal resource ids
+    /// needed for their removal notifications.
+    pub(crate) fn subtract_outputs_and_crtcs(
+        &mut self,
+        output_ids: &HashSet<u32>,
+        crtc_ids: &HashSet<u32>,
+    ) -> Vec<(u32, u32, u32)> {
+        let removed = self
+            .outputs
+            .iter()
+            .filter(|output| {
+                output_ids.contains(&output.output_id) || crtc_ids.contains(&output.crtc_id)
+            })
+            .map(|output| (output.output_id, output.crtc_id, output.mode_id))
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return removed;
+        }
+
+        self.outputs.retain(|output| {
+            !output_ids.contains(&output.output_id) && !crtc_ids.contains(&output.crtc_id)
+        });
+        self.output_crtc_associations.retain(|output_id, crtc_id| {
+            !output_ids.contains(output_id) && !crtc_ids.contains(crtc_id)
+        });
+        for provider in &mut self.providers {
+            provider.outputs.retain(|id| !output_ids.contains(id));
+            provider.crtcs.retain(|id| !crtc_ids.contains(id));
+        }
+        if !self
+            .outputs
+            .iter()
+            .any(|output| output.output_id == self.primary_output)
+        {
+            self.primary_output = self
+                .outputs
+                .iter()
+                .find(|output| output.mode_id != 0)
+                .or_else(|| self.outputs.iter().find(|output| output.connected))
+                .or_else(|| self.outputs.first())
+                .map_or(0, |output| output.output_id);
+        }
+        removed
+    }
+
     /// Look up a provider by its protocol XID.
     #[must_use]
     pub fn provider(&self, provider_id: u32) -> Option<&RandrProvider> {

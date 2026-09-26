@@ -940,6 +940,11 @@ pub struct ServerState {
     pub id_allocator: IdAllocator,
     pub start_instant: Instant,
     pub randr: RandrState,
+    /// RANDR resources withdrawn by an urgent backend publication. A full
+    /// later projection clears an id from these sets only after the backend
+    /// no longer names it.
+    pub(crate) withdrawn_randr_output_ids: HashSet<u32>,
+    pub(crate) withdrawn_randr_crtc_ids: HashSet<u32>,
     /// RANDR event masks selected via RRSelectInput: (client, window) -> mask.
     pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
     /// Whether `randr.primary_output` was explicitly chosen by a client via
@@ -1432,6 +1437,8 @@ impl ServerState {
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
             randr: RandrState::nested(0, width, height),
+            withdrawn_randr_output_ids: HashSet::new(),
+            withdrawn_randr_crtc_ids: HashSet::new(),
             randr_select_masks: HashMap::new(),
             randr_primary_output_explicit: false,
             randr_output_properties: HashMap::new(),
@@ -2344,6 +2351,50 @@ pub struct EventTarget {
 }
 
 impl ServerState {
+    /// Apply an urgent logical withdrawal to the published RANDR state and
+    /// remember its resource ids so queued older projections cannot revive
+    /// them.
+    pub(crate) fn withdraw_randr_resources(
+        &mut self,
+        output_ids: &[u32],
+        crtc_ids: &[u32],
+    ) -> Vec<(u32, u32, u32)> {
+        self.withdrawn_randr_output_ids
+            .extend(output_ids.iter().copied());
+        self.withdrawn_randr_crtc_ids
+            .extend(crtc_ids.iter().copied());
+        self.randr.subtract_outputs_and_crtcs(
+            &self.withdrawn_randr_output_ids,
+            &self.withdrawn_randr_crtc_ids,
+        )
+    }
+
+    /// Filter a newly produced projection against urgent withdrawals. The
+    /// update has already run, so ids absent from that backend projection can
+    /// leave the filter sets.
+    pub(crate) fn filter_withdrawn_randr_resources(&mut self) {
+        let projected_output_ids = self
+            .randr
+            .outputs
+            .iter()
+            .map(|output| output.output_id)
+            .collect::<HashSet<_>>();
+        let projected_crtc_ids = self
+            .randr
+            .outputs
+            .iter()
+            .map(|output| output.crtc_id)
+            .collect::<HashSet<_>>();
+        self.withdrawn_randr_output_ids
+            .retain(|id| projected_output_ids.contains(id));
+        self.withdrawn_randr_crtc_ids
+            .retain(|id| projected_crtc_ids.contains(id));
+        self.randr.subtract_outputs_and_crtcs(
+            &self.withdrawn_randr_output_ids,
+            &self.withdrawn_randr_crtc_ids,
+        );
+    }
+
     /// Stage 4e — set the COW's input shape to empty (click-through) at
     /// materialization. Mirrors Xorg's compositor convention where the
     /// COW's default input region passes pointer events through to

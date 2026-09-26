@@ -76,6 +76,15 @@ pub struct RequesterlessPublication {
     config_changed: bool,
     update_state: RequesterlessStateUpdate,
     emit_notifications: RequesterlessNotifications,
+    kind: RequesterlessPublicationKind,
+}
+
+enum RequesterlessPublicationKind {
+    StateUpdate,
+    UrgentWithdrawal {
+        output_ids: Vec<u32>,
+        crtc_ids: Vec<u32>,
+    },
 }
 
 impl RequesterlessPublication {
@@ -92,25 +101,83 @@ impl RequesterlessPublication {
             config_changed,
             update_state: Box::new(update_state),
             emit_notifications: Box::new(emit_notifications),
+            kind: RequesterlessPublicationKind::StateUpdate,
+        }
+    }
+
+    /// Build an urgent logical withdrawal. The core subtracts these resources
+    /// from its published projection immediately, without consulting a
+    /// backend state-rebuild closure.
+    #[must_use]
+    pub fn urgent_withdrawal(output_ids: Vec<u32>, crtc_ids: Vec<u32>) -> Self {
+        Self {
+            config_changed: true,
+            update_state: Box::new(|_| {}),
+            emit_notifications: Box::new(|_, _| {}),
+            kind: RequesterlessPublicationKind::UrgentWithdrawal {
+                output_ids,
+                crtc_ids,
+            },
+        }
+    }
+
+    /// The resource ids named by an urgent withdrawal, or `None` for an
+    /// ordinary backend state publication.
+    #[must_use]
+    pub fn urgent_withdrawal_ids(&self) -> Option<(&[u32], &[u32])> {
+        match &self.kind {
+            RequesterlessPublicationKind::StateUpdate => None,
+            RequesterlessPublicationKind::UrgentWithdrawal {
+                output_ids,
+                crtc_ids,
+            } => Some((output_ids, crtc_ids)),
         }
     }
 
     pub(crate) fn publish(self, state: &mut ServerState, output_bbox_before: Option<(u16, u16)>) {
         let last_set_time = state.randr.timestamp;
         let last_config_time = state.randr.config_timestamp;
-        (self.update_state)(state);
+        match self.kind {
+            RequesterlessPublicationKind::StateUpdate => {
+                (self.update_state)(state);
+                state.filter_withdrawn_randr_resources();
 
-        // Backend state refreshes may replace the whole RandR projection.
-        // A requester-less publication never changes lastSetTime; only an
-        // available-configuration change advances lastConfigTime.
-        state.randr.timestamp = last_set_time;
-        state.randr.config_timestamp = if self.config_changed {
-            state.timestamp_now()
-        } else {
-            last_config_time
-        };
-        (self.emit_notifications)(state, output_bbox_before);
+                // Backend state refreshes may replace the whole RandR
+                // projection. A requester-less publication never changes
+                // lastSetTime; only an available-config change advances
+                // lastConfigTime.
+                state.randr.timestamp = last_set_time;
+                state.randr.config_timestamp = if self.config_changed {
+                    state.timestamp_now()
+                } else {
+                    last_config_time
+                };
+                (self.emit_notifications)(state, output_bbox_before);
+            }
+            RequesterlessPublicationKind::UrgentWithdrawal {
+                output_ids,
+                crtc_ids,
+            } => {
+                let changed = state.withdraw_randr_resources(&output_ids, &crtc_ids);
+                state.randr.timestamp = last_set_time;
+                state.randr.config_timestamp = if changed.is_empty() {
+                    last_config_time
+                } else {
+                    state.timestamp_now()
+                };
+                if !changed.is_empty() {
+                    crate::core_loop::run::emit_randr_change_notifications(state, &changed);
+                }
+            }
+        }
     }
+}
+
+/// Backend-originated begin/end markers for one topology episode. The core
+/// holds the RANDR gate from `EpisodeBegin` through its matching `EpisodeEnd`.
+pub enum TopologyEpisodeEvent {
+    EpisodeBegin(u64),
+    EpisodeEnd(u64, Option<RequesterlessPublication>),
 }
 
 /// A pair identifying a logical Present sequence consumer and its requested
@@ -779,6 +846,16 @@ pub trait Backend {
     /// one so the core wakes even when no CRTC token is ready. The core orders
     /// these publications against its in-flight RANDR mutation.
     fn drain_requesterless_publications(&mut self) -> Vec<RequesterlessPublication> {
+        Vec::new()
+    }
+
+    /// Drain urgent withdrawals that publish outside the requester-less FIFO.
+    fn drain_urgent_requesterless_publications(&mut self) -> Vec<RequesterlessPublication> {
+        Vec::new()
+    }
+
+    /// Drain topology-episode boundaries and the episode's final publication.
+    fn drain_topology_episode_events(&mut self) -> Vec<TopologyEpisodeEvent> {
         Vec::new()
     }
 

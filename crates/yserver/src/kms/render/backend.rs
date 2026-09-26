@@ -30,8 +30,8 @@ use yserver_core::{
         AnyHandle, Backend, BackendFdKind, ClipState, CrtcConfigApply, CrtcConfigToken,
         CursorHandle, DrawState, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, FillState,
         FontHandle, GlyphSetHandle, KeymapLoad, OriginContext, PictureHandle, PixmapHandle,
-        PresentCaps, PresentScanoutCandidate, PresentSourceWait, RequesterAbandon, WindowHandle,
-        identity_ramp, resample_channel,
+        PresentCaps, PresentScanoutCandidate, PresentSourceWait, RequesterAbandon,
+        RequesterlessPublication, WindowHandle, identity_ramp, resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -1140,6 +1140,7 @@ pub(crate) struct RandrIdAllocator {
     providers: HashMap<RandrProviderEndpoint, u32>,
     connectors: HashMap<OutputKey, ConnectorEntry>,
     modes: HashMap<ModeIdentity, u32>,
+    withdrawn_devices: HashSet<DrmDeviceKey>,
 }
 
 /// One endpoint that can own a RANDR provider XID.
@@ -1522,6 +1523,27 @@ impl RandrIdAllocator {
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&OutputKey, &ConnectorEntry)> {
         self.connectors.iter()
+    }
+
+    fn withdraw_device(&mut self, device: DrmDeviceKey) -> Option<(Vec<u32>, Vec<u32>)> {
+        if !self.withdrawn_devices.insert(device) {
+            return None;
+        }
+        let mut output_ids = Vec::new();
+        let mut crtc_ids = Vec::new();
+        for (key, entry) in &self.connectors {
+            if key.device_key == device {
+                output_ids.push(entry.ids.output_id);
+                crtc_ids.push(entry.ids.crtc_id);
+            }
+        }
+        output_ids.sort_unstable();
+        crtc_ids.sort_unstable();
+        Some((output_ids, crtc_ids))
+    }
+
+    fn device_is_withdrawn(&self, device: DrmDeviceKey) -> bool {
+        self.withdrawn_devices.contains(&device)
     }
 }
 
@@ -2120,6 +2142,7 @@ pub struct KmsBackend {
     /// acquire to pause and resume the dedicated input thread.
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
     pub(super) randr_id_alloc: RandrIdAllocator,
+    urgent_requesterless_publications: VecDeque<RequesterlessPublication>,
     /// Session-persistent PRIME Output Source policy, keyed by the KMS sink.
     ///
     /// Values use the provider's tagged endpoint identity rather than a DRM
@@ -7276,6 +7299,7 @@ impl KmsBackend {
             client_modeset_released_framebuffers_for_tests: Vec::new(),
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            urgent_requesterless_publications: VecDeque::new(),
             provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
@@ -8658,6 +8682,7 @@ impl KmsBackend {
             client_modeset_released_framebuffers_for_tests: Vec::new(),
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            urgent_requesterless_publications: VecDeque::new(),
             provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
@@ -11018,7 +11043,9 @@ impl KmsBackend {
             let mut crtcs = Vec::new();
             let mut outputs = Vec::new();
             for (key, entry) in self.randr_id_alloc.entries() {
-                if key.device_key != device.key {
+                if key.device_key != device.key
+                    || self.randr_id_alloc.device_is_withdrawn(key.device_key)
+                {
                     continue;
                 }
                 crtcs.push(entry.ids.crtc_id);
@@ -11082,17 +11109,20 @@ impl KmsBackend {
         // the live CRTC remains projected while `connected` flips false. A
         // heavy drop (and a startup force-probe miss) sets config Off; do not
         // let a stale `platform.outputs` row revive that route.
-        let live_keys: HashSet<OutputKey> = self
-            .platform
-            .outputs
-            .iter()
-            .filter(|layout| {
-                self.randr_id_alloc
-                    .entry(&layout.key)
-                    .is_none_or(|entry| matches!(entry.config, ConnectorConfig::Enabled { .. }))
-            })
-            .map(|layout| layout.key.clone())
-            .collect();
+        let live_keys: HashSet<OutputKey> =
+            self.platform
+                .outputs
+                .iter()
+                .filter(|layout| {
+                    !self
+                        .randr_id_alloc
+                        .device_is_withdrawn(layout.key.device_key)
+                        && self.randr_id_alloc.entry(&layout.key).is_none_or(|entry| {
+                            matches!(entry.config, ConnectorConfig::Enabled { .. })
+                        })
+                })
+                .map(|layout| layout.key.clone())
+                .collect();
         let mut outs: Vec<RandrOutput> = Vec::with_capacity(
             self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
         );
@@ -11192,6 +11222,7 @@ impl KmsBackend {
         let advertised_modes: Vec<crate::platform::drm::Mode> = self
             .randr_id_alloc
             .entries()
+            .filter(|(key, _)| !self.randr_id_alloc.device_is_withdrawn(key.device_key))
             .flat_map(|(_, entry)| entry.modes.clone())
             .collect();
         // A replacement monitor can omit the timing still programmed on a
@@ -11233,7 +11264,10 @@ impl KmsBackend {
         let not_live: Vec<NotLiveConnector> = self
             .randr_id_alloc
             .entries()
-            .filter(|(key, _)| !live_keys.contains(*key))
+            .filter(|(key, _)| {
+                !live_keys.contains(*key)
+                    && !self.randr_id_alloc.device_is_withdrawn(key.device_key)
+            })
             .map(|(key, entry)| NotLiveConnector {
                 key: key.clone(),
                 ids: entry.ids,
@@ -11369,6 +11403,16 @@ impl KmsBackend {
             &mut state.randr,
         );
         state.randr.config_timestamp = if config_changed { ts_now } else { prev_ct };
+    }
+
+    pub(super) fn withdraw_outputs_for_device(&mut self, device: DrmDeviceKey) {
+        let Some((output_ids, crtc_ids)) = self.randr_id_alloc.withdraw_device(device) else {
+            return;
+        };
+        self.urgent_requesterless_publications.push_back(
+            RequesterlessPublication::urgent_withdrawal(output_ids, crtc_ids),
+        );
+        self.wake_crtc_config_ready();
     }
 
     /// Telemetry accessor — used by the acceptance harness to
@@ -25850,6 +25894,12 @@ impl Backend for KmsBackend {
         // later phases. Until then KMS keeps the existing direct publication
         // path and contributes no requester-less gate entries.
         Vec::new()
+    }
+
+    fn drain_urgent_requesterless_publications(
+        &mut self,
+    ) -> Vec<yserver_core::backend::RequesterlessPublication> {
+        self.urgent_requesterless_publications.drain(..).collect()
     }
 
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
@@ -65930,7 +65980,34 @@ mod tests {
         done: &dyn Fn(&super::KmsBackend) -> bool,
         hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
     ) -> Result<(), String> {
-        c0_3bi_core_driver_until_mode(backend, label, timeout, done, hardware_complete, false)
+        let mut state = ServerState::new();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            label,
+            timeout,
+            done,
+            hardware_complete,
+        )
+    }
+
+    fn c0_3bi_core_driver_until_with_state(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        label: &str,
+        timeout: std::time::Duration,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+        hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
+    ) -> Result<(), String> {
+        c0_3bi_core_driver_until_mode(
+            backend,
+            state,
+            label,
+            timeout,
+            done,
+            hardware_complete,
+            false,
+        )
     }
 
     fn c0_3bi_core_driver_until_before_crtc_result(
@@ -65939,7 +66016,8 @@ mod tests {
         timeout: std::time::Duration,
         done: &dyn Fn(&super::KmsBackend) -> bool,
     ) -> Result<(), String> {
-        c0_3bi_core_driver_until_mode(backend, label, timeout, done, None, true)
+        let mut state = ServerState::new();
+        c0_3bi_core_driver_until_mode(backend, &mut state, label, timeout, done, None, true)
     }
 
     /// Whether `fd` is a DRM character device (major 226), as opposed to the
@@ -65972,6 +66050,7 @@ mod tests {
 
     fn c0_3bi_core_driver_until_mode(
         backend: &mut super::KmsBackend,
+        state: &mut ServerState,
         label: &str,
         timeout: std::time::Duration,
         done: &dyn Fn(&super::KmsBackend) -> bool,
@@ -65979,7 +66058,6 @@ mod tests {
         stop_when_done_before_crtc_result: bool,
     ) -> Result<(), String> {
         use std::time::Instant;
-        let mut state = ServerState::new();
         let end = Instant::now() + timeout;
         let sources = Backend::poll_fds(backend);
         while Instant::now() < end {
@@ -65994,7 +66072,7 @@ mod tests {
                 && done(backend)
             {
                 let _bounded_wait = Backend::next_wakeup(backend);
-                c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 return Ok(());
             }
             // A test backend has no CoreSender. Treat the queued notification
@@ -66003,7 +66081,7 @@ mod tests {
             if !backend.ready_crtc_config_announcements.is_empty() {
                 let _bounded_wait = Backend::next_wakeup(backend);
                 c0_3bi_finish_announced_crtc_configs(backend)?;
-                c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && backend.ready_crtc_config_announcements.is_empty()
                     && backend.core_driver_script_notification_count_for_tests == 0
@@ -66020,7 +66098,7 @@ mod tests {
                 backend.core_driver_script_notification_count_for_tests -= 1;
                 let _bounded_wait = Backend::next_wakeup(backend);
                 c0_3bi_finish_announced_crtc_configs(backend)?;
-                c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && backend.ready_crtc_config_announcements.is_empty()
                     && backend.core_driver_script_notification_count_for_tests == 0
@@ -66041,8 +66119,8 @@ mod tests {
                     ));
                 };
                 let _bounded_wait = Backend::next_wakeup(backend);
-                Backend::on_page_flip_ready(backend, &mut state, fd);
-                c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+                Backend::on_page_flip_ready(backend, state, fd);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && backend.core_driver_drm_events_for_tests.is_empty()
                     && backend.ready_crtc_config_announcements.is_empty()
@@ -66054,7 +66132,7 @@ mod tests {
             }
             if done(backend) {
                 let _bounded_wait = Backend::next_wakeup(backend);
-                c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 return Ok(());
             }
 
@@ -66062,16 +66140,16 @@ mod tests {
                 let _bounded_wait = Backend::next_wakeup(backend);
                 match kind {
                     yserver_core::backend::BackendFdKind::Drm => {
-                        Backend::on_page_flip_ready(backend, &mut state, fd);
+                        Backend::on_page_flip_ready(backend, state, fd);
                     }
                     yserver_core::backend::BackendFdKind::ExecutorControl => {
-                        Backend::on_executor_readable(backend, &mut state);
+                        Backend::on_executor_readable(backend, state);
                     }
                     yserver_core::backend::BackendFdKind::OwnerCompletion => {
-                        Backend::on_owner_completion_ready(backend, &mut state);
+                        Backend::on_owner_completion_ready(backend, state);
                     }
                     yserver_core::backend::BackendFdKind::ScanoutRenderCompletion => {
-                        Backend::on_scanout_render_completion(backend, &mut state);
+                        Backend::on_scanout_render_completion(backend, state);
                     }
                     _ => {
                         return Err(format!(
@@ -66087,7 +66165,7 @@ mod tests {
                         &mut backend.core_driver_hardware_completes_for_tests,
                     ));
                 }
-                c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && backend.ready_crtc_config_announcements.is_empty()
                     && backend.core_driver_script_notification_count_for_tests == 0
@@ -66102,13 +66180,13 @@ mod tests {
             // enters through the production Backend trait method.
             if !backend.core_driver_owner_events_for_tests.is_empty() {
                 let _bounded_wait = Backend::next_wakeup(backend);
-                Backend::on_owner_completion_ready(backend, &mut state);
+                Backend::on_owner_completion_ready(backend, state);
                 if let Some(observed) = hardware_complete {
                     observed.borrow_mut().extend(std::mem::take(
                         &mut backend.core_driver_hardware_completes_for_tests,
                     ));
                 }
-                c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && backend.ready_crtc_config_announcements.is_empty()
                     && backend.core_driver_script_notification_count_for_tests == 0
@@ -66123,13 +66201,13 @@ mod tests {
                 .is_empty()
             {
                 let _bounded_wait = Backend::next_wakeup(backend);
-                Backend::on_scanout_render_completion(backend, &mut state);
+                Backend::on_scanout_render_completion(backend, state);
                 if let Some(observed) = hardware_complete {
                     observed.borrow_mut().extend(std::mem::take(
                         &mut backend.core_driver_hardware_completes_for_tests,
                     ));
                 }
-                c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
                     && backend.ready_crtc_config_announcements.is_empty()
                     && backend.core_driver_script_notification_count_for_tests == 0
@@ -66182,16 +66260,16 @@ mod tests {
                 }
                 match kind {
                     yserver_core::backend::BackendFdKind::Drm => {
-                        Backend::on_page_flip_ready(backend, &mut state, *fd);
+                        Backend::on_page_flip_ready(backend, state, *fd);
                     }
                     yserver_core::backend::BackendFdKind::ExecutorControl => {
-                        Backend::on_executor_readable(backend, &mut state);
+                        Backend::on_executor_readable(backend, state);
                     }
                     yserver_core::backend::BackendFdKind::OwnerCompletion => {
-                        Backend::on_owner_completion_ready(backend, &mut state);
+                        Backend::on_owner_completion_ready(backend, state);
                     }
                     yserver_core::backend::BackendFdKind::ScanoutRenderCompletion => {
-                        Backend::on_scanout_render_completion(backend, &mut state);
+                        Backend::on_scanout_render_completion(backend, state);
                     }
                     _ => continue,
                 }
@@ -66204,7 +66282,7 @@ mod tests {
                     ));
                 }
             }
-            c0_3bi_core_driver_iteration_tail(backend, &mut state, hardware_complete);
+            c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
             if done(backend)
                 && backend.ready_crtc_config_announcements.is_empty()
                 && backend.core_driver_script_notification_count_for_tests == 0
@@ -75818,7 +75896,16 @@ mod tests {
                     .incarnation()
             )
         );
-        assert!(receiver.try_recv_all().next().is_none());
+        let wakeups = receiver.try_recv_all().collect::<Vec<_>>();
+        assert!(
+            matches!(wakeups.as_slice(), [Message::CrtcConfigReady]),
+            "logical withdrawal wakes the core exactly once: {wakeups:?}"
+        );
+        assert_eq!(
+            Backend::drain_urgent_requesterless_publications(&mut owner_backend).len(),
+            1,
+            "unknown Owner completion withdraws through the urgent publication path"
+        );
 
         let mut legacy_backend = super::KmsBackend::for_tests();
         let legacy_device = legacy_backend.platform.primary_device().unwrap().key;
@@ -92651,6 +92738,69 @@ mod tests {
             &backend,
             "c0_3bi_pure_legacy_modeset_unchanged",
             &c0_3bi_expected_end_state([kept_output]),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_withdraw_outputs_emits_urgent_withdrawal_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::{identity::IncarnationId, lifecycle::LifecycleAction},
+        };
+
+        let (mut fixture, device, output_id, connector, _mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), false)
+                .expect("environmental skip: live Vulkan lifecycle fixture");
+        let backend = &mut fixture.backend;
+        let output_key = OutputKey::new(device, connector);
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        let _client = c0_3aii_install_dpms_core_client(&mut state, 71);
+        let (_poll, sender, _rx) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(backend, sender);
+
+        // AcceptKernelCalls exercises only the in-memory Owner protocol. The
+        // /dev/null-backed fixture cannot reproduce VT_RELDISP or drmDropMaster.
+        backend.lifecycle_apply_action(
+            device,
+            None,
+            LifecycleAction::WithdrawOutputs(crate::kms::owner::lifecycle::WorkTag::ordinary(
+                IncarnationId::first(),
+                crate::kms::owner::lifecycle::LifecycleEpochId::first(),
+            )),
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "withdraw outputs action",
+            std::time::Duration::from_secs(1),
+            &|backend| !backend.urgent_requesterless_publications.is_empty(),
+            None,
+        )
+        .expect("the urgent withdrawal must be queued through core entries");
+
+        let withdrawal = Backend::drain_urgent_requesterless_publications(backend);
+        assert_eq!(withdrawal.len(), 1, "one urgent publication is emitted");
+        assert_eq!(
+            withdrawal[0].urgent_withdrawal_ids(),
+            Some((&[output_id][..], &[ids.crtc_id][..])),
+            "withdrawal names this device's output and CRTC"
+        );
+        let (projected, _modes) = backend.randr_outputs_and_modes();
+        assert!(
+            projected.iter().all(|output| output.output_id != output_id),
+            "the backend RandR model no longer names the withdrawn output"
+        );
+        assert!(
+            state.clients.contains_key(&71),
+            "the driver's entry state is retained"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_withdraw_outputs_emits_urgent_withdrawal_vulkan",
+            &c0_3bi_expected_end_state([output_key]),
         );
     }
 

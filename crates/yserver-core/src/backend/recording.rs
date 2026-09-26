@@ -30,7 +30,8 @@ use crate::{
         AnyHandle, Backend, ClipState, CompletedPresentEvent, CrtcConfigApply, CrtcConfigToken,
         CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle, ModeSpec, OriginContext,
         PictureHandle, PixmapHandle, PresentScanoutCandidate, PresentSequenceTarget,
-        PresentSourceWait, RequesterAbandon, RequesterlessPublication, WindowHandle,
+        PresentSourceWait, RequesterAbandon, RequesterlessPublication, TopologyEpisodeEvent,
+        WindowHandle,
     },
     core_loop::{CoreSender, Message},
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
@@ -255,6 +256,45 @@ impl RequesterlessPublicationProducer {
     }
 }
 
+/// Test producer for urgent logical withdrawals. Each enqueue uses the
+/// existing CRTC-ready wake path.
+#[derive(Clone)]
+pub struct UrgentWithdrawalProducer {
+    publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
+    sender: CoreSender,
+}
+
+impl UrgentWithdrawalProducer {
+    pub fn enqueue(&self, publication: RequesterlessPublication) -> io::Result<()> {
+        assert!(
+            publication.urgent_withdrawal_ids().is_some(),
+            "urgent producer accepts only urgent withdrawals"
+        );
+        self.publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(publication);
+        self.sender.send(Message::CrtcConfigReady)
+    }
+}
+
+/// Test producer for topology episode boundaries.
+#[derive(Clone)]
+pub struct TopologyEpisodeProducer {
+    events: Arc<Mutex<VecDeque<TopologyEpisodeEvent>>>,
+    sender: CoreSender,
+}
+
+impl TopologyEpisodeProducer {
+    pub fn enqueue(&self, event: TopologyEpisodeEvent) -> io::Result<()> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(event);
+        self.sender.send(Message::CrtcConfigReady)
+    }
+}
+
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
@@ -352,6 +392,8 @@ pub struct RecordingBackend {
     pub pending_crtc_config: Option<CrtcConfigToken>,
     pub ready_crtc_configs: Vec<CrtcConfigToken>,
     requesterless_publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
+    urgent_requesterless_publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
+    topology_episode_events: Arc<Mutex<VecDeque<TopologyEpisodeEvent>>>,
     pub crtc_config_results:
         std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
     pub finished_crtc_configs: Vec<CrtcConfigToken>,
@@ -607,6 +649,8 @@ impl RecordingBackend {
             pending_crtc_config: None,
             ready_crtc_configs: Vec::new(),
             requesterless_publications: Arc::new(Mutex::new(VecDeque::new())),
+            urgent_requesterless_publications: Arc::new(Mutex::new(VecDeque::new())),
+            topology_episode_events: Arc::new(Mutex::new(VecDeque::new())),
             crtc_config_results: std::collections::HashMap::new(),
             finished_crtc_configs: Vec::new(),
             cancelled_crtc_configs: Vec::new(),
@@ -685,6 +729,24 @@ impl RecordingBackend {
     ) -> RequesterlessPublicationProducer {
         RequesterlessPublicationProducer {
             publications: Arc::clone(&self.requesterless_publications),
+            sender,
+        }
+    }
+
+    /// Return a producer handle for urgent logical withdrawals.
+    #[must_use]
+    pub fn urgent_withdrawal_producer(&self, sender: CoreSender) -> UrgentWithdrawalProducer {
+        UrgentWithdrawalProducer {
+            publications: Arc::clone(&self.urgent_requesterless_publications),
+            sender,
+        }
+    }
+
+    /// Return a producer handle for topology episode boundaries.
+    #[must_use]
+    pub fn topology_episode_producer(&self, sender: CoreSender) -> TopologyEpisodeProducer {
+        TopologyEpisodeProducer {
+            events: Arc::clone(&self.topology_episode_events),
             sender,
         }
     }
@@ -1396,6 +1458,22 @@ impl Backend for RecordingBackend {
 
     fn drain_requesterless_publications(&mut self) -> Vec<RequesterlessPublication> {
         self.requesterless_publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
+    }
+
+    fn drain_urgent_requesterless_publications(&mut self) -> Vec<RequesterlessPublication> {
+        self.urgent_requesterless_publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
+    }
+
+    fn drain_topology_episode_events(&mut self) -> Vec<TopologyEpisodeEvent> {
+        self.topology_episode_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain(..)

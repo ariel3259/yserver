@@ -5280,6 +5280,7 @@ pub(crate) fn publish_crtc_config(
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
             backend.refresh_randr_state_set_time(state, publication.set_time);
+            state.filter_withdrawn_randr_resources();
             let changed: Vec<(u32, u32, u32)> = state
                 .randr
                 .outputs

@@ -1478,7 +1478,7 @@ impl KmsBackend {
         }
     }
 
-    fn lifecycle_apply_action(
+    pub(super) fn lifecycle_apply_action(
         &mut self,
         device: DrmDeviceKey,
         requester: Option<TransitionTag<IncarnationId>>,
@@ -1604,9 +1604,9 @@ impl KmsBackend {
                     self.activate_admission_clock_probes(device);
                 }
             }
+            LifecycleAction::WithdrawOutputs(_) => self.withdraw_outputs_for_device(device),
             LifecycleAction::DispositionChanged { .. }
             | LifecycleAction::ReleaseSeat(_)
-            | LifecycleAction::WithdrawOutputs(_)
             | LifecycleAction::TerminalizeProtocolWork(_)
             | LifecycleAction::AllocateRecoveryIncident { .. }
             | LifecycleAction::RecoveryTableF(_)

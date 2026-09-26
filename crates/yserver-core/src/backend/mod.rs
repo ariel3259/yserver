@@ -26,8 +26,8 @@ pub use trait_def::{
     CrtcConfigToken, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, HostSocketStatus,
     KeyboardMappingChange, KeymapLoad, ModeSpec, PresentCaps, PresentClockSample,
     PresentClockSource, PresentScanoutCandidate, PresentSequenceTarget, PresentSourceWait,
-    PresentWake, RequesterAbandon, RequesterlessPublication, SyncobjHandle, XkbNewKeyboardInfo,
-    XshmfenceHandle,
+    PresentWake, RequesterAbandon, RequesterlessPublication, SyncobjHandle, TopologyEpisodeEvent,
+    XkbNewKeyboardInfo, XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;
