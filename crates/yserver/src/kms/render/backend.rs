@@ -2086,6 +2086,14 @@ pub struct KmsBackend {
     /// Coalesced counter-events for the state machine.
     /// Consumed by `drive_vt_event`.
     vt_pending: crate::vt::state::VtPending,
+    /// Owner VT release is asynchronous: the lifecycle slot, rather than the
+    /// core thread, owns the ACTIVE=0 commit while this deadline bounds the
+    /// seat hand-off.
+    owner_vt_release: Option<OwnerVtRelease>,
+    #[cfg(test)]
+    pub(super) vt_call_trace_for_tests: Vec<&'static str>,
+    #[cfg(test)]
+    vt_skip_master_ioctls_for_tests: bool,
     /// Controlling console TTY guard. Present in direct mode when the
     /// process is launched on a real VT; `None` when no controlling
     /// console exists (pty / graphical terminal / test harness).
@@ -2217,6 +2225,11 @@ pub struct KmsBackend {
 
     /// Last `export holders` report, for change detection.
     export_holders: crate::kms::render::export_holders::ExportHoldersReporter,
+}
+
+struct OwnerVtRelease {
+    deadline: std::time::Instant,
+    devices: Vec<DrmDeviceKey>,
 }
 
 #[cfg(test)]
@@ -7270,6 +7283,11 @@ impl KmsBackend {
             #[cfg(test)]
             vt_resume_lifecycle_observations_for_tests: Vec::new(),
             vt_pending: crate::vt::state::VtPending::default(),
+            owner_vt_release: None,
+            #[cfg(test)]
+            vt_call_trace_for_tests: Vec::new(),
+            #[cfg(test)]
+            vt_skip_master_ioctls_for_tests: false,
             console_guard,
             vt_switching_armed: false,
             led_relay: None,
@@ -8653,6 +8671,11 @@ impl KmsBackend {
             #[cfg(test)]
             vt_resume_lifecycle_observations_for_tests: Vec::new(),
             vt_pending: crate::vt::state::VtPending::default(),
+            owner_vt_release: None,
+            #[cfg(test)]
+            vt_call_trace_for_tests: Vec::new(),
+            #[cfg(test)]
+            vt_skip_master_ioctls_for_tests: false,
             console_guard: None,
             vt_switching_armed: false,
             led_relay: None,
@@ -13680,7 +13703,7 @@ impl KmsBackend {
         self.input_thread_control = Some(control);
     }
 
-    fn pause_input_thread(&self) {
+    pub(super) fn pause_input_thread(&self) {
         if let Some(control) = self.input_thread_control.as_ref() {
             control.pause();
         }
@@ -22569,6 +22592,7 @@ impl KmsBackend {
                 let _ = self.admission_wake(device_key, false);
             }
         }
+        self.maybe_finish_owner_vt_release(now);
         consumed
     }
 
@@ -23762,6 +23786,571 @@ enum MappingEdit {
     Modmap(Box<[u8; 256]>),
 }
 
+impl KmsBackend {
+    /// Keep the established Legacy sequence intact. A Legacy-only server
+    /// continues to use this body unchanged; the Owner route below adds its
+    /// asynchronous lifecycle hand-off alongside it.
+    fn on_vt_release_legacy(&mut self, state: &mut ServerState) {
+        use crate::vt::state::VtEventKind;
+        use ::drm::Device as _;
+
+        // Step logging is load-bearing: if a switch wedges, the last line
+        // printed pinpoints which step stalled (kernel blocks the VT switch
+        // until VT_RELDISP, so a stall here freezes the whole session).
+        log::info!("kms: VT release — begin (pause input)");
+        self.pause_input_thread();
+        log::info!("kms: VT release — input paused; run_suspend");
+        self.drive_vt_event(state, VtEventKind::Disable);
+        // B-11: pause the resource service's serviced-time budget for the
+        // duration of the VT switch -- a long switch must not count toward
+        // any pending batch's deadline (R9). Inert when no service exists
+        // (R8: nothing installs one in production yet).
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(false, std::time::Instant::now());
+        }
+        log::info!("kms: VT release — suspended; drmDropMaster");
+        for device in &self.platform.devices {
+            if let Err(err) = device.device.release_master_lock() {
+                log::warn!("kms: drmDropMaster failed on {}: {err}", device.key);
+            }
+        }
+        log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(console_guard) = self.console_guard.as_ref()
+            && let Err(err) = console_guard.vt_reldisp(1)
+        {
+            log::warn!("kms: VT_RELDISP(1) failed: {err}");
+        }
+        log::info!("kms: VT release — done (switch should complete now)");
+    }
+
+    fn on_vt_release_owner(&mut self, state: &mut ServerState, owner_devices: Vec<DrmDeviceKey>) {
+        use crate::vt::state::{VtAction, VtEventKind, VtState};
+
+        if self.owner_vt_release.is_some() {
+            log::debug!("kms: Owner VT release coalesced while hand-off is pending");
+            return;
+        }
+        let release_time = std::time::Instant::now();
+        let deadline = release_time + std::time::Duration::from_secs(1);
+        match self
+            .vt_state
+            .on_event(&mut self.vt_pending, VtEventKind::Disable)
+        {
+            VtAction::BeginSuspend => {}
+            VtAction::Nothing => {
+                log::debug!("kms: Owner VT release coalesced in {:?}", self.vt_state);
+                if self.vt_state != VtState::Suspending {
+                    return;
+                }
+            }
+            VtAction::BeginResume => unreachable!("Disable never begins resume"),
+        }
+        self.bump_crtc_config_topology_epoch("VT transition");
+        self.owner_vt_release = Some(OwnerVtRelease {
+            deadline,
+            devices: owner_devices,
+        });
+
+        log::info!("kms: VT release — Owner route; prompt obligations");
+        self.pause_input_thread();
+        #[cfg(test)]
+        self.vt_call_trace_for_tests.push("pause_input");
+        self.synthesize_held_releases(state);
+        #[cfg(test)]
+        self.vt_call_trace_for_tests.push("held_releases");
+        state.dpms.power_level = 0;
+        state.dpms.last_activity = release_time;
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(false, release_time);
+        }
+
+        // This is the production transition entry. The driver's ReleaseSeat
+        // action pauses serviced time and closes admission synchronously;
+        // admission closure is independent of the commit currently in the
+        // Owner slot.
+        let _owner_route =
+            self.lifecycle_set_seat_target(crate::kms::owner::lifecycle::SeatTarget::Released);
+
+        let legacy_devices = self.dpms_legacy_devices();
+        if !legacy_devices.is_empty() {
+            self.run_suspend_for_legacy_devices(state, &legacy_devices, deadline);
+        }
+        self.maybe_finish_owner_vt_release(std::time::Instant::now());
+    }
+
+    /// Resolve Owner slots at the first terminal result or the absolute
+    /// release deadline. The completion route calls this after consuming an
+    /// Owner batch; before_block calls it after executor/deadline service.
+    fn maybe_finish_owner_vt_release(&mut self, now: std::time::Instant) {
+        let Some(release) = self.owner_vt_release.as_ref() else {
+            return;
+        };
+        let deadline_expired = now >= release.deadline;
+        let mut all_terminal = true;
+        let mut unknown = Vec::new();
+        for device in &release.devices {
+            let slot_idle = self
+                .platform
+                .owner_ref(*device)
+                .is_none_or(|owner| owner.slot().is_idle());
+            let executor_live = self
+                .platform
+                .device_for_key(*device)
+                .and_then(|entry| entry.executor.as_ref())
+                .is_some_and(|executor| {
+                    executor.state() == crate::kms::executor::ExecutorState::Live
+                });
+            let lit = self
+                .owner_dpms_installed_active
+                .get(device)
+                .copied()
+                .unwrap_or(true);
+            let release_transition_pending = lit
+                && self
+                    .lifecycle_coordinator
+                    .device(device)
+                    .is_some_and(|arbiter| {
+                        arbiter.transition().is_some()
+                            || arbiter.state()
+                                == crate::kms::owner::lifecycle::DeviceLifecycleState::Ready
+                                && arbiter.desired().seat_target()
+                                    == Some(crate::kms::owner::lifecycle::SeatTarget::Released)
+                    });
+            if !slot_idle || release_transition_pending {
+                all_terminal = false;
+            }
+            if !executor_live || deadline_expired && (!slot_idle || release_transition_pending) {
+                unknown.push(*device);
+            }
+        }
+        if !all_terminal && !deadline_expired && unknown.is_empty() {
+            return;
+        }
+
+        let _release_record = self
+            .owner_vt_release
+            .take()
+            .expect("release record checked above");
+        for device in unknown {
+            if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                conductor.lifecycle_admission_closed = true;
+                conductor.recovery_stopped = true;
+            }
+            if let Some(gate) = self.platform.transport_gate_mut(&device) {
+                gate.force_close();
+            }
+            if let Some(executor) = self
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == device)
+                .and_then(|entry| entry.executor.as_mut())
+            {
+                executor.request_termination();
+                let _ = executor.try_reap();
+            }
+            let events = self
+                .platform
+                .owner_for(device)
+                .map(|owner| owner.quarantine_live())
+                .unwrap_or_default();
+            if !events.is_empty() {
+                // This routes the unknown terminal through the ordinary
+                // Owner/resource path. A dispatched client modeset therefore
+                // keeps its gate publication and queues its token as ready.
+                let _ = self.route_owner_event_batch(device, events, now);
+            }
+            let has_completion_loss = self
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.recovery())
+                .is_some_and(|incident| {
+                    matches!(
+                        incident.origin(),
+                        crate::kms::owner::lifecycle::IncidentOrigin::CompletionLoss { .. }
+                    )
+                });
+            if !has_completion_loss {
+                self.lifecycle_report_completion_loss(device);
+            }
+            self.lifecycle_queue_input(
+                device,
+                crate::kms::owner::lifecycle::ArbiterInput::DeviceStateChanged(
+                    crate::kms::owner::lifecycle::DeviceLifecycleState::ExecutorStalled,
+                ),
+            );
+            log::error!(
+                "kms: VT release deadline left Owner device {device} unknown; incarnation quarantined"
+            );
+        }
+
+        log::info!("kms: VT release — hand-off; drmDropMaster");
+        for device in &self.platform.devices {
+            #[cfg(test)]
+            if self.vt_skip_master_ioctls_for_tests {
+                continue;
+            }
+            if let Err(err) = ::drm::Device::release_master_lock(device.device.as_ref()) {
+                log::warn!("kms: drmDropMaster failed on {}: {err}", device.key);
+            }
+        }
+        #[cfg(test)]
+        self.vt_call_trace_for_tests.push("drop_master");
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(console_guard) = self.console_guard.as_ref()
+            && let Err(err) = console_guard.vt_reldisp(1)
+        {
+            log::warn!("kms: VT_RELDISP(1) failed: {err}");
+        }
+        #[cfg(test)]
+        self.vt_call_trace_for_tests.push("vt_reldisp");
+        if self.vt_state == crate::vt::state::VtState::Suspending {
+            self.vt_state.suspend_complete(&self.vt_pending);
+        }
+        log::info!("kms: VT release — done (Owner hand-off complete)");
+    }
+
+    fn on_vt_acquire_route(&mut self, state: &mut ServerState) {
+        if !self.lifecycle_owner_incarnation_devices().is_empty() {
+            self.on_vt_acquire_owner_closed(state);
+            return;
+        }
+        self.on_vt_acquire_legacy(state);
+    }
+
+    fn on_vt_acquire_legacy(&mut self, state: &mut ServerState) {
+        use crate::vt::state::VtEventKind;
+        use ::drm::Device as _;
+
+        log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(console_guard) = self.console_guard.as_ref()
+            && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
+        {
+            log::warn!("kms: VT_ACKACQ failed: {err}");
+        }
+        log::info!("kms: VT acquire — acked; drmSetMaster");
+
+        let mut acquired = true;
+        for device in &self.platform.devices {
+            if let Err(err) = try_acquire_master_bounded(
+                || device.device.acquire_master_lock(),
+                10,
+                std::time::Duration::from_millis(5),
+            ) {
+                log::error!(
+                    "kms: drmSetMaster failed on {} after retries: {err}",
+                    device.key
+                );
+                acquired = false;
+            }
+        }
+        if !acquired {
+            log::error!(
+                "kms: at least one DRM device did not regain master; keeping scanout closed and exiting"
+            );
+            for device in &self.platform.devices {
+                if let Err(error) = device.device.release_master_lock() {
+                    log::warn!(
+                        "kms: cleanup drmDropMaster failed on {} after partial acquire: {error}",
+                        device.key
+                    );
+                }
+            }
+            self.request_exit();
+            return;
+        }
+
+        log::info!("kms: VT acquire — master held={acquired}; run_resume");
+        self.drive_vt_event(state, VtEventKind::Enable);
+        if self.vt_state != crate::vt::state::VtState::Active {
+            log::error!(
+                "kms: VT acquire did not reach Active ({:?}); keeping input paused",
+                self.vt_state
+            );
+            return;
+        }
+        // B-11: resume the resource service's serviced-time budget now that
+        // the VT switch is genuinely done (Active reached above) -- pending
+        // batches' deadlines start counting again from here, not from
+        // whenever the fd happened to signal. Inert when no service exists.
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(true, std::time::Instant::now());
+        }
+        log::info!("kms: VT acquire — resumed; resume input");
+        self.resume_input_thread();
+
+        // Xorg VT-enter resync: forget all held keys/modifiers. Keys held
+        // across the switch (e.g. the Ctrl+Alt of the switch combo) were
+        // released while we weren't reading, so xkb_state would keep them
+        // depressed and stamp every subsequent key with stale modifiers
+        // ("can't type at the greeter after a switch"). Rebuild a fresh
+        // state from the keymap; new key events repopulate it cleanly.
+        // The before-mask log proves whether the latch was actually stuck.
+        let mods_before = self.serialize_modifiers();
+        self.core.down_keys.clear();
+        self.core.xkb_state =
+            crate::kms::core::XkbState(xkbcommon::xkb::State::new(&self.core.xkb_keymap.0));
+        log::info!(
+            "kms: VT acquire — xkb resync: modifiers were 0x{mods_before:04x}, now 0x{:04x}",
+            self.serialize_modifiers()
+        );
+        log::info!("kms: VT acquire — done");
+    }
+
+    fn on_vt_acquire_owner_closed(&mut self, state: &mut ServerState) {
+        use crate::vt::state::{VtAction, VtEventKind, VtState};
+
+        log::info!("kms: VT acquire — Owner interim route; VT_ACKACQ");
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(console_guard) = self.console_guard.as_ref()
+            && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
+        {
+            log::warn!("kms: VT_ACKACQ failed: {err}");
+        }
+        let mut acquired = true;
+        for device in &self.platform.devices {
+            #[cfg(test)]
+            if self.vt_skip_master_ioctls_for_tests {
+                continue;
+            }
+            if let Err(err) = try_acquire_master_bounded(
+                || ::drm::Device::acquire_master_lock(device.device.as_ref()),
+                10,
+                std::time::Duration::from_millis(5),
+            ) {
+                log::error!(
+                    "kms: drmSetMaster failed on {} after retries: {err}",
+                    device.key
+                );
+                acquired = false;
+            }
+        }
+        if !acquired {
+            log::error!("kms: at least one DRM device did not regain master; exiting");
+            for device in &self.platform.devices {
+                if let Err(error) = ::drm::Device::release_master_lock(device.device.as_ref()) {
+                    log::warn!(
+                        "kms: cleanup drmDropMaster failed on {} after partial acquire: {error}",
+                        device.key
+                    );
+                }
+            }
+            self.request_exit();
+            return;
+        }
+
+        if self
+            .vt_state
+            .on_event(&mut self.vt_pending, VtEventKind::Enable)
+            != VtAction::BeginResume
+        {
+            log::debug!("kms: Owner VT acquire coalesced in {:?}", self.vt_state);
+            return;
+        }
+        let legacy_devices = self.dpms_legacy_devices();
+        if !legacy_devices.is_empty() && !self.run_resume_for_devices(state, &legacy_devices) {
+            return;
+        }
+        if self.vt_state.resume_complete(&mut self.vt_pending) != VtAction::Nothing {
+            // Rapid-switch precedence is completed in Task 5. Until then,
+            // leave the scanout gate closed if a release arrived mid-resume.
+            self.vt_state = VtState::Suspending;
+            return;
+        }
+        if let Some(service) = self.resource_service.as_mut() {
+            service.set_seat_active(true, std::time::Instant::now());
+        }
+        self.resume_input_thread();
+        #[cfg(test)]
+        self.vt_call_trace_for_tests.push("resume_input");
+        let mods_before = self.serialize_modifiers();
+        self.core.down_keys.clear();
+        self.core.xkb_state =
+            crate::kms::core::XkbState(xkbcommon::xkb::State::new(&self.core.xkb_keymap.0));
+        log::info!(
+            "kms: VT acquire — xkb resync: modifiers were 0x{mods_before:04x}, now 0x{:04x}",
+            self.serialize_modifiers()
+        );
+        log::info!("kms: VT acquire — interim route complete; Owner devices remain closed");
+    }
+
+    fn run_suspend_for_legacy_devices(
+        &mut self,
+        state: &mut ServerState,
+        devices: &HashSet<DrmDeviceKey>,
+        deadline: std::time::Instant,
+    ) {
+        log::info!("kms: mixed VT suspend — scoped Legacy devices {devices:?}");
+        let direct_legacy = self.scanout_m2.active() && self.scanout_m2_touches_devices(devices);
+        let direct_shadow_error = if direct_legacy {
+            self.materialize_direct_shadow_for_unflip().err()
+        } else {
+            None
+        };
+        let old_pending_pageflips = self.pending_pageflip_crtcs_for_devices(devices);
+        let idle_budget = deadline.saturating_duration_since(std::time::Instant::now());
+        if !idle_budget.is_zero() {
+            self.platform.wait_idle_bounded_for(idle_budget);
+        }
+        if let Err(error) = self.platform.cursor_plane_hide_for_devices(devices) {
+            log::debug!("kms: mixed VT suspend could not hide Legacy cursor planes: {error}");
+        }
+        if let Err(error) = self
+            .platform
+            .dpms_set_outputs_active_for_devices(false, devices)
+        {
+            log::error!("kms: mixed VT suspend could not disable Legacy outputs: {error}; exiting");
+            self.request_exit();
+            return;
+        }
+        self.clear_armed_vblank_targets_for_devices(devices);
+        let drain_budget = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Err(error) = self
+            .platform
+            .discard_old_drm_events_after_all_off_for_devices(
+                &old_pending_pageflips,
+                drain_budget,
+                Some(devices),
+            )
+        {
+            log::error!(
+                "kms: mixed VT suspend could not drain Legacy DRM events: {error}; exiting"
+            );
+            self.request_exit();
+            return;
+        }
+        if direct_legacy {
+            self.stop_direct_after_scanout_replaced("mixed VT suspend");
+        }
+        self.scene
+            .drain_devices(&mut self.platform, self.resource_service.as_mut(), devices);
+        if let Err(error) = self.platform.reset_scanout_bos_for_devices(Some(devices)) {
+            self.kms_outputs_active = false;
+            log::error!(
+                "kms: mixed VT suspend could not reset Legacy scanout pools: {error}; exiting"
+            );
+            self.request_exit();
+            return;
+        }
+        if !self.scanout_m2.active() {
+            self.scanout_m1.clear("mixed VT suspend");
+        }
+        if let Some(error) = direct_shadow_error {
+            log::error!("scanout_m2: mixed VT suspend copy failed: {error}; exiting");
+            self.kms_outputs_active = false;
+            self.request_exit();
+        }
+        state.dpms.power_level = 0;
+        state.dpms.last_activity = std::time::Instant::now();
+        self.kms_outputs_active = false;
+    }
+
+    fn run_resume_for_devices(
+        &mut self,
+        state: &mut ServerState,
+        devices: &HashSet<DrmDeviceKey>,
+    ) -> bool {
+        log::info!("kms: VT resume — scoped Legacy devices {devices:?}");
+        let snapshot = match self.platform.probe_connector_snapshot() {
+            Ok(snapshot) => snapshot
+                .into_iter()
+                .filter(|entry| devices.contains(&entry.key.device_key))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                log::error!("kms: mixed resume connector probe failed: {error}; exiting");
+                self.request_exit();
+                return false;
+            }
+        };
+        let active_removed = self.platform.outputs.iter().any(|output| {
+            devices.contains(&output.key.device_key)
+                && !snapshot
+                    .iter()
+                    .any(|entry| entry.preserves_active_output(output))
+        });
+        let topology_quiesced =
+            self.scanout_m2.active() && self.scanout_m2_touches_devices(devices) || active_removed;
+        if topology_quiesced
+            && let Err(error) = self.quiesce_before_topology_mutation_for_devices(
+                "mixed VT resume topology apply",
+                devices,
+            )
+        {
+            log::error!("kms: mixed resume: old Legacy topology could not be quiesced: {error}");
+            return false;
+        }
+
+        let configured = self.randr_id_alloc.client_configured_keys();
+        let known_connected = self
+            .randr_id_alloc
+            .connected_keys()
+            .into_iter()
+            .filter(|key| devices.contains(&key.device_key))
+            .collect::<HashSet<_>>();
+        let rescan = self.platform.apply_connector_snapshot_for_devices(
+            snapshot,
+            &known_connected,
+            Some(devices),
+        );
+        let registry_delta = self.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+        let active_topology_changed = !rescan.dropped_old_indices.is_empty();
+        if active_topology_changed {
+            let reserved = self.reserved_layout_slots();
+            self.platform
+                .recompact_horizontal_layout(&configured, &reserved);
+            self.platform
+                .recompute_fb_extent_with_reservations(&reserved);
+        }
+        if (!registry_delta.is_empty() || active_topology_changed)
+            && !self.fire_randr_changes(
+                state,
+                rescan,
+                &registry_delta.changed_keys,
+                registry_delta.config_changed,
+                active_topology_changed,
+                false,
+            )
+        {
+            return false;
+        }
+        self.prune_armed_targets_to_live_outputs();
+        if let Err(error) = self
+            .platform
+            .dpms_set_outputs_active_for_devices(true, devices)
+        {
+            log::error!("kms: mixed resume: Legacy re-light failed: {error}; exiting");
+            self.request_exit();
+            self.kms_outputs_active = false;
+            return false;
+        }
+        self.reapply_gamma_for_devices(devices);
+        let (hot_x, hot_y) = self
+            .effective_cursor_xid
+            .and_then(|xid| self.cursor_records.get(&xid))
+            .map(|record| (record.hot_x, record.hot_y))
+            .unwrap_or((0, 0));
+        #[allow(clippy::cast_possible_truncation)]
+        let cx = self.core.cursor_x as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let cy = self.core.cursor_y as i32;
+        self.platform
+            .rearm_cursor_for_devices(devices, hot_x, hot_y, cx, cy);
+        self.kms_outputs_active = self
+            .platform
+            .outputs
+            .iter()
+            .any(|output| devices.contains(&output.key.device_key));
+        self.scene.wake_for_devices(&self.platform, devices);
+        true
+    }
+}
+
 impl Backend for KmsBackend {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
@@ -24287,6 +24876,7 @@ impl Backend for KmsBackend {
         }
         self.service_direct_framebuffer_edges(now, true);
         self.service_retired_outputs();
+        self.maybe_finish_owner_vt_release(now);
     }
 
     fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -24418,6 +25008,11 @@ impl Backend for KmsBackend {
             )
             .chain(self.platform.executor_deadline())
             .chain(self.platform.owner_completion_deadline())
+            .chain(
+                self.owner_vt_release
+                    .as_ref()
+                    .map(|release| release.deadline),
+            )
             .chain(
                 self.resource_service
                     .as_ref()
@@ -25428,117 +26023,17 @@ impl Backend for KmsBackend {
     }
 
     fn on_vt_release(&mut self, state: &mut ServerState) {
-        use crate::vt::state::VtEventKind;
-        use ::drm::Device as _;
-
-        // Step logging is load-bearing: if a switch wedges, the last line
-        // printed pinpoints which step stalled (kernel blocks the VT switch
-        // until VT_RELDISP, so a stall here freezes the whole session).
-        log::info!("kms: VT release — begin (pause input)");
-        self.pause_input_thread();
-        log::info!("kms: VT release — input paused; run_suspend");
-        self.drive_vt_event(state, VtEventKind::Disable);
-        // B-11: pause the resource service's serviced-time budget for the
-        // duration of the VT switch -- a long switch must not count toward
-        // any pending batch's deadline (R9). Inert when no service exists
-        // (R8: nothing installs one in production yet).
-        if let Some(service) = self.resource_service.as_mut() {
-            service.set_seat_active(false, std::time::Instant::now());
+        let has_owner_incarnations = !self.lifecycle_owner_incarnation_devices().is_empty();
+        if has_owner_incarnations {
+            let owner_devices = self.lifecycle_owner_devices();
+            self.on_vt_release_owner(state, owner_devices);
+            return;
         }
-        log::info!("kms: VT release — suspended; drmDropMaster");
-        for device in &self.platform.devices {
-            if let Err(err) = device.device.release_master_lock() {
-                log::warn!("kms: drmDropMaster failed on {}: {err}", device.key);
-            }
-        }
-        log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(console_guard) = self.console_guard.as_ref()
-            && let Err(err) = console_guard.vt_reldisp(1)
-        {
-            log::warn!("kms: VT_RELDISP(1) failed: {err}");
-        }
-        log::info!("kms: VT release — done (switch should complete now)");
+        self.on_vt_release_legacy(state);
     }
 
     fn on_vt_acquire(&mut self, state: &mut ServerState) {
-        use crate::vt::state::VtEventKind;
-        use ::drm::Device as _;
-
-        log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(console_guard) = self.console_guard.as_ref()
-            && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
-        {
-            log::warn!("kms: VT_ACKACQ failed: {err}");
-        }
-        log::info!("kms: VT acquire — acked; drmSetMaster");
-
-        let mut acquired = true;
-        for device in &self.platform.devices {
-            if let Err(err) = try_acquire_master_bounded(
-                || device.device.acquire_master_lock(),
-                10,
-                std::time::Duration::from_millis(5),
-            ) {
-                log::error!(
-                    "kms: drmSetMaster failed on {} after retries: {err}",
-                    device.key
-                );
-                acquired = false;
-            }
-        }
-        if !acquired {
-            log::error!(
-                "kms: at least one DRM device did not regain master; keeping scanout closed and exiting"
-            );
-            for device in &self.platform.devices {
-                if let Err(error) = device.device.release_master_lock() {
-                    log::warn!(
-                        "kms: cleanup drmDropMaster failed on {} after partial acquire: {error}",
-                        device.key
-                    );
-                }
-            }
-            self.request_exit();
-            return;
-        }
-
-        log::info!("kms: VT acquire — master held={acquired}; run_resume");
-        self.drive_vt_event(state, VtEventKind::Enable);
-        if self.vt_state != crate::vt::state::VtState::Active {
-            log::error!(
-                "kms: VT acquire did not reach Active ({:?}); keeping input paused",
-                self.vt_state
-            );
-            return;
-        }
-        // B-11: resume the resource service's serviced-time budget now that
-        // the VT switch is genuinely done (Active reached above) -- pending
-        // batches' deadlines start counting again from here, not from
-        // whenever the fd happened to signal. Inert when no service exists.
-        if let Some(service) = self.resource_service.as_mut() {
-            service.set_seat_active(true, std::time::Instant::now());
-        }
-        log::info!("kms: VT acquire — resumed; resume input");
-        self.resume_input_thread();
-
-        // Xorg VT-enter resync: forget all held keys/modifiers. Keys held
-        // across the switch (e.g. the Ctrl+Alt of the switch combo) were
-        // released while we weren't reading, so xkb_state would keep them
-        // depressed and stamp every subsequent key with stale modifiers
-        // ("can't type at the greeter after a switch"). Rebuild a fresh
-        // state from the keymap; new key events repopulate it cleanly.
-        // The before-mask log proves whether the latch was actually stuck.
-        let mods_before = self.serialize_modifiers();
-        self.core.down_keys.clear();
-        self.core.xkb_state =
-            crate::kms::core::XkbState(xkbcommon::xkb::State::new(&self.core.xkb_keymap.0));
-        log::info!(
-            "kms: VT acquire — xkb resync: modifiers were 0x{mods_before:04x}, now 0x{:04x}",
-            self.serialize_modifiers()
-        );
-        log::info!("kms: VT acquire — done");
+        self.on_vt_acquire_route(state);
     }
 
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {
@@ -33494,17 +33989,14 @@ impl Backend for KmsBackend {
 
 impl KmsBackend {
     fn dpms_legacy_devices(&self) -> HashSet<DrmDeviceKey> {
+        let owner_incarnations = self
+            .lifecycle_owner_incarnation_devices()
+            .into_iter()
+            .collect::<HashSet<_>>();
         self.platform
             .devices
             .iter()
-            .filter(|device| {
-                !self
-                    .platform
-                    .transport_gate(&device.key)
-                    .is_some_and(|gate| {
-                        gate.state() == crate::kms::render::resources::TransportState::Owner
-                    })
-            })
+            .filter(|device| !owner_incarnations.contains(&device.key))
             .map(|device| device.key)
             .collect()
     }
@@ -86706,6 +87198,436 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    struct C0VtSignalMaskGuard {
+        signals: libc::sigset_t,
+        previous: libc::sigset_t,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl C0VtSignalMaskGuard {
+        fn block() -> io::Result<Self> {
+            let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: both sigset pointers refer to writable stack storage.
+            let initialized = unsafe { libc::sigemptyset(signals.as_mut_ptr()) } == 0
+                && unsafe { libc::sigaddset(signals.as_mut_ptr(), libc::SIGUSR1) } == 0
+                && unsafe { libc::sigaddset(signals.as_mut_ptr(), libc::SIGUSR2) } == 0;
+            if !initialized {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the signal sets are initialized and the previous set
+            // points to writable storage.
+            let result = unsafe {
+                libc::pthread_sigmask(libc::SIG_BLOCK, signals.as_ptr(), previous.as_mut_ptr())
+            };
+            if result != 0 {
+                return Err(io::Error::from_raw_os_error(result));
+            }
+            // SAFETY: pthread_sigmask succeeded and initialized both sets.
+            Ok(Self {
+                signals: unsafe { signals.assume_init() },
+                previous: unsafe { previous.assume_init() },
+            })
+        }
+
+        fn wait_for(&self, expected: libc::c_int, timeout: std::time::Duration) {
+            let wait = libc::timespec {
+                tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+                tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+            };
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+            // SAFETY: the set is initialized, and sigtimedwait writes at most
+            // one siginfo value to the provided stack storage.
+            let signal = unsafe { libc::sigtimedwait(&self.signals, info.as_mut_ptr(), &wait) };
+            assert_eq!(
+                signal,
+                expected,
+                "timed out or received the wrong VT signal: expected {expected}, got {signal}: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for C0VtSignalMaskGuard {
+        fn drop(&mut self) {
+            // SAFETY: previous was filled by pthread_sigmask in `block`.
+            let result = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
+            };
+            if result != 0 {
+                log::warn!("hardware VT test could not restore the signal mask: {result}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct C0LinuxVtStat {
+        active: libc::c_ushort,
+        signal: libc::c_ushort,
+        state: libc::c_ushort,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct C0LinuxVtMode {
+        mode: libc::c_char,
+        waitv: libc::c_char,
+        relsig: libc::c_short,
+        acqsig: libc::c_short,
+        frsig: libc::c_short,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct C0VtSwitchGuard {
+        control_tty: std::fs::File,
+        _target_tty: std::fs::File,
+        original_vt: libc::c_int,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for C0VtSwitchGuard {
+        fn drop(&mut self) {
+            const VT_SETMODE: libc::c_ulong = 0x5602;
+            const VT_ACTIVATE: libc::c_ulong = 0x5606;
+            let mut mode = C0LinuxVtMode {
+                mode: 0,
+                waitv: 0,
+                relsig: 0,
+                acqsig: 0,
+                frsig: 0,
+            };
+            // SAFETY: the ioctl pointer addresses a correctly laid out
+            // VT-mode structure; the tty fd remains open for this guard.
+            if unsafe {
+                libc::ioctl(
+                    std::os::fd::AsRawFd::as_raw_fd(&self.control_tty),
+                    VT_SETMODE,
+                    &mut mode,
+                )
+            } < 0
+            {
+                eprintln!(
+                    "hardware VT test cleanup could not restore VT_AUTO: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            // SAFETY: VT_ACTIVATE consumes the original VT number as an
+            // integer ioctl argument, and the controlling tty is still open.
+            if unsafe {
+                libc::ioctl(
+                    std::os::fd::AsRawFd::as_raw_fd(&self.control_tty),
+                    VT_ACTIVATE,
+                    self.original_vt,
+                )
+            } < 0
+            {
+                eprintln!(
+                    "hardware VT test cleanup could not reactivate VT {}: {}",
+                    self.original_vt,
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs card1, a controlling text VT, and live Vulkan; NEVER run by the implementer"]
+    fn c0_hw_3c_vt_switch_on_card1_drm() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("environmental skip: VT_PROCESS card1 switching is a Linux hardware test");
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::{
+                os::fd::{AsFd, AsRawFd},
+                path::PathBuf,
+                time::{Duration, Instant},
+            };
+
+            use crate::kms::{
+                console::ConsoleGuard,
+                executor::KmsIoExecutor,
+                render::resources::{DrmCleanupRegistry, ResourceService},
+            };
+
+            const VT_GETSTATE: libc::c_ulong = 0x5603;
+            const VT_OPENQRY: libc::c_ulong = 0x5600;
+            let card1 = PathBuf::from("/dev/dri/card1");
+            if let Err(error) = std::fs::metadata(&card1) {
+                eprintln!("environmental skip: /dev/dri/card1 is unavailable: {error}");
+                return;
+            }
+
+            let signal_mask = C0VtSignalMaskGuard::block()
+                .expect("block SIGUSR1/SIGUSR2 before creating hardware worker threads");
+            let console_guard = match ConsoleGuard::acquire(None) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    eprintln!("environmental skip: no controlling text VT is available");
+                    return;
+                }
+                Err(error) => panic!("cannot acquire the controlling VT: {error}"),
+            };
+            let control_tty = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .expect("open controlling tty for VT state queries");
+            let control_fd = control_tty.as_raw_fd();
+            let mut active = C0LinuxVtStat {
+                active: 0,
+                signal: 0,
+                state: 0,
+            };
+            // SAFETY: VT_GETSTATE writes the Linux vt_stat structure to the
+            // valid stack pointer supplied here.
+            if unsafe { libc::ioctl(control_fd, VT_GETSTATE, &mut active) } < 0 {
+                eprintln!(
+                    "environmental skip: controlling tty is not an active VT: {}",
+                    io::Error::last_os_error()
+                );
+                return;
+            }
+            let original_vt = libc::c_int::from(active.active);
+            let mut free_vt: libc::c_int = 0;
+            // SAFETY: VT_OPENQRY writes one VT number to the valid pointer.
+            if unsafe { libc::ioctl(control_fd, VT_OPENQRY, &mut free_vt) } < 0 || free_vt <= 0 {
+                eprintln!("environmental skip: no free virtual terminal is available");
+                return;
+            }
+            let target_tty_path = format!("/dev/tty{free_vt}");
+            let target_tty = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&target_tty_path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!("environmental skip: cannot open {target_tty_path}: {error}");
+                    return;
+                }
+            };
+
+            let probe = super::KmsBackend::for_tests_with_vk_live_scene_real_drm().unwrap_or_else(
+                |error| panic!("card1 VT preflight cannot initialize Vulkan/DRM: {error}"),
+            );
+            let primary = probe
+                .platform
+                .vk
+                .as_ref()
+                .and_then(|vk| vk.selected_drm_identity)
+                .and_then(|identity| identity.primary)
+                .expect("Vulkan reports a primary DRM node");
+            let probe_path = super::card_path_for_key(primary).unwrap_or_else(|error| {
+                panic!("cannot map Vulkan primary {primary} to card1: {error}")
+            });
+            assert_eq!(
+                probe_path, card1,
+                "refusing to take DRM master on a card other than card1"
+            );
+            drop(probe);
+
+            let mut fixture =
+                super::KmsBackend::for_tests_with_live_kms().unwrap_or_else(|error| {
+                    panic!("card1 VT fixture cannot acquire live KMS: {error}")
+                });
+            let backend = &mut fixture.backend;
+            backend.resource_cleanup_on_drop_for_tests = true;
+            let device = backend
+                .platform
+                .primary_device()
+                .expect("live KMS fixture has a primary device")
+                .key;
+            let device_rc = backend
+                .platform
+                .device_for_key(device)
+                .expect("live KMS fixture retained card1")
+                .device
+                .clone();
+            let actual_path = super::card_path_for_key(device).unwrap_or_else(|error| {
+                panic!("cannot map live primary {device} to card1: {error}")
+            });
+            assert_eq!(actual_path, card1, "live fixture selected another DRM card");
+            let executor = KmsIoExecutor::spawn(
+                device_rc.as_fd(),
+                crate::kms::owner::identity::IncarnationId::first(),
+            )
+            .unwrap_or_else(|error| panic!("cannot spawn the card1 KMS executor: {error}"));
+            let (incarnation, lifecycle) = executor.owner_identity();
+            backend.platform.devices[0].executor = Some(executor);
+            backend.platform.devices[0].owner = Some(
+                crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+            );
+            let mut registry = DrmCleanupRegistry::new(device_rc, device, incarnation);
+            let mut service = ResourceService::new(device, incarnation);
+            for output_idx in 0..backend.platform.scanout_pools.len() {
+                let bo_count = backend.platform.scanout_pools[output_idx]
+                    .as_ref()
+                    .map_or(0, |scanout| scanout.display_pool().bos.len());
+                for bo_idx in 0..bo_count {
+                    backend
+                        .platform
+                        .register_managed_scanout_bo(
+                            &mut service,
+                            &mut registry,
+                            output_idx,
+                            bo_idx,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("card1 VT resource adoption failed: {error:?}")
+                        });
+                }
+            }
+            backend.install_resource_service_with_registry(service, registry);
+            install_admission_owner_gate(backend, device);
+            backend.install_admission_conductor_with_backend_composed_for_tests(
+                device,
+                AdmissionSourceFixture::new_source().0,
+            );
+            backend.console_guard = Some(console_guard);
+            backend
+                .console_guard
+                .as_ref()
+                .expect("controlling VT guard")
+                .arm_vt_process(libc::SIGUSR1, libc::SIGUSR2)
+                .expect("arm VT_PROCESS for real release/acquire signals");
+            backend.vt_switching_armed = true;
+            let _switch_guard = C0VtSwitchGuard {
+                control_tty,
+                _target_tty: target_tty,
+                original_vt,
+            };
+
+            let outputs = backend
+                .platform
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == device)
+                .map(|output| output.key.clone())
+                .collect::<Vec<_>>();
+            assert!(!outputs.is_empty(), "card1 has a live output");
+            let mut state = c0_3ci_core_state(backend);
+            backend.scene.mark_scene_structure_dirty();
+            backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+            backend.platform.wait_idle_bounded();
+            backend.drain_scanout_render_completions_for_tests();
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "initial card1 composed frame before VT switches",
+                Duration::from_secs(15),
+                &|backend| {
+                    backend.device_owner_for_tests(0).live_record().is_none()
+                        && backend
+                            .commit_consumer
+                            .current_resources
+                            .iter()
+                            .any(|resources| resources.direct_role.is_none())
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("initial card1 frame did not complete: {error}"));
+            let initial_lifecycle_sends = backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .1
+                .len();
+
+            for cycle in 1..=4 {
+                let release_started = Instant::now();
+                Backend::request_vt_switch(backend, u32::try_from(free_vt).unwrap());
+                signal_mask.wait_for(libc::SIGUSR1, Duration::from_secs(5));
+                Backend::on_vt_release(backend, &mut state);
+                let release_commit = backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .map(|record| record.commit_id());
+                c0_3bi_core_driver_until_with_state(
+                    backend,
+                    &mut state,
+                    "card1 Owner release hand-off",
+                    Duration::from_secs(2),
+                    &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("cycle {cycle}: release hand-off failed: {error}"));
+                assert!(
+                    release_started.elapsed() <= Duration::from_millis(1_100),
+                    "cycle {cycle}: Owner release exceeded its one-second absolute budget"
+                );
+                let owner = backend.device_owner_for_tests(0);
+                assert!(
+                    !owner.is_poisoned() && owner.live_record().is_none(),
+                    "cycle {cycle}: known release leaves the Owner incarnation healthy"
+                );
+                assert_eq!(
+                    backend.owner_dpms_installed_active.get(&device),
+                    Some(&false)
+                );
+                if cycle == 1 {
+                    assert!(
+                        release_commit.is_some(),
+                        "first release dispatched ACTIVE=0"
+                    );
+                    assert!(
+                        backend.lifecycle_drivers[&device]
+                            .topology_test_stats()
+                            .1
+                            .len()
+                            > initial_lifecycle_sends,
+                        "first release reached the card1 executor"
+                    );
+                }
+                let sent_after_release = backend.lifecycle_drivers[&device]
+                    .topology_test_stats()
+                    .1
+                    .len();
+
+                Backend::request_vt_switch(backend, u32::try_from(original_vt).unwrap());
+                signal_mask.wait_for(libc::SIGUSR2, Duration::from_secs(5));
+                Backend::on_vt_acquire(backend, &mut state);
+                assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
+                assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+                assert_eq!(
+                    backend.lifecycle_drivers[&device]
+                        .topology_test_stats()
+                        .1
+                        .len(),
+                    sent_after_release,
+                    "cycle {cycle}: interim acquire sent no KMS commit outside the executor"
+                );
+                assert_eq!(
+                    backend.lifecycle_drivers[&device]
+                        .client_modeset_test_stats()
+                        .1
+                        .len(),
+                    0,
+                    "cycle {cycle}: interim acquire sent no client KMS write"
+                );
+                assert_eq!(backend.platform.devices[0].key, device);
+                assert_eq!(backend.platform.outputs[0].key.device_key, device);
+                assert_eq!(backend.platform.device_for_key(device).unwrap().key, device);
+                assert_eq!(
+                    backend.vt_call_trace_for_tests.last(),
+                    Some(&"resume_input")
+                );
+            }
+            assert!(backend.vt_switching_armed);
+            c0_3bi_assert_end_state(
+                backend,
+                "c0_hw_3c_vt_switch_on_card1_drm",
+                &c0_3bi_expected_end_state(outputs),
+            );
+            // The switch guard restores VT_AUTO and the original text VT
+            // before the live-KMS fixture restores its captured CRTC.
+            let _ = &signal_mask;
+        }
+    }
+
     #[test]
     #[ignore = "needs live DRM master and Vulkan ICD"]
     fn c0_hw_3a_dpms_owner_on_card1_drm() {
@@ -92801,6 +93723,1128 @@ mod tests {
             backend,
             "c0_3ci_withdraw_outputs_emits_urgent_withdrawal_vulkan",
             &c0_3bi_expected_end_state([output_key]),
+        );
+    }
+
+    fn c0_3ci_live_release_fixture(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+        two_outputs: bool,
+    ) -> (
+        OwnerLiveFixture,
+        DrmDeviceKey,
+        Vec<OutputKey>,
+        yserver_core::backend::ModeSpec,
+    ) {
+        let (mut fixture, device, _, _, target_mode) =
+            c0_3bi_live_modeset_backend(behaviour, two_outputs)
+                .expect("environmental skip: live Vulkan release fixture");
+        if two_outputs {
+            // The second output is synthetic but shares the real device's
+            // property schema. The executor stub does not issue a real
+            // atomic request, so mirror the device-wide property IDs.
+            let (real_crtc, synthetic_crtc, plane_fb_id, plane_crtc_id, out_fence) = {
+                let outputs = &fixture.backend.platform.outputs;
+                (
+                    outputs[0].output.crtc,
+                    u32::from(outputs[1].output.crtc),
+                    outputs[0].output.plane_fb_id_prop,
+                    outputs[0].output.plane_crtc_id_prop,
+                    outputs[0].output.crtc_out_fence_ptr_prop,
+                )
+            };
+            let drm_device = std::rc::Rc::clone(&fixture.backend.platform.devices[0].device);
+            let active_property = fixture.backend.platform.devices[0]
+                .active_property_cache
+                .get_or_discover(drm_device.as_ref(), real_crtc)
+                .expect("discover ACTIVE on the real fixture CRTC");
+            fixture.backend.platform.outputs[1].output.plane_fb_id_prop = plane_fb_id;
+            fixture.backend.platform.outputs[1]
+                .output
+                .plane_crtc_id_prop = plane_crtc_id;
+            fixture.backend.platform.outputs[1]
+                .output
+                .crtc_out_fence_ptr_prop = out_fence;
+            fixture.backend.platform.devices[0]
+                .active_property_cache
+                .insert_for_tests(synthetic_crtc, active_property);
+        }
+        fixture.backend.vt_skip_master_ioctls_for_tests = true;
+        fixture.backend.platform.owner_completion_detached = true;
+        fixture
+            .backend
+            .lifecycle_register_owner_device(device)
+            .expect("register the already-installed Owner outputs as lifecycle-ready");
+        let outputs = fixture
+            .backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| output.key.clone())
+            .collect::<Vec<_>>();
+        let completion_crtcs = fixture
+            .backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(CrtcKey::for_output)
+            .collect::<Vec<_>>();
+        for crtc in completion_crtcs {
+            fixture.backend.platform.record_completion_clock(
+                crtc,
+                yserver_core::backend::PresentClockSample {
+                    msc: 1_000,
+                    ust: 1_000_000,
+                    source: yserver_core::backend::PresentClockSource::IdleSequence,
+                },
+            );
+        }
+        (fixture, device, outputs, target_mode)
+    }
+
+    fn c0_3ci_core_state(backend: &mut super::KmsBackend) -> ServerState {
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        let _requester = c0_3aii_install_dpms_core_client(&mut state, 71);
+        state
+    }
+
+    fn c0_3ci_expected_end_state_with_pending_client_modeset(
+        backend: &super::KmsBackend,
+        outputs: impl IntoIterator<Item = OutputKey>,
+    ) -> C0EndStateExpectation {
+        let mut expected = c0_3bi_expected_end_state(outputs);
+        expected.other_live_allocations = backend
+            .lifecycle_drivers
+            .values()
+            .filter_map(|driver| driver.client_modeset.as_ref())
+            .filter_map(|slot| slot.prepared.as_ref())
+            .flat_map(|prepared| prepared.prepared_set.allocation_keys.iter().copied())
+            .collect();
+        expected
+    }
+
+    fn c0_3ci_add_legacy_output(
+        backend: &mut super::KmsBackend,
+        device_number: u32,
+        crtc: u32,
+    ) -> (DrmDeviceKey, OutputKey) {
+        let device = test_device_key(device_number);
+        push_test_device(backend, device);
+        push_test_output(backend, crtc);
+        let output = &mut backend.platform.outputs[1];
+        let key = OutputKey::new(device, output.key.connector_name.clone());
+        output.key = key.clone();
+        output.scanout_route.kms_device_key = device;
+        backend.platform.output_instance_ids[1] = backend
+            .platform
+            .allocate_output_instance_id(&key)
+            .expect("Legacy fixture output instance");
+        let ids = backend.randr_id_alloc.ids_for(&key);
+        backend.output_key_by_id.insert(ids.output_id, key.clone());
+        let output = &backend.platform.outputs[1];
+        let entry = backend.randr_id_alloc.entry_mut(&key);
+        entry.connected = true;
+        entry.config = super::ConnectorConfig::Enabled {
+            mode_w: output.width,
+            mode_h: output.height,
+            vrefresh: output.output.picked.vrefresh,
+            x: output.x,
+            y: output.y,
+        };
+        entry.modes = output.output.modes.clone();
+        entry.edid = output.output.edid.clone();
+        entry.mm_width = output.output.mm_width;
+        entry.mm_height = output.output.mm_height;
+        entry.connector_type = output.output.connector_type.clone();
+        (device, key)
+    }
+
+    fn c0_3ci_install_legacy_probe_snapshot(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output: &OutputKey,
+    ) {
+        let layout = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| &layout.key == output)
+            .expect("Legacy probe output remains installed");
+        backend.platform.connector_snapshot_for_tests = Some(vec![ConnectorSnapshot {
+            key: output.clone(),
+            modes: layout.output.modes.clone(),
+            mm_width: layout.output.mm_width,
+            mm_height: layout.output.mm_height,
+            edid: layout.output.edid.clone(),
+            connector_type: layout.output.connector_type.clone(),
+        }]);
+        assert_eq!(output.device_key, device);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_prompt_obligations_never_wait_vulkan() {
+        use crate::{
+            kms::{executor::test_support::StubBehaviour, owner::lifecycle::SeatTarget},
+            vt::state::VtState,
+        };
+
+        let (mut fixture, device, outputs, target_mode) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptValidationThenNeverReply, false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        let mut peer = c0_3aii_install_dpms_core_client(&mut state, 72);
+        let output_id = backend.randr_id_alloc.ids_for(&outputs[0]).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, outputs[0].clone());
+        let token = c0_3bi_begin_client_modeset(
+            backend,
+            output_id,
+            &outputs[0].connector_name,
+            Some(target_mode),
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "dispatch client modeset before VT release",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .lifecycle_drivers
+                    .get(&device)
+                    .and_then(|driver| driver.client_modeset.as_ref())
+                    .is_some_and(|slot| {
+                        slot.token == token
+                            && slot.phase
+                                == crate::kms::render::admission::ClientModesetPhase::Dispatched
+                    })
+            },
+            None,
+        )
+        .expect("client modeset is dispatched and its executor stops replying");
+        let client_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("dispatched client commit")
+            .commit_id();
+        backend.core.down_keys.insert(38);
+        backend.core.button_mask = 0x0100;
+        state.dpms.power_level = 3;
+        let previous_activity = state.dpms.last_activity;
+
+        // The executor stub cannot issue a DRM atomic ioctl, signal a kernel
+        // out-fence, or perform the VT hand-off. It only accepts validation
+        // through its protocol and then withholds the live-call reply.
+        Backend::on_vt_release(backend, &mut state);
+
+        assert_eq!(backend.vt_state, VtState::Suspending);
+        assert_eq!(
+            backend.lifecycle_coordinator.seat_target(),
+            Some(SeatTarget::Released)
+        );
+        assert!(backend.core.down_keys.is_empty(), "held key was released");
+        assert_eq!(backend.core.button_mask, 0, "held button was released");
+        assert_eq!(state.dpms.power_level, 0, "protocol DPMS resets to On");
+        assert!(state.dpms.last_activity > previous_activity);
+        assert_eq!(
+            &backend.vt_call_trace_for_tests[..2],
+            ["pause_input", "held_releases"]
+        );
+        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert!(Backend::present_scanout_blackout(
+            backend,
+            u32::from(backend.platform.outputs[0].output.crtc)
+        ));
+        assert!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .is_some_and(|record| record.commit_id() == client_commit)
+        );
+        assert!(
+            kbd_map_drain(&mut peer).is_empty(),
+            "no executor reply was observed"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_prompt_obligations_never_wait_vulkan",
+            &c0_3ci_expected_end_state_with_pending_client_modeset(backend, outputs),
+        );
+    }
+
+    #[test]
+    fn c0_3ci_legacy_only_release_unchanged() {
+        use crate::vt::state::VtState;
+
+        let mut backend = KmsBackend::for_tests();
+        let output = backend.platform.outputs[0].key.clone();
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
+        let mut state = ServerState::new();
+
+        Backend::on_vt_release(&mut backend, &mut state);
+
+        assert_eq!(
+            backend.platform.dpms_output_calls_for_tests,
+            Some(vec![(false, vec![output.clone()])])
+        );
+        assert_eq!(
+            backend.platform.dpms_output_scopes_for_tests,
+            Some(vec![None])
+        );
+        assert!(backend.owner_vt_release.is_none());
+        assert!(
+            !backend
+                .vt_call_trace_for_tests
+                .contains(&"legacy_set_seat_target"),
+            "Legacy-only release keeps the established call sequence"
+        );
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3ci_legacy_only_release_unchanged",
+            &c0_3bi_expected_end_state([output]),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_release_commit_is_active_off_vulkan() {
+        use crate::kms::{
+            executor::{
+                ObservedOutcome, protocol::HostCallCorrelation, test_support::StubBehaviour,
+            },
+            owner::closure::ObjectKind,
+        };
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), true);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        // AcceptKernelCalls accepts protocol requests only. This Vulkan
+        // fixture does not execute DRM atomic ioctls, signal out-fences, or
+        // perform the VT master hand-off.
+        Backend::on_vt_release(backend, &mut state);
+        let description = backend.lifecycle_drivers[&device]
+            .pending_topology_descriptions_for_tests()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("ACTIVE=0 TEST_ONLY description is queued",));
+        let expected_crtcs = backend
+            .platform
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device)
+            .map(|output| u32::from(output.output.crtc))
+            .collect::<Vec<_>>();
+        assert_eq!(description.objects.len(), 2);
+        assert_eq!(description.crtc_state.len(), 2);
+        for (object, crtc) in description.objects.iter().zip(&expected_crtcs) {
+            assert_eq!(object.kind, ObjectKind::Crtc);
+            assert_eq!(object.object, *crtc);
+            assert_eq!(object.props, vec![(description.property_ids.active, 0)]);
+        }
+        assert!(description.objects.iter().all(|object| {
+            object.kind != ObjectKind::Plane
+                && object
+                    .props
+                    .iter()
+                    .all(|(property, _)| *property != description.property_ids.out_fence_ptr)
+        }));
+
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "executor accepts release lifecycle commit",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .expect("release commit reaches the executor through core entries");
+        let record = backend.device_owner_for_tests(0).live_record().unwrap();
+        assert_eq!(record.closure().expected_completion(), expected_crtcs);
+        let commit = record.commit_id();
+        let accepted_fence_count = backend
+            .drained_host_call_events_for_tests()
+            .into_iter()
+            .find_map(
+                |observation| match (observation.correlation, observation.kind) {
+                    (
+                        HostCallCorrelation::Atomic {
+                            commit: observed, ..
+                        },
+                        ObservedOutcome::Accepted { fence_count, .. },
+                    ) if observed == commit => Some(fence_count),
+                    _ => None,
+                },
+            )
+            .expect("executor accepted the release commit");
+        assert_eq!(
+            accepted_fence_count, 2,
+            "one required out-fence per lit CRTC"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_release_commit_is_active_off_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_release_commit_waits_behind_dispatched_modeset_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, target_mode) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        let output_id = backend.randr_id_alloc.ids_for(&outputs[0]).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, outputs[0].clone());
+        let token = c0_3bi_begin_client_modeset(
+            backend,
+            output_id,
+            &outputs[0].connector_name,
+            Some(target_mode),
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "dispatch the client modeset",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .lifecycle_drivers
+                    .get(&device)
+                    .and_then(|driver| driver.client_modeset.as_ref())
+                    .is_some_and(|slot| {
+                        slot.token == token
+                            && slot.phase
+                                == crate::kms::render::admission::ClientModesetPhase::Dispatched
+                    })
+            },
+            None,
+        )
+        .expect("client modeset occupies the Owner slot");
+        let client_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("client commit")
+            .commit_id();
+        Backend::on_vt_release(backend, &mut state);
+        assert_eq!(
+            backend
+                .device_owner_for_tests(0)
+                .live_record()
+                .map(|record| record.commit_id()),
+            Some(client_commit),
+            "VT release does not preempt the dispatched client commit"
+        );
+
+        // The executor stub accepts requests but cannot emit a real DRM
+        // page-flip event or signal an out-fence; the existing core-entry
+        // completion seam injects those kernel effects after 50 ms.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            client_commit,
+            "client modeset completes before release commit",
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "finish client token and dispatch queued VT release",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .is_some_and(|record| {
+                        record.commit_id() != client_commit && record.milestones().accepted
+                    })
+            },
+            None,
+        )
+        .expect("VT release commit is sent only after client completion");
+        assert!(c0_3bi_has_crtc_config_result(backend, token));
+        let _ = c0_3bi_take_crtc_config_result(backend, token)
+            .expect("client modeset token completes before VT hand-off");
+        let release_commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("release commit")
+            .commit_id();
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            release_commit,
+            "release commit completes after client modeset",
+        );
+        assert_eq!(
+            &backend.vt_call_trace_for_tests[backend.vt_call_trace_for_tests.len() - 2..],
+            ["drop_master", "vt_reldisp"]
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_release_commit_waits_behind_dispatched_modeset_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_dark_device_contributes_no_commit_vulkan() {
+        use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        backend.owner_dpms_installed_active.insert(device, false);
+        let mut state = c0_3ci_core_state(backend);
+        // The stub has no DRM/VT side effects; the test checks that a dark
+        // Owner contributes no atomic request before the synthetic hand-off.
+        Backend::on_vt_release(backend, &mut state);
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .1
+                .is_empty()
+        );
+        assert!(backend.owner_vt_release.is_none());
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_dark_device_contributes_no_commit_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_release_hands_off_after_commit_vulkan() {
+        use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        Backend::on_vt_release(backend, &mut state);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "accept VT release commit",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .expect("release commit reaches accepted state");
+        assert!(backend.vt_call_trace_for_tests.last() != Some(&"vt_reldisp"));
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .unwrap()
+            .commit_id();
+        // The /dev/null-backed helper cannot signal the kernel fence or
+        // drm event; the established core-entry completion helper models
+        // those two side effects after the test's 100 ms completion point.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            commit,
+            "complete VT release commit at 100 ms",
+        );
+        assert_eq!(
+            &backend.vt_call_trace_for_tests[backend.vt_call_trace_for_tests.len() - 2..],
+            ["drop_master", "vt_reldisp"]
+        );
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        assert!(
+            backend
+                .platform
+                .owner_ref(device)
+                .is_some_and(|owner| !owner.is_poisoned())
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_release_hands_off_after_commit_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_release_hands_off_at_the_bound_vulkan() {
+        use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
+
+        let (mut fixture, _device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptValidationThenNeverReply, false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        let release_started = std::time::Instant::now();
+        // The validation-only helper never issues a DRM atomic or performs
+        // drmDropMaster/VT_RELDISP; the deadline entry drives the hand-off.
+        Backend::on_vt_release(backend, &mut state);
+        let deadline = backend.owner_vt_release.as_ref().unwrap().deadline;
+        assert_eq!(deadline.duration_since(release_started).as_secs(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        Backend::on_vt_release(backend, &mut state);
+        assert_eq!(
+            backend.owner_vt_release.as_ref().unwrap().deadline,
+            deadline,
+            "a coalesced release cannot extend the absolute hand-off bound"
+        );
+        assert_eq!(Backend::next_wakeup(backend), Some(deadline));
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "Owner release absolute deadline",
+            std::time::Duration::from_secs(2),
+            &|backend| backend.vt_state == VtState::Suspended,
+            None,
+        )
+        .expect("the core loop wakes the absolute release deadline");
+        assert!(std::time::Instant::now() >= deadline);
+        assert!(std::time::Instant::now() - deadline < std::time::Duration::from_millis(100));
+        assert_eq!(
+            &backend.vt_call_trace_for_tests[backend.vt_call_trace_for_tests.len() - 2..],
+            ["drop_master", "vt_reldisp"]
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_release_hands_off_at_the_bound_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_unknown_release_closes_the_incarnation_vulkan() {
+        use crate::{
+            kms::{executor::test_support::StubBehaviour, owner::lifecycle::DeviceLifecycleState},
+            vt::state::VtState,
+        };
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptValidationThenNeverReply, false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        // The helper withholds the live reply and cannot perform a DRM atomic,
+        // signal an out-fence, or execute the real VT master hand-off.
+        Backend::on_vt_release(backend, &mut state);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "dispatch unanswered release commit",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .is_some_and(|record| record.milestones().dispatched)
+            },
+            None,
+        )
+        .expect("release commit is dispatched before the executor withholds its reply");
+        let commit = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("release atomic is in flight")
+            .commit_id();
+        let deadline = backend.owner_vt_release.as_ref().unwrap().deadline;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "unknown release deadline",
+            std::time::Duration::from_secs(2),
+            &|backend| backend.vt_state == VtState::Suspended,
+            None,
+        )
+        .expect("unknown completion closes the release route at its deadline");
+        assert!(std::time::Instant::now() >= deadline);
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .state(),
+            DeviceLifecycleState::ExecutorStalled
+        );
+        assert_eq!(backend.urgent_requesterless_publications.len(), 1);
+        assert!(backend.device_owner_for_tests(0).live_record().is_some());
+        let live_sends = backend.lifecycle_drivers[&device].topology_test_stats().1;
+        let helper_pid = backend.platform.devices[0]
+            .executor
+            .as_ref()
+            .expect("executor retained while unreaped")
+            .child_pid();
+        Backend::on_vt_acquire(backend, &mut state);
+        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats().1,
+            live_sends
+        );
+        assert_eq!(
+            backend.platform.devices[0]
+                .executor
+                .as_ref()
+                .unwrap()
+                .child_pid(),
+            helper_pid,
+            "the dead executor is retained with the closed incarnation"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .unwrap()
+                .desired()
+                .seat_target(),
+            Some(crate::kms::owner::lifecycle::SeatTarget::Released),
+            "interim acquire does not target the closed Owner incarnation"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_unknown_release_closes_the_incarnation_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+        let _ = commit;
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_unanswered_client_modeset_at_the_deadline_vulkan() {
+        use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
+        use yserver_core::{
+            backend::Backend,
+            core_loop::process_request::{RequestOutcome, complete_crtc_config, process_request},
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        let (mut fixture, device, outputs, target_mode) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptValidationThenNeverReply, false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        let mut requester = c0_3aii_install_dpms_core_client(&mut state, 73);
+        let output_id = backend.randr_id_alloc.ids_for(&outputs[0]).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, outputs[0].clone());
+        let crtc_id = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.output_id == output_id)
+            .expect("Owner output in core RandR state")
+            .crtc_id;
+        let requested_mode = target_mode;
+        // Model the screen extent having been enlarged before the CRTC
+        // request, as a client may do with RRSetScreenSize. The test is about
+        // the parked Owner token and its deadline result, not screen sizing.
+        state.randr.screen_width = state.randr.screen_width.max(requested_mode.width);
+        state.randr.screen_height = state.randr.screen_height.max(requested_mode.height);
+        let mode_id = state
+            .randr
+            .mode_table
+            .iter()
+            .find(|mode| {
+                mode.width == requested_mode.width
+                    && mode.height == requested_mode.height
+                    && mode.vrefresh == requested_mode.vrefresh
+            })
+            .expect("current mode in core RandR state")
+            .mode_id;
+        let mut body = Vec::with_capacity(28);
+        body.extend_from_slice(&crtc_id.to_le_bytes());
+        body.extend_from_slice(&1234_u32.to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&mode_id.to_le_bytes());
+        body.extend_from_slice(&1_u16.to_le_bytes());
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&output_id.to_le_bytes());
+        let pending = match process_request(
+            &mut state,
+            backend,
+            ClientId(73),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                length_units: 8,
+            },
+            &body,
+            None,
+        )
+        .expect("dispatch real core SetCrtcConfig")
+        {
+            RequestOutcome::PendingCrtcConfig(pending) => pending,
+            other => {
+                let wire = kbd_map_drain(&mut requester);
+                panic!("expected parked Owner request, got {other:?}, wire={wire:02x?}");
+            }
+        };
+        // The validation-only helper withholds the live reply and cannot issue
+        // the DRM atomic, signal its fence, or perform the VT hand-off.
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "dispatch unanswered client modeset",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .lifecycle_drivers
+                    .get(&device)
+                    .and_then(|driver| driver.client_modeset.as_ref())
+                    .is_some_and(|slot| {
+                        slot.token == pending.token
+                            && slot.phase
+                                == crate::kms::render::admission::ClientModesetPhase::Dispatched
+                    })
+            },
+            None,
+        )
+        .expect("client modeset occupies the Owner slot");
+        let lifecycle_sends_before = backend.lifecycle_drivers[&device].topology_test_stats().1;
+        Backend::on_vt_release(backend, &mut state);
+        let deadline = backend.owner_vt_release.as_ref().unwrap().deadline;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "unanswered client modeset deadline",
+            std::time::Duration::from_secs(2),
+            &|backend| backend.vt_state == VtState::Suspended,
+            None,
+        )
+        .expect("deadline terminalizes the client token and closes the device");
+        assert!(std::time::Instant::now() >= deadline);
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats().1,
+            lifecycle_sends_before,
+            "the queued ACTIVE=0 release never bypasses the client slot"
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "ordinary ready-token path for failed client mode",
+            std::time::Duration::from_secs(1),
+            &|backend| c0_3bi_has_crtc_config_result(backend, pending.token),
+            None,
+        )
+        .expect("unknown completion queues the client token as ready");
+        let result = c0_3bi_take_crtc_config_result(backend, pending.token);
+        assert!(result.is_err(), "client token resolves Failed");
+        complete_crtc_config(
+            &mut state,
+            backend,
+            ClientId(73),
+            SequenceNumber(1),
+            pending.publication,
+            pending.reply,
+            result,
+        )
+        .expect("the core failed-result continuation writes the ordinary reply");
+        let reply = kbd_map_drain(&mut requester);
+        assert_eq!(reply.len(), 32);
+        assert_eq!(reply[1], 3, "the parked requester receives Failed");
+        assert!(
+            !backend
+                .dispatched_client_modeset_tokens
+                .contains(&pending.token),
+            "the ordinary ready-token continuation retires its install-capable marker"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_unanswered_client_modeset_at_the_deadline_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_late_release_result_changes_nothing_vulkan() {
+        use crate::{
+            kms::{executor::test_support::StubBehaviour, owner::device::OwnerEvent},
+            vt::state::VtState,
+        };
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptValidationThenNeverReply, false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        Backend::on_vt_release(backend, &mut state);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "dispatch release commit before late result",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .is_some_and(|record| record.milestones().dispatched)
+            },
+            None,
+        )
+        .expect("release commit is accepted before its deadline");
+        let record = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("release commit in flight");
+        let commit = record.commit_id();
+        let scene = backend
+            .scene
+            .output_scene_identity_for_tests(0)
+            .expect("Owner scene identity before late result");
+        let pool = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("Owner scanout pool") as *const _;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "close unknown release before late result",
+            std::time::Duration::from_secs(2),
+            &|backend| backend.vt_state == VtState::Suspended,
+            None,
+        )
+        .expect("release deadline closes the old epoch");
+        let power_before = backend.owner_dpms_installed_active.get(&device).copied();
+        let publication_count = backend.urgent_requesterless_publications.len();
+
+        // The event enters at the ordinary OwnerCompletion Backend entry.
+        // It models a delayed executor/fence result; the test helper does not
+        // perform a kernel page flip or signal a DRM out-fence.
+        backend
+            .core_driver_owner_events_for_tests
+            .push_back((device, vec![OwnerEvent::HardwareComplete { commit }]));
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "discard late release completion",
+            std::time::Duration::from_millis(100),
+            &|backend| backend.core_driver_owner_events_for_tests.is_empty(),
+            None,
+        )
+        .expect("late completion is drained through the core entry");
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device).copied(),
+            power_before
+        );
+        assert_eq!(
+            backend.urgent_requesterless_publications.len(),
+            publication_count
+        );
+        assert_eq!(
+            backend.scene.output_scene_identity_for_tests(0),
+            Some(scene)
+        );
+        assert!(std::ptr::eq(
+            pool,
+            backend.platform.scanout_pools[0]
+                .as_ref()
+                .expect("late completion retains pool") as *const _
+        ));
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_late_release_result_changes_nothing_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_interim_acquire_leaves_owner_closed_vulkan() {
+        use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptValidationThenNeverReply, false);
+        let backend = &mut fixture.backend;
+        let (legacy_device, legacy_output) = c0_3ci_add_legacy_output(backend, 118, 0x3b1_919);
+        c0_3ci_install_legacy_probe_snapshot(backend, legacy_device, &legacy_output);
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
+        let mut state = c0_3ci_core_state(backend);
+        Backend::on_vt_release(backend, &mut state);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "finish release before interim acquire",
+            std::time::Duration::from_secs(2),
+            &|backend| backend.vt_state == VtState::Suspended,
+            None,
+        )
+        .expect("release is handed off before acquire");
+        let live_sends = backend.lifecycle_drivers[&device].topology_test_stats().1;
+        let client_sends = backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        // The helper does not issue Owner DRM atomics, signal out-fences, or
+        // perform VT master operations; only the scoped Legacy test seam does.
+        Backend::on_vt_acquire(backend, &mut state);
+        assert_eq!(backend.vt_state, VtState::Active);
+        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats().1,
+            live_sends
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device].client_modeset_test_stats(),
+            client_sends
+        );
+        assert_eq!(
+            backend.platform.dpms_output_calls_for_tests,
+            Some(vec![
+                (false, vec![legacy_output.clone()]),
+                (true, vec![legacy_output.clone()]),
+            ]),
+            "the interim acquire relights only the Legacy output"
+        );
+        assert_eq!(
+            backend.platform.dpms_output_scopes_for_tests,
+            Some(vec![
+                Some(HashSet::from([legacy_device])),
+                Some(HashSet::from([legacy_device])),
+            ])
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_interim_acquire_leaves_owner_closed_vulkan",
+            &c0_3bi_expected_end_state(outputs.into_iter().chain([legacy_output])),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_mixed_server_release_scopes_legacy_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let (legacy_device, legacy_output) = c0_3ci_add_legacy_output(backend, 119, 0x3b1_920);
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
+        let mut state = c0_3ci_core_state(backend);
+
+        // AcceptKernelCalls models executor protocol replies only. This
+        // fixture recorder does not issue Legacy DRM writes, and it cannot
+        // perform drmDropMaster or VT_RELDISP.
+        Backend::on_vt_release(backend, &mut state);
+        let description = backend.lifecycle_drivers[&device]
+            .pending_topology_descriptions_for_tests()
+            .into_iter()
+            .next()
+            .expect("the Owner receives its ACTIVE=0 release description");
+        assert_eq!(description.objects.len(), 1);
+        assert_eq!(description.crtc_state.len(), 1);
+        assert_eq!(
+            description.objects[0].props,
+            vec![(description.property_ids.active, 0)]
+        );
+        assert!(
+            !description
+                .objects
+                .iter()
+                .any(|object| { object.kind == crate::kms::owner::closure::ObjectKind::Plane })
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "accept the Owner release alongside scoped Legacy suspend",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .expect("the Owner release commit reaches the executor");
+        assert_eq!(
+            backend.platform.dpms_output_calls_for_tests,
+            Some(vec![(false, vec![legacy_output.clone()])]),
+            "the scoped Legacy all-off does not touch the Owner output"
+        );
+        assert_eq!(
+            backend.platform.dpms_output_scopes_for_tests,
+            Some(vec![Some(HashSet::from([legacy_device]))])
+        );
+        let (validation_sends, lifecycle_sends, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert!(validation_sends.len() <= 1);
+        assert_eq!(lifecycle_sends.len(), 1, "one Owner release commit is sent");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_mixed_server_release_scopes_legacy_vulkan",
+            &c0_3bi_expected_end_state(outputs.into_iter().chain([legacy_output])),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_mixed_release_legacy_suspend_consumes_the_budget_vulkan() {
+        use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
+
+        let (mut fixture, _device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptValidationThenNeverReply, false);
+        let backend = &mut fixture.backend;
+        let (_legacy_device, legacy_output) = c0_3ci_add_legacy_output(backend, 120, 0x3b1_921);
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
+        backend.platform.drm_event_drain_for_tests = Some((Vec::new(), true));
+        let mut state = c0_3ci_core_state(backend);
+        let release_started = std::time::Instant::now();
+
+        // The event-drain seam sleeps for exactly the supplied remaining
+        // allowance and substitutes for polling the synthetic Legacy DRM fd.
+        // AcceptValidationThenNeverReply models validation only; it leaves
+        // the Owner release unanswered and cannot reproduce kernel master or
+        // page-flip side effects.
+        Backend::on_vt_release(backend, &mut state);
+        let elapsed = release_started.elapsed();
+        let drain_budget = backend
+            .platform
+            .drm_event_drain_for_tests
+            .as_ref()
+            .and_then(|(calls, _)| calls.first())
+            .copied()
+            .expect("the scoped Legacy event drain ran");
+        assert!(!drain_budget.is_zero());
+        assert!(
+            drain_budget < std::time::Duration::from_secs(1),
+            "Legacy drain receives only the remaining release budget: {drain_budget:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(950)
+                && elapsed < std::time::Duration::from_millis(1_100),
+            "the hand-off follows the absolute one-second deadline: {elapsed:?}"
+        );
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        assert_eq!(
+            &backend.vt_call_trace_for_tests[backend.vt_call_trace_for_tests.len() - 2..],
+            ["drop_master", "vt_reldisp"]
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_mixed_release_legacy_suspend_consumes_the_budget_vulkan",
+            &c0_3bi_expected_end_state(outputs.into_iter().chain([legacy_output])),
         );
     }
 

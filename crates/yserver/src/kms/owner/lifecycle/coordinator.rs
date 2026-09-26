@@ -1241,13 +1241,15 @@ mod tests {
                     expected.logical.release_seat,
                     "seat action differed for {kind:?}"
                 );
+                let withdraw_outputs = expected.logical.withdraw_protocol_work
+                    || kind == CompletionUnknownRowKind::VTRelease;
                 assert_eq!(
                     dispatch
                         .actions
                         .iter()
                         .any(|action| matches!(action, Action::WithdrawOutputs(_))),
-                    expected.logical.withdraw_protocol_work,
-                    "withdraw action differed for {kind:?}"
+                    withdraw_outputs,
+                    "output withdrawal differed for {kind:?}"
                 );
                 assert_eq!(
                     dispatch

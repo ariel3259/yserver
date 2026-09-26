@@ -1213,7 +1213,7 @@ impl KmsBackend {
         }
     }
 
-    fn lifecycle_owner_devices(&self) -> Vec<DrmDeviceKey> {
+    pub(super) fn lifecycle_owner_devices(&self) -> Vec<DrmDeviceKey> {
         self.platform
             .devices
             .iter()
@@ -1222,6 +1222,26 @@ impl KmsBackend {
                     .transport_gate(&entry.key)
                     .is_some_and(|gate| {
                         gate.state() == crate::kms::render::resources::TransportState::Owner
+                    })
+                    .then_some(entry.key)
+            })
+            .collect()
+    }
+
+    /// Owner incarnations remain Owner-owned after their transport gate closes
+    /// on an unknown result. VT routing must keep those devices out of the
+    /// Legacy ioctl path until a later lifecycle task replaces the Owner.
+    pub(super) fn lifecycle_owner_incarnation_devices(&self) -> Vec<DrmDeviceKey> {
+        self.platform
+            .devices
+            .iter()
+            .filter_map(|entry| {
+                self.platform
+                    .transport_gate(&entry.key)
+                    .is_some_and(|gate| {
+                        gate.state() == crate::kms::render::resources::TransportState::Owner
+                            || gate.state() == crate::kms::render::resources::TransportState::Closed
+                                && entry.owner.is_some()
                     })
                     .then_some(entry.key)
             })
@@ -1360,6 +1380,49 @@ impl KmsBackend {
         }
     }
 
+    /// Project an actual VT boundary through the lifecycle arbiter. The
+    /// read-only observation above remains the Legacy feed; Owner transitions
+    /// must be explicit lifecycle work so ReleaseSeat and its commit are
+    /// driven by the per-device queue.
+    pub(crate) fn lifecycle_set_seat_target(
+        &mut self,
+        target: crate::kms::owner::lifecycle::SeatTarget,
+    ) -> bool {
+        let owner_devices = self.lifecycle_owner_devices();
+        if owner_devices.is_empty() {
+            #[cfg(test)]
+            self.vt_call_trace_for_tests.push("legacy_set_seat_target");
+            return false;
+        }
+        for device in owner_devices.iter().copied() {
+            if let Err(error) = self.lifecycle_register_owner_device(device) {
+                log::error!("lifecycle seat transition registration for {device}: {error:?}");
+                continue;
+            }
+            if target == crate::kms::owner::lifecycle::SeatTarget::Released {
+                // A dispatched client modeset delays transition creation in
+                // the arbiter. Close admission and answer its current Present
+                // obligations before recording that deferred transition.
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    conductor.lifecycle_admission_closed = true;
+                }
+                let _ = self.lifecycle_terminalize_presents(device);
+            }
+        }
+        let dispatches = match self.lifecycle_coordinator.set_seat_target(target) {
+            Ok(dispatches) => dispatches,
+            Err(error) => {
+                log::error!("lifecycle seat transition failed: {error:?}");
+                return true;
+            }
+        };
+        for dispatch in dispatches {
+            let requester = self.lifecycle_current_tag(dispatch.device);
+            self.lifecycle_queue_actions(dispatch.device, dispatch.actions, requester);
+        }
+        true
+    }
+
     fn lifecycle_current_tag(&self, device: DrmDeviceKey) -> Option<TransitionTag<IncarnationId>> {
         self.lifecycle_coordinator
             .device(&device)
@@ -1391,7 +1454,11 @@ impl KmsBackend {
         self.lifecycle_drain_driver(device);
     }
 
-    fn lifecycle_queue_input(&mut self, device: DrmDeviceKey, input: ArbiterInput<IncarnationId>) {
+    pub(super) fn lifecycle_queue_input(
+        &mut self,
+        device: DrmDeviceKey,
+        input: ArbiterInput<IncarnationId>,
+    ) {
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.enqueue(LifecycleDriverWork::Input(input));
             self.lifecycle_drain_driver(device);
@@ -1576,6 +1643,16 @@ impl KmsBackend {
                 if !self.lifecycle_tag_current(device, tag) {
                     return;
                 }
+                if self
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::ExecutorStalled
+                    })
+                {
+                    return;
+                }
                 if let Some(conductor) = self.admission_conductors.get_mut(&device) {
                     let _ = conductor
                         .admission
@@ -1605,8 +1682,21 @@ impl KmsBackend {
                 }
             }
             LifecycleAction::WithdrawOutputs(_) => self.withdraw_outputs_for_device(device),
+            LifecycleAction::ReleaseSeat(_) => {
+                // The core-thread VT entry has already paused input, emitted
+                // held-key/button releases, set protocol DPMS to On, and
+                // moved VtState to Suspending before it projects this action.
+                // These remaining prompt obligations are deliberately run
+                // synchronously here, before any executor result can be
+                // observed.
+                self.pause_input_thread();
+                if let Some(service) = self.resource_service.as_mut() {
+                    service.set_seat_active(false, std::time::Instant::now());
+                }
+                #[cfg(test)]
+                self.vt_call_trace_for_tests.push("release_seat_action");
+            }
             LifecycleAction::DispositionChanged { .. }
-            | LifecycleAction::ReleaseSeat(_)
             | LifecycleAction::TerminalizeProtocolWork(_)
             | LifecycleAction::AllocateRecoveryIncident { .. }
             | LifecycleAction::RecoveryTableF(_)
@@ -2666,10 +2756,27 @@ impl KmsBackend {
         &mut self,
         device: DrmDeviceKey,
     ) -> Result<CommitDescription, String> {
-        let target = crate::kms::owner::lifecycle::dpms_target_for_level(
-            self.lifecycle_coordinator.protocol_dpms_level(),
-        )
-        .ok_or_else(|| "lifecycle DPMS level is invalid".to_string())?;
+        let transition_kind = self
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .map(|transition| transition.kind);
+        let vt_release =
+            transition_kind == Some(crate::kms::owner::lifecycle::LifecycleKind::VTRelease);
+        let new_active = if vt_release {
+            false
+        } else {
+            crate::kms::owner::lifecycle::dpms_target_for_level(
+                self.lifecycle_coordinator.protocol_dpms_level(),
+            )
+            .ok_or_else(|| "lifecycle DPMS level is invalid".to_string())?
+                == crate::kms::owner::lifecycle::DpmsTarget::On
+        };
+        let device_was_lit = self
+            .owner_dpms_installed_active
+            .get(&device)
+            .copied()
+            .unwrap_or(true);
         let projected_outputs = self
             .lifecycle_coordinator
             .device(&device)
@@ -2690,7 +2797,9 @@ impl KmsBackend {
             .outputs
             .iter()
             .filter(|output| {
-                output.key.device_key == device && projected_outputs.contains(&output.key)
+                output.key.device_key == device
+                    && projected_outputs.contains(&output.key)
+                    && (!vt_release || device_was_lit)
             })
             .collect::<Vec<_>>();
         if outputs.is_empty() {
@@ -2721,7 +2830,6 @@ impl KmsBackend {
         let mut crtc_state = Vec::with_capacity(outputs.len());
         for output in outputs {
             let crtc_id = u32::from(output.output.crtc);
-            let new_active = target == crate::kms::owner::lifecycle::DpmsTarget::On;
             objects.push(crate::kms::owner::closure::SerializedObject {
                 object: crtc_id,
                 kind: crate::kms::owner::closure::ObjectKind::Crtc,
@@ -2987,7 +3095,14 @@ impl KmsBackend {
                 return AdmissionOutcome::BeginRefused;
             }
         }
-        let dpms_active = self.lifecycle_coordinator.protocol_dpms_level() == 0;
+        let dpms_active = self.lifecycle_coordinator.protocol_dpms_level() == 0
+            && self
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .is_none_or(|transition| {
+                    transition.kind != crate::kms::owner::lifecycle::LifecycleKind::VTRelease
+                });
         let validation_result = self.platform.owner_for(device).map(|owner| {
             owner.begin_validation_with_options(
                 &description,
@@ -5414,7 +5529,7 @@ impl KmsBackend {
         }
     }
 
-    fn lifecycle_report_completion_loss(&mut self, device: DrmDeviceKey) {
+    pub(super) fn lifecycle_report_completion_loss(&mut self, device: DrmDeviceKey) {
         if let Err(error) = self.lifecycle_register_owner_device(device) {
             log::error!("lifecycle completion loss registration for {device:?}: {error:?}");
             return;

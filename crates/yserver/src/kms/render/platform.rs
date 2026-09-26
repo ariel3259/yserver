@@ -2808,6 +2808,14 @@ pub struct PlatformBackend {
     #[cfg(test)]
     pub(crate) dpms_output_scopes_for_tests:
         Option<Vec<Option<std::collections::HashSet<crate::platform::drm::DrmDeviceKey>>>>,
+    /// Records the scoped old-event drain budget and can spend the full
+    /// allowance without polling a test DRM fd.
+    #[cfg(test)]
+    pub(crate) drm_event_drain_for_tests: Option<(Vec<std::time::Duration>, bool)>,
+    /// Supplies a device-qualified connector result to mixed VT-resume tests
+    /// without issuing GETCONNECTOR ioctls to synthetic device fds.
+    #[cfg(test)]
+    pub(crate) connector_snapshot_for_tests: Option<Vec<ConnectorSnapshot>>,
     /// Records synchronous connector modesets without issuing a DRM commit.
     /// Used by differential tests that exercise the production Legacy path.
     #[cfg(test)]
@@ -3640,6 +3648,10 @@ impl PlatformBackend {
             #[cfg(test)]
             dpms_output_scopes_for_tests: None,
             #[cfg(test)]
+            drm_event_drain_for_tests: None,
+            #[cfg(test)]
+            connector_snapshot_for_tests: None,
+            #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
@@ -3798,6 +3810,10 @@ impl PlatformBackend {
             dpms_output_calls_for_tests: None,
             #[cfg(test)]
             dpms_output_scopes_for_tests: None,
+            #[cfg(test)]
+            drm_event_drain_for_tests: None,
+            #[cfg(test)]
+            connector_snapshot_for_tests: None,
             #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
@@ -5035,6 +5051,10 @@ impl PlatformBackend {
     /// quiesce GPU/page-flip/direct work only after every device probe has
     /// succeeded, and before applying removals.
     pub(crate) fn probe_connector_snapshot(&self) -> io::Result<Vec<ConnectorSnapshot>> {
+        #[cfg(test)]
+        if let Some(snapshot) = self.connector_snapshot_for_tests.as_ref() {
+            return Ok(snapshot.clone());
+        }
         let mut snapshot = Vec::new();
         for device in &self.devices {
             let probes = crate::platform::drm::probe_connector_snapshots(&device.device).map_err(
@@ -5909,6 +5929,14 @@ impl PlatformBackend {
         timeout: std::time::Duration,
         devices: Option<&HashSet<crate::platform::drm::DrmDeviceKey>>,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some((calls, consume_budget)) = self.drm_event_drain_for_tests.as_mut() {
+            calls.push(timeout);
+            if *consume_budget {
+                std::thread::sleep(timeout);
+            }
+            return Ok(());
+        }
         #[cfg(test)]
         if self.dpms_output_scopes_for_tests.is_some() {
             // The paired all-off recorder issues no DRM commit, so this
@@ -8879,6 +8907,42 @@ impl PlatformBackend {
         }
     }
 
+    /// Give mixed-server Legacy quiescence only the time left in the Owner
+    /// VT-release budget. `vkDeviceWaitIdle` has no timeout argument, so run
+    /// the wait on a detached worker holding cloned Vulkan contexts and stop
+    /// waiting for it at the supplied cap. The contexts remain alive if a
+    /// driver wedges inside the host call.
+    pub(crate) fn wait_idle_bounded_for(&self, budget: std::time::Duration) {
+        if budget.is_zero() {
+            return;
+        }
+        let mut contexts = self.vk.iter().cloned().collect::<Vec<_>>();
+        contexts.extend(self.copy_vk_contexts.values().cloned());
+        if contexts.is_empty() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("yserver-vt-idle-wait".to_string())
+            .spawn(move || {
+                for context in contexts {
+                    // SAFETY: the Arc keeps each device alive for the wait.
+                    let result = unsafe { context.device.device_wait_idle() };
+                    if let Err(error) = result {
+                        log::warn!("kms: bounded VT GPU idle wait failed: {error:?}");
+                    }
+                }
+                let _ = sender.send(());
+            });
+        if let Err(error) = worker {
+            log::warn!("kms: could not start bounded VT GPU idle wait: {error}");
+            return;
+        }
+        if receiver.recv_timeout(budget).is_err() {
+            log::warn!("kms: mixed VT GPU idle wait reached its remaining time budget");
+        }
+    }
+
     /// Post-loop teardown — disable each output, leaving the
     /// scanout BOs in a state where their Drop can clean up
     /// (or, on atomic disable failure, disarm them so we leak
@@ -9226,6 +9290,15 @@ impl PlatformBackend {
         connected: Vec<ConnectorSnapshot>,
         known_connected: &HashSet<OutputKey>,
     ) -> RescanResult {
+        self.apply_connector_snapshot_for_devices(connected, known_connected, None)
+    }
+
+    pub(crate) fn apply_connector_snapshot_for_devices(
+        &mut self,
+        connected: Vec<ConnectorSnapshot>,
+        known_connected: &HashSet<OutputKey>,
+        devices: Option<&HashSet<crate::platform::drm::DrmDeviceKey>>,
+    ) -> RescanResult {
         let connected_order: Vec<OutputKey> = connected
             .iter()
             .map(|snapshot| snapshot.key.clone())
@@ -9238,9 +9311,10 @@ impl PlatformBackend {
             .outputs
             .iter()
             .filter(|output| {
-                connected
-                    .iter()
-                    .any(|snapshot| snapshot.preserves_active_output(output))
+                devices.is_some_and(|devices| !devices.contains(&output.key.device_key))
+                    || connected
+                        .iter()
+                        .any(|snapshot| snapshot.preserves_active_output(output))
             })
             .map(|output| output.key.clone())
             .collect();
@@ -9263,7 +9337,9 @@ impl PlatformBackend {
             ..RescanResult::default()
         };
         for (idx, layout) in self.outputs.iter().enumerate() {
-            if active_survivor_keys.contains(&layout.key) {
+            if devices.is_some_and(|devices| !devices.contains(&layout.key.device_key))
+                || active_survivor_keys.contains(&layout.key)
+            {
                 continue;
             }
             log::warn!(

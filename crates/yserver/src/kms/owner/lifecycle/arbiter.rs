@@ -1047,7 +1047,17 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         let active_kind = self
             .transition
             .map(|transition| transition.kind)
-            .unwrap_or(LifecycleKind::NormalRecovery);
+            .unwrap_or_else(|| {
+                // A client modeset can own the Owner slot when VTRelease is
+                // requested, so the arbiter has recorded the Released target
+                // but has not opened its transition yet. Its unknown result
+                // still belongs to C.0's VT-release row.
+                if self.desired.seat_target() == Some(super::SeatTarget::Released) {
+                    LifecycleKind::VTRelease
+                } else {
+                    LifecycleKind::NormalRecovery
+                }
+            });
         let row = match active_kind {
             LifecycleKind::Shutdown => CompletionUnknownRow::Shutdown,
             LifecycleKind::DeviceRemoved => CompletionUnknownRow::DeviceRemoved,
@@ -1082,8 +1092,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         if outcome.logical.release_seat {
             actions.push(LifecycleAction::ReleaseSeat(work_tag.clone()));
         }
-        if outcome.logical.withdraw_protocol_work {
+        if outcome.logical.withdraw_protocol_work || row == CompletionUnknownRow::VTRelease {
             actions.push(LifecycleAction::WithdrawOutputs(work_tag.clone()));
+        }
+        if outcome.logical.withdraw_protocol_work {
             actions.push(LifecycleAction::TerminalizeProtocolWork(work_tag));
         }
         if let Some((event, disposition)) = outcome.recovery.representative_disposition {
@@ -1127,6 +1139,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
             self.admission_open = false;
         } else if outcome.logical.release_seat {
             self.state = DeviceLifecycleState::Quiescing;
+            self.admission_open = false;
+        }
+        if row == CompletionUnknownRow::VTRelease {
+            self.state = DeviceLifecycleState::ExecutorStalled;
             self.admission_open = false;
         }
         actions.push(LifecycleAction::CompletionLossTableU { row, outcome });
@@ -1292,6 +1308,7 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
             || !self.admission_open && self.state == DeviceLifecycleState::Ready
             || self.state == DeviceLifecycleState::Poisoned
             || self.state == DeviceLifecycleState::Removed
+            || self.state == DeviceLifecycleState::ExecutorStalled
             || self.state == DeviceLifecycleState::ShutdownExecutorStalled
         {
             return Vec::new();

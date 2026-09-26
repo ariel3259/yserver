@@ -6059,6 +6059,122 @@ mod tests {
     }
 
     #[test]
+    fn c0_3ci_core_deadline_failure_replies_to_the_parked_request() {
+        use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
+
+        let mut state = make_c0_randr_state();
+        state.randr.timestamp = 777;
+        let mut requester = install_c0_client(&mut state, 1);
+        let mut listener = install_c0_client(&mut state, 2);
+        let mut next_requester = install_c0_client(&mut state, 3);
+        state.randr_select_masks.insert(
+            (2, crate::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_SCREEN_CHANGE
+                | yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE
+                | yserver_protocol::x11::randr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        let first = CrtcConfigToken(230);
+        let next = CrtcConfigToken(231);
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(first);
+        backend
+            .crtc_config_results
+            .insert(first, Err(std::io::ErrorKind::Other));
+        backend.crtc_config_results.insert(next, Ok(true));
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+        let mut trigger = ResetTrigger::new(ResetPolicy::NoReset);
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, 21, set_crtc_body_at(4, 333), 7),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(gate.is_busy(), "first mutation owns the gate");
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(3, 2, 21, set_crtc_body_at(3, 334), 7),
+        );
+        assert_eq!(queue.len, 1, "the second mutation waits behind the token");
+        backend.ready_crtc_configs.push(first);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut trigger,
+        );
+        let failed_reply = read_c0_available(&mut requester);
+        assert_eq!(
+            failed_reply.len(),
+            32,
+            "the parked request receives a reply"
+        );
+        assert_eq!(failed_reply[1], 3, "the deadline result is Failed");
+        assert!(read_c0_available(&mut listener).is_empty());
+        assert_eq!(state.randr.timestamp, 777, "failure publishes no state");
+        assert!(
+            !gate.is_busy(),
+            "failed ready-token completion releases the gate"
+        );
+        assert_eq!(backend.pending_crtc_config, None);
+        assert_eq!(backend.finished_crtc_configs, [first]);
+
+        backend.pending_crtc_config = Some(next);
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert!(
+            gate.is_busy(),
+            "the queued mutation takes the released gate: pending={:?}, queue_len={}, finished={:?}",
+            backend.pending_crtc_config,
+            queue.len,
+            backend.finished_crtc_configs
+        );
+        assert_eq!(
+            backend.pending_crtc_config, None,
+            "the queued token was taken"
+        );
+        assert_eq!(queue.len, 0, "the queued mutation is dispatched");
+        backend.ready_crtc_configs.push(next);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut trigger,
+        );
+        assert!(
+            !gate.is_busy(),
+            "the next mutation releases the gate normally"
+        );
+        assert_eq!(state.randr.timestamp, 334, "the queued mutation publishes");
+        let success_reply = read_c0_available(&mut next_requester);
+        assert_eq!(success_reply.len(), 32);
+        assert_eq!(success_reply[1], 0);
+        assert!(
+            !read_c0_available(&mut listener).is_empty(),
+            "only the succeeding queued mutation publishes notifications"
+        );
+    }
+
+    #[test]
     fn c0_3bii_last_set_time_can_go_backward() {
         use crate::backend::{CrtcConfigToken, recording::RecordingBackend};
 
