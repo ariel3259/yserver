@@ -362,16 +362,15 @@ removed device that reappears stays `Removed`. Hot-add is out of scope for C.0
 1. **VT switch latency:** on Owner the switch completes after the release
    commit (≤ 1 s bound), not immediately after the synchronous all-off.
    Invisible to clients.
-3. *(Rev 3.)* **Failure paths publish withdrawals where Legacy exits:** an
-   unknown release (§3.1) or a failed Owner acquire probe (§3.3) withdraws
-   that device's outputs with a requester-less publication, where Legacy ends
-   the server; the ordinary VT switch still emits nothing.
 2. **`GetScreenResources` under a forced reprobe** waits for the off-thread
    probe instead of blocking the whole loop; same reply contents — except
    *(rev 2, B-3)* when the probe misses its deadline: the reply carries the
    published state, and the change arrives by a later requester-less
    publication.
-
+3. *(Rev 3.)* **Failure paths publish withdrawals where Legacy exits:** an
+   unknown release (§3.1) or a failed Owner acquire probe (§3.3) withdraws
+   that device's outputs with a requester-less publication, where Legacy ends
+   the server; the ordinary VT switch still emits nothing.
 Any other difference found by the differential is a defect.
 
 ## 6. Evidence
