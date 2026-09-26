@@ -14,7 +14,7 @@ Spec: `docs/superpowers/specs/2026-09-24-phase-c0-stage-3b-modeset-and-randr-des
 | 3b-i-2 modeset routes (`...-3b-i-2-plan-modeset-routes.md`, rev 5) | done (F15 carried to activation) |
 | 3b-ii RANDR protocol (`...-3b-ii-plan-randr-protocol.md`, rev 9) | done; Task 5's gate scripts deferred to the real Owner server (`docs/phase-c0-deferred-real-server-tests.md`) |
 
-**Next:** the 3b acceptance finding, `docs/status.md`, then fold the WIP
+**3b accepted** (`docs/superpowers/findings/2026-09-26-stage-3b-accepted.md`). **Next:** fold the WIP
 commits into one commit per plan (user confirms history rewrites), then push
 (user confirms).
 
