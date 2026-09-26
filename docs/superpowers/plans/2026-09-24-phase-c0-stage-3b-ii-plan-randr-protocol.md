@@ -2,6 +2,17 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bii_`, `c0_3bi_`, `c0_3aii_`, `c0_adm` in `yserver`, and the whole `yserver-core` suite — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master; the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 9 (2026-09-26, coordinator) — Task 5 closed with what runs now
+(user decision).** Task 5 delivers the two named tests at the
+`process_request` level (G20, G21: an Owner mode change, the idempotent reply,
+event bytes, Legacy vs Owner) and the hardware protocol client. The case
+list's gate scripts need the real core loop with a KMS backend and real
+clients; they are **deferred to the real Owner server** and listed in
+`docs/phase-c0-deferred-real-server-tests.md`, closed by stage 5's layer-3
+rerun. The gate's own behaviour stays covered by the `yserver-core`
+`c0_3bii_` wire tests (transport-independent). No harness is built for them
+now.
+
 **Revision 8 (2026-09-24, coordinator)** — codex round 7 (0 blocking, 1 major,
 1 minor, `../findings/2026-09-24-stage-3b-ii-plan-review-round7.md`): the XDMCP
 termination branch waits for the terminal result too (M-1, Task 2); the goal's

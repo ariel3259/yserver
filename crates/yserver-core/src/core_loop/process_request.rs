@@ -5150,7 +5150,8 @@ fn handle_randr_request(
 /// synchronous apply or an asynchronous backend result. Keeping this as one
 /// continuation prevents the async path from redispatching validation or
 /// accidentally diverging in notification/timestamp behavior.
-pub(crate) fn complete_crtc_config(
+#[doc(hidden)]
+pub fn complete_crtc_config(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     client_id: ClientId,
