@@ -9,6 +9,11 @@ co-delivered, the mixed-server scoping moved into Task 1, the urgent
 withdrawal its own task before them, 8 tasks (B-2); the `AcquireEpisode`
 owner (M-1); core-level gate tests for the urgent withdrawal (M-2).
 
+**Review loop closed (user, 2026-09-26)** after round 4: findings were
+shrinking to edge cases of the gate and client interaction; further rounds
+would not converge. Remaining risk is carried by per-task verification and the
+hardware runs.
+
 **Revision 5 (2026-09-26, coordinator)** — codex round 4 (1 blocking, 2 major,
 confirmed, `../findings/2026-09-26-stage-3c-i-plan-review-round4.md`): a
 deadline resolves a client token `Failed` through the ordinary ready-token
