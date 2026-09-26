@@ -1,5 +1,15 @@
 # Phase C.0 stage 3c — VT switching, connector hotplug and device removal on the Owner
 
+**Revision 2 (2026-09-26)** — codex round 1 (3 blocking, 2 major, all
+confirmed, `../findings/2026-09-26-stage-3c-design-review-round1.md`): device
+removal is never deferred by a released seat (B-1); an unknown or timed-out
+release follows C.0 §10's VT-release row — helper termination, `ExecutorStalled`,
+no reinstall on the old incarnation, the fresh incarnation is 3d's (B-2); a
+forced reprobe that misses its deadline ends its gate turn, its result is
+discarded and a background rebuild follows (B-3); one probe episode covers
+every device with Legacy's combined failure boundary (M-1); the udev monitor
+yields typed events mapped to open devices (M-2).
+
 **Revision 1 (2026-09-26).** Umbrella:
 `docs/superpowers/specs/2026-09-22-phase-c0-stage-3-lifecycle-design.md` §3
 ("3c — VT, hotplug and devices"), §4 (client contract), §5 (evidence regime).
@@ -96,12 +106,22 @@ waiting on the executor. A client sees exactly what it sees on Legacy today.
    terminal result, or the 1 s bound expires, whichever is first: `drmDropMaster`
    on every device, then `VT_RELDISP(1)`. The bound is a `next_wakeup`
    deadline, so the loop wakes for it without polling.
-5. **A device whose release did not complete** (rejected, `CompletionUnknown`,
-   executor dead, or still in flight at the bound) is marked
-   **reinstall-required**. Its late results arrive in a dead epoch and change
-   no current state (3a/3b stale-result rule); resources whose release is
-   unproven stay quarantined for 3d; a dead executor makes the device
-   `Poisoned` (3a) and it stays closed until 3d's recovery.
+5. **Outcome per device** *(rev 2, B-2)*:
+   - **Completed**, or **rejected with known completion** (the kernel refused
+     the commit; nothing changed): the incarnation is healthy; acquire
+     reinstalls on it (§3.3).
+   - **Unknown**: `CompletionUnknown`, still in flight at the bound, or the
+     executor dead. C.0 §10's VT-release row applies: stop fd-alias creation,
+     request executor/helper termination, record the `REC-6` invalidation,
+     retain any unreaped executor and the complete old fd set in
+     `ExecutorStalled`, keep resources quarantined, and reap/close
+     asynchronously. Late results arrive in a dead epoch and change no current
+     state. The device is **closed**: no submission ever again on that
+     incarnation. Its reinstall needs `VTAcquire` **and** the old-lease
+     retirement barrier **and** a fresh KMS incarnation with qualified
+     installation — creating that incarnation is 3d's (the `REC-1` machinery);
+     in 3c the device stays closed after acquire, its outputs published but
+     dark, and a test proves no submission reaches the old incarnation.
 6. A poisoned or already-dark device contributes no commit; it does not
    delay the hand-off.
 
@@ -112,14 +132,22 @@ The VT state machine gains no new state: `Suspending` lasts until
 
 Parity with Legacy: `RRSetCrtcConfig` answers `Failed` (`SeatReleased`, 3b);
 `DPMSForceLevel` updates the protocol level and its hardware effect is
-`Deferred(SeatReleased)`; hotplug edges are recorded, not probed; any
-lifecycle event targeting an Owner device is `Deferred(SeatReleased)` and
-coalesces by `REC-5`.
+`Deferred(SeatReleased)`; connector hotplug edges are recorded, not probed;
+lifecycle events below `VTRelease` in precedence that target an Owner device
+are `Deferred(SeatReleased)` and coalesce by `REC-5`.
+
+*(Rev 2, B-1.)* **`Shutdown` and `DeviceRemoved` are never deferred by a
+released seat** — they outrank `VTRelease` (C.0 `REC-4`). The udev monitor
+keeps being drained while released; a removal is handled at once (§4.5):
+logical withdrawal and a requester-less publication while the VT is away; a
+removed renderer still ends the server.
 
 ### 3.3. Acquire
 
-`on_vt_acquire` keeps `VT_ACKACQ` and the bounded `drmSetMaster` (a failure
-keeps today's exit). Then, per Owner device, a `VTAcquire` transition:
+`on_vt_acquire` keeps `VT_ACKACQ` and the bounded `drmSetMaster` over the
+devices still present; a device removed while away (§3.2) is not asked for
+master and does not trigger the exit, which stays for a present device that
+fails. Then, per healthy Owner device (§3.1 step 5), a `VTAcquire` transition:
 
 1. A connector probe (3c-i uses the existing synchronous probe at this site;
    3c-ii moves every probe site, this one included, off the core thread).
@@ -166,18 +194,39 @@ connection, Legacy vs Owner).
 `probe_connector_snapshot` runs on a probe worker with its own DRM fd (no
 master needed for `GETRESOURCES`/`GETCONNECTOR`); its result returns to the
 core as a message tagged with the device, its incarnation and a probe epoch,
-and a stale result (older epoch, other incarnation) is discarded. Every probe
+and a stale result (older epoch, other incarnation) is discarded.
+
+*(Rev 2, M-1.)* **One probe episode covers every open device** — a hotplug
+edge, a forced reprobe or an acquire probes all of them. The episode applies
+nothing until every device has answered, and **if any device's probe fails the
+episode applies and publishes nothing** (Legacy's combined boundary,
+`run_display_rescan`/`run_resume`); the next edge starts a new episode. A probe
+answering `ENODEV` is not a failure: it is that device's `DeviceRemoved`
+(§4.5), and the episode continues without it. When every answer is in, the
+changes are applied as per-device commits (§4.3) and published once. Every probe
 site uses it: the debounced udev edge, RANDR's forced reprobe, and 3c-i's
 acquire. While a probe is outstanding the loop serves clients from the
 published state.
 
 RANDR's forced reprobe (`reprobe_connectors`, behind an install-capable
 mutation in the gate since 3b-ii) now parks `GetScreenResources` until the
-probe result arrives or its deadline expires; `L_reprobe` leaves the
+probe episode's result arrives or its deadline expires; `L_reprobe` leaves the
 synchronous term of 3b-ii's bound and becomes an `E`-like stage with its own
-deadline. On expiry the reply carries the published state, as Legacy does when
-its synchronous probe fails. The exact deadline is the plan's (measured on
-card1, bounded above by 2 s).
+deadline (the plan's, measured on card1, at most 2 s). *(Rev 2, B-3.)* The
+forced reprobe **owns its gate turn** until one of:
+
+- the result arrives: it is applied and published in the turn (as today), then
+  the reply is sent and the turn ends;
+- the deadline expires: the probe epoch is **invalidated** (its result, when it
+  comes, is discarded unapplied — it can never change topology after a later
+  mutation validated against the old state), the reply carries the published
+  state, the turn ends, and a **background `TopologyRebuild` probe** is armed
+  so a real change is still found and published requester-less (§4.4) in its
+  own turn.
+
+Named exception (§5): after a timeout the reply may omit a change a slower
+synchronous Legacy probe would have included; the change reaches the client
+by the later requester-less publication.
 
 ### 4.2. Classification
 
@@ -218,14 +267,29 @@ carried timestamp item as a verified equality, not a new rule. Events and
 
 ### 4.5. `DeviceRemoved`
 
-A udev `remove` for the device node of an open device, or a probe answering
-`ENODEV`, raises `DeviceRemoved` for that device:
+*(Rev 2, M-2.)* **The monitor yields typed events.** `DrmHotplugMonitor::drain`
+returns, per uevent, the action (`add`/`remove`/`change`), the device number
+(`dev_t`), the devnode and whether it is a card node, a connector sub-device or
+carries `HOTPLUG=1`; today's boolean is derived from them. A classifier maps
+each event to the open device by `dev_t` → `DrmDeviceKey` (and its current
+incarnation): `remove` of an open card node → `DeviceRemoved`; `add` of a card
+node that is not open → `DeviceAddedOrReplaced`; any `change` or connector
+sub-device event of an open card → a connector edge (§4.1). Tests drive the
+classifier with the typed records the monitor produces, and one test runs the
+real monitor end to end on a live udev socket; a stub cannot prove the
+kernel's actual delivery, which is a deferred hardware row.
 
-- **Owner device:** no KMS call is attempted (the device is gone); the
-  device's arbiter enters `Removed`; every in-flight commit terminates as
-  `CompletionUnknown` and its resources are quarantined for 3d; the executor
-  helper is reaped; its outputs are withdrawn logically and the change is
-  published requester-less; the server continues with the other devices.
+A classified `remove` of an open device node, or a probe answering `ENODEV`,
+raises `DeviceRemoved` for that device:
+
+- **Owner device** (C.0 §10 device-removal row): no KMS call is attempted;
+  stop fd-alias creation, request executor/helper termination, record
+  `Invalidated(DeviceRemoved)`, **withdraw the outputs logically at once** and
+  publish requester-less — never delayed by an unreaped helper, which stays
+  `ExecutorStalled` holding its handles and quarantine until reap; every
+  in-flight commit terminates as `CompletionUnknown` into quarantine for 3d;
+  the arbiter enters `Removed`; the server continues with the other devices.
+  This holds with the VT released (§3.2).
 - **The renderer device** (the Vulkan device): the server cannot continue and
   exits, as it does today on device loss.
 - **Legacy devices:** unchanged (the Legacy fork stays as it is until stage 5).
@@ -243,7 +307,10 @@ removed device that reappears stays `Removed`. Hot-add is out of scope for C.0
    commit (≤ 1 s bound), not immediately after the synchronous all-off.
    Invisible to clients.
 2. **`GetScreenResources` under a forced reprobe** waits for the off-thread
-   probe instead of blocking the whole loop; same reply contents.
+   probe instead of blocking the whole loop; same reply contents — except
+   *(rev 2, B-3)* when the probe misses its deadline: the reply carries the
+   published state, and the change arrives by a later requester-less
+   publication.
 
 Any other difference found by the differential is a defect.
 
@@ -270,13 +337,21 @@ executor reply); `c0_3ci_release_hands_off_after_commit`;
 `c0_3ci_acquire_reinstalls_from_scratch` (the reinstall's description does not
 depend on the pre-release installed state); `c0_3ci_acquire_honours_dpms_off`;
 `c0_3ci_requests_while_released_match_legacy`; `c0_3ci_release_supersedes_undispatched_acquire`;
-`c0_3ci_mixed_server_release_scopes_legacy`; `c0_3ci_vt_switch_emits_nothing`.
+`c0_3ci_mixed_server_release_scopes_legacy`; `c0_3ci_vt_switch_emits_nothing`;
+*(rev 2)* `c0_3ci_unknown_release_closes_the_incarnation` (a release commit
+still in flight at the bound: helper termination requested, `ExecutorStalled`,
+and after acquire no submission reaches the old incarnation) and
+`c0_3ci_acquire_skips_a_removed_device`.
 
 3c-ii: `c0_3cii_probe_runs_off_the_core_thread`; `c0_3cii_stale_probe_discarded`;
 `c0_3cii_classification`; `c0_3cii_unplug_retires_and_publishes`;
 `c0_3cii_replug_relights_remembered_route`; `c0_3cii_hotplug_timestamps_match_legacy`;
 `c0_3cii_forced_reprobe_parks_and_expires`; `c0_3cii_hotplug_while_released_waits_for_acquire`;
 `c0_3cii_device_removed_withdraws_and_continues`; `c0_3cii_device_added_is_ignored`;
+*(rev 2)* `c0_3cii_removal_while_released_is_not_deferred`,
+`c0_3cii_one_failed_probe_applies_nothing` (two devices, one probe fails or is
+late), `c0_3cii_forced_reprobe_timeout_discards_late_result`,
+`c0_3cii_udev_events_classified` and `c0_3cii_real_monitor_delivers_typed_events`;
 the Legacy/Owner differential of backend state and client bytes for unplug,
 replug and forced reprobe.
 
@@ -290,7 +365,11 @@ a VT switch emitting a RANDR event; a request while released dispatched to
 KMS; the probe run on the core thread; a stale probe result applied; a
 hotplug publication advancing `lastSetTime`; a kept output repainted by a
 lifecycle commit; a KMS call on a removed device; a removed device ending the
-server when it is not the renderer; a new card opened.
+server when it is not the renderer; a new card opened; *(rev 2)* a removal
+deferred while released; a reinstall submitted on an incarnation whose
+release was unknown; a partial episode applied after one device's probe
+failed; a timed-out forced reprobe's late result applied; a `DeviceRemoved`
+raised from anything but a classified event or `ENODEV`.
 
 ### 6.3. Hardware (card1, from a tty, with the user's approval)
 
@@ -327,8 +406,9 @@ Each at most ~14 tasks; a plan that grows is split without asking.
 ## 8. Carried and out of scope
 
 - **Stage 4:** the cursor plane detach in the release commit (with DPMS's).
-- **3d:** recovery of a `Poisoned` device after a failed release; transfer
-  of quarantined release resources; `Removed` teardown ordering.
+- **3d:** the fresh KMS incarnation for a device whose release was unknown
+  (and recovery of a `Poisoned` device); transfer of quarantined release
+  resources; `Removed` teardown ordering.
 - **Activation (4/5):** one resource service per Owner device (3b-i-2 F15).
 - **Out of scope for C.0:** opening a hot-added card.
 
@@ -340,3 +420,7 @@ Each at most ~14 tasks; a plan that grows is split without asking.
   site — 3c-i can land first without waiting for the probe worker.
 - The umbrella's pairing of entry points to kinds is read as the
   classification of §4.2 (by what changed), not a fixed entry-to-kind map.
+- *(Rev 2.)* A release whose commit is still unknown at the 1 s bound does
+  not come back lit after the switch: C.0 §10 forbids reusing that
+  incarnation, and creating a fresh one is 3d's recovery work. Between 3c and
+  3d this only happens in fixtures and in failure cases (production is Legacy).
