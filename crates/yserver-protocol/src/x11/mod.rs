@@ -3589,23 +3589,70 @@ pub fn write_xkb_new_keyboard_notify(
     writer.write_all(&buf)
 }
 
+/// Fields of an [`write_xkb_map_notify`] event: XKBproto.h `xkbMapNotify`
+/// (1050-1077) minus the header (`type`, `xkbType`, `sequenceNumber`) and
+/// `time` (0, like our other XKB events). `changed` is an `XkbMapPartsMask`
+/// set; each advertised part should have its first/count range filled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbMapNotify {
+    pub device_id: u8,
+    pub ptr_btn_actions: u8,
+    pub changed: u16,
+    pub min_keycode: u8,
+    pub max_keycode: u8,
+    pub first_type: u8,
+    pub n_types: u8,
+    pub first_key_sym: u8,
+    pub n_key_syms: u8,
+    pub first_key_act: u8,
+    pub n_key_acts: u8,
+    pub first_key_behavior: u8,
+    pub n_key_behaviors: u8,
+    pub first_key_explicit: u8,
+    pub n_key_explicit: u8,
+    pub first_mod_map_key: u8,
+    pub n_mod_map_keys: u8,
+    pub first_vmod_map_key: u8,
+    pub n_vmod_map_keys: u8,
+    pub virtual_mods: u16,
+}
+
+impl XkbMapNotify {
+    /// A whole-keymap replacement (a layout reload): `changed` =
+    /// KeyTypes|KeySyms|ModifierMap = 0x07, the keysym and modmap ranges
+    /// cover `min..=max`. VirtualMods is not claimed (vmod bindings are
+    /// layout-independent) and `virtualMods` stays zero, so every advertised
+    /// bit has populated fields. `n_types` MUST match GetMap's published
+    /// type count.
+    #[must_use]
+    pub fn whole_keymap(device_id: u8, min_keycode: u8, max_keycode: u8, n_types: u8) -> Self {
+        // CARD8 count: saturate so the full 0..=255 keycode range yields 255,
+        // not a wrap to 0 (255-0+1 == 256). The evdev range (8..=255 -> 248)
+        // never hits this, but the saturation is load-bearing for safety.
+        let count = max_keycode.saturating_sub(min_keycode).saturating_add(1);
+        Self {
+            device_id,
+            changed: 0x0007,
+            min_keycode,
+            max_keycode,
+            n_types,
+            first_key_sym: min_keycode,
+            n_key_syms: count,
+            first_mod_map_key: min_keycode,
+            n_mod_map_keys: count,
+            ..Self::default()
+        }
+    }
+}
+
 /// `XkbMapNotify` (xkbType=1). Layout per XKBproto.h `xkbMapNotify`
-/// (1050-1077). `changed` = KeyTypes|KeySyms|ModifierMap = 0x07; the
-/// per-component first/count ranges below cover the full keymap. We do
-/// not claim VirtualMods (layout-independent) and leave `virtualMods`
-/// zero, so every advertised bit has matching populated fields.
-/// `n_types` MUST match GetMap's published type count (4 in phase A;
-/// the derived count once real key types are published).
-#[allow(clippy::too_many_arguments)]
+/// (1050-1077); the fields come from [`XkbMapNotify`].
 pub fn write_xkb_map_notify(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     xkb_event_base: u8,
-    device_id: u8,
-    min_keycode: u8,
-    max_keycode: u8,
-    n_types: u8,
+    n: XkbMapNotify,
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base;
@@ -3614,23 +3661,145 @@ pub fn write_xkb_map_notify(
     write_u16(byte_order, &mut seq_buf, sequence.0);
     buf[2..4].copy_from_slice(&seq_buf);
     // buf[4..8] time = 0
-    buf[8] = device_id;
-    // buf[9] ptrBtnActions = 0
+    buf[8] = n.device_id;
+    buf[9] = n.ptr_btn_actions;
     let mut changed_buf = Vec::with_capacity(2);
-    write_u16(byte_order, &mut changed_buf, 0x0007); // KeyTypes|KeySyms|ModifierMap
+    write_u16(byte_order, &mut changed_buf, n.changed);
     buf[10..12].copy_from_slice(&changed_buf);
-    buf[12] = min_keycode;
-    buf[13] = max_keycode;
-    // firstType=0, nTypes — must match GetMap's published type count.
-    buf[14] = 0;
-    buf[15] = n_types;
-    // CARD8 count: saturate so the full 0..=255 keycode range yields 255,
-    // not a wrap to 0 (255-0+1 == 256). The evdev range (8..=255 -> 248)
-    // never hits this, but the saturation is load-bearing for safety.
-    buf[16] = min_keycode; // firstKeySym
-    buf[17] = max_keycode.saturating_sub(min_keycode).saturating_add(1); // nKeySyms
-    buf[24] = min_keycode; // firstModMapKey
-    buf[25] = max_keycode.saturating_sub(min_keycode).saturating_add(1); // nModMapKeys
+    buf[12] = n.min_keycode;
+    buf[13] = n.max_keycode;
+    buf[14] = n.first_type;
+    buf[15] = n.n_types;
+    buf[16] = n.first_key_sym;
+    buf[17] = n.n_key_syms;
+    buf[18] = n.first_key_act;
+    buf[19] = n.n_key_acts;
+    buf[20] = n.first_key_behavior;
+    buf[21] = n.n_key_behaviors;
+    buf[22] = n.first_key_explicit;
+    buf[23] = n.n_key_explicit;
+    buf[24] = n.first_mod_map_key;
+    buf[25] = n.n_mod_map_keys;
+    buf[26] = n.first_vmod_map_key;
+    buf[27] = n.n_vmod_map_keys;
+    let mut vmods_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut vmods_buf, n.virtual_mods);
+    buf[28..30].copy_from_slice(&vmods_buf);
+    // buf[30..32] pad1
+    writer.write_all(&buf)
+}
+
+/// Fields of an [`write_xkb_controls_notify`] event: XKBproto.h
+/// `xkbControlsNotify` minus the header and `time` (0, like our other XKB
+/// events).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbControlsNotify {
+    pub device_id: u8,
+    pub num_groups: u8,
+    /// `XkbControlsMask` bits that changed (e.g. PerKeyRepeat `1 << 30`).
+    pub changed_controls: u32,
+    pub enabled_controls: u32,
+    pub enabled_control_changes: u32,
+    pub keycode: u8,
+    pub event_type: u8,
+    pub request_major: u8,
+    pub request_minor: u8,
+}
+
+/// `XkbControlsNotify` (xkbType=3). Layout per XKBproto.h
+/// `xkbControlsNotify`: deviceID @8, numGroups @9, changedControls @12,
+/// enabledControls @16, enabledControlChanges @20, keycode @24,
+/// eventType @25, requestMajor @26, requestMinor @27.
+pub fn write_xkb_controls_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbControlsNotify,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = 3; // xkbType = XkbControlsNotify
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = n.device_id;
+    buf[9] = n.num_groups;
+    // buf[10..12] pad1
+    for (at, v) in [
+        (12, n.changed_controls),
+        (16, n.enabled_controls),
+        (20, n.enabled_control_changes),
+    ] {
+        let mut b = Vec::with_capacity(4);
+        write_u32(byte_order, &mut b, v);
+        buf[at..at + 4].copy_from_slice(&b);
+    }
+    buf[24] = n.keycode;
+    buf[25] = n.event_type;
+    buf[26] = n.request_major;
+    buf[27] = n.request_minor;
+    // buf[28..32] pad2
+    writer.write_all(&buf)
+}
+
+/// Which of the two `xkbIndicatorNotify` events an
+/// [`write_xkb_indicator_notify`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XkbIndicatorNotifyKind {
+    /// `XkbIndicatorStateNotify` (xkbType 4): indicators turned on/off.
+    State,
+    /// `XkbIndicatorMapNotify` (xkbType 5): indicator maps changed.
+    Map,
+}
+
+/// Fields of an [`write_xkb_indicator_notify`] event (XKBproto.h
+/// `xkbIndicatorNotify`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XkbIndicatorNotify {
+    pub kind: XkbIndicatorNotifyKind,
+    pub device_id: u8,
+    /// The indicators lit.
+    pub state: u32,
+    /// The indicators the event is about.
+    pub changed: u32,
+}
+
+/// `XkbIndicatorStateNotify` / `XkbIndicatorMapNotify`. Layout per
+/// XKBproto.h `xkbIndicatorNotify`: deviceID @8, state @12, changed @16.
+/// Time is 0, like our other XKB events.
+pub fn write_xkb_indicator_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbIndicatorNotify,
+) -> io::Result<()> {
+    let XkbIndicatorNotify {
+        kind,
+        device_id,
+        state,
+        changed,
+    } = n;
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = match kind {
+        XkbIndicatorNotifyKind::State => 4,
+        XkbIndicatorNotifyKind::Map => 5,
+    };
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = device_id;
+    // buf[9..12] pad1
+    for (at, v) in [(12, state), (16, changed)] {
+        let mut b = Vec::with_capacity(4);
+        write_u32(byte_order, &mut b, v);
+        buf[at..at + 4].copy_from_slice(&b);
+    }
+    // buf[20..32] pad2..pad5
     writer.write_all(&buf)
 }
 
@@ -4175,10 +4344,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             SequenceNumber(0x1234),
             85, // xkb_event_base
-            1,  // device_id
-            8,
-            255, // min/max keycode
-            4,   // n_types (phase A fixed table)
+            XkbMapNotify::whole_keymap(1, 8, 255, 4),
         )
         .unwrap();
         assert_eq!(buf.len(), 32);
@@ -4202,6 +4368,121 @@ mod tests {
             &0u16.to_le_bytes(),
             "virtualMods @28 = 0 (not claimed)"
         );
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkb-change-keyboard-mapping.txt`
+    /// protected-one-level): the ControlsNotify for a per-key repeat change,
+    /// byte for byte except seq/time.
+    #[test]
+    fn xkb_controls_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_controls_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            0x55,
+            XkbControlsNotify {
+                device_id: 3,
+                num_groups: 1,
+                changed_controls: 0x4000_0000,
+                enabled_controls: 0x0000_13a1,
+                enabled_control_changes: 0,
+                keycode: 0,
+                event_type: 0,
+                request_major: 100,
+                request_minor: 0,
+            },
+        )
+        .unwrap();
+        let xorg = "550309005b8574060301000000000040a1130000000000000000640000000000";
+        let xorg: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&xorg[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkb-set-modifier-mapping.txt`
+    /// vmod-remap-numlock): the IndicatorMapNotify of the Num Lock map, byte
+    /// for byte except seq/time.
+    #[test]
+    fn xkb_indicator_map_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_indicator_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            0x55,
+            XkbIndicatorNotify {
+                kind: XkbIndicatorNotifyKind::Map,
+                device_id: 3,
+                state: 0,
+                changed: 0x0000_0002,
+            },
+        )
+        .unwrap();
+        let xorg = "550509002397a006030000000000000002000000000000000000000000000000";
+        let xorg: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&xorg[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    /// Every `XkbMapNotify` field at its `xkbMapNotify` offset (XKBproto.h),
+    /// with distinct values so a swapped pair shows.
+    #[test]
+    fn xkb_map_notify_field_offsets() {
+        let n = XkbMapNotify {
+            device_id: 3,
+            ptr_btn_actions: 4,
+            changed: 0x0102,
+            min_keycode: 8,
+            max_keycode: 250,
+            first_type: 5,
+            n_types: 6,
+            first_key_sym: 20,
+            n_key_syms: 21,
+            first_key_act: 22,
+            n_key_acts: 23,
+            first_key_behavior: 24,
+            n_key_behaviors: 25,
+            first_key_explicit: 26,
+            n_key_explicit: 27,
+            first_mod_map_key: 28,
+            n_mod_map_keys: 29,
+            first_vmod_map_key: 30,
+            n_vmod_map_keys: 31,
+            virtual_mods: 0x0a0b,
+        };
+        let mut le = Vec::new();
+        write_xkb_map_notify(
+            &mut le,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            90,
+            n,
+        )
+        .unwrap();
+        assert_eq!(
+            le,
+            [
+                90, 1, 7, 0, 0, 0, 0, 0, 3, 4, 0x02, 0x01, 8, 250, 5, 6, 20, 21, 22, 23, 24, 25,
+                26, 27, 28, 29, 30, 31, 0x0b, 0x0a, 0, 0
+            ]
+        );
+        let mut be = Vec::new();
+        write_xkb_map_notify(
+            &mut be,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(7),
+            90,
+            n,
+        )
+        .unwrap();
+        assert_eq!(&be[2..4], &[0, 7], "sequenceNumber big-endian");
+        assert_eq!(&be[10..12], &[0x01, 0x02], "changed big-endian");
+        assert_eq!(&be[28..30], &[0x0a, 0x0b], "virtualMods big-endian");
     }
 
     #[test]
