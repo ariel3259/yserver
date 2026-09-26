@@ -9,6 +9,13 @@ co-delivered, the mixed-server scoping moved into Task 1, the urgent
 withdrawal its own task before them, 8 tasks (B-2); the `AcquireEpisode`
 owner (M-1); core-level gate tests for the urgent withdrawal (M-2).
 
+**Revision 4 (2026-09-26, coordinator)** — codex round 3 (2 blocking, 0 major,
+confirmed, `../findings/2026-09-26-stage-3c-i-plan-review-round3.md`): Task 2's
+interim acquire leaves Owner devices closed and resumes only the Legacy ones
+(B-1); the acquire episode begins at the start of `on_vt_acquire`, the core
+reserves its turn before draining pending requests, and the scoped Legacy
+resume stages its changes for `EpisodeEnd` (B-2).
+
 **Revision 3 (2026-09-26, coordinator)** — codex round 2 (2 blocking, 3 major,
 all confirmed, `../findings/2026-09-26-stage-3c-i-plan-review-round2.md`): the
 whole release is one task and the whole acquire another, so no tree exposes a
@@ -179,9 +186,13 @@ completion path or the wakeup, never by polling.
   outputs.
 - Late results of the dead epoch change nothing.
 
-**Interim acquire (until Task 4):** `on_vt_acquire` never submits to a closed
-incarnation (those devices stay withdrawn); every other device keeps today's
-resume path unchanged.
+**Interim acquire (until Task 4)** *(rev 4, B-1)*: on a server with an Owner
+device, `on_vt_acquire` takes master, runs today's resume **scoped to the
+Legacy devices** (`_for_devices` helpers), resumes input, and leaves **every
+Owner device closed** — admission stays closed, no Legacy write and no
+lifecycle commit reaches it (it stays dark) until Task 4 delivers the
+reinstall. A closed incarnation stays withdrawn. A Legacy-only server keeps
+today's acquire unchanged.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
@@ -195,6 +206,7 @@ resume path unchanged.
 | `c0_3ci_unknown_release_closes_the_incarnation_vulkan` | the release commit is in flight at the deadline: helper termination requested, `ExecutorStalled`, outputs withdrawn by one urgent withdrawal; a later acquire submits nothing to the old incarnation | **V8** submit to the old incarnation at acquire |
 | `c0_3ci_unanswered_client_modeset_at_the_deadline_vulkan` | through `on_vt_release`: a dispatched client modeset never answers; at the deadline its requester receives `Failed`, the queued release commit was never sent, the device is closed and withdrawn, and a late modeset completion publishes nothing | **V30** leave the client token pending past the hand-off |
 | `c0_3ci_late_release_result_changes_nothing_vulkan` | the release commit's completion arrives after the hand-off: installed state, pools and publication unchanged | **V9** apply the late completion |
+| `c0_3ci_interim_acquire_leaves_owner_closed_vulkan` | release then acquire before Task 4's route: the Owner device receives no ioctl and no commit, its admission stays closed; the Legacy device of a mixed server resumes | **V31** run today's unscoped resume on the Owner device |
 | `c0_3ci_mixed_server_release_scopes_legacy_vulkan` | Legacy + Owner: the Legacy all-off touches only the Legacy device; the Owner device receives only its release commit | **V24** run the unscoped Legacy suspend |
 | `c0_3ci_mixed_release_legacy_suspend_consumes_the_budget_vulkan` | the Legacy drain uses its whole allowance (a fixture seam on the drain's clock): the hand-off still happens at the absolute deadline | **V25** give the Legacy drain a fixed 1 s |
 
@@ -205,9 +217,10 @@ opens card1 as Owner, composes, then × 4 switches to another VT with
 `VT_ACTIVATE` and back, delivering SIGUSR1/SIGUSR2 to the production
 `on_vt_release`/`on_vt_acquire`. At this task it asserts the **release**: the
 hand-off happens inside the bound with the commit terminal and the device
-healthy; the return uses the interim acquire, and the test asserts only that
-the device is healthy and composes afterwards. The coordinator runs it × 3
-after this task.
+healthy; after each return (the interim acquire) it asserts only that **no
+write reached card1 outside the executor** and the device stays closed —
+it does not expect a frame until Task 4. The coordinator runs it × 3 after
+this task.
 
 ## Task 3 — while released (spec §3.2)
 
@@ -254,10 +267,17 @@ wait); the new epoch's clock probe starts after it. At `Applied`: full damage
 on every output, admission reopens. A direct frame current at release does
 not survive.
 
-**Deliver — the episode:** an `AcquireEpisode` record in the backend, created
-by `on_vt_acquire` when at least one Owner reinstall starts. It signals
-`EpisodeBegin(id)` (Task 1) before the first reinstall dispatch, so it holds
-the gate turn; each participant becomes terminal on its reinstall's terminal
+**Deliver — the episode:** *(rev 4, B-2)* an `AcquireEpisode` record in the
+backend, created at the **start** of `on_vt_acquire` whenever the server has an
+Owner device — **before** the probe and the scoped Legacy resume. It signals
+`EpisodeBegin(id)` (Task 1) first, and **the core consumes that signal right
+after the VT entry returns and before it drains any pending client request**
+(the core's `VtAcquire` handling in `core_loop/run.rs` reserves the turn, then
+drains), so no queued mutation is dispatched ahead of the episode. The scoped
+Legacy resume of a mixed server **stages** its RANDR difference into the
+episode instead of publishing it (today `run_resume` publishes through
+`fire_randr_changes` while applying the snapshot); the staged Legacy change
+and the Owner changes are published together at `EpisodeEnd`. each participant becomes terminal on its reinstall's terminal
 result (`Applied`, rejected, unknown — spec §4.1's outcome table; unknown also
 closes and urgently withdraws that device); Legacy participants are terminal
 when their scoped resume returns; urgently withdrawn devices leave it. When
@@ -277,6 +297,8 @@ first ends it with `EpisodeEnd(id, None)` (Task 5).
 | `c0_3ci_acquire_mixed_success_vulkan` | two Owner devices, B's probe fails: A reinstalls and composes; B is withdrawn urgently; the episode publication covers A only | **V19** skip A's reinstall because B failed |
 | `c0_3ci_acquire_episode_waits_for_every_participant_vulkan` | two healthy Owner devices, topology changed while away; A `Applied`, B held in flight: no publication and a client `SetCrtcConfig` stays queued; when B is terminal, exactly one publication, then the queued request proceeds | **V29** publish when the first participant applies |
 | `c0_3ci_direct_does_not_survive_the_switch_vulkan` | direct current at release: after acquire the primary is composed; a later Present re-enters direct through eligibility | **V20** reinstall the direct buffer |
+| `c0_3ci_acquire_reserves_the_turn_before_pending_requests` (yserver-core + backend) | a client `SetCrtcConfig` is pending when `VtAcquire` is handled: the core reserves the episode turn before draining it; the request is dispatched only after `EpisodeEnd` | **V32** drain pending requests before consuming `EpisodeBegin` |
+| `c0_3ci_mixed_acquire_stages_legacy_changes_vulkan` | mixed server, the Legacy device's topology changed while away and the Owner reinstall is held in flight: no RANDR bytes reach clients; at `EpisodeEnd` one publication carries both changes | **V33** let the scoped Legacy resume publish directly |
 | `c0_3ci_vt_switch_emits_nothing_vulkan` | release + acquire with no topology change: zero bytes to every connection, Legacy vs Owner | **V21** publish at acquire unconditionally |
 
 **Hardware:** `c0_hw_3c_vt_switch_on_card1_drm` now also asserts each
