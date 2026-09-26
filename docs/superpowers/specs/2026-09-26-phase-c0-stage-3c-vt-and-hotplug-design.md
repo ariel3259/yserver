@@ -1,5 +1,15 @@
 # Phase C.0 stage 3c — VT switching, connector hotplug and device removal on the Owner
 
+**Revision 5 (2026-09-26)** — codex round 4 (3 blocking, 1 major, all
+confirmed, `../findings/2026-09-26-stage-3c-design-review-round4.md`); the
+user chose to close these edges with simple rules and move to the plans (plan
+review is the safety net): an urgent withdrawal is its own publication and
+the episode publishes only the rest (B-1); an urgent withdrawal only
+subtracts outputs from the **published** projection (B-2); a mixed server's
+synchronous Legacy calls behave as today, a named limitation (B-3); a
+timed-out probe worker keeps its fd inside the incarnation's fd set and a
+device with a stuck worker fails its next probes at once (M-1).
+
 **Revision 4 (2026-09-26)** — codex round 3 (3 blocking, 1 major, all
 confirmed, `../findings/2026-09-26-stage-3c-design-review-round3.md`): the
 acquire episode is an explicit exception to the all-or-nothing rule, with a
@@ -129,7 +139,12 @@ waiting on the executor. A client sees exactly what it sees on Legacy today.
    returns, the core drains the Owner completions already delivered and hands
    off at the first of "every Owner device terminal" and the deadline. A
    Legacy step that runs out of budget is treated as Legacy treats a failed
-   suspend step today.
+   suspend step today. *(Rev 5, B-3.)* **Named limitation:** a synchronous
+   Legacy KMS call (its all-off ioctl) that blocks in the kernel blocks the
+   core exactly as it does on a Legacy-only server today, and the hand-off
+   waits for it; the absolute 1 s bound holds for the Owner part only. Mixed
+   servers exist in production only from stage 5; making Legacy's own calls
+   non-blocking is outside C.0 (the Legacy fork stays unchanged).
 4. **Hand-off.** When every Owner device's release commit has reached a
    terminal result, or the 1 s bound expires, whichever is first: `drmDropMaster`
    on every device, then `VT_RELDISP(1)`. The bound is a `next_wakeup`
@@ -207,9 +222,10 @@ deadline) passes:
 
 The Owner route does not end the server for one device, as 3a decided for
 completion loss. Healthy devices reinstall regardless of another device's
-failure; the episode publishes once when every participant is terminal
-(§4.1's episode table), so a withdrawn device and a reinstalled one appear in
-the same publication.
+failure. *(Rev 5, B-1.)* A failed Owner probe's withdrawal is an **urgent
+withdrawal** (§4.1): it is published at once, as its own publication, and the
+device leaves the episode; the episode publishes the remaining participants
+once, when they are terminal.
 
 Then, per healthy Owner device (§3.1 step 5), a `VTAcquire` transition:
 
@@ -272,7 +288,17 @@ changes are applied as per-device commits (§4.3) and published once.
 
 *(Rev 3, B-2.)* **Every episode has a deadline** (the probe deadline below).
 No answer by then counts as a failed probe; the episode's epoch is
-invalidated, so a late answer is discarded. A failed hotplug or forced-reprobe
+invalidated, so a late answer is discarded.
+
+*(Rev 5, M-1.)* **Probe workers and their fds.** Each probe runs on a fresh
+worker with its own DRM fd, registered in the device incarnation's fd set
+(C.0's tracked fd ownership). A worker that misses its deadline may still be
+inside `GETCONNECTOR`: it keeps its fd, which stays in the incarnation's fd set
+and is retired with it (device removal, 3d's teardown); the worker is joined
+when its call returns. While a device has a stuck worker, a new probe of that
+device **fails at once** (no second worker), and the episode applies the
+failure rule. The timeout test keeps a real worker blocked, not only a
+scripted late reply. A failed hotplug or forced-reprobe
 episode applies and publishes nothing (Legacy); the acquire episode's failure
 disposition is §3.3's.
 
@@ -291,25 +317,30 @@ terminal**, bounded by the lifecycle deadline of the transactions:
 
 No participant's change is published before the others are terminal.
 
-*(Rev 4, B-2.)* **Urgent withdrawals do not wait in the gate.** A
-`DeviceRemoved`, an unknown release (`ExecutorStalled`) and a failed Owner
-acquire probe withdraw at once (C.0 §10) — the publication of that withdrawal
-bypasses the gate's FIFO, even while an unrelated install-capable mutation
-holds it (today `drain_requesterless_publications` queues behind it). Two rules
-keep the rest consistent:
+*(Rev 4, B-2; rev 5, B-1/B-2.)* **Urgent withdrawals do not wait in the
+gate.** A `DeviceRemoved`, an unknown release (`ExecutorStalled`) and a failed
+Owner acquire probe withdraw at once (C.0 §10). Such a withdrawal is **its own
+publication**, bypassing the gate's FIFO even while an unrelated
+install-capable mutation holds it (today `drain_requesterless_publications`
+queues behind it). Its rules:
 
-- **Every publication is built from the backend's current model** at the
-  moment it publishes, not from a snapshot taken when its work started; a
-  withdrawn device's outputs are already absent from that model, so a later
-  publication (the unrelated modeset's, a queued episode's) cannot restore
-  them.
+- **It only subtracts.** The withdrawal publication removes that device's
+  outputs and CRTCs from the **published** RANDR projection and emits the
+  notifications for that removal; it never rebuilds the projection from the
+  backend model, so a mutation that is promoted in the backend but not yet
+  published (another device's modeset waiting for its gate publication) stays
+  invisible until its own publication.
+- **Later publications cannot restore it.** Every later publication — the
+  pending modeset's, an episode's — is built from the backend model, which
+  already excludes the withdrawn device.
 - **A mutation validates at its turn** against the post-withdrawal state: a
   queued request naming a withdrawn output is answered as it would be against
   the new topology; a dispatched commit on the removed device terminates
   `CompletionUnknown` and its requester gets `Failed` (3b).
+- An urgent withdrawal that interrupts an episode removes that device from the
+  episode; the episode publishes only its remaining participants.
 
-An urgent withdrawal that interrupts an episode removes that device from the
-episode as a participant with the "withdrawn" outcome. Every probe
+This is an exception to 3b's gate order (§5). Every probe
 site uses it: the debounced udev edge, RANDR's forced reprobe, and 3c-i's
 acquire. While a probe is outstanding the loop serves clients from the
 published state.
@@ -424,6 +455,11 @@ removed device that reappears stays `Removed`. Hot-add is out of scope for C.0
    unknown release (§3.1) or a failed Owner acquire probe (§3.3) withdraws
    that device's outputs with a requester-less publication, where Legacy ends
    the server; the ordinary VT switch still emits nothing.
+4. *(Rev 5.)* **Urgent withdrawal publications bypass the gate's order**
+   (§4.1): a withdrawal can reach clients while an unrelated mutation holds
+   the gate; it only subtracts from the published projection.
+5. *(Rev 5.)* **Mixed-server VT release:** a blocking synchronous Legacy call
+   delays the hand-off as it does today (§3.1 step 3).
 Any other difference found by the differential is a defect.
 
 ## 6. Evidence
@@ -471,7 +507,10 @@ and after acquire no submission reaches the old incarnation) and
 `c0_3cii_device_removed_withdraws_and_continues`; `c0_3cii_device_added_is_ignored`;
 *(rev 2)* `c0_3cii_removal_while_released_is_not_deferred`,
 `c0_3cii_one_failed_probe_applies_nothing` (two devices, one probe fails or is
-late), *(rev 4)* `c0_3cii_removal_during_unrelated_modeset_publishes_at_once`,
+late), *(rev 5)* `c0_3cii_urgent_withdrawal_hides_unpublished_modeset` (a client
+reading between the withdrawal and the pending modeset's publication sees the
+withdrawal but not the modeset), `c0_3cii_stuck_worker_fails_next_probe_fast`;
+*(rev 4)* `c0_3cii_removal_during_unrelated_modeset_publishes_at_once`,
 `c0_3cii_unknown_release_withdrawal_during_unrelated_modeset`,
 `c0_3cii_later_publication_does_not_restore_withdrawn_outputs`;
 *(rev 3)* `c0_3cii_episode_publishes_once_after_every_commit`,
