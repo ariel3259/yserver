@@ -76,6 +76,15 @@ re-run once; a repeat or any other failure is a finding.
   `--include-ignored --skip _drm`; `--lib`; `c0_2ci`; `yserver-core`; each
   integration file except `render_acceptance`.
 
+## Carried to the activation stage (4/5)
+
+- **One `ResourceService` + `DrmCleanupRegistry` per Owner device.** Today the
+  backend holds one, and `install_resource_service` has no production caller;
+  a client modeset on a second Owner device fails closed at preparation
+  (`Stage::Allocation`). The stage that installs services in production owns
+  it, together with 3b-i-2's carried test `c0_3bi_enable_on_b_unflips_a_vulkan`
+  (F15, plan rev 5).
+
 ## Carried to 3c
 
 - The arbiter defers prompt obligations during a dispatched modeset.
