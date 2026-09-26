@@ -67,6 +67,7 @@ Rules for keeping it current:
 | `ffc9fbdb`, `0ebcef48` | — | telemetry: list what holds every exported backing; root-readback warning paced | low — observability | none beyond the report existing on Owner |
 | `ad71461c` | #172 | XKB: ChangeKeyboardMapping as Xorg | low — XKB | its Xorg-golden tests |
 | `76d541d0`, `1e7680b6`, `3ccd665c`, `d9e11922` | — | `just rendercheck-yserver-hw` runs on this machine's KMS | none — tooling | — |
+| `d5db7ccb` | #171, #174 | XKB: ChangeKeyboardMapping and SetModifierMapping edit and reinstall the real keymap (xmodmap reaches XKB clients and key cooking), Xorg's event order and per-key repeat | low — XKB/input, no KMS route | its Xorg-golden tests; smoke: `xmodmap` caps-as-control on Owner |
 
 ## Reproduction tooling already in the tree
 
