@@ -970,6 +970,14 @@ pub trait Backend {
     /// `RecordingBackend`).
     fn dump_drawables(&mut self) {}
 
+    /// Diagnostic: log exported backings joined with `core()`'s holders if they changed; returns whether they did.
+    fn report_export_holders(
+        &mut self,
+        _core: &dyn Fn() -> crate::backend::export_holders::CoreHolders,
+    ) -> bool {
+        false
+    }
+
     /// Notify the backend that a window property changed or was
     /// deleted. KMS uses this to re-evaluate EWMH stack hints
     /// (`_NET_WM_WINDOW_TYPE`, `_NET_WM_STATE`, `WM_TRANSIENT_FOR`).
@@ -1218,6 +1226,26 @@ pub trait Backend {
 
     fn unmap_subwindow(&mut self, origin: Option<OriginContext>, host_xid: u32) -> io::Result<()>;
 
+    /// A window became viewable: allocate and paint its storage (parent first; never root/COW).
+    fn realize_window_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        let _ = (origin, host_xid);
+        Ok(())
+    }
+
+    /// A window became unviewable: drop its storage (core: child first, never root/COW).
+    fn release_window_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        let _ = (origin, host_xid);
+        Ok(())
+    }
+
     fn configure_subwindow(
         &mut self,
         origin: Option<OriginContext>,
@@ -1397,6 +1425,15 @@ pub trait Backend {
     ) -> io::Result<()> {
         let _ = (origin, backing);
         Ok(())
+    }
+
+    /// Drop exactly the one alias ref a freed name held; host-X11 names own a host pixmap each.
+    fn release_window_pixmap_name(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        self.free_pixmap(origin, backing.as_raw())
     }
 
     /// Returns whether the existing redirected backing storage already
@@ -2831,6 +2868,16 @@ pub trait Backend {
     ) -> io::Result<(u8, Vec<u32>)>;
 
     fn get_modifier_mapping(&mut self, origin: Option<OriginContext>) -> io::Result<(u8, Vec<u8>)>;
+
+    /// Apply `ChangeKeyboardMapping` as Xorg's `XkbApplyMappingChange`; `false` = core stores the rows.
+    fn change_keyboard_mapping(
+        &mut self,
+        _first_keycode: u8,
+        _keysyms_per_keycode: u8,
+        _keysyms: &[u32],
+    ) -> bool {
+        false
+    }
 
     /// RANDR per-output identity for the read-only output properties
     /// `EDID` / `EDID_DATA` / `ConnectorType`: returns `(raw EDID blob,

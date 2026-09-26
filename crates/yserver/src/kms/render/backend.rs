@@ -177,6 +177,8 @@ pub(crate) struct WindowGeometry {
     pub(crate) height: u16,
     pub(crate) depth: u8,
     pub(crate) mapped: bool,
+    /// Mirror of core viewability, kept by `realize_window_storage` / `release_window_storage`.
+    pub(crate) viewable: bool,
     pub(crate) parent: Option<u32>,
     pub(crate) stack_rank: u64,
     pub(crate) bg_pixel: Option<u32>,
@@ -1886,12 +1888,10 @@ pub struct KmsBackend {
     /// previous pair.
     pub(crate) recent_present_pixmaps: std::collections::VecDeque<(u32, u32)>,
 
-    /// Exact drawable instance retained by each Drawable-backed
-    /// Picture. `render_create_picture` may incref an old window
-    /// storage instance that later gets detached from `by_xid`
-    /// during an internal reconfigure/reallocate; `render_free_picture`
-    /// must drop that same `DrawableId` rather than whatever the
-    /// host xid resolves to at free time.
+    /// Exact drawable instance retained by each pixmap-backed Picture,
+    /// so `render_free_picture` drops that same `DrawableId` rather
+    /// than whatever the host xid resolves to at free time. Window
+    /// Pictures retain nothing: they resolve the window at each use.
     picture_drawable_ids: HashMap<u32, DrawableId>,
 
     /// Pictures whose backing drawable was not yet materialized in
@@ -1904,6 +1904,9 @@ pub struct KmsBackend {
     /// `render_free_picture` without a decref if the backing never
     /// materialized.
     pending_picture_drawable_refs: HashMap<u32, u32>,
+
+    /// Paces the root-readback warning, which a client reading the root while no output is lit repeats thousands of times a second.
+    root_readback_warn: WarnThrottle,
 
     /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
     /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
@@ -2188,6 +2191,9 @@ pub struct KmsBackend {
     /// ignored tests remain safe even if the harness runs them in parallel.
     #[cfg(test)]
     real_drm_test_guard: Option<RealDrmTestGuard>,
+
+    /// Last `export holders` report, for change detection.
+    export_holders: crate::kms::render::export_holders::ExportHoldersReporter,
 }
 
 #[cfg(test)]
@@ -5611,6 +5617,55 @@ impl KmsBackend {
         .collect()
     }
 
+    /// Test hook: MapWindow as core drives it — map, then realize every window it makes viewable.
+    pub fn map_window_for_tests(&mut self, host_xid: u32) -> io::Result<()> {
+        self.map_subwindow(None, host_xid)?;
+        let parent_viewable = self
+            .windows
+            .get(&host_xid)
+            .and_then(|g| g.parent)
+            .is_none_or(|p| self.windows.get(&p).is_none_or(|g| g.viewable));
+        if !parent_viewable {
+            return Ok(());
+        }
+        let mut stack = vec![host_xid];
+        while let Some(xid) = stack.pop() {
+            self.realize_window_storage(None, xid)?;
+            let mut children: Vec<(u64, u32)> = self
+                .windows
+                .iter()
+                .filter(|(_, g)| g.parent == Some(xid) && g.mapped)
+                .map(|(c, g)| (g.stack_rank, *c))
+                .collect();
+            children.sort_unstable();
+            stack.extend(children.into_iter().rev().map(|(_, c)| c));
+        }
+        Ok(())
+    }
+
+    /// Test hook: UnmapWindow as core drives it — unmap, then release the subtree, child first.
+    pub fn unmap_window_for_tests(&mut self, host_xid: u32) -> io::Result<()> {
+        self.unmap_subwindow(None, host_xid)?;
+        let mut pre = Vec::new();
+        let mut stack = vec![host_xid];
+        while let Some(xid) = stack.pop() {
+            if !self.windows.get(&xid).is_some_and(|g| g.viewable) {
+                continue;
+            }
+            pre.push(xid);
+            stack.extend(
+                self.windows
+                    .iter()
+                    .filter(|(_, g)| g.parent == Some(xid))
+                    .map(|(c, _)| *c),
+            );
+        }
+        for xid in pre.into_iter().rev() {
+            self.release_window_storage(None, xid)?;
+        }
+        Ok(())
+    }
+
     pub fn storage_extent_for_tests(&self, host_xid: u32) -> Option<(u32, u32)> {
         let id = self.store.lookup(host_xid)?;
         self.store.get(id).map(|d| {
@@ -6877,63 +6932,6 @@ impl KmsBackend {
         }
     }
 
-    /// True when every ancestor of `host_xid` up to the root is mapped
-    /// (the root itself is always viewable). `host_xid` must already
-    /// have its own `mapped` flag set by the caller.
-    fn window_viewable(&self, host_xid: u32) -> bool {
-        let mut cursor = self.windows.get(&host_xid).and_then(|g| g.parent);
-        while let Some(parent_xid) = cursor {
-            let Some(parent) = self.windows.get(&parent_xid) else {
-                // Parent not tracked (root container) — treat as mapped.
-                return true;
-            };
-            if !parent.mapped {
-                return false;
-            }
-            cursor = parent.parent;
-        }
-        true
-    }
-
-    /// Collect `host_xid` plus every descendant whose path down from it
-    /// is fully mapped — i.e. the subtree that becomes viewable when
-    /// `host_xid` maps — along with the background each window should be
-    /// tiled with. Windows with neither bg pixel nor bg pixmap are
-    /// skipped (X11 background None = contents stay undefined).
-    fn collect_viewable_bg_paint_targets(
-        &self,
-        host_xid: u32,
-    ) -> Vec<(u32, u32, Option<u32>, u16, u16)> {
-        let mut out = Vec::new();
-        let mut stack = vec![host_xid];
-        while let Some(xid) = stack.pop() {
-            let Some(geom) = self.windows.get(&xid) else {
-                continue;
-            };
-            if xid != host_xid && !geom.mapped {
-                // Unmapped child: neither it nor its inferiors become
-                // viewable through this map.
-                continue;
-            }
-            if geom.bg_pixel.is_some() || geom.bg_pixmap.is_some() {
-                out.push((
-                    xid,
-                    geom.bg_pixel.unwrap_or(0),
-                    geom.bg_pixmap,
-                    geom.width.max(1),
-                    geom.height.max(1),
-                ));
-            }
-            stack.extend(
-                self.windows
-                    .iter()
-                    .filter(|(_, g)| g.parent == Some(xid))
-                    .map(|(child, _)| *child),
-            );
-        }
-        out
-    }
-
     fn restack_subwindow(&mut self, host_xid: u32, stack_mode: u8, sibling: Option<u32>) {
         let Some(current) = self.windows.get(&host_xid).copied() else {
             return;
@@ -7094,6 +7092,7 @@ impl KmsBackend {
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             picture_drawable_ids: HashMap::new(),
             pending_picture_drawable_refs: HashMap::new(),
+            root_readback_warn: WarnThrottle::default(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -7171,6 +7170,7 @@ impl KmsBackend {
             legacy_dispositions_for_tests: Vec::new(),
             #[cfg(test)]
             real_drm_test_guard: None,
+            export_holders: Default::default(),
         };
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
@@ -8475,6 +8475,7 @@ impl KmsBackend {
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             picture_drawable_ids: HashMap::new(),
             pending_picture_drawable_refs: HashMap::new(),
+            root_readback_warn: WarnThrottle::default(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -8551,6 +8552,7 @@ impl KmsBackend {
             legacy_dispositions_for_tests: Vec::new(),
             #[cfg(test)]
             real_drm_test_guard: None,
+            export_holders: Default::default(),
         };
         let live: Vec<_> = backend
             .platform
@@ -8723,7 +8725,11 @@ impl KmsBackend {
             .get(&host_xid)
             .map(|w| w.depth)
             .or_else(|| leaf_id.and_then(|id| self.store.get(id).map(|d| d.depth)))?;
-        if self.windows.contains_key(&host_xid) {
+        if let Some(geom) = self.windows.get(&host_xid) {
+            // An unviewable window is clipped away, even under a viewable redirected ancestor.
+            if !geom.viewable && !self.storage_lifecycle_exempt(host_xid) {
+                return None;
+            }
             self.resolve_window_paint_target(host_xid, leaf_id, leaf_depth)
         } else {
             let leaf_id = leaf_id?;
@@ -9745,10 +9751,12 @@ impl KmsBackend {
             match read_scanout_region(self, rect, ScanoutReadSelection::OnScreenOnly) {
                 Ok(bytes) => Some(bytes),
                 Err(error) => {
-                    log::warn!(
-                        "render root scanout readback: {rect:?} unreadable, \
-                         zero-filling that piece: {error}"
-                    );
+                    if let Some(held) = self.root_readback_warn.check(std::time::Instant::now()) {
+                        log::warn!(
+                            "render root scanout readback: {rect:?} unreadable, \
+                             zero-filling that piece: {error} ({held} more since the last report)"
+                        );
+                    }
                     None
                 }
             }
@@ -11616,6 +11624,78 @@ impl KmsBackend {
         }
     }
 
+    /// `export holders` rows: drawables in exportable memory or with an export entry, plus orphaned entries.
+    pub(crate) fn export_holder_rows(&self) -> Vec<crate::kms::render::export_holders::HolderRow> {
+        use crate::kms::{
+            render::export_holders::{ExportRow, HolderRow, StoreRow},
+            vk::mem_accounting::{self, MemCategory},
+        };
+        let export_row = |e: &ExportedBacking| ExportRow {
+            glx_refs: e.glx_refs,
+            dri3_fd: e.fd.is_some(),
+            lifetime_held: e.lifetime_ref_held,
+            lifetime_via_alias: e.lifetime_via_alias,
+        };
+        let mut pictures: HashMap<crate::kms::render::store::DrawableId, u32> = HashMap::new();
+        for id in self.picture_drawable_ids.values() {
+            *pictures.entry(*id).or_default() += 1;
+        }
+        let redirect_of: HashMap<u32, u32> = self
+            .core
+            .host_window_to_backing
+            .iter()
+            .map(|(&w, b)| (b.as_raw(), w))
+            .collect();
+        let mut rows = Vec::new();
+        for d in self.store.drawables() {
+            let entry = mem_accounting::entry_of(d.storage.memory);
+            let export = self.exported_dmabufs.get(&d.id);
+            let export_mem = matches!(
+                entry,
+                Some((_, MemCategory::RedirectExport | MemCategory::TfpExport))
+            );
+            if !export_mem && export.is_none() {
+                continue;
+            }
+            let attached = self.store.lookup(d.xid) == Some(d.id);
+            let handle = PixmapHandle::from_raw(d.xid);
+            rows.push(HolderRow {
+                host_xid: d.xid,
+                store: Some(StoreRow {
+                    drawable_id: d.id.as_u64(),
+                    category: entry.map(|(_, c)| c),
+                    width: d.storage.extent.width,
+                    height: d.storage.extent.height,
+                    bytes: entry.map_or(0, |(b, _)| b),
+                    refcount: d.refcount,
+                    pending_retire: self.store.is_pending_retire(d.id),
+                    xid_attached: attached,
+                    pictures: pictures.get(&d.id).copied().unwrap_or(0),
+                }),
+                alias_refcount: handle
+                    .filter(|_| attached)
+                    .and_then(|h| self.core.alias_registry.get(h))
+                    .map(|a| a.refcount),
+                export: export.map(export_row),
+                sync_dup: self.store.is_exported(d.id),
+                redirect_of: redirect_of.get(&d.xid).copied().filter(|_| attached),
+            });
+        }
+        for (id, e) in &self.exported_dmabufs {
+            if self.store.get(*id).is_none() {
+                rows.push(HolderRow {
+                    host_xid: e.backing.as_raw(),
+                    store: None,
+                    alias_refcount: None,
+                    export: Some(export_row(e)),
+                    sync_dup: self.store.is_exported(*id),
+                    redirect_of: None,
+                });
+            }
+        }
+        rows
+    }
+
     /// GLX-TFP (Task 3.4 callers): record that a GLXPixmap now references
     /// the export of `host_xid`. Creates the entry (+ lifetime ref) if
     /// this is the first arrival. Public so the GLX protocol surface can
@@ -12416,6 +12496,17 @@ impl KmsBackend {
     /// panicking on lookup.
     pub fn store_drawable_exists_for_tests(&self, host_xid: u32) -> bool {
         self.store.get_by_xid(host_xid).is_some()
+    }
+
+    /// The `export holders` report for the current state, without change detection.
+    #[doc(hidden)]
+    pub fn export_holders_report_for_tests(
+        &self,
+        core: &yserver_core::backend::export_holders::CoreHolders,
+    ) -> Vec<String> {
+        let mut r = crate::kms::render::export_holders::ExportHoldersReporter::default();
+        r.observe(self.export_holder_rows());
+        crate::kms::render::export_holders::format_report(r.rows(), core)
     }
 
     /// Phase A T7: simulate the pageflip-retire frame-boundary flush
@@ -18147,14 +18238,9 @@ impl KmsBackend {
         }
     }
 
-    /// Allocate v2 storage + windows entry for a host xid.
-    /// Idempotent against duplicate xids (logs + skips). `parent`
-    /// is `Some(parent_xid)` for subwindows + `None` for top-levels
-    /// (parent = root, not tracked in `windows`). The
-    /// `bg_pixel` slot is what gets painted into fresh storage —
-    /// `None` leaves it Vk-undefined (depth-1 / depth-8 masks).
+    /// Record a window's geometry, parent and background, unviewable and without storage.
     #[allow(clippy::too_many_arguments)]
-    fn allocate_window_storage(
+    fn register_window_geometry(
         &mut self,
         host_xid: u32,
         x: i16,
@@ -18170,58 +18256,6 @@ impl KmsBackend {
             return;
         }
         let stack_rank = self.alloc_window_stack_rank();
-        let mut storage_allocated = false;
-        // #133 step 3 (3.3) — allocate the BORDERED extent, content at
-        // `(bw, bw)` inside it (Xorg `compAllocPixmap`,
-        // `composite/compalloc.c:610`). Identical to `width x height`
-        // at `bw == 0`.
-        let (storage_w, storage_h) =
-            bordered_storage_extent(width.max(1), height.max(1), border_width);
-        match self.platform.allocate_drawable_storage_as(
-            u16::try_from(storage_w).unwrap_or(u16::MAX),
-            u16::try_from(storage_h).unwrap_or(u16::MAX),
-            depth,
-            crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
-        ) {
-            Ok(storage) => {
-                if let Err(e) = self.store_alloc(
-                    host_xid,
-                    DrawableKind::Window,
-                    depth,
-                    false, // becomes true on map_subwindow
-                    storage,
-                ) {
-                    log::warn!(
-                        "render allocate_window_storage: store.allocate failed for xid {host_xid:#x}: {e:?}",
-                    );
-                    return;
-                }
-                // #133 step 3 — the layout this storage was allocated
-                // with, for `storage_content_offset`.
-                if let Some(id) = self.store.lookup(host_xid) {
-                    self.store.set_content_offset(id, i32::from(border_width));
-                }
-                self.telemetry.record_storage_allocation();
-                self.telemetry.record_image_view_create();
-                storage_allocated = true;
-            }
-            Err(e)
-                if self.platform.vk.is_none()
-                    && e == ash::vk::Result::ERROR_INITIALIZATION_FAILED =>
-            {
-                // No Vk fixture (`for_tests`) → storage allocation
-                // returns ERROR_INITIALIZATION_FAILED. Tracking
-                // the geometry without storage is fine; the scene
-                // tick filters out null image-views.
-                log::debug!("render allocate_window_storage: no Vk for xid {host_xid:#x}: {e:?}",);
-            }
-            Err(e) => {
-                log::warn!(
-                    "render allocate_window_storage: allocation failed for xid {host_xid:#x} \
-                     {width}x{height} d{depth}: {e:?}"
-                );
-            }
-        }
         self.windows.insert(
             host_xid,
             WindowGeometry {
@@ -18234,6 +18268,7 @@ impl KmsBackend {
                 height,
                 depth,
                 mapped: false,
+                viewable: false,
                 parent,
                 stack_rank,
                 bg_pixel,
@@ -18241,43 +18276,103 @@ impl KmsBackend {
                 cursor: None,
             },
         );
-        // Stage 3f.6 + 3f.14: clear newly-allocated storage to a
-        // defined colour so freshly-mapped windows don't surface
-        // the pool returner's pixels (3f.10 PixmapPool recycles
-        // image/view/memory triples — the bytes are whatever the
-        // previous owner left). When `bg_pixel` is set, use it
-        // (v1's create_subwindow behaviour); otherwise paint a
-        // depth-appropriate safe default (3f.14).
-        if storage_allocated && let Some(id) = self.store.lookup(host_xid) {
-            let format = PlatformBackend::format_for_depth(depth);
-            let color = bg_pixel.map_or_else(
-                || default_window_init_color(depth),
-                |pixel| decode_x11_pixel_for_storage(pixel, depth, format),
-            );
-            let rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D::default(),
-                extent: ash::vk::Extent2D {
-                    width: storage_w,
-                    height: storage_h,
-                },
-            };
-            // PRIVILEGED backing write: the initial clear covers the whole
-            // allocation, ring included (see
-            // `sync_window_leaf_storage_to_geometry`). Not the border
-            // paint — that is step 4.
-            if let Err(e) = self.engine.fill_rect(
-                &mut self.store,
-                &mut self.platform,
-                Dst::server_internal(id),
-                rect,
-                color,
-            ) {
-                log::debug!(
-                    "render allocate_window_storage: initial fill failed for xid {host_xid:#x}: {e:?}"
-                );
+        self.admission_note_layout_change_all_devices("window geometry registered");
+    }
+
+    /// Allocate and clear a window's leaf at its bordered extent; returns an existing leaf as is.
+    fn allocate_window_leaf(&mut self, host_xid: u32) -> Option<DrawableId> {
+        if let Some(id) = self.store.lookup(host_xid) {
+            return Some(id);
+        }
+        let geom = self.windows.get(&host_xid).copied()?;
+        // #133 step 3: the bordered extent, as Xorg `compAllocPixmap` (`compalloc.c:610`).
+        let (storage_w, storage_h) =
+            bordered_storage_extent(geom.width.max(1), geom.height.max(1), geom.border_width);
+        let storage = match self.platform.allocate_drawable_storage_as(
+            u16::try_from(storage_w).unwrap_or(u16::MAX),
+            u16::try_from(storage_h).unwrap_or(u16::MAX),
+            geom.depth,
+            crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+        ) {
+            Ok(storage) => storage,
+            Err(e)
+                if self.platform.vk.is_none()
+                    && e == ash::vk::Result::ERROR_INITIALIZATION_FAILED =>
+            {
+                // No Vk fixture (`for_tests`): track the geometry without storage.
+                log::debug!("render allocate_window_leaf: no Vk for xid {host_xid:#x}: {e:?}");
+                return None;
             }
+            Err(e) => {
+                log::warn!(
+                    "render allocate_window_leaf: allocation failed for xid {host_xid:#x} \
+                     {}x{} d{}: {e:?}",
+                    geom.width,
+                    geom.height,
+                    geom.depth,
+                );
+                return None;
+            }
+        };
+        if let Err(e) = self.store_alloc(
+            host_xid,
+            DrawableKind::Window,
+            geom.depth,
+            geom.mapped,
+            storage,
+        ) {
+            log::warn!(
+                "render allocate_window_leaf: store.allocate failed for xid {host_xid:#x}: {e:?}",
+            );
+            return None;
+        }
+        let id = self.store.lookup(host_xid)?;
+        // #133 step 3 — the layout this storage was allocated with, for `storage_content_offset`.
+        self.store
+            .set_content_offset(id, i32::from(geom.border_width));
+        self.telemetry.record_storage_allocation();
+        self.telemetry.record_image_view_create();
+        let format = PlatformBackend::format_for_depth(geom.depth);
+        let color = geom.bg_pixel.map_or_else(
+            || default_window_init_color(geom.depth),
+            |pixel| decode_x11_pixel_for_storage(pixel, geom.depth, format),
+        );
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent: ash::vk::Extent2D {
+                width: storage_w,
+                height: storage_h,
+            },
+        };
+        // PRIVILEGED backing write: the initial clear covers the whole allocation, ring included.
+        if let Err(e) = self.engine.fill_rect(
+            &mut self.store,
+            &mut self.platform,
+            Dst::server_internal(id),
+            rect,
+            color,
+        ) {
+            log::debug!(
+                "render allocate_window_leaf: initial fill failed for xid {host_xid:#x}: {e:?}"
+            );
         }
         self.admission_note_layout_change_all_devices("window storage allocation");
+        Some(id)
+    }
+
+    /// True for the two windows whose storage is outside the viewability lifecycle.
+    fn storage_lifecycle_exempt(&self, host_xid: u32) -> bool {
+        host_xid == self.core.window_id
+            || host_xid == yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0
+    }
+
+    /// A paint op found no target: a known window is hidden (clipped away), anything else a gap.
+    fn log_unresolved_target(&self, host_xid: u32, method: &'static str) {
+        if self.windows.contains_key(&host_xid) {
+            log::trace!("render {method}: window 0x{host_xid:x} is not viewable; clipped away");
+        } else {
+            self.log_render_gap(method);
+        }
     }
 
     // ── Stage 3a: Core-text helpers ─────────────────────────────
@@ -23513,6 +23608,26 @@ impl Backend for KmsBackend {
                 return;
             }
             HostInputEvent::Key(raw) => {
+                // Xorg `Xi/exevents.c` UpdateDeviceState: "don't allow
+                // ddx to generate multiple downs" and "guard against
+                // duplicates" — a press of a key already down, or a
+                // release of a key that is not, is DONT_PROCESS: it
+                // reaches neither XKB nor any client. XTEST clients do
+                // send these (`xdotool key super+5` presses Super_L
+                // three times and releases it twice), and xkbcommon
+                // counts every down, so without this guard the extra
+                // press leaves the modifier set forever (#168).
+                // Autorepeat is unaffected: `fire_pending_repeats`
+                // emits a release before each repeated press.
+                if raw.pressed == self.core.down_keys.contains(&raw.keycode) {
+                    log::debug!(
+                        "host key {} {}: key already {}, dropped (Xorg duplicate guard)",
+                        raw.keycode,
+                        if raw.pressed { "press" } else { "release" },
+                        if raw.pressed { "down" } else { "up" },
+                    );
+                    return;
+                }
                 let cooked = self.cook_host_key(raw);
                 // Maintain the held-keys set so suspend can synthesize
                 // releases (Task 10). Use the COOKED keycode so
@@ -24146,6 +24261,23 @@ impl Backend for KmsBackend {
         if let Err(e) = do_dump_scanout(self) {
             log::warn!("render dump_scanout: {e}");
         }
+    }
+
+    fn report_export_holders(
+        &mut self,
+        core: &dyn Fn() -> yserver_core::backend::export_holders::CoreHolders,
+    ) -> bool {
+        let rows = self.export_holder_rows();
+        if !self.export_holders.observe(rows) {
+            return false;
+        }
+        let core = core();
+        for line in
+            crate::kms::render::export_holders::format_report(self.export_holders.rows(), &core)
+        {
+            log::info!(target: crate::RESOURCE_TELEMETRY_TARGET, "{line}");
+        }
+        true
     }
 
     fn dump_drawables(&mut self) {
@@ -25971,19 +26103,8 @@ impl Backend for KmsBackend {
             self.windows.get(&parent_xid).map(|g| g.depth)
         };
         let depth = depth_for_visual(visual, parent_depth);
-        // Stage 3f.6: record the parent xid so `build_scene` can
-        // recurse the tree. `bg_pixel` is passed into
-        // `allocate_window_storage`, which paints it into the fresh
-        // storage; bg_pixmap is stored as metadata for now (proper
-        // pixmap-bg support is a Stage 4-ish item).
-        // #133 step 3 (3.3): the border width goes IN to the allocation
-        // — storage is `(w + 2bw) x (h + 2bw)` from the start, so the
-        // content offset is right on the window's first paint. Nothing
-        // paints the ring until step 4; the border SOURCE arrives
-        // separately, via a `change_subwindow_attributes` carrying
-        // CWBorderPixmap / CWBorderPixel that core sends right after
-        // this create.
-        self.allocate_window_storage(
+        // Created unmapped, so no storage: `realize_window_storage` allocates it on viewability.
+        self.register_window_geometry(
             xid,
             x,
             y,
@@ -26053,36 +26174,85 @@ impl Backend for KmsBackend {
         if let Some(id) = self.store.lookup(host_xid) {
             self.store.set_scene_participating(id, true);
         }
-        // X11 map semantics (Xorg dix/window.c MapWindow → RealizeTree →
-        // HandleExposures → miPaintWindow): when a window becomes
-        // viewable and no earlier contents are remembered, the server
-        // tiles it with its background — bg pixmap or bg pixel — and the
-        // same applies to every inferior that becomes viewable with it.
-        // v2 keeps storage across unmap/remap, but X11 says unmapped
-        // contents are NOT remembered, so remap must repaint bg too.
-        // Without this, XTS Xlib4 XMapWindow-9 et al. read fresh/stale
-        // storage where the bg tile belongs ("Bad pixel in tiled area
-        // at (2, 0)"). Windows with bg None keep undefined contents —
-        // no paint, matching miPaintWindow's None early-out.
-        if self.window_viewable(host_xid) {
-            let targets = self.collect_viewable_bg_paint_targets(host_xid);
-            for (xid, bg_pixel, bg_pixmap, w, h) in targets {
-                if let Err(e) = self.clear_window_area_with_background(
-                    xid,
-                    bg_pixel,
-                    bg_pixmap,
-                    0,
-                    0,
-                    w,
-                    h,
-                    (0, 0),
-                ) {
-                    log::debug!("render map_subwindow: bg paint failed for 0x{xid:x}: {e:?}");
-                }
-            }
-        }
         if geometry_changed || storage_changed {
             self.admission_note_layout_change_all_devices("window mapped");
+        }
+        // The map-time background paint lives in `realize_window_storage`, driven by the delta.
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    fn realize_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        if self.storage_lifecycle_exempt(host_xid) {
+            return Ok(());
+        }
+        let Some(geom) = self.windows.get_mut(&host_xid) else {
+            return Ok(());
+        };
+        geom.viewable = true;
+        let geom = *geom;
+        let leaf = self.allocate_window_leaf(host_xid);
+        if let Some(id) = leaf {
+            self.store.set_scene_participating(id, geom.mapped);
+        }
+        // Xorg miPaintWindow on RealizeTree: tile the background wherever the window paints.
+        if geom.bg_pixel.is_some() || geom.bg_pixmap.is_some() {
+            if let Err(e) = self.clear_window_area_with_background(
+                host_xid,
+                geom.bg_pixel.unwrap_or(0),
+                geom.bg_pixmap,
+                0,
+                0,
+                geom.width.max(1),
+                geom.height.max(1),
+                (0, 0),
+            ) {
+                log::debug!(
+                    "render realize_window_storage: bg paint failed for 0x{host_xid:x}: {e:?}"
+                );
+            }
+        } else if let Some(id) = leaf
+            && self
+                .resolve_paint_target(host_xid)
+                .is_some_and(|t| t.backing_id() == id)
+        {
+            // Background None shows what is underneath: seed from the parent (no lower siblings).
+            self.seed_backing_from_parent(host_xid, id);
+        }
+        // The ring, once core has sent the border source (it does right after CreateWindow).
+        if geom.border_pixel.is_some() || geom.border_pixmap.is_some() {
+            let tile_origin = self.border_tile_origin(host_xid);
+            let _ = self.paint_window_border(host_xid, tile_origin);
+        }
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    fn release_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        if self.storage_lifecycle_exempt(host_xid) {
+            return Ok(());
+        }
+        let Some(geom) = self.windows.get_mut(&host_xid) else {
+            return Ok(());
+        };
+        geom.viewable = false;
+        // A direct frame may still scan this leaf; its pins keep the image alive past the decref.
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("release_direct_frame_drawable");
+        }
+        if let Some(id) = self.store.lookup(host_xid) {
+            // Detach first: a pinned leaf survives the decref but must not stay the window's.
+            self.store.detach_xid(host_xid);
+            self.store_decref_with_invalidate(id);
+            self.admission_note_layout_change_all_devices("window storage released");
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -26446,7 +26616,7 @@ impl Backend for KmsBackend {
         if !self.windows.contains_key(&host_xid) {
             // Top-level: parent = None (root), no bg_pixel known yet
             // (set later via change_subwindow_attributes).
-            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 0, 24, None, None);
+            self.register_window_geometry(host_xid, 0, 0, 1, 1, 0, 24, None, None);
         }
         // Step 2 (DRIFT 2): top_level_order membership is no longer set
         // here — the create / reparent-to-root core handlers reproject it
@@ -26473,7 +26643,7 @@ impl Backend for KmsBackend {
             // window as a top-level until a `create_subwindow`
             // catches up. Matches v1's "no parent tracking" status
             // — v1 simply doesn't compose children either.
-            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 0, 32, None, None);
+            self.register_window_geometry(host_xid, 0, 0, 1, 1, 0, 32, None, None);
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -26748,9 +26918,10 @@ impl Backend for KmsBackend {
                 let tile_origin = self.border_tile_origin(w_xid);
                 let _ = self.paint_window_border(w_xid, tile_origin);
             } else {
-                log::warn!(
-                    "render allocate_redirected_backing(0x{w_xid:x}): window not in store \
-                     (seed succeeded, route flip skipped)",
+                // No leaf means not viewable; core realizes the backing after the leaf.
+                log::debug!(
+                    "render allocate_redirected_backing(0x{w_xid:x}): window has no leaf \
+                     (route flip skipped)",
                 );
             }
         } else {
@@ -26877,10 +27048,30 @@ impl Backend for KmsBackend {
         // alias_registry; if this was the final ref, free the
         // underlying pixmap. Mirrors the alias-aware branch of
         // `free_pixmap` for consistency.
+        let export_id = self.store.lookup(backing.as_raw());
         if self.core.alias_registry.decref(backing) {
             self.free_pixmap(origin, backing.as_raw())?;
+        } else if let Some(id) = export_id {
+            // An alias left this backing: an export-only entry (glx_refs == 0) goes, as at FreePixmap.
+            self.maybe_teardown_export(id);
         }
         Ok(())
+    }
+
+    fn release_window_pixmap_name(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        // A name owns exactly one alias ref; an untracked backing has none left to drop.
+        if self.core.alias_registry.get(backing).is_none() {
+            log::warn!(
+                "render release_window_pixmap_name: 0x{:x} not in alias_registry — no-op",
+                backing.as_raw(),
+            );
+            return Ok(());
+        }
+        self.drop_backing_storage(origin, backing)
     }
 
     fn release_redirected_backing(
@@ -27069,6 +27260,7 @@ impl Backend for KmsBackend {
             height: fb_h,
             depth: 24,
             mapped: true,
+            viewable: true,
             // `parent: None` matches windows's convention for a
             // direct child of the root (root is not itself tracked
             // in windows — see register_top_level).
@@ -28043,11 +28235,13 @@ impl Backend for KmsBackend {
         // it converts the wire window-local src coords into backing
         // coords.
         let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
-            log::warn!(
-                "render copy_area dropped — src unresolvable: src=0x{src_host_xid:x} \
+            if !self.windows.contains_key(&src_host_xid) {
+                log::warn!(
+                    "render copy_area dropped — src unresolvable: src=0x{src_host_xid:x} \
                      dst=0x{dst_host_xid:x} src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
-            );
-            self.log_render_gap("copy_area_unknown_xid");
+                );
+            }
+            self.log_unresolved_target(src_host_xid, "copy_area_unknown_xid");
             return Ok(());
         };
         let (src, src_off): (super::store::DrawableId, (i32, i32)) =
@@ -28060,11 +28254,13 @@ impl Backend for KmsBackend {
         // copy_area into a redirected window lands in the backing
         // with the descendant offset applied.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::warn!(
-                "render copy_area dropped — dst unresolvable: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
-                 src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
-            );
-            self.log_render_gap("copy_area_unknown_xid");
+            if !self.windows.contains_key(&dst_host_xid) {
+                log::warn!(
+                    "render copy_area dropped — dst unresolvable: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
+                     src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+                );
+            }
+            self.log_unresolved_target(dst_host_xid, "copy_area_unknown_xid");
             return Ok(());
         };
         // Screenshot fast-path: `CopyArea(src=root, …, IncludeInferiors)` must
@@ -28699,7 +28895,7 @@ impl Backend for KmsBackend {
         data: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("put_image_unknown_xid");
+            self.log_unresolved_target(host_xid, "put_image_unknown_xid");
             return Ok(());
         };
         // GC function + plane-mask (X11 §PutImage combines the wire
@@ -28916,7 +29112,7 @@ impl Backend for KmsBackend {
             return result;
         }
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("get_image_unknown_xid");
+            self.log_unresolved_target(host_xid, "get_image_unknown_xid");
             return Ok(None);
         };
         // `x11_depth()` is the depth of the drawable the CLIENT named;
@@ -29064,7 +29260,7 @@ impl Backend for KmsBackend {
         // the scene clips window draws to the bounding shape,
         // shaped popups render wrong (e16 hover clouds).
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("read_depth1_pixmap_unknown_xid");
+            self.log_unresolved_target(host_xid, "read_depth1_pixmap_unknown_xid");
             return Ok(None);
         };
         let (depth, extent, content_version) = match self.store.get(target.backing_id()) {
@@ -29193,7 +29389,7 @@ impl Backend for KmsBackend {
         points: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("poly_line_unknown_xid");
+            self.log_unresolved_target(host_xid, "poly_line_unknown_xid");
             return Ok(());
         };
         // Cook the polyline vertices (coordinate_mode 0 = Origin
@@ -29233,7 +29429,7 @@ impl Backend for KmsBackend {
         segments: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("poly_segment_unknown_xid");
+            self.log_unresolved_target(host_xid, "poly_segment_unknown_xid");
             return Ok(());
         };
         // Each segment is (x1:i16, y1:i16, x2:i16, y2:i16). Cook into
@@ -29270,7 +29466,7 @@ impl Backend for KmsBackend {
         rectangles: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("poly_rectangle_unknown_xid");
+            self.log_unresolved_target(host_xid, "poly_rectangle_unknown_xid");
             return Ok(());
         };
         let stroke = self.current_stroke_state(foreground);
@@ -29320,7 +29516,7 @@ impl Backend for KmsBackend {
         arcs: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("poly_arc_unknown_xid");
+            self.log_unresolved_target(host_xid, "poly_arc_unknown_xid");
             return Ok(());
         };
         // Each arc: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
@@ -29375,7 +29571,7 @@ impl Backend for KmsBackend {
         points: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("poly_point_unknown_xid");
+            self.log_unresolved_target(host_xid, "poly_point_unknown_xid");
             return Ok(());
         };
         let mut rects = Vec::new();
@@ -29412,7 +29608,7 @@ impl Backend for KmsBackend {
     ) -> io::Result<()> {
         // Each X11 Rectangle is 8 bytes: { i16 x, i16 y, u16 w, u16 h }.
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("poly_fill_rectangle_unknown_xid");
+            self.log_unresolved_target(host_xid, "poly_fill_rectangle_unknown_xid");
             return Ok(());
         };
         let mut rects = Vec::new();
@@ -29437,7 +29633,7 @@ impl Backend for KmsBackend {
         arcs: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("poly_fill_arc_unknown_xid");
+            self.log_unresolved_target(host_xid, "poly_fill_arc_unknown_xid");
             return Ok(());
         };
         // Each arc is 12 bytes: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
@@ -29486,7 +29682,7 @@ impl Backend for KmsBackend {
         points: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("fill_poly_unknown_xid");
+            self.log_unresolved_target(host_xid, "fill_poly_unknown_xid");
             return Ok(());
         };
         // i16 vertex pairs. coord_mode 0 = Origin (absolute), 1 = Previous.
@@ -29526,7 +29722,7 @@ impl Backend for KmsBackend {
         height: u16,
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_render_gap("fill_rectangle_unknown_xid");
+            self.log_unresolved_target(host_xid, "fill_rectangle_unknown_xid");
             return Ok(());
         };
         let rects = self.intersect_with_current_clip_live(&[Rectangle16 {
@@ -29701,29 +29897,32 @@ impl Backend for KmsBackend {
         values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
         // Stage 3b: real picture record. Insert default
-        // `PictureRecord::Drawable`, incref the backing drawable in
-        // the store (so a `free_pixmap` on the backing survives
-        // while this picture wraps it — picture_record_drawable_
-        // refcount test), then delegate to render_change_picture for
-        // the value-mask body.
+        // `PictureRecord::Drawable`, incref a PIXMAP backing in the
+        // store (so a `free_pixmap` on the backing survives while this
+        // picture wraps it — picture_record_drawable_refcount test),
+        // then delegate to render_change_picture for the value-mask
+        // body.
         let drawable_xid = host_drawable.as_raw();
         let picture_xid = self.core.next_host_xid();
         self.core.pictures.insert(
             picture_xid,
             PictureRecord::drawable_default(drawable_xid, ynest_format),
         );
-        if let Some(id) = self.store.lookup(drawable_xid) {
-            self.store.incref(id);
-            self.picture_drawable_ids.insert(picture_xid, id);
-        } else {
-            // Backing not materialized yet (window map + redirect
-            // before backing alloc, GLX-TFP / Present / DRI3 import).
-            // Defer the incref: `apply_pending_picture_refs` pins the
-            // backing the moment it materializes, so a later
-            // `free_pixmap` can't reach refcount 0 and destroy the
-            // drawable out from under this live Picture.
-            self.pending_picture_drawable_refs
-                .insert(picture_xid, drawable_xid);
+        // A window Picture holds no store ref: every use resolves the window's current storage.
+        if matches!(host_drawable, AnyHandle::Pixmap(_)) {
+            if let Some(id) = self.store.lookup(drawable_xid) {
+                self.store.incref(id);
+                self.picture_drawable_ids.insert(picture_xid, id);
+            } else {
+                // Backing not materialized yet (GLX-TFP / Present /
+                // DRI3 import). Defer the incref:
+                // `apply_pending_picture_refs` pins the backing the
+                // moment it materializes, so a later `free_pixmap`
+                // can't reach refcount 0 and destroy the drawable out
+                // from under this live Picture.
+                self.pending_picture_drawable_refs
+                    .insert(picture_xid, drawable_xid);
+            }
         }
         if value_mask != 0 {
             // Recompose the body shape that render_change_picture
@@ -29823,8 +30022,9 @@ impl Backend for KmsBackend {
             if let Some(id) = retained_drawable_id {
                 self.store_decref_with_invalidate(id);
             } else {
-                // Backing never materialized — no store ref was ever
-                // taken; just drop the deferred ref request.
+                // A window Picture, or a backing that never
+                // materialized — no store ref was ever taken; just drop
+                // any deferred ref request.
                 self.pending_picture_drawable_refs.remove(&host_pic);
             }
         }
@@ -32497,42 +32697,35 @@ impl Backend for KmsBackend {
         first_keycode: u8,
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
-        // Stage 3f.7 follow-up: port v1's body verbatim. KmsCore
-        // carries `xkb_keymap` so the lookup works on both backends.
-        // The pre-fix stub returned 0 keysyms per code, which made
-        // xterm think every key was dead — typing into xterm worked
-        // for cursor movement but Enter/letters were swallowed.
-        //
-        // X11 GetKeyboardMapping: per keycode, return a flat row of
-        // keysyms across shift levels (unshifted / shifted /
-        // mode-switch-unshifted / mode-switch-shifted). Apps combine
-        // the keycode with the modifier bits in the event's `state`
-        // field to pick the right slot.
-        const LEVELS: usize = 4;
-        let max_kc = u16::from(first_keycode) + u16::from(count);
-        let mut flat = Vec::with_capacity(usize::from(count) * LEVELS);
-        for kc in u16::from(first_keycode)..max_kc {
-            let xkb_kc = xkbcommon::xkb::Keycode::new(u32::from(kc));
-            for level in 0..LEVELS as u32 {
-                let syms = self
-                    .core
-                    .xkb_keymap
-                    .0
-                    .key_get_syms_by_level(xkb_kc, 0, level);
-                flat.push(syms.first().map_or(0, |s| s.raw()));
-            }
-        }
-        Ok((LEVELS as u8, flat))
+        // Xorg's XkbGetCoreMap layout (one width for the whole map, §12.4 group order).
+        let map = crate::kms::xkb::core_keyboard_map(
+            &self.core.xkb_keymap.0,
+            &self.core.core_map_overrides,
+        );
+        Ok((map.width, map.rows(first_keycode, count)))
+    }
+
+    fn change_keyboard_mapping(
+        &mut self,
+        first_keycode: u8,
+        keysyms_per_keycode: u8,
+        keysyms: &[u32],
+    ) -> bool {
+        crate::kms::xkb::apply_core_mapping_change(
+            &self.core.xkb_keymap.0,
+            &mut self.core.core_map_overrides,
+            first_keycode,
+            keysyms_per_keycode,
+            keysyms,
+        );
+        true
     }
 
     fn get_modifier_mapping(
         &mut self,
         _origin: Option<OriginContext>,
     ) -> io::Result<(u8, Vec<u8>)> {
-        // Derive the modifier→keycode table from the live keymap so
-        // it always agrees with the XKB GetMap modifier map (same
-        // `real_mod_mask_for_keycode` keymap-probe source of truth).
-        // Avoids a hand-written table drifting from the actual keymap.
+        // Xorg's generate_modkeymap over the keymap's modifier_map, the same data XKB GetMap sends.
         Ok(crate::kms::xkb::modifier_mapping_from_keymap(
             &self.core.xkb_keymap.0,
         ))
@@ -33150,8 +33343,45 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
     result
 }
 
+/// Logs at most once per [`WarnThrottle::PERIOD`], counting what it held back.
+#[derive(Debug, Default)]
+struct WarnThrottle {
+    last: Option<std::time::Instant>,
+    held: u64,
+}
+
+impl WarnThrottle {
+    const PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// `Some(n)` when a warning should be logged now, `n` being how many were held back since the last one.
+    fn check(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < Self::PERIOD)
+        {
+            self.held += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.held))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn warn_throttle_logs_once_per_period_and_counts_the_rest() {
+        use super::WarnThrottle;
+        let t0 = std::time::Instant::now();
+        let mut w = WarnThrottle::default();
+        assert_eq!(w.check(t0), Some(0));
+        for i in 1..=5 {
+            assert_eq!(w.check(t0 + std::time::Duration::from_millis(i)), None);
+        }
+        assert_eq!(w.check(t0 + WarnThrottle::PERIOD), Some(5));
+        assert_eq!(w.check(t0 + WarnThrottle::PERIOD), None);
+    }
+
     use super::{
         CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
         PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint, SequenceArm,
@@ -37489,14 +37719,13 @@ mod tests {
         assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
     }
 
-    /// A Drawable-backed Picture must release the exact drawable
-    /// instance it retained at create time, even if the same host
-    /// xid has since been detached and rebound to fresh storage by
-    /// an internal window reconfigure. Pre-fix `render_free_picture`
-    /// looked up by xid again and could drop the new live drawable
-    /// instead, blanking the window while leaking the old storage.
+    /// A window Picture takes no store reference: when the window's
+    /// storage is detached and replaced under the same xid (reconfigure
+    /// today, unmap/remap under the window-storage lifecycle), the old
+    /// storage dies with its owner ref, the Picture resolves to the new
+    /// storage, and freeing the Picture leaves that storage untouched.
     #[test]
-    fn picture_free_uses_retained_drawable_after_xid_rebind() {
+    fn window_picture_holds_no_store_ref_and_follows_rebind() {
         use ash::vk;
 
         use crate::kms::render::store::{DrawableKind, Storage};
@@ -37504,22 +37733,21 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let window_xid = 0x400230;
-        let old_id = b
-            .store
-            .allocate(
-                window_xid,
-                DrawableKind::Window,
-                24,
-                true,
-                Storage::for_tests_null(
-                    vk::Extent2D {
-                        width: 64,
-                        height: 32,
-                    },
-                    vk::Format::B8G8R8A8_UNORM,
-                ),
-            )
-            .expect("allocate old window storage");
+        let alloc = |b: &mut KmsBackend, width| {
+            b.store
+                .allocate(
+                    window_xid,
+                    DrawableKind::Window,
+                    24,
+                    true,
+                    Storage::for_tests_null(
+                        vk::Extent2D { width, height: 32 },
+                        vk::Format::B8G8R8A8_UNORM,
+                    ),
+                )
+                .expect("allocate window storage")
+        };
+        let old_id = alloc(&mut b, 64);
 
         let picture = b
             .render_create_picture(
@@ -37532,58 +37760,482 @@ mod tests {
             .expect("create_picture")
             .expect("Some(handle)");
         let pic_xid = picture.as_raw();
-        assert_eq!(b.store.get(old_id).expect("old entry").refcount, 2);
+        assert_eq!(b.store.get(old_id).expect("old entry").refcount, 1);
+        assert!(!b.pending_picture_drawable_refs.contains_key(&pic_xid));
 
-        // Mirror configure_subwindow's detach + owner decref before
-        // the replacement storage is allocated under the same xid.
+        // Mirror configure_subwindow's detach + owner decref.
         b.store.detach_xid(window_xid);
         b.store_decref_with_invalidate(old_id);
-        assert_eq!(
-            b.store
-                .get(old_id)
-                .expect("old entry kept alive by picture")
-                .refcount,
-            1,
-        );
-        assert!(
-            b.store.lookup(window_xid).is_none(),
-            "detach removes the xid binding before re-allocation",
-        );
-
-        let new_id = b
-            .store
-            .allocate(
-                window_xid,
-                DrawableKind::Window,
-                24,
-                true,
-                Storage::for_tests_null(
-                    vk::Extent2D {
-                        width: 1565,
-                        height: 32,
-                    },
-                    vk::Format::B8G8R8A8_UNORM,
-                ),
-            )
-            .expect("allocate replacement window storage");
-        assert_eq!(b.store.lookup(window_xid), Some(new_id));
-
-        b.render_free_picture(None, pic_xid).expect("free_picture");
-
         assert!(
             b.store.get(old_id).is_none(),
-            "free_picture must drop the old retained drawable",
+            "the Picture must not keep the old window storage alive",
+        );
+        let new_id = alloc(&mut b, 1565);
+        assert_eq!(
+            b.store.get(new_id).expect("new entry").refcount,
+            1,
+            "materializing window storage must not apply a picture ref",
         );
         assert_eq!(
-            b.store.lookup(window_xid),
+            b.resolve_paint_target(window_xid).map(|t| t.backing_id()),
             Some(new_id),
-            "free_picture must not detach the replacement xid binding",
+            "the Picture's drawable resolves to the replacement storage",
         );
+
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert_eq!(b.store.lookup(window_xid), Some(new_id));
         assert_eq!(
             b.store.get(new_id).expect("replacement entry").refcount,
             1,
-            "replacement window storage must keep its owner ref",
+            "freeing a window Picture must not decref the window storage",
         );
+    }
+
+    /// A window Picture draws into whatever storage the window has at the
+    /// time of use: the reallocated leaf after a resize, nothing (no error)
+    /// while the window has no storage, and a freshly allocated leaf after.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn window_picture_follows_window_storage_and_clips_away_without_it() {
+        use yserver_core::{
+            backend::{AnyHandle, Backend, WindowHandle},
+            host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+        };
+
+        use crate::kms::render::store::DrawableKind;
+
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let rect = |w: u16, h: u16| {
+            let mut r = Vec::new();
+            r.extend_from_slice(&0i16.to_le_bytes());
+            r.extend_from_slice(&0i16.to_le_bytes());
+            r.extend_from_slice(&w.to_le_bytes());
+            r.extend_from_slice(&h.to_le_bytes());
+            r
+        };
+        let red = [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF];
+        let blue = [0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
+        let assert_all = |b: &mut KmsBackend, xid: u32, n: u16, bgr: [u8; 3], what: &str| {
+            let px = b
+                .get_image_pixels_for_tests(xid, 2, 0, 0, n, n, !0)
+                .expect("get_image")
+                .expect("pixels");
+            for (i, p) in px.chunks_exact(4).enumerate() {
+                assert_eq!(&p[..3], &bgr, "{what}: pixel {i}");
+            }
+        };
+
+        let root = WindowHandle::from_raw(1).expect("root");
+        let w = b
+            .create_subwindow(
+                None,
+                root,
+                0,
+                0,
+                8,
+                8,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 24,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                None,
+                None,
+            )
+            .expect("window");
+        let w_xid = w.as_raw();
+        b.map_window_for_tests(w_xid).expect("map");
+        let pic = b
+            .render_create_picture(None, AnyHandle::Window(w), 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some")
+            .as_raw();
+        let first = b.store.lookup(w_xid).expect("leaf");
+        assert_eq!(b.store.get(first).unwrap().refcount, 1, "no picture ref");
+        b.render_fill_rectangles(None, pic, 1, red, &rect(8, 8), 0, 0)
+            .expect("fill");
+        assert_all(&mut b, w_xid, 8, [0, 0, 0xFF], "first leaf");
+
+        b.configure_subwindow(
+            None,
+            w_xid,
+            HostSubwindowConfig {
+                x: None,
+                y: None,
+                width: Some(16),
+                height: Some(16),
+                border_width: None,
+                sibling: None,
+                stack_mode: None,
+            },
+        )
+        .expect("resize");
+        let second = b.store.lookup(w_xid).expect("resized leaf");
+        assert_ne!(second, first, "resize reallocates the leaf");
+        b.render_fill_rectangles(None, pic, 1, red, &rect(16, 16), 0, 0)
+            .expect("fill");
+        assert_all(&mut b, w_xid, 16, [0, 0, 0xFF], "reallocated leaf");
+
+        // No storage: the Picture's ops are clipped away, not errors.
+        b.store.detach_xid(w_xid);
+        b.store_decref_with_invalidate(second);
+        assert!(b.store.lookup(w_xid).is_none());
+        b.render_fill_rectangles(None, pic, 1, red, &rect(16, 16), 0, 0)
+            .expect("fill with no storage");
+        let pix = b.create_pixmap(None, 24, 4, 4).expect("pixmap");
+        let pix_pic = b
+            .render_create_picture(None, AnyHandle::Pixmap(pix), 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some")
+            .as_raw();
+        b.render_fill_rectangles(None, pix_pic, 1, blue, &rect(4, 4), 0, 0)
+            .expect("fill pixmap");
+        let painted = b
+            .render_composite(None, 1, pic, 0, pix_pic, 0, 0, 0, 0, 0, 0, 4, 4)
+            .expect("composite from a window without storage");
+        assert!(painted.is_empty());
+        assert_all(&mut b, pix.as_raw(), 4, [0xFF, 0, 0], "pixmap untouched");
+
+        // New storage: the same Picture binds to it.
+        let storage = b
+            .platform
+            .allocate_drawable_storage_as(
+                16,
+                16,
+                24,
+                crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+            )
+            .expect("storage");
+        let third = b
+            .store_alloc(w_xid, DrawableKind::Window, 24, true, storage)
+            .expect("store_alloc");
+        assert_eq!(b.store.get(third).unwrap().refcount, 1, "no picture ref");
+        b.render_fill_rectangles(None, pic, 1, red, &rect(16, 16), 0, 0)
+            .expect("fill");
+        assert_all(&mut b, w_xid, 16, [0, 0, 0xFF], "new leaf");
+        b.render_free_picture(None, pic).expect("free_picture");
+        assert_eq!(b.store.get(third).unwrap().refcount, 1);
+    }
+
+    /// Window-storage step 5: a window Picture draws nothing while hidden, then binds to the new leaf.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn window_picture_rebinds_to_the_new_leaf_after_remap() {
+        use yserver_core::{
+            backend::{AnyHandle, Backend, WindowHandle},
+            host_x11::HostSubwindowVisual,
+        };
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let rect = {
+            let mut r = Vec::new();
+            r.extend_from_slice(&0i16.to_le_bytes());
+            r.extend_from_slice(&0i16.to_le_bytes());
+            r.extend_from_slice(&8u16.to_le_bytes());
+            r.extend_from_slice(&8u16.to_le_bytes());
+            r
+        };
+        let red = [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF];
+        let blue = [0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
+        let assert_all = |b: &mut KmsBackend, xid: u32, bgr: [u8; 3], what: &str| {
+            let px = b
+                .get_image_pixels_for_tests(xid, 2, 0, 0, 8, 8, !0)
+                .expect("get_image")
+                .expect("pixels");
+            for (i, p) in px.chunks_exact(4).enumerate() {
+                assert_eq!(&p[..3], &bgr, "{what}: pixel {i}");
+            }
+        };
+        let root = WindowHandle::from_raw(1).expect("root");
+        let w = b
+            .create_subwindow(
+                None,
+                root,
+                0,
+                0,
+                8,
+                8,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 24,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                Some(0),
+                None,
+            )
+            .expect("window");
+        let w_xid = w.as_raw();
+        let pic = b
+            .render_create_picture(None, AnyHandle::Window(w), 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some")
+            .as_raw();
+        b.render_fill_rectangles(None, pic, 1, red, &rect, 0, 0)
+            .expect("fill before the first map");
+        assert!(
+            b.store.lookup(w_xid).is_none(),
+            "an unmapped window has no leaf"
+        );
+
+        b.map_window_for_tests(w_xid).expect("map");
+        let first = b.store.lookup(w_xid).expect("leaf after map");
+        assert_all(
+            &mut b,
+            w_xid,
+            [0, 0, 0],
+            "the first map tiles the background",
+        );
+        b.render_fill_rectangles(None, pic, 1, red, &rect, 0, 0)
+            .expect("fill");
+        assert_all(&mut b, w_xid, [0, 0, 0xFF], "first leaf");
+
+        b.unmap_window_for_tests(w_xid).expect("unmap");
+        assert!(b.store.lookup(w_xid).is_none(), "unmap releases the leaf");
+        b.render_fill_rectangles(None, pic, 1, blue, &rect, 0, 0)
+            .expect("fill while unmapped is clipped away");
+
+        b.map_window_for_tests(w_xid).expect("remap");
+        let second = b.store.lookup(w_xid).expect("leaf after remap");
+        assert_ne!(first, second, "the remap allocates a fresh leaf");
+        assert_all(&mut b, w_xid, [0, 0, 0], "the hidden fill wrote nothing");
+        b.render_fill_rectangles(None, pic, 1, blue, &rect, 0, 0)
+            .expect("fill");
+        assert_all(
+            &mut b,
+            w_xid,
+            [0xFF, 0, 0],
+            "the Picture binds to the new leaf",
+        );
+        assert!(
+            b.logged_gaps.borrow().is_empty(),
+            "no render gap was logged"
+        );
+    }
+
+    /// Window-storage step 5: a draw to an unmapped window writes nothing, not even into a backing.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn drawing_to_an_unmapped_window_writes_nothing_even_under_a_redirected_parent() {
+        use yserver_core::{
+            backend::{Backend, WindowHandle},
+            host_x11::HostSubwindowVisual,
+        };
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let visual = HostSubwindowVisual::Explicit {
+            depth: 24,
+            visual_xid: 0,
+            colormap_xid: 0,
+        };
+        let root = WindowHandle::from_raw(1).expect("root");
+        let w = b
+            .create_subwindow(None, root, 0, 0, 16, 16, 0, visual, Some(0), None)
+            .expect("W");
+        let w_xid = w.as_raw();
+        let c = b
+            .create_subwindow(None, w, 4, 4, 8, 8, 0, visual, None, None)
+            .expect("C");
+        let c_xid = c.as_raw();
+        b.map_window_for_tests(w_xid).expect("map W");
+        let all_of = |b: &mut KmsBackend, xid: u32| {
+            let (_, _, px) = b.backing_pixels_for_tests(xid).expect("pixels");
+            let first: [u8; 3] = px[..3].try_into().expect("pixel");
+            assert!(
+                px.chunks_exact(4).all(|p| p[..3] == first),
+                "0x{xid:x} is not uniform"
+            );
+            first
+        };
+        let hidden_draws = |b: &mut KmsBackend| {
+            b.fill_rectangle(None, c_xid, 0x00FF_0000, 0, 0, 8, 8)
+                .expect("fill");
+            b.clear_area(None, c_xid, 0x0000_FF00, None, 0, 0, 8, 8, (0, 0))
+                .expect("clear_area");
+            b.change_subwindow_attributes(None, c_xid, 0x08, &[0x0000_00FF])
+                .expect("border pixel");
+            b.copy_area(None, w_xid, c_xid, 0, 0, 0, 0, 8, 8)
+                .expect("copy into C");
+            b.copy_area(None, c_xid, w_xid, 0, 0, 0, 0, 8, 8)
+                .expect("copy from C");
+        };
+
+        assert!(b.store.lookup(c_xid).is_none(), "C was never viewable");
+        hidden_draws(&mut b);
+        assert!(b.store.lookup(c_xid).is_none(), "drawing allocates nothing");
+        assert_eq!(all_of(&mut b, w_xid), [0, 0, 0], "W untouched");
+
+        let backing = b
+            .allocate_redirected_backing(None, w, 16, 16, 24)
+            .expect("redirect W");
+        b.fill_rectangle(None, w_xid, 0x0000_FF00, 0, 0, 16, 16)
+            .expect("paint the backing");
+        assert!(
+            b.resolve_paint_target(c_xid).is_none(),
+            "hidden C resolves to None"
+        );
+        hidden_draws(&mut b);
+        assert_eq!(all_of(&mut b, w_xid), [0, 0xFF, 0], "backing untouched");
+
+        b.map_window_for_tests(c_xid).expect("map C");
+        assert_eq!(
+            b.resolve_paint_target(c_xid).map(|t| t.backing_id()),
+            b.store.lookup(backing.as_raw()),
+            "a viewable C paints into W's backing",
+        );
+        b.unmap_window_for_tests(c_xid).expect("unmap C");
+        assert!(b.store.lookup(c_xid).is_none(), "unmap releases C's leaf");
+        assert!(
+            b.resolve_paint_target(c_xid).is_none(),
+            "unmapped C resolves to None"
+        );
+        hidden_draws(&mut b);
+        assert_eq!(
+            all_of(&mut b, w_xid),
+            [0, 0xFF, 0],
+            "backing still untouched"
+        );
+        assert!(
+            b.logged_gaps.borrow().is_empty(),
+            "no render gap was logged"
+        );
+    }
+
+    /// Window-storage step 5: the root and the COW own their storage outside the lifecycle.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn root_and_cow_storage_never_go_through_the_lifecycle() {
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let root = b.core.window_id;
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        assert!(b.get_overlay_window(None).expect("claim COW"));
+        let root_id = b.store.lookup(root).expect("root storage");
+        let cow_id = b.store.lookup(cow).expect("COW storage");
+        for xid in [root, cow] {
+            b.release_window_storage(None, xid).expect("release");
+            b.realize_window_storage(None, xid).expect("realize");
+        }
+        assert_eq!(
+            b.store.lookup(root),
+            Some(root_id),
+            "root keeps its storage"
+        );
+        assert_eq!(b.store.lookup(cow), Some(cow_id), "COW keeps its storage");
+        assert!(
+            b.resolve_paint_target(cow).is_some(),
+            "the COW stays paintable"
+        );
+    }
+
+    /// Window-storage step 5: a same-size remap takes the released leaf back from the pool.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn window_remap_at_the_same_size_is_a_pool_hit() {
+        use crate::kms::vk::mem_accounting::{self, MemCategory};
+        use yserver_core::{
+            backend::{Backend, WindowHandle},
+            host_x11::HostSubwindowVisual,
+        };
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        fn settle(b: &mut KmsBackend) {
+            b.engine
+                .close_open_frame(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::frame_builder::CloseReason::SyncWait,
+                )
+                .expect("close frame");
+            b.engine
+                .flush_submit_group(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::submit_group::FlushReason::SyncBoundary,
+                )
+                .expect("flush");
+            b.platform.wait_idle_bounded();
+            b.poll_pending_retire_with_invalidate();
+        }
+        let vk = std::sync::Arc::clone(b.platform.vk.as_ref().expect("vk"));
+        let pool = std::sync::Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(vk));
+        b.platform.pixmap_pool = Some(std::sync::Arc::clone(&pool));
+        let memory_of = |b: &KmsBackend, xid: u32| {
+            let id = b.store.lookup(xid).expect("leaf");
+            b.store.get(id).expect("drawable").storage.memory
+        };
+        // An odd extent no other test allocates: the pool and the ledger are shared.
+        let root = WindowHandle::from_raw(1).expect("root");
+        let w = b
+            .create_subwindow(
+                None,
+                root,
+                0,
+                0,
+                83,
+                79,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 32,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                Some(0),
+                None,
+            )
+            .expect("window")
+            .as_raw();
+        b.map_window_for_tests(w).expect("map");
+        let mem = memory_of(&b, w);
+        assert_eq!(
+            mem_accounting::entry_of(mem).map(|e| e.1),
+            Some(MemCategory::WindowStorage)
+        );
+        b.unmap_window_for_tests(w).expect("unmap");
+        settle(&mut b);
+        assert!(b.store.lookup(w).is_none(), "unmap released the leaf");
+        assert_eq!(
+            mem_accounting::entry_of(mem).map(|e| e.1),
+            Some(MemCategory::PoolIdle),
+            "the released leaf parks in the pool",
+        );
+        b.map_window_for_tests(w).expect("remap");
+        assert_eq!(memory_of(&b, w), mem, "same-size remap is a pool hit");
+        assert_eq!(
+            mem_accounting::entry_of(mem).map(|e| e.1),
+            Some(MemCategory::WindowStorage)
+        );
+        b.destroy_subwindow(None, w).expect("destroy");
+        settle(&mut b);
+        pool.drain();
     }
 
     /// `picture_solid_fill_premul_correct` per plan §3b. NB: the
@@ -39451,6 +40103,7 @@ mod tests {
                 height: 8,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: rank,
                 bg_pixel: None,
@@ -39508,6 +40161,7 @@ mod tests {
                 height: 8,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: rank,
                 bg_pixel: None,
@@ -39568,6 +40222,7 @@ mod tests {
                 height: 16,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(root_host),
                 stack_rank: rank_p,
                 bg_pixel: None,
@@ -39587,6 +40242,7 @@ mod tests {
                 height: 8,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(parent),
                 stack_rank: rank_c,
                 bg_pixel: None,
@@ -39802,6 +40458,7 @@ mod tests {
                 height: 200,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -39913,6 +40570,7 @@ mod tests {
                 height: 200,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40105,6 +40763,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40145,6 +40804,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(parent_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40259,6 +40919,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40298,6 +40959,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(parent_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40397,6 +41059,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40449,6 +41112,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(parent_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40485,6 +41149,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(parent_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40570,6 +41235,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40622,6 +41288,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(owner_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40658,6 +41325,7 @@ mod tests {
                 height: 80,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(lower_branch_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40694,6 +41362,7 @@ mod tests {
                 height: 40,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(owner_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
@@ -40779,6 +41448,7 @@ mod tests {
                 height: 100,
                 depth: 32,
                 mapped: false,
+                viewable: true,
                 parent: None,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -40835,6 +41505,7 @@ mod tests {
                 height: 100,
                 depth: 24,
                 mapped: false,
+                viewable: true,
                 parent: None,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -41060,6 +41731,64 @@ mod tests {
             }
             None => panic!("Mod4+Return must activate the WM passive key grab"),
         }
+    }
+
+    /// Issue #168: `xdotool key super+5` sends Super_L press THREE
+    /// times, then 5, then Super_L release only TWICE, then 5's release
+    /// (XTEST FakeInput sequence captured from yserver's log in the vng
+    /// `xtest-super-stuck` scenario). Xorg drops a press of a key that
+    /// is already down and a release of a key that is not
+    /// (`Xi/exevents.c` "don't allow ddx to generate multiple downs" /
+    /// "guard against duplicates"), so neither reaches XKB. Fed to
+    /// xkbcommon, three downs against two ups left Mod4 set after every
+    /// key was up: Super stuck system-wide until a VT switch.
+    #[test]
+    fn duplicate_key_press_and_release_do_not_stick_modifier() {
+        use yserver_core::{
+            core_loop::HostInputEvent, host_x11::HostKeyEvent, server::ServerState,
+        };
+
+        const SUPER_L: u8 = 133;
+        const FIVE: u8 = 14;
+        const MOD4: u16 = 0x40;
+
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let key = |keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                keycode,
+                pressed,
+                state: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                time: 0,
+            })
+        };
+
+        for (keycode, pressed) in [
+            (SUPER_L, true),
+            (SUPER_L, true),
+            (SUPER_L, true),
+            (FIVE, true),
+            (SUPER_L, false),
+            (SUPER_L, false),
+            (FIVE, false),
+        ] {
+            b.on_host_input(&mut state, key(keycode, pressed));
+        }
+
+        assert_eq!(
+            b.serialize_modifiers() & MOD4,
+            0,
+            "Super_L must not stay latched once every key is released"
+        );
+        assert!(b.core.down_keys.is_empty(), "no key may remain held");
+        assert!(
+            state.keys_down.iter().all(|&byte| byte == 0),
+            "QueryKeymap must report no held keys"
+        );
     }
 
     /// Test A: a compiled `grp:alt_shift_toggle` option makes the
@@ -41368,7 +42097,7 @@ mod tests {
                 },
             );
             state.resources.window_mut(xid).unwrap().host_xid = WindowHandle::from_raw(host);
-            assert!(state.resources.map_window(xid));
+            assert!(state.resources.map_window(xid).mapping_changed);
             b.windows.insert(
                 host,
                 super::WindowGeometry {
@@ -41381,6 +42110,7 @@ mod tests {
                     height,
                     depth: 24,
                     mapped: true,
+                    viewable: true,
                     parent: None,
                     stack_rank: 0,
                     bg_pixel: None,
@@ -41514,6 +42244,7 @@ mod tests {
                 height: 100,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -41533,6 +42264,7 @@ mod tests {
                 height: 100,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: 1,
                 bg_pixel: None,
@@ -41589,6 +42321,7 @@ mod tests {
                 height: 600,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -41611,6 +42344,7 @@ mod tests {
                 height: 10,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(0x1000),
                 stack_rank: 0,
                 bg_pixel: None,
@@ -41632,6 +42366,7 @@ mod tests {
                 height: 10,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(0x1000),
                 stack_rank: 1,
                 bg_pixel: None,
@@ -41670,6 +42405,7 @@ mod tests {
                 height: 10,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: Some(0x1000),
                 stack_rank: 99,
                 bg_pixel: None,
@@ -41832,6 +42568,7 @@ mod tests {
                 height: 40,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -41903,6 +42640,7 @@ mod tests {
                 height: 100,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -41922,6 +42660,7 @@ mod tests {
                 height: 20,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: 1,
                 bg_pixel: None,
@@ -41971,6 +42710,7 @@ mod tests {
                 height: 100,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -42010,6 +42750,7 @@ mod tests {
                 height: 100,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 // Originally a sub-window under some frame; the WM now
                 // reparents it back to root (withdraw / frame teardown).
                 parent: Some(0x0040_0060),
@@ -42053,6 +42794,7 @@ mod tests {
                 height: 10,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: Some(0xBEEF),
                 stack_rank: 0,
                 bg_pixel: None,
@@ -42072,6 +42814,7 @@ mod tests {
                 height: 10,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: Some(0xBEEF),
                 stack_rank: 1,
                 bg_pixel: None,
@@ -42104,6 +42847,7 @@ mod tests {
                 height: 100,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -42123,6 +42867,7 @@ mod tests {
                 height: 20,
                 depth: 32,
                 mapped: true,
+                viewable: true,
                 parent: Some(0xC0FFEE),
                 stack_rank: 1,
                 bg_pixel: None,
@@ -42173,6 +42918,7 @@ mod tests {
                 // even when routed into a depth-32 backing (the picom/xterm shape).
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -42224,6 +42970,7 @@ mod tests {
                 height: h,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -42404,6 +43151,7 @@ mod tests {
                     height: 10,
                     depth,
                     mapped: true,
+                    viewable: true,
                     parent,
                     stack_rank: 0,
                     bg_pixel: None,
@@ -43461,6 +44209,9 @@ mod tests {
                 None,
             )
             .expect("create window");
+        // Created unmapped: no storage until it becomes viewable.
+        assert!(b.store.lookup(w.as_raw()).is_none(), "no leaf before map");
+        b.map_window_for_tests(w.as_raw()).expect("map window");
         let w_mem = memory_of(&b, w.as_raw());
         assert_eq!(
             mem_accounting::entry_of(w_mem).map(|e| e.1),
@@ -45896,6 +46647,7 @@ mod tests {
                     height: 200,
                     depth: 32,
                     mapped: true,
+                    viewable: true,
                     parent: None,
                     stack_rank: rank,
                     bg_pixel: None,
@@ -46404,6 +47156,7 @@ mod tests {
                 height,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: parent_host,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -46688,7 +47441,7 @@ mod tests {
         }
         let _ = state.resources.map_window(xid);
         backend
-            .map_subwindow(None, host.as_raw())
+            .map_window_for_tests(host.as_raw())
             .expect("map_subwindow");
         host
     }
@@ -47797,6 +48550,180 @@ mod tests {
             control.chunks_exact(4).all(|c| c == px),
             "control region must be the uniform root fill (overlay must not \
              have touched it)"
+        );
+    }
+
+    fn dispatch_raw(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from((4 + body.len()) / 4).expect("request length"),
+            },
+            body,
+            None,
+        )
+        .expect("process_request must succeed");
+    }
+
+    /// Window-storage step 4: a NameWindowPixmap taken before an unmap keeps
+    /// the released backing alive and readable, and the remap hands the
+    /// window a new backing (Xorg compUnrealizeWindow / compRealizeWindow).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn named_pixmap_survives_unmap_and_remap_gets_new_backing() {
+        use yserver_core::{backend::Backend, resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let window = ResourceId(0x0140_0001);
+        let named = ResourceId(0x0140_0002);
+        let host = create_live_window(
+            &mut state,
+            &mut backend,
+            window,
+            ROOT_WINDOW,
+            10,
+            10,
+            16,
+            16,
+        );
+        let window_body = window.0.to_le_bytes();
+        let mut redirect = window.0.to_le_bytes().to_vec();
+        redirect.extend_from_slice(&[1, 0, 0, 0]); // Manual
+        dispatch_raw(&mut state, &mut backend, 144, 1, &redirect); // RedirectWindow
+        let first = state
+            .resources
+            .window(window)
+            .unwrap()
+            .redirected_backing
+            .as_ref()
+            .expect("viewable redirected window has a backing")
+            .host_pixmap
+            .as_raw();
+
+        let color = 0x00aa_55ff;
+        backend
+            .fill_rectangle(None, host.as_raw(), color, 0, 0, 16, 16)
+            .expect("paint window");
+        let mut name = window.0.to_le_bytes().to_vec();
+        name.extend_from_slice(&named.0.to_le_bytes());
+        dispatch_raw(&mut state, &mut backend, 144, 6, &name); // NameWindowPixmap
+        let named_host = state
+            .resources
+            .pixmap(named)
+            .and_then(|p| p.host_xid)
+            .expect("named pixmap resource")
+            .as_raw();
+        assert_eq!(named_host, first, "named pixmap is the backing");
+
+        dispatch_raw(&mut state, &mut backend, 10, 0, &window_body); // UnmapWindow
+        assert!(
+            state
+                .resources
+                .window(window)
+                .unwrap()
+                .redirected_backing
+                .is_none()
+        );
+        assert!(
+            state.composite_redirects.contains_key(&(window, false)),
+            "redirect stays"
+        );
+        assert_eq!(backend.test_host_window_to_backing(host.as_raw()), None);
+        assert_eq!(
+            backend.test_alias_registry_get(first).map(|e| e.refcount),
+            Some(1),
+            "only the named pixmap holds the old backing",
+        );
+        let read = |backend: &mut KmsBackend, xid: u32| {
+            backend
+                .get_image_pixels_for_tests(xid, 2, 0, 0, 16, 16, !0)
+                .expect("get_image")
+                .expect("bytes")
+        };
+        let painted = |bytes: &[u8]| {
+            bytes
+                .chunks_exact(4)
+                .all(|px| px[..3] == [0xff, 0x55, 0xaa])
+        };
+        assert!(
+            painted(&read(&mut backend, named_host)),
+            "named pixmap readable after unmap"
+        );
+        let copy = backend.create_pixmap(None, 24, 16, 16).expect("copy dst");
+        backend
+            .copy_area(None, named_host, copy.as_raw(), 0, 0, 0, 0, 16, 16)
+            .expect("copy");
+        assert!(
+            painted(&read(&mut backend, copy.as_raw())),
+            "CopyArea from named pixmap"
+        );
+
+        dispatch_raw(&mut state, &mut backend, 8, 0, &window_body); // MapWindow
+        let second = state
+            .resources
+            .window(window)
+            .unwrap()
+            .redirected_backing
+            .as_ref()
+            .expect("remap re-creates the backing")
+            .host_pixmap
+            .as_raw();
+        assert_ne!(second, first, "remap gets a new backing");
+        assert_eq!(
+            backend.test_host_window_to_backing(host.as_raw()),
+            Some(second)
+        );
+        assert_eq!(
+            state
+                .resources
+                .pixmap(named)
+                .and_then(|p| p.host_xid)
+                .map(|h| h.as_raw()),
+            Some(first),
+            "named pixmap keeps the old backing",
+        );
+        assert!(
+            painted(&read(&mut backend, named_host)),
+            "named pixmap unchanged by the remap"
+        );
+
+        dispatch_raw(&mut state, &mut backend, 54, 0, &named.0.to_le_bytes()); // FreePixmap
+        assert!(
+            backend.test_alias_registry_get(first).is_none(),
+            "FreePixmap drops the last hold"
+        );
+        assert_eq!(
+            backend.test_alias_registry_get(second).map(|e| e.refcount),
+            Some(1)
         );
     }
 
@@ -51138,7 +52065,7 @@ mod tests {
         let (source_id, _, source_pin, cow_pin) =
             install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
 
-        b.map_subwindow(None, target_xid)
+        b.map_window_for_tests(target_xid)
             .expect("map direct destination");
 
         assert!(b.windows[&target_xid].mapped);
@@ -51164,7 +52091,7 @@ mod tests {
         let (source_id, _, source_pin, cow_pin) =
             install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
 
-        b.map_subwindow(None, unrelated_xid)
+        b.map_window_for_tests(unrelated_xid)
             .expect("map unrelated window");
 
         assert!(b.windows[&unrelated_xid].mapped);
@@ -56792,6 +57719,9 @@ mod tests {
         c0_conv_cii_assert_generation_bumped(backend, device, "map_subwindow", |backend| {
             backend.map_subwindow(None, child).expect("map_subwindow");
         });
+        backend
+            .realize_window_storage(None, child)
+            .expect("realize mapped window storage");
         c0_conv_cii_assert_generation_bumped(backend, device, "unmap_subwindow", |backend| {
             backend
                 .unmap_subwindow(None, child)
@@ -64921,6 +65851,14 @@ mod tests {
                     "complete Owner DPMS transition through core entries",
                 );
                 last_commit = Some(commit);
+                if backend.device_owner_for_tests(0).live_record().is_none()
+                    && backend
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .is_none_or(|arbiter| arbiter.transition().is_none())
+                {
+                    return last_commit;
+                }
                 continue;
             }
             let complete = c0_3bi_core_driver_until(
@@ -75804,13 +76742,14 @@ mod tests {
         device: DrmDeviceKey,
         first_present_id: u32,
     ) -> io::Result<OwnerDirectCandidate> {
-        if !backend.composed_return_established(device) {
-            c0_conv_ciii_establish_composed_return(backend, device);
-        }
         backend
             .scene
             .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
         let prepared = owner_root_direct_candidate_with_real_import(backend, first_present_id)?;
+        if !backend.composed_return_established(device) {
+            c0_conv_ciii_establish_composed_return(backend, device);
+        }
+        assert!(backend.composed_return_established(device));
         let output_idx = backend
             .present_crtc_output(prepared.candidate.crtc_id)
             .map(|(output_idx, _)| output_idx)
@@ -75864,7 +76803,13 @@ mod tests {
                 ),
             "the direct frame must become current through routed Owner milestones"
         );
-        owner_root_direct_candidate_with_real_import(backend, first_present_id + 100)
+        let mut successor =
+            owner_direct_candidate_with_real_import(backend, first_present_id + 100)?;
+        owner_direct_candidate_use_root_window(
+            &mut successor,
+            prepared.candidate.paint_dst_host_xid,
+        );
+        Ok(successor)
     }
 
     fn c0_conv_ciii_mark_retained_composed(backend: &mut super::KmsBackend) {
@@ -81848,16 +82793,23 @@ mod tests {
             )?
             .as_raw();
         backend
-            .map_subwindow(None, target_xid)
-            .expect("map production root candidate window");
+            .map_window_for_tests(target_xid)
+            .expect("map and realize production root candidate window");
         if !backend.core.top_level_order.contains(&target_xid) {
             backend.core.top_level_order.push(target_xid);
         }
+        owner_direct_candidate_use_root_window(&mut prepared, target_xid);
+        Ok(prepared)
+    }
+
+    fn owner_direct_candidate_use_root_window(
+        prepared: &mut OwnerDirectCandidate,
+        target_xid: u32,
+    ) {
         prepared.candidate.dst_window_xid = target_xid;
         prepared.candidate.paint_dst_host_xid = target_xid;
         prepared.candidate.completion_dst_host_xid = target_xid;
         prepared.event.dst_host_xid = target_xid;
-        Ok(prepared)
     }
 
     #[test]
@@ -84701,21 +85653,31 @@ mod tests {
             // backing, and `seed_bordered_window`'s null test storage is a
             // VK_NULL_HANDLE image there (found on card1, 2026-09-22). Use the
             // production allocation and map so the backing is a real image.
-            let target_xid = 0xc0_1110;
             let target_width = backend.platform.fb_w;
             let target_height = backend.platform.fb_h;
-            backend.allocate_window_storage(
-                target_xid,
+            let root = backend.core.window_id;
+            let target_xid = <super::KmsBackend as Backend>::create_subwindow(
+                backend,
+                None,
+                yserver_core::backend::WindowHandle::from_raw(root).expect("root handle"),
                 0,
                 0,
                 target_width,
                 target_height,
                 0,
-                24,
+                yserver_core::host_x11::HostSubwindowVisual::Explicit {
+                    depth: 24,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
                 None,
                 None,
-            );
-            <super::KmsBackend as Backend>::map_subwindow(backend, None, target_xid)
+            )
+            .expect("create the direct target window")
+            .as_raw();
+            // Storage exists only while viewable: map and realize as core does.
+            backend
+                .map_window_for_tests(target_xid)
                 .expect("map the direct target window");
             backend.core.top_level_order = vec![target_xid];
 
@@ -88135,6 +89097,7 @@ mod tests {
             .map(|output| u32::from(output.output.crtc))
             .collect::<Vec<_>>();
         backend.scene.mark_scene_structure_dirty();
+        backend.scene.reset_tick_diagnostics_for_tests(0);
         c0_3bi_core_driver_until(
             backend,
             "compose an Owner repaint after unflip retirement",
@@ -88284,6 +89247,131 @@ mod tests {
         observed_commit
             .borrow()
             .unwrap_or_else(|| panic!("{label}: no live direct commit for Present {present_id}"))
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_merge_unmap_direct_window_unflips_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, _output_id, connector, _) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), false)
+                .expect("environmental skip: live Vulkan direct window fixture");
+        let backend = &mut fixture.backend;
+        let direct = owner_root_direct_candidate_with_real_import(backend, 0x3b20)
+            .expect("production direct import and realized root window");
+        backend
+            .scene
+            .test_set_cursor_mode(crate::kms::render::scene::CursorPlaneMode::Hw);
+        c0_3bi_repaint_after_owner_unflip(backend, device);
+        assert!(backend.composed_return_established(device));
+
+        let present_id = c0_3bi_assert_direct_reentry_probation(backend, &direct);
+        backend.platform.owner_completion_detached = true;
+        let direct_commit = c0_3bi_wait_direct_present_live(
+            backend,
+            device,
+            present_id,
+            "dispatch direct Present before unmapping its window",
+        );
+        c0_3bi_wait_owner_commit_accepted(
+            backend,
+            device,
+            direct_commit,
+            "accept direct Present before unmapping its window",
+        );
+        c0_3bi_page_flip_owner_commit_through_core_driver(
+            backend,
+            device,
+            direct_commit,
+            direct.candidate.crtc_id,
+            "present direct frame before unmapping its window",
+        );
+        c0_3aii_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            direct_commit,
+            "complete direct Present before unmapping its window",
+        );
+        assert!(backend.scanout_m2.current.is_some());
+
+        let window_xid = direct.candidate.paint_dst_host_xid;
+        let leaf_id = backend
+            .store
+            .lookup(window_xid)
+            .expect("mapped direct window owns realized storage");
+        let image = backend
+            .store
+            .get(leaf_id)
+            .expect("window leaf exists")
+            .storage
+            .image;
+        assert_ne!(image, ash::vk::Image::null());
+        let direct_allocation = c0_3aii_current_direct_allocation(backend);
+
+        backend
+            .unmap_window_for_tests(window_xid)
+            .expect("unmap and release direct window storage through lifecycle entries");
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(backend.scanout_m2.current.is_some());
+        assert_eq!(
+            backend.scanout_m2.unflip_last_reason,
+            Some("release_direct_frame_drawable"),
+            "release_window_storage must request the ordinary Ciii unflip"
+        );
+        assert!(backend.store.lookup(window_xid).is_none());
+        assert_eq!(
+            backend.store.get(leaf_id).map(|leaf| leaf.storage.image),
+            Some(image),
+            "the direct frame pin keeps the released window image alive until unflip retirement"
+        );
+        assert!(
+            backend
+                .resource_service()
+                .expect("Owner resource service")
+                .contains(&direct_allocation)
+        );
+
+        c0_3bi_core_driver_until(
+            backend,
+            "dispatch ordinary Ciii unflip after window storage release",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.scanout_m2.owner_unflip_return.is_some()
+                    && backend.device_owner_for_tests(0).live_record().is_some()
+            },
+            None,
+        )
+        .expect("core-entry driver dispatches the ordinary Ciii unflip");
+        let unflip = backend
+            .device_owner_for_tests(0)
+            .live_record()
+            .expect("Owner unflip remains live until retirement")
+            .commit_id();
+        c0_3bi_wait_owner_commit_accepted(
+            backend,
+            device,
+            unflip,
+            "accept ordinary Ciii unflip through kernel-faithful stub",
+        );
+        assert!(backend.scanout_m2.current.is_some());
+        assert_eq!(
+            backend.store.get(leaf_id).map(|leaf| leaf.storage.image),
+            Some(image),
+            "the image remains alive after acceptance and before unflip retirement"
+        );
+
+        c0_3bi_retire_owner_unflip(backend, device, unflip, None);
+        assert!(backend.scanout_m2.current.is_none());
+        assert!(
+            backend.store.get(leaf_id).is_none(),
+            "unflip retirement releases the direct frame pin and frees window storage"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_merge_unmap_direct_window_unflips_vulkan",
+            &c0_3bi_expected_end_state([OutputKey::new(device, connector)]),
+        );
     }
 
     #[test]
@@ -89514,5 +90602,343 @@ mod tests {
     #[ignore = "needs live DRM master and Vulkan ICD"]
     fn c0_hw_cp_copied_route_cross_device_drm() {
         run_copied_route_cross_device_hardware_test();
+    }
+
+    /// One case of `testdata/xorg-change-keyboard-mapping.txt`.
+    struct KbdMapCase {
+        name: String,
+        layout: String,
+        options: Option<String>,
+        first: u8,
+        kpk: u8,
+        count: u8,
+        syms: Vec<u32>,
+        /// Further `(first, kpk, count, syms)` requests sent before the read-back.
+        more: Vec<(u8, u8, u8, Vec<u32>)>,
+        width: u8,
+        notify: Option<(u8, u8)>,
+        rows: std::collections::BTreeMap<u8, Vec<u32>>,
+    }
+
+    /// Parse the Xvfb capture into round-trip cases and `(first, kpk, count, nsyms, outcome)` edge lines.
+    /// `(first, kpk, count, nsyms, outcome)` of one invalid/edge request line.
+    type KbdMapEdge = (u8, u8, u8, usize, String);
+
+    fn parse_kbd_map_fixture(text: &str) -> (Vec<KbdMapCase>, Vec<KbdMapEdge>) {
+        let field = |line: &str, key: &str| -> String {
+            line.split(' ')
+                .find_map(|t| t.strip_prefix(&format!("{key}=")).map(str::to_owned))
+                .unwrap_or_default()
+        };
+        let hex_list = |v: &str| -> Vec<u32> {
+            if v == "-" {
+                Vec::new()
+            } else {
+                v.split(',')
+                    .map(|h| u32::from_str_radix(h, 16).unwrap())
+                    .collect()
+            }
+        };
+        let (mut cases, mut edges): (Vec<KbdMapCase>, Vec<_>) = (Vec::new(), Vec::new());
+        for line in text.lines() {
+            if line.starts_with("## + ") {
+                cases.last_mut().unwrap().more.push((
+                    field(line, "first").parse().unwrap(),
+                    field(line, "kpk").parse().unwrap(),
+                    field(line, "count").parse().unwrap(),
+                    hex_list(&field(line, "syms")),
+                ));
+            } else if let Some(rest) = line.strip_prefix("## ") {
+                let opts = field(line, "options");
+                cases.push(KbdMapCase {
+                    name: rest.split(' ').next().unwrap().to_owned(),
+                    layout: field(line, "layout"),
+                    options: (opts != "-").then_some(opts),
+                    first: field(line, "first").parse().unwrap(),
+                    kpk: field(line, "kpk").parse().unwrap(),
+                    count: field(line, "count").parse().unwrap(),
+                    syms: hex_list(&field(line, "syms")),
+                    more: Vec::new(),
+                    width: 0,
+                    notify: None,
+                    rows: std::collections::BTreeMap::new(),
+                });
+            } else if let Some(rest) = line.strip_prefix("! ") {
+                let (req, outcome) = rest.split_once(" -> ").unwrap();
+                edges.push((
+                    field(req, "first").parse().unwrap(),
+                    field(req, "kpk").parse().unwrap(),
+                    field(req, "count").parse().unwrap(),
+                    field(req, "nsyms").parse().unwrap(),
+                    outcome.to_owned(),
+                ));
+            } else if let Some(w) = line.strip_prefix("# keysyms_per_keycode=") {
+                cases.last_mut().unwrap().width = w.parse().unwrap();
+            } else if line.starts_with("# notify") {
+                cases.last_mut().unwrap().notify = Some((
+                    field(line, "first").parse().unwrap(),
+                    field(line, "count").parse().unwrap(),
+                ));
+            } else if !line.starts_with('#') && !line.is_empty() {
+                let mut it = line.split(' ');
+                let kc: u8 = it.next().unwrap().parse().unwrap();
+                let rest: Vec<&str> = it.collect();
+                let row = if rest == ["cleared"] {
+                    Vec::new()
+                } else {
+                    rest.iter()
+                        .map(|h| u32::from_str_radix(h, 16).unwrap())
+                        .collect()
+                };
+                cases.last_mut().unwrap().rows.insert(kc, row);
+            }
+        }
+        (cases, edges)
+    }
+
+    fn kbd_map_client(
+        state: &mut yserver_core::server::ServerState,
+    ) -> std::os::unix::net::UnixStream {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        let (peer, writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        state.clients.insert(
+            5,
+            yserver_core::server::ClientState {
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
+                byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: yserver_core::resources::ROOT_WINDOW,
+                reader_control: None,
+                is_local: true,
+                fd_passing: true,
+            },
+        );
+        peer
+    }
+
+    fn kbd_map_drain(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    fn kbd_map_request(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            yserver_protocol::x11::ClientId(5),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    /// ChangeKeyboardMapping { first, kpk, count, syms } as the wire body after the header.
+    fn change_kbd_map_body(first: u8, kpk: u8, syms: &[u32]) -> Vec<u8> {
+        let mut body = vec![first, kpk, 0, 0];
+        for s in syms {
+            body.extend_from_slice(&s.to_le_bytes());
+        }
+        body
+    }
+
+    /// GetKeyboardMapping(8, 248) as `(keysyms_per_keycode, keysyms)`.
+    fn kbd_map_get(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        peer: &mut std::os::unix::net::UnixStream,
+    ) -> (u8, Vec<u32>) {
+        kbd_map_request(state, backend, 101, 0, &[8, 248, 0, 0]);
+        let r = kbd_map_drain(peer);
+        assert_eq!(r[0], 1, "GetKeyboardMapping reply");
+        let syms = r[32..]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        (r[1], syms)
+    }
+
+    fn kbd_map_backend(layout: &str, options: Option<&str>) -> KmsBackend {
+        let mut backend = KmsBackend::for_tests();
+        backend.core.install_keymap(
+            crate::kms::xkb::golden_keymap(layout, options),
+            &crate::kms::core::XkbRmlvo {
+                rules: "evdev".into(),
+                model: "pc105".into(),
+                layout: layout.into(),
+                variant: String::new(),
+                options: options.map(str::to_owned),
+            },
+        );
+        backend
+    }
+
+    /// Golden (Xvfb 21.1.24): core and XI key maps after ChangeKeyboardMapping, plus MappingNotify.
+    #[test]
+    fn change_keyboard_mapping_round_trips_as_xorg() {
+        let (cases, _) =
+            parse_kbd_map_fixture(include_str!("../testdata/xorg-change-keyboard-mapping.txt"));
+        assert_eq!(cases.len(), 26, "fixture parsed");
+        let mut failures = Vec::new();
+        for case in &cases {
+            let mut backend = kbd_map_backend(&case.layout, case.options.as_deref());
+            let mut state = yserver_core::server::ServerState::new();
+            let mut peer = kbd_map_client(&mut state);
+            let (w0, before) = kbd_map_get(&mut state, &mut backend, &mut peer);
+            let body = change_kbd_map_body(case.first, case.kpk, &case.syms);
+            kbd_map_request(&mut state, &mut backend, 100, case.count, &body);
+            let mut ev = kbd_map_drain(&mut peer);
+            for (first, kpk, count, syms) in &case.more {
+                kbd_map_request(
+                    &mut state,
+                    &mut backend,
+                    100,
+                    *count,
+                    &change_kbd_map_body(*first, *kpk, syms),
+                );
+                ev = kbd_map_drain(&mut peer);
+            }
+            let notify =
+                (ev.len() >= 32 && ev[0] & 0x7f == 34 && ev[4] == 1).then(|| (ev[5], ev[6]));
+            if notify != case.notify {
+                failures.push(format!(
+                    "{}: MappingNotify ours {notify:?} xorg {:?}",
+                    case.name, case.notify
+                ));
+            }
+            let (w, after) = kbd_map_get(&mut state, &mut backend, &mut peer);
+            if w != case.width {
+                failures.push(format!(
+                    "{}: keysyms_per_keycode ours {w} xorg {}",
+                    case.name, case.width
+                ));
+                continue;
+            }
+            for (i, row) in after.chunks(usize::from(w)).enumerate() {
+                let kc = u8::try_from(8 + i).unwrap();
+                let want = match case.rows.get(&kc) {
+                    Some(r) if r.is_empty() => vec![0; usize::from(w)],
+                    Some(r) => r.clone(),
+                    // Unlisted rows are unchanged; across a width change only all-NoSymbol rows are unlisted.
+                    None => {
+                        let old = &before[i * usize::from(w0)..(i + 1) * usize::from(w0)];
+                        let mut r = old.to_vec();
+                        r.resize(usize::from(w), 0);
+                        r
+                    }
+                };
+                if row != want.as_slice() {
+                    failures.push(format!(
+                        "{}: keycode {kc}: ours {row:x?} xorg {want:x?}",
+                        case.name
+                    ));
+                }
+            }
+            // XI GetDeviceKeyMapping on the master keyboard reads the same map.
+            kbd_map_request(&mut state, &mut backend, 137, 24, &[3, 8, 248, 0]);
+            let xi = kbd_map_drain(&mut peer);
+            let xi_syms: Vec<u32> = xi[32..]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            if (xi[8], xi_syms) != (w, after) {
+                failures.push(format!(
+                    "{}: XI GetDeviceKeyMapping differs from core",
+                    case.name
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// XI ChangeDeviceKeyMapping goes through the same conversion (Xorg: both reach XkbApplyMappingChange).
+    #[test]
+    fn xi_change_device_key_mapping_converts_as_core() {
+        let (cases, _) =
+            parse_kbd_map_fixture(include_str!("../testdata/xorg-change-keyboard-mapping.txt"));
+        let case = cases.iter().find(|c| c.name == "two-sterling").unwrap();
+        let mut backend = kbd_map_backend(&case.layout, None);
+        let mut state = yserver_core::server::ServerState::new();
+        let mut peer = kbd_map_client(&mut state);
+        let mut body = vec![3, case.first, case.kpk, case.count];
+        for s in &case.syms {
+            body.extend_from_slice(&s.to_le_bytes());
+        }
+        kbd_map_request(&mut state, &mut backend, 137, 25, &body);
+        let _ = kbd_map_drain(&mut peer);
+        let (w, after) = kbd_map_get(&mut state, &mut backend, &mut peer);
+        let i = usize::from(case.first - 8) * usize::from(w);
+        assert_eq!(w, case.width);
+        assert_eq!(
+            &after[i..i + usize::from(w)],
+            case.rows[&case.first].as_slice()
+        );
+    }
+
+    /// Golden (Xvfb): ProcChangeKeyboardMapping's BadLength/BadValue rules and error values.
+    #[test]
+    fn change_keyboard_mapping_errors_as_xorg() {
+        let (_, edges) =
+            parse_kbd_map_fixture(include_str!("../testdata/xorg-change-keyboard-mapping.txt"));
+        assert_eq!(edges.len(), 9, "fixture parsed");
+        let mut failures = Vec::new();
+        for (first, kpk, count, nsyms, want) in edges {
+            let mut backend = kbd_map_backend("gb", None);
+            let mut state = yserver_core::server::ServerState::new();
+            let mut peer = kbd_map_client(&mut state);
+            let body = change_kbd_map_body(first, kpk, &vec![0x61; nsyms]);
+            kbd_map_request(&mut state, &mut backend, 100, count, &body);
+            let r = kbd_map_drain(&mut peer);
+            let got = if r.first() == Some(&0) {
+                let value = u32::from_le_bytes([r[4], r[5], r[6], r[7]]);
+                format!("error={} value={value}", r[1])
+            } else if r.len() >= 32 && r[0] & 0x7f == 34 {
+                format!("ok notify={},{}", r[5], r[6])
+            } else {
+                "ok notify=none".to_owned()
+            };
+            if got != want {
+                failures.push(format!(
+                    "first={first} kpk={kpk} count={count} nsyms={nsyms}: ours {got} xorg {want}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

@@ -1838,6 +1838,8 @@ pub(crate) struct KmsCore {
     #[allow(dead_code)]
     pub(crate) xkb_context: XkbContext,
     pub(crate) xkb_keymap: XkbKeymap,
+    /// Keys rewritten by `ChangeKeyboardMapping`, in Xorg's XKB form; dropped with the keymap.
+    pub(crate) core_map_overrides: crate::kms::xkb::CoreMapOverrides,
     pub(crate) xkb_state: XkbState,
     // Read by GetNames to derive `symbolsName` from the active RMLVO.
     pub(crate) xkb_rmlvo: XkbRmlvo,
@@ -1984,6 +1986,7 @@ impl KmsCore {
             top_level_order: Vec::new(),
             xkb_context,
             xkb_keymap,
+            core_map_overrides: crate::kms::xkb::CoreMapOverrides::new(),
             xkb_state,
             xkb_rmlvo: rmlvo,
             locked_group: 0,
@@ -2065,6 +2068,7 @@ impl KmsCore {
             top_level_order: Vec::new(),
             xkb_context,
             xkb_keymap,
+            core_map_overrides: crate::kms::xkb::CoreMapOverrides::new(),
             xkb_state,
             xkb_rmlvo: XkbRmlvo::default(),
             locked_group: 0,
@@ -2148,6 +2152,17 @@ impl KmsCore {
             rmlvo.options.clone(),
             xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
         )?;
+        Some(self.install_keymap(keymap, rmlvo))
+    }
+
+    /// Make `keymap` (compiled from `rmlvo`) the active one; returns its
+    /// clamped keycode bounds. The tail of [`Self::recompile_keymap`], split
+    /// out so tests can install a keymap frozen from a known xkeyboard-config.
+    pub(crate) fn install_keymap(
+        &mut self,
+        keymap: xkbcommon::xkb::Keymap,
+        rmlvo: &XkbRmlvo,
+    ) -> (u8, u8) {
         let (min_kc, max_kc) = crate::kms::xkb::clamped_keycode_bounds(&keymap);
         let mut new_state = xkbcommon::xkb::State::new(&keymap);
         for kc in &self.down_keys {
@@ -2158,6 +2173,7 @@ impl KmsCore {
         }
         self.xkb_state = XkbState(new_state);
         self.xkb_keymap = XkbKeymap(keymap);
+        self.core_map_overrides.clear();
         self.xkb_rmlvo = rmlvo.clone();
         log::info!(
             "xkb: recompiled keymap -> rules={} model={} layout={} variant={:?} options={:?}",
@@ -2167,7 +2183,7 @@ impl KmsCore {
             rmlvo.variant,
             rmlvo.options
         );
-        Some((min_kc, max_kc))
+        (min_kc, max_kc)
     }
 }
 

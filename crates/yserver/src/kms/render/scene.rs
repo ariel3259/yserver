@@ -6823,19 +6823,24 @@ fn retire_owner_current(
         .iter()
         .filter(|buffer| buffer.state() == OwnerBufferState::Releasing)
         .count();
+    // A blocked KMS release must not starve later Releasing buffers whose
+    // resource obligations are already discharged.
+    let mut visited = std::collections::HashSet::with_capacity(releasing_count);
     for _ in 0..releasing_count {
-        let Some(index) = state
-            .owner_buffers
-            .iter()
-            .position(|buffer| buffer.state() == OwnerBufferState::Releasing)
-        else {
+        let Some(index) = state.owner_buffers.iter().position(|buffer| {
+            buffer.state() == OwnerBufferState::Releasing
+                && !visited.contains(&(buffer.identity().bo_idx, buffer.identity().generation))
+        }) else {
             break;
         };
         let prepared = state.owner_buffers.remove(index);
-        let ready = prepared
+        let generation = prepared.identity().generation;
+        visited.insert((prepared.identity().bo_idx, generation));
+        let managed_batch_pending = prepared
             .pending_ack()
-            .is_some_and(|ack| ack.managed_batch.is_none())
-            && service.is_releasable(&prepared.identity().managed_key);
+            .is_some_and(|ack| ack.managed_batch.is_some());
+        let releasable = service.is_releasable(&prepared.identity().managed_key);
+        let ready = prepared.pending_ack().is_some() && !managed_batch_pending && releasable;
         if ready {
             let bo_idx = prepared.identity().bo_idx;
             let copied = matches!(
@@ -14955,6 +14960,7 @@ mod tests {
                 height: h,
                 depth: 32,
                 mapped,
+                viewable: true,
                 parent,
                 stack_rank: 0,
                 bg_pixel: None,
@@ -17812,6 +17818,7 @@ mod tests {
                 height: 40,
                 depth: 24,
                 mapped: true,
+                viewable: true,
                 parent: None,
                 stack_rank: rank,
                 bg_pixel: None,
@@ -19687,7 +19694,7 @@ mod tests {
     // byte-identical draw list.
 
     /// A window whose storage is the BORDERED extent placed at the OUTER
-    /// origin, exactly as `allocate_window_storage` builds it
+    /// origin, exactly as `allocate_window_leaf` builds it
     /// (`backend.rs:13440`-`:13476`): extent `(w + 2bw) x (h + 2bw)` and the
     /// allocation's `content_offset` recorded as `bw`.
     #[allow(clippy::too_many_arguments)]
@@ -19728,6 +19735,7 @@ mod tests {
                 height: h,
                 depth: 32,
                 mapped,
+                viewable: true,
                 parent,
                 stack_rank: 0,
                 bg_pixel: None,

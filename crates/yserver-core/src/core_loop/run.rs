@@ -115,6 +115,9 @@ pub(crate) struct LoopTelemetry {
     clients: HashMap<yserver_protocol::x11::ClientId, ClientLoopTelemetry>,
     channel_request_batch_max: usize,
     channel_client_batch_max: (u32, usize),
+    /// Last `report_export_holders` run, and whether it saw a change.
+    export_holders_last: Option<Instant>,
+    export_holders_changed: bool,
 }
 
 impl LoopTelemetry {
@@ -234,6 +237,26 @@ impl LoopTelemetry {
         if iter_wall > self.max_iter_wall {
             self.max_iter_wall = iter_wall;
         }
+    }
+
+    /// Whether the export-holders report is due: enabled and 1 s since the last run.
+    fn export_holders_due(&self, now: Instant) -> bool {
+        self.enabled
+            && self
+                .export_holders_last
+                .is_none_or(|last| now.saturating_duration_since(last) >= TELEMETRY_EMIT_INTERVAL)
+    }
+
+    fn note_export_holders(&mut self, now: Instant, changed: bool) {
+        self.export_holders_last = Some(now);
+        self.export_holders_changed = changed;
+    }
+
+    /// Re-check a second after a change so a set that settles while idle still gets logged.
+    fn export_holders_deadline(&self) -> Option<Instant> {
+        let last = self.export_holders_last?;
+        self.export_holders_changed
+            .then(|| last + TELEMETRY_EMIT_INTERVAL)
     }
 
     fn maybe_emit(&mut self, now: Instant) {
@@ -1909,9 +1932,11 @@ pub fn run_core(
             // state machine belongs on this loop, where it can see the
             // generation boundary directly.
             let xdmcp_deadline = xdmcp.as_ref().and_then(XdmcpService::next_deadline);
+            let holders_deadline = telemetry.export_holders_deadline();
             repeat_deadline
                 .into_iter()
                 .chain(backend_deadline)
+                .chain(holders_deadline)
                 .chain(dpms_deadline)
                 .chain(ss_idle_deadline)
                 .chain(ss_cycle_deadline)
@@ -2441,6 +2466,13 @@ pub fn run_core(
             let wall = now.saturating_duration_since(start);
             telemetry.record_iteration(requests_this_iter, wall);
             telemetry.maybe_emit(now);
+            if telemetry.export_holders_due(now) {
+                let core_state: &ServerState = state;
+                let changed = backend.report_export_holders(&|| {
+                    crate::backend::export_holders::collect_core_holders(core_state)
+                });
+                telemetry.note_export_holders(now, changed);
+            }
         }
 
         // The generation boundary. Reached only from an action the
@@ -4522,6 +4554,27 @@ mod tests {
             "time budget must not bind before the count cap for ~0.25ms requests \
              (elapsed_at_cap={elapsed_at_cap:?}, budget={REQUEST_TIME_BUDGET:?})"
         );
+    }
+
+    #[test]
+    fn export_holders_report_is_gated_paced_and_rechecks_after_change() {
+        let t0 = Instant::now();
+        let off = LoopTelemetry::default();
+        assert!(!off.export_holders_due(t0));
+        let mut on = LoopTelemetry {
+            enabled: true,
+            ..LoopTelemetry::default()
+        };
+        assert!(on.export_holders_due(t0));
+        on.note_export_holders(t0, true);
+        assert!(!on.export_holders_due(t0 + Duration::from_millis(999)));
+        assert!(on.export_holders_due(t0 + TELEMETRY_EMIT_INTERVAL));
+        assert_eq!(
+            on.export_holders_deadline(),
+            Some(t0 + TELEMETRY_EMIT_INTERVAL)
+        );
+        on.note_export_holders(t0 + TELEMETRY_EMIT_INTERVAL, false);
+        assert_eq!(on.export_holders_deadline(), None);
     }
 
     #[test]

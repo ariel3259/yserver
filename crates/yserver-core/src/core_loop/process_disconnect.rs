@@ -81,10 +81,12 @@ pub struct HostPixmapFrees {
 /// candidates through here so the decision stays
 /// `ResourceTable::host_xid_still_referenced` and never a per-call-site
 /// subset — the omissions were the #133 use-after-free/leak pair.
-fn free_orphaned_host_pixmaps(
-    state: &ServerState,
+/// `last_names` carry a freed name's last alias ref; a deferred one is recorded.
+pub(crate) fn free_orphaned_host_pixmaps(
+    state: &mut ServerState,
     backend: &mut dyn Backend,
     mut candidates: Vec<u32>,
+    last_names: &[u32],
     mut report: Option<&mut HostPixmapFrees>,
 ) {
     // Deduplicated, because a tile can arrive from more than one source — a
@@ -99,19 +101,62 @@ fn free_orphaned_host_pixmaps(
     candidates.sort_unstable();
     candidates.dedup();
     for xid in candidates {
-        if crate::backend::PixmapHandle::from_raw(xid)
-            .is_some_and(|handle| state.resources.host_xid_still_referenced(handle))
+        if let Some(handle) = crate::backend::PixmapHandle::from_raw(xid)
+            && state.resources.host_xid_still_referenced(handle)
         {
+            if last_names.contains(&xid) {
+                state.resources.defer_name_ref(handle);
+            }
             if let Some(report) = report.as_deref_mut() {
                 report.deferred.push(xid);
             }
             continue;
         }
-        let _ = backend.free_pixmap(None, xid);
+        match crate::backend::PixmapHandle::from_raw(xid) {
+            Some(handle) if last_names.contains(&xid) => {
+                let _ = backend.release_window_pixmap_name(None, handle);
+            }
+            _ => {
+                let _ = backend.free_pixmap(None, xid);
+            }
+        }
+        state.resources.host_pixmap_freed(xid);
         if let Some(report) = report.as_deref_mut() {
             report.freed.push(xid);
         }
     }
+}
+
+/// One alias ref per removed name (Xorg `compext.c:260`); each LAST ref goes to the orphan gate.
+pub(crate) fn release_removed_names(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<crate::backend::OriginContext>,
+    names: &[crate::backend::PixmapHandle],
+) -> Vec<u32> {
+    let mut per_backing: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for name in names {
+        *per_backing.entry(name.as_raw()).or_default() += 1;
+    }
+    let mut last = Vec::new();
+    for (xid, mut refs) in per_backing {
+        let Some(handle) = crate::backend::PixmapHandle::from_raw(xid) else {
+            continue;
+        };
+        // Another live name, or an already-deferred ref, keeps the backing alive for the gate.
+        if !state.resources.host_xid_named_by_pixmap(handle)
+            && !state.resources.has_deferred_name_ref(handle)
+        {
+            refs -= 1;
+            last.push(xid);
+        }
+        for _ in 0..refs {
+            if let Err(err) = backend.release_window_pixmap_name(origin, handle) {
+                log::warn!("release_window_pixmap_name(0x{xid:x}) failed: {err}");
+            }
+        }
+    }
+    last
 }
 
 /// Drop every server-side resource owned by `client_id` and free the
@@ -259,6 +304,12 @@ pub fn process_disconnect_reporting(
             });
         }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
+        crate::core_loop::process_request::free_pictures_on_destroyed_windows(
+            state, backend, None, &order,
+        );
+        crate::core_loop::process_request::release_redirects_on_destroyed_windows(
+            state, backend, None, &order,
+        );
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }
@@ -552,9 +603,11 @@ pub fn process_disconnect_reporting(
     // `A` creating a tile, `B` bordering with it and `A` disconnecting left
     // `B` sampling freed GPU storage (#133). The client's own windows and GCs
     // are gone by this point, so the gate sees only survivors.
+    let last_names = release_removed_names(state, backend, None, &removed.freed_names);
     let mut freeable = removed.freed_pixmaps;
     freeable.extend(attr_pixmap_xids);
-    free_orphaned_host_pixmaps(state, backend, freeable, host_pixmap_frees);
+    freeable.extend(&last_names);
+    free_orphaned_host_pixmaps(state, backend, freeable, &last_names, host_pixmap_frees);
     for (pic_xid, owned_pix) in removed.freed_pictures {
         let _ = backend.render_free_picture(None, pic_xid);
         if let Some(pix_xid) = owned_pix {
@@ -611,21 +664,7 @@ pub(crate) fn teardown_redirect_for_window(
     origin: Option<crate::backend::OriginContext>,
     window: ResourceId,
 ) {
-    let (host_window, backing) = {
-        let Some(w) = state.resources.window_mut(window) else {
-            return;
-        };
-        (w.host_xid, w.redirected_backing.take())
-    };
-    let Some(backing) = backing else {
-        return;
-    };
-    if let Err(err) = backend.release_redirected_backing(origin, backing.host_pixmap) {
-        log::warn!(
-            "release_redirected_backing(0x{:x}) failed: {err}",
-            backing.host_pixmap.as_raw()
-        );
-    }
+    unrealize_redirect_backing(state, backend, origin, window);
     // Restore W's scene-participation. The matching
     // `activate_redirect_backing_for` in `process_request.rs` flipped
     // it to false for Manual mode (and true for Automatic — a no-op
@@ -636,6 +675,14 @@ pub(crate) fn teardown_redirect_for_window(
     // session) leaves every Manually-redirected window with
     // `scene_participating=false` — i.e. invisible — for the rest of
     // the session.
+    // A mapped window hidden by an unmapped ancestor has no backing but is still excluded.
+    let Some((host_window, mapped)) = state
+        .resources
+        .window(window)
+        .map(|w| (w.host_xid, w.map_state != MapState::Unmapped))
+    else {
+        return;
+    };
     let Some(host_window) = host_window else {
         log::debug!(
             "teardown_redirect_for_window(0x{:x}): no host_xid; skipping participation restore",
@@ -643,12 +690,43 @@ pub(crate) fn teardown_redirect_for_window(
         );
         return;
     };
-    if let Err(err) = backend.set_window_scene_participation(origin, host_window, true) {
+    if let Err(err) = backend.set_window_scene_participation(origin, host_window, mapped) {
         log::warn!(
-            "teardown_redirect_for_window: set_window_scene_participation(0x{:x}, true) failed: {err}",
+            "teardown_redirect_for_window: set_window_scene_participation(0x{:x}, {mapped}) failed: {err}",
             window.0
         );
     }
+}
+
+/// Drop a redirected window's backing when it becomes unviewable, as Xorg's
+/// `compUnrealizeWindow` → `compCheckRedirect` does
+/// (`composite/compwindow.c:291`, `:176-181`). Unlike
+/// [`teardown_redirect_for_window`] the redirect record and the window's
+/// scene exclusion stay: a later realize allocates a fresh backing for the
+/// same redirect. Named pixmaps keep the old backing alive through the
+/// backend's alias registry and stop following the window, as Xorg's
+/// `DestroyPixmap` only drops the window's own reference (`:181`).
+/// Returns the released backing, if the window had one.
+pub(crate) fn unrealize_redirect_backing(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<crate::backend::OriginContext>,
+    window: ResourceId,
+) -> Option<crate::backend::PixmapHandle> {
+    let backing = {
+        let w = state.resources.window_mut(window)?;
+        let backing = w.redirected_backing.take()?;
+        w.composite_named_pixmaps
+            .retain(|alias| alias.host_pixmap != backing.host_pixmap);
+        backing
+    };
+    if let Err(err) = backend.release_redirected_backing(origin, backing.host_pixmap) {
+        log::warn!(
+            "release_redirected_backing(0x{:x}) failed: {err}",
+            backing.host_pixmap.as_raw()
+        );
+    }
+    Some(backing.host_pixmap)
 }
 
 /// Destroy every resource owned by a zombie client — invoked by
@@ -721,6 +799,12 @@ pub fn destroy_zombie_resources_reporting(
             });
         }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
+        crate::core_loop::process_request::free_pictures_on_destroyed_windows(
+            state, backend, None, &order,
+        );
+        crate::core_loop::process_request::release_redirects_on_destroyed_windows(
+            state, backend, None, &order,
+        );
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }
@@ -757,9 +841,11 @@ pub fn destroy_zombie_resources_reporting(
     // `A` creating a tile, `B` bordering with it and `A` disconnecting left
     // `B` sampling freed GPU storage (#133). The client's own windows and GCs
     // are gone by this point, so the gate sees only survivors.
+    let last_names = release_removed_names(state, backend, None, &removed.freed_names);
     let mut freeable = removed.freed_pixmaps;
     freeable.extend(attr_pixmap_xids);
-    free_orphaned_host_pixmaps(state, backend, freeable, host_pixmap_frees);
+    freeable.extend(&last_names);
+    free_orphaned_host_pixmaps(state, backend, freeable, &last_names, host_pixmap_frees);
     for (pic_xid, owned_pix) in removed.freed_pictures {
         let _ = backend.render_free_picture(None, pic_xid);
         if let Some(pix_xid) = owned_pix {
@@ -1157,6 +1243,63 @@ mod tests {
         );
     }
 
+    /// A disconnect releases one ref per name on a shared backing; a background defers only the last.
+    #[test]
+    fn disconnect_releases_one_ref_per_window_pixmap_name() {
+        for as_background in [false, true] {
+            const HOST: u32 = 0x9999_0051;
+            let host = crate::backend::PixmapHandle::from_raw(HOST).expect("non-zero");
+            let names = [0x0070_0051, 0x0070_0052, 0x0070_0053].map(ResourceId);
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            install_client(&mut state, 7);
+            install_client(&mut state, 8);
+            for name in names {
+                state.resources.create_pixmap(
+                    ClientId(7),
+                    CreatePixmapRequest {
+                        pixmap: name,
+                        drawable: ROOT_WINDOW,
+                        width: 16,
+                        height: 16,
+                        depth: 24,
+                    },
+                );
+                assert!(state.resources.set_pixmap_host_xid(name, host));
+                state.resources.mark_pixmap_composite_name(name);
+            }
+            if as_background {
+                state.resources.create_window(
+                    ClientId(8),
+                    CreateWindowRequest {
+                        depth: 24,
+                        window: ResourceId(0x0080_0001),
+                        parent: ROOT_WINDOW,
+                        width: 10,
+                        height: 10,
+                        class: 1,
+                        visual: crate::resources::ROOT_VISUAL,
+                        background_pixmap: Some(names[1]),
+                        ..Default::default()
+                    },
+                );
+                assert!(state.resources.host_xid_still_referenced(host));
+            }
+            let frees = |backend: &RecordingBackend| {
+                backend
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, RecordedCall::FreePixmap(HOST)))
+                    .count()
+            };
+            process_disconnect(&mut state, &mut backend, ClientId(7));
+            let held = usize::from(as_background);
+            assert_eq!(frees(&backend), 3 - held, "background={as_background}");
+            process_disconnect(&mut state, &mut backend, ClientId(8));
+            assert_eq!(frees(&backend), 3, "background={as_background}");
+        }
+    }
+
     /// #133: the leak on the other side of the same gate. A tile kept alive
     /// past its `FreePixmap` by the client's OWN window border must be
     /// released when disconnect destroys that window. The disconnect paths
@@ -1533,6 +1676,8 @@ mod tests {
                 ..Default::default()
             },
         );
+        // Viewable: only a viewable redirected window holds a backing.
+        let _ = state.resources.map_window(window_id);
         {
             let w = state.resources.window_mut(window_id).unwrap();
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(host_xid));
@@ -1582,6 +1727,66 @@ mod tests {
         assert!(
             release_idx < restore_idx,
             "release must precede participation restore; calls={calls:#?}",
+        );
+    }
+
+    #[test]
+    fn disconnect_of_a_redirected_windows_owner_releases_its_backing() {
+        // The app exits without DestroyWindow under the compositor's RedirectSubwindows(root).
+        let mut state = ServerState::new();
+        let compositor = 9;
+        let app = 10;
+        install_client(&mut state, compositor);
+        install_client(&mut state, app);
+        let window_id = ResourceId(0x00a0_0001);
+        let backing_xid: u32 = 0xBA51_0001;
+        state.resources.create_window(
+            ClientId(app),
+            CreateWindowRequest {
+                depth: 24,
+                window: window_id,
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(window_id);
+        state
+            .resources
+            .window_mut(window_id)
+            .unwrap()
+            .redirected_backing = Some(crate::resources::RedirectedBacking {
+            host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(backing_xid),
+            width: 100,
+            height: 100,
+            depth: 24,
+        });
+        let record = RedirectRecord {
+            mode: CompositeRedirectMode::Manual,
+            owner: ClientId(compositor),
+        };
+        state
+            .composite_redirects
+            .insert((ROOT_WINDOW, true), record);
+        state.composite_redirects.insert((window_id, false), record);
+
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(app));
+
+        let releases = backend
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::ReleaseRedirectedBacking(x) if *x == backing_xid))
+            .count();
+        assert_eq!(releases, 1, "calls={:#?}", backend.calls());
+        assert!(state.resources.window(window_id).is_none());
+        assert!(!state.composite_redirects.contains_key(&(window_id, false)));
+        assert!(
+            state.composite_redirects.contains_key(&(ROOT_WINDOW, true)),
+            "the compositor's root redirect outlives the app"
         );
     }
 

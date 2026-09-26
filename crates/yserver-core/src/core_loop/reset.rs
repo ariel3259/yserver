@@ -268,6 +268,7 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
             continue;
         }
         let _ = backend.free_pixmap(None, xid);
+        state.resources.host_pixmap_freed(xid);
     }
 }
 

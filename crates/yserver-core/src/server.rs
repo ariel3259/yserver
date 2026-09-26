@@ -6157,10 +6157,11 @@ mod tests {
             id_picture,
             PictureState {
                 client: owner,
-                host_picture_xid: PictureHandle::from_raw_for_test(1),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(1)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Sourceless,
                 drawable: None,
+                window: None,
             },
         );
         expect.push(id_picture);

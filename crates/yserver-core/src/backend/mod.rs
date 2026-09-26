@@ -1,6 +1,7 @@
 //! Backend abstraction. Currently `HostX11Backend` is the sole impl;
 //! Phase 6.3+ will add a KMS backend.
 
+pub mod export_holders;
 pub mod gamma;
 pub mod handles;
 pub mod params;

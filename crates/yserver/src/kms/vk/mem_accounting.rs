@@ -301,7 +301,6 @@ pub fn category_of(mem: vk::DeviceMemory) -> Option<MemCategory> {
 }
 
 /// Size and category of a live handle.
-#[cfg(test)]
 pub(crate) fn entry_of(mem: vk::DeviceMemory) -> Option<(u64, MemCategory)> {
     ledger()
         .as_ref()
