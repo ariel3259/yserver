@@ -1,5 +1,14 @@
 # Phase C.0 stage 3c — VT switching, connector hotplug and device removal on the Owner
 
+**Revision 3 (2026-09-26)** — codex round 2 (2 blocking, 2 major, all
+confirmed, `../findings/2026-09-26-stage-3c-design-review-round2.md`): an
+unknown release withdraws the device's outputs logically at once (B-1); every
+probe episode has a deadline and a terminal disposition, and an acquire whose
+Owner probe fails closes and withdraws that device instead of exiting (B-2);
+a mixed server's acquire runs the scoped Legacy resume (M-1); one episode
+holds one RANDR gate turn and publishes once, after every participant's
+commit is terminal, with a partial-failure rule (M-2).
+
 **Revision 2 (2026-09-26)** — codex round 1 (3 blocking, 2 major, all
 confirmed, `../findings/2026-09-26-stage-3c-design-review-round1.md`): device
 removal is never deferred by a released seat (B-1); an unknown or timed-out
@@ -119,9 +128,13 @@ waiting on the executor. A client sees exactly what it sees on Legacy today.
      state. The device is **closed**: no submission ever again on that
      incarnation. Its reinstall needs `VTAcquire` **and** the old-lease
      retirement barrier **and** a fresh KMS incarnation with qualified
-     installation — creating that incarnation is 3d's (the `REC-1` machinery);
-     in 3c the device stays closed after acquire, its outputs published but
-     dark, and a test proves no submission reaches the old incarnation.
+     installation — creating that incarnation is 3d's (the `REC-1` machinery).
+     *(Rev 3, B-1.)* `ExecutorStalled` is **logical withdrawal** (C.0 §10
+     state table): the device's outputs and CRTCs leave the active
+     RANDR/backend model at once, published requester-less, and stay withdrawn
+     until 3d's qualified recovery. This failure publication is the one
+     client-visible exception to the VT no-event invariant (§5); a test proves
+     no submission reaches the old incarnation.
 6. A poisoned or already-dark device contributes no commit; it does not
    delay the hand-off.
 
@@ -147,7 +160,28 @@ removed renderer still ends the server.
 `on_vt_acquire` keeps `VT_ACKACQ` and the bounded `drmSetMaster` over the
 devices still present; a device removed while away (§3.2) is not asked for
 master and does not trigger the exit, which stays for a present device that
-fails. Then, per healthy Owner device (§3.1 step 5), a `VTAcquire` transition:
+fails.
+
+*(Rev 3, M-1.)* **Order on a mixed server:** after master, the acquire probe
+episode (§4.1) runs over every device; then the **scoped Legacy resume** runs
+synchronously for the Legacy devices (today's `run_resume` steps — relight,
+gamma, cursor re-arm — through the `_for_devices` helpers); then the Owner
+transitions below are started. **Input resumes and the VT state reaches
+`Active` once the Legacy resume is done and the Owner transitions are
+started** — input never waits for an Owner commit; Owner frames wait in
+admission until their device's reinstall is `Applied`. A Legacy-only server
+runs today's code unchanged.
+
+*(Rev 3, B-2.)* **If the acquire episode fails** (a probe error, or no answer
+by the episode deadline): on a Legacy-only server, today's exit; with Owner
+devices, a Legacy device's failed probe keeps today's exit (Legacy is
+unchanged), while an **Owner device whose probe failed is closed and
+logically withdrawn** (published requester-less) and the episode continues
+for the other devices — the Owner route does not end the server for one
+device, as 3a decided for completion loss. The episode deadline is the probe
+deadline of §4.1.
+
+Then, per healthy Owner device (§3.1 step 5), a `VTAcquire` transition:
 
 1. A connector probe (3c-i uses the existing synchronous probe at this site;
    3c-ii moves every probe site, this one included, off the core thread).
@@ -165,7 +199,8 @@ fails. Then, per healthy Owner device (§3.1 step 5), a `VTAcquire` transition:
    waits for no clock; the new epoch's clock probe starts after it (3a carried
    item: probe at VT reacquire).
 4. Full damage on every output; admission reopens when the reinstall is
-   `Applied`; input resumes and xkb resyncs as today.
+   `Applied`. (Input and the xkb resync happen at the ordering point above,
+   not here.)
 5. If the topology changed while away, the change is published once, as a
    requester-less publication at `Applied` (3b-ii), with the events Legacy's
    `run_resume` emits in the same case.
@@ -203,7 +238,28 @@ episode applies and publishes nothing** (Legacy's combined boundary,
 `run_display_rescan`/`run_resume`); the next edge starts a new episode. A probe
 answering `ENODEV` is not a failure: it is that device's `DeviceRemoved`
 (§4.5), and the episode continues without it. When every answer is in, the
-changes are applied as per-device commits (§4.3) and published once. Every probe
+changes are applied as per-device commits (§4.3) and published once.
+
+*(Rev 3, B-2.)* **Every episode has a deadline** (the probe deadline below).
+No answer by then counts as a failed probe; the episode's epoch is
+invalidated, so a late answer is discarded. A failed hotplug or forced-reprobe
+episode applies and publishes nothing (Legacy); the acquire episode's failure
+disposition is §3.3's.
+
+*(Rev 3, M-2.)* **One episode, one gate turn, one publication.** A topology
+episode takes one RANDR gate turn (3b-ii ordering for requester-less
+publications) from its first commit to its publication. Legacy participants
+apply synchronously inside the turn; Owner participants run their per-device
+transactions. The episode publishes **once, when every participant is
+terminal**, bounded by the lifecycle deadline of the transactions:
+
+| Participant outcome | What the publication shows for it |
+| --- | --- |
+| `Applied` | the new topology |
+| rejected with known completion (nothing changed, 3b) | its previous installed topology — except outputs whose connector is physically gone, which are withdrawn logically |
+| `CompletionUnknown` / stalled | logical withdrawal (`ExecutorStalled`) |
+
+No participant's change is published before the others are terminal. Every probe
 site uses it: the debounced udev edge, RANDR's forced reprobe, and 3c-i's
 acquire. While a probe is outstanding the loop serves clients from the
 published state.
@@ -306,6 +362,10 @@ removed device that reappears stays `Removed`. Hot-add is out of scope for C.0
 1. **VT switch latency:** on Owner the switch completes after the release
    commit (≤ 1 s bound), not immediately after the synchronous all-off.
    Invisible to clients.
+3. *(Rev 3.)* **Failure paths publish withdrawals where Legacy exits:** an
+   unknown release (§3.1) or a failed Owner acquire probe (§3.3) withdraws
+   that device's outputs with a requester-less publication, where Legacy ends
+   the server; the ordinary VT switch still emits nothing.
 2. **`GetScreenResources` under a forced reprobe** waits for the off-thread
    probe instead of blocking the whole loop; same reply contents — except
    *(rev 2, B-3)* when the probe misses its deadline: the reply carries the
@@ -338,7 +398,12 @@ executor reply); `c0_3ci_release_hands_off_after_commit`;
 depend on the pre-release installed state); `c0_3ci_acquire_honours_dpms_off`;
 `c0_3ci_requests_while_released_match_legacy`; `c0_3ci_release_supersedes_undispatched_acquire`;
 `c0_3ci_mixed_server_release_scopes_legacy`; `c0_3ci_vt_switch_emits_nothing`;
-*(rev 2)* `c0_3ci_unknown_release_closes_the_incarnation` (a release commit
+*(rev 3)* `c0_3ci_mixed_server_acquire_runs_scoped_legacy_resume`,
+`c0_3ci_acquire_probe_error_withdraws_owner_device`,
+`c0_3ci_acquire_probe_no_reply_withdraws_owner_device` (both through the acquire
+entry), `c0_3ci_input_resumes_before_owner_reinstall`;
+*(rev 2)* `c0_3ci_unknown_release_closes_the_incarnation` (now also: its
+outputs are withdrawn and published once) (a release commit
 still in flight at the bound: helper termination requested, `ExecutorStalled`,
 and after acquire no submission reaches the old incarnation) and
 `c0_3ci_acquire_skips_a_removed_device`.
@@ -350,7 +415,9 @@ and after acquire no submission reaches the old incarnation) and
 `c0_3cii_device_removed_withdraws_and_continues`; `c0_3cii_device_added_is_ignored`;
 *(rev 2)* `c0_3cii_removal_while_released_is_not_deferred`,
 `c0_3cii_one_failed_probe_applies_nothing` (two devices, one probe fails or is
-late), `c0_3cii_forced_reprobe_timeout_discards_late_result`,
+late), *(rev 3)* `c0_3cii_episode_publishes_once_after_every_commit`,
+`c0_3cii_episode_partial_commit_failure` (two devices, one commit rejected, one
+unknown; the table's outcomes), `c0_3cii_episode_mixed_legacy_owner`, `c0_3cii_forced_reprobe_timeout_discards_late_result`,
 `c0_3cii_udev_events_classified` and `c0_3cii_real_monitor_delivers_typed_events`;
 the Legacy/Owner differential of backend state and client bytes for unplug,
 replug and forced reprobe.
@@ -369,7 +436,11 @@ server when it is not the renderer; a new card opened; *(rev 2)* a removal
 deferred while released; a reinstall submitted on an incarnation whose
 release was unknown; a partial episode applied after one device's probe
 failed; a timed-out forced reprobe's late result applied; a `DeviceRemoved`
-raised from anything but a classified event or `ENODEV`.
+raised from anything but a classified event or `ENODEV`; *(rev 3)* an
+unknown release leaving its outputs published; an acquire probe failure that
+leaves input paused or ends the server for an Owner device; a mixed acquire
+skipping the Legacy resume; an episode publishing one device before another
+is terminal.
 
 ### 6.3. Hardware (card1, from a tty, with the user's approval)
 
@@ -420,6 +491,10 @@ Each at most ~14 tasks; a plan that grows is split without asking.
   site — 3c-i can land first without waiting for the probe worker.
 - The umbrella's pairing of entry points to kinds is read as the
   classification of §4.2 (by what changed), not a fixed entry-to-kind map.
+- *(Rev 3, decided by the coordinator — change it if you disagree.)* An
+  acquire whose Owner probe fails withdraws that device and keeps the server
+  running, instead of Legacy's exit; input resumes at acquire without waiting
+  for the Owner reinstall.
 - *(Rev 2.)* A release whose commit is still unknown at the 1 s bound does
   not come back lit after the switch: C.0 §10 forbids reusing that
   incarnation, and creating a fresh one is 3d's recovery work. Between 3c and
