@@ -187,12 +187,6 @@ pub(crate) enum OwnerRefusal {
     SlotOccupied,
     ClockNotReady,
     ReadinessClosed,
-    NotYetSupported(ClientModesetUnsupportedFeature),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientModesetUnsupportedFeature {
-    PositionOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +479,7 @@ pub(crate) struct ClientModesetSlot {
     pub(crate) mode: Option<yserver_core::backend::ModeSpec>,
     pub(crate) x: i32,
     pub(crate) y: i32,
+    pub(crate) position_only: bool,
     pub(crate) phase: ClientModesetPhase,
     pub(crate) prepared: Option<PreparedClientModesetDescription>,
 }
@@ -577,6 +572,8 @@ pub(crate) struct LifecycleDriver {
     stale_results: usize,
     #[cfg(test)]
     pub(crate) client_modeset_promotion_steps: Vec<ClientModesetPromotionStep>,
+    #[cfg(test)]
+    client_modeset_topology_dispatches: Vec<(ClientModesetTag<IncarnationId>, Tier, usize, usize)>,
 }
 
 impl LifecycleDriver {
@@ -625,6 +622,8 @@ impl LifecycleDriver {
             stale_results: 0,
             #[cfg(test)]
             client_modeset_promotion_steps: Vec::new(),
+            #[cfg(test)]
+            client_modeset_topology_dispatches: Vec::new(),
         }
     }
 
@@ -770,6 +769,13 @@ impl LifecycleDriver {
             self.client_validation_sends.clone(),
             self.client_live_sends.clone(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn client_modeset_topology_dispatches_for_tests(
+        &self,
+    ) -> &[(ClientModesetTag<IncarnationId>, Tier, usize, usize)] {
+        &self.client_modeset_topology_dispatches
     }
 
     #[cfg(test)]
@@ -1084,6 +1090,21 @@ impl KmsBackend {
             topology_generation,
             modeset,
         };
+        let position_only = mode.is_some_and(|requested| {
+            self.output_key_for_id(output_id)
+                .filter(|key| key.device_key == device && key.connector_name == connector)
+                .and_then(|key| {
+                    self.platform
+                        .outputs
+                        .iter()
+                        .find(|output| output.key == *key)
+                })
+                .is_some_and(|output| {
+                    output.width == requested.width
+                        && output.height == requested.height
+                        && output.output.picked.vrefresh == requested.vrefresh
+                })
+        });
         let driver = self
             .lifecycle_drivers
             .get_mut(&device)
@@ -1096,6 +1117,7 @@ impl KmsBackend {
             mode,
             x,
             y,
+            position_only,
             phase: ClientModesetPhase::Queued,
             prepared: None,
         });
@@ -2229,6 +2251,7 @@ impl KmsBackend {
                     slot.mode,
                     slot.x,
                     slot.y,
+                    slot.position_only,
                 )
             })
             .ok_or_else(|| std::io::Error::other("client modeset slot became stale"))?;
@@ -2237,6 +2260,46 @@ impl KmsBackend {
             .filter(|key| key.device_key == device && key.connector_name == request.1)
             .cloned()
             .ok_or_else(|| preparation_error(Stage::Discovery))?;
+        if request.5 {
+            let output = self
+                .platform
+                .outputs
+                .iter()
+                .find(|output| output.key == output_key)
+                .ok_or_else(|| preparation_error(Stage::Discovery))?;
+            let mode = request.2.ok_or_else(|| preparation_error(Stage::Mode))?;
+            if mode.width != output.width
+                || mode.height != output.height
+                || mode.vrefresh != output.output.picked.vrefresh
+            {
+                return Err(preparation_error(Stage::Mode));
+            }
+            return Ok(PreparedClientModesetDescription {
+                description: CommitDescription {
+                    objects: Vec::new(),
+                    crtc_state: Vec::new(),
+                    present_consumers: Vec::new(),
+                    page_flip_event: false,
+                    property_ids: crate::kms::owner::closure::PropertyIds {
+                        crtc_id: 0,
+                        active: 0,
+                        out_fence_ptr: 0,
+                    },
+                },
+                staged_projection: None,
+                prepared_set: PreparedClientModesetSet {
+                    output: None,
+                    output_instance_id: None,
+                    scanout: None,
+                    scene: None,
+                    clock_key: None,
+                    mode_blob: None,
+                    allocation_keys: Vec::new(),
+                    #[cfg(test)]
+                    framebuffer_handles_for_tests: Vec::new(),
+                },
+            });
+        }
         let current = self
             .platform
             .outputs
@@ -3161,8 +3224,53 @@ impl KmsBackend {
                 return AdmissionOutcome::PreparationRefused;
             }
         };
+        #[cfg(test)]
+        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+            driver.client_modeset_topology_dispatches.push((
+                tag,
+                decision.tier,
+                description.objects.len(),
+                description.crtc_state.len(),
+            ));
+        }
         if self.lifecycle_client_modeset_requires_direct_unflip(device, tag) {
             self.lifecycle_park_client_modeset_for_unflip(device, token, tag);
+            return AdmissionOutcome::NothingAdmissible;
+        }
+        let position_only = self
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.client_modeset.as_ref())
+            .is_some_and(|slot| slot.tag == tag && slot.position_only);
+        if position_only {
+            if self
+                .platform
+                .owner_ref(device)
+                .is_none_or(|owner| !owner.slot().is_idle())
+            {
+                self.admission_abort(device, token);
+                return AdmissionOutcome::SlotBusy;
+            }
+            self.admission_abort(device, token);
+            if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                conductor
+                    .admission
+                    .cancel_topology(TopologyWork::ClientModeset(tag));
+            }
+            let Some(slot) = self.lifecycle_take_client_modeset_slot(device, tag) else {
+                return AdmissionOutcome::BeginRefused;
+            };
+            let crtc_token = slot.token;
+            let result = if self.lifecycle_promote_position_only_client_modeset(device, &slot) {
+                Ok(true)
+            } else {
+                Err(std::io::Error::other(ClientModesetFailure::Stale))
+            };
+            let promoted = result.is_ok();
+            let result = client_modeset_error_for_slot(device, &slot, result);
+            self.lifecycle_release_client_modeset_slot(slot);
+            self.lifecycle_end_client_modeset_direct_hold(device, tag, promoted);
+            self.complete_owner_client_modeset(crtc_token, result);
             return AdmissionOutcome::NothingAdmissible;
         }
         let required_clock_crtcs = description
@@ -3455,6 +3563,142 @@ impl KmsBackend {
         );
     }
 
+    fn lifecycle_promote_position_only_client_modeset(
+        &mut self,
+        device: DrmDeviceKey,
+        slot: &ClientModesetSlot,
+    ) -> bool {
+        // The caller revalidates the tag before taking its slot. The helper
+        // receives that owned slot, so `client_modeset_tag_current` would
+        // necessarily report false after the take.
+        if !slot.position_only {
+            return false;
+        }
+        let Some(mode) = slot.mode else {
+            return false;
+        };
+        let key = crate::kms::backend::OutputKey::new(device, slot.connector.clone());
+        let Some(output_idx) = self
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == key)
+        else {
+            return false;
+        };
+        let output = &self.platform.outputs[output_idx];
+        if output.width != mode.width
+            || output.height != mode.height
+            || output.output.picked.vrefresh != mode.vrefresh
+        {
+            return false;
+        }
+
+        let old_extent = (self.platform.fb_w, self.platform.fb_h);
+        self.platform.outputs[output_idx].x = slot.x;
+        self.platform.outputs[output_idx].y = slot.y;
+        let entry = self.randr_id_alloc.entry_mut(&key);
+        entry.config = crate::kms::render::backend::ConnectorConfig::Enabled {
+            mode_w: mode.width,
+            mode_h: mode.height,
+            vrefresh: mode.vrefresh,
+            x: slot.x,
+            y: slot.y,
+        };
+        entry.crtc_associated = true;
+        entry.client_configured = true;
+        entry.connected = true;
+        entry.last_enabled = None;
+        let (fb_w, fb_h) = crate::kms::render::platform::recompute_fb_extent_from(
+            &self
+                .platform
+                .outputs
+                .iter()
+                .map(|output| (output.x, output.y, output.width, output.height))
+                .collect::<Vec<_>>(),
+        );
+        self.platform.fb_w = fb_w;
+        self.platform.fb_h = fb_h;
+        self.update_input_extent(fb_w, fb_h);
+        let root_storage_changed = old_extent != (fb_w, fb_h);
+        if root_storage_changed {
+            self.replace_root_storage_after_owner_position(fb_w, fb_h);
+        }
+
+        let affected_devices = if root_storage_changed {
+            self.lifecycle_conductors_devices_for_root_change()
+        } else {
+            HashSet::from([device])
+        };
+        let mut offers = self.queued_composed_offers_for_layout(&affected_devices);
+        let affected_instances = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| affected_devices.contains(&output.key.device_key))
+            .map(|(index, output)| {
+                (
+                    output.key.device_key,
+                    self.platform.output_instance_ids[index],
+                )
+            })
+            .collect::<HashSet<_>>();
+        offers.extend(
+            self.scene
+                .queued_owner_offers_for_outputs(&affected_instances),
+        );
+        offers.sort_by_key(|offer| {
+            (
+                offer.device,
+                offer.crtc,
+                offer.generation,
+                offer.output_instance_id,
+            )
+        });
+        offers.dedup();
+        for offer in &offers {
+            self.scene.invalidate_queued_owner_offer(*offer);
+        }
+        self.withdraw_retired_composed_offers(offers);
+        self.scene
+            .promote_output_position(&key, slot.x, slot.y, root_storage_changed);
+
+        for affected in affected_devices.iter().copied() {
+            let _ = self.admission_advance_layout_generation(affected);
+        }
+        self.scene.wake_for_damage();
+        for affected in affected_devices {
+            let _ = self.admission_wake(affected, false);
+        }
+        true
+    }
+
+    fn queued_composed_offers_for_layout(
+        &self,
+        devices: &HashSet<DrmDeviceKey>,
+    ) -> Vec<crate::kms::render::scene::ComposedOffer> {
+        self.admission_conductors
+            .iter()
+            .filter(|(device, _)| devices.contains(device))
+            .flat_map(|(device, conductor)| {
+                conductor.composed.iter().filter_map(|(crtc, generation)| {
+                    let instance = conductor
+                        .composed_output_instances
+                        .get(crtc)
+                        .copied()
+                        .flatten()?;
+                    Some(crate::kms::render::scene::ComposedOffer {
+                        device: *device,
+                        crtc: *crtc,
+                        generation: *generation,
+                        output_instance_id: instance,
+                    })
+                })
+            })
+            .collect()
+    }
+
     fn lifecycle_client_modeset_requires_direct_unflip(
         &self,
         device: DrmDeviceKey,
@@ -3493,17 +3737,15 @@ impl KmsBackend {
             }
             saw_target = true;
             if let Some(mode) = slot.mode {
-                let Some(prepared_output) = prepared_output else {
-                    return true;
+                let picked = if slot.position_only {
+                    output.output.picked.clone()
+                } else {
+                    let Some(prepared_output) = prepared_output else {
+                        return true;
+                    };
+                    prepared_output.picked.clone()
                 };
-                projected.push((
-                    device,
-                    slot.x,
-                    slot.y,
-                    mode.width,
-                    mode.height,
-                    prepared_output.picked.clone(),
-                ));
+                projected.push((device, slot.x, slot.y, mode.width, mode.height, picked));
             }
         }
         if let Some(mode) = slot.mode

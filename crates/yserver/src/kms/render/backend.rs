@@ -15099,6 +15099,128 @@ impl KmsBackend {
         Ok(())
     }
 
+    /// Replace root and Composite overlay storage after an Owner topology
+    /// promotion has already crossed its direct-unflip and admission
+    /// barriers. This intentionally leaves the global Legacy topology epoch
+    /// and open Owner damage transactions alone: a kept output on another
+    /// device may still have an accepted composed flip in flight.
+    pub(super) fn replace_root_storage_after_owner_position(&mut self, w: u16, h: u16) {
+        let root_xid = self.core.window_id;
+        if let Some(old_id) = self.store.lookup(root_xid) {
+            self.store.detach_xid(root_xid);
+            self.store_decref_with_invalidate(old_id);
+            let storage = self
+                .platform
+                .allocate_drawable_storage_as(
+                    w,
+                    h,
+                    32,
+                    crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+                )
+                .unwrap_or_else(|error| {
+                    log::debug!(
+                        "Owner position promotion: root Vk allocation unavailable: {error:?}"
+                    );
+                    Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        PlatformBackend::format_for_depth(32),
+                    )
+                });
+            match self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage) {
+                Ok(root_id) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    let rect = ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D::default(),
+                        extent: ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                    };
+                    if let Err(error) = self.engine.fill_rect(
+                        &mut self.store,
+                        &mut self.platform,
+                        Dst::server_internal(root_id),
+                        rect,
+                        decode_x11_pixel_for_storage(
+                            self.core.bg_pixel.unwrap_or(0x0050_5050),
+                            24,
+                            PlatformBackend::format_for_depth(24),
+                        ),
+                    ) && self.platform.vk.is_some()
+                    {
+                        log::warn!("Owner position promotion: root fill failed: {error:?}");
+                    }
+                }
+                Err(error) => {
+                    log::warn!("Owner position promotion: root storage install failed: {error:?}")
+                }
+            }
+        }
+
+        if let Some(old_cow_id) = self.cow_id.take() {
+            let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+            self.store.detach_xid(cow_xid);
+            self.store_decref_with_invalidate(old_cow_id);
+            let storage = self
+                .platform
+                .allocate_drawable_storage_as(
+                    w,
+                    h,
+                    24,
+                    crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+                )
+                .unwrap_or_else(|error| {
+                    log::debug!(
+                        "Owner position promotion: overlay Vk allocation unavailable: {error:?}"
+                    );
+                    Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        PlatformBackend::format_for_depth(24),
+                    )
+                });
+            match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
+                Ok(cow_id) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    let rect = ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D::default(),
+                        extent: ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                    };
+                    if let Err(error) = self.engine.fill_rect(
+                        &mut self.store,
+                        &mut self.platform,
+                        Dst::server_internal(cow_id),
+                        rect,
+                        default_window_init_color(24),
+                    ) && self.platform.vk.is_some()
+                    {
+                        log::warn!("Owner position promotion: overlay fill failed: {error:?}");
+                    }
+                    self.cow_id = Some(cow_id);
+                    if let Some(geom) = self.windows.get_mut(&cow_xid) {
+                        geom.width = w;
+                        geom.height = h;
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Owner position promotion: overlay storage install failed: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Extent of the root drawable's backing storage, or `None` on a
     /// fixture whose root xid is not in the store.
     fn root_storage_extent(&self) -> Option<ash::vk::Extent2D> {
@@ -23074,38 +23196,6 @@ impl KmsBackend {
                 .apply_crtc_config(output_id, connector, mode, x, y)
                 .map(CrtcConfigApply::Applied);
         }
-        if let (
-            ConnectorConfig::Enabled {
-                mode_w,
-                mode_h,
-                vrefresh,
-                ..
-            },
-            Some(mode),
-        ) = (current, mode)
-            && mode_w == mode.width
-            && mode_h == mode.height
-            && vrefresh == mode.vrefresh
-        {
-            let modeset = self.admission_reserve_client_modeset_id(output_key.device_key)?;
-            return Err(crate::kms::render::admission::ClientModesetError {
-                diagnostic: crate::kms::render::admission::ClientModesetDiagnostic {
-                    device: output_key.device_key,
-                    modeset,
-                    output_id,
-                    output: connector.to_string(),
-                    requested_mode: Some(mode),
-                    x,
-                    y,
-                },
-                failure: crate::kms::render::admission::ClientModesetFailure::OwnerRefused(
-                    crate::kms::render::admission::OwnerRefusal::NotYetSupported(
-                        crate::kms::render::admission::ClientModesetUnsupportedFeature::PositionOnly,
-                    ),
-                ),
-            }
-            .into_io_error());
-        }
         if mode.is_some()
             && self
                 .platform
@@ -25340,7 +25430,7 @@ impl Backend for KmsBackend {
 
         {
             let entry = self.randr_id_alloc.entry_mut(&pending.output_key);
-            entry.config = ConnectorConfig::Enabled {
+            entry.config = crate::kms::render::backend::ConnectorConfig::Enabled {
                 mode_w: pending.mode.width,
                 mode_h: pending.mode.height,
                 vrefresh: pending.mode.vrefresh,
@@ -63499,6 +63589,167 @@ mod tests {
         Ok((fixture, device_key, ids.output_id, connector, target_mode))
     }
 
+    fn c0_3bi_live_two_owner_position_backend(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> Result<(OwnerLiveFixture, DrmDeviceKey, DrmDeviceKey, u32, String), std::io::Error> {
+        let (mut fixture, device_a, output_id, connector, _) =
+            c0_3bi_live_modeset_backend(behaviour, true)?;
+        let backend = &mut fixture.backend;
+        let device_b = DrmDeviceKey {
+            major: 0x7fff_ff00,
+            minor: 41,
+        };
+        push_test_device(backend, device_b);
+        // The fixture's second pool was initially registered under A. Drop
+        // those unused fixture leases before changing its output identity,
+        // then adopt the same BOs again after the new B instance is installed.
+        {
+            let (service, registry) = (
+                backend
+                    .resource_service
+                    .as_mut()
+                    .expect("fixture resource service"),
+                backend
+                    .drm_cleanup_registry
+                    .as_mut()
+                    .expect("fixture cleanup registry"),
+            );
+            backend.platform.scanout_pools[1]
+                .as_mut()
+                .expect("second output pool")
+                .detach_managed_entries(Some(registry));
+            service.service_ready_with_registry(registry);
+        }
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(behaviour)
+            .map_err(|error| std::io::Error::other(format!("second Owner executor: {error}")))?;
+        let (incarnation, lifecycle) = executor.owner_identity();
+        let drm_device_a = std::rc::Rc::clone(
+            &backend
+                .platform
+                .device_for_key(device_a)
+                .expect("first fixture device")
+                .device,
+        );
+        let second_device = backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device_b)
+            .expect("second fixture device");
+        second_device.device = drm_device_a;
+        second_device.executor = Some(executor);
+        second_device.owner = Some(crate::kms::owner::device::DeviceCommitOwner::new(
+            incarnation,
+            lifecycle,
+            1,
+        ));
+
+        let output_key = OutputKey::new(device_b, "position-test-output-b");
+        {
+            let output = &mut backend.platform.outputs[1];
+            output.key = output_key.clone();
+            output.scanout_route.kms_device_key = device_b;
+            // The fixture starts this synthetic output without discovered
+            // KMS property handles. Seed the same persistent ids used by the
+            // other live Owner fixture so B can become composed-ready.
+            output.output.plane = ::drm::control::from_u32(11).expect("B fixture plane");
+            output.output.plane_fb_id_prop =
+                ::drm::control::from_u32(19).expect("B fixture FB_ID property");
+            output.output.plane_crtc_id_prop =
+                ::drm::control::from_u32(20).expect("B fixture CRTC_ID property");
+            output.output.crtc_out_fence_ptr_prop =
+                Some(::drm::control::from_u32(22).expect("B fixture OUT_FENCE_PTR property"));
+        }
+        backend
+            .platform
+            .rebuild_output_instance_ids_for_tests()
+            .map_err(|error| std::io::Error::other(format!("second output identity: {error}")))?;
+        let vk = backend
+            .platform
+            .vk
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("second output Vulkan context"))?;
+        let replacement_pool = backend
+            .platform
+            .allocate_test_output_scanout(vk, 1)
+            .map_err(|error| {
+                std::io::Error::other(format!("second output pool recreation: {error}"))
+            })?;
+        let replacement_bo_count = replacement_pool.display_pool().bos.len();
+        backend.platform.scanout_pools[1] = Some(replacement_pool);
+        backend.platform.bo_generations[1] = vec![Default::default(); replacement_bo_count];
+        backend
+            .scene
+            .rebuild_outputs(&backend.platform)
+            .map_err(|error| std::io::Error::other(format!("second output scene: {error:?}")))?;
+
+        let bo_count = backend.platform.scanout_pools[1]
+            .as_ref()
+            .expect("second output pool")
+            .display_pool()
+            .bos
+            .len();
+        {
+            let platform = &mut backend.platform;
+            let service = backend
+                .resource_service
+                .as_mut()
+                .expect("fixture resource service");
+            let registry = backend
+                .drm_cleanup_registry
+                .as_mut()
+                .expect("fixture cleanup registry");
+            for bo_idx in 0..bo_count {
+                platform
+                    .register_managed_scanout_bo(service, registry, 1, bo_idx)
+                    .map_err(|error| {
+                        std::io::Error::other(format!("second output BO adoption: {error:?}"))
+                    })?;
+            }
+        }
+
+        let crtc = u32::from(backend.platform.outputs[1].output.crtc);
+        backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device_b)
+            .expect("second fixture device")
+            .active_property_cache
+            .insert_for_tests(crtc, 21);
+        let output = &backend.platform.outputs[1];
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&output_key);
+            entry.connected = true;
+            entry.config = crate::kms::render::backend::ConnectorConfig::Enabled {
+                mode_w: output.width,
+                mode_h: output.height,
+                vrefresh: output.output.picked.vrefresh,
+                x: output.x,
+                y: output.y,
+            };
+            entry.modes = output.output.modes.clone();
+            entry.edid = output.output.edid.clone();
+            entry.mm_width = output.output.mm_width;
+            entry.mm_height = output.output.mm_height;
+            entry.connector_type = output.output.connector_type.clone();
+        }
+        backend.output_key_by_id.insert(ids.output_id, output_key);
+
+        install_admission_owner_gate(backend, device_b);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            device_b,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend
+            .lifecycle_register_owner_device(device_b)
+            .map_err(|error| std::io::Error::other(format!("second Owner lifecycle: {error:?}")))?;
+        backend.activate_admission_clock_probes(device_b);
+        Ok((fixture, device_a, device_b, output_id, connector))
+    }
+
     fn c0_3bi_copied_live_modeset_backend(
         behaviour: crate::kms::executor::test_support::StubBehaviour,
     ) -> Result<
@@ -63658,12 +63909,35 @@ mod tests {
         connector: &str,
         mode: Option<yserver_core::backend::ModeSpec>,
     ) -> yserver_core::backend::CrtcConfigToken {
-        let result = Backend::begin_crtc_config(backend, output_id, connector, mode, 0, 0)
+        c0_3bi_begin_client_modeset_at(backend, output_id, connector, mode, 0, 0)
+    }
+
+    fn c0_3bi_begin_client_modeset_at(
+        backend: &mut super::KmsBackend,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> yserver_core::backend::CrtcConfigToken {
+        let result = Backend::begin_crtc_config(backend, output_id, connector, mode, x, y)
             .expect("Owner client modeset begin");
         let CrtcConfigApply::Pending(token) = result else {
             panic!("non-idempotent Owner request must occupy the asynchronous slot")
         };
         token
+    }
+
+    fn c0_3bi_current_mode(
+        backend: &super::KmsBackend,
+        output_idx: usize,
+    ) -> yserver_core::backend::ModeSpec {
+        let output = &backend.platform.outputs[output_idx];
+        yserver_core::backend::ModeSpec {
+            width: output.width,
+            height: output.height,
+            vrefresh: output.output.picked.vrefresh,
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88547,6 +88821,635 @@ mod tests {
             backend,
             "c0_3bi_h_end_state_check_catches_a_stuck_phase_vulkan",
             &c0_3bi_expected_end_state([output_key]),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_position_only_sends_no_kms_call_vulkan() {
+        use crate::kms::{executor::test_support::StubBehaviour, owner::admission::Tier};
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), true)
+                .expect("environmental skip: live Vulkan position-only fixture");
+        backend.platform.owner_completion_detached = true;
+        let expected_live_outputs = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect::<Vec<_>>();
+        let original_extent = (backend.platform.fb_w, backend.platform.fb_h);
+        let original_identity = backend
+            .scene
+            .output_scene_identity_for_tests(0)
+            .expect("output scene state");
+        let registry_key = OutputKey::new(device, connector.clone());
+        let hardware_crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let clock_ready = |backend: &super::KmsBackend| {
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| {
+                    owner
+                        .clock_key_for_hardware_crtc(hardware_crtc)
+                        .and_then(|key| owner.clock(key))
+                })
+                .is_some_and(|clock| {
+                    matches!(clock.probe, crate::kms::owner::clock::ProbeState::Succeeded)
+                })
+        };
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "qualify the output clock before measuring position-only requests",
+            std::time::Duration::from_secs(3),
+            &clock_ready,
+            None,
+        )
+        .expect("output clock probe reaches Owner through core entries");
+        c0_3bi_complete_owner_followups(
+            &mut backend,
+            device,
+            4,
+            "settle startup Owner frames before measuring position-only requests",
+        );
+        let mode = c0_3bi_current_mode(&backend, 0);
+        let sent_before = backend
+            .platform
+            .device_for_key(device)
+            .and_then(|entry| entry.executor.as_ref())
+            .expect("shared kernel-faithful executor")
+            .sent_requests_for_tests();
+
+        let token =
+            c0_3bi_begin_client_modeset_at(&mut backend, output_id, &connector, Some(mode), 1, 0);
+        assert_eq!(
+            backend
+                .platform
+                .device_for_key(device)
+                .and_then(|entry| entry.executor.as_ref())
+                .expect("shared kernel-faithful executor")
+                .sent_requests_for_tests(),
+            sent_before,
+            "the position-only transaction sends no TEST_ONLY or live atomic request"
+        );
+        c0_3bi_drive_crtc_config_result(&mut backend, token, "position-only logical promotion");
+        assert!(
+            c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect("position-only request succeeds")
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_topology_dispatches_for_tests()
+                .iter()
+                .any(|(_, tier, objects, crtcs)| {
+                    *tier == Tier::Topology && *objects == 0 && *crtcs == 0
+                })
+        );
+        assert_eq!(backend.platform.outputs[0].x, 1);
+        let registry = backend
+            .randr_id_alloc
+            .entry(&registry_key)
+            .expect("position-only output registry entry");
+        assert_eq!(
+            registry.config,
+            super::ConnectorConfig::Enabled {
+                mode_w: mode.width,
+                mode_h: mode.height,
+                vrefresh: mode.vrefresh,
+                x: 1,
+                y: 0,
+            },
+            "the Owner registry publishes the same logical CRTC position as Legacy"
+        );
+        assert!(registry.crtc_associated);
+        assert!(registry.client_configured);
+        assert!(registry.connected);
+        assert!(registry.last_enabled.is_none());
+        assert_eq!(backend.scene.output_origin_for_tests(0), Some((1, 0)));
+        assert_eq!(
+            backend.scene.output_scene_identity_for_tests(0),
+            Some(original_identity),
+            "position-only promotion preserves the existing scene state"
+        );
+        assert_eq!(
+            (backend.platform.fb_w, backend.platform.fb_h),
+            original_extent
+        );
+        let (validation_sends, live_sends) =
+            backend.lifecycle_drivers[&device].client_modeset_test_stats();
+        assert!(validation_sends.is_empty());
+        assert!(live_sends.is_empty());
+        c0_3bi_complete_owner_followups(
+            &mut backend,
+            device,
+            2,
+            "settle ordinary repaint after position-only promotion",
+        );
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_position_only_sends_no_kms_call_vulkan",
+            &c0_3bi_expected_end_state(expected_live_outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_position_only_waits_behind_an_accepted_flip_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour, owner::admission::Tier,
+            render::owner_buffer::OwnerBufferState,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), false)
+                .expect("environmental skip: live Vulkan position-only fixture");
+        let expected_live_outputs = vec![OutputKey::new(device, connector.clone())];
+        backend.platform.owner_completion_detached = true;
+        c0_3bi_compose_and_drain(&mut backend);
+        let accepted_commit = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("baseline composed Owner commit")
+            .commit_id();
+        c0_3bi_wait_owner_commit_accepted(
+            &mut backend,
+            device,
+            accepted_commit,
+            "accept baseline composed frame",
+        );
+
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "queue a composed frame behind the accepted flip",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.admission_conductors[&device]
+                    .composed
+                    .get(&crtc)
+                    .is_some_and(|generation| *generation > 0)
+            },
+            None,
+        )
+        .expect("core driver queues the next composed generation");
+        let queued_generation = backend.admission_conductors[&device].composed[&crtc];
+        assert!(
+            matches!(
+                backend
+                    .scene
+                    .owner_state_for_generation_for_tests(0, queued_generation),
+                Some(OwnerBufferState::Desired | OwnerBufferState::Displaced)
+            ),
+            "the old-layout composed offer retains its Owner buffer while the accepted flip occupies the slot"
+        );
+
+        let mode = c0_3bi_current_mode(&backend, 0);
+        let token =
+            c0_3bi_begin_client_modeset_at(&mut backend, output_id, &connector, Some(mode), 1, 0);
+        assert!(!c0_3bi_has_crtc_config_result(&backend, token));
+        assert_eq!(backend.platform.outputs[0].x, 0);
+        assert!(backend.platform.owner_ref(device).is_some_and(|owner| {
+            owner.live_record().is_some_and(|record| {
+                record.commit_id() == accepted_commit && record.milestones().accepted
+            })
+        }));
+
+        // The stub's /dev/null out-fence cannot signal a real kernel event;
+        // this helper supplies HardwareComplete and PageFlip through the core-entry driver.
+        c0_3bi_complete_owner_commit_through_core_driver(
+            &mut backend,
+            device,
+            accepted_commit,
+            "retire accepted flip before position promotion",
+        );
+        c0_3bi_drive_crtc_config_result(
+            &mut backend,
+            token,
+            "promote position after accepted flip retires",
+        );
+        assert!(
+            c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect("queued position-only request succeeds")
+        );
+        assert_eq!(backend.platform.outputs[0].x, 1);
+        assert!(
+            !matches!(
+                backend
+                    .scene
+                    .owner_state_for_generation_for_tests(0, queued_generation),
+                Some(
+                    OwnerBufferState::Rendering
+                        | OwnerBufferState::Desired
+                        | OwnerBufferState::Submitted
+                        | OwnerBufferState::Accepted
+                )
+            ),
+            "an old-layout frame is no longer dispatchable after position promotion"
+        );
+        assert!(
+            !backend.admission_conductors[&device]
+                .composed
+                .contains_key(&crtc)
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_topology_dispatches_for_tests()
+                .last()
+                .map(|(_, tier, objects, crtcs)| (*tier, *objects, *crtcs)),
+            Some((Tier::Topology, 0, 0))
+        );
+        c0_3bi_complete_owner_followups(&mut backend, device, 2, "finish position-only repaint");
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_position_only_waits_behind_an_accepted_flip_vulkan",
+            &c0_3bi_expected_end_state(expected_live_outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_position_only_updates_in_place_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (OwnerLiveFixture { mut backend, .. }, device, output_id, connector, _) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), false)
+                .expect("environmental skip: live Vulkan position-only fixture");
+        let expected_live_outputs = vec![OutputKey::new(device, connector.clone())];
+        backend.platform.owner_completion_detached = true;
+        c0_3bi_settle_composed_owner_frame(
+            &mut backend,
+            device,
+            "settle Owner buffer before position-only promotion",
+        );
+        let state_identity = backend
+            .scene
+            .output_scene_identity_for_tests(0)
+            .expect("output scene state");
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("output instance");
+        let owner_buffer_identities = backend.scene.owner_buffer_identities_for_tests(0);
+        let owner_buffer_states = backend.scene.owner_buffer_states_for_tests(0);
+        let pool_occupancy = backend
+            .scene
+            .tick_diagnostics_for_tests(0)
+            .expect("output pool diagnostics")
+            .pool_occupancy;
+        let pending_release_count = backend.scene.pending_pool_release_count_for_tests(0);
+        let ticket = backend
+            .platform
+            .fence_pool
+            .as_ref()
+            .expect("live Vulkan fence pool")
+            .acquire()
+            .expect("acquire unsignaled Vulkan fence");
+        backend
+            .scene
+            .defer_current_pool_release_for_tests(0, ticket.clone())
+            .expect("hold one output pool-ring release");
+        let mode = c0_3bi_current_mode(&backend, 0);
+
+        let token =
+            c0_3bi_begin_client_modeset_at(&mut backend, output_id, &connector, Some(mode), 1, 0);
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(instance)
+        );
+        assert_eq!(
+            backend.scene.output_scene_identity_for_tests(0),
+            Some(state_identity),
+            "the same OutputSceneState is updated in place"
+        );
+        assert_eq!(
+            backend.scene.owner_buffer_identities_for_tests(0),
+            owner_buffer_identities,
+            "the scanout-owner records stay attached to the same scene state"
+        );
+        assert_eq!(
+            backend.scene.owner_buffer_states_for_tests(0),
+            owner_buffer_states
+        );
+        assert_eq!(
+            backend
+                .scene
+                .tick_diagnostics_for_tests(0)
+                .expect("output pool diagnostics")
+                .pool_occupancy,
+            (pool_occupancy.0 + 1, pool_occupancy.1),
+            "the held pool-ring slot remains occupied through promotion"
+        );
+        assert_eq!(
+            backend.scene.pending_pool_release_count_for_tests(0),
+            pending_release_count + 1
+        );
+        assert_eq!(backend.scene.output_origin_for_tests(0), Some((1, 0)));
+        c0_3bi_drive_crtc_config_result(&mut backend, token, "finish in-place position update");
+        assert!(
+            c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect("position-only request succeeds")
+        );
+
+        ticket.test_signal();
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "release held pool-ring slot through core driver",
+            std::time::Duration::from_secs(3),
+            &|backend| backend.scene.pending_pool_release_count_for_tests(0) == 0,
+            None,
+        )
+        .expect("core driver observes the signaled Vulkan fence");
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_position_only_updates_in_place_vulkan",
+            &c0_3bi_expected_end_state(expected_live_outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_root_change_repaints_kept_outputs_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour, owner::completion::CompletionClass,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device_a, device_b, output_id, connector) =
+            c0_3bi_live_two_owner_position_backend(StubBehaviour::AcceptKernelCalls(1_000))
+                .expect("environmental skip: live two-Owner position fixture");
+        let expected_live_outputs = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect::<Vec<_>>();
+        let b_output_key = backend.platform.outputs[1].key.clone();
+        let b_instance = backend
+            .scene
+            .output_instance_id_for_tests(1)
+            .expect("kept output B instance");
+        let b_images = c0_3bi_scanout_images(&backend, 1);
+        let b_scene_identity = backend
+            .scene
+            .output_scene_identity_for_tests(1)
+            .expect("kept output B scene state");
+        let b_crtc = u32::from(backend.platform.outputs[1].output.crtc);
+        let clocks_ready = |backend: &super::KmsBackend| {
+            backend
+                .platform
+                .owner_ref(device_b)
+                .and_then(|owner| {
+                    owner
+                        .clock_key_for_hardware_crtc(b_crtc)
+                        .and_then(|key| owner.clock(key))
+                })
+                .is_some_and(|clock| {
+                    matches!(clock.probe, crate::kms::owner::clock::ProbeState::Succeeded)
+                })
+        };
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "qualify device B clock through its executor",
+            std::time::Duration::from_secs(3),
+            &clocks_ready,
+            None,
+        )
+        .expect("device B probe reply reaches Owner through core entries");
+
+        backend.platform.owner_completion_detached = true;
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "accept the initial composed frame on device A",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device_a)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .expect("device A's initial frame is accepted");
+        let a_commit = backend
+            .platform
+            .owner_ref(device_a)
+            .and_then(|owner| owner.live_record())
+            .expect("A's accepted composed commit")
+            .commit_id();
+        // The stub's /dev/null out-fence cannot signal or emit a kernel
+        // PageFlip; the core-entry helper models those kernel effects.
+        c0_3bi_complete_owner_commit_through_core_driver(
+            &mut backend,
+            device_a,
+            a_commit,
+            "settle device A before waiting on device B",
+        );
+        c0_3bi_complete_owner_followups(
+            &mut backend,
+            device_a,
+            2,
+            "settle device A's initial repaint",
+        );
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "accept device B's composed frame",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device_b)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .expect("device B's composed frame is accepted through its executor");
+        let b_commit = backend
+            .platform
+            .owner_ref(device_b)
+            .and_then(|owner| owner.live_record())
+            .expect("B's accepted composed commit")
+            .commit_id();
+        let b_damage_before = backend
+            .scene
+            .scanout_damage_signature_for_tests(1)
+            .expect("B scanout damage before root resize");
+
+        // A can offer another scene generation while the bounded driver
+        // waits for B's executor. Settle those accepted A flips through the
+        // same core entries before beginning A's logical position request.
+        c0_3bi_complete_owner_followups(
+            &mut backend,
+            device_a,
+            4,
+            "settle device A before the root-changing position request",
+        );
+
+        let mode = c0_3bi_current_mode(&backend, 0);
+        let old_extent = (backend.platform.fb_w, backend.platform.fb_h);
+        let new_x = i32::from(old_extent.0).saturating_add(1);
+        let token = c0_3bi_begin_client_modeset_at(
+            &mut backend,
+            output_id,
+            &connector,
+            Some(mode),
+            new_x,
+            0,
+        );
+        c0_3bi_drive_crtc_config_result(
+            &mut backend,
+            token,
+            "promote root-changing position while device B is accepted",
+        );
+        assert!(
+            c0_3bi_take_crtc_config_result(&mut backend, token)
+                .expect("position-only request succeeds")
+        );
+        assert!(backend.platform.fb_w > old_extent.0);
+        assert_eq!(
+            backend.root_storage_extent().map(|extent| extent.width),
+            Some(u32::from(backend.platform.fb_w))
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(1),
+            Some(b_instance)
+        );
+        assert_eq!(
+            backend.scene.output_scene_identity_for_tests(1),
+            Some(b_scene_identity),
+            "root resizing keeps B's OutputSceneState and scanout pool"
+        );
+        assert_eq!(c0_3bi_scanout_images(&backend, 1), b_images);
+        let b_damage_after = backend
+            .scene
+            .scanout_damage_signature_for_tests(1)
+            .expect("B scanout damage after root resize");
+        let b_full_area = u64::from(backend.platform.outputs[1].width)
+            * u64::from(backend.platform.outputs[1].height);
+        assert_ne!(
+            b_damage_after, b_damage_before,
+            "root replacement invalidates the kept output's prior damage state"
+        );
+        assert_eq!(b_damage_after.0, b_full_area);
+        assert!(b_damage_after.1.iter().all(|area| *area == b_full_area));
+        assert!(!b_damage_after.2, "full invalidation clears a staged frame");
+        assert!(backend.platform.owner_ref(device_b).is_some_and(|owner| {
+            owner.live_record().is_some_and(|record| {
+                record.commit_id() == b_commit && record.milestones().accepted
+            })
+        }));
+        assert_eq!(backend.platform.outputs[1].key, b_output_key);
+
+        c0_3bi_complete_owner_commit_through_core_driver(
+            &mut backend,
+            device_b,
+            b_commit,
+            "finish device B's pre-resize accepted flip",
+        );
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "dispatch device B's class-2 full repaint",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device_b)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| {
+                        record.milestones().accepted
+                            && record.completion_context().class == CompletionClass::FastUpdate
+                    })
+            },
+            None,
+        )
+        .expect("kept output B repaints through ordinary Owner admission");
+        assert!(
+            backend.lifecycle_drivers[&device_b]
+                .client_modeset
+                .is_none()
+        );
+        let (validation_sends, live_sends) =
+            backend.lifecycle_drivers[&device_b].client_modeset_test_stats();
+        assert!(validation_sends.is_empty());
+        assert!(live_sends.is_empty());
+        c0_3bi_complete_owner_followups(&mut backend, device_b, 2, "finish kept output B repaint");
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_root_change_repaints_kept_outputs_vulkan",
+            &c0_3bi_expected_end_state(expected_live_outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_position_change_invalidates_direct_eligibility_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, output_id, connector, _, _) =
+            c0_3bi_live_direct_modeset_fixture(StubBehaviour::AcceptKernelCalls(1_000))
+                .expect("environmental skip: live direct position fixture");
+        let backend = &mut fixture.backend;
+        let expected_live_outputs = vec![OutputKey::new(device, connector.clone())];
+        // The executor's /dev/null out-fence cannot report kernel
+        // HardwareComplete; the unflip retirement helper supplies that
+        // kernel effect through the Owner-completion core entry below.
+        backend.platform.owner_completion_detached = true;
+        let old_x = backend.platform.outputs[0].x;
+        let mode = c0_3bi_current_mode(backend, 0);
+        let token = c0_3bi_begin_client_modeset_at(
+            backend,
+            output_id,
+            &connector,
+            Some(mode),
+            old_x.saturating_add(1),
+            0,
+        );
+        let unflip_commit = backend
+            .scanout_m2
+            .owner_unflip_return
+            .as_ref()
+            .filter(|record| record.commit.device == device)
+            .map(|record| record.commit.commit)
+            .expect("position change requests direct unflip");
+        assert_eq!(backend.platform.outputs[0].x, old_x);
+        assert!(backend.lifecycle_drivers[&device].client_modeset.is_some());
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .is_empty()
+        );
+        c0_3bi_wait_owner_commit_accepted(
+            backend,
+            device,
+            unflip_commit,
+            "accept direct unflip before moving output",
+        );
+        c0_3bi_retire_owner_unflip(backend, device, unflip_commit, None);
+        c0_3bi_drive_crtc_config_result(
+            backend,
+            token,
+            "promote position after direct unflip retires",
+        );
+        assert!(
+            c0_3bi_take_crtc_config_result(backend, token)
+                .expect("position-only request succeeds after unflip")
+        );
+        assert_eq!(backend.platform.outputs[0].x, old_x.saturating_add(1));
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .0
+                .is_empty()
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3bi_position_change_invalidates_direct_eligibility_vulkan",
+            &c0_3bi_expected_end_state(expected_live_outputs),
         );
     }
 
