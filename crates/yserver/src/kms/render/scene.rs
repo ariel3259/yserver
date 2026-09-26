@@ -2194,6 +2194,121 @@ impl SceneCompositor {
         Ok(())
     }
 
+    /// Rebuild only selected Legacy-device outputs after their topology was
+    /// fully quiesced. Kept outputs retain their scene state by output
+    /// instance, even when a Legacy output removal shifts their index.
+    pub(crate) fn rebuild_outputs_for_devices(
+        &mut self,
+        platform: &PlatformBackend,
+        rebuild_devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) -> Result<(), SceneError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        assert_eq!(
+            platform.outputs.len(),
+            platform.output_instance_ids.len(),
+            "Legacy scene rebuild requires parallel output instances"
+        );
+        let vk = inner.vk.clone();
+        let mut rebuilt = HashMap::new();
+        for (output_idx, layout) in platform.outputs.iter().enumerate() {
+            if rebuild_devices.contains(&layout.key.device_key) {
+                let state = Self::build_output_state(&vk, platform, output_idx)?;
+                rebuilt.insert(layout.key.clone(), state);
+            }
+        }
+
+        // Keep the existing Vec allocation when every retained output remains
+        // at the same index. This preserves the kept scene object itself as
+        // well as its OutputInstanceId and GPU/KMS bookkeeping.
+        let keeps_at_same_index = platform
+            .outputs
+            .iter()
+            .zip(&platform.output_instance_ids)
+            .enumerate()
+            .all(|(output_idx, (layout, &instance_id))| {
+                rebuild_devices.contains(&layout.key.device_key)
+                    || inner.outputs.get(output_idx).is_some_and(|state| {
+                        state.output_key == layout.key && state.output_instance_id == instance_id
+                    })
+            });
+        if keeps_at_same_index && platform.outputs.len() <= inner.outputs.capacity() {
+            for (output_idx, (layout, &instance_id)) in platform
+                .outputs
+                .iter()
+                .zip(&platform.output_instance_ids)
+                .enumerate()
+            {
+                if rebuild_devices.contains(&layout.key.device_key) {
+                    let state = rebuilt
+                        .remove(&layout.key)
+                        .expect("selected Legacy output was staged before promotion");
+                    if output_idx < inner.outputs.len() {
+                        // Legacy quiesce drained this output's scene and pool
+                        // before topology mutation, so the replaced state has
+                        // no outstanding GPU or KMS proof debt.
+                        inner.outputs[output_idx] = state;
+                    } else {
+                        inner.outputs.push(state);
+                    }
+                } else {
+                    let state = &mut inner.outputs[output_idx];
+                    assert_eq!(state.output_key, layout.key);
+                    assert_eq!(state.output_instance_id, instance_id);
+                    state.output_idx = output_idx;
+                }
+            }
+            inner.outputs.truncate(platform.outputs.len());
+            inner
+                .owner_offers
+                .retain(|offer| !rebuild_devices.contains(&offer.device));
+            self.scene_structure_dirty = true;
+            self.root_overlay_clear();
+            return Ok(());
+        }
+
+        let mut old_states = std::mem::take(&mut inner.outputs)
+            .into_iter()
+            .map(|state| (state.output_instance_id, state))
+            .collect::<HashMap<_, _>>();
+        let mut outputs = Vec::with_capacity(platform.outputs.len());
+        for (output_idx, (layout, &instance_id)) in platform
+            .outputs
+            .iter()
+            .zip(&platform.output_instance_ids)
+            .enumerate()
+        {
+            if rebuild_devices.contains(&layout.key.device_key) {
+                // Legacy quiesce drained this output's scene and pool before
+                // topology mutation, so its old state has no outstanding
+                // GPU or KMS proof debt and can be dropped here.
+                old_states.retain(|_, state| state.output_key != layout.key);
+                outputs.push(
+                    rebuilt
+                        .remove(&layout.key)
+                        .expect("selected Legacy output was staged before promotion"),
+                );
+                continue;
+            }
+
+            let mut state = old_states
+                .remove(&instance_id)
+                .expect("kept output scene state is present by instance id");
+            assert_eq!(state.output_key, layout.key);
+            assert_eq!(state.output_instance_id, instance_id);
+            state.output_idx = output_idx;
+            outputs.push(state);
+        }
+        inner.outputs = outputs;
+        inner
+            .owner_offers
+            .retain(|offer| !rebuild_devices.contains(&offer.device));
+        self.scene_structure_dirty = true;
+        self.root_overlay_clear();
+        Ok(())
+    }
+
     /// Stage 3f.8: register the software cursor sprite after the
     /// backend has uploaded its pixel data. Idempotent — a later
     /// `define_cursor` flow (Stage 4) can swap the entry. Drops to

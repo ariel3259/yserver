@@ -3665,6 +3665,33 @@ impl KmsBackend {
         Ok(())
     }
 
+    fn relight_after_direct_teardown_for_devices(
+        &mut self,
+        required: bool,
+        context: &'static str,
+        devices: &HashSet<DrmDeviceKey>,
+    ) -> io::Result<()> {
+        if !required {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .platform
+            .dpms_set_outputs_active_for_devices(true, devices)
+        {
+            self.kms_outputs_active = false;
+            log::error!("scanout_m2: {context}: composed re-light failed: {error}; exiting");
+            self.request_exit();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("scanout M2 {context}: composed re-light failed: {error}"),
+            ));
+        }
+        // A full modeset may reset the hardware LUT. Reapply only after the
+        // selected Legacy framebuffers have been restored.
+        self.reapply_gamma_for_devices(devices);
+        Ok(())
+    }
+
     /// Stop grouped direct scanout while the old output/CRTC routing is still
     /// authoritative. A subsequent topology query is allowed to remove or
     /// reassign those objects, so releasing the client framebuffer afterward
@@ -3847,14 +3874,103 @@ impl KmsBackend {
         Ok(())
     }
 
+    fn quiesce_before_topology_mutation_for_devices(
+        &mut self,
+        context: &'static str,
+        devices: &HashSet<DrmDeviceKey>,
+    ) -> io::Result<()> {
+        self.bump_crtc_config_topology_epoch_for_devices(context, devices);
+        let old_pending_pageflips = self.pending_pageflip_crtcs_for_devices(devices);
+        let direct_legacy = self.scanout_m2.active() && self.scanout_m2_touches_devices(devices);
+        if direct_legacy {
+            if let Err(error) = self.materialize_direct_shadow_for_unflip() {
+                self.request_exit();
+                return Err(error);
+            }
+        } else {
+            self.platform.wait_idle_bounded();
+        }
+
+        if let Err(error) = self
+            .platform
+            .dpms_set_outputs_active_for_devices(false, devices)
+        {
+            log::error!(
+                "kms: {context}: could not disable the selected Legacy output topology: {error}; exiting"
+            );
+            self.request_exit();
+            return Err(error);
+        }
+        if direct_legacy {
+            self.stop_direct_after_scanout_replaced(context);
+            self.scanout_m1.clear(context);
+        }
+        self.clear_armed_vblank_targets_for_devices(devices);
+
+        if let Err(error) = self
+            .platform
+            .discard_old_drm_events_after_all_off_for_devices(
+                &old_pending_pageflips,
+                std::time::Duration::from_secs(1),
+                Some(devices),
+            )
+        {
+            log::error!(
+                "kms: {context}: selected Legacy page-flip events could not be retired safely: {error}; exiting"
+            );
+            self.request_exit();
+            return Err(error);
+        }
+
+        // Direct teardown may have submitted the lazy COW copy immediately
+        // before disabling scanout. Wait for that work, then retire only the
+        // selected Legacy scene and pool state while the old indices remain
+        // authoritative.
+        self.platform.wait_idle_bounded();
+        self.scene
+            .drain_devices(&mut self.platform, self.resource_service.as_mut(), devices);
+        if let Err(error) = self.platform.reset_scanout_bos_for_devices(Some(devices)) {
+            self.kms_outputs_active = false;
+            log::error!(
+                "kms: {context}: selected Legacy scanout devices could not be quiesced after all outputs were disabled: {error}; preserving quarantine and exiting"
+            );
+            self.request_exit();
+            return Err(error);
+        }
+        self.scanout_m1.clear(context);
+        Ok(())
+    }
+
     fn recover_failed_crtc_config(
         &mut self,
         restore_old_topology: bool,
         original: io::Error,
     ) -> io::Error {
-        let scene_recovery_failed = if let Err(scene_error) =
+        self.recover_failed_crtc_config_inner(restore_old_topology, original, None)
+    }
+
+    fn recover_failed_crtc_config_for_devices(
+        &mut self,
+        restore_old_topology: bool,
+        original: io::Error,
+        devices: &HashSet<DrmDeviceKey>,
+    ) -> io::Error {
+        self.recover_failed_crtc_config_inner(restore_old_topology, original, Some(devices))
+    }
+
+    fn recover_failed_crtc_config_inner(
+        &mut self,
+        restore_old_topology: bool,
+        original: io::Error,
+        devices: Option<&HashSet<DrmDeviceKey>>,
+    ) -> io::Error {
+        let scene_rebuild = if let Some(devices) = devices {
+            self.scene
+                .rebuild_outputs_for_devices(&self.platform, devices)
+        } else {
             self.scene.rebuild_outputs(&self.platform)
-        {
+        };
+        let scene_recovery_failed = if let Err(scene_error) = scene_rebuild {
             log::error!(
                 "apply_crtc_config: scene recovery after failure also failed: {scene_error:?}; exiting"
             );
@@ -3864,10 +3980,19 @@ impl KmsBackend {
         } else {
             false
         };
-        match self.relight_after_direct_teardown(
-            restore_old_topology,
-            "RANDR CRTC configuration recovery",
-        ) {
+        let relight = if let Some(devices) = devices {
+            self.relight_after_direct_teardown_for_devices(
+                restore_old_topology,
+                "RANDR CRTC configuration recovery",
+                devices,
+            )
+        } else {
+            self.relight_after_direct_teardown(
+                restore_old_topology,
+                "RANDR CRTC configuration recovery",
+            )
+        };
+        match relight {
             Ok(()) => {
                 if !scene_recovery_failed {
                     self.kms_outputs_active =
@@ -25806,13 +25931,26 @@ impl Backend for KmsBackend {
         }
 
         let restore_old_on_failure = pending.was_active;
-        self.quiesce_before_topology_mutation("asynchronous RANDR CRTC configuration changed")?;
+        let scoped_legacy_devices =
+            self.legacy_modeset_devices_if_mixed(pending.output_key.device_key);
+        if let Some(devices) = scoped_legacy_devices.as_ref() {
+            self.quiesce_before_topology_mutation_for_devices(
+                "asynchronous RANDR CRTC configuration changed",
+                devices,
+            )?;
+        } else {
+            self.quiesce_before_topology_mutation("asynchronous RANDR CRTC configuration changed")?;
+        }
         if let Err(error) = self.platform.install_prepared_connector_plan(prepared) {
             log::error!(
                 "finish_crtc_config: installing qualified plan for {} failed: {error}",
                 pending.connector
             );
-            return Err(self.recover_failed_crtc_config(restore_old_on_failure, error));
+            return Err(if let Some(devices) = scoped_legacy_devices.as_ref() {
+                self.recover_failed_crtc_config_for_devices(restore_old_on_failure, error, devices)
+            } else {
+                self.recover_failed_crtc_config(restore_old_on_failure, error)
+            });
         }
 
         {
@@ -25846,25 +25984,47 @@ impl Backend for KmsBackend {
             true,
             self.platform.outputs.len(),
         );
-        if let Err(error) = self.scene.rebuild_outputs(&self.platform) {
+        let scene_rebuild = if let Some(devices) = scoped_legacy_devices.as_ref() {
+            self.scene
+                .rebuild_outputs_for_devices(&self.platform, devices)
+        } else {
+            self.scene.rebuild_outputs(&self.platform)
+        };
+        if let Err(error) = scene_rebuild {
             log::error!(
                 "finish_crtc_config: scene rebuild failed after topology change: {error:?}"
             );
             let error = io::Error::other(format!(
                 "finish_crtc_config: scene rebuild failed: {error:?}"
             ));
-            let relight = self.relight_after_direct_teardown(
-                desired_active,
-                "asynchronous RANDR CRTC scene-rebuild failure",
-            );
+            let relight = if let Some(devices) = scoped_legacy_devices.as_ref() {
+                self.relight_after_direct_teardown_for_devices(
+                    desired_active,
+                    "asynchronous RANDR CRTC scene-rebuild failure",
+                    devices,
+                )
+            } else {
+                self.relight_after_direct_teardown(
+                    desired_active,
+                    "asynchronous RANDR CRTC scene-rebuild failure",
+                )
+            };
             self.kms_outputs_active = false;
             self.request_exit();
             return Err(relight.err().unwrap_or(error));
         }
-        self.relight_after_direct_teardown(
-            desired_active,
-            "asynchronous RANDR CRTC configuration",
-        )?;
+        if let Some(devices) = scoped_legacy_devices.as_ref() {
+            self.relight_after_direct_teardown_for_devices(
+                desired_active,
+                "asynchronous RANDR CRTC configuration",
+                devices,
+            )?;
+        } else {
+            self.relight_after_direct_teardown(
+                desired_active,
+                "asynchronous RANDR CRTC configuration",
+            )?;
+        }
         self.kms_outputs_active = desired_active;
         self.update_input_extent(self.platform.fb_w, self.platform.fb_h);
         self.scene.wake_for_damage();
@@ -26127,7 +26287,15 @@ impl Backend for KmsBackend {
         // the scene's `pending_acks` is fresh-empty for every output, so
         // the subsequent `wake_for_damage` tick is EBUSY-safe.
         let restore_old_on_failure = self.device_outputs_powered_on(output_key.device_key);
-        self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
+        let scoped_legacy_devices = self.legacy_modeset_devices_if_mixed(output_key.device_key);
+        if let Some(devices) = scoped_legacy_devices.as_ref() {
+            self.quiesce_before_topology_mutation_for_devices(
+                "RANDR CRTC configuration changed",
+                devices,
+            )?;
+        } else {
+            self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
+        }
 
         match mode {
             None => {
@@ -26174,9 +26342,17 @@ impl Backend for KmsBackend {
                         // Vulkan owner, then return to the core loop so
                         // input/VT handling remains responsive.
                         if restore_old_on_failure {
-                            match self.platform.dpms_set_outputs_active(true) {
-                                Ok(()) => {
+                            let relight = if let Some(devices) = scoped_legacy_devices.as_ref() {
+                                self.platform
+                                    .dpms_set_outputs_active_for_devices(true, devices)
+                                    .inspect(|()| self.reapply_gamma_for_devices(devices))
+                            } else {
+                                self.platform.dpms_set_outputs_active(true).inspect(|()| {
                                     self.reapply_gamma_for_live_outputs();
+                                })
+                            };
+                            match relight {
+                                Ok(()) => {
                                     self.kms_outputs_active = !self.platform.outputs.is_empty();
                                     log::error!(
                                         "apply_crtc_config: terminal disposable probe failure; \
@@ -26202,7 +26378,15 @@ impl Backend for KmsBackend {
                         }
                         return Err(e);
                     }
-                    return Err(self.recover_failed_crtc_config(restore_old_on_failure, e));
+                    return Err(if let Some(devices) = scoped_legacy_devices.as_ref() {
+                        self.recover_failed_crtc_config_for_devices(
+                            restore_old_on_failure,
+                            e,
+                            devices,
+                        )
+                    } else {
+                        self.recover_failed_crtc_config(restore_old_on_failure, e)
+                    });
                 }
 
                 // Update registry.
@@ -26244,11 +26428,27 @@ impl Backend for KmsBackend {
         );
 
         // ── Scene + RANDR rebuild ─────────────────────────────────────────
-        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+        let scene_rebuild = if let Some(devices) = scoped_legacy_devices.as_ref() {
+            self.scene
+                .rebuild_outputs_for_devices(&self.platform, devices)
+        } else {
+            self.scene.rebuild_outputs(&self.platform)
+        };
+        if let Err(e) = scene_rebuild {
             log::error!("apply_crtc_config: scene rebuild failed after topology change: {e:?}");
             let error = io::Error::other(format!("apply_crtc_config: scene rebuild failed: {e:?}"));
-            let relight = self
-                .relight_after_direct_teardown(desired_active, "RANDR CRTC scene-rebuild failure");
+            let relight = if let Some(devices) = scoped_legacy_devices.as_ref() {
+                self.relight_after_direct_teardown_for_devices(
+                    desired_active,
+                    "RANDR CRTC scene-rebuild failure",
+                    devices,
+                )
+            } else {
+                self.relight_after_direct_teardown(
+                    desired_active,
+                    "RANDR CRTC scene-rebuild failure",
+                )
+            };
             // Hardware/platform/registry state has already changed, but the
             // core RANDR projection cannot be rebuilt consistently. Rollback
             // would itself require another fallible modeset, so fail-stop
@@ -26257,7 +26457,15 @@ impl Backend for KmsBackend {
             self.request_exit();
             return Err(relight.err().unwrap_or(error));
         }
-        self.relight_after_direct_teardown(desired_active, "RANDR CRTC configuration")?;
+        if let Some(devices) = scoped_legacy_devices.as_ref() {
+            self.relight_after_direct_teardown_for_devices(
+                desired_active,
+                "RANDR CRTC configuration",
+                devices,
+            )?;
+        } else {
+            self.relight_after_direct_teardown(desired_active, "RANDR CRTC configuration")?;
+        }
         self.kms_outputs_active = desired_active;
 
         // Update input extent (cursor clamp) to reflect new fb size.
@@ -33249,6 +33457,26 @@ impl KmsBackend {
             })
             .map(|device| device.key)
             .collect()
+    }
+
+    fn legacy_modeset_devices_if_mixed(
+        &self,
+        target_device: DrmDeviceKey,
+    ) -> Option<HashSet<DrmDeviceKey>> {
+        let target_is_legacy = !self
+            .platform
+            .transport_gate(&target_device)
+            .is_some_and(|gate| {
+                gate.state() == crate::kms::render::resources::TransportState::Owner
+            });
+        let has_owner_device = self.platform.devices.iter().any(|device| {
+            self.platform
+                .transport_gate(&device.key)
+                .is_some_and(|gate| {
+                    gate.state() == crate::kms::render::resources::TransportState::Owner
+                })
+        });
+        (target_is_legacy && has_owner_device).then(|| self.dpms_legacy_devices())
     }
 
     pub(crate) fn update_resource_service_activity(&mut self) {
@@ -90921,6 +91149,227 @@ mod tests {
             backend,
             "c0_3bi_position_change_invalidates_direct_eligibility_vulkan",
             &c0_3bi_expected_end_state(expected_live_outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_mixed_legacy_modeset_spares_owner() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, owner_device, _, _, _) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), false)
+                .expect("environmental skip: live Owner fixture");
+        let backend = &mut fixture.backend;
+        let owner_output = backend.platform.outputs[0].key.clone();
+        backend.platform.owner_completion_detached = true;
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until(
+            backend,
+            "accept Owner composed flip before Legacy modeset",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(owner_device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .expect("Owner composed frame is accepted through the executor");
+        let owner_commit = backend
+            .platform
+            .owner_ref(owner_device)
+            .and_then(|owner| owner.live_record())
+            .expect("accepted Owner composed frame")
+            .commit_id();
+        let owner_scene_identity = backend
+            .scene
+            .output_scene_identity_for_tests(0)
+            .expect("Owner scene state");
+        let owner_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("Owner output instance");
+
+        // Add a Legacy-only fixture output after A is already in flight. Its
+        // pool is intentionally absent: the output recorder below replaces
+        // Legacy KMS writes, and this test exercises only disable/quiesce.
+        let legacy_device = test_device_key(117);
+        push_test_device(backend, legacy_device);
+        push_test_output(backend, 0x3b1_917);
+        let legacy_connector = backend.platform.outputs[1].key.connector_name.clone();
+        let legacy_output = OutputKey::new(legacy_device, legacy_connector.clone());
+        backend.platform.outputs[1].key = legacy_output.clone();
+        backend.platform.outputs[1].scanout_route.kms_device_key = legacy_device;
+        backend.platform.output_instance_ids[1] = backend
+            .platform
+            .allocate_output_instance_id(&legacy_output)
+            .expect("Legacy output instance");
+        // Make the Legacy output extend the logical framebuffer so disabling
+        // it changes fb_w, as an ordinary mixed layout does.
+        let owner_right = backend.platform.outputs[0]
+            .x
+            .saturating_add(i32::from(backend.platform.outputs[0].width));
+        backend.platform.outputs[1].x = owner_right;
+        let legacy_right = owner_right.saturating_add(i32::from(backend.platform.outputs[1].width));
+        backend.platform.fb_w = u16::try_from(legacy_right.clamp(1, i32::from(u16::MAX)))
+            .expect("bounded Legacy fixture extent");
+        let logical_width_before = backend.platform.fb_w;
+        let root_storage_before = backend.store.lookup(backend.core.window_id);
+        assert!(root_storage_before.is_some(), "live fixture root storage");
+
+        let ids = backend.randr_id_alloc.ids_for(&legacy_output);
+        backend
+            .output_key_by_id
+            .insert(ids.output_id, legacy_output.clone());
+        {
+            let output = &backend.platform.outputs[1];
+            let entry = backend.randr_id_alloc.entry_mut(&legacy_output);
+            entry.connected = true;
+            entry.config = super::ConnectorConfig::Enabled {
+                mode_w: output.width,
+                mode_h: output.height,
+                vrefresh: output.output.picked.vrefresh,
+                x: output.x,
+                y: output.y,
+            };
+            entry.modes = output.output.modes.clone();
+            entry.edid = output.output.edid.clone();
+            entry.mm_width = output.output.mm_width;
+            entry.mm_height = output.output.mm_height;
+            entry.connector_type = output.output.connector_type.clone();
+        }
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
+
+        // This production Legacy request is synchronous. The Owner executor
+        // stays the only source of replies; no reply is injected into Owner.
+        let applied =
+            Backend::begin_crtc_config(backend, ids.output_id, &legacy_connector, None, 0, 0)
+                .expect("Legacy xrandr --off");
+        assert!(matches!(applied, CrtcConfigApply::Applied(true)));
+        assert_ne!(backend.platform.fb_w, logical_width_before);
+        assert_eq!(
+            backend.platform.dpms_output_calls_for_tests,
+            Some(vec![
+                (false, vec![legacy_output.clone()]),
+                (true, Vec::new())
+            ]),
+            "Legacy all-off and relight may only select Legacy outputs"
+        );
+        let legacy_devices = std::collections::HashSet::from([legacy_device]);
+        assert_eq!(
+            backend.platform.dpms_output_scopes_for_tests,
+            Some(vec![Some(legacy_devices.clone()), Some(legacy_devices)]),
+            "the mixed path keeps its device scope through all-off and relight"
+        );
+        assert!(
+            backend
+                .platform
+                .owner_ref(owner_device)
+                .is_some_and(|owner| {
+                    owner.live_record().is_some_and(|record| {
+                        record.commit_id() == owner_commit && record.milestones().accepted
+                    })
+                })
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(0),
+            Some(owner_instance)
+        );
+        assert_eq!(
+            backend.scene.output_scene_identity_for_tests(0),
+            Some(owner_scene_identity),
+            "the kept Owner OutputSceneState remains the same object"
+        );
+
+        // apply_crtc_config recomputes PlatformBackend.fb_w/fb_h when it
+        // removes a CRTC, but it calls neither apply_virtual_screen_extent
+        // nor the Owner-only replace_root_storage_after_owner_position.
+        // Therefore root-storage-change full damage is unreachable here; if
+        // this path starts replacing root storage, it must fully damage kept
+        // Owner outputs and repaint through ordinary composed admission.
+        assert_eq!(
+            backend.store.lookup(backend.core.window_id),
+            root_storage_before,
+            "Legacy CRTC disable does not replace root storage"
+        );
+
+        // The stub cannot emit the kernel page-flip event for its /dev/null
+        // fence; this helper supplies HardwareComplete and PageFlip via the
+        // core-entry driver after the Legacy modeset has returned.
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            owner_device,
+            owner_commit,
+            "complete Owner flip after Legacy modeset",
+        );
+        c0_3bi_complete_owner_followups(
+            backend,
+            owner_device,
+            2,
+            "settle Owner composed repaint after Legacy modeset",
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3bi_mixed_legacy_modeset_spares_owner",
+            &c0_3bi_expected_end_state([owner_output]),
+        );
+    }
+
+    #[test]
+    fn c0_3bi_pure_legacy_modeset_unchanged() {
+        let mut backend = KmsBackend::for_tests();
+        let legacy_device = backend.platform.outputs[0].key.device_key;
+        let disabled_output = backend.platform.outputs[0].key.clone();
+        push_test_output(&mut backend, 0x3b1_918);
+        let kept_output = backend.platform.outputs[1].key.clone();
+        let ids = backend.randr_id_alloc.ids_for(&disabled_output);
+        backend
+            .output_key_by_id
+            .insert(ids.output_id, disabled_output.clone());
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
+
+        let applied = Backend::begin_crtc_config(
+            &mut backend,
+            ids.output_id,
+            &disabled_output.connector_name,
+            None,
+            0,
+            0,
+        )
+        .expect("pure Legacy xrandr --off");
+        assert!(matches!(applied, CrtcConfigApply::Applied(true)));
+        assert_eq!(
+            backend.platform.dpms_output_calls_for_tests,
+            Some(vec![
+                (false, vec![disabled_output.clone(), kept_output.clone()]),
+                (true, vec![kept_output.clone()]),
+            ]),
+            "the established Legacy all-off/relight output sequence is unchanged"
+        );
+        assert_eq!(
+            backend.platform.dpms_output_scopes_for_tests,
+            Some(vec![None, None]),
+            "a Legacy-only server continues through the unscoped path"
+        );
+        assert_eq!(backend.platform.devices.len(), 1);
+        assert_eq!(backend.platform.devices[0].key, legacy_device);
+        assert!(
+            !backend
+                .platform
+                .transport_gate(&legacy_device)
+                .is_some_and(|gate| {
+                    gate.state() == crate::kms::render::resources::TransportState::Owner
+                })
+        );
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_pure_legacy_modeset_unchanged",
+            &c0_3bi_expected_end_state([kept_output]),
         );
     }
 
