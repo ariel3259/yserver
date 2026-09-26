@@ -87289,6 +87289,200 @@ mod tests {
         Ok(displaced_allocations)
     }
 
+    fn c0_hw_3b_set_position(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        output_id: u32,
+        connector: &str,
+        output_key: &OutputKey,
+        x: i32,
+        y: i32,
+        label: &str,
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<(), String> {
+        let output = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| &output.key == output_key)
+            .ok_or_else(|| format!("{label}: output is absent before the position update"))?;
+        let mode = ModeSpec {
+            width: output.width,
+            height: output.height,
+            vrefresh: output.output.picked.vrefresh,
+        };
+        let sends_before = backend.lifecycle_drivers.get(&device).map(|driver| {
+            let (validation, live) = driver.client_modeset_test_stats();
+            (validation.len(), live.len())
+        });
+        let result = Backend::begin_crtc_config(backend, output_id, connector, Some(mode), x, y)
+            .map_err(|error| format!("{label}: begin failed: {error}"))?;
+        let CrtcConfigApply::Pending(token) = result else {
+            return Err(format!("{label}: position update completed synchronously"));
+        };
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(20),
+            &|backend| c0_3bi_has_crtc_config_result(backend, token),
+            hardware_complete,
+        )?;
+        let changed = c0_3bi_take_crtc_config_result(backend, token)
+            .map_err(|error| format!("{label}: core driver finish failed: {error}"))?;
+        if !changed {
+            return Err(format!("{label}: position update was not promoted"));
+        }
+        let installed = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| &output.key == output_key)
+            .ok_or_else(|| format!("{label}: output is absent after the position update"))?;
+        if (installed.x, installed.y) != (x, y) {
+            return Err(format!(
+                "{label}: promoted position is ({}, {}), expected ({x}, {y})",
+                installed.x, installed.y
+            ));
+        }
+        let sends_after = backend.lifecycle_drivers.get(&device).map(|driver| {
+            let (validation, live) = driver.client_modeset_test_stats();
+            (validation.len(), live.len())
+        });
+        if sends_after != sends_before {
+            return Err(format!(
+                "{label}: position-only request sent a KMS lifecycle call ({sends_before:?} -> {sends_after:?})"
+            ));
+        }
+        Ok(())
+    }
+
+    fn c0_hw_3b_compose_and_complete_through_core_driver(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        output_key: &OutputKey,
+        label: &str,
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<crate::kms::owner::identity::CommitId, String> {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| &output.key == output_key)
+            .ok_or_else(|| format!("{label}: lit output is absent"))?;
+        let damage_before = backend
+            .scene
+            .damage_history_latest_generation_for_tests(output_idx);
+        let complete_before = hardware_complete.borrow().clone();
+        backend.scene.mark_scene_structure_dirty();
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(20),
+            &|backend| {
+                hardware_complete
+                    .borrow()
+                    .iter()
+                    .any(|commit| !complete_before.contains(commit))
+                    && backend
+                        .platform
+                        .owner_ref(device)
+                        .is_some_and(|owner| owner.live_record().is_none())
+                    && backend
+                        .scene
+                        .damage_history_latest_generation_for_tests(output_idx)
+                        > damage_before
+                    && backend
+                        .commit_consumer
+                        .current_resources
+                        .iter()
+                        .any(|resources| resources.direct_role.is_none())
+            },
+            hardware_complete,
+        )?;
+        let completed = hardware_complete
+            .borrow()
+            .iter()
+            .find(|commit| !complete_before.contains(commit))
+            .copied()
+            .ok_or_else(|| format!("{label}: composed frame has no HardwareComplete"))?;
+        if c0_3aii_owner_current_framebuffer(backend, output_idx).is_none() {
+            return Err(format!(
+                "{label}: composed frame did not become the retained current framebuffer"
+            ));
+        }
+        Ok(completed)
+    }
+
+    fn c0_hw_3b_compose_until_accepted_through_core_driver(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        output_key: &OutputKey,
+        label: &str,
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<crate::kms::owner::identity::CommitId, String> {
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| &output.key == output_key)
+            .ok_or_else(|| format!("{label}: output is absent before composition"))?;
+        let crtc = u32::from(backend.platform.outputs[output_idx].output.crtc);
+        let output = &backend.platform.outputs[output_idx];
+        backend.scene.mark_scene_structure_damage_rect(
+            output_idx,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: u32::from(output.width),
+                    height: u32::from(output.height),
+                },
+            },
+        );
+        let accepted_commit = std::rc::Rc::new(std::cell::Cell::new(None));
+        let accepted_commit_for_wait = std::rc::Rc::clone(&accepted_commit);
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(20),
+            &|backend| {
+                let Some(record) = backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                else {
+                    return false;
+                };
+                let accepted = record.milestones().accepted
+                    && record.completion_context().class
+                        == crate::kms::owner::completion::CompletionClass::FastUpdate
+                    && record.closure().present_event().contains(&crtc);
+                if accepted {
+                    accepted_commit_for_wait.set(Some(record.commit_id()));
+                }
+                accepted
+            },
+            hardware_complete,
+        )?;
+        accepted_commit
+            .get()
+            .ok_or_else(|| format!("{label}: composed frame was not accepted"))
+    }
+
     fn c0_hw_3b_wait_for_pool_release(
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
@@ -87523,6 +87717,7 @@ mod tests {
             .position(|output| output.key.device_key == device)
             .expect("HDMI-2 is a card1 Owner output");
         let output_key = backend.platform.outputs[output_idx].key.clone();
+        let mut expected_live_outputs = vec![output_key.clone()];
         assert_eq!(output_key.connector_name, "HDMI-2");
         assert_eq!(
             backend
@@ -87811,9 +88006,210 @@ mod tests {
             .unwrap_or_else(|error| panic!("{on}: composed frame failed: {error}"));
         }
 
-        eprintln!(
-            "card1 HDMI-2 Owner modeset test passed: advertised mode/back ×4, disable/enable ×4, DPMS-off/mode/on ×4; every lit step composed and every displaced pool was discharged"
+        for (cycle, x) in [(1, 1), (2, 0), (3, 1), (4, 0)] {
+            let step = format!("position change {cycle} to x={x}");
+            c0_hw_3b_set_position(
+                backend,
+                device,
+                drm_fd,
+                output_id,
+                "HDMI-2",
+                &output_key,
+                x,
+                0,
+                &step,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{step} failed: {error}"));
+            let config = &backend.randr_id_alloc.entry(&output_key).unwrap().config;
+            assert!(
+                matches!(config, super::ConnectorConfig::Enabled { x: installed_x, y: 0, .. } if *installed_x == x),
+                "{step}: RANDR's installed position agrees with the promoted layout"
+            );
+            c0_hw_3b_compose_and_complete_through_core_driver(
+                backend,
+                device,
+                drm_fd,
+                &output_key,
+                &step,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{step}: composed frame failed: {error}"));
+        }
+
+        let second_owner_output = backend
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(_, output)| {
+                output.key.device_key != device
+                    && backend.platform.owner_ref(output.key.device_key).is_some()
+                    && backend
+                        .owner_dpms_installed_active
+                        .get(&output.key.device_key)
+                        == Some(&true)
+                    && backend
+                        .randr_id_alloc
+                        .entry(&output.key)
+                        .is_some_and(|entry| {
+                            entry.connected
+                                && matches!(entry.config, super::ConnectorConfig::Enabled { .. })
+                        })
+            })
+            .map(|(output_idx, output)| (output_idx, output.key.device_key, output.key.clone()));
+        if let Some((other_output_idx, other_device, other_key)) = second_owner_output {
+            let other_scene = backend
+                .scene
+                .output_scene_identity_for_tests(other_output_idx)
+                .expect("second Owner output scene state");
+            let other_pool = backend.platform.scanout_pools[other_output_idx]
+                .as_ref()
+                .expect("second Owner output pool") as *const _;
+            let other_images = c0_3bi_scanout_images(backend, other_output_idx);
+            let other_lifecycle_counts =
+                backend.lifecycle_drivers[&other_device].client_modeset_test_stats();
+
+            let other_device_fd = std::os::fd::AsRawFd::as_raw_fd(
+                &backend
+                    .platform
+                    .device_for_key(other_device)
+                    .expect("second Owner device has a KMS handle")
+                    .device
+                    .as_fd(),
+            );
+            let other_commit = c0_hw_3b_compose_until_accepted_through_core_driver(
+                backend,
+                other_device,
+                other_device_fd,
+                &other_key,
+                "accept the second device's composed frame",
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("second device composition failed: {error}"));
+
+            let output_idx = backend
+                .platform
+                .outputs
+                .iter()
+                .position(|output| output.key == output_key)
+                .expect("HDMI-2 remains installed");
+            let retired_instance = backend
+                .scene
+                .output_instance_id_for_tests(output_idx)
+                .expect("HDMI-2 output instance before second-device check");
+            let displaced = c0_hw_3b_set_crtc_config(
+                backend,
+                device,
+                drm_fd,
+                output_id,
+                "HDMI-2",
+                &output_key,
+                Some(alternate_mode),
+                "card1 mode change while the second device composes",
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("card1 second-device modeset failed: {error}"));
+            c0_hw_3b_drive_until(
+                backend,
+                other_device,
+                other_device_fd,
+                "complete the second device's composed frame after card1 modeset",
+                Duration::from_secs(35),
+                &|_| hardware_complete.borrow().contains(&other_commit),
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("second device flip did not complete: {error}"));
+            c0_hw_3b_compose_and_complete_through_core_driver(
+                backend,
+                device,
+                drm_fd,
+                &output_key,
+                "card1 repaint after the second-device modeset",
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("card1 repaint failed: {error}"));
+            c0_hw_3b_wait_for_pool_release(
+                backend,
+                device,
+                drm_fd,
+                "card1 second-device modeset",
+                &displaced,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("card1 displaced pool stayed live: {error}"));
+            assert!(
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(retired_instance),
+                "card1's retired scene and pool are destroyed after all proofs"
+            );
+            assert_eq!(
+                backend
+                    .scene
+                    .output_scene_identity_for_tests(other_output_idx),
+                Some(other_scene),
+                "card1's modeset preserves the second device's scene object"
+            );
+            assert!(std::ptr::eq(
+                other_pool,
+                backend.platform.scanout_pools[other_output_idx]
+                    .as_ref()
+                    .expect("second device pool remains installed") as *const _
+            ));
+            assert_eq!(
+                c0_3bi_scanout_images(backend, other_output_idx),
+                other_images,
+                "card1's modeset preserves the second device's pool images"
+            );
+            assert_eq!(
+                backend.lifecycle_drivers[&other_device].client_modeset_test_stats(),
+                other_lifecycle_counts,
+                "card1's mode change sends no lifecycle commit through the second executor"
+            );
+            assert!(hardware_complete.borrow().contains(&other_commit));
+            expected_live_outputs.push(other_key);
+        } else {
+            match c0_hw_3b_card0_has_connected_lit_output() {
+                Ok(false) => eprintln!(
+                    "environmental skip: no second device has a connected, lit output; /dev/dri/card0 (amdgpu) reports no active output"
+                ),
+                Ok(true) => panic!(
+                    "card0 has a connected, lit output, but the card1 live-KMS fixture did not enroll a second Owner output"
+                ),
+                Err(reason) => panic!(
+                    "could not establish whether a second device has a connected, lit output: {reason}"
+                ),
+            }
+        }
+
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_hw_3b_modeset_owner_on_card1_drm",
+            &c0_3bi_expected_end_state(expected_live_outputs),
         );
+
+        eprintln!(
+            "card1 HDMI-2 Owner modeset test passed: advertised mode/back ×4, disable/enable ×4, DPMS-off/mode/on ×4, position change ×4; every lit step composed and every displaced pool was discharged"
+        );
+    }
+
+    fn c0_hw_3b_card0_has_connected_lit_output() -> Result<bool, String> {
+        use ::drm::control::Device as _;
+
+        let device = crate::drm::Device::open("/dev/dri/card0")
+            .map_err(|error| format!("opening /dev/dri/card0: {error}"))?;
+        let outputs = crate::drm::modeset::discover_outputs(&device)
+            .map_err(|error| format!("discovering /dev/dri/card0 outputs: {error}"))?;
+        for output in outputs {
+            if device
+                .get_crtc(output.crtc)
+                .is_ok_and(|crtc| crtc.mode().is_some())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn hardware_drm_key(path: &str) -> Result<crate::platform::drm::DrmDeviceKey, std::io::Error> {
@@ -91079,6 +91475,263 @@ mod tests {
         c0_3bi_assert_end_state(
             &backend,
             "c0_3bi_root_change_repaints_kept_outputs_vulkan",
+            &c0_3bi_expected_end_state(expected_live_outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bi_modeset_on_a_leaves_b_alone_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour, owner::completion::CompletionClass,
+        };
+
+        let (OwnerLiveFixture { mut backend, .. }, device_a, device_b, output_id, connector) =
+            c0_3bi_live_two_owner_position_backend(StubBehaviour::AcceptKernelCalls(1_000))
+                .expect("environmental skip: live two-Owner modeset fixture");
+        let a_output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device_a)
+            .expect("device A has its installed output");
+        let b_output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == device_b)
+            .expect("device B has its installed output");
+        let a_key = backend.platform.outputs[a_output_idx].key.clone();
+        let b_key = backend.platform.outputs[b_output_idx].key.clone();
+        let expected_live_outputs = vec![a_key.clone(), b_key.clone()];
+        assert_eq!(expected_live_outputs.len(), 2);
+        assert_eq!(a_key.device_key, device_a);
+        assert_eq!(b_key.device_key, device_b);
+        assert_eq!(
+            backend.output_key_by_id.get(&output_id),
+            Some(&a_key),
+            "the client modeset targets device A's explicitly expected output"
+        );
+        let b_crtc = u32::from(backend.platform.outputs[b_output_idx].output.crtc);
+        let b_scene_identity = backend
+            .scene
+            .output_scene_identity_for_tests(b_output_idx)
+            .expect("device B scene state");
+        let b_pool = backend.platform.scanout_pools[b_output_idx]
+            .as_ref()
+            .expect("device B scanout pool") as *const _;
+        let b_images = c0_3bi_scanout_images(&backend, b_output_idx);
+        let b_clock_ready = |backend: &super::KmsBackend| {
+            backend
+                .platform
+                .owner_ref(device_b)
+                .and_then(|owner| {
+                    owner
+                        .clock_key_for_hardware_crtc(b_crtc)
+                        .and_then(|key| owner.clock(key))
+                })
+                .is_some_and(|clock| {
+                    matches!(clock.probe, crate::kms::owner::clock::ProbeState::Succeeded)
+                })
+        };
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "qualify device B clock through its executor",
+            std::time::Duration::from_secs(3),
+            &b_clock_ready,
+            None,
+        )
+        .expect("device B clock probe reply reaches Owner through core entries");
+
+        backend.platform.owner_completion_detached = true;
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "accept device A's initial composed frame",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device_a)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| {
+                        record.milestones().accepted
+                            && record.completion_context().class == CompletionClass::FastUpdate
+                    })
+            },
+            None,
+        )
+        .expect("device A's composed frame is accepted through its executor");
+        let a_initial_commit = backend
+            .platform
+            .owner_ref(device_a)
+            .and_then(|owner| owner.live_record())
+            .expect("A's accepted composed commit")
+            .commit_id();
+        // The executor stub accepts ioctl-shaped calls; its /dev/null fences
+        // do not signal and it cannot emit the kernel PageFlip event. The
+        // shared core-entry completion shim supplies those kernel effects.
+        c0_3bi_complete_owner_commit_through_core_driver(
+            &mut backend,
+            device_a,
+            a_initial_commit,
+            "settle device A before holding device B's flip",
+        );
+        c0_3bi_complete_owner_followups(
+            &mut backend,
+            device_a,
+            4,
+            "settle device A before holding device B's flip",
+        );
+
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "accept device B's composed frame",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device_b)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| {
+                        record.milestones().accepted
+                            && record.completion_context().class == CompletionClass::FastUpdate
+                    })
+            },
+            None,
+        )
+        .expect("device B's composed frame is accepted through its executor");
+        let b_commit = backend
+            .platform
+            .owner_ref(device_b)
+            .and_then(|owner| owner.live_record())
+            .expect("B's accepted composed commit")
+            .commit_id();
+
+        // A refresh-only mode, when available, preserves the root extent so
+        // this test isolates per-device scene replacement.
+        let current_mode = c0_3bi_current_mode(&backend, a_output_idx);
+        let alternate_mode = backend.platform.outputs[a_output_idx]
+            .output
+            .modes
+            .iter()
+            .map(|mode| yserver_core::backend::ModeSpec {
+                width: mode.width,
+                height: mode.height,
+                vrefresh: mode.vrefresh,
+            })
+            .find(|mode| {
+                *mode != current_mode
+                    && mode.width == current_mode.width
+                    && mode.height == current_mode.height
+            })
+            .or_else(|| {
+                backend.platform.outputs[a_output_idx]
+                    .output
+                    .modes
+                    .iter()
+                    .map(|mode| yserver_core::backend::ModeSpec {
+                        width: mode.width,
+                        height: mode.height,
+                        vrefresh: mode.vrefresh,
+                    })
+                    .find(|mode| *mode != current_mode)
+            })
+            .expect("device A advertises an alternate mode");
+        let token =
+            c0_3bi_begin_client_modeset(&mut backend, output_id, &connector, Some(alternate_mode));
+        let a_modeset_commit = c0_3bi_wait_client_modeset_live(
+            &mut backend,
+            device_a,
+            token,
+            "dispatch device A's client modeset while B's flip is accepted",
+        );
+        assert!(backend.platform.owner_ref(device_b).is_some_and(|owner| {
+            owner.live_record().is_some_and(|record| {
+                record.commit_id() == b_commit
+                    && record.milestones().accepted
+                    && record.completion_context().class == CompletionClass::FastUpdate
+            })
+        }));
+        c0_3bi_complete_owner_commit_through_core_driver(
+            &mut backend,
+            device_a,
+            a_modeset_commit,
+            "complete device A's client modeset while B's flip is held",
+        );
+        c0_3bi_drive_crtc_config_result(
+            &mut backend,
+            token,
+            "promote device A's modeset while B's flip is held",
+        );
+        assert!(
+            c0_3bi_take_crtc_config_result(&mut backend, token).expect("device A modeset succeeds")
+        );
+
+        assert_eq!(
+            backend.scene.output_scene_identity_for_tests(b_output_idx),
+            Some(b_scene_identity),
+            "A's modeset preserves B's OutputSceneState object"
+        );
+        assert!(std::ptr::eq(
+            b_pool,
+            backend.platform.scanout_pools[b_output_idx]
+                .as_ref()
+                .expect("B scanout pool remains installed") as *const _
+        ));
+        assert_eq!(
+            c0_3bi_scanout_images(&backend, b_output_idx),
+            b_images,
+            "A's modeset preserves B's scanout pool images"
+        );
+        let (b_validation_sends, b_lifecycle_sends) =
+            backend.lifecycle_drivers[&device_b].client_modeset_test_stats();
+        assert!(b_validation_sends.is_empty());
+        assert!(
+            b_lifecycle_sends.is_empty(),
+            "A's modeset sends no lifecycle commit through B's executor"
+        );
+        assert!(backend.platform.owner_ref(device_b).is_some_and(|owner| {
+            owner.live_record().is_some_and(|record| {
+                record.commit_id() == b_commit && record.milestones().accepted
+            })
+        }));
+        assert_eq!(backend.platform.outputs[b_output_idx].key, b_key);
+
+        c0_3bi_complete_owner_commit_through_core_driver(
+            &mut backend,
+            device_b,
+            b_commit,
+            "complete device B's composed flip after A's modeset",
+        );
+        c0_3bi_complete_owner_followups(
+            &mut backend,
+            device_b,
+            4,
+            "settle device B after its held composed flip",
+        );
+        c0_3bi_complete_owner_followups(
+            &mut backend,
+            device_a,
+            4,
+            "settle device A after its modeset",
+        );
+        c0_3bi_core_driver_until(
+            &mut backend,
+            "service A's retired pool through core entries",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .scene
+                    .retired_output_end_states_for_tests()
+                    .is_empty()
+            },
+            None,
+        )
+        .expect("A's retired output bundle is serviced by the core driver");
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3bi_modeset_on_a_leaves_b_alone_vulkan",
             &c0_3bi_expected_end_state(expected_live_outputs),
         );
     }
