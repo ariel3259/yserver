@@ -2805,6 +2805,9 @@ pub struct PlatformBackend {
         std::collections::VecDeque<(OutputInstanceId, ScanoutRenderCompletionStage)>,
     #[cfg(test)]
     pub(crate) dpms_output_calls_for_tests: Option<Vec<(bool, Vec<OutputKey>)>>,
+    #[cfg(test)]
+    pub(crate) dpms_output_scopes_for_tests:
+        Option<Vec<Option<std::collections::HashSet<crate::platform::drm::DrmDeviceKey>>>>,
     /// Records synchronous connector modesets without issuing a DRM commit.
     /// Used by differential tests that exercise the production Legacy path.
     #[cfg(test)]
@@ -3635,6 +3638,8 @@ impl PlatformBackend {
             #[cfg(test)]
             dpms_output_calls_for_tests: None,
             #[cfg(test)]
+            dpms_output_scopes_for_tests: None,
+            #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
@@ -3791,6 +3796,8 @@ impl PlatformBackend {
             hold_next_scanout_render_completions_for_tests: std::collections::VecDeque::new(),
             #[cfg(test)]
             dpms_output_calls_for_tests: None,
+            #[cfg(test)]
+            dpms_output_scopes_for_tests: None,
             #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
@@ -5902,6 +5909,14 @@ impl PlatformBackend {
         timeout: std::time::Duration,
         devices: Option<&HashSet<crate::platform::drm::DrmDeviceKey>>,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        if self.dpms_output_scopes_for_tests.is_some() {
+            // The paired all-off recorder issues no DRM commit, so this
+            // fixture cannot produce a page-flip event. The Owner test
+            // completes its accepted flip later through the core-entry
+            // driver instead of polling the real DRM fd here.
+            return Ok(());
+        }
         #[cfg(test)]
         if self.dpms_output_calls_for_tests.is_some() && expected_pageflips.is_empty() {
             // The recorder replaces the fixture's modeset, so no page-flip
@@ -8945,14 +8960,27 @@ impl PlatformBackend {
     /// rest, then returns it. The caller (KmsBackend::set_dpms_power)
     /// logs and advances the in-memory DPMS state regardless.
     pub(crate) fn dpms_set_outputs_active(&mut self, active: bool) -> io::Result<()> {
-        self.dpms_set_outputs_active_inner(active, false)
+        self.dpms_set_outputs_active_inner(active, false, None)
     }
 
     pub(crate) fn dpms_set_legacy_outputs_active(&mut self, active: bool) -> io::Result<()> {
-        self.dpms_set_outputs_active_inner(active, true)
+        self.dpms_set_outputs_active_inner(active, true, None)
     }
 
-    fn dpms_set_outputs_active_inner(&mut self, active: bool, legacy_only: bool) -> io::Result<()> {
+    pub(crate) fn dpms_set_outputs_active_for_devices(
+        &mut self,
+        active: bool,
+        devices: &std::collections::HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) -> io::Result<()> {
+        self.dpms_set_outputs_active_inner(active, false, Some(devices))
+    }
+
+    fn dpms_set_outputs_active_inner(
+        &mut self,
+        active: bool,
+        legacy_only: bool,
+        devices: Option<&std::collections::HashSet<crate::platform::drm::DrmDeviceKey>>,
+    ) -> io::Result<()> {
         #[cfg(test)]
         let record_outputs = self.dpms_output_calls_for_tests.is_some();
         #[cfg(test)]
@@ -8963,11 +8991,12 @@ impl PlatformBackend {
             // before blank) or any registered fb — same selection
             // logic as `requery_outputs_and_modeset` at :2030.
             for (i, layout) in self.outputs.iter().enumerate() {
-                if legacy_only
-                    && !self.allows_legacy(
-                        &layout.key.device_key,
-                        crate::kms::render::resources::WriterClass::Dpms,
-                    )
+                if devices.is_some_and(|devices| !devices.contains(&layout.key.device_key))
+                    || legacy_only
+                        && !self.allows_legacy(
+                            &layout.key.device_key,
+                            crate::kms::render::resources::WriterClass::Dpms,
+                        )
                 {
                     continue;
                 }
@@ -9061,11 +9090,12 @@ impl PlatformBackend {
             }
         } else {
             for layout in &self.outputs {
-                if legacy_only
-                    && !self.allows_legacy(
-                        &layout.key.device_key,
-                        crate::kms::render::resources::WriterClass::Dpms,
-                    )
+                if devices.is_some_and(|devices| !devices.contains(&layout.key.device_key))
+                    || legacy_only
+                        && !self.allows_legacy(
+                            &layout.key.device_key,
+                            crate::kms::render::resources::WriterClass::Dpms,
+                        )
                 {
                     continue;
                 }
@@ -9115,6 +9145,9 @@ impl PlatformBackend {
         #[cfg(test)]
         if let Some(calls) = self.dpms_output_calls_for_tests.as_mut() {
             calls.push((active, recorded_outputs));
+            if let Some(scopes) = self.dpms_output_scopes_for_tests.as_mut() {
+                scopes.push(devices.cloned());
+            }
             return Ok(());
         }
         match first_err {

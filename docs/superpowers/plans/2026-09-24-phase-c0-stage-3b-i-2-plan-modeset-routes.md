@@ -2,6 +2,19 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 5 (2026-09-26, coordinator) — Task 5 F8: one resource service.**
+`KmsBackend` holds one `ResourceService` and one `DrmCleanupRegistry`, and
+client-modeset preparation requires them to belong to the modeset's device and
+incarnation (`render/admission.rs`, preparation `Stage::Allocation`), so a
+client modeset on a second Owner device fails closed at allocation.
+`install_resource_service` has no production caller yet (production is
+Legacy); the stage that installs resource services in production (activation,
+stage 4/5) must install **one per Owner device** and owns the obligation. So:
+`c0_3bi_enable_on_b_unflips_a_vulkan` (**F15**) is **carried** to that stage,
+not written here. Task 5 delivers F14, F16 and the hardware additions. The
+coverage flip (F16) cites the tests that exist and names F15's carried
+obligation in its evidence note; it never claims two-device enable evidence.
+
 **Revision 4 (2026-09-25, coordinator) — Task H closed as delivered.** The
 user closed Task H at `dede8405`: the end-state check, the core-entry driver and
 the kernel-faithful shared stub stand as they are; `index_shift` produced a

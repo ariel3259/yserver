@@ -2791,12 +2791,17 @@ fn c0_2ci_completion_waiter_registration_and_recheck() {
     assert!(wakes.contains(&ResourceConsumer::DirectCapacity));
 }
 
-/// Spec 4.4 (stage 2c-i debt): a writer-coverage proof built from explicit
-/// evidence for every writer class. Every class is an owner-mediated mock
-/// here; a test that needs one disabled builds its own evidence.
-pub(crate) fn writer_coverage_for_tests() -> WriterCoverageProof {
+/// Spec 4.4 (stage 2c-i debt): explicit evidence for every writer class.
+/// Modeset coverage cites `c0_3bi_begin_on_owner_is_pending_vulkan` and
+/// `c0_3bi_modeset_differential_backend_state_vulkan` from 3b-i-1, plus
+/// `c0_3bi_modeset_on_a_leaves_b_alone_vulkan` from 3b-i-2. The 3b-i-2
+/// `c0_3bi_enable_on_b_unflips_a_vulkan` obligation is carried to activation
+/// for per-Owner-device resource services; this evidence does not claim
+/// two-device enable coverage. Every class is an owner-mediated mock here; a
+/// test that needs one disabled builds its own evidence.
+pub(crate) fn writer_coverage_evidence_for_tests() -> super::transport::TestWriterCoverageEvidence {
     use super::transport::{TestWriterCoverage::OwnerMediatedMock, TestWriterCoverageEvidence};
-    WriterCoverageProof::new_for_tests(TestWriterCoverageEvidence {
+    TestWriterCoverageEvidence {
         primary: OwnerMediatedMock,
         unflip: OwnerMediatedMock,
         modeset: OwnerMediatedMock,
@@ -2806,7 +2811,25 @@ pub(crate) fn writer_coverage_for_tests() -> WriterCoverageProof {
         cursor: OwnerMediatedMock,
         gamma: OwnerMediatedMock,
         helper_mutation: OwnerMediatedMock,
-    })
+    }
+}
+
+/// Build the proof from the same named evidence the Task 5 coverage test
+/// checks. This keeps the field switch and its cited coverage in lockstep.
+pub(crate) fn writer_coverage_for_tests() -> WriterCoverageProof {
+    WriterCoverageProof::new_for_tests(writer_coverage_evidence_for_tests())
+}
+
+#[test]
+fn c0_3bi_modeset_writer_coverage_proven() {
+    use super::transport::TestWriterCoverage::OwnerMediatedMock;
+
+    let evidence = writer_coverage_evidence_for_tests();
+    assert_eq!(
+        evidence.coverage(WriterClass::Modeset),
+        OwnerMediatedMock,
+        "3b-i-1 modeset execution/parity plus 3b-i-2 cross-device isolation prove the field; F15 remains explicitly carried"
+    );
 }
 
 /// M-14: a real-shaped `LegacyDrained` proof for `issue_handover_permit`,

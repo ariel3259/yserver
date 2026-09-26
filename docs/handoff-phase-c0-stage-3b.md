@@ -1,7 +1,7 @@
 # Handoff — Phase C.0 stage 3b (2026-09-26)
 
-Branch `feat/phase-c0-atomic-kms-migration`, tip `d069a29c` (plus this file).
-**89 commits are unpushed** since `8f0de9ea`; push only after asking the user.
+Branch `feat/phase-c0-atomic-kms-migration`, tip `730606b4` (plus this file).
+**Over 90 commits are unpushed** since `8f0de9ea`; push only after asking the user.
 
 ## Where 3b stands
 
@@ -35,7 +35,10 @@ message; revalidation rows added to `docs/phase-c0-upstream-fixes-revalidation.m
 It fixed a real product defect found by the merge: `retire_owner_current`
 starved releasable buffers behind one blocked on `KmsRelease`.
 Gate green; `c0_hw_3b_modeset_owner_on_card1_drm` 3/3 on card1.
-**Still to do for this merge: run `render_acceptance` once** (GPU; ask first).
+`render_acceptance --include-ignored`: 180/180 on the 2026-09-26 tip (a first run
+failed only `present_pixmap_enqueues_pending_and_defers_emission`, its < 50 ms
+enqueue-time bound under load; 3/3 alone and 2/2 full runs after).
+`730606b4` then merged `d5db7ccb` (XKB #171, low exposure; gate green).
 
 ## Known intermittent failures (`c0_3bi_`, under suite concurrency)
 
@@ -72,6 +75,15 @@ re-run once; a repeat or any other failure is a finding.
   default, `tcp-transport`, `xdmcp`; each `c0_*` filter with
   `--include-ignored --skip _drm`; `--lib`; `c0_2ci`; `yserver-core`; each
   integration file except `render_acceptance`.
+
+## Carried to the activation stage (4/5)
+
+- **One `ResourceService` + `DrmCleanupRegistry` per Owner device.** Today the
+  backend holds one, and `install_resource_service` has no production caller;
+  a client modeset on a second Owner device fails closed at preparation
+  (`Stage::Allocation`). The stage that installs services in production owns
+  it, together with 3b-i-2's carried test `c0_3bi_enable_on_b_unflips_a_vulkan`
+  (F15, plan rev 5).
 
 ## Carried to 3c
 
