@@ -214,6 +214,14 @@ struct PendingAck {
     /// Owner-route staging is delayed until the owner reports Accepted.
     /// Keep the recorder's exact coverage beside the captured ack until then.
     stage_complete: bool,
+    /// A topology promotion retired this output while this frame was still
+    /// pre-submit. The bundle must retain its BO and descriptor slot until
+    /// the render fence is observed signalled.
+    retired_unsubmitted: bool,
+    retired_unsubmitted_fence_proven: bool,
+    /// A copied Owner frame has a second GPU stage after its render fence.
+    /// Keep its retired bundle until that copy completion is serviced too.
+    retired_unsubmitted_copy_pending: bool,
     stage_repaint: Region,
     stage_painted: Region,
     /// Step 2 — the participants this frame emitted. Becomes
@@ -609,6 +617,17 @@ pub(crate) struct RetiredOutputBundle {
     pub(crate) instance: OutputInstanceId,
     scene: OutputSceneState,
     pool: OutputScanout,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct RetiredOutputEndStateForTests {
+    pub(crate) key: OutputKey,
+    pub(crate) instance: OutputInstanceId,
+    pub(crate) allocation_keys: Vec<AllocationKey>,
+    pub(crate) phases: Vec<BoPhase>,
+    pub(crate) owner_buffers: Vec<(usize, OwnerBufferState)>,
+    pub(crate) gpu_fence_proofs: usize,
 }
 
 pub(crate) struct StagedOutputSceneState {
@@ -1215,10 +1234,12 @@ pub(crate) struct SceneCompositor {
     drain_all_calls_for_tests: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ComposedOffer {
     pub(crate) device: crate::platform::drm::DrmDeviceKey,
     pub(crate) crtc: u32,
     pub(crate) generation: u64,
+    pub(crate) output_instance_id: OutputInstanceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1839,9 +1860,9 @@ impl SceneCompositor {
         &mut self,
         platform: &PlatformBackend,
         mut identity_map: StagedOutputIdentityMap,
-    ) {
+    ) -> Vec<ComposedOffer> {
         let Some(inner) = self.inner.as_mut() else {
-            return;
+            return Vec::new();
         };
         assert_eq!(
             platform.outputs.len(),
@@ -1854,6 +1875,7 @@ impl SceneCompositor {
             .collect::<HashMap<_, _>>();
         let mut next_outputs = Vec::with_capacity(platform.outputs.len());
         let mut retired = Vec::new();
+        let mut retired_offers = Vec::new();
 
         for (output_idx, (layout, &instance_id)) in platform
             .outputs
@@ -1877,9 +1899,10 @@ impl SceneCompositor {
                     staged,
                     retired_pool,
                 } => {
-                    let old = old_states
+                    let mut old = old_states
                         .remove(&old_instance)
                         .expect("replaced output state is present by instance id");
+                    retired_offers.extend(terminalize_unsubmitted_owner_buffers(&mut old));
                     retired.push(RetiredOutputBundle {
                         key: old.output_key.clone(),
                         instance: old.output_instance_id,
@@ -1905,10 +1928,11 @@ impl SceneCompositor {
                     old_instance,
                     retired_pool,
                 } => {
-                    let old = old_states
+                    let mut old = old_states
                         .remove(&old_instance)
                         .expect("removed output state is present by instance id");
                     assert_eq!(old.output_key, key);
+                    retired_offers.extend(terminalize_unsubmitted_owner_buffers(&mut old));
                     retired.push(RetiredOutputBundle {
                         key: old.output_key.clone(),
                         instance: old.output_instance_id,
@@ -1923,6 +1947,19 @@ impl SceneCompositor {
             old_states.is_empty(),
             "every old output has a promotion entry"
         );
+        let retired_instances = retired
+            .iter()
+            .map(|bundle| bundle.instance)
+            .collect::<HashSet<_>>();
+        let mut retained_offers = VecDeque::with_capacity(inner.owner_offers.len());
+        while let Some(offer) = inner.owner_offers.pop_front() {
+            if retired_instances.contains(&offer.output_instance_id) {
+                retired_offers.push(offer);
+            } else {
+                retained_offers.push_back(offer);
+            }
+        }
+        inner.owner_offers = retained_offers;
         inner.outputs = next_outputs;
         for bundle in retired {
             inner
@@ -1933,6 +1970,16 @@ impl SceneCompositor {
         }
         self.scene_structure_dirty = true;
         self.root_overlay_clear();
+        let mut seen = HashSet::new();
+        retired_offers.retain(|offer| {
+            seen.insert((
+                offer.device,
+                offer.crtc,
+                offer.generation,
+                offer.output_instance_id,
+            ))
+        });
+        retired_offers
     }
 
     /// A completed client modeset has displaced the old pool's current
@@ -1971,10 +2018,10 @@ impl SceneCompositor {
         staged_state: StagedOutputSceneState,
         retired_pool: OutputScanout,
         platform: &PlatformBackend,
-    ) {
+    ) -> Vec<ComposedOffer> {
         let mut identity_map = self.stage_output_identity_map();
         identity_map.replace(key, staged_state, retired_pool);
-        self.promote_output_identity_map(platform, identity_map);
+        self.promote_output_identity_map(platform, identity_map)
     }
 
     /// Step 3 — mark every output's scanout BOs wholly stale.
@@ -2707,13 +2754,30 @@ impl SceneCompositor {
             return;
         };
         loop {
-            let Some((output_idx, index)) =
-                inner
-                    .outputs
-                    .iter()
-                    .enumerate()
-                    .find_map(|(output_idx, state)| {
-                        state
+            let active = inner
+                .outputs
+                .iter()
+                .enumerate()
+                .find_map(|(output_idx, state)| {
+                    state
+                        .owner_buffers
+                        .iter()
+                        .position(|buffer| {
+                            buffer.commit_id() == Some(commit.commit)
+                                && buffer.identity().output_key.device_key == commit.device
+                                && buffer.state() == OwnerBufferState::Submitted
+                        })
+                        .map(|index| (output_idx, index))
+                });
+            let Some((output_idx, index)) = active else {
+                let retired = inner
+                    .retired_outputs
+                    .get_mut(&commit.device)
+                    .into_iter()
+                    .flatten()
+                    .find_map(|bundle| {
+                        bundle
+                            .scene
                             .owner_buffers
                             .iter()
                             .position(|buffer| {
@@ -2721,10 +2785,17 @@ impl SceneCompositor {
                                     && buffer.identity().output_key.device_key == commit.device
                                     && buffer.state() == OwnerBufferState::Submitted
                             })
-                            .map(|index| (output_idx, index))
-                    })
-            else {
-                return;
+                            .map(|index| (&mut bundle.scene.owner_buffers, index))
+                    });
+                let Some((owner_buffers, index)) = retired else {
+                    return;
+                };
+                let buffer = owner_buffers.remove(index);
+                match buffer.into_accepted() {
+                    Ok(buffer) => owner_buffers.insert(index, buffer),
+                    Err(buffer) => owner_buffers.insert(index, *buffer),
+                }
+                continue;
             };
             let state = &mut inner.outputs[output_idx];
             let buffer = state.owner_buffers.remove(index);
@@ -2834,24 +2905,73 @@ impl SceneCompositor {
         // A bundled owner commit has one CompletionRetired event carrying the
         // bundle's resources. Resolve every scene member keyed by this commit.
         loop {
-            let Some((output_idx, index)) =
-                inner
-                    .outputs
-                    .iter()
-                    .enumerate()
-                    .find_map(|(output_idx, state)| {
-                        state
+            let active = inner
+                .outputs
+                .iter()
+                .enumerate()
+                .find_map(|(output_idx, state)| {
+                    state
+                        .owner_buffers
+                        .iter()
+                        .position(|buffer| {
+                            buffer.commit_id() == Some(commit.commit)
+                                && buffer.identity().output_key.device_key == commit.device
+                                && buffer.state() == OwnerBufferState::Accepted
+                        })
+                        .map(|index| (output_idx, index))
+                });
+            let Some((output_idx, index)) = active else {
+                let retired = inner
+                    .retired_outputs
+                    .get_mut(&commit.device)
+                    .into_iter()
+                    .flatten()
+                    .find_map(|bundle| {
+                        bundle
+                            .scene
                             .owner_buffers
                             .iter()
                             .position(|buffer| {
                                 buffer.commit_id() == Some(commit.commit)
                                     && buffer.identity().output_key.device_key == commit.device
-                                    && buffer.state() == OwnerBufferState::Accepted
+                                    && matches!(
+                                        buffer.state(),
+                                        OwnerBufferState::Submitted | OwnerBufferState::Accepted
+                                    )
                             })
-                            .map(|index| (output_idx, index))
-                    })
-            else {
-                return;
+                            .map(|index| (&mut bundle.scene.owner_buffers, index))
+                    });
+                let Some((owner_buffers, index)) = retired else {
+                    return;
+                };
+                let buffer = owner_buffers.remove(index);
+                let buffer = match buffer.state() {
+                    OwnerBufferState::Submitted => match buffer.into_accepted() {
+                        Ok(buffer) => buffer,
+                        Err(buffer) => {
+                            owner_buffers.insert(index, *buffer);
+                            return;
+                        }
+                    },
+                    OwnerBufferState::Accepted => buffer,
+                    _ => unreachable!("retired owner-buffer selector restricts its state"),
+                };
+                let buffer = match buffer.into_current() {
+                    Ok(buffer) => buffer,
+                    Err(buffer) => {
+                        owner_buffers.insert(index, *buffer);
+                        return;
+                    }
+                };
+                let buffer = match buffer.into_releasing() {
+                    Ok(buffer) => buffer,
+                    Err(buffer) => {
+                        owner_buffers.insert(index, *buffer);
+                        return;
+                    }
+                };
+                owner_buffers.insert(index, buffer);
+                continue;
             };
             let state = &mut inner.outputs[output_idx];
             let old_index = Self::owner_current_index(state);
@@ -2976,6 +3096,35 @@ impl SceneCompositor {
                 .iter()
                 .position(|output| output.key == member.output_key)
             else {
+                let retired_bundle = inner
+                    .retired_outputs
+                    .get_mut(&commit.device)
+                    .into_iter()
+                    .flatten()
+                    .find(|bundle| bundle.key == member.output_key);
+                if let Some(bundle) = retired_bundle {
+                    let submitted = member.accepted
+                        && bundle.scene.owner_buffers.iter().any(|buffer| {
+                            buffer.identity().output_key == member.output_key
+                                && buffer.identity().bo_idx == member.bo_idx
+                                && buffer.identity().generation == member.generation
+                                && matches!(
+                                    buffer.state(),
+                                    OwnerBufferState::Submitted | OwnerBufferState::Accepted
+                                )
+                                && buffer
+                                    .pending_ack()
+                                    .is_some_and(|ack| ack.stage == InFlightStage::OwnerSubmitted)
+                        });
+                    if submitted {
+                        for snapshot in member.drawable_snapshots {
+                            store.ack_presentation_damage(snapshot);
+                        }
+                        bundle.scene.damage.retire_success();
+                    } else {
+                        bundle.scene.damage.invalidate();
+                    }
+                }
                 continue;
             };
             let submitted = inner.outputs.get(output_idx).is_some_and(|state| {
@@ -3195,6 +3344,185 @@ impl SceneCompositor {
     }
 
     #[cfg(test)]
+    pub(crate) fn retired_output_end_states_for_tests(&self) -> Vec<RetiredOutputEndStateForTests> {
+        self.inner
+            .as_ref()
+            .into_iter()
+            .flat_map(|inner| inner.retired_outputs.values().flatten())
+            .map(|bundle| RetiredOutputEndStateForTests {
+                key: bundle.key.clone(),
+                instance: bundle.instance,
+                allocation_keys: bundle
+                    .pool
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .filter_map(|bo| bo.managed_key())
+                    .chain(bundle.pool.copied().into_iter().flat_map(|pool| {
+                        pool.sources
+                            .iter()
+                            .filter_map(|source| source.managed_key())
+                    }))
+                    .collect(),
+                phases: bundle
+                    .pool
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .map(|bo| bo.state.phase)
+                    .collect(),
+                owner_buffers: bundle
+                    .scene
+                    .owner_buffers
+                    .iter()
+                    .map(|buffer| (buffer.identity().bo_idx, buffer.state()))
+                    .collect(),
+                gpu_fence_proofs: bundle
+                    .scene
+                    .pending_acks
+                    .iter()
+                    .filter(|ack| ack.ticket.is_some())
+                    .count()
+                    + bundle
+                        .scene
+                        .owner_buffers
+                        .iter()
+                        .map(|buffer| {
+                            buffer.pending_ack().map_or(0, |ack| {
+                                usize::from(
+                                    ack.retired_unsubmitted
+                                        && !ack.retired_unsubmitted_fence_proven,
+                                ) + usize::from(ack.retired_unsubmitted_copy_pending)
+                            })
+                        })
+                        .sum::<usize>()
+                    + bundle.scene.pending_pool_releases.len()
+                    + bundle.scene.failed_submit_bos.len(),
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_buffer_identities_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Vec<OwnerBufferIdentity> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map(|state| {
+                state
+                    .owner_buffers
+                    .iter()
+                    .map(|buffer| buffer.identity().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bo_has_pending_proof_for_tests(
+        &self,
+        instance: OutputInstanceId,
+        bo_idx: usize,
+    ) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        let scene = inner
+            .outputs
+            .iter()
+            .find(|state| state.output_instance_id == instance)
+            .or_else(|| {
+                inner
+                    .retired_outputs
+                    .get(&instance.device_key)
+                    .into_iter()
+                    .flatten()
+                    .find(|bundle| bundle.instance == instance)
+                    .map(|bundle| &bundle.scene)
+            });
+        scene.is_some_and(|scene| {
+            scene.pending_acks.iter().any(|ack| ack.bo_idx == bo_idx)
+                || scene
+                    .failed_submit_bos
+                    .iter()
+                    .any(|failed| failed.bo_idx == bo_idx)
+                || !scene.pending_pool_releases.is_empty()
+                || scene
+                    .owner_buffers
+                    .iter()
+                    .any(|buffer| buffer.identity().bo_idx == bo_idx)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_pending_ack_for_tests(&mut self, output_idx: usize, bo_idx: usize) -> bool {
+        let Some(state) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+        else {
+            return false;
+        };
+        let Some(slot) = state.pool_ring.acquire() else {
+            return false;
+        };
+        state.pool_slots.push_back(slot);
+        state.pending_acks.push_back(PendingAck {
+            bo_idx,
+            generation: 1,
+            stage: InFlightStage::KmsFlipPending,
+            drawable_snapshots: Vec::new(),
+            ticket: Some(FenceTicket::for_tests_stub()),
+            submitted_output_damage: RegionSet::new(),
+            stage_complete: true,
+            retired_unsubmitted: false,
+            retired_unsubmitted_fence_proven: false,
+            retired_unsubmitted_copy_pending: false,
+            stage_repaint: Region::new(),
+            stage_painted: Region::new(),
+            submitted_participants: Vec::new(),
+            submitted_scene_structure_damage: RegionSet::new(),
+            submitted_failed_repaint: RegionSet::new(),
+            cursor_transition: None,
+            cursor_prev_pos_after_retire: None,
+            cursor_mode_after_retire: OutputCursorMode::Hidden,
+            last_present_cursor_rect_after_retire: None,
+            last_present_cursor_version_after_retire: None,
+            managed_batch: None,
+            copied_receipt: None,
+        });
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_retired_output_bo_phase_for_tests(
+        &mut self,
+        instance: OutputInstanceId,
+        bo_idx: usize,
+        phase: BoPhase,
+    ) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        let Some(bundle) = inner
+            .retired_outputs
+            .get_mut(&instance.device_key)
+            .into_iter()
+            .flatten()
+            .find(|bundle| bundle.instance == instance)
+        else {
+            return false;
+        };
+        let Some(bo) = bundle.pool.display_pool_mut().bos.get_mut(bo_idx) else {
+            return false;
+        };
+        bo.state.phase = phase;
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn retired_output_has_instance_for_tests(&self, instance: OutputInstanceId) -> bool {
         self.inner.as_ref().is_some_and(|inner| {
             inner
@@ -3369,6 +3697,45 @@ impl SceneCompositor {
                     .and_then(|state| state.owner_buffers.get(index))
             })
             .map(OwnerBuffer::state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_state_for_generation_for_tests(
+        &self,
+        output_idx: usize,
+        generation: u64,
+    ) -> Option<OwnerBufferState> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .and_then(|state| {
+                state
+                    .owner_buffers
+                    .iter()
+                    .find(|buffer| buffer.identity().generation == generation)
+            })
+            .map(OwnerBuffer::state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_owner_render_fence_for_tests(
+        &mut self,
+        output_idx: usize,
+        generation: u64,
+    ) -> Option<FenceTicket> {
+        let buffer = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+            .and_then(|state| {
+                state
+                    .owner_buffers
+                    .iter_mut()
+                    .find(|buffer| buffer.identity().generation == generation)
+            })?;
+        let ticket = buffer.pending_ack()?.ticket.as_ref()?.clone();
+        ticket.hold_polling_for_tests();
+        Some(ticket)
     }
 
     #[cfg(test)]
@@ -3851,6 +4218,11 @@ impl SceneCompositor {
                         .pending_acks
                         .iter()
                         .any(|ack| ack.ticket.is_some())
+                    || bundle.scene.owner_buffers.iter().any(|buffer| {
+                        buffer.pending_ack().is_some_and(|ack| {
+                            ack.retired_unsubmitted && !ack.retired_unsubmitted_fence_proven
+                        })
+                    })
             })
         })
     }
@@ -5018,6 +5390,7 @@ fn handle_scanout_render_completion_inner(
             device: output_key.device_key,
             crtc: u32::from(platform.outputs[output_idx].output.crtc),
             generation,
+            output_instance_id: state.output_instance_id,
         });
         // `fd` is intentionally dropped here. Owner carries no producer fd
         // through an ioctl; the drain owns and closes the notification.
@@ -5104,11 +5477,6 @@ fn handle_scanout_render_completion_inner(
                 return true;
             }
 
-            #[cfg(test)]
-            println!(
-                "CP copied destination promotion gate passed key={destination_key:?} obligation={destination_obligation:?} pending=false frozen=false generation={generation}"
-            );
-
             let managed = match service.reserve(
                 prepared.identity().managed_key,
                 crate::kms::render::resources::UseKind::Retain,
@@ -5153,11 +5521,8 @@ fn handle_scanout_render_completion_inner(
                 device: output_key.device_key,
                 crtc: u32::from(platform.outputs[output_idx].output.crtc),
                 generation,
+                output_instance_id: state.output_instance_id,
             });
-            #[cfg(test)]
-            println!(
-                "CP copied destination offer enqueued key={destination_key:?} obligation={destination_obligation:?} generation={generation}"
-            );
             drop(fd);
             return true;
         }
@@ -5343,6 +5708,12 @@ fn handle_retired_scanout_render_completion(
     }
     if let Err(error) = service.service_completions(std::time::Instant::now()) {
         log::warn!("render retired output: completion service failed: {error:?}");
+    }
+    if completion_stage == ScanoutRenderCompletionStage::CopiedOwnerCopy
+        && let Some(ack) = buffer.pending_ack_mut()
+        && ack.retired_unsubmitted
+    {
+        ack.retired_unsubmitted_copy_pending = false;
     }
     if matches!(
         buffer.state(),
@@ -5944,6 +6315,8 @@ fn retire_onscreen_pool_bo_after_kms_proof(
 
 fn retire_owner_buffers_in_bundle(
     bundle: &mut RetiredOutputBundle,
+    platform: &mut PlatformBackend,
+    vk: &crate::kms::vk::device::VkContext,
     resource_service: Option<&mut ResourceService>,
 ) {
     let Some(service) = resource_service else {
@@ -5951,11 +6324,45 @@ fn retire_owner_buffers_in_bundle(
     };
     let mut index = 0;
     while index < bundle.scene.owner_buffers.len() {
+        let needs_render_fence = bundle.scene.owner_buffers[index]
+            .pending_ack()
+            .is_some_and(|ack| ack.retired_unsubmitted && !ack.retired_unsubmitted_fence_proven);
+        if needs_render_fence {
+            let ticket = bundle.scene.owner_buffers[index]
+                .pending_ack()
+                .and_then(|ack| ack.ticket.clone());
+            let Some(ticket) = ticket else {
+                index += 1;
+                continue;
+            };
+            match ticket.poll_signaled_result(vk) {
+                Ok(true) => {
+                    if let Some(ack) = bundle.scene.owner_buffers[index].pending_ack_mut() {
+                        ack.retired_unsubmitted_fence_proven = true;
+                    }
+                }
+                Ok(false) => {
+                    index += 1;
+                    continue;
+                }
+                Err(error) => {
+                    log::error!(
+                        "render retired output: never-submitted frame fence status failed: {error:?}"
+                    );
+                    platform.renderer_failed = true;
+                    index += 1;
+                    continue;
+                }
+            }
+        }
         let releasable_state = matches!(
             bundle.scene.owner_buffers[index].state(),
             OwnerBufferState::Displaced | OwnerBufferState::Releasing
         );
         let ready = releasable_state
+            && !bundle.scene.owner_buffers[index]
+                .pending_ack()
+                .is_some_and(|ack| ack.retired_unsubmitted_copy_pending)
             && bundle.scene.owner_buffers[index]
                 .pending_ack()
                 .is_some_and(|ack| ack.managed_batch.is_none())
@@ -6030,6 +6437,94 @@ fn retire_owner_buffers_in_bundle(
             bundle.scene.pool_ring.release(pool_slot);
         }
     }
+
+    // A retired copied pool can outlive its OwnerBuffer record when the
+    // completion wake was already consumed before topology promotion. Retire
+    // any now-unreferenced source payloads once their resource proofs are
+    // complete so the pool-drain predicate cannot strand the bundle on an
+    // ownerless Foreign source.
+    if let OutputScanout::Copied(pool) = &mut bundle.pool {
+        for bo_idx in 0..pool.sources.len() {
+            if bundle
+                .scene
+                .owner_buffers
+                .iter()
+                .any(|buffer| buffer.identity().bo_idx == bo_idx)
+            {
+                continue;
+            }
+            let Some(source_key) = pool
+                .sources
+                .get(bo_idx)
+                .and_then(|source| source.managed_key())
+            else {
+                continue;
+            };
+            if !service.copied_source_is_retirement_terminal(&source_key)
+                && service.is_releasable(&source_key)
+            {
+                let _ = crate::kms::render::copied_owner::retire_source_after_completion_proof(
+                    pool, service, bo_idx,
+                );
+            }
+        }
+    }
+}
+
+/// A retired output can never dispatch a composed generation that is still
+/// before the owner IPC boundary. Keep its BO, allocation lease, fence ticket
+/// and descriptor slot together, but move it to the existing local-release
+/// state so the bundle can drain after the render fence and resource proofs.
+fn terminalize_unsubmitted_owner_buffers(state: &mut OutputSceneState) -> Vec<ComposedOffer> {
+    let mut offers = Vec::new();
+    let mut index = 0;
+    while index < state.owner_buffers.len() {
+        let owner_state = state.owner_buffers[index].state();
+        let pre_submit = matches!(
+            owner_state,
+            OwnerBufferState::Rendering | OwnerBufferState::Desired | OwnerBufferState::Displaced
+        );
+        let submitted_stage = state.owner_buffers[index].pending_ack().is_some_and(|ack| {
+            matches!(
+                ack.stage,
+                InFlightStage::OwnerSubmitted | InFlightStage::KmsFlipPending
+            )
+        });
+        if !pre_submit || submitted_stage {
+            index += 1;
+            continue;
+        }
+
+        let identity = state.owner_buffers[index].identity().clone();
+        if matches!(
+            owner_state,
+            OwnerBufferState::Rendering | OwnerBufferState::Desired
+        ) {
+            let buffer = state.owner_buffers.remove(index);
+            match buffer.into_displaced() {
+                Ok(displaced) => state.owner_buffers.insert(index, displaced),
+                Err(buffer) => {
+                    state.owner_buffers.insert(index, *buffer);
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+
+        if let Some(ack) = state.owner_buffers[index].pending_ack_mut() {
+            ack.retired_unsubmitted = true;
+            ack.retired_unsubmitted_copy_pending =
+                matches!(ack.stage, InFlightStage::OwnerCopyWaiting { .. });
+        }
+        offers.push(ComposedOffer {
+            device: identity.output_key.device_key,
+            crtc: identity.crtc,
+            generation: identity.generation,
+            output_instance_id: state.output_instance_id,
+        });
+        index += 1;
+    }
+    offers
 }
 
 fn drain_retired_output_bundles(
@@ -6046,7 +6541,12 @@ fn drain_retired_output_bundles(
                 vk.as_ref(),
                 resource_service.as_deref(),
             );
-            retire_owner_buffers_in_bundle(bundle, resource_service.as_deref_mut());
+            retire_owner_buffers_in_bundle(
+                bundle,
+                platform,
+                vk.as_ref(),
+                resource_service.as_deref_mut(),
+            );
             drain_retired_pending_pool_releases(
                 &mut bundle.scene,
                 vk.as_ref(),
@@ -8372,6 +8872,9 @@ fn tick_one_output(
                 ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,
                 stage_complete: compose_complete,
+                retired_unsubmitted: false,
+                retired_unsubmitted_fence_proven: false,
+                retired_unsubmitted_copy_pending: false,
                 stage_repaint: requested.clone(),
                 stage_painted: plan.painted.clone(),
                 submitted_participants: built.participants,
@@ -12724,6 +13227,9 @@ mod tests {
                 ticket: Some(FenceTicket::for_tests_stub()),
                 submitted_output_damage: RegionSet::new(),
                 stage_complete: true,
+                retired_unsubmitted: false,
+                retired_unsubmitted_fence_proven: false,
+                retired_unsubmitted_copy_pending: false,
                 stage_repaint: Region::new(),
                 stage_painted: Region::new(),
                 submitted_participants: Vec::new(),

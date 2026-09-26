@@ -182,6 +182,8 @@ pub(crate) struct ResourceService {
     dirty_entries: Rc<RefCell<BTreeSet<AllocationKey>>>,
     zero_edges: Rc<RefCell<BTreeSet<AllocationKey>>>,
     pending_batches: Vec<CoreRetirementBatch>,
+    #[cfg(test)]
+    held_copied_batches_for_tests: Vec<(AllocationKey, AllocationKey)>,
     quarantined_batches: Vec<(CoreRetirementBatch, ResourceError)>,
     seat_active: bool,
     waiters: WaiterRegistry,
@@ -201,6 +203,19 @@ pub(crate) struct ResourceService {
     transport_gate: Option<TransportGateHandle>,
 }
 
+/// Read-only ownership data used by the KMS lifecycle end-state assertions.
+/// The snapshot intentionally exposes allocation holders and proof obligations
+/// separately so a test cannot treat a still-live lease as proof that a
+/// retired allocation is justified.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AllocationEndStateForTests {
+    pub(crate) key: AllocationKey,
+    pub(crate) live_uses: Vec<UseKind>,
+    pub(crate) pending_obligations: Vec<ObligationKind>,
+    pub(crate) frozen: bool,
+}
+
 #[allow(dead_code)]
 impl ResourceService {
     pub(crate) fn new(device: DrmDeviceKey, incarnation: IncarnationId) -> Self {
@@ -215,6 +230,8 @@ impl ResourceService {
             dirty_entries: Rc::new(RefCell::new(BTreeSet::new())),
             zero_edges: Rc::new(RefCell::new(BTreeSet::new())),
             pending_batches: Vec::new(),
+            #[cfg(test)]
+            held_copied_batches_for_tests: Vec::new(),
             quarantined_batches: Vec::new(),
             seat_active: true,
             waiters: WaiterRegistry::new(),
@@ -278,6 +295,26 @@ impl ResourceService {
 
     pub(crate) fn contains(&self, key: &AllocationKey) -> bool {
         self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocation_end_state_for_tests(&self) -> Vec<AllocationEndStateForTests> {
+        self.entries
+            .iter()
+            .map(|(key, entry)| {
+                let availability = entry.availability.borrow();
+                AllocationEndStateForTests {
+                    key: *key,
+                    live_uses: availability.live_uses.values().copied().collect(),
+                    pending_obligations: availability
+                        .pending_obligations
+                        .values()
+                        .copied()
+                        .collect(),
+                    frozen: availability.frozen,
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn has_pending_obligations(&self, key: &AllocationKey) -> bool {
@@ -1549,6 +1586,26 @@ impl ResourceService {
     /// deadline) fails closed: the batch is quarantined immediately rather
     /// than admitted to `pending_batches` to be polled forever.
     pub(crate) fn register_batch(&mut self, mut batch: CoreRetirementBatch) {
+        #[cfg(test)]
+        if let Some(index) =
+            self.held_copied_batches_for_tests
+                .iter()
+                .position(|(source, destination)| {
+                    batch
+                        .read_obligation
+                        .as_ref()
+                        .is_some_and(|read| read.source_key() == *source)
+                        && batch.obligation().is_some_and(|obligation| {
+                            obligation
+                                .entries()
+                                .iter()
+                                .any(|(key, _)| *key == *destination)
+                        })
+                })
+        {
+            batch.test_ticket_status = Some(Ok(false));
+            self.held_copied_batches_for_tests.remove(index);
+        }
         match self
             .serviced_elapsed
             .checked_add(self.max_serviced_duration)
@@ -1575,6 +1632,16 @@ impl ResourceService {
     #[cfg(test)]
     pub(crate) fn pending_batches_mut(&mut self) -> &mut [CoreRetirementBatch] {
         &mut self.pending_batches
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_copied_batch_for_tests(
+        &mut self,
+        source: AllocationKey,
+        destination: AllocationKey,
+    ) {
+        self.held_copied_batches_for_tests
+            .push((source, destination));
     }
 
     pub(crate) fn quarantined_batches(&self) -> &[(CoreRetirementBatch, ResourceError)] {

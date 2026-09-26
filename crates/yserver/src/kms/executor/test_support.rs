@@ -57,6 +57,27 @@ pub enum StubBehaviour {
         sequence: u64,
         errno: i32,
     },
+    /// Accept every kernel request family with the response shape implied by
+    /// the request, including one out-fence descriptor per requested slot.
+    AcceptKernelCalls(u64),
+    /// Accept ordinary atomic calls and reject TEST_ONLY validation calls.
+    RejectValidationWith {
+        sequence: u64,
+        errno: i32,
+    },
+    /// Reject ordinary atomic requests while answering every request family.
+    RejectAtomicWith {
+        sequence: u64,
+        errno: i32,
+    },
+    /// Accept every kernel call after delaying the first reply, so a higher
+    /// priority lifecycle request can supersede an in-flight validation.
+    AcceptKernelCallsAfter(Duration),
+    /// Accept TEST_ONLY validation and reject the next ordinary atomic call.
+    AcceptValidationThenRejectWith {
+        sequence: u64,
+        errno: i32,
+    },
     ProbeThenRejectAtomic {
         sequence: u64,
         errno: i32,
@@ -115,6 +136,19 @@ impl StubBehaviour {
             }
             Self::RejectFirstProbeThenAccept { sequence, errno } => {
                 format!("reject-first-probe:{sequence}:{errno}")
+            }
+            Self::AcceptKernelCalls(sequence) => format!("accept-kernel-calls:{sequence}"),
+            Self::RejectValidationWith { sequence, errno } => {
+                format!("reject-validation:{sequence}:{errno}")
+            }
+            Self::RejectAtomicWith { sequence, errno } => {
+                format!("reject-atomic:{sequence}:{errno}")
+            }
+            Self::AcceptKernelCallsAfter(delay) => {
+                format!("accept-kernel-calls-after:{}", delay.as_millis())
+            }
+            Self::AcceptValidationThenRejectWith { sequence, errno } => {
+                format!("accept-validation-then-reject:{sequence}:{errno}")
             }
             Self::ProbeThenRejectAtomic { sequence, errno } => {
                 format!("probe-then-reject-atomic:{sequence}:{errno}")
@@ -204,6 +238,31 @@ impl StubBehaviour {
         } else if let Some(rest) = s.strip_prefix("reject-first-probe:") {
             let (sequence, errno) = rest.split_once(':')?;
             Some(Self::RejectFirstProbeThenAccept {
+                sequence: sequence.parse::<u64>().ok()?,
+                errno: errno.parse::<i32>().ok()?,
+            })
+        } else if let Some(rest) = s.strip_prefix("accept-kernel-calls:") {
+            rest.parse::<u64>().ok().map(Self::AcceptKernelCalls)
+        } else if let Some(rest) = s.strip_prefix("reject-validation:") {
+            let (sequence, errno) = rest.split_once(':')?;
+            Some(Self::RejectValidationWith {
+                sequence: sequence.parse::<u64>().ok()?,
+                errno: errno.parse::<i32>().ok()?,
+            })
+        } else if let Some(rest) = s.strip_prefix("reject-atomic:") {
+            let (sequence, errno) = rest.split_once(':')?;
+            Some(Self::RejectAtomicWith {
+                sequence: sequence.parse::<u64>().ok()?,
+                errno: errno.parse::<i32>().ok()?,
+            })
+        } else if let Some(delay) = s.strip_prefix("accept-kernel-calls-after:") {
+            delay
+                .parse::<u64>()
+                .ok()
+                .map(|ms| Self::AcceptKernelCallsAfter(Duration::from_millis(ms)))
+        } else if let Some(rest) = s.strip_prefix("accept-validation-then-reject:") {
+            let (sequence, errno) = rest.split_once(':')?;
+            Some(Self::AcceptValidationThenRejectWith {
                 sequence: sequence.parse::<u64>().ok()?,
                 errno: errno.parse::<i32>().ok()?,
             })
@@ -777,6 +836,21 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
         StubBehaviour::AcceptProbesThenNeverReply(sequence) => {
             serve_probes_then_wait(&control, sequence)
         }
+        StubBehaviour::AcceptKernelCalls(sequence) => {
+            serve_kernel_faithful_calls(&control, sequence, None, None, None, None)
+        }
+        StubBehaviour::RejectValidationWith { sequence, errno } => {
+            serve_kernel_faithful_calls(&control, sequence, Some(errno), None, None, None)
+        }
+        StubBehaviour::RejectAtomicWith { sequence, errno } => {
+            serve_kernel_faithful_calls(&control, sequence, None, None, None, Some(errno))
+        }
+        StubBehaviour::AcceptKernelCallsAfter(delay) => {
+            serve_kernel_faithful_calls(&control, 1_000, None, None, Some(delay), None)
+        }
+        StubBehaviour::AcceptValidationThenRejectWith { sequence, errno } => {
+            serve_kernel_faithful_calls(&control, sequence, None, Some(errno), None, None)
+        }
         StubBehaviour::RejectFirstProbeThenAccept { sequence, errno } => {
             serve_call_families(&control, sequence, false, None, Some(errno))
         }
@@ -962,6 +1036,114 @@ fn serve_probes_then_wait(control: &UnixStream, sequence: u64) -> io::Result<()>
             helper_duration_ns: 1_000_000,
         };
         transport::send_frame(control, &protocol::encode_reply(&reply))?;
+    }
+}
+
+/// Serve requests for as long as the backend keeps the executor channel open.
+/// Atomic replies mirror the request's out-fence slots (TEST_ONLY therefore
+/// carries none); probes and sequence queues receive their matching reply
+/// family. This models the executor side of a successful kernel response while
+/// leaving fence signaling and DRM events to the test's synthetic completion.
+fn serve_kernel_faithful_calls(
+    control: &UnixStream,
+    sequence: u64,
+    reject_validation_errno: Option<i32>,
+    reject_after_validation_errno: Option<i32>,
+    first_reply_delay: Option<Duration>,
+    reject_ordinary_errno: Option<i32>,
+) -> io::Result<()> {
+    use super::HostCallClass;
+
+    let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+    let mut first_reply_delay = first_reply_delay;
+    let mut validation_seen = false;
+    let mut rejected_after_validation = false;
+    loop {
+        let received = transport::recv_frame(control, &mut req_buf)?;
+        if received.len == 0 {
+            return Ok(());
+        }
+        let request = protocol::decode_request(&req_buf[..received.len]).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("protocol error: {error:?}"),
+            )
+        })?;
+        let correlation = request.correlation();
+        let (reply, fence_count) = match request {
+            protocol::HostCallRequest::Atomic(request) => {
+                let is_validation = matches!(
+                    request.class,
+                    HostCallClass::SeatActiveValidation
+                        | HostCallClass::ColdStartOrOfflineValidation
+                );
+                let rejection = if is_validation {
+                    validation_seen = true;
+                    reject_validation_errno
+                } else if let Some(errno) = reject_ordinary_errno {
+                    Some(errno)
+                } else if validation_seen && !rejected_after_validation {
+                    let rejection = reject_after_validation_errno;
+                    rejected_after_validation |= rejection.is_some();
+                    rejection
+                } else {
+                    None
+                };
+                if let Some(errno) = rejection {
+                    (
+                        protocol::HostCallReply::Rejected {
+                            correlation,
+                            errno,
+                            helper_duration_ns: 1_000_000,
+                            unexpected_fence_output: false,
+                        },
+                        0,
+                    )
+                } else {
+                    let fence_count = request.out_fence_slots.len();
+                    let fence_mask = if fence_count >= 32 {
+                        u32::MAX
+                    } else if fence_count == 0 {
+                        0
+                    } else {
+                        (1u32 << fence_count) - 1
+                    };
+                    (
+                        protocol::HostCallReply::Accepted {
+                            correlation,
+                            helper_duration_ns: 1_000_000,
+                            out_fence_mask: fence_mask,
+                        },
+                        fence_count,
+                    )
+                }
+            }
+            protocol::HostCallRequest::ClockProbe(_) => (
+                protocol::HostCallReply::ProbeAccepted {
+                    correlation,
+                    sequence,
+                    helper_duration_ns: 1_000_000,
+                },
+                0,
+            ),
+            protocol::HostCallRequest::SequenceQueue(_) => (
+                protocol::HostCallReply::QueueAccepted {
+                    correlation,
+                    sequence,
+                    helper_duration_ns: 1_000_000,
+                },
+                0,
+            ),
+        };
+        let reply_frame = protocol::encode_reply(&reply);
+        if let Some(delay) = first_reply_delay.take() {
+            std::thread::sleep(delay);
+        }
+        let dummy_files = (0..fence_count)
+            .map(|_| std::fs::File::open("/dev/null"))
+            .collect::<io::Result<Vec<_>>>()?;
+        let fence_refs = dummy_files.iter().map(AsFd::as_fd).collect::<Vec<_>>();
+        transport::send_reply_with_fences(control, &reply_frame, &fence_refs)?;
     }
 }
 
