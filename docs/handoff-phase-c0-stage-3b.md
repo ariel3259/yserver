@@ -1,0 +1,80 @@
+# Handoff — Phase C.0 stage 3b (2026-09-26)
+
+Branch `feat/phase-c0-atomic-kms-migration`, tip `d069a29c` (plus this file).
+**89 commits are unpushed** since `8f0de9ea`; push only after asking the user.
+
+## Where 3b stands
+
+Spec: `docs/superpowers/specs/2026-09-24-phase-c0-stage-3b-modeset-and-randr-design.md` (rev 12).
+3b = client modeset and RANDR on the Owner route (VT/hotplug are 3c).
+
+| Plan | State |
+| --- | --- |
+| 3b-i-1 modeset execution (`...-3b-i-1-plan-modeset-execution.md`, rev 11) | done, incl. hardware addenda A1, A2, A3 (`94c00628`) |
+| 3b-i-2 modeset routes (`...-3b-i-2-plan-modeset-routes.md`, rev 4) | Tasks 1, 2, H, 3 done. **Next: Task 4** (Legacy path in a mixed server), then Task 5 (two devices, coverage, hardware additions) |
+| 3b-ii RANDR protocol (`...-3b-ii-plan-randr-protocol.md`, rev 8) | Tasks 1–4 done. **Task 5** pending (protocol-order differential, hardware client) |
+
+After those: the 3b acceptance finding, `docs/status.md`, then fold the WIP
+commits into one commit per plan (user confirms history rewrites), then push
+(user confirms).
+
+**Task H is closed by user decision** (plan rev 4): the end-state check
+(`c0_3bi_assert_end_state`), the core-entry driver (`c0_3bi_core_driver_until`)
+and the kernel-faithful stub (`StubBehaviour::AcceptKernelCalls`) stay as they
+are. The "shared run-one-iteration" refactor of `core_loop::run` was
+**dropped** — do not re-propose it. Defects found later go to addenda. An
+unverified flake-hunt patch is kept outside the repo at
+`~/Projects/yserver-patches/taskH-flakes-partial-on-dede8405.patch` (probably
+obsolete, see below).
+
+## Last merge from upstream
+
+`d069a29c` merges joske/master up to `ad71461c` (window storage only while
+viewable, composite backing fixes, XKB). Integration notes are in the merge
+message; revalidation rows added to `docs/phase-c0-upstream-fixes-revalidation.md`.
+It fixed a real product defect found by the merge: `retire_owner_current`
+starved releasable buffers behind one blocked on `KmsRelease`.
+Gate green; `c0_hw_3b_modeset_owner_on_card1_drm` 3/3 on card1.
+**Still to do for this merge: run `render_acceptance` once** (GPU; ask first).
+
+## Known intermittent failures (`c0_3bi_`, under suite concurrency)
+
+Plan rev 4 lists `direct_hold_released_on_every_end`, `each_failure_has_its_cause`,
+`retired_copied_frame_stages`, `a3_desired_frame_of_a_retired_output_is_released`.
+New since Task 3: `position_only_updates_in_place` (1 in 3 runs).
+The starvation fix in the merge may have been the cause of the `direct_hold`
+flake; re-measure before assuming. Rule: a gate failing only on these is
+re-run once; a repeat or any other failure is a finding.
+
+## How the work is run
+
+- **Codex implements** (`gpt-6-luna`, `xhigh`; `max` on send-backs):
+  `codex exec -m gpt-6-luna -c model_reasoning_effort=xhigh --sandbox danger-full-access "<prompt>" < /dev/null`.
+  Resuming a session: `codex exec resume -m ... -c sandbox_mode=danger-full-access <SESSION_ID> "<prompt>"`
+  (`resume` rejects `--sandbox`). Every prompt restates: no git writes; never
+  `_drm` tests, `render_acceptance`, `c0_hw_*`, DRM master or modesets; never
+  edit `docs/status.md`; never weaken an assertion; the gate with exact counts
+  per filter; the known-flakes rule. Plans give interfaces, invariants, tests
+  and mutations — not code.
+- **Codex reviews specs/plans** via `docs/superpowers/review/review.sh`
+  (`gpt-6-sol` xhigh); findings go to `docs/superpowers/findings/`.
+- **The coordinator verifies**: re-runs the suites itself (codex has
+  misreported passing suites), spot-checks mutations, commits, and runs the
+  hardware test after every task that touches a real KMS path.
+- **Hardware** (`c0_hw_3b_modeset_owner_on_card1_drm`, card1 = RTX 5060 Ti,
+  HDMI-A-2): the box is also the user's VR/gaming rig — ask before GPU work.
+  Preflight must gate, not just print: the active VT
+  (`/sys/class/tty/tty0/active`) must not be the graphical session's, and no
+  VR/game process may run. Hyprland on tty1 with Xwayland holding card1 open is
+  fine while the user is on another tty (logind drops its master). Never exit
+  Hyprland: it kills the other sessions.
+- Gate: `cargo +nightly fmt --check`; clippy `--all-targets -D warnings` in
+  default, `tcp-transport`, `xdmcp`; each `c0_*` filter with
+  `--include-ignored --skip _drm`; `--lib`; `c0_2ci`; `yserver-core`; each
+  integration file except `render_acceptance`.
+
+## Carried to 3c
+
+- The arbiter defers prompt obligations during a dispatched modeset.
+- The RANDR reprobe must move off the core thread.
+- The requester-less publication timestamp rule versus Legacy hotplug.
