@@ -28,6 +28,24 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-09-26 Phase C.0 stage 3b (client modeset and the RANDR protocol on
+  the Owner) ACCEPTED** at `68cffa47`. A client `SetCrtcConfig` on an Owner
+  device is one atomic `ALLOW_MODESET` transaction per device: validated with
+  `TEST_ONLY`, prepared with the old topology lit, promoted infallibly;
+  retired outputs keep their state in identity-keyed bundles until their KMS
+  proof; direct frames unflip first; copied route, position-only (no KMS
+  call) and a Legacy modeset in a mixed server (scoped to Legacy devices) are
+  covered, and a Legacy-only server is unchanged. `RandrMutationGate`
+  serializes RANDR mutations server-wide with `Q` = 30 s and publication that
+  outlives its requester. The card1 hardware test passes 3/3 (mode, enable,
+  DPMS and position cycles ×4, plus a protocol client). Hardware found three
+  defects no fixture reached (addenda A1–A3); the test harness and the
+  upstream merges found two more (retired-bundle completion retirement,
+  release starvation). Tests that need the assembled server on Owner are
+  listed in `docs/phase-c0-deferred-real-server-tests.md` for stages 4/5;
+  one resource service per Owner device is carried to activation. `--lib`
+  1935/0/287. Finding:
+  `docs/superpowers/findings/2026-09-26-stage-3b-accepted.md`.
 - **2026-09-24 Phase C.0 stage 3a-ii (DPMS execution on the Owner) ACCEPTED**
   at `1f252e52`, with the stage 2b clock-probe addendum. DPMS on an Owner
   device is an `ACTIVE`-only lifecycle commit driven by the 3a-i arbiter
