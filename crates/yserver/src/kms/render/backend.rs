@@ -87289,6 +87289,266 @@ mod tests {
         Ok(displaced_allocations)
     }
 
+    type C0Hw3bProtocolOutcome = (
+        Vec<crate::kms::render::resources::AllocationKey>,
+        Vec<u8>,
+        Vec<u8>,
+    );
+
+    /// Send one real RANDR SetCrtcConfig request through the core dispatcher,
+    /// then let the ordinary core-entry driver finish its Owner token before
+    /// the protocol continuation publishes and writes the reply.
+    fn c0_hw_3b_set_crtc_config_through_core(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        client_id: u32,
+        sequence: u16,
+        output_id: u32,
+        connector: &str,
+        output_key: &OutputKey,
+        mode: ModeSpec,
+        requester: &mut std::os::unix::net::UnixStream,
+        listener: &mut std::os::unix::net::UnixStream,
+        label: &str,
+        synthetic_completion: bool,
+    ) -> Result<C0Hw3bProtocolOutcome, String> {
+        use yserver_core::core_loop::process_request::{
+            RequestOutcome, complete_crtc_config, process_request,
+        };
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        let output = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.output_id == output_id)
+            .ok_or_else(|| format!("{label}: RANDR output {output_id} is absent"))?;
+        assert_eq!(output.name, connector, "{label}: connector identity");
+        let crtc_id = output.crtc_id;
+        let (x, y) = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|current| &current.key == output_key)
+            .map(|current| (current.x, current.y))
+            .ok_or_else(|| format!("{label}: platform output is absent"))?;
+        let x =
+            i16::try_from(x).map_err(|_| format!("{label}: output x is outside RANDR range"))?;
+        let y =
+            i16::try_from(y).map_err(|_| format!("{label}: output y is outside RANDR range"))?;
+        let mode_id = state
+            .randr
+            .mode_table
+            .iter()
+            .find(|candidate| {
+                candidate.width == mode.width
+                    && candidate.height == mode.height
+                    && candidate.vrefresh == mode.vrefresh
+            })
+            .map(|candidate| candidate.mode_id)
+            .ok_or_else(|| format!("{label}: requested mode is absent from RANDR state"))?;
+        let old_allocations = c0_hw_3b_pool_allocations(backend, output_key);
+        let displaces_pool = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| &output.key == output_key)
+            .is_some_and(|output| output.width != mode.width || output.height != mode.height);
+        let displaced_allocations = if displaces_pool {
+            old_allocations
+        } else {
+            Vec::new()
+        };
+
+        // SetCrtcConfig: crtc, timestamp, config timestamp, x/y, mode,
+        // RR_Rotate_0, pad, and the one output attached to the CRTC.
+        let mut body = Vec::with_capacity(28);
+        body.extend_from_slice(&crtc_id.to_le_bytes());
+        body.extend_from_slice(&1234_u32.to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&mode_id.to_le_bytes());
+        body.extend_from_slice(&1_u16.to_le_bytes());
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&output_id.to_le_bytes());
+        let pending = match process_request(
+            state,
+            backend,
+            ClientId(client_id),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                length_units: 8,
+            },
+            &body,
+            None,
+        )
+        .map_err(|error| format!("{label}: core request failed: {error}"))?
+        {
+            RequestOutcome::PendingCrtcConfig(pending) => pending,
+            other => {
+                let wire = kbd_map_drain(requester);
+                return Err(format!(
+                    "{label}: expected pending Owner request, got {other:?}, wire={wire:02x?}"
+                ));
+            }
+        };
+        assert!(
+            kbd_map_drain(requester).is_empty(),
+            "{label}: Owner SetCrtcConfig must not reply before promotion"
+        );
+
+        if synthetic_completion {
+            // The executor stub returns placeholder /dev/null out-fences.
+            // Do not let the fixture's fence observer interpret them as
+            // kernel sync files; the core-entry script below supplies the
+            // matching completion and page-flip records.
+            backend.platform.owner_completion_detached = true;
+        }
+        let commit = c0_3bi_wait_client_modeset_live(backend, device, pending.token, label);
+        if synthetic_completion {
+            c0_3bi_complete_owner_commit_through_core_driver(backend, device, commit, label);
+            c0_3bi_drive_crtc_config_result(backend, pending.token, label);
+        } else {
+            c0_3bi_drive_crtc_config_result(backend, pending.token, label);
+        }
+        let changed = c0_3bi_take_crtc_config_result(backend, pending.token)
+            .map_err(|error| format!("{label}: taking core-entry result failed: {error}"))?;
+        if synthetic_completion {
+            backend.platform.owner_completion_detached = false;
+        }
+        assert!(changed, "{label}: accepted modeset reports a real change");
+        assert!(
+            c0_3bi_kms_displacements(backend, device, commit).is_empty(),
+            "{label}: CompletionRetired discharges every KmsRelease"
+        );
+        complete_crtc_config(
+            state,
+            backend,
+            ClientId(client_id),
+            SequenceNumber(sequence),
+            pending.publication,
+            pending.reply,
+            Ok(changed),
+        )
+        .map_err(|error| format!("{label}: protocol completion failed: {error}"))?;
+
+        let reply = c0_hw_3b_read_exact(requester, 32, label)?;
+        assert_eq!(reply[0], 1, "{label}: SetCrtcConfig reply packet");
+        assert_eq!(reply[1], 0, "{label}: installed mode reports Success");
+        assert_eq!(
+            u16::from_le_bytes(reply[2..4].try_into().expect("reply sequence")),
+            sequence,
+            "{label}: reply carries the request sequence"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().expect("reply timestamp")),
+            1234,
+            "{label}: reply carries the published lastSetTime"
+        );
+        assert!(reply[12..].iter().all(|byte| *byte == 0));
+
+        let events = c0_hw_3b_read_exact(listener, 96, label)?;
+        assert_eq!(events[0] & 0x7f, 89, "{label}: ScreenChangeNotify first");
+        assert_eq!(events[32] & 0x7f, 90, "{label}: CRTC change second");
+        assert_eq!(events[33], yserver_protocol::x11::randr::NOTIFY_CRTC_CHANGE);
+        assert_eq!(events[64] & 0x7f, 90, "{label}: Output change third");
+        assert_eq!(
+            events[65],
+            yserver_protocol::x11::randr::NOTIFY_OUTPUT_CHANGE
+        );
+        assert_eq!(
+            u32::from_le_bytes(events[4..8].try_into().expect("screen timestamp")),
+            1234
+        );
+        assert_eq!(
+            u32::from_le_bytes(events[32 + 4..32 + 8].try_into().expect("CRTC timestamp")),
+            1234
+        );
+        assert_eq!(
+            u32::from_le_bytes(events[64 + 4..64 + 8].try_into().expect("output timestamp")),
+            1234
+        );
+        Ok((displaced_allocations, reply, events))
+    }
+
+    fn c0_hw_3b_read_exact(
+        peer: &mut std::os::unix::net::UnixStream,
+        length: usize,
+        label: &str,
+    ) -> Result<Vec<u8>, String> {
+        use std::io::Read as _;
+
+        peer.set_nonblocking(false)
+            .map_err(|error| format!("{label}: blocking protocol peer: {error}"))?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .map_err(|error| format!("{label}: protocol peer timeout: {error}"))?;
+        let mut bytes = vec![0; length];
+        let result = peer
+            .read_exact(&mut bytes)
+            .map_err(|error| format!("{label}: reading protocol bytes: {error}"));
+        peer.set_read_timeout(None)
+            .map_err(|error| format!("{label}: clearing protocol timeout: {error}"))?;
+        peer.set_nonblocking(true)
+            .map_err(|error| format!("{label}: restoring nonblocking peer: {error}"))?;
+        result?;
+        Ok(bytes)
+    }
+
+    fn c0_3bii_idempotent_set_crtc_config_reply(
+        state: &mut ServerState,
+        backend: &mut super::KmsBackend,
+        client_id: u32,
+        sequence: u16,
+        output_id: u32,
+        peer: &mut std::os::unix::net::UnixStream,
+        label: &str,
+    ) -> Vec<u8> {
+        use yserver_core::core_loop::process_request::{RequestOutcome, process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        let output = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.output_id == output_id)
+            .unwrap_or_else(|| panic!("{label}: RANDR output {output_id} is absent"));
+        assert_ne!(output.mode_id, 0, "{label}: idempotent output is enabled");
+        let mut body = Vec::with_capacity(28);
+        body.extend_from_slice(&output.crtc_id.to_le_bytes());
+        body.extend_from_slice(&1234_u32.to_le_bytes());
+        body.extend_from_slice(&state.randr.config_timestamp.to_le_bytes());
+        body.extend_from_slice(&output.x.to_le_bytes());
+        body.extend_from_slice(&output.y.to_le_bytes());
+        body.extend_from_slice(&output.mode_id.to_le_bytes());
+        body.extend_from_slice(&1_u16.to_le_bytes());
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&output_id.to_le_bytes());
+        let outcome = process_request(
+            state,
+            backend,
+            ClientId(client_id),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                length_units: 8,
+            },
+            &body,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: process SetCrtcConfig: {error}"));
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "{label}: an idempotent CRTC request is synchronous: {outcome:?}"
+        );
+        c0_hw_3b_read_exact(peer, 32, label)
+            .unwrap_or_else(|error| panic!("{label}: read reply: {error}"))
+    }
+
     fn c0_hw_3b_set_position(
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
@@ -87602,6 +87862,305 @@ mod tests {
             },
             hardware_complete,
         )
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bii_protocol_order_differential_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_protocol::x11::randr as rr;
+
+        // AcceptKernelCalls drives the Owner protocol path through its
+        // executor. The stub does not issue the atomic commit to the kernel,
+        // change the physical CRTC, or produce scanout.
+        let (mut fixture, device, output_id, connector, target_mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), false)
+                .expect("environmental skip: live Vulkan protocol fixture");
+        let backend = &mut fixture.backend;
+        let output_key = backend.output_key_by_id[&output_id].clone();
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == output_key)
+            .expect("Owner output is installed");
+        let current_mode = c0_3bi_current_mode(backend, output_idx);
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        state.randr.screen_width = state
+            .randr
+            .screen_width
+            .max(target_mode.width)
+            .max(current_mode.width);
+        state.randr.screen_height = state
+            .randr
+            .screen_height
+            .max(target_mode.height)
+            .max(current_mode.height);
+        state.randr.timestamp = 1234;
+        let mut requester = c0_3aii_install_dpms_core_client(&mut state, 71);
+        let mut listener = c0_3aii_install_dpms_core_client(&mut state, 72);
+        state.randr_select_masks.insert(
+            (72, yserver_core::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_SCREEN_CHANGE
+                | rr::NOTIFY_MASK_CRTC_CHANGE
+                | rr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+
+        let (_displaced, reply, events) = c0_hw_3b_set_crtc_config_through_core(
+            backend,
+            &mut state,
+            device,
+            71,
+            1,
+            output_id,
+            &connector,
+            &output_key,
+            target_mode,
+            &mut requester,
+            &mut listener,
+            "Owner protocol mode change",
+            true,
+        )
+        .expect("Owner protocol request completes after promotion");
+        let mut expected_reply = [0_u8; 32];
+        expected_reply[0] = 1;
+        expected_reply[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        expected_reply[8..12].copy_from_slice(&1234_u32.to_le_bytes());
+        assert_eq!(reply, expected_reply, "Legacy SetCrtcConfig Success bytes");
+        assert_eq!(
+            events.len(),
+            96,
+            "Legacy Screen, CRTC, Output notifications"
+        );
+        assert_eq!(events[0], 89, "ScreenChangeNotify precedes CRTC/Output");
+        assert_eq!(events[32], 90);
+        assert_eq!(events[33], rr::NOTIFY_CRTC_CHANGE);
+        assert_eq!(events[64], 90);
+        assert_eq!(events[65], rr::NOTIFY_OUTPUT_CHANGE);
+
+        // The identical idempotent SetCrtcConfig on both KmsBackend paths
+        // is synchronous and wire-identical to Legacy. This is the MATE
+        // re-assert case; it produces no change notifications.
+        let mut owner_reassert_peer = c0_3aii_install_dpms_core_client(&mut state, 73);
+        let owner_reassert = c0_3bii_idempotent_set_crtc_config_reply(
+            &mut state,
+            backend,
+            73,
+            3,
+            output_id,
+            &mut owner_reassert_peer,
+            "Owner idempotent reassert",
+        );
+        assert_eq!(owner_reassert[0], 1);
+        assert_eq!(owner_reassert[1], 0);
+        assert!(
+            kbd_map_drain(&mut listener).is_empty(),
+            "no-op emits no events"
+        );
+
+        let mut legacy_backend = super::KmsBackend::for_tests();
+        let legacy_device = legacy_backend.platform.devices[0].key;
+        let legacy_renderer = RenderDeviceId::DrmRender(test_device_key(128));
+        legacy_backend.platform.render_devices =
+            vec![test_render_device(legacy_renderer, Some(legacy_device))];
+        legacy_backend.platform.selected_render_device = Some(legacy_renderer);
+        legacy_backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(legacy_renderer, legacy_device, RenderKmsRelationship::Same);
+        legacy_backend
+            .initialize_provider_output_sources()
+            .expect("Legacy fixture has a same-device renderer route");
+        let mut legacy_state = ServerState::new();
+        legacy_backend.rebuild_randr_state(&mut legacy_state, None, false);
+        legacy_state.randr.timestamp = 1234;
+        let legacy_output_id = legacy_state.randr.outputs[0].output_id;
+        let mut legacy_peer = c0_3aii_install_dpms_core_client(&mut legacy_state, 73);
+        let legacy_reassert = c0_3bii_idempotent_set_crtc_config_reply(
+            &mut legacy_state,
+            &mut legacy_backend,
+            73,
+            3,
+            legacy_output_id,
+            &mut legacy_peer,
+            "Legacy idempotent reassert",
+        );
+        assert_eq!(
+            owner_reassert, legacy_reassert,
+            "Legacy and Owner reply bytes"
+        );
+
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3bii_protocol_order_differential_vulkan Owner",
+            &c0_3bi_expected_end_state([output_key]),
+        );
+        c0_3bi_assert_end_state(
+            &legacy_backend,
+            "c0_3bii_protocol_order_differential_vulkan Legacy",
+            &c0_3bi_expected_end_state(
+                legacy_backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| output.key.clone()),
+            ),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3bii_named_exceptions_are_the_only_differences_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_protocol::x11::{
+            ClientByteOrder, SequenceNumber,
+            randr::{self as rr, CrtcChangeNotify, OutputChangeNotify, ScreenChangeNotify},
+        };
+
+        // The executor accepts the test Owner transaction. It does not send
+        // a kernel atomic commit, alter physical scanout, or fabricate a
+        // hardware completion event.
+        let (mut fixture, device, output_id, connector, mode) =
+            c0_3bi_live_modeset_backend(StubBehaviour::AcceptKernelCalls(1_000), false)
+                .expect("environmental skip: live Vulkan protocol fixture");
+        let backend = &mut fixture.backend;
+        let output_key = backend.output_key_by_id[&output_id].clone();
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        state.randr.screen_width = state.randr.screen_width.max(mode.width);
+        state.randr.screen_height = state.randr.screen_height.max(mode.height);
+        state.randr.timestamp = 1234;
+        let screen = (
+            state.randr.screen_width,
+            state.randr.screen_height,
+            u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX),
+            u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX),
+            state.randr.config_timestamp,
+        );
+        let initial_output = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.output_id == output_id)
+            .expect("Owner RANDR output");
+        let crtc_id = initial_output.crtc_id;
+        let (x, y) = (initial_output.x, initial_output.y);
+        let mode_id = state
+            .randr
+            .mode_table
+            .iter()
+            .find(|candidate| {
+                candidate.width == mode.width
+                    && candidate.height == mode.height
+                    && candidate.vrefresh == mode.vrefresh
+            })
+            .expect("requested mode is advertised")
+            .mode_id;
+        let mut requester = c0_3aii_install_dpms_core_client(&mut state, 81);
+        let mut listener = c0_3aii_install_dpms_core_client(&mut state, 82);
+        state.randr_select_masks.insert(
+            (82, yserver_core::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_SCREEN_CHANGE
+                | rr::NOTIFY_MASK_CRTC_CHANGE
+                | rr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+
+        let (_displaced, reply, events) = c0_hw_3b_set_crtc_config_through_core(
+            backend,
+            &mut state,
+            device,
+            81,
+            1,
+            output_id,
+            &connector,
+            &output_key,
+            mode,
+            &mut requester,
+            &mut listener,
+            "named-exception baseline mode change",
+            true,
+        )
+        .expect("Owner protocol request completes");
+
+        let mut expected_reply = [0_u8; 32];
+        expected_reply[0] = 1;
+        expected_reply[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        expected_reply[8..12].copy_from_slice(&1234_u32.to_le_bytes());
+        let root = yserver_core::resources::ROOT_WINDOW.0;
+        let expected_screen = rr::encode_screen_change_notify_event(
+            ClientByteOrder::LittleEndian,
+            89,
+            SequenceNumber(0),
+            ScreenChangeNotify {
+                timestamp: 1234,
+                config_timestamp: screen.4,
+                root,
+                request_window: root,
+                width: screen.0,
+                height: screen.1,
+                width_mm: screen.2,
+                height_mm: screen.3,
+            },
+        );
+        let expected_crtc = rr::encode_crtc_change_notify_event(
+            ClientByteOrder::LittleEndian,
+            89,
+            SequenceNumber(0),
+            CrtcChangeNotify {
+                timestamp: 1234,
+                request_window: root,
+                crtc: crtc_id,
+                mode: mode_id,
+                x,
+                y,
+                width: mode.width,
+                height: mode.height,
+            },
+        );
+        let expected_output = rr::encode_output_change_notify_event(
+            ClientByteOrder::LittleEndian,
+            89,
+            SequenceNumber(0),
+            OutputChangeNotify {
+                timestamp: 1234,
+                config_timestamp: screen.4,
+                request_window: root,
+                output: output_id,
+                crtc: crtc_id,
+                mode: mode_id,
+                connection: rr::CONNECTION_CONNECTED,
+            },
+        );
+        let mut expected_events = Vec::with_capacity(96);
+        expected_events.extend_from_slice(&expected_screen);
+        expected_events.extend_from_slice(&expected_crtc);
+        expected_events.extend_from_slice(&expected_output);
+        let mut diff_set = Vec::new();
+        if reply != expected_reply {
+            diff_set.push("SetCrtcConfig reply");
+        }
+        if events != expected_events {
+            diff_set.push("Screen/CRTC/Output event bytes");
+        }
+        // This ordinary successful mode change reaches no exception in
+        // design §8.4; any protocol-byte difference is unnamed.
+        let reachable_named_exceptions: &[&str] = &[];
+        assert_eq!(diff_set, reachable_named_exceptions);
+
+        assert_eq!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .find(|output| output.output_id == output_id)
+                .expect("published Owner output")
+                .mode_id,
+            mode_id
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3bii_named_exceptions_are_the_only_differences_vulkan",
+            &c0_3bi_expected_end_state([output_key]),
+        );
     }
 
     #[test]
@@ -88181,6 +88740,75 @@ mod tests {
                     "could not establish whether a second device has a connected, lit output: {reason}"
                 ),
             }
+        }
+
+        // Replay the advertised-mode/back SetCrtcConfig pair through the
+        // actual core protocol dispatcher as well as the direct hardware
+        // helpers above. The listener receives the protocol notifications;
+        // the requester gets the 32-byte reply only after the Owner result is
+        // finished through the core-entry driver.
+        let mut protocol_state = ServerState::new();
+        backend.rebuild_randr_state(&mut protocol_state, None, false);
+        protocol_state.randr.screen_width = protocol_state
+            .randr
+            .screen_width
+            .max(alternate_mode.width)
+            .max(current_mode.width);
+        protocol_state.randr.screen_height = protocol_state
+            .randr
+            .screen_height
+            .max(alternate_mode.height)
+            .max(current_mode.height);
+        let mut protocol_requester = c0_3aii_install_dpms_core_client(&mut protocol_state, 71);
+        let mut protocol_listener = c0_3aii_install_dpms_core_client(&mut protocol_state, 72);
+        protocol_state.randr_select_masks.insert(
+            (72, yserver_core::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_SCREEN_CHANGE
+                | yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE
+                | yserver_protocol::x11::randr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        for (sequence, (label, mode)) in [
+            ("core protocol alternate mode", alternate_mode),
+            ("core protocol restore original mode", current_mode),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let step = format!("{label} #{sequence}");
+            let (displaced, _reply, _events) = c0_hw_3b_set_crtc_config_through_core(
+                backend,
+                &mut protocol_state,
+                device,
+                71,
+                u16::try_from(sequence + 1).expect("two protocol requests fit in sequence"),
+                output_id,
+                "HDMI-2",
+                &output_key,
+                mode,
+                &mut protocol_requester,
+                &mut protocol_listener,
+                &step,
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{step} failed: {error}"));
+            c0_hw_3b_compose_and_complete(
+                backend,
+                device,
+                drm_fd,
+                &output_key,
+                &step,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{step}: composed frame failed: {error}"));
+            c0_hw_3b_wait_for_pool_release(
+                backend,
+                device,
+                drm_fd,
+                &step,
+                &displaced,
+                &hardware_complete,
+            )
+            .unwrap_or_else(|error| panic!("{step}: displaced pool stayed live: {error}"));
         }
 
         c0_3bi_assert_end_state(

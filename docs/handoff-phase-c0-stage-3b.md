@@ -1,7 +1,7 @@
 # Handoff — Phase C.0 stage 3b (2026-09-26)
 
 Branch `feat/phase-c0-atomic-kms-migration`, tip `730606b4` (plus this file).
-**Over 90 commits are unpushed** since `8f0de9ea`; push only after asking the user.
+Pushed to `fork` up to `e9cfcbef` (2026-09-26); push later work after asking the user.
 
 ## Where 3b stands
 
@@ -11,10 +11,10 @@ Spec: `docs/superpowers/specs/2026-09-24-phase-c0-stage-3b-modeset-and-randr-des
 | Plan | State |
 | --- | --- |
 | 3b-i-1 modeset execution (`...-3b-i-1-plan-modeset-execution.md`, rev 11) | done, incl. hardware addenda A1, A2, A3 (`94c00628`) |
-| 3b-i-2 modeset routes (`...-3b-i-2-plan-modeset-routes.md`, rev 4) | Tasks 1, 2, H, 3 done. **Next: Task 4** (Legacy path in a mixed server), then Task 5 (two devices, coverage, hardware additions) |
-| 3b-ii RANDR protocol (`...-3b-ii-plan-randr-protocol.md`, rev 8) | Tasks 1–4 done. **Task 5** pending (protocol-order differential, hardware client) |
+| 3b-i-2 modeset routes (`...-3b-i-2-plan-modeset-routes.md`, rev 5) | done (F15 carried to activation) |
+| 3b-ii RANDR protocol (`...-3b-ii-plan-randr-protocol.md`, rev 9) | done; Task 5's gate scripts deferred to the real Owner server (`docs/phase-c0-deferred-real-server-tests.md`) |
 
-After those: the 3b acceptance finding, `docs/status.md`, then fold the WIP
+**Next:** the 3b acceptance finding, `docs/status.md`, then fold the WIP
 commits into one commit per plan (user confirms history rewrites), then push
 (user confirms).
 
@@ -75,6 +75,11 @@ re-run once; a repeat or any other failure is a finding.
   default, `tcp-transport`, `xdmcp`; each `c0_*` filter with
   `--include-ignored --skip _drm`; `--lib`; `c0_2ci`; `yserver-core`; each
   integration file except `render_acceptance`.
+
+## Deferred to the real Owner server
+
+`docs/phase-c0-deferred-real-server-tests.md` (user, 2026-09-26) lists every
+test that needs the assembled server on Owner; stages 4 and 5 run them.
 
 ## Carried to the activation stage (4/5)
 
