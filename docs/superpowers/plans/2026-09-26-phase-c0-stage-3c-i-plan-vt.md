@@ -9,6 +9,14 @@ co-delivered, the mixed-server scoping moved into Task 1, the urgent
 withdrawal its own task before them, 8 tasks (B-2); the `AcquireEpisode`
 owner (M-1); core-level gate tests for the urgent withdrawal (M-2).
 
+**Revision 5 (2026-09-26, coordinator)** — codex round 4 (1 blocking, 2 major,
+confirmed, `../findings/2026-09-26-stage-3c-i-plan-review-round4.md`): a
+deadline resolves a client token `Failed` through the ordinary ready-token
+path, so the parked request is answered (B-1); the core filters every
+publication against withdrawn ids, including ones queued before the
+withdrawal (M-1); the driver gains a state-carrying variant used by every test
+that asserts client bytes (M-2).
+
 **Revision 4 (2026-09-26, coordinator)** — codex round 3 (2 blocking, 0 major,
 confirmed, `../findings/2026-09-26-stage-3c-i-plan-review-round3.md`): Task 2's
 interim acquire leaves Owner devices closed and resumes only the Legacy ones
@@ -108,6 +116,15 @@ the backend model. Every other publication keeps being built from the backend
 model. The driver executes `LifecycleAction::WithdrawOutputs` by withdrawing
 the device's outputs from the backend model and emitting one urgent withdrawal.
 
+*(Rev 5, M-1.)* **Publications already queued.** A requester-less publication
+queued behind the gate before the withdrawal carries a deferred state-update
+closure that may have captured the old projection. The core keeps the set of
+withdrawn output and CRTC ids and **filters every later publication's
+resulting projection against it** (after its `update_state` runs, before its
+notifications), until the backend's model no longer names them — so no
+publication, queued before or after the withdrawal, can restore a withdrawn
+output.
+
 **Deliver — the episode turn** (yserver-core + backend): the backend can
 signal `EpisodeBegin(id)` and `EpisodeEnd(id, Option<RequesterlessPublication>)`
 through a drain the core already polls (next to
@@ -124,10 +141,22 @@ core-loop gate tests (`c0_3bii_` in `core_loop/run.rs`) — a real gate, a
 retained `ServerState`, client reads; **backend** tests use the core-entry
 driver.
 
+*(Rev 5, M-2.)* **The driver carries the entry's state.** The existing
+core-entry driver builds a fresh `ServerState` per call, so it loses the
+clients and bytes of the entry that started the scenario. This task adds one
+variant, `c0_3bi_core_driver_until_with_state(backend, &mut state, …)`, with the
+same loop and the caller's `ServerState` (the existing function delegates to it
+with a fresh state) — an extension of the one driver, not a new harness.
+**Every backend test in this plan that asserts client bytes, a reply or a
+publication uses it**, with the clients installed by the existing
+`c0_3aii_install_dpms_core_client` helper; the gate-ordering properties stay
+in the core layer.
+
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
 | `c0_3ci_core_withdrawal_bypasses_the_gate` (yserver-core) | the gate holds an install-capable mutation; an urgent withdrawal arrives: the listener receives the withdrawal's notifications before the mutation's reply | **V11** queue the withdrawal behind the gate |
 | `c0_3ci_core_withdrawal_only_subtracts` (yserver-core) | the backend model already holds a promoted-but-unpublished change; a client reads between the withdrawal and that change's publication: it sees the withdrawal and not the change; after the publication, both | **V10** build the withdrawal from the backend model |
+| `c0_3ci_core_queued_publication_cannot_restore_withdrawn` (yserver-core) | a requester-less publication that still names output X is queued behind a held gate; X is urgently withdrawn; the gate releases and the queued publication runs: X stays absent from the projection and no notification re-adds it | **V35** run queued publications unfiltered |
 | `c0_3ci_core_episode_holds_the_turn` (yserver-core) | an episode is open; a client `SetCrtcConfig` arrives: it is not dispatched until `EpisodeEnd`; a query is answered at once from the published state | **V29a** let a client mutation take the turn during an episode |
 | `c0_3ci_core_episode_abort_releases_the_turn` (yserver-core) | `EpisodeEnd(None)`: nothing published, the queued mutation proceeds | **V29b** publish on abort |
 | `c0_3ci_withdraw_outputs_emits_urgent_withdrawal_vulkan` | the driver executes `WithdrawOutputs` for an Owner device: its outputs leave the backend model and exactly one urgent withdrawal naming them is emitted | **V27** emit an ordinary requester-less publication |
@@ -180,8 +209,15 @@ completion path or the wakeup, never by polling.
   in `ExecutorStalled`, quarantine; **every** outstanding piece of work on that
   device is terminalized in the same step: a queued release commit is
   cancelled unsent; a dispatched **client modeset's CRTC token resolves
-  `Failed`** through 3b's failure path, and its gate publication is withdrawn
-  so no late result can publish; Presents are answered by blackout. The
+  `Failed`** *(rev 5, B-1)* through the **ordinary ready-token path** — the
+  backend queues the token as ready with a `ClientModesetFailure` result, and
+  the core's existing `drain_ready_crtc_configs` path takes the gate
+  publication, publishes nothing for a failed result (3b-ii
+  `c0_3bii_failed_publishes_nothing`), replies `Failed` to the parked
+  requester and releases the gate; the gate publication is **not** removed
+  out of band (that would drop the reply); the executor's late completion for
+  that commit is discarded by the backend (dead epoch, token already
+  finished); Presents are answered by blackout. The
   incarnation is **closed forever**; `WithdrawOutputs` (Task 1) withdraws its
   outputs.
 - Late results of the dead epoch change nothing.
@@ -205,6 +241,7 @@ today's acquire unchanged.
 | `c0_3ci_release_hands_off_at_the_bound_vulkan` | the executor never answers: hand-off at exactly the deadline through `next_wakeup` | **V7** do not arm the deadline as a wakeup |
 | `c0_3ci_unknown_release_closes_the_incarnation_vulkan` | the release commit is in flight at the deadline: helper termination requested, `ExecutorStalled`, outputs withdrawn by one urgent withdrawal; a later acquire submits nothing to the old incarnation | **V8** submit to the old incarnation at acquire |
 | `c0_3ci_unanswered_client_modeset_at_the_deadline_vulkan` | through `on_vt_release`: a dispatched client modeset never answers; at the deadline its requester receives `Failed`, the queued release commit was never sent, the device is closed and withdrawn, and a late modeset completion publishes nothing | **V30** leave the client token pending past the hand-off |
+| `c0_3ci_core_deadline_failure_replies_to_the_parked_request` (yserver-core) | a parked `SetCrtcConfig` whose token the backend resolves `Failed` at a deadline: the requester receives `Failed`, nothing is published, the gate is released and the next mutation proceeds | **V34** remove the gate publication instead of resolving the token |
 | `c0_3ci_late_release_result_changes_nothing_vulkan` | the release commit's completion arrives after the hand-off: installed state, pools and publication unchanged | **V9** apply the late completion |
 | `c0_3ci_interim_acquire_leaves_owner_closed_vulkan` | release then acquire before Task 4's route: the Owner device receives no ioctl and no commit, its admission stays closed; the Legacy device of a mixed server resumes | **V31** run today's unscoped resume on the Owner device |
 | `c0_3ci_mixed_server_release_scopes_legacy_vulkan` | Legacy + Owner: the Legacy all-off touches only the Legacy device; the Owner device receives only its release commit | **V24** run the unscoped Legacy suspend |
