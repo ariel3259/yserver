@@ -2,6 +2,19 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3bi_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm` — with `--include-ignored` only when the prompt records the user's GPU approval, otherwise without it; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, or anything that performs a modeset or takes DRM master: the hardware additions of Task 5 are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code or in C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 4 (2026-09-25, coordinator) — Task H closed as delivered.** The
+user closed Task H at `dede8405`: the end-state check, the core-entry driver and
+the kernel-faithful shared stub stand as they are; `index_shift` produced a
+product fix. **Not done, by decision:** the shared "run one iteration" export
+from `yserver-core` (dropped — the loop will change again in 3c) and the
+flake investigation. Known intermittent failures of `c0_3bi_` under suite
+concurrency (about 4 in 25 runs): `direct_hold_released_on_every_end`,
+`each_failure_has_its_cause`, `retired_copied_frame_stages`,
+`a3_desired_frame_of_a_retired_output_is_released`. A gate run that fails only
+on these is re-run once; a repeat failure, or any other failure, is a finding.
+Defects found later go to addenda. New tests still use the driver and end with
+the end-state check.
+
 **Revision 3 (2026-09-25, coordinator)** — the user's standing testing rule
 (after three hardware-only defects in 3b-i-1): Task H, inserted before Task 3,
 gives every 3b scenario test an end-state leak check (A) and a single driver
