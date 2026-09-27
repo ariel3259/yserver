@@ -45,8 +45,7 @@ readiness, and retirement promotion ordering — section 10.
 - add a second resource ledger (stage 2c §2) — resources stay with 2c-i;
 - consume damage — 2c-iii;
 - convert producers — 2c-iii; in 2c-ii intents come from tests;
-- implement cursor/gamma producers or the cursor coordinate transport — stage 4
-  (stage 2c §6);
+- implement cursor/gamma producers — stage 4 (stage 2c §6);
 - implement any Phase C.1 async behaviour (section 9);
 - activate anything in production (R8): the production transport stays `Legacy`.
 
@@ -397,12 +396,7 @@ the conductor does not retry, and C.0's failure path applies.
 
 ## 8. Out of scope, and the doors that must stay open
 
-**The cursor coordinate lane** (C.0 §7.1, `OwnerMediatedLegacyMove`): a fast,
-audited-cohort-only cursor move with its own per-plane `CoordinateSubmitting`
-reservation that may overlap a primary commit. It has no ticket and does not
-enter the tiers; stage 4 owns it. 2c-ii only has to know it exists and **never
-absorb coordinate-only intent**. `SynchronousAtomicMove` — the cursor as an
-ordinary atomic commit — is maintenance with a ticket and is in scope.
+(Removed in revision 5 — see C.0 §16.3.)
 
 **Phase C.1 async** (C.0 §14): C.0 builds the generic primary successor slot and
 C.1 inherits it — no second async queue. C.1 adds async capability/admission,

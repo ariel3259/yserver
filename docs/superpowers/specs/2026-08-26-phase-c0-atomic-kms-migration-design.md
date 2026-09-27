@@ -1,16 +1,14 @@
 # Phase C.0 — complete KMS ownership and atomic state migration
 
-**Date:** 2026-09-16 (section 16.3 revision 4: containment disposition, lifecycle bootstrap deadline, resource return and execution contract; revision 3 of 2026-09-10 made runtime qualification the release gate)
+**Date:** 2026-09-27 (section 16.3 revision 5: no owner-side legacy cursor ioctl; runtime qualification and measured demotion remain the only hardware-cursor policy)
 **Status:** Approved — concurrency, evidence, delivery, driver-eligibility,
 composition-predicate, driver-expansion, fixed-executor and shutdown-barrier
 dispositions incorporated. Revision 2 replaces the `CAP-4` cohort allowlist with
 a runtime-derived cursor policy and measured demotion, and no longer gates merge
-on any particular device remaining available. Revision 3 completes that
-direction on the evidence side: section 16.3 replaces the per-cohort campaign,
-its eight-hour soaks and its coordinate quotas with per-incarnation runtime
-qualification plus a bounded delivery check on available hardware. The audited-
-cohort table ships empty, so `OwnerMediatedLegacyMove` is specified but
-unreachable in C.0. Sections 10, 15, 16.2, 17 and 18 follow
+on any particular device remaining available. Revisions 3–5 make runtime
+qualification per device incarnation the release gate and remove cohort
+certification and the owner-side legacy cursor-coordinate path. Sections 10,
+15, 16.2, 17 and 18 follow.
 **Branch:** `feat/phase-c0-atomic-kms-migration`
 **Baseline:** `master` at `02bafec3`, including the final squash of PR #129 at
 `fc76b743`, the subsequent VT cursor-plane fix at `c09358a1`, and the
@@ -22,11 +20,12 @@ damage-clipped repaint work for non-composited desktops
 
 Phase C.0 completes ownership of yserver's live KMS state under one
 device-local scheduler. Persistent cursor state uses universal cursor-plane
-properties and CRTC gamma uses atomic `GAMMA_LUT` blobs. A narrowly qualified,
-owner-mediated legacy `MOVECURSOR` transport may remain only for coordinates of
-an already installed cursor where Linux exposes the driver's immediate cursor
-hook through no atomic userspace UAPI. Primary-plane, cursor attach/image/
-visibility, color, modeset, unflip, DPMS, and topology state remain atomic.
+properties and CRTC gamma uses atomic `GAMMA_LUT` blobs. Every cursor mutation on
+a C.0 Owner device, including coordinates, uses atomic cursor-plane properties.
+The capability-activated `Legacy` route remains the permanent fallback for
+devices that cannot enter the Owner model; it is outside the Owner invariant.
+Primary-plane, cursor attach/image/visibility, color, modeset, unflip, DPMS, and
+topology state on Owner devices remains atomic.
 
 The merged Phase A+B implementation is normative input, not code to reshape
 back toward an older draft. In particular, C.0 inherits Xorg-compatible
@@ -38,9 +37,9 @@ This phase does not implement tearing, advertise
 `PresentCapabilityAsyncMayTear`, or submit `PAGE_FLIP_ASYNC`. Its purpose is to
 provide a single ordering model before Phase C.1 raises primary-plane commit
 cadence above vblank. Phase C.2 still owns a durable above-vblank atomic/UAPI
-mechanism and removal of any temporary coordinate exception. C.0 preserves each
-device's already-shipping coordinate latency rather than deliberately regressing
-it during the interval before C.2.
+mechanism for above-vblank cursor motion. C.0 preserves the shipping
+coordinate-latency goal through CAP-4 measured demotion to software wherever
+atomic cursor updates underperform.
 
 ## 2. Problem
 
@@ -48,14 +47,14 @@ yserver currently controls primary planes, direct scanout, composed unflips,
 modesets, and DPMS with atomic commits, but still mutates KMS state through two
 legacy families:
 
-- hardware cursor through `SETCURSOR`/`SETCURSOR2` and `MOVECURSOR`;
+- hardware cursor through the legacy cursor load/show/move ioctl family;
 - RANDR gamma through the legacy CRTC `set_gamma` ioctl.
 
 Linux DRM deprecates the cursor entry points in favor of universal cursor
 planes. Atomic-capable CRTCs expose color management through the `GAMMA_LUT`
-blob property. The defect is uncontrolled mutation outside one owner; the
-userspace ioctl number alone is not the invariant when the kernel exposes a
-cursor fast path only through its legacy-to-atomic compatibility entry point.
+blob property. The defect is uncontrolled mutation outside one owner. C.0
+therefore routes every Owner cursor change through the owning device's atomic
+cursor-plane state.
 
 The existing combination already has a measured failure history:
 
@@ -74,14 +73,15 @@ The existing combination already has a measured failure history:
 NVIDIA has a distinct measured failure. On the GTX 1050 proprietary stack,
 legacy `MOVECURSOR` averaged about 11.5 ms and reached 16.3 ms while returning
 no `EBUSY`; the driver paced the call to vblank and blocked yserver's
-single-threaded core. The shipping policy therefore selects the empirically
-smooth software cursor on NVIDIA. An ordinary atomic cursor commit is also
-vblank-paced, so C.0 does not claim to make that hardware update immediate.
-C.0 chooses a process-isolated `KmsIoExecutor` for every KMS host-call class as
-section 4.1 defines. The historical stall is not proof that every atomic ioctl
-will block, but it demonstrates the consequence of allowing a driver wait to
-occupy the X11 core. Lifting the NVIDIA software-cursor policy remains
-conditional on the separate hardware gate in section 16.3.
+single-threaded core. That measurement explains why the C.0 Owner does not use
+a legacy cursor ioctl.
+An ordinary atomic cursor commit is also vblank-paced, so C.0 does not claim to
+make that hardware update immediate. C.0 chooses a process-isolated
+`KmsIoExecutor` for every KMS host-call class as section 4.1 defines. The
+historical stall is not proof that every atomic ioctl will block, but it
+demonstrates the consequence of allowing a driver wait to occupy the X11 core.
+Structural capability and runtime qualification select the atomic cursor path;
+CAP-4 demotes it to software when runtime measurements show underperformance.
 
 Phase C.1 will submit immediate primary-plane flips at high cadence. It depends
 on cursor-plane and completion capability, not programmable gamma. Unsupported
@@ -93,9 +93,9 @@ qualified primary/cursor pipeline.
 1. Express cursor image, framebuffer, CRTC binding, position, size, hotspot,
    visibility, animation, and detach through universal cursor-plane properties.
 2. Express RANDR CRTC gamma through atomic `GAMMA_LUT` property blobs.
-3. Eliminate every legacy cursor load/show/hide/disable and gamma ioctl. Permit
-   only a qualified coordinate-only `MOVECURSOR` transport under the same owner
-   until Phase C.2 supplies and qualifies its replacement.
+3. Eliminate every legacy cursor ioctl and gamma ioctl from C.0 Owner devices.
+   Devices that lack structural capability stay on the permanent `Legacy`
+   fallback route selected by stage 5.
 4. Preserve cursor correctness and each device's shipping coordinate-latency
    baseline on idle and animating desktops, during composition, and during
    fullscreen direct scanout. Where a device cannot hold that baseline, prove it
@@ -128,8 +128,7 @@ qualified primary/cursor pipeline.
 ## 4. Non-goals
 
 - `PAGE_FLIP_ASYNC` or visible tearing.
-- A new above-vblank atomic cursor UAPI. Phase C.2 owns that mechanism and the
-  removal decision for C.0's explicitly scoped coordinate exception.
+- A new above-vblank atomic cursor UAPI. Phase C.2 owns that mechanism.
 - Core Present scheduling, target equivalence, async-option parsing, or Present
   capability changes. C.0 does convert the already-shipped direct primary
   submission and successor promotion below that layer.
@@ -151,29 +150,27 @@ qualified primary/cursor pipeline.
 C.0 requires `KmsIoExecutor`: one process-isolated host-call executor per DRM
 device incarnation. This is a design decision, not the result of a finite
 returnability claim. Proprietary NVKMS is opaque, its reachable waits cannot be
-bounded by source audit, and the historical NVIDIA `MOVECURSOR` measurement
-demonstrates that a driver wait can block yserver's single-threaded X11 core for
-an output period. C.0 therefore pays the IPC and lifecycle cost once and makes
-core containment structural for every supported cohort. That cost is measured
-rather than assumed: dispatch-to-reply is single-digit microseconds at p99
-under load, a live coordinate reservation occupies under 0.5% of the channel at
-1000 Hz, and the dominant term in the coordinate path is the ioctl held by the
-call in flight. That dominant term is identical for an in-process owner on the
-same single thread, which would carry it without crash containment, watchdog or
-bounded reap. The arms, their load conditions and their limits are recorded in
+bounded by source audit, and the historical NVIDIA legacy cursor-coordinate
+measurement demonstrates that a driver wait can block yserver's single-threaded
+X11 core for an output period. C.0 therefore pays the IPC and lifecycle cost once
+and makes core containment structural for every supported cohort. That cost is
+measured rather than assumed: dispatch-to-reply is single-digit microseconds at
+p99 under load, and an executor message at 1000 Hz occupies under 0.5% of the
+channel. An in-process owner on the same single thread would carry the same
+message and driver wait without crash containment, watchdog or bounded reap. The arms, their load conditions and their limits are recorded in
 `docs/superpowers/findings/2026-09-02-phase-c0-executor-ipc-cost-measurement.md`.
 
 The executor owns every C.0 KMS host call: cursor-only atomic `NONBLOCK`,
-primary-only and changed-primary/changed-cursor commits, qualified coordinate-
-only `MOVECURSOR`, gamma-only, unflip, modeset/install/recovery, final
-`TEST_ONLY`, and `GET_SEQUENCE`/`QUEUE_SEQUENCE`. There is no per-driver,
+primary-only and changed-primary/changed-cursor commits, gamma-only, unflip,
+modeset/install/recovery, final `TEST_ONLY`, and
+`GET_SEQUENCE`/`QUEUE_SEQUENCE`. There is no per-driver,
 per-cohort, per-call-class or runtime in-process branch. A future phase may
 recover in-process execution for a named call class only after a new spec and
 cohort-specific returnability evidence establish its safety; C.0 neither
 anticipates nor exposes such a switch.
 
-The owner installs `Submitting` or `CoordinateSubmitting` and the applicable fd
-lease before IPC dispatch. From that boundary, explicit rejection, success and
+The owner installs `Submitting` and the applicable fd lease before IPC dispatch.
+From that boundary, explicit rejection, success and
 acceptance-unknown remain distinct; IPC loss, helper exit or watchdog expiry
 cannot be rewritten as rejection. The executor watchdog, asynchronous reap,
 `ExecutorStalled`, quarantine, and prompt logical VT/device-loss progress are
@@ -193,72 +190,9 @@ additional supervisor IPC on the measured path, never wraps or overwrites, and
 exports only after the arm ends. Exhaustion makes the affected evidence row
 `EvidenceInsufficient`.
 
-The concurrency premise is fixed against a verified kernel range rather than a
-single revision. It holds for Linux 7.1.9 through 7.2.2 in the five functions
-that carry it: `drm_atomic_helper_async_check()`,
-`drm_atomic_helper_setup_commit()`, `drm_atomic_add_affected_planes()`,
-`amdgpu_dm_atomic_check()`'s modeset/color-management/VRR/`dsc_force_changed`
-guard, and `dm_crtc_get_cursor_mode()`. Across that range those functions
-differ only by the 7.2 rename of `struct drm_atomic_state` to
-`struct drm_atomic_commit` and by two `dm_crtc_get_cursor_mode()` changes that
-section 7.1 records; no C.0 conclusion depends on either. Commit
-`77cb8f24c2381a8abb7272d7bbdec548d6426a8a` is recorded as the provenance of the
-original reading, not as a mainline reference point. A cohort kernel outside
-the verified range requires the same five-function comparison before its
-evidence is admissible.
-`drm_atomic_helper_async_check()` checks the outstanding
-`old_plane_state->commit`; it contains no outstanding-CRTC-commit check.
-`drm_atomic_helper_setup_commit()` installs a plane commit only for planes
-present in the atomic state. Therefore a primary request that omits an unchanged
-cursor does not by the core helper alone block the legacy cursor async path,
-whereas restating that cursor attaches the primary commit to its plane. The
-request is not thereby proven coordinate-overlap-safe: a driver may add the
-cursor during atomic check. Section 7.1 names AMDGPU's audited expansion paths
-and requires the complete serialized request to have
-`AuditedCursorExpansionHazard=false` before coordinate overlap. This field is a
-conservative source-derived classification, not observation of the driver's
-internal atomic closure.
-
-Coordinate concurrency has a phase-aware release quota on each required device
-whose stock cohort nominates `OwnerMediatedLegacyMove`; in the current release
-matrix this is the Raphael iGPU, never stock NVIDIA. Under both continuous
-composed and continuous direct primary traffic, collect 100,000
-production-shape initial coordinate attempts made after the matching primary's
-accepted dispatch and before its
-`HardwareComplete` milestone. Only a primary whose old/candidate shapes pass
-the native contract, whose userspace request omits the cursor and whose audited
-expansion hazard is false can supply this interval. Gamma, modeset or any other
-hazard-classified record creates no coordinate attempt and cannot fill a quota.
-
-Post-processing divides the exact dispatch-to-`HardwareComplete` interval into
-ten equal normalized phase deciles; every decile must contain at least 5,000
-qualified initial attempts. Attempts outside the interval and deferred retries
-after completion are reported but do not count. Each composed/direct stratum
-stops successfully at 100,000 qualified initial attempts and 5,000 in every
-actual decile. It may consume at most `PhaseCycleCap = 250,000` accepted-primary
-cycles and `PhaseAttemptCap = 250,000` initial attempts. An underfilled quota,
-cap exhaustion or recorder overflow is `EvidenceInsufficient`; extending a cap
-requires a reviewed spec revision.
-
-Every coordinate record contains the coordinate generation, primary
-`CommitId`, primary dispatch, attempt and eventual `HardwareComplete` instants,
-request shape, initial-versus-retry kind, result/errno, helper-measured duration,
-construction-time `NativeCursorCompositionContract`, complete-request
-`AuditedCursorExpansionHazard` and reasons, exact userspace object/plane set,
-and owner state proving the accepted primary was overlap-safe. No field claims
-the driver's unobservable post-check plane set. Phase is computed only after
-canonical completion as `(attempt - dispatch) / (HardwareComplete - dispatch)`
-with checked arithmetic. Zero/negative intervals or attempts outside
-`[dispatch, HardwareComplete)` do not qualify. A retry points to its initial
-`EBUSY`, records the next primary-admission instant, and proves it ran after the
-matching completion but before later primary admission. Initial and retry
-samples never combine to satisfy the quota.
-
-The cursor-unchanged-absorbed shape remains optional bounded characterization
-through a documented nonmergeable diff. It has no quota, phase scheduler,
-transport-closure suppression or merge effect. Production cursor omission is
-established by source audit, unit tests and the required production-shape
-hardware arms.
+C.0 cursor coordinates are ordinary atomic cursor-plane state. The owner never
+overlaps a cursor mutation with a primary commit, so no driver-source expansion
+audit or hardware coordinate-overlap campaign is part of this design.
 
 ## 5. Global invariant
 
@@ -267,31 +201,14 @@ For every device/domain advertised as C.0-complete:
 ```text
 all persistent live KMS state mutation uses atomic commits
 && every mutation is ordered by the owning device-local commit owner
-&& no legacy modeset/page-flip/gamma or cursor load/show/hide/disable is reachable
-&& a legacy cursor ioctl, when present, is coordinate-only MOVECURSOR for an
-   already installed framebuffer on an evidence-qualified plane
+&& no legacy modeset/page-flip/gamma or cursor ioctl is reachable from a C.0 Owner
 ```
 
-The coordinate exception is a transport, not a second owner. It is admissible
-only with no atomic `Submitting`, lifecycle barrier, or validation lease. It
-may coexist with one accepted primary commit only when that request's recorded
-userspace object set omitted the cursor plane, its old and candidate primary
-shapes both passed `NativeCursorCompositionContract`,
-`AuditedCursorExpansionHazard=false`, and it changed no connector, topology,
-unflip, cursor, or lifecycle state. It carries the current cursor/
-topology generations, coalesces latest-wins, and may change no
-framebuffer, hotspot, visibility, CRTC binding, size, or source rectangle. Its
-qualified fast return—or actual helper reap after an uncertain isolated
-result—is the ordering boundary before any later cursor-affecting or newly
-dispatched atomic mutation; the already accepted overlap-safe primary cannot
-overwrite it. A contract failure or audited expansion hazard prevents overlap
-under section 7.1 and leaves the newest coordinates as ordinary bounded atomic/
-software desired state. A returned call above the latency bound, visible ioctl
-rejection, uncertain return, or loss of any other transport qualification closes
-the fast transport for the complete plane incarnation. It never retries
-immediately or beyond section 7.1's single deferred `EBUSY` attempt, and never
-falls back to another uncontrolled ioctl.
-C.2 owns replacing or removing this temporary transport.
+Devices that fail capability activation remain on the permanent `Legacy` route
+defined by stage 5, including its legacy cursor operations. That fallback is
+not a C.0 Owner. Every cursor mutation on an Owner device, including movement,
+is an atomic commit serialized by the owner. Phase C.2 owns a future
+above-vblank atomic cursor mechanism; C.0 provides no fast coordinate lane.
 
 `DRM_IOCTL_CRTC_QUEUE_SEQUENCE`, event reads, capability queries, framebuffer
 allocation/import, and read-only property discovery are not state mutations and
@@ -350,9 +267,8 @@ the owner:
 - retirement-time promotion of `ScanoutM2State::queued_successor`;
 - the best-effort legacy `cursor_plane_hide_all` added before the authoritative
   VT all-off transaction by `c09358a1`;
-- cursor load, show, hide and detach, including direct-entry cursor bind, plus
-  coordinate-only movement through either the atomic request or the qualified
-  owner-mediated exception above;
+- cursor load, show, hide, detach and movement, including direct-entry cursor
+  bind, through atomic cursor-plane properties;
 - legacy RANDR `set_gamma`, the legacy `get_crtc().gamma_length()` discovery
   path, every `u16::MAX` gamma-size clamp/fallback, and every resume/reapply
   consumer of that state; and
@@ -397,14 +313,11 @@ conflicting text is a spec defect.
 | Event token | Non-zero `u64` allocated from one monotonic namespace across the complete device incarnation and carried verbatim in DRM event `user_data`. It is never reused within that incarnation and resolves to exactly one typed target: an atomic commit record or a sequence-arm record. |
 | CRTC clock source | Epoch-local `KernelSequence`, selected only from a successful `DRM_IOCTL_CRTC_GET_SEQUENCE` result with a trusted `u64` reference. `EOPNOTSUPP` closes C.0 qualification; software protocol-clock synthesis is deferred beyond C.0. |
 | Topology generation | One mapping of protocol outputs/CRTCs to discovered DRM objects within an incarnation. It cannot clear incarnation poison. |
-| Native cursor composition contract | Checked construction precondition for every active C.0 primary while `OwnerMediatedLegacyMove` is selectable: exactly one below-cursor primary per active CRTC, XRGB8888, inactive plane color pipeline, fixed normalized z-order below the cursor, source and destination at 1:1 scale, and destination `(0,0)` with the complete mode extent. Framebuffer identity, contents, damage and a qualified modifier may change without changing the contract. An out-of-contract direct candidate is rejected before KMS. Any other path that constructs an out-of-contract primary invalidates `OwnerMediatedLegacyMove` before that primary's ioctl may begin and may install it only after an ordered transition has made the transport unselectable. The same plane incarnation cannot reselect the transport afterward; re-entry requires complete plane-incarnation requalification through a cursor detach/reattach with a contract-valid primary already represented in the atomic state. |
-| Audited cursor expansion hazard | Immutable cohort-specific, conservative prediction over the complete final serialized atomic request. It is true when source audit says the driver may add or otherwise serialize the cursor plane despite userspace omission. It records named reasons and the userspace object set but never claims to observe the driver's internal post-check plane set. Only a contract-preserving primary request with this value false may overlap `OwnerMediatedLegacyMove`. |
 | Lifecycle epoch | A monotonic per-device `LifecycleEpochId` that is always present, including during ordinary `Ready` traffic. It changes before lifecycle work can supersede or invalidate an in-flight operation. |
 | Lifecycle transition | Optional bounded work identified by `LifecycleTransitionId`; ordinary cursor/gamma/primary commits have no transition id but always carry the current lifecycle epoch. |
 | Protocol domain | Client-visible device/output identity set for which cacheable capability is advertised, after applying the merged connector-class policy, including the `non-desktop` filter. A connector excluded by that policy is not a hidden member of the domain. |
 | Intent | Bounded desired work not yet accepted by KMS. It owns only never-submitted resources. |
 | Submitting record | A live transaction durably installed in the owner before it crosses executor IPC. Kernel acceptance is unknown until an explicit result arrives, so it occupies the device slot and owns both possible state/resource sets. |
-| Coordinate-submitting record | One owner-installed, per-cursor-plane mutation reservation for a qualified coordinate-only ioctl. It occupies no atomic device slot and may coexist only with an accepted contract-preserving primary whose userspace request omits the cursor and whose `AuditedCursorExpansionHazard` is false. While its host call is unresolved it excludes every new KMS host-call dispatch; an uncertain isolated result retains the plane reservation until actual helper reap. |
 | Commit record | One owner-serialized live transaction with identity, expected evidence, resources, and exactly one terminal state. |
 | Atomic CRTC closure | The exact set of CRTCs pulled into the userspace-constructed persistent atomic request by CRTC properties and by connector/plane properties through their old or new `CRTC_ID` binding. `ExpectedCompletionCrtcs` is its old-or-new powered subset. Ephemeral `OUT_FENCE_PTR` entries are added only after this set is fixed and may not enlarge it. This is not a claim about objects a driver's atomic check may add internally. |
 | Teardown barrier | Evidence that a stated class of old hardware/userspace ownership is unreachable. Barriers are resource-class-specific, never universal by implication. |
@@ -433,8 +346,8 @@ uses `transition_id=None`, never a fabricated or previous transition id.
 
 | Layer | Key | Becomes true when | Becomes false when |
 | --- | --- | --- | --- |
-| `atomic_kms_pipeline_structurally_capable` | `(device_identity, protocol_domain)` | Discovery proves simultaneous cursor-plane coverage, at least one structurally available coordinate transport, required completion-property coverage, `DRM_CAP_CRTC_IN_VBLANK_EVENT=1`, monotonic DRM event timestamps, and usable `GET_SEQUENCE`. A multi-CRTC domain additionally forms one structurally homogeneous group. Gamma and release validation are not part of this bit. | Only recomputation for a changed client-visible protocol domain says so. Runtime failure never rewrites it. |
-| `atomic_kms_cursor_policy` | `(device_identity, driver_identity)` | Runtime-derived. It is `AtomicHardware` when structural capability and incarnation qualification hold, no measured demotion is in force for this device identity, and no degradation prior matches the installed driver version. | A measured demotion under `CAP-4`, a matching degradation prior, or loss of structural capability or qualification makes it `SoftwareComposited`. Demotion is remembered for the server process lifetime and never reopens within it. |
+| `atomic_kms_pipeline_structurally_capable` | `(device_identity, protocol_domain)` | Discovery proves simultaneous cursor-plane coverage, usable universal cursor-plane properties and required completion-property coverage, `DRM_CAP_CRTC_IN_VBLANK_EVENT=1`, monotonic DRM event timestamps, and usable `GET_SEQUENCE`. A multi-CRTC domain additionally forms one structurally homogeneous group. Gamma and release validation are not part of this bit. | Only recomputation for a changed client-visible protocol domain says so. Runtime failure never rewrites it. |
+| `atomic_kms_cursor_policy` | `(device_identity)` | Runtime-derived. It is `AtomicHardware` when structural capability and the current incarnation qualification hold and no measured demotion is in force for this device identity. | A measured demotion under `CAP-4` or loss of structural capability or qualification makes it `SoftwareComposited`. Demotion is remembered for the server process lifetime and never reopens within it. |
 | `atomic_gamma_capable` | `(device_identity, protocol_crtc)` | That protocol CRTC maps to a usable atomic `GAMMA_LUT` and representable `GAMMA_LUT_SIZE`. | Recomputed when that protocol CRTC's mapping or advertised gamma contract changes. It never gates C.1. |
 | `atomic_kms_incarnation_qualified` | `(device_incarnation, topology_generation)` | Required cursor/primary/completion properties exist, no relevant latch/poison exists, and the mandatory real install/restore commit completes with canonical fence evidence. Gamma properties are independent. | Topology rejection, completion breach, incarnation retirement, or new topology requiring qualification. |
 | `atomic_kms_pipeline_ready` | `(device_incarnation, lifecycle_epoch, protocol_crtc, topology_generation)` | Structural capability, `atomic_kms_cursor_policy = AtomicHardware` and incarnation qualification are true, and seat/output, owner, generations, recovery, and cursor state permit this submission. | Any per-submit gate closes. Owner occupancy alone does not make it false. |
@@ -462,77 +375,38 @@ terminal supported state for that CRTC and cannot close C.1 capability,
 qualification, or readiness.
 
 **CAP-4 — measured cursor policy, not a maintainer allowlist.** Cursor policy
-separates a correctness gate from a quality gate. Only the correctness gate is
-decided ahead of runtime, because only it protects something a measurement
-cannot observe.
+separates structural/runtime correctness from measured quality. No cohort table,
+source audit, prior hardware campaign or vendor-family default selects a cursor
+transport. Each device incarnation is qualified at runtime on every boot.
 
-`OwnerMediatedLegacyMove` keeps an explicit allowlist. Its precondition is
-`AuditedCursorExpansionHazard`, a conservative prediction derived from reading
-the driver's source: whether that driver may add or serialize the cursor plane
-despite userspace omission. No runtime measurement substitutes for a source
-audit, and a wrong answer is an unmodelled concurrent mutation rather than a
-slow cursor. A plane therefore selects this transport only on an exact match in
-the audited-cohort table, which records the driver, kernel range, GPU class, the
-audited expansion reasons and the `NativeCursorCompositionContract` rule. In
-C.0 that table is empty: section 16.3 runs no allowlisting campaign, so no
-cohort matches and the transport is specified but unreachable. Every cohort's
-cursor policy is therefore decided by the measured path below.
+`SynchronousAtomicMove` is the only C.0 Owner hardware cursor-movement path. It
+is the ordinary owner atomic commit with canonical out-fence evidence. It is
+vblank-paced and occupies the sole atomic device slot. Structural capability
+plus successful runtime qualification select `AtomicHardware`; the owner does
+not require a driver-specific arm or physical performance result to enable it.
 
-`SynchronousAtomicMove` has no such precondition. It is the ordinary owner
-commit with canonical out-fence evidence, and its failure mode is quality: it is
-vblank-paced, occupies the sole atomic device slot, and can leave motion slower
-than software composition. C.0 selects it optimistically on every device whose
-structural capability and incarnation qualification pass, and withdraws it from
-measurement rather than from a table.
-
-`atomic_kms_cursor_policy` is per `(device_identity, driver_identity)` and
-derived at runtime as defined in section 6.2. C.1 admission requires structural
-capability, `atomic_kms_cursor_policy = AtomicHardware`, incarnation
-qualification and per-submit readiness.
+`atomic_kms_cursor_policy` is derived at runtime as defined in section 6.2. C.1
+admission requires structural capability, `atomic_kms_cursor_policy =
+AtomicHardware`, incarnation qualification and per-submit readiness.
 
 **Measured demotion.** The owner demotes a device to `SoftwareComposited` only
 on the conjunction of a symptom and its attributable cause, over a window of
 continuous cursor motion:
 
 - `CursorServiceRate`, the distinct cursor generations retired per second, falls
-  below `DemotionRatio` of the CRTC's mode-derived refresh rate, which is the
-  achievable ceiling for a vblank-paced transport; **and**
+  below `DemotionRatio` of the CRTC's mode-derived refresh rate; **and**
 - the p99 helper-measured duration of that window's cursor-affecting host calls
   exceeds `CursorHostCallMax`.
 
-Both are required, and the conjunction is normative rather than a tuning
-convenience. Section 9.2.1 tier-3 absorption legitimately pins cursor updates to
-a slow client's cadence on healthy hardware, so the symptom alone would demote a
-correct device; the measured host-call duration is what separates a driver
-defect from ordinary scheduling. Demotion requires consecutive qualifying
+Both are required. Section 9.2.1 tier-3 absorption can pin cursor updates to a
+slow client's cadence on healthy hardware, so the symptom alone does not demote
+a correct device; helper-measured host-call duration separates a slow driver
+call from ordinary scheduling. Demotion requires consecutive qualifying
 windows, and a window whose atomic slot was occupied by primaries unrelated to
-the cursor is discarded rather than counted against the device. Demotion is
-remembered for that device identity for the server process lifetime, executes
-through the section 11.4 hardware-to-software transition as an explicit policy
-change, and never reopens within that process.
-
-**Degradation prior.** A compiled-in table may record cohorts with recorded
-measured failure, so a known-bad driver starts in `SoftwareComposited` without
-ever exposing its degraded window. This table is an optimization and never a
-safety mechanism: measured demotion protects every device whether or not it is
-listed, so a missing, stale or wrong entry costs at most one short degraded
-window and cannot produce an unsafe policy. Each entry carries the worst
-recorded driver version; an installed version above that bound does not match
-and the device starts optimistically again. Nothing promotes a device out of the
-prior by measurement, because measuring the hardware path requires using it and
-section 10.1 forbids synthetic probes. The version bound is the sole exit, and
-it requires no spec revision.
-
-Only stock, publicly released driver builds are valid evidence for either table.
-C.0 records no patched, proposed, out-of-tree or unreleased build and assigns no
-hypothetical future version range. Stock NVIDIA lacks the cursor async hook in
-the source audited for this phase and therefore cannot select
-`OwnerMediatedLegacyMove` under any measurement; its production cursor policies
-are software composition and `SynchronousAtomicMove`.
-
-Neither table is a rollout lever. Both are compiled in and expose no environment
-variable, command-line flag, configuration key or user override, preserving
-goal 11.
+the cursor is discarded. Demotion executes through section 11.4's ordered
+hardware-to-software transition and never reopens within the server process.
+For visible direct-scanout cursors, that transition performs the ordered
+software/unflip path before software reveal.
 
 Discovery defaults are class-specific and explicit. The existing
 `connector_is_non_desktop` policy remains fail-open on read-only property-query
@@ -561,8 +435,8 @@ The persistent property list is minimal rather than a full desired-state dump.
 It contains every object whose persistent generation actually changes and any
 additional object the kernel requires for that change. In particular, a
 primary-only request omits an unchanged cursor plane entirely; it never adds
-cursor properties or the plane merely to restate desired state. Coordinate-only
-intent is not an atomic property-list input.
+cursor properties or the plane merely to restate desired state. Cursor-coordinate
+changes are ordinary cursor-plane properties in that same minimal request.
 
 This is the userspace construction counterpart of the kernel's atomic CRTC
 inclusion rule. A plane/connector move includes both powered endpoints; detach
@@ -578,13 +452,6 @@ recorded set, construction fails before submit. When `PAGE_FLIP_EVENT` is set,
 `KernelEventCrtcs = ExpectedCompletionCrtcs`; `PresentEventCrtcs` is the subset
 with a Present consumer. Events in the set difference are correlated and
 drained but do not create protocol completion or an event deadline.
-For a cohort that nominates `OwnerMediatedLegacyMove`, that same immutable
-request is also passed to the cohort's `AuditedCursorExpansionHazard` rule after
-all persistent and ephemeral properties are present. The resulting prediction
-and reasons are installed in the `Submitting` record before dispatch; later
-request mutation is forbidden. This classification does not alter or claim to
-measure `AtomicCrtcClosure`.
-
 The off-to-off restriction is about kernel `drm_crtc_state.event`, not only a
 userspace-visible page event. Linux `prepare_signaling()` creates that event
 state for every CRTC in the atomic state when either the request carries
@@ -659,29 +526,6 @@ calls are restricted to cold startup before service or final offline/shutdown
 work after prompt lifecycle obligations have ended. `ValidationOnly` is neither
 a live blocking commit nor a submitted record; it uses the exclusive validation
 lease and watchdog defined in section 5.
-
-The qualified coordinate-only transport is also a seat-active executor host
-call. It is a typed message carrying incarnation, lifecycle epoch, plane identity, installed
-cursor generation, the installed `NativeCursorCompositionContract` proof, the
-overlapped primary's `AuditedCursorExpansionHazard` classification when any,
-and newest coordinates; its typed reply includes the helper-measured ioctl
-duration independently of IPC. A returned duration above
-`CoordinateFastReturnMax` is subject to section 7.1's transport-health rule. It
-has no
-out-fence and creates no submitted atomic record. Before dispatch the owner
-installs `CoordinateSubmitting` as a cursor-plane mutation reservation, not as
-the atomic device slot. It may begin with the atomic slot idle or with exactly
-one accepted coordinate-overlap-safe primary commit as defined in section 5,
-but never
-while another atomic ioctl is still `Submitting`. While the coordinate host
-call itself is unresolved, the owner dispatches no new KMS host call. A typed
-return releases the plane reservation while any compatible accepted primary
-commit continues to own the atomic slot. Timeout, lost/invalid IPC, or helper
-failure closes the transport and enters the coordinate case of
-`ExecutorStalled`: no fallback or other KMS mutation may dispatch until actual
-helper reap proves that the old ioctl can no longer mutate coordinates. After
-reap, the newest coalesced coordinate is submitted through the selected
-fallback and overwrites any acceptance-unknown old position.
 
 **COMMIT-6 — dispatch is an uncertainty boundary.** Before sending IPC, the
 owner installs a `Submitting` record, reserves the sole device slot, registers
@@ -1024,186 +868,19 @@ to `u64`, never by a narrowing cast. Overflow, unsupported format/modifier/
 size, or a required scale is not submitted: it selects the ordered software-
 cursor transition instead.
 
+**Direct-scanout shape for hardware cursor.** The production direct-eligibility
+predicate rejects scaled or partial-coverage candidates, every primary format
+other than XRGB8888 (including YUV/video), and HDR/10-bit candidates before any
+KMS request. The format-consistency test binds the composed
+`VkScanoutFb::format()` and the direct-eligibility gate to XRGB8888 so neither
+can drift independently. This full-output, 1:1 XRGB8888 shape remains required
+when `SynchronousAtomicMove` keeps a hardware cursor visible over a direct frame;
+it preserves the production-tested direct-frame composition beneath the cursor,
+while the device's single atomic slot serializes cursor and primary updates.
+
 ### 7.1. Coordinate transport qualification
 
-Linux currently reaches a driver's `atomic_async_check`/
-`atomic_async_update` cursor hook through the legacy plane update path, which
-sets `legacy_cursor_update`; `drm_mode_atomic_ioctl` exposes no equivalent
-cursor-coordinate flag. C.0 qualifies the viable coordinate transports for the
-exact driver/kernel/GPU/plane-incarnation cohort through measurement rather
-than vendor-family inference:
-
-- `OwnerMediatedLegacyMove` is eligible only when a real baseline/qualification
-  probe has placed that exact driver/kernel/GPU/plane class in the immutable
-  audited-cohort table, including external input-to-visible evidence no worse
-  than the shipping legacy baseline. This is the one transport `CAP-4` still
-  gates ahead of runtime, because its precondition is a source audit. Where the
-  driver may expand a userspace request or restrict its async hook from
-  below-cursor state, that evidence also supplies
-  the checked `NativeCursorCompositionContract` and cohort-specific
-  `AuditedCursorExpansionHazard` rule. Runtime does not infer an internal async
-  hook merely from one fast ioctl return. It requires an exact cohort-table
-  match, a contract-valid installed primary, the qualified plane incarnation,
-  unchanged installed framebuffer/binding and only coordinate fields in the
-  cursor request.
-- `SynchronousAtomicMove` uses the ordinary owner commit and out-fence evidence
-  where no qualified fast legacy transport is available. It is vblank-paced and
-  occupies the atomic device slot. It is selected optimistically wherever
-  structural capability and incarnation qualification hold, and is withdrawn by
-  the `CAP-4` measured demotion rather than by absence from a table.
-- `SoftwareCursor` remains viable independently of a hardware-transport failure.
-  It is the terminal fallback: the state a device reaches when it lacks
-  structural capability, matches a degradation prior, or has been demoted by
-  measurement. It is no longer the default for hardware merely because no
-  campaign has been run against it.
-
-The C.0 NVIDIA model considers only stock, publicly released driver builds.
-Those builds expose no cursor-plane `atomic_async_update` hook in the source
-audited for this phase, so no NVIDIA cohort in C.0 can select
-`OwnerMediatedLegacyMove`. A composed NVIDIA desktop uses `SoftwareCursor`;
-direct scanout may use `SynchronousAtomicMove` only after its own stock-driver
-gate passes, otherwise it performs the ordered software/unflip transition. C.0
-does not measure, mention in a support table, or derive future capability from
-an out-of-tree, patched, proposed, or unreleased driver. A later released driver
-with a new mechanism requires a future spec revision and complete new cohort
-evidence; it is not anticipated by this document.
-
-For the required Raphael iGPU cohort (RDNA2/DCN 3.1.5) across the kernel range
-verified in section 4.1, C.0 does not
-attempt to mirror AMD's hysteretic cursor-mode state. Every primary constructed
-while `OwnerMediatedLegacyMove` is selectable must instead satisfy
-`NativeCursorCompositionContract`: one full-mode XRGB8888 primary at `(0,0)`,
-1:1 source/destination scale, fixed z-order below the cursor, and no active
-plane color pipeline. The merged direct path already rejects non-XRGB8888,
-non-root-sized and non-exact-output-tiling candidates before KMS; composed
-scanout programs the same full-mode shape. Specifically,
-`kms/vk/scanout.rs` registers the composed `VkScanoutFb` as
-`DrmFourcc::Xrgb8888`, while the direct gate in `kms/render/backend.rs` requires
-`DRM_FORMAT_XRGB8888`; both are load-bearing sources for the fixed-format
-contract. C.1 inherits this eligibility and does not add scaled, HDR/10-bit,
-YUV/video or partial-coverage scanout. Direct eligibility and every owner
-primary builder assert the contract. A direct candidate that fails it uses the
-existing composed fallback.
-
-Any future path that constructs an out-of-contract primary must invalidate
-`OwnerMediatedLegacyMove` during construction, before that primary's ioctl may
-begin, and complete the ordered transition away from the transport before
-installing the primary. Canonical completion is too late for this invalidation.
-After such an installation the same plane incarnation cannot simply reselect
-the fast transport when a later primary passes the contract. Re-entry requires
-complete plane-incarnation requalification: atomically detach and reattach the
-cursor with the contract-valid primary already represented in the state, then
-rerun the cohort qualification. The reattach makes
-`drm_atomic_plane_enabling()` set AMD's cursor-mode reconsideration, while the
-associated CRTC `plane_mask` change makes `drm_atomic_normalize_zpos()` include
-the affected planes, so the driver recomputes against the contract-valid
-primary rather than a cursor-only state. This future extension requires a
-reviewed spec and new cohort evidence; current C.0 has no producer of an out-of-
-contract primary.
-
-Omitting the cursor from userspace's request is necessary but not sufficient
-for overlap on AMDGPU. `dm_crtc_get_cursor_mode()` obtains and thereby adds the
-cursor plane when an enabled cursor shares a CRTC with a relevant plane
-enable/disable, framebuffer-format, scale-ratio, z-order or plane color-pipeline
-change. Earlier in `amdgpu_dm_atomic_check()`,
-`drm_atomic_add_affected_planes()` also adds every current plane on an enabled
-CRTC when the request needs a modeset, changes CRTC color management, changes
-VRR state, or carries `dsc_force_changed`. DRM marks CRTC color management
-changed when `GAMMA_LUT`, `CTM` or `DEGAMMA_LUT` is replaced, so C.0 gamma-only
-commits are expansion hazards even though they do not pass through the cursor-
-mode trigger.
-
-For this cohort, `AuditedCursorExpansionHazard` is therefore true for the
-complete final serialized request when it includes or implies any of: modeset;
-CRTC `GAMMA_LUT`, `CTM` or `DEGAMMA_LUT` replacement; VRR change; DSC-force
-change; relevant plane enable/disable or binding; framebuffer-format change;
-scale-ratio change; normalized-z-order change; or plane color-pipeline change.
-The classification is installed before host-call dispatch and remains on the
-accepted record through canonical completion. Coordinate overlap is permitted
-only for a primary-only request that preserves the native contract, omits the
-cursor in the userspace object set, and has no audited hazard reason. Gamma,
-modeset and all other non-primary classes already exclude coordinate overlap;
-the explicit hazard still prevents later code from misclassifying them. A
-kernel/driver revision that changes the expansion set creates a new cohort, and
-so does a change of display IP version; C.0 never guesses from vendor name or
-reports this prediction as measured kernel closure. The DCN native-cursor
-exemption list is 4.0.1, 4.2.0 and, from Linux 7.2, 4.2.1. Those are DCN 4.x, so
-neither DCN 3.0 nor the required cohort's DCN 3.1.5 is exempt, and that reading
-transfers across the substitution. From the same revision
-`dm_crtc_get_cursor_mode()` additionally returns native mode early for a
-disabled CRTC, which cannot affect an enabled CRTC on either IP version. Both
-readings hold across the range verified in section 4.1.
-
-The trigger set above does **not** transfer by the same argument. It was derived
-by reading `amdgpu_dm` against DCN 3.0, and cursor-mode selection and overlay
-handling are IP-version-specific. Before `OwnerMediatedLegacyMove` is
-allowlisted for the Raphael iGPU cohort, the audit is redone against DCN 3.1.5
-and its reasons recorded for that cohort. Until then the cohort is not in the
-audited-cohort table and its cursor policy is decided entirely by `CAP-4`, which
-needs no audit: structural capability plus qualification select
-`SynchronousAtomicMove`, and measurement withdraws it if it underperforms. No
-cohort completes that audit in C.0, so this is the path every device takes.
-
-Runtime preference is state-derived, not a configuration lever. A qualified
-`OwnerMediatedLegacyMove` is preferred in both composed and direct presentation.
-Without it, a composed desktop uses `SoftwareCursor`; direct scanout uses
-`SynchronousAtomicMove` only when that exact cohort passed its continuous-
-primary qualification, otherwise the ordered software-cursor transition exits
-direct scanout. Thus composition favors fluid cursor interaction while direct
-scanout may preserve scanout with a vblank-paced hardware cursor. Crossing the
-composed/direct boundary re-evaluates this fixed preference table and performs
-the existing ordered HW/SW transition; it does not probe during motion or
-oscillate on individual results. A driver, kernel, GPU, plane incarnation, mode
-or relevant topology change invalidates the applicable runtime incarnation
-qualification before reuse. Every primary construction rechecks the native
-contract, and every final serialized atomic request receives a fresh audited
-hazard classification before dispatch. A driver/kernel/GPU identity change
-additionally requires new release evidence. Phase C.2 may replace this table
-when it introduces the above-vblank atomic transport.
-
-`OwnerMediatedLegacyMove` is dispatched only from the owner with no atomic
-`Submitting`, lifecycle barrier, or exclusive validation lease. The atomic slot
-may be idle or held by one accepted contract-preserving primary commit whose
-userspace object set omitted the cursor and whose audited expansion hazard is
-false; every other accepted class blocks it. The move contains only `CRTC_X/Y`
-for the current installed cursor state. On kernels
-using the atomic helpers, the compatibility ioctl constructs its own atomic
-state internally; userspace never treats it as an independent owner.
-`CoordinateFastReturnMax` is one millisecond. A slow return means a successful
-call exceeded that transport-health maximum; an unresolved call instead
-follows the executor watchdog and reap rules. On atomic-helper drivers,
-an internal `atomic_async_check()` rejection is not a userspace errno: the
-helper sets `state->async_update=false` and continues through its ordinary
-commit path. That ordinary blocking path waits for dependencies before its
-commit tail and may cost an output period. Therefore any returned over-bound
-call is a coordinate-policy/cohort defect, not runtime composition detection:
-it closes `OwnerMediatedLegacyMove` for the complete plane incarnation, emits telemetry
-with the contract proof, exact userspace request, audited hazard classification
-and duration, and moves the newest point to `SynchronousAtomicMove` or the
-ordered software transition. It cannot be rehabilitated within that plane
-incarnation. A userspace-visible rejection other than the eligible concurrent
-`EBUSY`, topology/lifecycle invalidation, an uncertain return, or evidence that
-the request changed more than coordinates remains a non-composition failure and
-closes the transport at the existing incarnation/reap scope. An eligible
-concurrent `EBUSY` is a benign
-pre-submit rejection: it does not close the transport and retains/coalesces the
-newest point for exactly one deferred retry after the accepted primary
-completes. At that completion wake, a waiting lifecycle barrier still wins;
-otherwise the single coordinate retry dispatches before the next atomic primary
-admission. Consecutive coordinate `EBUSY` means attempts with no successful
-coordinate return between them; every successful coordinate return resets the
-count. A second consecutive `EBUSY`, or any `EBUSY` without the recorded
-overlap-safe primary conflict, closes the transport. Completion of an atomic
-request does not itself reset the count, and there is no immediate retry loop.
-Every fallback waits for
-`CoordinateSubmitting` to clear, and an uncertain isolated result clears only
-after helper reap, never merely at watchdog or IPC failure. Phase C.2 owns a
-future atomic-UAPI replacement and its removal plan; C.0 neither claims nor
-invents that UAPI.
-
-The desired state is separate from submitted and retired state. Updating the
-desired cursor never releases the framebuffer referenced by an in-flight or
-currently scanned atomic state.
+(Removed in revision 5 — see §16.3.)
 
 ## 8. Atomic gamma payload
 
@@ -1342,22 +1019,17 @@ deliberately conservative C.0 rule serializes commits
 that could conflict through shared planes, connectors, routing, or a multi-CRTC
 transaction. A later phase may admit disjoint concurrent commits only after it
 tracks complete DRM object conflict sets; CRTC identity alone is insufficient.
-The section 7.1 coordinate transport is not an atomic transaction: its
-per-cursor-plane `CoordinateSubmitting` reservation may overlap the completion
-interval of the one accepted contract-preserving primary whose final serialized
-request omitted the cursor and was conservatively classified with
-`AuditedCursorExpansionHazard=false`, but it blocks every new KMS host-call
-dispatch until its typed return or helper reap.
+
 
 This is the named `SingleSlotMultiCrtcCeiling`, an accepted C.0 throughput
 limitation. A multi-CRTC protocol domain is C.0-complete only when all active
-CRTCs have the same exact mode-derived refresh rational and hardware
-qualification proves the per-CRTC fairness and aggregate single-slot floors in
-section 16.3. Such CRTCs form one `HomogeneousCompletionGroup`; compatible ready
+CRTCs have the same exact mode-derived refresh rational. Such CRTCs form one
+`HomogeneousCompletionGroup`; compatible ready
 primary generations may improve throughput through the section 9.2.1 bundle
 tier, but full refresh on every output is not promised. Different refresh
-rationals, failure of the single-slot gate, or an unknown mode period keeps the
-topology on the merged Phase A+B backend path. A hotplug/modeset that would leave
+rationals or an unknown mode period keeps the topology on the merged Phase A+B
+backend path. Physical throughput characterization can falsify shared scheduler
+machinery but does not qualify a driver or group. A hotplug/modeset that would leave
 the group first quiesces the C.0 owner through the lifecycle barrier and
 installs the baseline topology. A future independent **Multi-CRTC Parallel
 Retirement** design may lift the ceiling after tracking complete DRM-object
@@ -1374,12 +1046,10 @@ The owner tracks:
 
 - last retired/displayed state per CRTC and plane;
 - at most one `Submitting` or accepted nonblocking atomic commit pending for the
-  device, plus at most one `CoordinateSubmitting` reservation on a cursor plane
-  only in the concurrency class defined by sections 5 and 7.1;
+  device;
 - the pending commit id, device/topology generation, affected CRTC set, expected
-  completion set, completions already observed, exact userspace-included DRM
-  object/plane set, native-composition-contract result, and the separately named
-  audited expansion-hazard prediction used to prove coordinate-overlap safety;
+  completion set, completions already observed, and exact userspace-included DRM
+  object/plane set;
 - the current final-validation `AtomicSnapshotId`, including device, lifecycle,
   topology, primary, cursor, gamma, connector and CRTC desired generations, and
   the exclusive validation lease that makes it usable by exactly one live
@@ -1387,8 +1057,6 @@ The owner tracks:
 - every pre-submit producer wait, every returned out-fence, and the separate
   presentation/release milestones in section 10.2;
 - newest queued cursor intent per CRTC;
-- the per-plane coordinate transport, its qualification generation and any
-  newest owner-mediated coordinate intent;
 - desired/pending/current gamma blob and generation per CRTC;
 - primary-plane/direct/unflip intents that must not be reordered;
 - cursor framebuffer references for current, pending, and queued generations;
@@ -1472,7 +1140,7 @@ The C.0 dispatch-timing policy is named
 eligible, the owner runs admission in that wake and dispatches the selected work
 without a retention timer. This is an explicit policy point rather than an
 accidental consequence of the event handler. Phase C.2 may replace the policy
-when it owns late/above-vblank cursor submission; C.0 fixes it to immediate
+when it owns above-vblank atomic cursor submission; C.0 fixes it to immediate
 dispatch.
 
 Each ready unsent maintenance identity `(CRTC, cursor|gamma)` owns at most one
@@ -1481,13 +1149,7 @@ even when the device slot is free. Latest-wins replacement changes the payload
 but preserves that ticket and its original age. A topology transition drops only
 tickets whose generation cannot be remapped; surviving desired protocol state
 retains its relative age.
-Qualified `OwnerMediatedLegacyMove` coordinate intent instead uses the bounded
-per-plane lane from section 7.1 and owns no maintenance ticket. It enters this
-ticketed scheduler only after a native-contract fallback or transport closure
-converts the newest coordinate to `SynchronousAtomicMove` or an ordered
-software transition. Its one eligible
-post-`EBUSY` retry runs at primary completion before the atomic tiers below,
-except that a waiting lifecycle/topology barrier closes admission first.
+
 
 Retirement-time promotion of the merged direct successor is a named admission
 path, not an event-handler bypass. When a direct predecessor retires, the owner
@@ -1560,10 +1222,11 @@ CRTC in the `HomogeneousCompletionGroup` and builds one atomic transaction. It
 is eligible only when at least two CRTCs are ready, no lifecycle/unflip barrier
 intervenes, every included CRTC has canonical completion coverage, and all
 changed aged maintenance required by tiers 3–4 is either compatibly absorbed
-or serviced first. It never carries unchanged cursor state or coordinate-only
-intent. Each distinct included primary generation retires once from the same
-physical commit; a CRTC not ready at construction is not represented by carried
-state and earns no logical retirement. When fewer than two CRTCs are ready,
+or serviced first. It never carries unchanged cursor state; changed cursor
+positions remain ordinary persistent cursor-plane state. Each distinct included
+primary generation retires once from the same physical commit; a CRTC not ready
+at construction is not represented by carried state and earns no logical
+retirement. When fewer than two CRTCs are ready,
 tier 6 preserves the existing round-robin singular path without waiting on a
 timer for a bundle.
 
@@ -1626,12 +1289,11 @@ failure.
 
 ### 9.3. Cursor and gamma progress on idle scenes
 
-A cursor image, visibility, binding or synchronous-coordinate intent schedules
-its own prompt atomic flush when no compatible primary commit is imminent. A
-qualified coordinate-only legacy intent runs from the same owner as soon as its
-cursor-plane reservation and lifecycle permit, including while an accepted
-contract-preserving, no-hazard primary commit owns the atomic device slot.
-Neither path is gated on `scene_wants_compose`, damage, or the next scene tick.
+A cursor image, position, visibility or binding intent schedules an atomic
+flush through the same owner whenever the device slot is free. Motion and other
+cursor changes coalesce latest-wins while a primary commit is pending; retirement
+then admits the newest cursor state under the ordinary ticketed scheduler. Cursor
+work is not gated on `scene_wants_compose`, damage, or the next scene tick.
 
 Gamma-only intent follows the same progress rule, while multiple unsubmitted
 gamma updates coalesce to the newest complete LUT.
@@ -1645,7 +1307,6 @@ The queue is bounded:
 
 ```text
 per device: one submitted atomic commit
-per cursor plane: at most one CoordinateSubmitting reservation
 per CRTC: one latest desired cursor state + one latest desired gamma ramp
 ```
 
@@ -1665,30 +1326,6 @@ close qualification/readiness, record the foreign/internal-busy evidence, and
 enter the bounded topology/recovery path. There is no completion to wait for,
 no immediate retry and no retry spin.
 
-The qualified coordinate exception is narrower. `MOVECURSOR` may return
-`EBUSY` when it is deliberately dispatched alongside the one accepted cursor-
-overlap-safe primary commit. That rejection is benign and consumes no atomic
-slot: the owner retains/coalesces the newest point and allows one retry after
-that primary completes and before any later primary admission. Coordinate
-`EBUSY` results are consecutive only when no successful coordinate return
-intervenes; every success resets the count, while atomic completion alone does
-not. A second consecutive coordinate `EBUSY` closes the plane's fast transport
-for the incarnation and moves the newest point to ordered atomic or software
-fallback. An `EBUSY` when no such compatible primary is live is an invariant/
-qualification failure and closes the transport immediately. Neither
-case poisons otherwise proven atomic completion, retries immediately, bypasses
-the owner, or selects another legacy ioctl. Telemetry distinguishes eligible
-concurrent rejection, retry success, retry exhaustion, and impossible-context
-`EBUSY`.
-
-An internal driver `atomic_async_check()` result is not classified here as a
-userspace `EINVAL`: the atomic helper may consume it by selecting the ordinary
-blocking commit path. Section 7.1 prevents known-ineligible calls before
-dispatch; any coordinate call that nevertheless returns above its latency bound
-is a coordinate-policy/cohort defect and closes the fast transport for the plane
-incarnation. A real userspace-visible `EINVAL` after the owner proved a
-coordinate-only request is likewise a request/driver contradiction and closes
-the transport; neither result creates an automatic rehabilitation path.
 
 ## 10. Commit lifecycle, completion, and recovery
 
@@ -1894,10 +1531,8 @@ Events are classified normatively:
 The single device slot is reserved before IPC dispatch and remains a conflict-
 serialization rule, not a substitute for event identity. An unrelated event
 cannot poison a healthy incarnation, but an explicit contradiction of its active
-commit can. The coordinate-plane exception does not release or duplicate this
-slot: it may overlap only the completion interval of the recorded cursor-
-disjoint primary class and excludes every new KMS host call while its own result
-is unresolved.
+commit can. Every cursor mutation uses the same atomic slot as primary and other
+live KMS mutations; there is no overlapping coordinate reservation.
 
 Every nonblocking commit has a canonical hardware-completion out-fence for each
 member of the section 6.3 `ExpectedCompletionCrtcs` atomic closure. This set
@@ -1971,8 +1606,7 @@ A dispatched transaction reaches exactly one terminal state:
   nor new resources are proven unreferenced.
 
 Before an orderly VT release, topology rebuild, DPMS teardown, or shutdown, the
-owner stops admission and drains `CoordinateSubmitting`, `Submitting`, or the
-accepted pending record without blocking the X11 core indefinitely. A bounded timeout, executor/IPC
+owner stops admission and drains `Submitting` or the accepted pending record without blocking the X11 core indefinitely. A bounded timeout, executor/IPC
 loss, or device/master loss moves it to `CompletionUnknown`. An executor still
 inside the host call additionally enters `ExecutorStalled` after the watchdog,
 without delaying prompt protocol/seat handling. Resources from an unknown
@@ -2146,9 +1780,6 @@ commit per device awaits correlation. A page event never closes an out-fence,
 and an out-fence never completes or timestamps Present. `PriorBufferReleased`
 may occur later and remains in the existing bounded BO/resource retirement
 ledger; it does not keep the device submission slot occupied.
-An accepted coordinate-overlap-safe primary may coexist with one coordinate-
-plane reservation during this interval; the reservation is not a second atomic
-slot and cannot authorize another atomic transaction.
 
 Ordinary C.0 resource ownership follows this table:
 
@@ -2208,25 +1839,22 @@ The owner separates four timers:
    `FastHardwareCompletionDeadline =
    clamp(3 * slowest_affected_mode_period, 100 ms, 2 s)`; an unknown mode uses
    16.667 ms before clamping. Modeset, topology install and seat-active recovery
-   instead use the release cohort's audited/measured
-   `LifecycleCompletionObservedMax` and
+   use this device incarnation's validated runtime observation,
+   `LifecycleCompletionObservedMax`, and
    `LifecycleHardwareCompletionDeadline =
    min(30 s, max(10 s, LifecycleCompletionObservedMax + 2 s))`. An
    unrepresentable calculation, or an observed healthy completion above the
-   28-second representable margin, leaves that cohort unvalidated rather than
-   poisoning it under the fast-update timer.
-   **Bootstrap (section 16.3 revision 4).** When no audited or measured
-   `LifecycleCompletionObservedMax` exists for the cohort — the case for every
-   cohort nobody in this project owns — the lifecycle deadline is the ceiling,
-   `LifecycleHardwareCompletionDeadline = 30 s`, so the qualification commit is
-   bounded from the first incarnation. A completion within it qualifies
-   normally; expiry is handled as any lifecycle hardware-completion expiry and
-   does not qualify the incarnation. Nothing observed under the bootstrap
-   deadline is persisted or transferred to another incarnation, device or
-   cohort: a measured value comes only from the section 16.3 fault-injection row
-   on a device actually available. Without this, the qualification commit of an
-   unmeasured cohort could never be bounded, and the cohort could never
-   qualify.
+   28-second representable margin, leaves this incarnation unvalidated rather
+   than poisoning it under the fast-update timer.
+   **Bootstrap (section 16.3 revision 4).** When no validated runtime
+   `LifecycleCompletionObservedMax` exists for this device incarnation, its
+   lifecycle deadline is the ceiling, `LifecycleHardwareCompletionDeadline =
+   30 s`, so the qualification commit is bounded from the first incarnation.
+   A completion within it qualifies normally; expiry is handled as any lifecycle
+   hardware-completion expiry and does not qualify the incarnation. The observed
+   value is the lifecycle completion measured at runtime on this same device
+   incarnation. Physical runs may falsify the shared deadline machinery, but do
+   not establish that runtime observation for another incarnation.
 4. **Primary Present event:** after `HardwareComplete`, create one timer for each
    required Present CRTC whose event has not already arrived:
    `deadline[crtc] = hardware_complete_observed_at +
@@ -2393,8 +2021,10 @@ The merged Phase A+B baseline is explicit:
 - replacement idles the never-submitted victim immediately and defers its
   `Skip` behind the predecessor;
 - composed/direct/unflip work is always visible to Present pacing; and
-- the hardware-cursor strategy is enabled by default but the shipping NVIDIA
-  device policy still selects software cursor.
+- the merged Phase A+B baseline selects software cursor on the shipping NVIDIA
+  configuration. C.0 does not retain a driver-specific cursor policy: each
+  structurally capable Owner incarnation selects atomic hardware cursor after
+  runtime qualification, with CAP-4 measured demotion where needed.
 
 C.0 preserves those protocol outcomes, but it necessarily changes the primary
 submission machinery. `submit_direct_scanout` is converted from a plane-only,
@@ -2429,21 +2059,13 @@ atomic gamma exposes gamma unavailable through `atomic_gamma_capable=false` but
 may enable C.1 when the structural, cursor-policy, cursor/primary and completion
 gates pass.
 
-NVIDIA is not declared good at hardware cursor merely because its cursor plane
-exposes the right properties, and it is not declared bad merely because it is
-NVIDIA. Section 16.3 compares the shipping software cursor, the rejected
-legacy-hardware path and the C.0 atomic-hardware path on the measured drag
-workload. That comparison no longer decides whether the cohort may enable
-hardware cursor at all — `CAP-4` makes that a runtime decision for every device.
-It decides two narrower questions: whether the measured demotion actually
-catches this driver, and whether the cohort earns a degradation prior so its
-users never see the degraded window. If the atomic arm preserves smooth
-interaction, removes the X11-core stall and meets the direct-scanout and
-maintenance bounds, the cohort takes no prior and runs hardware cursor like any
-other device. If it fails, the recorded result justifies the prior entry and its
-driver-version bound. Either way the result and test hardware are recorded for
-that exact cohort rather than generalized to every NVIDIA architecture, hidden
-behind a runtime override, or modeled as transient not-ready state.
+C.0 does not assign cursor policy by vendor or shipping composition. Every
+structurally capable and runtime-qualified Owner incarnation selects
+`SynchronousAtomicMove` unless CAP-4 has measured underperformance and demoted
+that device. This applies in composed and direct presentation. If a visible
+direct-scanout cursor is demoted, the ordered software/unflip transition runs
+before software reveal. Physical runs on stock drivers can falsify shared
+machinery but do not qualify a driver or supply a policy allowlist.
 
 Structural coverage is re-evaluated before every topology installation. If a
 proposed topology loses it while C.1 is enabled, C.1 submission is first
@@ -2563,8 +2185,9 @@ Requirements in this section are identified as **MULTI**.
 - A device without universal cursor-plane coverage reports the cursor/primary
   pipeline unavailable only for its own outputs. Missing atomic `GAMMA_LUT`
   reports gamma unavailable independently.
-- Unsupported devices never regain an uncontrolled legacy state-mutating path;
-  only the section 5 owner-mediated coordinate transport is permitted.
+- A device that cannot activate the C.0 Owner remains on the permanent `Legacy`
+  fallback route selected by capability. A C.0 Owner issues no legacy cursor
+  ioctl; its cursor mutations use atomic plane properties.
 
 ## 14. Projection to Phase C.1
 
@@ -2599,33 +2222,23 @@ Provide counters or structured logs for:
 
 - the merged `m1_gate_*` per-reason direct-eligibility counters, preserved and
   extended so `m1_gate_reject_cursor` distinguishes property/capability failure
-  from the NVIDIA software-cursor device policy;
+  from a CAP-4 software-cursor demotion;
 - primary-plane successor queued/replaced/promoted, async option only as
   diagnostics, immediate idle/release timestamp, deferred `Skip` publication,
   predecessor completion ordering, and duplicate-idle prevention;
 - atomic cursor desired/submitted/retired;
 - moves coalesced and identical moves deduplicated;
 - cursor-only commits, changed-persistent cursor bundled with primary updates,
-  unchanged cursor planes omitted from primary requests, and forbidden
-  coordinate absorption;
+  and unchanged cursor planes omitted from primary requests;
 - pending/queued high-water marks;
-- atomic versus coordinate-transport `EBUSY`, whether the one permitted
-  overlap-safe primary conflict existed, coalesced retry eligibility, retry-
-  after-completion result, consecutive count, successful-return reset,
-  readiness/transport closure, and proof that neither an atomic completion nor
-  an immediate retry reset the count; measurement-only absorbed-conflict
-  closure suppression and the production closure it would have taken are
-  separate fields and must remain zero/unreachable outside that exact artifact;
-- `NativeCursorCompositionContract` result and per-field rejection,
-  `AuditedCursorExpansionHazard` boolean and named reasons over the complete
-  final request, exact userspace-included objects/planes, returned coordinate-
-  call duration/result, incarnation-scoped over-bound closure and fallback
-  selected. These fields explicitly label the hazard as a source-derived
-  prediction and never as the driver's observed post-check closure;
+- atomic `EBUSY`, readiness closure, recovery entry and result;
+- CAP-4 cursor-service windows, helper-measured cursor host-call durations,
+  demotion conjunction/count, demotion cause and ordered hardware-to-software
+  transition outcome;
 - commit ids, atomic/expected/event/completed CRTC sets, old/new binding inputs,
   exact userspace-included plane/object set, per-CRTC page-flag/out-fence
-  signaling source, off-to-off construction rejection, coordinate-overlap-safe
-  classification, partial completions, completion mechanism, and terminal state;
+  signaling source, off-to-off construction rejection, partial completions,
+  completion mechanism, and terminal state;
 - per-CRTC primary-event deadline, arrival, and expiry, including the mode
   period (or documented fallback) used to calculate each deadline;
 - accepted/hardware-complete/presented/prior-buffer-released milestones and
@@ -2663,12 +2276,8 @@ Provide counters or structured logs for:
   accepted-stale quarantine, `ExecutorStalled` entry/exit, shutdown wait status,
   and `ShutdownExecutorStalled` duration;
 - latency-artifact fixed capacity/occupancy/overflow, monotonic in-memory
-  timestamps, primary dispatch/`HardwareComplete` interval, normalized phase
-  decile, request shape, qualified-overlap count, initial/retry kind, linked
-  initial `EBUSY`, retry-before-next-primary result, and whether a record belongs
-  to required production-omitted evidence or optional absorbed characterization;
-  per-stratum `PhaseCycleCap`/
-  `PhaseAttemptCap` usage, terminal quota state, and cap-exhaustion reason;
+  timestamps, input-to-dispatch and helper-call intervals, cursor-service windows,
+  and runtime demotion evidence;
 - page-event classification and token allocation, resolved logical
   identity, pending tuple contradictions, duplicate warnings,
   tombstone-window occupancy/eviction, raw versus normalized MSC/UST,
@@ -2682,14 +2291,11 @@ Provide counters or structured logs for:
   `NativeCoordinateOnly`, or failure), property-pair validation, and discovery
   contradiction;
 - cursor image/framebuffer generations current, pending, and queued;
-- per-plane `FullSourceSignedDestination`/`SourceCrop` and coordinate-transport
-  qualification, plus forbidden legacy cursor calls (zero) and permitted
-  coordinate-only `MOVECURSOR` calls;
-- input-to-cursor-submit, input-to-retirement and externally correlated input-
-  to-visible-motion latency plus effective coordinate updates/s, aggregated as p50/p99
-  and compared with the current shipping baseline under the same input/output
-  mode: software composition on NVIDIA, legacy HW cursor where that remains the
-  unmodified baseline, plus the separate NVIDIA legacy-HW scale arm;
+- per-plane `FullSourceSignedDestination`/`SourceCrop` qualification and legacy
+  cursor ioctl calls, which must be zero on every C.0 Owner device;
+- optional input-to-cursor-submit, input-to-retirement, input-to-visible-motion
+  latency and effective cursor updates/s, recorded as characterization only;
+  these physical values do not qualify a device or change cursor policy;
 - sustained physical device commits/s and logical retired generations/s per
   CRTC with one active CRTC and with two active homogeneous CRTCs, including
   each refresh target and the device-slot idle/occupied fraction; mixed/unknown-
@@ -2731,12 +2337,12 @@ applicable, hardware evidence is incomplete.
 | Requirement group | Normative source | Unit/state evidence | Hardware/lifecycle evidence |
 | --- | --- | --- | --- |
 | `INV`, `ID-1..3` | Sections 5 and 6.1 | Owner reachability, lifecycle epoch, generation, fd-set, stale-event, and exact-close tests | Helper-alias, transition-race recovery, and teardown injection |
-| `CAP-1..4` | Section 6.2 | Cursor/primary versus gamma capability, qualification/readiness, measured-demotion conjunction and its false-positive guard, and degradation-prior version-bound tests | VT, DPMS, topology, reopen, domain-change, and the demotion-mechanism hardware runs |
+| `CAP-1..4` | Section 6.2 | Cursor/primary versus gamma capability, per-incarnation qualification/readiness, measured-demotion conjunction and its false-positive guard | VT, DPMS, topology, reopen, domain-change, and optional falsification runs for shared demotion machinery |
 | `COMMIT-1..7` | Sections 4.1, 6.3, and 10 | Commit-class matrix, pre-IPC submitting boundary, fences/events, fd ownership, terminalization, per-CRTC deadlines, fixed executor architecture, watchdog, and orderly-reap tests | Driver fence/event/reply reordering, delayed/stuck-ioctl, executor death/reap, and shutdown injection |
 | `REC-1..6` | Section 6.4 and section 10 | Poison, sole recovery attempt, total lifecycle mapping/precedence, recovery-fate matrix, bounded desired-state convergence, logical withdrawal, and quarantine tests | Concurrent/coalesced lifecycle, VT acquire/release, device replace, runtime loss, recovery-stage failure, and shutdown injection |
-| `CURSOR-PAYLOAD` | Section 7 | Encoding, full-source/crop policy, coordinate-transport qualification, hotspot, plane compatibility, framebuffer lifetime tests | Visible/animated/high-rate cursor and legacy-baseline matrix |
+| `CURSOR-PAYLOAD` | Section 7 | Encoding, full-source/crop policy, hotspot, plane compatibility, framebuffer lifetime tests | Optional visible/animated/high-rate cursor characterization |
 | `GAMMA-PAYLOAD` | Section 8 | RANDR contract, LUT encoding, resampling, blob lifetime tests | Gamma round-trip and lifecycle matrix |
-| `SCHED` | Section 9 | Bounded categories, tickets, coalescing, fairness, `EBUSY` tests | Concurrent CRTC/C.1 pressure runs |
+| `SCHED` | Section 9 | Bounded categories, tickets, coalescing, fairness, `EBUSY` tests | Optional pressure capture; shared-scheduler falsification only |
 | `CURSOR-LIFECYCLE` | Section 11 | HW/SW state machine and unknown-detach tests | Direct/unflip/failure-transition runs |
 | `DMG-1..5` | Section 12.1 | Commit-outcome to damage-transition mapping, unknown/poison invalidation, bundle staging, and direct-bypass tests | Damage-clipped repaint under direct/composed transitions, injected acceptance-unknown, and the phased damage workload |
 | `MULTI` | Section 13 | Device ownership and transfer coordinator tests | Same/cross-device crossing and failure injection |
@@ -2752,53 +2358,34 @@ applicable, hardware evidence is incomplete.
 4. [`CURSOR-PAYLOAD`] Image replacement retains current/pending framebuffer lifetimes.
 5. [`CURSOR-LIFECYCLE`] Hide followed by Show during a pending commit restores the newest sprite.
 6. [`SCHED`] Cursor-only work progresses without scene damage or a primary flip.
-7. [`SCHED`] Atomic `EBUSY` with no owner live record closes readiness and
-   enters bounded recovery without retry. Coordinate `EBUSY` beside the one
-   accepted overlap-safe primary coalesces and retries once after completion;
-   absent a lifecycle barrier that retry precedes the next primary admission.
-   Only a successful coordinate return resets the consecutive count. Atomic
-   completion without such a return does not; a second consecutive or
-   impossible-context result closes only that fast transport and falls back
-   without a spin. Any returned over-bound coordinate call closes the fast
-   transport for the plane incarnation and cannot be rehabilitated there.
+7. [`SCHED`] Atomic `EBUSY` with no owner live record closes readiness and enters
+   bounded recovery without a generic retry. Cursor positions remain latest-wins
+   desired state and are retried only by the ordinary scheduler after the
+   recovery/qualification transition permits admission.
 8. [`SCHED`] Primary and cursor intents preserve ordering when combined or separated.
 9. [`REC-4`] Stale VT/DPMS/hotplug/topology generations cannot submit.
 10. [`MULTI`] Cross-device/output movement never leaves duplicate visible cursor planes.
 11. [`CURSOR-LIFECYCLE`] Direct entry/unflip preserves cursor visibility and framebuffer ownership.
 12. [`SCHED`, `CURSOR-PAYLOAD`] Animated cursor coalesces without unbounded state.
-13. [`CAP-1`, `CURSOR-PAYLOAD`] Cursor/primary structural capability is false
-    without complete universal-plane coverage and one qualified coordinate
-    transport per required cursor plane. Qualification is exact-cohort evidence,
-    never a vendor-family default. Preference tests select qualified
-    `OwnerMediatedLegacyMove` in composed and direct state; without it they
-    select software in composed state and qualified `SynchronousAtomicMove` in
-    direct state, or the ordered software/unflip transition when synchronous
-    atomic did not qualify. Driver/kernel/plane/mode/topology invalidation forces
-    qualification before reuse. Every C.0 primary builder enforces
-    `NativeCursorCompositionContract`; direct eligibility rejects scaled,
-    partial-coverage, non-XRGB8888 including YUV/video and HDR/10-bit candidates
-    before KMS. A format-consistency test binds the composed
-    `VkScanoutFb::format()` and direct eligibility gate to XRGB8888 so neither
-    can drift independently. Construction of any otherwise permitted out-of-
-    contract primary invalidates the fast transport before ioctl dispatch;
-    completion cannot perform that invalidation. State-machine tests forbid
-    re-selection in the same plane incarnation and require detach/reattach plus
-    complete requalification with the contract-valid primary represented in
-    the state. Table-driven complete-request cases set
-    `AuditedCursorExpansionHazard` for modeset, CRTC gamma/CTM/degamma, VRR,
-    DSC-force, plane enable/disable or binding, format, scale-ratio, z-order and
-    plane color-pipeline changes. Only a contract-preserving primary with no
-    hazard and no userspace cursor object is overlap-safe. Stock NVIDIA never
-    selects `OwnerMediatedLegacyMove` in C.0.
-14. [`INV`, `CURSOR-PAYLOAD`] No C.0 cursor load/show/hide/disable reaches a
-    legacy ioctl. The only reachable legacy call is coordinate-only
-    `MOVECURSOR`, from the owner, for a qualified installed plane with an idle
-    atomic slot or the exact accepted coordinate-overlap-safe primary class.
-    The per-
-    plane reservation blocks new KMS host calls until typed return/reap;
-    changing any other field or bypassing the owner fails the test. Internal
-    helper async-check rejection is exercised as an ordinary slow-path return,
-    not fabricated as a userspace `EINVAL`.
+13. [`CAP-1`, `CAP-4`, `CURSOR-PAYLOAD`] Cursor/primary structural capability
+    requires complete universal-plane and completion coverage. Each device
+    incarnation is qualified at runtime on every boot; no cohort table or
+    physical driver arm selects `AtomicHardware`. Structural capability plus
+    successful incarnation qualification select `SynchronousAtomicMove`, while
+    only the measured CAP-4 conjunction demotes to `SoftwareComposited`. Tests
+    cover both composed and direct state, including the ordered software/unflip
+    transition on direct-scanout demotion. Primary and cursor mutations share the
+    single atomic owner slot. The direct-eligibility predicate rejects scaled,
+    partial-coverage, non-XRGB8888 (including YUV/video), and HDR/10-bit
+    candidates before KMS. A format-consistency test binds composed
+    `VkScanoutFb::format()` and the direct-eligibility gate to XRGB8888. These
+    production shape constraints preserve a safe direct frame beneath a
+    `SynchronousAtomicMove` hardware cursor.
+14. [`INV`, `CURSOR-PAYLOAD`] A C.0 Owner issues no legacy cursor ioctl for
+    load, move, show, hide, or disable. Cursor coordinates and all other cursor
+    state use universal cursor-plane atomic properties through the owner. Devices
+    that fail capability activation remain on the permanent `Legacy` fallback
+    route selected by stage 5.
 15. [`GAMMA-PAYLOAD`] `GAMMA_LUT_SIZE` validation accepts exact representable arrays and rejects
     zero, `u16` overflow, byte-size overflow, over-1-MiB allocation, and request
     mismatch without clamping. Legacy `get_crtc().gamma_length()`, cached-size
@@ -2813,11 +2400,9 @@ applicable, hardware evidence is incomplete.
     cursor/primary pipeline incapable. Missing atomic `GAMMA_LUT` makes only
     `atomic_gamma_capable` false and cannot close C.1 qualification/readiness.
 21. [`INV`, `GAMMA-PAYLOAD`] No C.0 gamma operation reaches `set_gamma`.
-22. [`SCHED`] One device never has two submitted nonblocking live atomic commits,
-    including for otherwise disjoint CRTCs. The only overlap is one per-plane
-    coordinate reservation with an accepted contract-preserving primary whose
-    recorded userspace request omitted the cursor and whose audited expansion
-    hazard is false; it cannot dispatch another atomic transaction.
+22. [`SCHED`] One device never has two submitted nonblocking live atomic
+    commits, including for otherwise disjoint CRTCs. Cursor and primary updates
+    both use that single slot; there is no non-atomic cursor overlap reservation.
 23. [`COMMIT-1`, `COMMIT-2`] A multi-CRTC commit remains hardware-pending after a partial out-fence set
     and retires exactly once after the complete expected set reports successful
     signalled status.
@@ -2840,15 +2425,12 @@ applicable, hardware evidence is incomplete.
 26. [`REC-1`, `COMMIT-1`] VT loss, device loss, hotplug, and bounded drain timeout terminalize a
     submitted commit as `CompletionUnknown`, quarantine both possible resource
     sets, and release them only after the teardown barrier.
-27. [`SCHED`, `CAP-1`] `EBUSY`, `EACCES`, removed-object, `EINVAL`, and device-
-   loss failures do not enter a generic completion-driven retry path. The sole
-   exception is one deferred retry of an already-qualified coordinate
-   transport after its recorded overlap-safe primary completes. None
-   selects a new legacy ioctl; retry exhaustion closes that transport. A real
-   visible coordinate `EINVAL` is distinct from an internal async-check result
-   consumed by the helper. An internal rejection that produces a returned
-   over-bound call closes the transport as a coordinate-policy/cohort defect
-   rather than masquerading as a userspace errno or per-key suspension.
+27. [`SCHED`, `CAP-1`] An atomic `EBUSY` with no owner-tracked live record, and
+    `EACCES`, removed-object, `EINVAL`, or device-loss failures, do not enter a
+    generic retry path or select a legacy ioctl. The no-record `EBUSY` closes
+    readiness and enters bounded topology recovery. A tracked explicit rejection
+    follows §9.2.1's one bounded scheduler retry, never an immediate retry; no
+    cursor-specific exception exists.
 28. [`MULTI`, `CURSOR-LIFECYCLE`] Cross-device transfer submits destination attach only after source-detach
     completion; attach failure leaves no duplicate sprite and activates the
     software-cursor recovery path with the newest desired generation.
@@ -2883,18 +2465,19 @@ applicable, hardware evidence is incomplete.
     synchronous primary on the same CRTC without crossing an unflip/topology
     barrier; retirement-promoted synchronous direct successors perform the
     symmetric absorption. Only changed persistent cursor/gamma generations may
-    be absorbed; unchanged cursor planes and coordinate-only intents are absent
-    from the request. Incompatible work remains separate and the combined commit
-    retires every absorbed generation and ticket exactly once.
-34. [`ID-1`, `COMMIT-1`] Speculative `TEST_ONLY` plus unchanged topology generation cannot authorize
-    live installation after cursor/gamma/primary generation changes; final
-    serialized test and live submit use identical persistent state while live
-    sync properties/fds/holder addresses are freshly constructed.
-    `ValidationOnly` creates no live record/out-fence and holds the exclusive
-    validation lease; coordinate movement arriving during that lease is
-    coalesced but cannot dispatch until the paired live installation completes
-    or the lease is abandoned. It uses the executor's two- or 30-second
-    watchdog, and timeout never becomes acceptance-unknown hardware state.
+    be absorbed; unchanged cursor planes are omitted, while changed cursor
+    positions are included as persistent cursor-plane state. Incompatible work
+    remains separate and the combined commit retires every absorbed generation
+    and ticket exactly once.
+34. [`ID-1`, `COMMIT-1`] Speculative `TEST_ONLY` plus unchanged topology
+generation cannot authorize live installation after cursor/gamma/primary
+generation changes; final serialized test and live submit use identical
+persistent state while live sync properties/fds/holder addresses are freshly
+constructed. `ValidationOnly` creates no live record/out-fence and holds the
+exclusive validation lease; cursor changes arriving during that lease coalesce
+in desired state but cannot dispatch until the paired live installation
+completes or the lease is abandoned. It uses the executor's two- or 30-second
+watchdog, and timeout never becomes acceptance-unknown hardware state.
 35. [`CURSOR-PAYLOAD`] Cursor edge tests pin full-source/signed-destination
     rectangles for every partial edge, i915-style `SRC_X/Y=0`, fully offscreen
     detach, checked signed encoding, hotspot extremes, overflow and no scaling.
@@ -2949,10 +2532,10 @@ applicable, hardware evidence is incomplete.
 46. [`CURSOR-PAYLOAD`] Hotspot discovery enables atomic first and attempts the hotspot cap before
     plane enumeration. Success requires both properties, programs unmodified
     metadata, and performs one visual coordinate subtraction. `EOPNOTSUPP`
-    selects native coordinate-only hardware cursor rather than rejecting it;
+    selects the native no-hotspot cursor mode rather than rejecting the plane;
     every other cap error fails discovery. Property/capability contradictions
-    reject the affected discovery without retrying a metadata-required plane as
-    coordinate-only.
+    reject the affected discovery without retrying a metadata-required plane
+    without its required hotspot properties.
 47. [`COMMIT-1`, `COMMIT-2`] Producer, hardware, and primary-event timers start at their specified
     monotonic milestones; producer waits inherit their source-specific policy,
     the other timers apply the exact clamp formulas, and a producer timeout is
@@ -3010,15 +2593,12 @@ applicable, hardware evidence is incomplete.
     remappable tickets/intents, and prevents the displaced transition from
     opening or publishing an fd.
 58. [`COMMIT-5`, `COMMIT-6`, `REC-4`] The X11 core stays responsive while an
-    executor call is deliberately delayed. Every seat-active live submit carries
-    `NONBLOCK`; lifecycle supersession makes a late explicit rejection locally
-    releasable but a late success accepted-stale and quarantined. Missing reply
-    remains acceptance-unknown, and the lease prevents premature fd retirement.
-    A delayed coordinate ioctl may coexist with an overlap-safe accepted
-    primary and holds its per-plane `CoordinateSubmitting`; watchdog/IPC loss
-    closes its transport but neither atomic fallback nor another KMS host call
-    dispatches until actual helper reap, after which the newest point overwrites
-    any acceptance-unknown old coordinate.
+    executor atomic ioctl is deliberately delayed. Every seat-active live submit
+    carries `NONBLOCK`; lifecycle supersession makes a late explicit rejection
+    locally releasable but a late success accepted-stale and quarantined. Missing
+    reply remains acceptance-unknown, and the `Submitting` record and fd lease
+    prevent premature fd retirement. No other KMS host call dispatches until
+    actual helper reap.
 59. [`COMMIT-2`, `SCHED`] A qualified homogeneous multi-CRTC Present calculates
     and arms one event deadline per required Present CRTC. A pre-arrived event
     arms no timer for that CRTC, and expiry of any remaining deadline produces
@@ -3126,9 +2706,8 @@ applicable, hardware evidence is incomplete.
 73. [`SCHED`, `COMMIT-2`] Retirement-time successor promotion enters the named
     owner tier, preserves the merged immediate dispatch instant, serializes a
     fresh event token plus canonical out-fences, and absorbs only compatible
-    changed persistent cursor/gamma generations. It omits unchanged cursor state
-    and every coordinate-only intent. No direct event handler issues a plane-
-    only commit.
+    changed persistent cursor/gamma generations. It omits unchanged cursor
+    planes. No direct event handler issues a plane-only commit.
 74. [`COMMIT-2`] Relative-idle and absolute-target sequence arms allocate fresh
     typed tokens. Scrapped, successor-displaced, skipped, old-epoch and
     consumerless arms cannot advance either clock; a valid absolute wake during
@@ -3143,25 +2722,14 @@ applicable, hardware evidence is incomplete.
     authoritative all-off atomic closure or by a canonically completed owner-
     ordered predecessor; detach failure closes readiness and preserves its
     framebuffer/quarantine truthfully.
-77. [`CAP-1`, `CURSOR-PAYLOAD`, `SCHED`] NVIDIA policy validation covers the
-    executor atomic host-call characterization, shipping software cursor, a single-site
-    development-only yserver legacy-HW policy edit, and C.0 atomic HW on the
-    same workload, all against the exact same stock published NVIDIA module.
-    It additionally runs `SynchronousAtomicMove` under continuous composed and
-    direct primary traffic even if that transport is not selected, proving its
-    slot occupancy, completion, `EBUSY`, host-call, coordinate-rate and primary-
-    FPS behavior. The exact driver/kernel/GPU cohort and audited module source
-    are recorded; a version change invalidates the result rather than inheriting
-    a family-wide classification.
-    The required NVIDIA coordinate arm is `SynchronousAtomicMove` under continuous composed and
-    direct primary traffic; neither omitted/absorbed legacy-move phase quotas nor
-    a patched fast-hook arm apply to this stock cohort.
-    Results apply only to the tested stock driver/kernel/GPU cohort. No patched,
-    proposed, out-of-tree or unreleased NVIDIA module contributes evidence. No
-    production environment, CLI or config lever selects an arm; failure justifies
-    a degradation prior bounded by the tested driver version, without rewriting
-    discovered structural capability and without preventing any other device from
-    selecting `AtomicHardware`.
+77. [`CAP-1`, `CAP-4`, `CURSOR-PAYLOAD`, `SCHED`] No physical NVIDIA cursor
+    arm is a precondition for selecting `SynchronousAtomicMove`. Optional runs on
+    an available stock NVIDIA device may record atomic host-call duration,
+    service rate, completion and direct/composed scheduling as falsification
+    evidence for shared executor and CAP-4 machinery only. They never certify a
+    driver/GPU cohort or select policy; only runtime qualification and measured
+    demotion affect that device. No patched, proposed, out-of-tree or unreleased
+    module contributes evidence.
 78. [`INV`] Production builds contain no C.0 rollout or diagnostic gate. Every
     injected capability, errno, fence/event stall, and executor fault is
     reachable only through `#[cfg(test)]` or a
@@ -3169,38 +2737,27 @@ applicable, hardware evidence is incomplete.
     from the submitted diff. No patched DRM module is a qualification or merge
     input.
 79. [`COMMIT-5`, `COMMIT-7`] Every host-call class uses the process-isolated
-    executor. Synthetic cases prove `Submitting` or `CoordinateSubmitting` and
-    the fd lease exist before IPC; explicit rejection, accepted-stale success
-    and acceptance-unknown remain distinct; the two- and 30-second watchdogs
-    enter the specified quarantine; IPC death or a helper that outlives
-    termination enters `ExecutorStalled`; and neither resource release nor a
-    fresh incarnation precedes actual reap. Logical VT/device-loss obligations
-    remain prompt, while orderly physical exit prefers reap and falls back to a
-    bounded exit at its teardown deadline.
-    No test path permits a worker-thread, in-process, driver-specific or
-    call-class-specific executor alternative.
-80. [`COMMIT-5`, `SCHED`, `CURSOR-PAYLOAD`] The latency/concurrency recorder
-    performs no measured-path filesystem I/O, allocation, flush or additional
-    supervisor IPC and cannot wrap its checked preallocated record buffer. The
-    required executor IPC is itself measured. No cohort is nominated for
-    `OwnerMediatedLegacyMove` in C.0 (section 16.3, revisions 3–4), so the quota
-    gate below has no subject and collects nothing; it remains specified for a
-    later phase that completes the audit. Where a cohort is nominated, for each
-    composed/direct production-omitted stratum, qualified initial attempts reach
-    at least 100,000 and
-    every dispatch-to-`HardwareComplete` phase decile reaches 5,000. Non-overlap
-    and retries cannot pad those counts. Each retry links to one initial
-    `EBUSY`, follows that primary's completion, and precedes the next primary
-    admission. An overflow,
-    reaching the 250,000-cycle or 250,000-attempt stratum cap with incomplete
-    coverage, an underfilled stratum/decile, zero interval, extra initial
-    attempt, or ordering breach fails with its specified evidence or normative
-    outcome. Optional absorbed characterization is labelled separately and no
-    count from it can satisfy or fail this gate.
+    executor. Synthetic cases prove `Submitting` and the fd lease exist before
+    IPC; explicit rejection, accepted-stale success and acceptance-unknown
+    remain distinct; the two- and 30-second watchdogs enter the specified
+    quarantine; IPC death or a helper that outlives termination enters
+    `ExecutorStalled`; and neither resource release nor a fresh incarnation
+    precedes actual reap. Logical VT/device-loss obligations remain prompt,
+    while orderly physical exit prefers reap and falls back to a bounded exit at
+    its teardown deadline. No test path permits a worker-thread, in-process,
+    driver-specific or call-class-specific executor alternative.
+80. [`COMMIT-5`, `SCHED`, `CURSOR-PAYLOAD`] The latency recorder performs no
+    measured-path filesystem I/O, allocation, flush or additional supervisor IPC
+    and cannot wrap its checked preallocated buffer. It records executor
+    dispatch/reply timing and CAP-4's per-device measured-demotion windows and
+    outcomes. There are no coordinate-overlap quotas, phase deciles, or
+    cohort-specific fast-path evidence gates.
 81. [`CAP-1`, `CAP-4`] `atomic_kms_cursor_policy` is runtime-derived: a device
     with structural capability and incarnation qualification selects
-    `AtomicHardware` with no table entry of any kind, and a device lacking
-    either selects `SoftwareComposited`. Table-driven cases prove no environment
+    `AtomicHardware` without a cohort allowlist or physical pass result. A
+    qualified Owner device demoted under CAP-4 selects `SoftwareComposited`,
+    while a structurally incapable device remains on the stage 5 `Legacy`
+    route. Table-driven cases prove no environment
     variable, command-line flag or configuration key reaches the value, that a
     demotion changes only that device identity's policy and never the advertised
     structural-capability bit, and that a second device on the same driver is
@@ -3216,13 +2773,10 @@ applicable, hardware evidence is incomplete.
     section 11.4 transition as an explicit policy change, emits no duplicate
     sprite, and cannot reopen within the process even across VT, DPMS, topology
     and incarnation replacement.
-83. [`CAP-4`] The degradation prior is a starting posture, not a verdict. A
-    matching entry starts the device in `SoftwareComposited` with no measurement
-    window; an installed driver version above the entry's recorded bound does not
-    match and the device starts optimistically; a missing or stale entry is
-    indistinguishable from unknown hardware and is still protected by measured
-    demotion. No path promotes a device out of a matching prior by measurement,
-    and no synthetic cursor probe is inserted to attempt it.
+83. [`CAP-4`] No compiled cohort or driver-version prior affects cursor policy.
+    Every structurally capable, runtime-qualified incarnation starts in
+    `AtomicHardware`; only the measured CAP-4 conjunction demotes it, and no
+    synthetic cursor probe is inserted to attempt or reverse that decision.
 84. [`DMG-1`, `DMG-2`, `DMG-3`, `DMG-4`] The section 12.1 mapping is
     exhaustive and each terminal state produces exactly its transition. Nothing
     stages at `Submitting` or at dispatch; an explicit rejection leaves nothing
@@ -3238,6 +2792,48 @@ applicable, hardware evidence is incomplete.
     state.
 
 ### 16.3. Hardware validation
+
+#### Revision 5 — 2026-09-27
+
+Revision 5 applies the user's final 2026-09-19 decision and preserves revision
+4's 2026-09-16 evidence rule: C.0 qualifies each device incarnation at runtime
+on every boot, never certifies a driver/GPU cohort in advance, and physical runs
+only falsify shared machinery. `SynchronousAtomicMove` is selected by structural
+capability plus successful runtime qualification; CAP-4 measurement withdraws
+it to `SoftwareComposited` when it underperforms, using the ordered software/
+unflip transition for direct scanout. CAP-4 therefore preserves the shipping
+coordinate-latency goal through measured demotion, with no hardware coordinate
+arm required to enable the atomic path.
+
+Removed from the operative design: §7.1's `OwnerMediatedLegacyMove` transport
+and audited-cohort table; its `CoordinateSubmitting` reservation, retry lane and
+telemetry; §4.1's driver-source expansion audit and coordinate-overlap campaign;
+`AuditedCursorExpansionHazard`; `CoordinateFastReturnMax`; Goal 3's legacy-move
+exception; the section 5 coordinate exception; section 12's NVIDIA-specific
+comparison and degradation-prior decision; section 16.2 overlap, source-audit
+and legacy-move tests; section 16.3 cohort arms, phase quotas and coordinate-
+latency gates; and the cursor-coordinate door in the stage 2c-ii §8.
+The reason recorded in the 2026-09-19 decision is that enabling any cohort would
+require an exact driver-source audit and a hardware campaign the project cannot
+afford (“no somos Red Hat”). With revision 4's audited-cohort table empty, the
+transport was dead specification that still cost review surface. Runtime-measured
+qualification cannot safely decide its correctness because a wrong answer can
+corrupt state; leaving it inert would retain the same review cost.
+The `NativeCursorCompositionContract` name and its overlap-specific obligations
+are removed. Its hazard analysis, out-of-contract invalidation and
+detach/reattach requalification existed only to make concurrent legacy cursor
+movement safe. The production direct-scanout shape constraints are independent
+and remain operative in §7: they keep the direct primary in the tested
+full-output, 1:1 XRGB8888 shape beneath a `SynchronousAtomicMove` hardware
+cursor. C.0 serializes cursor and primary mutations through one atomic slot, so
+none of the removed concurrency contract carries over. The §7.1 heading and
+stage 2c-ii door retain one-line stubs for existing cross-references.
+
+C.0 Owner devices issue no legacy cursor ioctl, including `MOVECURSOR` and the
+legacy set/move calls. Stage 5's capability-activated `Legacy` route remains the
+permanent fallback for devices that cannot enter the Owner model. The GTX 1050
+11.5 ms / 16.3 ms historical measurement in §2 remains as the reason that the
+legacy coordinate ioctl is not a C.0 Owner transport.
 
 #### Evidence regime — revision 4, 2026-09-16
 
@@ -3303,290 +2899,57 @@ rarity of driver defects, or that any untested architecture works. It claims
 that an unqualified or misbehaving device degrades truthfully instead of
 corrupting state, and that the degradation is legible in section 15 telemetry.
 
-**No campaign is required to merge C.0.** There is no soak, no per-stratum
-coordinate quota, no device-hour budget and no allowlisting campaign. The
-audited-cohort table ships empty, so `OwnerMediatedLegacyMove` is specified but
-unreachable in C.0 and every cohort's cursor policy is decided by `CAP-4` at
-runtime. Absent, busy or unavailable hardware never produces
-`EvidenceInsufficient` for the release and never blocks merge.
+**No hardware cursor arm is a release precondition.** Structural capability
+and successful runtime qualification on the current device incarnation select
+`SynchronousAtomicMove` on each eligible Owner incarnation. CAP-4 measures that device's cursor service rate and
+host-call duration during actual use; the measured conjunction demotes it to
+`SoftwareComposited`, and visible direct scanout takes the ordered software/
+unflip transition. No physical latency or coordinate-throughput result selects,
+certifies or disqualifies a driver/GPU cohort.
 
-The rows below are retained on that footing. Injection and deterministic rows
-are required and need no specific silicon. Rows that need a real driver run on
-whatever devices are available, are reported by exact device identity, and name
-every unexercised architecture as unexercised.
+Injection and deterministic rows are required and need no specific silicon.
+Physical runs on available devices may falsify shared discovery, completion,
+executor, scheduler, lifecycle or measured-demotion machinery; they cannot
+certify that device or transfer a result to another driver, kernel, GPU or
+firmware. An unavailable device never produces `EvidenceInsufficient` for
+release.
 
 The devices actually available are the author's Raphael iGPU (Ryzen 7 7700,
 RDNA2/DCN 3.1.5, `amdgpu`, PCI `1002:164e`) and RTX 5060 Ti (GB206/Blackwell),
-both in one machine.
+both in one machine. Earlier revisions required a Radeon RX 6800 XT and then
+substituted the Raphael iGPU. Those boards are not required: their different
+display IP illustrates why physical observations do not transfer. The historical
+Polaris/RX 580 captures remain provenance only.
 
-Earlier revisions required a Radeon RX 6800 XT and then substituted the Raphael
-iGPU. Under revisions 3–4 neither is a required board, but the reasoning behind the
-substitution survives as the reason results do not transfer: Navi 21 is DCN 3.0
-and Raphael is DCN 3.1.5, and every physical row here exercises display IP
-rather than shader IP. Cursor-plane behaviour, hotspot support, off-transition
-fence delivery, LUT sizes and the atomic-check paths all live in that differing
-code, so a result from one display IP version says nothing about another. That
-is the general rule of this section, not a property of these two boards. The
-`AuditedCursorExpansionHazard` source audit and the `OwnerMediatedLegacyMove`
-coordinate quota were written against Navi 21/DCN 3.0 and are not redone; the
-transport stays unreachable rather than being allowlisted on transferred
-reasoning. The historical Polaris/RX 580 captures remain provenance only.
+Optional cursor characterization may report input-to-submit, input-to-retirement,
+externally observed input-to-visible motion, service rate and direct-scanout FPS
+under composed and direct primary traffic. These measurements are falsification
+evidence for shared instrumentation and CAP-4 behavior only. They do not impose a
+legacy-baseline threshold or decide whether any device enables hardware cursor.
+A runtime underperformance observation must be handled by CAP-4 on that
+incarnation; physical characterization cannot install a cohort prior.
 
-An executor, owner-completion, poison, watchdog, or off-transition-fence failure
-on either device blocks merge **unless** it is classified driver-local under the
-release disposition stated with the delivery check below. How the machinery
-handles such a failure is an architecture property on every device; what
-triggers it may be a driver's own contract violation, and only positive evidence
-of that makes it driver-local.
+Evidence ownership is explicit: the author owns the bounded delivery check and
+any optional characterization on available hardware.
 
-No cursor-policy outcome blocks merge, and no device's unavailability produces
-`EvidenceInsufficient` for the release, because under `CAP-4` and revisions 3–4 no
-cohort depends on a campaign for anything. Intel, Asahi, other AMD
-generations and other NVIDIA cohorts need no campaign at all: they select
-`AtomicHardware` optimistically at runtime, qualify their lifecycle commits
-under the bootstrap deadline of section 10.3, and are protected by measured
-demotion. A campaign is required only to allowlist `OwnerMediatedLegacyMove` for
-a cohort, or to justify a degradation prior and its driver-version bound.
+Optional cursor characterization can include:
 
-Evidence ownership is explicit: the author owns and schedules the delivery
-check and any optional characterization on the devices at hand.
-
-The four-arm NVIDIA comparison below is optional characterization under this
-revision and gates nothing: `CAP-4` already decides cursor policy by
-measurement, and a cohort that earns no degradation prior simply runs the
-ordinary measured path. Run it when the device time is available, on the same
-GPU, mode, desktop, stock published module and XFCE/Thunar drag workload. Its
-result may record a degradation prior bounded by the tested driver version, or
-expose a threshold-calibration defect in the measured demotion, which blocks as
-shared machinery; it may not qualify or disqualify any cohort. No patched or
-proposed driver build is an arm:
-
-| Arm | Construction | Question answered |
-| --- | --- | --- |
-| Executor atomic host-call characterization | The release-shaped C.0 build measures helper ioctl duration, IPC dispatch-to-reply, total input-to-dispatch overhead and `SynchronousAtomicMove`; there is no production `OwnerMediatedLegacyMove` phase quota on stock NVIDIA. | Does the fixed executor keep the X11 core responsive with acceptable IPC cost while exercising every stock NVIDIA atomic class? |
-| Legacy hardware cursor | One documented development-only yserver source edit changes only the NVIDIA policy constructor to the normal legacy-HW path; the stock module is unchanged and the edit is never merged. | What is the magnitude of the driver's cursor wait on this cohort through the helper's ordinary fallback? The historical 11.5 ms mean / 16.3 ms max was an X11-core block; under the fixed executor the same wait is contained in the helper and structurally cannot reach the core, which is section 4.1's intended effect and not a measurement failure. The magnitude is consumed by the `SynchronousAtomicMove` expectation below and by section 2's justification. This is regression scale, not fast-hook qualification. |
-| Software composited cursor | Unmodified merged baseline and shipping NVIDIA policy. | What smoothness, input latency and direct-scanout reachability does C.0 actually have to beat? |
-| C.0 atomic hardware cursor | C.0 owner build using the required `KmsIoExecutor` and stock NVIDIA module, with no runtime override. Its only hardware coordinate transport is `SynchronousAtomicMove`; it is recorded under continuous composed/direct primaries even if software remains selected. | Does synchronous atomic motion make hardware cursor acceptable while unlocking direct scanout and preserving maintenance fairness, and what completion/slot cost does it impose? |
-
-The atomic arm must beat the legacy arm's core stall and be no worse than the
-software arm's drag smoothness/input latency within the recorded confidence
-range, and must satisfy the direct-successor FPS and owner bounds below. If it
-does, this cohort takes no degradation prior and runs hardware cursor like any
-other device. If it does not, the recorded result justifies a prior entry
-bounded by the tested driver version, and the same run must show the measured
-demotion firing on its own — an arm that is subjectively bad while
-`CursorServiceRate` and the cursor host-call p99 stay inside their thresholds is
-a threshold-calibration failure and blocks the prior until the thresholds are
-corrected.
-
-The expected stock-NVIDIA result is confirmation of the fallback:
-`SynchronousAtomicMove` is vblank-paced and occupies the sole atomic device
-slot, so at low client frame rates tier-3 absorption pins hardware cursor
-updates to client cadence and is unlikely to match the software arm's drag
-smoothness and input latency. The four-arm gate attempts to refute this
-prediction; confirming it is a valid cohort-local result, not a shared-design
-failure.
-
-- idle desktop with continuous cursor motion;
-- 1000 Hz mouse motion and circular/diagonal movement;
-- visible cursor over composed desktop and fullscreen direct scanout;
-- animated cursors, image/name changes, hotspot changes, XFixes hide/show, and
+- idle desktop and 1000 Hz mouse motion, including circular and diagonal paths;
+- cursor visibility over composed desktop and fullscreen direct scanout;
+- animated cursors, image/name changes, hotspot changes, hide/show, and
   `Cursor=None` followed by restore;
-- drag operations under MATE/Cinnamon without window lag;
-- multi-output crossing, including different device owners where available;
-- instrumented cross-device crossing verifies detach completion precedes attach
-  submission and forced destination failure produces no duplicate sprite;
-- Alt-Tab/direct unflip/re-entry;
-- VT switch, DPMS cycle, hotplug, and shutdown;
-- zero legacy cursor load/show/hide/disable calls on C.0-ready devices;
-  in production C.0 arms, coordinate-only `MOVECURSOR` is separately counted
-  and must occur only on a qualified owner-mediated plane; it may begin while
-  the atomic slot is idle or held by the one accepted coordinate-overlap-safe
-  primary class and retains its per-plane `CoordinateSubmitting` reservation through
-  typed return or helper reap. The explicitly non-production NVIDIA legacy-HW
-  scale arm is reported separately and cannot satisfy this rule;
-- zero sustained `EBUSY` storm and no cursor freeze, trail, flash, or duplicate
-  on an idle scene. Every exact cohort with qualified
-  `OwnerMediatedLegacyMove` must preserve its shipping legacy latency;
-  synchronous atomic motion is accepted only where its own composed/direct
-  concurrency, completion, FPS and platform-baseline gates pass;
-- the measured demotion mechanism itself, on both devices. Calibrate
-  `DemotionRatio`, `CursorHostCallMax` and the consecutive-window count against
-  the four-arm results; prove demotion fires on a cohort that needs it, executes
-  through the section 11.4 transition with no duplicate sprite, flash or trail,
-  and never reopens within the process. The mandatory negative case is the
-  tier-3 absorption scenario: a healthy device under a deliberately slow client
-  depresses `CursorServiceRate` while the cursor host-call p99 stays inside
-  `CursorHostCallMax`, and must **not** demote. A demotion there is a
-  false positive and blocks merge, because it would silently withdraw hardware
-  cursor from correct hardware — the exact failure this revision exists to
-  remove. Also prove a degradation prior is skipped when the installed driver
-  version is above its recorded bound, and that neither table is reachable
-  through any environment variable, flag or configuration key;
-- on the Raphael iGPU, production builders prove every primary constructed while
-  `OwnerMediatedLegacyMove` is selectable satisfies
-  `NativeCursorCompositionContract`. Direct eligibility rejects scaled,
-  partial-coverage, non-XRGB8888 including YUV/video and HDR/10-bit candidates
-  before any KMS request. The construction suite also proves that composed
-  `VkScanoutFb` registration and direct eligibility both remain XRGB8888, that
-  an out-of-contract construction invalidates the transport before dispatch,
-  and that re-entry requires detach/reattach plus complete plane-incarnation
-  requalification with a contract-valid primary already in the state.
-  Instrumentation records the exact userspace object set
-  separately from `AuditedCursorExpansionHazard`, which is explicitly a
-  conservative source-derived prediction. Table-driven construction tests cover
-  every audited AMD hazard reason, including gamma/CTM/degamma, modeset, VRR,
-  DSC-force and the plane-local triggers. Hardware gamma, modeset and primary
-  traffic proves coordinate calls never overlap a hazard-classified accepted
-  record. The documented nonmergeable raw-KMS harness may install an out-of-
-  contract shape to demonstrate AMD's cursor-overlay and ordinary slow paths;
-  those calls are mechanism characterization and cannot satisfy production
-  evidence;
-- no cohort nominates `OwnerMediatedLegacyMove` in C.0. Allowlisting one
-  requires the source audit and the campaign this revision removes, so the
-  audited-cohort table ships empty and the transport is unreachable. Its phase
-  quotas, decile sampling and `EBUSY`/retry accounting are therefore not
-  collected. The transport's definition, its construction preconditions and its
-  `NativeCursorCompositionContract` obligations remain specified and inert for a
-  later phase that can afford the audit; nothing selects them here.
-  Production ordering remains one retry after primary completion and before the
-  next primary admission; retry samples never pad the overlap quota. An
-  underfilled stratum/decile, exhausted phase cap, or fixed-buffer overflow is
-  `EvidenceInsufficient`;
-- a Warframe-shaped high-rate direct stream proving displaced successors idle
-  immediately, deferred `Skip`s follow predecessor completion, each buffer is
-  released once, and request/idle throughput does not collapse to refresh;
-- synchronized direct successors at continuous load proving retirement-time
-  promotion absorbs only changed compatible cursor/gamma state and neither class
-  starves behind a self-refilling primary stream;
-- the `c09358a1` VT scenario, historically reproduced and fixed on Polaris/RX
-  580, replayed as a required gate on the current Radeon Raphael iGPU, proving
-  cursor-plane detach is part of the canonical owner/all-off sequence and no
-  legacy best-effort hide remains; a best-effort future Polaris replay is
-  supplementary only;
-- `xrandr --gamma`/RANDR SetCrtcGamma and GetCrtcGamma round trips, identity and
-  non-identity ramps, repeated rapid changes, DPMS/VT/hotplug persistence, and
-  zero legacy gamma ioctl calls on C.0-ready devices;
-- on a deliberately gamma-less CRTC or test-only equivalent, `redshift`,
-  `gammastep`, and one Proton title exercise `GetCrtcGammaSize=0`; any crash,
-  divide-by-zero, unrecoverable loop or material regression reopens the design;
-- cursor-only and gamma-only out-fence completion on each driver, multi-CRTC
-  partial-fence plus tagged-primary-event accounting, qualification/readiness
-  closure on a deliberately unsupported topology, and VT/device-loss teardown
-  with no premature framebuffer or blob destruction;
-- continuous primary traffic on one CRTC while moving the cursor, changing
-  gamma, and presenting synchronized work on another CRTC, proving the C.0
-  admission bounds and absence of starvation without depending on C.1;
-- cross-device attach failure while the destination owns direct scanout,
-  proving unflip precedes reported software visibility and direct scanout stays
-  inhibited through recovery;
-- injected atomic accept/reject and userspace fence/event wakeup reordering
-  proving exact fd ownership, separate typed Present completion, prior-buffer
-  release, and no framebuffer/blob/FOREIGN retirement from the wrong milestone;
-  the test also proves both signals originate from the same mainline
-  `drm_pending_vblank_event` and treats reordering as defensive observation;
-- injected zero/unknown `EventToken`, current tagged zero/unexpected `crtc_id`,
-  stale-generation and old-incarnation events, duplicate, contradictory-current,
-  malformed, and missing page events proving the telemetry/poison boundary,
-  no collision after tombstone eviction, and bounded tombstone behavior;
-- mandatory initial and later real restore/install qualification plus forced
-  timeout/failure on both drivers, proving no synthetic live-state probe is
-  inserted, readiness remains closed until success, and capability is not
-  derived from a driver allowlist;
-- virtual/para-virtual cursor-plane coverage where available, verifying hotspot
-  negotiation before enumeration, required paired properties, unmodified
-  metadata, and deterministic failure; on NVIDIA/AMDGPU the expected
-  `EOPNOTSUPP` path retains native coordinate-only hardware cursor;
-- capability injection for `DRM_CAP_CRTC_IN_VBLANK_EVENT` and
-  `DRM_CAP_TIMESTAMP_MONOTONIC`, proving a zero/query failure closes structural
-  capability before exposure and an active tagged event with zero `crtc_id`
-  poisons immediately after successful capability discovery;
-- raw page-event replay around the `u32` sequence wrap and across a CRTC clock
-  epoch change, proving normalized 64-bit MSC/monotonic UST never regress or
-  leak between CRTCs/epochs; inject delayed `DRM_EVENT_CRTC_SEQUENCE` events to
-  prove only a fresh sequence-arm token matching CRTC, epoch, purpose, target,
-  and event type can advance the reference;
-- injected and, when available, real GET_SEQUENCE `EOPNOTSUPP` proving C.0
-  structural capability and qualification close, no software protocol clock or
-  sequence arm is created, and source/state-machine evidence alone cannot enable
-  that cohort;
-- injected producer, out-fence, and page-event stalls at each deadline boundary,
-  proving source-specific pre-submit producer handling, correct post-accept
-  timeout classification, and Present `Skip` without premature idle/release;
-- equal-refresh multi-CRTC Present proving each included CRTC receives its own
-  event/fence evidence, a pre-arrived event needs no timer, and any remaining
-  expiry poisons the whole transaction exactly once; separate mixed 60/240 Hz
-  and unknown-period topology changes prove orderly owner quiesce, capability
-  false, and merged-baseline installation without a C.0 combined commit;
-- injected readable out-fences with pending, negative, and query-failure status,
-  including mixed multi-CRTC results, proving only successful canonical status
-  retires hardware;
-- VT/DPMS, topology epochs, and fd reopen after a completion poison, proving the
-  advertised bit remains stable, epochs cannot clear the poison, and only a new
-  qualified incarnation reopens readiness;
-- injected accepted cursor-detach completion loss on same- and cross-device
-  transitions, proving `HwDetachUnknown` never reveals SW or attaches the
-  destination, no further KMS commit reaches the poisoned fd, and autonomous
-  recovery requires teardown plus a freshly proven state;
-- injected normal-runtime completion failure with no VT/DPMS/hotplug, plus
-  reopen/discovery/test/install failure at each recovery stage, proving immediate
-  owner recovery or deterministic `RecoveryFailed` logical withdrawal/RANDR
-  failure without a reopen loop;
-- recovery while a route-probe helper deliberately holds a duplicated KMS fd,
-  proving the helper is cancelled/reaped, every lease closes, and no fresh
-  incarnation is created early;
-- every lifecycle-precedence race while normal recovery is active, including
-  shutdown/removal/device-replacement/VT acquire-release/reprobe/hotplug/
-  topology/DPMS permutations, proving one arbiter owns teardown/reopen,
-  quarantine transfers, and no superseded transition publishes;
-- the complete `REC-6` winner/recovery cross-product, proving old versus fresh
-  `RecoveryId` fate and attempt accounting at real VT, hotplug, reprobe, topology,
-  and DPMS boundaries;
-- topology/DPMS/seat storms during every higher-priority transition, proving
-  storage stays bounded by protocol outputs, equal events merge by type, final
-  installation consumes a fresh desired snapshot, and every event id obtains a
-  truthful disposition without replaying stale DRM objects;
-- DPMS/topology changes arriving while VT is released, proving they remain one
-  prerequisite-deferred desired state, converge after reacquire, or are
-  invalidated exactly once by removal/shutdown;
-- a deliberately delayed executor ioctl concurrent with VT release and device
-  removal, proving request/input dispatch remains responsive, neither lifecycle
-  event waits for the host call, explicit stale rejection differs from accepted-
-  stale success/unknown, and the fd lease prevents premature retirement;
-- executor reply/page-event reordering plus forced IPC death before and after
-  ioctl entry, proving `Submitting` precedes dispatch, stages early events,
-  occupies the only slot, and never converts lost acceptance into rejection;
-- a host-call helper that ignores termination long enough to cross its watchdog,
-  proving `ExecutorStalled` withdraws outputs without blocking the core and
-  forbids fd retirement, resource release, reopen, or retry until actual reap;
-- orderly shutdown with delayed and simulated-uninterruptible executor helpers,
-  proving client/seat shutdown is prompt but the parent remains as teardown
-  supervisor with quarantine intact until wait status, after which fd,
-  Vulkan/GBM/shared teardown and process exit occur in order; the uninterruptible
-  case additionally runs past the teardown deadline and past a service-manager
-  stop timeout, proving the parent exits with the unreaped lease recorded and
-  that a restart attempted while the orphaned helper still holds the device lock
-  waits or refuses before installing any state;
-- enable, disable, connector/plane move, detach, and inactive-to-inactive
-  commits proving the exact old/new atomic CRTC closure, one canonical out-fence
-  per expected powered CRTC, and one userspace page event per such CRTC only
-  when `PAGE_FLIP_EVENT` is set; rejection of an off-to-off CRTC carrying either
-  that global flag or a local `OUT_FENCE_PTR`; acceptance only when that off-to-
-  off member has neither kernel signaling source; draining non-Present CRTC
-  events without protocol completion; no vacuous disable completion/
-  qualification; and no misuse of flip out-fence as full device teardown
-  evidence;
-- real DPMS-off, VT all-off and CRTC-disable loops proving every old-active
-  `ExpectedCompletionCrtcs` fence signals without a future physical vblank;
-- cold-start/offline blocking and seat-active nonblocking real install/restore
-  commits, plus a transaction with empty `ExpectedCompletionCrtcs`, proving
-  qualification always consumes canonical out-fence evidence, never succeeds
-  vacuously, and never blocks the active X11 core or VT/device-loss handling.
-- a deliberately slow DP/MST/HDMI sink or controlled equivalent during hotplug,
-  modeset, install and recovery, establishing
-  `LifecycleCompletionObservedMax`, exercising the lifecycle-specific deadline,
-  and proving a healthy completion beyond the fast two-second clamp does not
-  poison the incarnation.
+- drag operations and multi-output crossing, including different device owners;
+- direct entry/unflip/re-entry, VT switch, DPMS cycle, hotplug and shutdown;
+- cursor-plane atomic completion under primary traffic and absence of freeze,
+  trail, flash or duplicate sprite;
+- runtime CAP-4 demotion with injected slow-call and low-service windows, plus the
+  negative case where tier-3 absorption depresses service rate while host-call
+  duration remains within `CursorHostCallMax`; and
+- on every C.0 Owner device, zero legacy cursor ioctl calls. The `Legacy`
+  fallback route for devices that cannot activate the Owner is outside this row.
+
+These optional runs can expose a shared implementation defect. Their performance
+results never qualify the atomic cursor path for a specific device.
 
 Without fault injection, each available device runs a bounded delivery check
 rather than a soak. A scripted transition set — DPMS off/on, VT release and
@@ -3649,43 +3012,21 @@ accepted by the kernel and reaching completion on that device. A transition that
 failed before KMS submission, or ran without master, is not counted. A row
 missing any of these records is invalid, not passing.
 
-Record a reproducible before/after performance table using the current shipping
-baseline and C.0 on identical hardware, modes, and workload. On a cohort whose
-shipping baseline is legacy HW cursor, that exact transport is the comparator;
-on the required NVIDIA cohort the comparator is the software arm above, with the
-legacy-HW arm retained as historical-regression scale. Input-to-visible motion
-uses the same external high-speed-camera or
-scanout-sensor method and input marker in both builds; ioctl return is not a
-visibility proxy. The table must contain at least:
+Optional physical performance records may report, under matched modes and
+workloads, input-to-cursor-submit, input-to-retirement, externally correlated
+input-to-visible motion, effective cursor updates/s, direct-scanout FPS, physical
+commits/s and logical retired generations/s per CRTC. These are descriptive
+falsification evidence for shared machinery. They never form a per-device
+selection gate, a shipping-latency pass/fail threshold, or evidence that another
+driver/GPU cohort works. A device that underperforms in actual use is handled by
+CAP-4's runtime demotion on that device incarnation.
 
-1. input-to-cursor-submit, input-to-cursor-retirement and externally correlated
-   input-to-visible-motion p50/p99 plus effective coordinate updates/s;
-2. sustained physical device commits/s and logical retired generations/s per
-   CRTC with `N=1` and homogeneous-qualified `N=2` active CRTCs;
-3. direct-scanout FPS with an idle cursor and continuous cursor motion;
-4. helper-measured ioctl and executor IPC p50/p99/p99.9/max for every section
-   4.1 class, the count of dispatch-to-reply excursions above
-   `ExecutorTransportExcursionCeiling` with their fraction of that arm's
-   samples, total input-to-dispatch overhead,
-   production-omitted coordinate overlap/actual-phase-decile counts, retry
-   ordering, both composed/direct phase caps, fixed-buffer capacity and high-
-   water; any absorbed-shape run is labelled optional characterization;
-5. executor dispatch/reply/watchdog/reap totals, maximum lease duration,
-   `ExecutorStalled`/`ShutdownExecutorStalled` outcomes, exact kernel/module/
-   source identity and any evidence-insufficient reason; and
-6. the RTX 5060 Ti `SynchronousAtomicMove` composed/direct arm's slot occupancy,
-   completion, `EBUSY`, coordinate rate and primary FPS, whether or not that
-   transport is selected.
-
-For `N=1`, continuous cursor motion must retain at least 95% of the idle-cursor
-direct-scanout FPS, sustained completed commits/s must reach at least 90% of the
-active refresh rate, input-to-submit p99 must not exceed one output period plus
-2 ms, and input-to-retirement p99 must not exceed input-to-submit p99 plus two
-output periods and 2 ms. *Submit* is the instant the owner installs the
-`Submitting` or `CoordinateSubmitting` record and dispatches the request to its
-executor, consistent with sections 4.1 and 10.2; it contains neither the
-executor round trip nor the ioctl. Those are bounded by the three transport
-criteria below, and input-to-retirement covers the complete path end to end.
+For every physical executor characterization, record helper-measured ioctl and
+executor IPC p50/p99/p99.9/max for each host-call class, input-to-dispatch
+overhead, dispatch/reply/watchdog/reap totals, maximum lease duration, exact
+build/kernel/module/source identity, and any evidence-validity issue. A shared
+executor defect may block; driver-specific observations cannot qualify or
+pre-disqualify a cohort.
 
 Each transport criterion names what a violation is attributable to.
 `ExecutorTransportP99Max = 50 us` and `ExecutorTransportP999Max = 100 us` bound
@@ -3694,10 +3035,9 @@ class's own helper ioctl duration excluded. Exceeding either fails the affected
 performance row on that device. Both figures carry roughly five times margin
 over a measured basis rather than being axiomatic: dispatch-to-reply p99 of 5 to
 9 us under CPU load on a Ryzen 7 7700 class host at the `powersave` governor,
-recorded in the finding cited in section 4.1. A cohort host whose CPU class is
-materially slower records its own basis and bound by the same route the cohort
-kernel range uses, with the derivation stated; it does not silently inherit a
-number measured elsewhere.
+recorded in the finding cited in section 4.1. These limits apply to the shared
+executor machinery; no driver, GPU, kernel, or device cohort receives a separate
+threshold or is certified by meeting them.
 
 `ExecutorTransportExcursionCeiling = 500 us` is a characterization ceiling, not
 a tolerance budget. It applies to dispatch-to-reply with that class's own
@@ -3721,46 +3061,12 @@ attributable to
 `EvidenceInsufficient` and requires a rerun on a host that is not CPU
 saturated.
 
-The 95% gate is a measured steady-state invariant: changed persistent cursor
-state is absorbible, unchanged cursor state is omitted, and qualified
-coordinate-only movement consumes no atomic slot while a contract-preserving,
-no-hazard primary is pending. Telemetry must show that cursor-maintenance admissions
-consume less than 5% of primary opportunities; otherwise the gate fails rather
-than being excused as incompatible work.
-
-On any cohort whose shipping baseline has a legacy immediate cursor path, the
-qualified C.0 transport's input-to-visible p99 may regress by at most 5% and its
-effective coordinate updates/s must retain at least 95% of that baseline under
-the same 1000 Hz input and mode. Both comparisons run separately under
-continuous composed-primary updates and continuous fullscreen direct-primary
-updates; an idle-desktop result cannot satisfy either gate. Submit/return timing
-alone cannot satisfy this gate.
-
-For `N=2`, the throughput gate applies only to a qualified
-`HomogeneousCompletionGroup` whose two active CRTCs have the same exact mode-
-derived refresh rational. Report physical commits separately from logical
-retirements. First measure `R1`, the sustained accepted-to-completed physical
-transaction rate from the matching `N=1` run on the same device, mode and
-workload. Define `SingleSlotCeiling = min(R1, refresh_1 + refresh_2)`. The
-compatible `N=2` workload offers each CRTC distinct, monotonically numbered
-primary generations at no less than 110% of that CRTC's refresh rate, uses a
-60-second warmup, and measures a continuous ten-minute window. A logical
-retirement is counted once, on the first canonical completion that proves a
-particular workload-issued generation for that CRTC. Re-observing unchanged or
-carried state, a no-op, `Skip`, rejected request, or superseded generation does
-not count. A combined transaction counts one physical commit but at most one
-new logical retirement for each CRTC whose distinct generation it first proves.
-Each active CRTC must retire at least `0.45 * SingleSlotCeiling`, and their
-logical-retirement sum must reach at least `0.90 * SingleSlotCeiling`. Bundle
-gains above that accepted single-slot floor are reported but are not required.
-Starvation, insufficient offered load, or substituting physical device commits
-for logical per-CRTC progress fails the gate. This named
-`SingleSlotMultiCrtcCeiling` is an accepted C.0 limitation; a future independent
-**Multi-CRTC Parallel Retirement** design, not C.1, may lift it. Raw captures
-and exact commands belong in the PR evidence. A mixed-refresh or unknown-period topology instead proves that
-C.0 multi-CRTC capability remains false, the C.0 owner is quiesced before the
-change, and the merged Phase A+B backend preserves functional Present, cursor,
-DPMS, VT and hotplug behavior; it cannot claim the homogeneous throughput gate.
+Optional `N=2` scheduler captures may report the accepted single-slot physical
+rate and distinct logical primary retirements per CRTC for homogeneous refresh
+groups. Their purpose is to falsify shared scheduling machinery. They do not
+qualify a hardware group, a device incarnation, or cursor policy. A mixed-refresh
+or unknown-period topology remains on the merged Phase A+B backend path under
+section 9.
 
 ## 17. Acceptance criteria
 
@@ -3770,13 +3076,13 @@ redefine their terms or state transitions. C.0 is complete when:
 - section 4.1's fixed `KmsIoExecutor` architecture covers every named host-call
   class with no in-process, worker-thread, driver-specific or runtime branch;
   release evidence records exact kernel/module/source identities, executor IPC
-  and helper duration, fills every production coordinate phase quota without
-  recorder overflow, and keeps absorbed-shape characterization optional;
-- the complete visible cursor lifecycle and persistent state use universal
-  cursor-plane atomic properties; the only permitted legacy transport is the
-  qualified owner-mediated coordinate exception in section 7.1;
-- one device-local owner orders every atomic mutation and that coordinate
-  exception;
+  and helper duration without measured-path recorder overflow; physical cursor
+  and throughput values remain optional falsification evidence;
+- the complete visible cursor lifecycle and persistent state on C.0 Owner devices
+  use universal cursor-plane atomic properties; no legacy cursor ioctl is
+  reachable from an Owner, while incapable devices retain the stage 5 `Legacy`
+  fallback route;
+- one device-local owner orders every atomic mutation;
 - one device-local lifecycle arbiter applies the normative precedence, so
   concurrent teardown/recovery causes coalesce or supersede deterministically,
   transfer quarantine, and cannot open or publish two replacement incarnations;
@@ -3788,10 +3094,10 @@ redefine their terms or state transitions. C.0 is complete when:
 - every desired device-presence, seat, reprobe, topology, DPMS, and recovery
   state maps to a named transition; the total `REC-6` matrix assigns exactly one
   fate and attempt budget to an active recovery under every possible winner;
-- `Submitting` or `CoordinateSubmitting` and every applicable fd lease are
-  installed before executor IPC. The reservation occupies its specified slot,
-  and explicit reject, accepted-stale success and acceptance-unknown remain
-  distinct under every reply, event, IPC-death and watchdog ordering;
+- `Submitting` and every applicable fd lease are installed before executor IPC.
+  The record occupies the sole atomic device slot, and explicit reject,
+  accepted-stale success and acceptance-unknown remain distinct under every
+  reply, event, IPC-death and watchdog ordering;
 - every ordinary or transition-owned request carries the current lifecycle
   epoch; ordinary traffic uses no transition id, epoch advancement precedes
   invalidation, and stale epoch/optional-transition results cannot publish;
@@ -3805,28 +3111,17 @@ redefine their terms or state transitions. C.0 is complete when:
 - each device has at most one dispatched-or-submitted nonblocking live atomic
   transaction, identified and
   retired through canonical out-fences, while tagged page events independently
-  drive primary Present MSC/UST. Only one per-plane coordinate reservation may
-  overlap the exact accepted contract-preserving, no-hazard primary class.
-  Homogeneous multi-
-  output physical commits and logical per-CRTC retirements meet the separate
-  section 16.3 gates;
-- cursor motion progresses independently of scene damage through its qualified
-  coordinate transport or ordinary synchronous atomic path, including under
-  continuous composed and direct primary traffic. Transport viability is
-  measured for the exact cohort rather than inferred from vendor family;
-  composed/direct state applies section 7.1's fixed preference table,
-  checked construction keeps every installed primary within
-  `NativeCursorCompositionContract`, complete-request
-  `AuditedCursorExpansionHazard` classification prevents overlap with every
-  audited driver-expansion path, out-of-contract construction invalidates the
-  fast transport before dispatch and permits no same-incarnation re-entry
-  without detach/reattach plus complete requalification, any returned
-  over-bound call closes the
-  transport for the plane incarnation, and every HW/SW change uses the ordered
-  lifecycle transition;
-- high-rate motion is bounded/coalesced without retry spinning or an `EBUSY`
-  storm; C.0 preserves a qualified existing coordinate transport but Phase C.2
-  owns its atomic/UAPI replacement and long-term fast-path decision;
+  drive primary Present MSC/UST. Cursor and primary mutations share this single
+  slot. Homogeneous multi-output bundles follow the structural and fairness
+  requirements of section 9; physical rate observations do not qualify a driver;
+- cursor motion progresses independently of scene damage through ordinary
+  synchronous atomic cursor-plane commits. Structural capability plus runtime
+  qualification select this path on each incarnation; CAP-4 measured
+  underperformance demotes the device through the ordered hardware-to-software
+  transition, including the software/unflip transition during direct scanout;
+- high-rate motion is bounded/latest-wins under the atomic owner and uses no
+  legacy cursor ioctl on C.0 Owner devices. Phase C.2 owns any future above-vblank
+  atomic cursor mechanism;
 - current and pending cursor framebuffer lifetimes are correct;
 - unknown post-submit completion quarantines resources until a proven teardown
   barrier, and late events cannot retire a newer device generation;
@@ -3835,15 +3130,15 @@ redefine their terms or state transitions. C.0 is complete when:
 - the merged Phase A+B contracts remain correct: core target equivalence,
   generic full-plane successor replacement, immediate one-shot idle/release,
   predecessor-before-`Skip` completion, direct/unflip pacing, VT, DPMS,
-  hotplug, multi-output state, and shutdown. The single physical device slot
-  meets the per-CRTC logical progress gates through the explicit homogeneous
-  bundle tier; mixed/unknown-period topology quiesces C.0 and retains the merged
-  baseline rather than running an unsatisfiable single-slot schedule;
+  hotplug, multi-output state, and shutdown. The single-slot scheduler enforces
+  the logical admission and fairness bounds through its homogeneous bundle tier;
+  optional physical throughput observations do not gate selection. Mixed or
+  unknown-period topology quiesces C.0 and retains the merged baseline rather
+  than running an unsatisfiable single-slot schedule;
 - supported protocol domains advertise cacheable cursor/primary structural
-  capability from cursor-plane coverage, coordinate transport, completion
-  properties, per-CRTC event identity, monotonic timestamps and the exact
-  platform cohort gate. A multi-CRTC domain additionally requires a qualified
-  `HomogeneousCompletionGroup`; atomic gamma capability is independent. The advertised
+  capability from cursor-plane coverage, completion properties, per-CRTC event
+  identity and monotonic timestamps. A multi-CRTC domain additionally requires
+  structurally homogeneous refresh; atomic gamma capability is independent. The advertised
   cursor/primary bit remains stable
   across transient runtime/incarnation failure, while
   mandatory real-commit incarnation qualification and per-submit readiness
@@ -3857,8 +3152,8 @@ redefine their terms or state transitions. C.0 is complete when:
   bound (`2(N - 1)` with the one retry after a kernel rejection, §9.2.1
   amendment of 2026-09-18);
 - every synchronous admission, including retirement-promoted direct
-  successors, absorbs only compatible changed persistent maintenance state,
-  omits unchanged cursor planes and never absorbs coordinate intent; maintenance-
+  successors, absorbs only compatible changed persistent maintenance state and omits
+  unchanged cursor planes; maintenance-
   selected admission symmetrically absorbs a compatible ready synchronous
   primary without crossing an unflip/topology barrier; a C.1 async primary
   neither absorbs nor carries cursor/gamma state;
@@ -3872,9 +3167,9 @@ redefine their terms or state transitions. C.0 is complete when:
 - cursor clipping, signed property encoding, plane compatibility, and
   destination-specific framebuffer upload obey the checked rules in section 7;
 - cursor hotspot negotiation occurs after atomic enable and before enumeration;
-  success requires/programs paired metadata, native `EOPNOTSUPP` retains
-  coordinate-only hardware cursor, and neither path double-applies the hotspot
-  or silently omits required metadata;
+  success requires/programs paired metadata, native `EOPNOTSUPP` retains the
+  no-hotspot cursor mode, and neither path double-applies the hotspot or
+  silently omits required metadata;
 - every HW→SW transition proves hardware detach before software reveal;
   accepted-unknown detach suppresses both software reveal and destination attach
   and forbids every new live commit on the poisoned incarnation until teardown
@@ -3925,11 +3220,10 @@ redefine their terms or state transitions. C.0 is complete when:
   same-device projections retire through an ordered atomic transition, hotplug
   inherits the current level, removal invalidates only its projection, and no
   partial loop or aggregate boolean claims completion;
-- the section 16.3 performance table records all required executor/helper
-  metrics and passes the single-CRTC FPS/input-latency, executor transport
-  latency and excursion-frequency, accepted single-slot two-CRTC ceiling and
-  no-starvation thresholds; a saturated measurement host withdraws the arm
-  as `EvidenceInsufficient` instead of failing it;
+- the section 16.3 records executor/helper metrics and applies the shared executor
+  transport latency and excursion-frequency limits. Saturated measurement is
+  marked `EvidenceInsufficient`; physical cursor and multi-CRTC throughput values
+  remain optional and cannot gate device or cursor-path selection;
 - RANDR gamma-unavailable replies and `SetCrtcGamma` validation reproduce Xorg's
   fixed-header, resource, lease, checked minimum-payload, size-match, and
   trailing-byte precedence exactly;
@@ -3963,15 +3257,10 @@ redefine their terms or state transitions. C.0 is complete when:
   host-call p99, over consecutive qualifying windows, demotes it. Tier-3
   absorption behind a slow client does not demote a healthy device. No
   environment variable, flag or configuration key selects a policy;
-- the section 16.3 four-arm NVIDIA comparison is optional characterization and
-  gates no merge. When run, it may record a degradation prior bounded by its
-  driver version, or expose a threshold-calibration defect in measured
-  demotion, which blocks as shared machinery. It does not decide whether any
-  hardware may enable hardware cursor. No patched, proposed or
-  unreleased module is considered; stock NVIDIA cannot select
-  `OwnerMediatedLegacyMove`, and its arm instead exercises
-  `SynchronousAtomicMove` under continuous composed and direct primary traffic
-  even when software cursor remains selected;
+- no NVIDIA or other driver-specific physical arm is required to select
+  `SynchronousAtomicMove`. Optional runs on available stock hardware only
+  falsify shared executor, scheduling, lifecycle or CAP-4 machinery; a physical
+  pass never certifies a driver/GPU cohort or installs a cursor-policy prior;
 - every device available at release completes section 16.3's bounded delivery
   check, and each observed poison, unknown detach, executor watchdog expiry or
   missing off-transition fence is classified as a defect in shared machinery,
@@ -3990,10 +3279,10 @@ redefine their terms or state transitions. C.0 is complete when:
   section 18 evidence manifest classifies tip-sensitive physical evidence and
   reusable deterministic evidence; every required class is valid for the final
   integrated tip under that class's explicit invalidation rule;
-- unsupported cursor devices use software composition and cannot enable Phase
-  C.1; unsupported gamma CRTCs independently expose gamma unavailable and do
-  not block Phase C.1. Neither path uses a legacy gamma or cursor visibility/
-  framebuffer ioctl;
+- devices without atomic cursor coverage remain on the permanent `Legacy`
+  fallback route and cannot enable Phase C.1; an Owner device demoted by CAP-4
+  uses software composition with an ordered unflip where required. Unsupported
+  gamma CRTCs independently expose gamma unavailable and do not block Phase C.1;
 - `cargo +nightly fmt -- --check`,
   `cargo clippy --all-targets -- -D warnings`, and
   `cargo test --all-targets --locked` pass.
@@ -4071,8 +3360,8 @@ review stages inside that PR, not separately mergeable PRs:
 4. **Atomic cursor and gamma conversion.** Add universal cursor payloads, VT
    detach, direct absorption, RANDR gamma blobs and atomic-only size discovery,
    HW/SW cursor transitions, multi-device coordination, and removal of every
-   legacy gamma and cursor load/show/hide/disable call. The only possible
-   survivor is the qualified owner-mediated coordinate transport.
+   legacy gamma and cursor ioctl on C.0 Owner devices. The capability-activated
+   `Legacy` fallback remains for devices that fail structural Owner activation.
 5. **Activation by capability** *(added 2026-09-22 as "Activation and
    legacy removal"; rewritten 2026-09-24 by user decision after the stage
    3a-ii hardware test,
@@ -4119,14 +3408,6 @@ instrumentation reaches every physical row through the executor path named
 below. `ExecutorSchedulingSaturation` is not a failure and repairs nothing: it
 withdraws the affected arm as `EvidenceInsufficient` and requires a rerun on a
 host that is not CPU saturated.
-
-`CoordinateFastReturnMax` has no C.0 consumer while the audited-cohort table is
-empty, so no coordinate-policy row exists to fail or rerun. Physical rows are
-reusable only when the manifest proves their submission, completion, executor
-and policy paths unreachable from the change or byte-identical; unexplained or
-cross-cutting impact invalidates every reachable tip-sensitive row. A repair
-reruns the bounded delivery check on the devices at hand, which costs the
-transition set rather than a device-hour budget.
 
 The manifest combines the substrate, primary, lifecycle and cursor/gamma
 matrices: portable builds and raw-event corruption; cold start; direct and
