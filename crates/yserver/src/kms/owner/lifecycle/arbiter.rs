@@ -753,39 +753,45 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         kind: LifecycleKind,
         actions: &mut Vec<LifecycleAction<I>>,
     ) -> bool {
-        let prerequisite = match kind {
-            LifecycleKind::DeviceAddedOrReplaced
-                if self.desired.seat_target() != Some(super::SeatTarget::Owned) =>
-            {
-                Some(Prerequisite::SeatReleased)
+        let prerequisite = if kind.precedence() > LifecycleKind::VTRelease.precedence()
+            && self.desired.seat_target() == Some(super::SeatTarget::Released)
+        {
+            Some(Prerequisite::SeatReleased)
+        } else {
+            match kind {
+                LifecycleKind::DeviceAddedOrReplaced
+                    if self.desired.seat_target() != Some(super::SeatTarget::Owned) =>
+                {
+                    Some(Prerequisite::SeatReleased)
+                }
+                LifecycleKind::VTAcquire if self.desired.device_presence() != Some(true) => {
+                    Some(Prerequisite::DeviceAbsent)
+                }
+                LifecycleKind::DPMS if self.state == DeviceLifecycleState::Poisoned => {
+                    Some(Prerequisite::ReadinessClosed)
+                }
+                LifecycleKind::DPMS
+                    if self.desired.seat_target() == Some(super::SeatTarget::Released) =>
+                {
+                    Some(Prerequisite::SeatReleased)
+                }
+                LifecycleKind::DPMS if self.state != DeviceLifecycleState::Ready => {
+                    Some(Prerequisite::ReadinessClosed)
+                }
+                LifecycleKind::DPMS
+                    if self.topology_latch.is_some_and(|generation| {
+                        self.desired
+                            .discovery_epoch()
+                            .is_some_and(|current| current != generation)
+                    }) =>
+                {
+                    None
+                }
+                LifecycleKind::DPMS if let Some(generation) = self.topology_latch => {
+                    Some(Prerequisite::TopologyLatched(generation))
+                }
+                _ => None,
             }
-            LifecycleKind::VTAcquire if self.desired.device_presence() != Some(true) => {
-                Some(Prerequisite::DeviceAbsent)
-            }
-            LifecycleKind::DPMS if self.state == DeviceLifecycleState::Poisoned => {
-                Some(Prerequisite::ReadinessClosed)
-            }
-            LifecycleKind::DPMS
-                if self.desired.seat_target() == Some(super::SeatTarget::Released) =>
-            {
-                Some(Prerequisite::SeatReleased)
-            }
-            LifecycleKind::DPMS if self.state != DeviceLifecycleState::Ready => {
-                Some(Prerequisite::ReadinessClosed)
-            }
-            LifecycleKind::DPMS
-                if self.topology_latch.is_some_and(|generation| {
-                    self.desired
-                        .discovery_epoch()
-                        .is_some_and(|current| current != generation)
-                }) =>
-            {
-                None
-            }
-            LifecycleKind::DPMS if let Some(generation) = self.topology_latch => {
-                Some(Prerequisite::TopologyLatched(generation))
-            }
-            _ => None,
         };
         if let Some(prerequisite) = prerequisite {
             self.set_disposition(event_id, Disposition::Deferred(prerequisite), actions);
@@ -1372,6 +1378,11 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
     }
 
     fn prerequisite_for(&self, kind: LifecycleKind) -> Option<Prerequisite> {
+        if kind.precedence() > LifecycleKind::VTRelease.precedence()
+            && self.desired.seat_target() == Some(super::SeatTarget::Released)
+        {
+            return Some(Prerequisite::SeatReleased);
+        }
         match kind {
             LifecycleKind::DeviceAddedOrReplaced
                 if self.desired.seat_target() != Some(super::SeatTarget::Owned) =>
@@ -1923,12 +1934,20 @@ mod tests {
                     .representatives()
                     .iter()
                     .map(|representative| representative.kind)
-                    .filter(|kind| match kind {
-                        LifecycleKind::DeviceAddedOrReplaced => {
-                            arbiter.desired.seat_target() == Some(SeatTarget::Owned)
-                        }
-                        LifecycleKind::VTAcquire => arbiter.desired.device_presence() == Some(true),
-                        _ => true,
+                    .filter(|kind| {
+                        let held_by_seat = kind.precedence()
+                            > LifecycleKind::VTRelease.precedence()
+                            && arbiter.desired.seat_target() == Some(SeatTarget::Released);
+                        !held_by_seat
+                            && match kind {
+                                LifecycleKind::DeviceAddedOrReplaced => {
+                                    arbiter.desired.seat_target() == Some(SeatTarget::Owned)
+                                }
+                                LifecycleKind::VTAcquire => {
+                                    arbiter.desired.device_presence() == Some(true)
+                                }
+                                _ => true,
+                            }
                     })
                     .min_by_key(|kind| kind.precedence());
                 assert_eq!(
@@ -1944,23 +1963,15 @@ mod tests {
                         .transition()
                         .is_some_and(|transition| transition.kind == representative.kind);
                     if !is_winner {
-                        let expected_prerequisite = match representative.kind {
-                            LifecycleKind::DeviceAddedOrReplaced
-                                if arbiter.desired.seat_target() != Some(SeatTarget::Owned) =>
-                            {
-                                Some(Prerequisite::SeatReleased)
-                            }
-                            LifecycleKind::VTAcquire
-                                if arbiter.desired.device_presence() != Some(true) =>
-                            {
-                                Some(Prerequisite::DeviceAbsent)
-                            }
-                            _ => None,
-                        };
-                        if let Some(prerequisite) = expected_prerequisite {
+                        let device_present = arbiter.desired.device_presence() != Some(false);
+                        let seat_target =
+                            arbiter.desired.seat_target().unwrap_or(SeatTarget::Owned);
+                        if let Some(expected) =
+                            expected_deferred(representative.kind, device_present, seat_target)
+                        {
                             assert_eq!(
                                 arbiter.desired.disposition(representative.event_id),
-                                Some(Disposition::Deferred(prerequisite))
+                                Some(expected)
                             );
                         }
                     }
@@ -2241,17 +2252,23 @@ mod tests {
         device_present: bool,
         seat_target: SeatTarget,
     ) -> Option<Disposition> {
-        match kind {
-            LifecycleKind::DeviceAddedOrReplaced if seat_target != SeatTarget::Owned => {
-                Some(Disposition::Deferred(Prerequisite::SeatReleased))
+        if kind.precedence() > LifecycleKind::VTRelease.precedence()
+            && seat_target == SeatTarget::Released
+        {
+            Some(Disposition::Deferred(Prerequisite::SeatReleased))
+        } else {
+            match kind {
+                LifecycleKind::DeviceAddedOrReplaced if seat_target != SeatTarget::Owned => {
+                    Some(Disposition::Deferred(Prerequisite::SeatReleased))
+                }
+                LifecycleKind::VTAcquire if !device_present => {
+                    Some(Disposition::Deferred(Prerequisite::DeviceAbsent))
+                }
+                LifecycleKind::DPMS if seat_target == SeatTarget::Released => {
+                    Some(Disposition::Deferred(Prerequisite::SeatReleased))
+                }
+                _ => None,
             }
-            LifecycleKind::VTAcquire if !device_present => {
-                Some(Disposition::Deferred(Prerequisite::DeviceAbsent))
-            }
-            LifecycleKind::DPMS if seat_target == SeatTarget::Released => {
-                Some(Disposition::Deferred(Prerequisite::SeatReleased))
-            }
-            _ => None,
         }
     }
 

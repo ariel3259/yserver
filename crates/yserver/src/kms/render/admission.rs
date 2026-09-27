@@ -1322,7 +1322,10 @@ impl KmsBackend {
     /// device's run-to-completion queue before returning. `false` leaves the
     /// existing all-Legacy path byte-for-byte in control.
     pub(crate) fn lifecycle_set_dpms_power(&mut self, level: u8) -> std::io::Result<bool> {
-        let owner_devices = self.lifecycle_owner_devices();
+        // A VT release closes the transport gate after the Owner transition
+        // is accepted. Keep projecting protocol intent to that incarnation so
+        // DPMS requests received while away remain in REC-5 desired state.
+        let owner_devices = self.lifecycle_owner_incarnation_devices();
         if owner_devices.is_empty() {
             return Ok(false);
         }

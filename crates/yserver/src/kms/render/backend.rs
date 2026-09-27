@@ -2194,6 +2194,9 @@ pub struct KmsBackend {
     /// host-call slot until the sequence request can start.
     pub(super) modeset_lit_clock_probes: HashSet<(DrmDeviceKey, u32, u64)>,
     hotplug_rescan_deadline: Option<std::time::Instant>,
+    /// Hotplug arrived while an Owner seat was away; wait for Active before
+    /// arming the debounced rescan so no connector probe runs without the seat.
+    hotplug_rescan_deferred: bool,
     gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
@@ -7328,6 +7331,7 @@ impl KmsBackend {
             waiting_clock_probes: HashMap::new(),
             modeset_lit_clock_probes: HashSet::new(),
             hotplug_rescan_deadline: None,
+            hotplug_rescan_deferred: false,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
@@ -8716,6 +8720,7 @@ impl KmsBackend {
             waiting_clock_probes: HashMap::new(),
             modeset_lit_clock_probes: HashSet::new(),
             hotplug_rescan_deadline: None,
+            hotplug_rescan_deferred: false,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
@@ -24247,6 +24252,21 @@ impl KmsBackend {
         self.kms_outputs_active = false;
     }
 
+    #[cfg(target_os = "linux")]
+    fn record_display_hotplug_edge(&mut self) {
+        if self.vt_state != crate::vt::state::VtState::Active
+            && !self.lifecycle_owner_incarnation_devices().is_empty()
+        {
+            self.hotplug_rescan_deadline = None;
+            self.hotplug_rescan_deferred = true;
+            log::debug!("kms: display hotplug edge — recorded until Owner VT acquire");
+        } else {
+            self.hotplug_rescan_deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+            log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
+        }
+    }
+
     fn run_resume_for_devices(
         &mut self,
         state: &mut ServerState,
@@ -26046,9 +26066,7 @@ impl Backend for KmsBackend {
                 .map(|monitor| monitor.drain())
                 .unwrap_or(false);
             if saw_change {
-                self.hotplug_rescan_deadline =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
-                log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
+                KmsBackend::record_display_hotplug_edge(self);
             }
         }
     }
@@ -27058,11 +27076,23 @@ impl Backend for KmsBackend {
         self.core_entry_trace_for_tests
             .borrow_mut()
             .push("poll_deferred_input");
+        if self.hotplug_rescan_deferred && self.vt_state == crate::vt::state::VtState::Active {
+            self.hotplug_rescan_deferred = false;
+            self.hotplug_rescan_deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+        }
         if let Some(deadline) = self.hotplug_rescan_deadline
             && std::time::Instant::now() >= deadline
         {
-            self.hotplug_rescan_deadline = None;
-            self.run_display_rescan(state);
+            if self.vt_state != crate::vt::state::VtState::Active
+                && !self.lifecycle_owner_incarnation_devices().is_empty()
+            {
+                self.hotplug_rescan_deadline = None;
+                self.hotplug_rescan_deferred = true;
+            } else {
+                self.hotplug_rescan_deadline = None;
+                self.run_display_rescan(state);
+            }
         }
     }
 
@@ -93828,6 +93858,498 @@ mod tests {
         backend.rebuild_randr_state(&mut state, None, false);
         let _requester = c0_3aii_install_dpms_core_client(&mut state, 71);
         state
+    }
+
+    fn c0_3ci_release_owner_to_suspended(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        label: &str,
+    ) {
+        use std::time::Duration;
+
+        // AcceptKernelCalls cannot issue the kernel atomic commit, signal its
+        // out-fence/page-flip, or perform VT_RELDISP/drmDropMaster. The
+        // established core-entry helper models commit completion; fixture
+        // flags skip the real VT/master ioctls.
+        Backend::on_vt_release(backend, state);
+        let accepted_label = format!("{label}: accept release commit");
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            &accepted_label,
+            Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .expect("release commit reaches accepted state through core entries");
+        let commit = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("accepted release commit remains live")
+            .commit_id();
+        let completion_label = format!("{label}: synthetic kernel completion");
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            commit,
+            &completion_label,
+        );
+        let suspended_label = format!("{label}: release hand-off");
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            &suspended_label,
+            Duration::from_secs(1),
+            &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
+            None,
+        )
+        .expect("release reaches Suspended through core entries");
+        assert!(
+            backend
+                .platform
+                .owner_ref(device)
+                .is_some_and(|owner| !owner.is_poisoned()),
+            "known release completion keeps the Owner incarnation healthy"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_requests_while_released_match_legacy_vulkan() {
+        use std::{os::unix::net::UnixStream, time::Duration};
+
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_core::core_loop::process_request::{RequestOutcome, process_request};
+        use yserver_protocol::x11::{
+            ClientId, RequestHeader, SequenceNumber, dpms,
+            randr::{self as rr},
+        };
+
+        fn set_crtc_disable(
+            backend: &mut super::KmsBackend,
+            state: &mut ServerState,
+            peer: &mut UnixStream,
+            client: u32,
+            output_id: u32,
+        ) -> Vec<u8> {
+            let output = state
+                .randr
+                .outputs
+                .iter()
+                .find(|output| output.output_id == output_id)
+                .expect("requested RANDR output");
+            let mut body = Vec::with_capacity(24);
+            body.extend_from_slice(&output.crtc_id.to_le_bytes());
+            body.extend_from_slice(&1234_u32.to_le_bytes());
+            body.extend_from_slice(&state.randr.config_timestamp.to_le_bytes());
+            body.extend_from_slice(&0_i16.to_le_bytes());
+            body.extend_from_slice(&0_i16.to_le_bytes());
+            body.extend_from_slice(&0_u32.to_le_bytes());
+            body.extend_from_slice(&0_u16.to_le_bytes());
+            body.extend_from_slice(&[0; 2]);
+            let outcome = process_request(
+                state,
+                backend,
+                ClientId(client),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: rr::RR_SET_CRTC_CONFIG,
+                    length_units: 7,
+                },
+                &body,
+                None,
+            )
+            .expect("core SetCrtcConfig dispatch");
+            assert!(
+                matches!(outcome, RequestOutcome::Handled),
+                "released SetCrtcConfig must answer synchronously: {outcome:?}"
+            );
+            kbd_map_drain(peer)
+        }
+
+        fn dpms_wire(
+            backend: &mut super::KmsBackend,
+            state: &mut ServerState,
+            requester: &mut UnixStream,
+            listener: &mut UnixStream,
+        ) -> (Vec<u8>, Vec<u8>) {
+            fn issue(
+                backend: &mut super::KmsBackend,
+                state: &mut ServerState,
+                client: u32,
+                sequence: u16,
+                minor: u8,
+                body: &[u8],
+            ) {
+                let outcome = process_request(
+                    state,
+                    backend,
+                    ClientId(client),
+                    SequenceNumber(sequence),
+                    RequestHeader {
+                        opcode: 134,
+                        data: minor,
+                        length_units: if body.is_empty() { 1 } else { 2 },
+                    },
+                    body,
+                    None,
+                )
+                .expect("core DPMS request dispatch");
+                assert!(
+                    matches!(outcome, RequestOutcome::Handled),
+                    "DPMS request completes synchronously: {outcome:?}"
+                );
+            }
+
+            issue(
+                backend,
+                state,
+                82,
+                1,
+                dpms::SELECT_INPUT,
+                &dpms::DPMS_INFO_NOTIFY_MASK.to_le_bytes(),
+            );
+            issue(
+                backend,
+                state,
+                81,
+                2,
+                dpms::FORCE_LEVEL,
+                &[dpms::DPMS_MODE_OFF as u8, 0, 0, 0],
+            );
+            issue(backend, state, 81, 3, dpms::INFO, &[]);
+            (kbd_map_drain(requester), kbd_map_drain(listener))
+        }
+
+        // AcceptKernelCalls exercises the Owner helper protocol only; it does
+        // not issue the kernel ACTIVE=0 atomic commit or VT_RELDISP/drmDropMaster.
+        let (mut fixture, device, outputs, _target_mode) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut owner_state = c0_3ci_core_state(backend);
+        owner_state.dpms.kms_capable = true;
+        owner_state.dpms.enabled = true;
+        owner_state.start_instant = std::time::Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .expect("stable protocol clock");
+        owner_state.randr.timestamp = 1234;
+        let mut owner_requester = c0_3aii_install_dpms_core_client(&mut owner_state, 81);
+        let mut owner_listener = c0_3aii_install_dpms_core_client(&mut owner_state, 82);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut owner_state,
+            device,
+            "Task 3 Owner release before protocol requests",
+        );
+        assert_eq!(backend.vt_state, crate::vt::state::VtState::Suspended);
+        let (released_output_id, released_output_name) = owner_state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| backend.output_key_for_id(output.output_id) == Some(&outputs[0]))
+            .map(|output| (output.output_id, output.name.clone()))
+            .expect("live Owner RANDR output");
+        let released_key = backend
+            .output_key_for_id(released_output_id)
+            .expect("Owner output key");
+        let released_error = backend
+            .begin_owner_crtc_config(
+                released_output_id,
+                &released_output_name,
+                None,
+                0,
+                0,
+                released_key.clone(),
+            )
+            .expect_err("released Owner seat refuses SetCrtcConfig");
+        assert_eq!(
+            c0_3bi_client_modeset_failure(&released_error),
+            Some(crate::kms::render::admission::ClientModesetFailure::SeatReleased),
+            "the Legacy-identical Failed reply is specifically caused by SeatReleased: {released_error:?}"
+        );
+        let owner_topology_sends = backend.lifecycle_drivers[&device]
+            .topology_test_stats()
+            .1
+            .len();
+        let owner_client_sends = backend.lifecycle_drivers[&device]
+            .client_modeset_test_stats()
+            .1
+            .len();
+
+        let mut legacy = super::KmsBackend::for_tests();
+        legacy.vt_state = crate::vt::state::VtState::Suspended;
+        legacy.kms_outputs_active = false;
+        let mut legacy_state = c0_3ci_core_state(&mut legacy);
+        legacy_state.dpms.kms_capable = true;
+        legacy_state.dpms.enabled = true;
+        legacy_state.start_instant = std::time::Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .expect("stable protocol clock");
+        legacy_state.randr.timestamp = 1234;
+        let mut legacy_requester = c0_3aii_install_dpms_core_client(&mut legacy_state, 81);
+        let mut legacy_listener = c0_3aii_install_dpms_core_client(&mut legacy_state, 82);
+
+        let owner_crtc_reply = set_crtc_disable(
+            backend,
+            &mut owner_state,
+            &mut owner_requester,
+            81,
+            released_output_id,
+        );
+        let legacy_output_id = legacy_state
+            .randr
+            .outputs
+            .first()
+            .expect("one Legacy RANDR output")
+            .output_id;
+        let legacy_crtc_reply = set_crtc_disable(
+            &mut legacy,
+            &mut legacy_state,
+            &mut legacy_requester,
+            81,
+            legacy_output_id,
+        );
+        assert_eq!(
+            owner_crtc_reply, legacy_crtc_reply,
+            "SetCrtcConfig reply bytes"
+        );
+        assert_eq!(owner_crtc_reply.len(), 32);
+        assert_eq!(owner_crtc_reply[1], 3, "RRSetCrtcConfig reports Failed");
+        assert_eq!(
+            u32::from_le_bytes(owner_crtc_reply[8..12].try_into().unwrap()),
+            1234,
+            "failed reply preserves lastSetTime"
+        );
+
+        let owner_dpms = dpms_wire(
+            backend,
+            &mut owner_state,
+            &mut owner_requester,
+            &mut owner_listener,
+        );
+        let legacy_dpms = dpms_wire(
+            &mut legacy,
+            &mut legacy_state,
+            &mut legacy_requester,
+            &mut legacy_listener,
+        );
+        assert_eq!(owner_dpms, legacy_dpms, "DPMSInfo and notification bytes");
+        assert_eq!(owner_dpms.0.len(), 32, "one DPMSInfo reply");
+        assert_eq!(
+            u16::from_le_bytes(owner_dpms.0[8..10].try_into().unwrap()),
+            dpms::DPMS_MODE_OFF,
+            "DPMSForceLevel updates the protocol level while released"
+        );
+        assert_eq!(owner_dpms.1.len(), 32, "one DPMSInfoNotify event");
+
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut owner_state,
+            "Task 3 released requests do not dispatch Owner KMS work",
+            Duration::from_millis(20),
+            &|_| true,
+            None,
+        )
+        .expect("core entries drain any released-seat lifecycle work");
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .1
+                .len(),
+            owner_topology_sends,
+            "released requests send no lifecycle KMS calls"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .client_modeset_test_stats()
+                .1
+                .len(),
+            owner_client_sends,
+            "released SetCrtcConfig sends no client modeset"
+        );
+
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_requests_while_released_match_legacy_vulkan Owner",
+            &c0_3bi_expected_end_state(outputs.clone()),
+        );
+        c0_3bi_assert_end_state(
+            &legacy,
+            "c0_3ci_requests_while_released_match_legacy_vulkan Legacy",
+            &c0_3bi_expected_end_state(
+                legacy
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| output.key.clone()),
+            ),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_dpms_while_released_is_deferred_vulkan() {
+        use std::time::Duration;
+
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            owner::lifecycle::{DesiredField, Disposition, Prerequisite},
+        };
+        use yserver_core::core_loop::process_request::{RequestOutcome, process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber, dpms};
+
+        // The accepting stub does not issue the kernel ACTIVE=0 atomic commit
+        // or perform VT_RELDISP/drmDropMaster; it only replies to helper IPC.
+        let (mut fixture, device, outputs, _target_mode) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let _requester = c0_3aii_install_dpms_core_client(&mut state, 81);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "Task 3 DPMS release before deferred level updates",
+        );
+
+        let sends_before = backend.lifecycle_drivers[&device]
+            .topology_test_stats()
+            .1
+            .len();
+        for (sequence, level) in [(1, dpms::DPMS_MODE_STANDBY), (2, dpms::DPMS_MODE_OFF)] {
+            let outcome = process_request(
+                &mut state,
+                backend,
+                ClientId(81),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 134,
+                    data: dpms::FORCE_LEVEL,
+                    length_units: 2,
+                },
+                &[level as u8, 0, 0, 0],
+                None,
+            )
+            .expect("core DPMSForceLevel dispatch");
+            assert!(matches!(outcome, RequestOutcome::Handled));
+        }
+
+        let arbiter = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner lifecycle arbiter");
+        let desired = arbiter.desired();
+        assert_eq!(state.dpms.power_level, dpms::DPMS_MODE_OFF as u8);
+        assert_eq!(
+            backend.lifecycle_coordinator.protocol_dpms_level(),
+            dpms::DPMS_MODE_OFF as u8,
+            "coordinator keeps the protocol level even while its transport is closed; gate={:?}",
+            backend
+                .platform
+                .transport_gate(&device)
+                .map(|gate| gate.state())
+        );
+        let representative = desired
+            .representative(DesiredField::Dpms)
+            .expect("deferred DPMS representative");
+        assert_eq!(
+            u16::from(desired.protocol_dpms_level()),
+            dpms::DPMS_MODE_OFF
+        );
+        assert_eq!(
+            representative.disposition,
+            Some(Disposition::Deferred(Prerequisite::SeatReleased))
+        );
+        let projection = desired
+            .dpms_targets()
+            .get(&outputs[0])
+            .expect("Owner output's DPMS projection");
+        assert_eq!(u16::from(projection.level), dpms::DPMS_MODE_OFF);
+        assert_eq!(projection.representative, Some(representative.event_id));
+        assert!(backend.device_owner_for_tests(0).live_record().is_none());
+
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "Task 3 newest released DPMS level remains deferred",
+            Duration::from_millis(20),
+            &|_| true,
+            None,
+        )
+        .expect("core entries drain any released-seat lifecycle work");
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .1
+                .len(),
+            sends_before,
+            "deferred DPMS levels send no executor call"
+        );
+
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_dpms_while_released_is_deferred_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c0_3ci_hotplug_edge_is_recorded_until_owner_seat_returns() {
+        use std::time::Duration;
+
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        // NeverReply is idle in this scenario: the injected edge is retained
+        // as state, and no connector probe or kernel KMS side effect occurs.
+        let (mut backend, device) = lifecycle_dpms_backend(StubBehaviour::NeverReply);
+        backend.vt_state = crate::vt::state::VtState::Suspended;
+        super::KmsBackend::record_display_hotplug_edge(&mut backend);
+        assert!(backend.hotplug_rescan_deferred);
+        assert!(backend.hotplug_rescan_deadline.is_none());
+
+        let mut state = ServerState::new();
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "released Owner hotplug edge remains recorded",
+            Duration::from_millis(20),
+            &|_| true,
+            None,
+        )
+        .expect("core entry leaves released hotplug edge pending");
+        assert!(backend.hotplug_rescan_deferred);
+        assert!(backend.hotplug_rescan_deadline.is_none());
+
+        backend.vt_state = crate::vt::state::VtState::Active;
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "returned Owner hotplug edge arms its debounce",
+            Duration::from_millis(20),
+            &|backend| backend.hotplug_rescan_deferred,
+            None,
+        )
+        .expect("core entry arms the deferred hotplug rescan after acquire");
+        assert!(!backend.hotplug_rescan_deferred);
+        assert!(backend.hotplug_rescan_deadline.is_some());
+
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3ci_hotplug_edge_is_recorded_until_owner_seat_returns",
+            &c0_3bi_expected_end_state([OutputKey::new(device, "test")]),
+        );
     }
 
     fn c0_3ci_expected_end_state_with_pending_client_modeset(
