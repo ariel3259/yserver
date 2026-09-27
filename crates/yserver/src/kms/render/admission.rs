@@ -5148,6 +5148,12 @@ impl KmsBackend {
         };
         let tag = pending.tag;
         if pending.cancelled || !self.lifecycle_tag_current(device, tag) {
+            log::warn!(
+                "lifecycle topology validation {validation_commit:?} on {device:?} discarded: \
+                 cancelled={} tag_current={}",
+                pending.cancelled,
+                self.lifecycle_tag_current(device, tag)
+            );
             if let Some(owner) = self.platform.owner_for(device) {
                 let _ = owner.abandon_validation(validation_commit);
             }
@@ -5171,6 +5177,11 @@ impl KmsBackend {
                 self.lifecycle_submit_validated_topology(device, validation_commit, pending);
             }
             crate::kms::owner::device::ValidationOutcome::Rejected { errno } => {
+                log::warn!(
+                    "lifecycle topology TEST_ONLY {validation_commit:?} on {device:?} rejected by \
+                     the kernel: {} (errno {errno})",
+                    std::io::Error::from_raw_os_error(errno)
+                );
                 if let Some(owner) = self.platform.owner_for(device) {
                     let _ = owner.abandon_validation(validation_commit);
                 }

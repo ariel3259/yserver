@@ -87852,6 +87852,9 @@ mod tests {
     #[test]
     #[ignore = "needs card1, a controlling text VT, and live Vulkan; NEVER run by the implementer"]
     fn c0_hw_3c_vt_switch_on_card1_drm() {
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .is_test(true)
+            .try_init();
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!("environmental skip: VT_PROCESS card1 switching is a Linux hardware test");
