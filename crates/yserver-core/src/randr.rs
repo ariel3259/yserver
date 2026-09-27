@@ -277,7 +277,7 @@ fn screen_extent(edges: impl Iterator<Item = i32>) -> u16 {
         .unwrap_or(0)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RandrState {
     pub timestamp: u32,
     pub config_timestamp: u32,

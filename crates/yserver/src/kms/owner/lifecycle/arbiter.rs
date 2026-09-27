@@ -391,6 +391,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         self.desired.observe_seat_target(target, epoch);
     }
 
+    pub(crate) fn observe_device_present(&mut self) {
+        self.desired.observe_device_present();
+    }
+
     /// Remove one stable protocol output projection from this device.
     pub fn remove_protocol_output(&mut self, output: &O) -> Option<super::OutputProjectionRemoval> {
         self.desired.remove_protocol_output(output)

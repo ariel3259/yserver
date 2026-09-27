@@ -175,7 +175,7 @@ fn local_mode_from(m: &DrmMode) -> Mode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Output {
     pub connector: connector::Handle,
     pub connector_name: String,

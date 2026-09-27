@@ -260,6 +260,34 @@ impl CommitResourceConsumer {
         self.current_resources = retained;
     }
 
+    /// Retire every current resource group belonging to a device after a
+    /// completed whole-device reinstall has replaced all of its scanout
+    /// planes. Resource groups are indivisible, so a cross-device group is an
+    /// invariant violation rather than something to split here.
+    pub(crate) fn retire_current_for_device(&mut self, device: DrmDeviceKey) {
+        let current = std::mem::take(&mut self.current_resources);
+        let mut retained = Vec::with_capacity(current.len());
+        for resources in current {
+            let matches_device = resources
+                .crtcs
+                .iter()
+                .any(|member| member.crtc.device_key == device);
+            if matches_device {
+                assert!(
+                    resources
+                        .crtcs
+                        .iter()
+                        .all(|member| member.crtc.device_key == device),
+                    "a whole-device reinstall cannot split a current resource group across DRM devices"
+                );
+                self.releasing_resources.push(resources);
+            } else {
+                retained.push(resources);
+            }
+        }
+        self.current_resources = retained;
+    }
+
     /// A commit can retire after its output has already left the installed
     /// topology. Such resources must not become current for an absent CRTC;
     /// move only complete resource groups whose members all lack a live

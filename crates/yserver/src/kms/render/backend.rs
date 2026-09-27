@@ -31,7 +31,8 @@ use yserver_core::{
         CursorHandle, DrawState, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, FillState,
         FontHandle, GlyphSetHandle, KeymapLoad, OriginContext, PictureHandle, PixmapHandle,
         PresentCaps, PresentScanoutCandidate, PresentSourceWait, RequesterAbandon,
-        RequesterlessPublication, WindowHandle, identity_ramp, resample_channel,
+        RequesterlessPublication, TopologyEpisodeEvent, WindowHandle, identity_ramp,
+        resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -765,7 +766,7 @@ impl ScanoutM1ProbeCache {
         self.entries.remove(&id);
     }
 
-    fn clear(&mut self, reason: &'static str) {
+    pub(super) fn clear(&mut self, reason: &'static str) {
         if !self.entries.is_empty() || !self.index.is_empty() {
             log::debug!(
                 "scanout_m1: dropping {} cached probe framebuffer(s): {reason}",
@@ -1721,13 +1722,17 @@ pub struct KmsBackend {
         Vec<crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>>,
     )>,
     #[cfg(test)]
+    pub(crate) core_driver_vt_releases_for_tests: usize,
+    #[cfg(test)]
+    pub(crate) core_driver_vt_acquires_for_tests: usize,
+    #[cfg(test)]
     pub(crate) core_driver_drm_events_for_tests:
         VecDeque<(DrmDeviceKey, crate::drm::event_stream::DrmEventRecord)>,
     #[cfg(test)]
     pub(crate) core_driver_owner_batch_results_for_tests: Vec<bool>,
     #[cfg(test)]
     pub(crate) core_driver_hardware_completes_for_tests:
-        HashSet<crate::kms::owner::identity::CommitId>,
+        HashSet<(DrmDeviceKey, crate::kms::owner::identity::CommitId)>,
     #[cfg(test)]
     pub(crate) core_driver_finished_crtc_configs_for_tests:
         VecDeque<(CrtcConfigToken, std::io::Result<bool>)>,
@@ -2151,6 +2156,9 @@ pub struct KmsBackend {
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
     pub(super) randr_id_alloc: RandrIdAllocator,
     urgent_requesterless_publications: VecDeque<RequesterlessPublication>,
+    topology_episode_events: VecDeque<TopologyEpisodeEvent>,
+    next_acquire_episode_id: u64,
+    acquire_episode: Option<AcquireEpisode>,
     /// Session-persistent PRIME Output Source policy, keyed by the KMS sink.
     ///
     /// Values use the provider's tagged endpoint identity rather than a DRM
@@ -2233,6 +2241,107 @@ pub struct KmsBackend {
 struct OwnerVtRelease {
     deadline: std::time::Instant,
     devices: Vec<DrmDeviceKey>,
+}
+
+struct AcquireEpisode {
+    id: u64,
+    remaining: std::collections::BTreeSet<DrmDeviceKey>,
+    publication: Option<AcquirePublicationDraft>,
+}
+
+/// The core-visible RandR projection produced by an acquire topology change.
+/// It remains staged until EpisodeEnd so read requests see the last published
+/// generation while the episode is holding the RandR mutation gate.
+#[derive(Clone)]
+struct AcquireRandrProjection {
+    randr: yserver_core::randr::RandrState,
+    primary_explicit: bool,
+    root_size: Option<(u16, u16)>,
+    overlay_size: Option<(u16, u16)>,
+}
+
+impl AcquireRandrProjection {
+    fn capture(state: &ServerState) -> Self {
+        let window_size = |id| {
+            state
+                .resources
+                .window(id)
+                .map(|window| (window.width, window.height))
+        };
+        Self {
+            randr: state.randr.clone(),
+            primary_explicit: state.randr_primary_output_explicit,
+            root_size: window_size(yserver_core::resources::ROOT_WINDOW),
+            overlay_size: window_size(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW),
+        }
+    }
+
+    fn apply(self, state: &mut ServerState) {
+        state.randr = self.randr;
+        state.randr_primary_output_explicit = self.primary_explicit;
+        for (id, size) in [
+            (yserver_core::resources::ROOT_WINDOW, self.root_size),
+            (
+                yserver_core::resources::COMPOSITE_OVERLAY_WINDOW,
+                self.overlay_size,
+            ),
+        ] {
+            if let Some((width, height)) = size
+                && let Some(window) = state.resources.window_mut(id)
+            {
+                window.width = width;
+                window.height = height;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct AcquirePublicationDraft {
+    config_changed: bool,
+    crtc_changed: Vec<(u32, u32, u32)>,
+    output_changed: Vec<(u32, u32, u32)>,
+    projection: Option<AcquireRandrProjection>,
+}
+
+impl AcquirePublicationDraft {
+    fn append(
+        &mut self,
+        config_changed: bool,
+        crtc_changed: &[(u32, u32, u32)],
+        output_changed: &[(u32, u32, u32)],
+        projection: AcquireRandrProjection,
+    ) {
+        self.config_changed |= config_changed;
+        self.crtc_changed.extend_from_slice(crtc_changed);
+        self.output_changed.extend_from_slice(output_changed);
+        self.crtc_changed.sort_unstable();
+        self.crtc_changed.dedup();
+        self.output_changed.sort_unstable();
+        self.output_changed.dedup();
+        self.projection = Some(projection);
+    }
+
+    fn into_publication(self) -> Option<RequesterlessPublication> {
+        let changed =
+            self.config_changed || !self.crtc_changed.is_empty() || !self.output_changed.is_empty();
+        changed.then(|| {
+            let projection = self
+                .projection
+                .expect("changed acquire publication has a RandR projection");
+            RequesterlessPublication::new(
+                self.config_changed,
+                move |state| projection.apply(state),
+                move |state, _| {
+                    yserver_core::core_loop::run::emit_randr_connector_change_notifications(
+                        state,
+                        &self.crtc_changed,
+                        &self.output_changed,
+                    );
+                },
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3570,7 +3679,7 @@ impl KmsBackend {
 
     /// Release direct records only after the caller has disabled/replaced the
     /// primary planes. A not-yet-retired submission falls back to Copy mode.
-    fn stop_direct_after_scanout_replaced(&mut self, reason: &'static str) {
+    pub(super) fn stop_direct_after_scanout_replaced(&mut self, reason: &'static str) {
         if let Some(mut pending) = self.scanout_m2.pending.take() {
             pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_COPY;
             pending.event.emit_idle = true;
@@ -3599,6 +3708,10 @@ impl KmsBackend {
         self.scanout_m2.sync_ownership();
         self.finish_deferred_cow_release();
         log::debug!("scanout_m2: stopped after scanout replacement: {reason}");
+    }
+
+    pub(super) fn clear_scanout_m1_after_topology_replacement(&mut self) {
+        self.scanout_m1.clear("Owner VT acquire reinstall");
     }
 
     /// Apply the owner-route return exactly once, using the output identities
@@ -7203,6 +7316,10 @@ impl KmsBackend {
             #[cfg(test)]
             core_driver_owner_events_for_tests: VecDeque::new(),
             #[cfg(test)]
+            core_driver_vt_releases_for_tests: 0,
+            #[cfg(test)]
+            core_driver_vt_acquires_for_tests: 0,
+            #[cfg(test)]
             core_driver_drm_events_for_tests: VecDeque::new(),
             #[cfg(test)]
             core_driver_owner_batch_results_for_tests: Vec::new(),
@@ -7321,6 +7438,9 @@ impl KmsBackend {
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             urgent_requesterless_publications: VecDeque::new(),
+            topology_episode_events: VecDeque::new(),
+            next_acquire_episode_id: 1,
+            acquire_episode: None,
             provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
@@ -8593,6 +8713,10 @@ impl KmsBackend {
             #[cfg(test)]
             core_driver_owner_events_for_tests: VecDeque::new(),
             #[cfg(test)]
+            core_driver_vt_releases_for_tests: 0,
+            #[cfg(test)]
+            core_driver_vt_acquires_for_tests: 0,
+            #[cfg(test)]
             core_driver_drm_events_for_tests: VecDeque::new(),
             #[cfg(test)]
             core_driver_owner_batch_results_for_tests: Vec::new(),
@@ -8710,6 +8834,9 @@ impl KmsBackend {
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             urgent_requesterless_publications: VecDeque::new(),
+            topology_episode_events: VecDeque::new(),
+            next_acquire_episode_id: 1,
+            acquire_episode: None,
             provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
@@ -15182,6 +15309,10 @@ impl KmsBackend {
         rebuild_scene: bool,
         relight_after_quiesce: bool,
     ) -> bool {
+        let acquire_published_projection = self
+            .acquire_episode
+            .as_ref()
+            .map(|_| AcquireRandrProjection::capture(state));
         let previous_outputs: HashMap<u32, ProjectedRandrOutputState> = state
             .randr
             .outputs
@@ -15201,6 +15332,7 @@ impl KmsBackend {
                 )
             })
             .collect();
+        let previous_config_timestamp = state.randr.config_timestamp;
         let physically_connected: HashSet<&OutputKey> =
             rescan.connected.iter().map(|entry| &entry.key).collect();
         for key in &rescan.added_keys {
@@ -15362,11 +15494,23 @@ impl KmsBackend {
         }
         crtc_changed.sort_unstable_by_key(|&(output, _, _)| output);
         output_changed.sort_unstable_by_key(|&(output, _, _)| output);
-        yserver_core::core_loop::run::emit_randr_connector_change_notifications(
-            state,
-            &crtc_changed,
-            &output_changed,
-        );
+        if self.acquire_episode.is_some() {
+            // The backend and scene use the probed topology now, while the
+            // core keeps serving the last published RandR projection until
+            // EpisodeEnd applies this staged projection and its notifications.
+            state.randr.config_timestamp = previous_config_timestamp;
+            let published = acquire_published_projection
+                .expect("an active acquire episode captured its published projection");
+            let staged = AcquireRandrProjection::capture(state);
+            self.stage_acquire_publication(config_changed, &crtc_changed, &output_changed, staged);
+            published.apply(state);
+        } else {
+            yserver_core::core_loop::run::emit_randr_connector_change_notifications(
+                state,
+                &crtc_changed,
+                &output_changed,
+            );
+        }
         self.scene.wake_for_damage();
         true
     }
@@ -21810,7 +21954,7 @@ impl KmsBackend {
         }
     }
 
-    fn refresh_present_crtc_clock_epochs(&mut self) {
+    pub(super) fn refresh_present_crtc_clock_epochs(&mut self) {
         let live: Vec<(u32, CrtcKey)> = self
             .crtc_key_by_id
             .keys()
@@ -22476,7 +22620,9 @@ impl KmsBackend {
         #[cfg(test)]
         self.core_driver_hardware_completes_for_tests
             .extend(events.iter().filter_map(|event| match event {
-                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } => Some(*commit),
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit } => {
+                    Some((device_key, *commit))
+                }
                 _ => None,
             }));
         self.promote_waiting_clock_probe(device_key);
@@ -24018,10 +24164,93 @@ impl KmsBackend {
 
     fn on_vt_acquire_route(&mut self, state: &mut ServerState) {
         if !self.lifecycle_owner_incarnation_devices().is_empty() {
-            self.on_vt_acquire_owner_closed(state);
+            self.on_vt_acquire_owner(state);
             return;
         }
         self.on_vt_acquire_legacy(state);
+    }
+
+    fn begin_acquire_episode(&mut self, participants: impl IntoIterator<Item = DrmDeviceKey>) {
+        if let Some(previous) = self.acquire_episode.take() {
+            self.topology_episode_events
+                .push_back(TopologyEpisodeEvent::EpisodeEnd(previous.id, None));
+        }
+        let id = self.next_acquire_episode_id;
+        self.next_acquire_episode_id = self
+            .next_acquire_episode_id
+            .checked_add(1)
+            .expect("topology episode id exhausted");
+        let remaining = participants
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        self.topology_episode_events
+            .push_back(TopologyEpisodeEvent::EpisodeBegin(id));
+        if remaining.is_empty() {
+            self.topology_episode_events
+                .push_back(TopologyEpisodeEvent::EpisodeEnd(id, None));
+        } else {
+            self.acquire_episode = Some(AcquireEpisode {
+                id,
+                remaining,
+                publication: None,
+            });
+        }
+    }
+
+    fn stage_acquire_publication(
+        &mut self,
+        config_changed: bool,
+        crtc_changed: &[(u32, u32, u32)],
+        output_changed: &[(u32, u32, u32)],
+        projection: AcquireRandrProjection,
+    ) {
+        if let Some(episode) = self.acquire_episode.as_mut() {
+            episode
+                .publication
+                .get_or_insert_with(AcquirePublicationDraft::default)
+                .append(config_changed, crtc_changed, output_changed, projection);
+        }
+    }
+
+    pub(super) fn acquire_episode_participant_terminal(&mut self, device: DrmDeviceKey) {
+        let Some(episode) = self.acquire_episode.as_mut() else {
+            return;
+        };
+        episode.remaining.remove(&device);
+        if !episode.remaining.is_empty() {
+            return;
+        }
+        let episode = self
+            .acquire_episode
+            .take()
+            .expect("episode was checked above");
+        self.topology_episode_events
+            .push_back(TopologyEpisodeEvent::EpisodeEnd(
+                episode.id,
+                episode.publication.unwrap_or_default().into_publication(),
+            ));
+    }
+
+    pub(super) fn close_owner_after_acquire_probe_failure(&mut self, device: DrmDeviceKey) {
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor.lifecycle_admission_closed = true;
+            conductor.recovery_stopped = true;
+        }
+        if let Some(gate) = self.platform.transport_gate_mut(&device) {
+            gate.force_close();
+        }
+        if let Some(executor) = self
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device)
+            .and_then(|entry| entry.executor.as_mut())
+        {
+            executor.request_termination();
+            let _ = executor.try_reap();
+        }
+        self.withdraw_outputs_for_device(device);
+        self.update_resource_service_activity();
     }
 
     fn on_vt_acquire_legacy(&mut self, state: &mut ServerState) {
@@ -24039,6 +24268,10 @@ impl KmsBackend {
 
         let mut acquired = true;
         for device in &self.platform.devices {
+            #[cfg(test)]
+            if self.vt_skip_master_ioctls_for_tests {
+                continue;
+            }
             if let Err(err) = try_acquire_master_bounded(
                 || device.device.acquire_master_lock(),
                 10,
@@ -24104,10 +24337,22 @@ impl KmsBackend {
         log::info!("kms: VT acquire — done");
     }
 
-    fn on_vt_acquire_owner_closed(&mut self, state: &mut ServerState) {
+    fn on_vt_acquire_owner(&mut self, state: &mut ServerState) {
         use crate::vt::state::{VtAction, VtEventKind, VtState};
 
-        log::info!("kms: VT acquire — Owner interim route; VT_ACKACQ");
+        let owner_devices = self
+            .lifecycle_owner_devices()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let legacy_devices = self.dpms_legacy_devices();
+        self.begin_acquire_episode(
+            owner_devices
+                .iter()
+                .copied()
+                .chain(legacy_devices.iter().copied()),
+        );
+
+        log::info!("kms: VT acquire — Owner route; VT_ACKACQ");
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if let Some(console_guard) = self.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
@@ -24116,6 +24361,17 @@ impl KmsBackend {
         }
         let mut acquired = true;
         for device in &self.platform.devices {
+            let removed = self
+                .lifecycle_coordinator
+                .device(&device.key)
+                .is_some_and(|arbiter| arbiter.desired().device_presence() == Some(false));
+            if removed {
+                log::info!(
+                    "kms: VT acquire — skipping removed DRM device {}",
+                    device.key
+                );
+                continue;
+            }
             #[cfg(test)]
             if self.vt_skip_master_ioctls_for_tests {
                 continue;
@@ -24143,7 +24399,34 @@ impl KmsBackend {
                 }
             }
             self.request_exit();
+            self.end_acquire_episode_without_publication();
             return;
+        }
+
+        // Keep every result, including failures, so one bad card cannot hide
+        // a later healthy device's connector snapshot.
+        let probes = self.platform.probe_connector_snapshots_per_device();
+        let mut legacy_snapshot = Vec::new();
+        for device in &legacy_devices {
+            match probes.get(device) {
+                Some(Ok(snapshot)) => legacy_snapshot.extend(snapshot.iter().cloned()),
+                Some(Err(error)) => {
+                    log::error!(
+                        "kms: mixed resume connector probe failed on Legacy device {device}: {error}; exiting"
+                    );
+                    self.request_exit();
+                    self.end_acquire_episode_without_publication();
+                    return;
+                }
+                None => {
+                    log::error!(
+                        "kms: mixed resume has no connector probe result for Legacy device {device}; exiting"
+                    );
+                    self.request_exit();
+                    self.end_acquire_episode_without_publication();
+                    return;
+                }
+            }
         }
 
         if self
@@ -24152,16 +24435,136 @@ impl KmsBackend {
             != VtAction::BeginResume
         {
             log::debug!("kms: Owner VT acquire coalesced in {:?}", self.vt_state);
+            self.end_acquire_episode_without_publication();
             return;
         }
-        let legacy_devices = self.dpms_legacy_devices();
-        if !legacy_devices.is_empty() && !self.run_resume_for_devices(state, &legacy_devices) {
+        if !legacy_devices.is_empty()
+            && !self.run_resume_for_devices_with_snapshot(state, &legacy_devices, legacy_snapshot)
+        {
+            self.end_acquire_episode_without_publication();
             return;
         }
+
+        let mut healthy_owner_snapshots = Vec::new();
+        let mut healthy_owner_devices = HashSet::new();
+        let mut failed_owner_devices = Vec::new();
+        let mut already_withdrawn_owner_devices = Vec::new();
+        for device in owner_devices.iter().copied() {
+            match probes.get(&device) {
+                Some(Ok(snapshot)) => {
+                    let explicitly_removed = self
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .is_some_and(|arbiter| arbiter.desired().device_presence() == Some(false));
+                    if explicitly_removed {
+                        already_withdrawn_owner_devices.push(device);
+                        continue;
+                    }
+                    match self.lifecycle_coordinator.observe_device_present(&device) {
+                        Ok(()) => {
+                            healthy_owner_devices.insert(device);
+                            healthy_owner_snapshots.extend(snapshot.iter().cloned());
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "kms: Owner acquire has no lifecycle arbiter for {device}: {error:?}; closing incarnation"
+                            );
+                            failed_owner_devices.push(device);
+                        }
+                    }
+                }
+                Some(Err(error)) => {
+                    log::error!(
+                        "kms: Owner acquire connector probe failed on {device}: {error}; closing incarnation"
+                    );
+                    failed_owner_devices.push(device);
+                }
+                None => {
+                    log::error!(
+                        "kms: Owner acquire has no connector probe result for {device}; closing incarnation"
+                    );
+                    failed_owner_devices.push(device);
+                }
+            }
+        }
+        for device in failed_owner_devices {
+            self.close_owner_after_acquire_probe_failure(device);
+            self.acquire_episode_participant_terminal(device);
+        }
+        for device in already_withdrawn_owner_devices {
+            self.acquire_episode_participant_terminal(device);
+        }
+
+        // A closed Owner incarnation stays withdrawn and is never considered
+        // for this install. Only a still-open Owner transport that passed the
+        // probe can receive the full reinstall.
+        let install_devices = healthy_owner_devices
+            .intersection(&owner_devices)
+            .copied()
+            .collect::<HashSet<_>>();
+        if !install_devices.is_empty() {
+            let active_removed = self.platform.outputs.iter().any(|output| {
+                install_devices.contains(&output.key.device_key)
+                    && !healthy_owner_snapshots
+                        .iter()
+                        .any(|entry| entry.preserves_active_output(output))
+            });
+            let configured = self.randr_id_alloc.client_configured_keys();
+            let known_connected = self
+                .randr_id_alloc
+                .connected_keys()
+                .into_iter()
+                .filter(|key| install_devices.contains(&key.device_key))
+                .collect::<HashSet<_>>();
+            let rescan = self.platform.apply_connector_snapshot_for_devices(
+                healthy_owner_snapshots,
+                &known_connected,
+                Some(&install_devices),
+            );
+            let registry_delta = self.reconcile_connector_registry(
+                &rescan.connected,
+                &rescan.dropped_keys,
+                &rescan.dropped_layouts,
+            );
+            let active_topology_changed = !rescan.dropped_old_indices.is_empty();
+            if active_topology_changed {
+                let reserved = self.reserved_layout_slots();
+                self.platform
+                    .recompact_horizontal_layout(&configured, &reserved);
+                self.platform
+                    .recompute_fb_extent_with_reservations(&reserved);
+            }
+            if (!registry_delta.is_empty() || active_topology_changed)
+                && !self.fire_randr_changes(
+                    state,
+                    rescan,
+                    &registry_delta.changed_keys,
+                    registry_delta.config_changed,
+                    active_topology_changed || active_removed,
+                    false,
+                )
+            {
+                self.end_acquire_episode_without_publication();
+                return;
+            }
+        }
+
+        // set_seat_target(Owned) creates the C.0 VTAcquire transition. Its
+        // topology description and prepared pools continue asynchronously.
+        let owner_route = install_devices.is_empty()
+            || self.lifecycle_set_seat_target(crate::kms::owner::lifecycle::SeatTarget::Owned);
+        if !owner_route {
+            log::error!("kms: Owner VT acquire has no live lifecycle route");
+            self.end_acquire_episode_without_publication();
+            self.request_exit();
+            return;
+        }
+
         if self.vt_state.resume_complete(&mut self.vt_pending) != VtAction::Nothing {
             // Rapid-switch precedence is completed in Task 5. Until then,
             // leave the scanout gate closed if a release arrived mid-resume.
             self.vt_state = VtState::Suspending;
+            self.end_acquire_episode_without_publication();
             return;
         }
         if let Some(service) = self.resource_service.as_mut() {
@@ -24178,7 +24581,31 @@ impl KmsBackend {
             "kms: VT acquire — xkb resync: modifiers were 0x{mods_before:04x}, now 0x{:04x}",
             self.serialize_modifiers()
         );
-        log::info!("kms: VT acquire — interim route complete; Owner devices remain closed");
+
+        for device in legacy_devices {
+            self.acquire_episode_participant_terminal(device);
+        }
+        for device in owner_devices {
+            let transition_pending = self
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .is_some_and(|transition| {
+                    transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                });
+            if !transition_pending {
+                self.acquire_episode_participant_terminal(device);
+            }
+        }
+        log::info!("kms: VT acquire — active; Owner reinstalls continue asynchronously");
+    }
+
+    fn end_acquire_episode_without_publication(&mut self) {
+        let Some(episode) = self.acquire_episode.take() else {
+            return;
+        };
+        self.topology_episode_events
+            .push_back(TopologyEpisodeEvent::EpisodeEnd(episode.id, None));
     }
 
     fn run_suspend_for_legacy_devices(
@@ -24267,23 +24694,12 @@ impl KmsBackend {
         }
     }
 
-    fn run_resume_for_devices(
+    fn run_resume_for_devices_with_snapshot(
         &mut self,
         state: &mut ServerState,
         devices: &HashSet<DrmDeviceKey>,
+        snapshot: Vec<ConnectorSnapshot>,
     ) -> bool {
-        log::info!("kms: VT resume — scoped Legacy devices {devices:?}");
-        let snapshot = match self.platform.probe_connector_snapshot() {
-            Ok(snapshot) => snapshot
-                .into_iter()
-                .filter(|entry| devices.contains(&entry.key.device_key))
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                log::error!("kms: mixed resume connector probe failed: {error}; exiting");
-                self.request_exit();
-                return false;
-            }
-        };
         let active_removed = self.platform.outputs.iter().any(|output| {
             devices.contains(&output.key.device_key)
                 && !snapshot
@@ -24920,7 +25336,7 @@ impl Backend for KmsBackend {
                 matches!(
                     event,
                     crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }
-                        if self.core_driver_hardware_completes_for_tests.contains(commit)
+                        if self.core_driver_hardware_completes_for_tests.contains(&(device_key, *commit))
                 )
             });
             let consumed = if already_completed {
@@ -26413,6 +26829,10 @@ impl Backend for KmsBackend {
         &mut self,
     ) -> Vec<yserver_core::backend::RequesterlessPublication> {
         self.urgent_requesterless_publications.drain(..).collect()
+    }
+
+    fn drain_topology_episode_events(&mut self) -> Vec<TopologyEpisodeEvent> {
+        self.topology_episode_events.drain(..).collect()
     }
 
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
@@ -65770,6 +66190,25 @@ mod tests {
                 ::drm::control::from_u32(19).expect("B fixture FB_ID property");
             output.output.plane_crtc_id_prop =
                 ::drm::control::from_u32(20).expect("B fixture CRTC_ID property");
+            // The second Owner shares the test DRM fd, but its synthetic
+            // output must still serialize unique property IDs per object.
+            // AcceptKernelCalls never submits this request to the kernel.
+            output.output.plane_src_x_prop =
+                ::drm::control::from_u32(30).expect("B fixture SRC_X property");
+            output.output.plane_src_y_prop =
+                ::drm::control::from_u32(31).expect("B fixture SRC_Y property");
+            output.output.plane_src_w_prop =
+                ::drm::control::from_u32(32).expect("B fixture SRC_W property");
+            output.output.plane_src_h_prop =
+                ::drm::control::from_u32(33).expect("B fixture SRC_H property");
+            output.output.plane_crtc_x_prop =
+                ::drm::control::from_u32(34).expect("B fixture CRTC_X property");
+            output.output.plane_crtc_y_prop =
+                ::drm::control::from_u32(35).expect("B fixture CRTC_Y property");
+            output.output.plane_crtc_w_prop =
+                ::drm::control::from_u32(36).expect("B fixture CRTC_W property");
+            output.output.plane_crtc_h_prop =
+                ::drm::control::from_u32(37).expect("B fixture CRTC_H property");
             output.output.crtc_out_fence_ptr_prop =
                 Some(::drm::control::from_u32(22).expect("B fixture OUT_FENCE_PTR property"));
         }
@@ -66557,17 +66996,26 @@ mod tests {
 
     /// Finish one simulated core-loop iteration with the real production
     /// tail, then observe any hardware completion the tail made visible.
+    fn c0_3bi_collect_hardware_completes_for_tests(
+        backend: &mut super::KmsBackend,
+        hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
+    ) {
+        if let Some(observed) = hardware_complete {
+            observed.borrow_mut().extend(
+                std::mem::take(&mut backend.core_driver_hardware_completes_for_tests)
+                    .into_iter()
+                    .map(|(_, commit)| commit),
+            );
+        }
+    }
+
     fn c0_3bi_core_driver_iteration_tail(
         backend: &mut super::KmsBackend,
         state: &mut ServerState,
         hardware_complete: Option<&Rc<RefCell<HashSet<crate::kms::owner::identity::CommitId>>>>,
     ) {
         yserver_core::core_loop::run::run_iteration_tail_for_tests(state, backend);
-        if let Some(observed) = hardware_complete {
-            observed.borrow_mut().extend(std::mem::take(
-                &mut backend.core_driver_hardware_completes_for_tests,
-            ));
-        }
+        c0_3bi_collect_hardware_completes_for_tests(backend, hardware_complete);
     }
 
     fn c0_3bi_core_driver_until_mode(
@@ -66584,10 +67032,32 @@ mod tests {
         let sources = Backend::poll_fds(backend);
         while Instant::now() < end {
             Backend::before_block(backend);
+            if backend.core_driver_vt_releases_for_tests > 0 {
+                backend.core_driver_vt_releases_for_tests -= 1;
+                Backend::on_vt_release(backend, state);
+                backend
+                    .core_entry_trace_for_tests
+                    .borrow_mut()
+                    .push("vt_release");
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                continue;
+            }
+            if backend.core_driver_vt_acquires_for_tests > 0 {
+                backend.core_driver_vt_acquires_for_tests -= 1;
+                Backend::on_vt_acquire(backend, state);
+                backend
+                    .core_entry_trace_for_tests
+                    .borrow_mut()
+                    .push("vt_acquire");
+                c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
+                continue;
+            }
             if let Some(observed) = hardware_complete {
-                observed.borrow_mut().extend(std::mem::take(
-                    &mut backend.core_driver_hardware_completes_for_tests,
-                ));
+                observed.borrow_mut().extend(
+                    std::mem::take(&mut backend.core_driver_hardware_completes_for_tests)
+                        .into_iter()
+                        .map(|(_, commit)| commit),
+                );
             }
             if stop_when_done_before_crtc_result
                 && backend.core_driver_script_notification_count_for_tests == 0
@@ -66683,9 +67153,11 @@ mod tests {
                     backend.core_driver_script_notification_count_for_tests += 1;
                 }
                 if let Some(observed) = hardware_complete {
-                    observed.borrow_mut().extend(std::mem::take(
-                        &mut backend.core_driver_hardware_completes_for_tests,
-                    ));
+                    observed.borrow_mut().extend(
+                        std::mem::take(&mut backend.core_driver_hardware_completes_for_tests)
+                            .into_iter()
+                            .map(|(_, commit)| commit),
+                    );
                 }
                 c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
@@ -66704,9 +67176,11 @@ mod tests {
                 let _bounded_wait = Backend::next_wakeup(backend);
                 Backend::on_owner_completion_ready(backend, state);
                 if let Some(observed) = hardware_complete {
-                    observed.borrow_mut().extend(std::mem::take(
-                        &mut backend.core_driver_hardware_completes_for_tests,
-                    ));
+                    observed.borrow_mut().extend(
+                        std::mem::take(&mut backend.core_driver_hardware_completes_for_tests)
+                            .into_iter()
+                            .map(|(_, commit)| commit),
+                    );
                 }
                 c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
@@ -66725,9 +67199,11 @@ mod tests {
                 let _bounded_wait = Backend::next_wakeup(backend);
                 Backend::on_scanout_render_completion(backend, state);
                 if let Some(observed) = hardware_complete {
-                    observed.borrow_mut().extend(std::mem::take(
-                        &mut backend.core_driver_hardware_completes_for_tests,
-                    ));
+                    observed.borrow_mut().extend(
+                        std::mem::take(&mut backend.core_driver_hardware_completes_for_tests)
+                            .into_iter()
+                            .map(|(_, commit)| commit),
+                    );
                 }
                 c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
                 if done(backend)
@@ -66799,9 +67275,11 @@ mod tests {
                     backend.core_driver_script_notification_count_for_tests += 1;
                 }
                 if let Some(observed) = hardware_complete {
-                    observed.borrow_mut().extend(std::mem::take(
-                        &mut backend.core_driver_hardware_completes_for_tests,
-                    ));
+                    observed.borrow_mut().extend(
+                        std::mem::take(&mut backend.core_driver_hardware_completes_for_tests)
+                            .into_iter()
+                            .map(|(_, commit)| commit),
+                    );
                 }
             }
             c0_3bi_core_driver_iteration_tail(backend, state, hardware_complete);
@@ -83900,8 +84378,16 @@ mod tests {
             .ok_or_else(|| io::Error::other("real DRI3 import was not stored"))?;
         let fallback = backend.create_pixmap(None, 24, width, height)?;
         let fallback_xid = fallback.as_raw();
-        let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
-        bind_test_randr_crtc(backend, 0, crtc_id);
+        let output_key = backend.platform.outputs[0].key.clone();
+        let crtc_id = backend
+            .crtc_key_by_id
+            .iter()
+            .find_map(|(&crtc_id, key)| (*key == output_key).then_some(crtc_id))
+            .unwrap_or_else(|| {
+                let hardware_crtc = u32::from(backend.platform.outputs[0].output.crtc);
+                bind_test_randr_crtc(backend, 0, hardware_crtc);
+                hardware_crtc
+            });
         let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
 
         let (fourcc, modifier, offset, pitch, imported_fd) = {
@@ -87636,10 +88122,43 @@ mod tests {
                     .topology_test_stats()
                     .1
                     .len();
+                let acquire_description_count = backend.lifecycle_drivers[&device]
+                    .acquire_topology_descriptions_for_tests()
+                    .len();
+                let retired_instance = backend
+                    .scene
+                    .output_instance_id_for_tests(0)
+                    .expect("pre-acquire scene instance");
+                let composed_offers_before = backend.core_driver_composed_offers_for_tests.len();
 
                 Backend::request_vt_switch(backend, u32::try_from(original_vt).unwrap());
                 signal_mask.wait_for(libc::SIGUSR2, Duration::from_secs(5));
-                Backend::on_vt_acquire(backend, &mut state);
+                backend.core_driver_vt_acquires_for_tests += 1;
+                c0_3bi_core_driver_until_with_state(
+                    backend,
+                    &mut state,
+                    "card1 Owner acquire starts its lifecycle reinstall",
+                    Duration::from_secs(15),
+                    &|backend| {
+                        backend.core_driver_vt_acquires_for_tests == 0
+                            && backend.lifecycle_drivers[&device]
+                                .acquire_topology_descriptions_for_tests()
+                                .len()
+                                > acquire_description_count
+                            && backend
+                                .device_owner_for_tests(0)
+                                .live_record()
+                                .is_some_and(|record| {
+                                    record.completion_context().class
+                                        == crate::kms::owner::completion::CompletionClass::LifecycleInstallRestore
+                                        && record.completion_context().allow_modeset
+                                })
+                    },
+                    None,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("cycle {cycle}: acquire reinstall was not dispatched: {error}")
+                });
                 assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
                 assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
                 assert_eq!(
@@ -87647,8 +88166,8 @@ mod tests {
                         .topology_test_stats()
                         .1
                         .len(),
-                    sent_after_release,
-                    "cycle {cycle}: interim acquire sent no KMS commit outside the executor"
+                    sent_after_release + 1,
+                    "cycle {cycle}: the ALLOW_MODESET reinstall is sent through the card1 executor"
                 );
                 assert_eq!(
                     backend.lifecycle_drivers[&device]
@@ -87656,14 +88175,142 @@ mod tests {
                         .1
                         .len(),
                     0,
-                    "cycle {cycle}: interim acquire sent no client KMS write"
+                    "cycle {cycle}: VT acquire uses its lifecycle reinstall, not a client KMS write"
+                );
+                let reinstall_record = backend
+                    .device_owner_for_tests(0)
+                    .live_record()
+                    .expect("acquire reinstall remains live before its hardware completion");
+                let reinstall_commit = reinstall_record.commit_id();
+                assert_eq!(
+                    reinstall_record.completion_context().class,
+                    crate::kms::owner::completion::CompletionClass::LifecycleInstallRestore
+                );
+                assert!(reinstall_record.completion_context().allow_modeset);
+                let description = backend.lifecycle_drivers[&device]
+                    .acquire_topology_descriptions_for_tests()
+                    .last()
+                    .expect("the acquire records its atomic reinstall description");
+                let connectors = description
+                    .objects
+                    .iter()
+                    .filter(|object| {
+                        object.kind == crate::kms::owner::closure::ObjectKind::Connector
+                    })
+                    .collect::<Vec<_>>();
+                let crtcs = description
+                    .objects
+                    .iter()
+                    .filter(|object| object.kind == crate::kms::owner::closure::ObjectKind::Crtc)
+                    .collect::<Vec<_>>();
+                let planes = description
+                    .objects
+                    .iter()
+                    .filter(|object| object.kind == crate::kms::owner::closure::ObjectKind::Plane)
+                    .collect::<Vec<_>>();
+                assert!(
+                    !connectors.is_empty(),
+                    "cycle {cycle}: card1 has reinstall outputs"
+                );
+                assert_eq!(connectors.len(), crtcs.len());
+                assert_eq!(connectors.len(), planes.len());
+                assert!(
+                    connectors
+                        .iter()
+                        .all(|object| object.old_crtc_id == Some(0))
+                );
+                assert!(planes.iter().all(|object| object.old_crtc_id == Some(0)));
+                assert!(
+                    description
+                        .crtc_state
+                        .iter()
+                        .all(|power| !power.old_active && power.new_active)
                 );
                 assert_eq!(backend.platform.devices[0].key, device);
-                assert_eq!(backend.platform.outputs[0].key.device_key, device);
                 assert_eq!(backend.platform.device_for_key(device).unwrap().key, device);
                 assert_eq!(
                     backend.vt_call_trace_for_tests.last(),
                     Some(&"resume_input")
+                );
+
+                c0_3bi_core_driver_until_with_state(
+                    backend,
+                    &mut state,
+                    "card1 acquire Applied and a new composed frame reaches scanout",
+                    Duration::from_secs(20),
+                    &|backend| {
+                        let applied = backend
+                            .lifecycle_coordinator
+                            .device(&device)
+                            .is_none_or(|arbiter| arbiter.transition().is_none())
+                            && backend
+                                .device_owner_for_tests(0)
+                                .live_record()
+                                .is_none_or(|record| record.commit_id() != reinstall_commit)
+                            && !backend.admission_conductors[&device].lifecycle_admission_closed
+                            && backend.owner_dpms_installed_active.get(&device) == Some(&true);
+                        if !applied {
+                            return false;
+                        }
+                        let outputs = backend
+                            .platform
+                            .outputs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, output)| output.key.device_key == device)
+                            .collect::<Vec<_>>();
+                        !outputs.is_empty()
+                            && outputs.iter().all(|(index, output)| {
+                                let instance = backend.platform.output_instance_ids[*index];
+                                instance != retired_instance
+                                && backend.core_driver_composed_offers_for_tests
+                                    [composed_offers_before..]
+                                    .iter()
+                                    .any(|(offered_device, _, _, offered_instance)| {
+                                        *offered_device == device && *offered_instance == instance
+                                    })
+                                && backend
+                                    .scene
+                                    .owner_buffer_states_for_tests(*index)
+                                    .contains(
+                                    &crate::kms::render::owner_buffer::OwnerBufferState::Current,
+                                )
+                                && output.key.device_key == device
+                            })
+                    },
+                    None,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("cycle {cycle}: acquire did not apply and compose: {error}")
+                });
+                let expected_live_outputs = backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .filter(|output| output.key.device_key == device)
+                    .map(|output| output.key.clone())
+                    .collect::<Vec<_>>();
+                c0_3bi_core_driver_until_with_state(
+                    backend,
+                    &mut state,
+                    "card1 acquire retires displaced resources to a clean end state",
+                    Duration::from_secs(15),
+                    &|backend| {
+                        c0_3bi_end_state_errors(
+                            backend,
+                            &c0_3bi_expected_end_state(expected_live_outputs.clone()),
+                        )
+                        .is_empty()
+                    },
+                    None,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("cycle {cycle}: acquire end state did not settle: {error}")
+                });
+                c0_3bi_assert_end_state(
+                    backend,
+                    "c0_hw_3c_vt_switch_on_card1_drm after acquire",
+                    &c0_3bi_expected_end_state(expected_live_outputs),
                 );
             }
             assert!(backend.vt_switching_armed);
@@ -93776,6 +94423,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn c0_3ci_per_device_probe_collects_every_result() {
+        let mut backend = super::KmsBackend::for_tests();
+        let first = backend.platform.devices[0].key;
+        let second = DrmDeviceKey {
+            major: 0x7fff_ff01,
+            minor: 51,
+        };
+        let third = DrmDeviceKey {
+            major: 0x7fff_ff01,
+            minor: 52,
+        };
+        push_test_device(&mut backend, second);
+        push_test_device(&mut backend, third);
+        backend.platform.connector_snapshots_per_device_for_tests =
+            Some(std::collections::BTreeMap::from([
+                (first, Ok(Vec::new())),
+                (second, Err(io::ErrorKind::Other)),
+                (third, Ok(Vec::new())),
+            ]));
+
+        // The fixture supplies GETCONNECTOR results and does not issue those
+        // kernel ioctls on its `/dev/null` device fds.
+        let results = backend.platform.probe_connector_snapshots_per_device();
+        assert_eq!(
+            results.keys().copied().collect::<Vec<_>>(),
+            [first, second, third]
+        );
+        assert!(results[&first].is_ok());
+        assert_eq!(
+            results[&second].as_ref().unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert!(
+            results[&third].is_ok(),
+            "probing continues after device two fails"
+        );
+        let live = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone());
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3ci_per_device_probe_collects_every_result",
+            &c0_3bi_expected_end_state(live),
+        );
+    }
+
     fn c0_3ci_live_release_fixture(
         behaviour: crate::kms::executor::test_support::StubBehaviour,
         two_outputs: bool,
@@ -93820,6 +94516,29 @@ mod tests {
         }
         fixture.backend.vt_skip_master_ioctls_for_tests = true;
         fixture.backend.platform.owner_completion_detached = true;
+        let mut per_device_snapshots = std::collections::BTreeMap::new();
+        for device in &fixture.backend.platform.devices {
+            let snapshot = fixture
+                .backend
+                .platform
+                .outputs
+                .iter()
+                .filter(|layout| layout.key.device_key == device.key)
+                .map(|layout| ConnectorSnapshot {
+                    key: layout.key.clone(),
+                    modes: layout.output.modes.clone(),
+                    mm_width: layout.output.mm_width,
+                    mm_height: layout.output.mm_height,
+                    edid: layout.output.edid.clone(),
+                    connector_type: layout.output.connector_type.clone(),
+                })
+                .collect::<Vec<_>>();
+            per_device_snapshots.insert(device.key, Ok(snapshot));
+        }
+        fixture
+            .backend
+            .platform
+            .connector_snapshots_per_device_for_tests = Some(per_device_snapshots);
         fixture
             .backend
             .lifecycle_register_owner_device(device)
@@ -93860,10 +94579,46 @@ mod tests {
         state
     }
 
+    fn c0_3ci_acquire_through_core_driver(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        label: &str,
+    ) {
+        // The executor stub accepts helper IPC only; it does not issue the
+        // kernel DRM atomic reinstall or VT master ioctl. The fixture skips
+        // master ioctls and drives the backend entry through the core driver.
+        backend.core_driver_vt_acquires_for_tests += 1;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            label,
+            std::time::Duration::from_secs(2),
+            &|backend| backend.core_driver_vt_acquires_for_tests == 0,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert!(
+            backend
+                .core_entry_trace_for_tests
+                .borrow()
+                .contains(&"vt_acquire"),
+            "the acquire ran through a Backend core entry"
+        );
+    }
+
     fn c0_3ci_release_owner_to_suspended(
         backend: &mut super::KmsBackend,
         state: &mut ServerState,
         device: DrmDeviceKey,
+        label: &str,
+    ) {
+        c0_3ci_release_owners_to_suspended(backend, state, &[device], label);
+    }
+
+    fn c0_3ci_release_owners_to_suspended(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        devices: &[DrmDeviceKey],
         label: &str,
     ) {
         use std::time::Duration;
@@ -93872,36 +94627,42 @@ mod tests {
         // out-fence/page-flip, or perform VT_RELDISP/drmDropMaster. The
         // established core-entry helper models commit completion; fixture
         // flags skip the real VT/master ioctls.
-        Backend::on_vt_release(backend, state);
-        let accepted_label = format!("{label}: accept release commit");
-        c0_3bi_core_driver_until_with_state(
-            backend,
-            state,
-            &accepted_label,
-            Duration::from_secs(3),
-            &|backend| {
-                backend
-                    .platform
-                    .owner_ref(device)
-                    .and_then(|owner| owner.live_record())
-                    .is_some_and(|record| record.milestones().accepted)
-            },
-            None,
-        )
-        .expect("release commit reaches accepted state through core entries");
-        let commit = backend
-            .platform
-            .owner_ref(device)
-            .and_then(|owner| owner.live_record())
-            .expect("accepted release commit remains live")
-            .commit_id();
-        let completion_label = format!("{label}: synthetic kernel completion");
-        c0_3bi_complete_owner_commit_through_core_driver(
-            backend,
-            device,
-            commit,
-            &completion_label,
-        );
+        backend.core_driver_vt_releases_for_tests += 1;
+        let mut commits = Vec::with_capacity(devices.len());
+        for device in devices.iter().copied() {
+            let accepted_label = format!("{label}: accept release commit on {device}");
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                state,
+                &accepted_label,
+                Duration::from_secs(3),
+                &|backend| {
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record())
+                        .is_some_and(|record| record.milestones().accepted)
+                },
+                None,
+            )
+            .expect("release commit reaches accepted state through core entries");
+            let commit = backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .expect("accepted release commit remains live")
+                .commit_id();
+            commits.push((device, commit));
+        }
+        for (device, commit) in commits {
+            let completion_label = format!("{label}: synthetic kernel completion on {device}");
+            c0_3bi_complete_owner_commit_through_core_driver(
+                backend,
+                device,
+                commit,
+                &completion_label,
+            );
+        }
         let suspended_label = format!("{label}: release hand-off");
         c0_3bi_core_driver_until_with_state(
             backend,
@@ -93911,14 +94672,135 @@ mod tests {
             &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
             None,
         )
-        .expect("release reaches Suspended through core entries");
-        assert!(
-            backend
+        .unwrap_or_else(|error| {
+            let devices = devices
+                .iter()
+                .map(|device| {
+                    (
+                        device,
+                        backend.lifecycle_coordinator.device(device).map(|arbiter| {
+                            (
+                                arbiter.state(),
+                                arbiter.transition(),
+                                arbiter.desired().seat_target(),
+                            )
+                        }),
+                        backend
+                            .platform
+                            .owner_ref(*device)
+                            .and_then(|owner| owner.live_record())
+                            .map(|record| (record.commit_id(), record.milestones())),
+                        backend.owner_dpms_installed_active.get(device).copied(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!("release reaches Suspended through core entries: {error}; devices={devices:?}")
+        });
+        for device in devices {
+            assert!(
+                backend
+                    .platform
+                    .owner_ref(*device)
+                    .is_some_and(|owner| !owner.is_poisoned()),
+                "known release completion keeps the Owner incarnation healthy"
+            );
+        }
+    }
+
+    fn c0_3ci_expected_end_state_with_acquire_preparation(
+        backend: &super::KmsBackend,
+        outputs: impl IntoIterator<Item = OutputKey>,
+    ) -> C0EndStateExpectation {
+        let mut expected = c0_3bi_expected_end_state(outputs);
+        expected.other_live_allocations = backend
+            .lifecycle_drivers
+            .values()
+            .flat_map(|driver| driver.prepared_acquire_allocation_keys_for_tests())
+            .collect();
+        expected
+    }
+
+    fn c0_3ci_test_probe_results(
+        backend: &super::KmsBackend,
+    ) -> std::collections::BTreeMap<DrmDeviceKey, Result<Vec<ConnectorSnapshot>, io::ErrorKind>>
+    {
+        backend
+            .platform
+            .devices
+            .iter()
+            .map(|device| {
+                let snapshot = backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .filter(|layout| layout.key.device_key == device.key)
+                    .map(|layout| ConnectorSnapshot {
+                        key: layout.key.clone(),
+                        modes: layout.output.modes.clone(),
+                        mm_width: layout.output.mm_width,
+                        mm_height: layout.output.mm_height,
+                        edid: layout.output.edid.clone(),
+                        connector_type: layout.output.connector_type.clone(),
+                    })
+                    .collect();
+                (device.key, Ok(snapshot))
+            })
+            .collect()
+    }
+
+    fn c0_3ci_wait_owner_acquire_accepted(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        label: &str,
+    ) -> crate::kms::owner::identity::CommitId {
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            label,
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| record.milestones().accepted)
+            },
+            None,
+        )
+        .unwrap_or_else(|error| {
+            let arbiter = backend.lifecycle_coordinator.device(&device).map(|arbiter| {
+                (
+                    arbiter.state(),
+                    arbiter.transition(),
+                    arbiter.desired().device_presence(),
+                    arbiter.desired().representative(
+                        crate::kms::owner::lifecycle::DesiredField::Seat,
+                    ),
+                )
+            });
+            let record = backend
                 .platform
                 .owner_ref(device)
-                .is_some_and(|owner| !owner.is_poisoned()),
-            "known release completion keeps the Owner incarnation healthy"
-        );
+                .and_then(|owner| owner.live_record())
+                .map(|record| (record.commit_id(), record.state(), record.milestones()));
+            let stats = backend.lifecycle_drivers.get(&device).map(|driver| {
+                (
+                    driver.topology_test_stats(),
+                    driver.pending_topology_descriptions_for_tests(),
+                    driver.acquire_topology_descriptions_for_tests(),
+                )
+            });
+            let host_calls = backend.host_call_events_for_tests.lock().unwrap().clone();
+            let owner_poisoned = backend.platform.owner_ref(device).map(|owner| owner.is_poisoned());
+            panic!("{label}: {error}; arbiter={arbiter:?}; owner={record:?}; poisoned={owner_poisoned:?}; driver={stats:?}; host_calls={host_calls:?}");
+        });
+        backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("accepted VTAcquire reinstall remains live")
+            .commit_id()
     }
 
     #[test]
@@ -94400,6 +95282,10 @@ mod tests {
         entry.mm_width = output.output.mm_width;
         entry.mm_height = output.output.mm_height;
         entry.connector_type = output.output.connector_type.clone();
+        backend
+            .scene
+            .rebuild_outputs(&backend.platform)
+            .expect("Legacy fixture output joins the scene inventory");
         (device, key)
     }
 
@@ -94414,14 +95300,22 @@ mod tests {
             .iter()
             .find(|layout| &layout.key == output)
             .expect("Legacy probe output remains installed");
-        backend.platform.connector_snapshot_for_tests = Some(vec![ConnectorSnapshot {
+        let snapshot = ConnectorSnapshot {
             key: output.clone(),
             modes: layout.output.modes.clone(),
             mm_width: layout.output.mm_width,
             mm_height: layout.output.mm_height,
             edid: layout.output.edid.clone(),
             connector_type: layout.output.connector_type.clone(),
-        }]);
+        };
+        backend.platform.connector_snapshot_for_tests = Some(vec![snapshot.clone()]);
+        if let Some(snapshots) = backend
+            .platform
+            .connector_snapshots_per_device_for_tests
+            .as_mut()
+        {
+            snapshots.insert(device, Ok(vec![snapshot]));
+        }
         assert_eq!(output.device_key, device);
     }
 
@@ -95213,49 +96107,32 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn c0_3ci_interim_acquire_leaves_owner_closed_vulkan() {
+    fn c0_3ci_mixed_server_acquire_runs_scoped_legacy_resume_vulkan() {
         use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
 
         let (mut fixture, device, outputs, _) =
-            c0_3ci_live_release_fixture(StubBehaviour::AcceptValidationThenNeverReply, false);
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
         let backend = &mut fixture.backend;
         let (legacy_device, legacy_output) = c0_3ci_add_legacy_output(backend, 118, 0x3b1_919);
         c0_3ci_install_legacy_probe_snapshot(backend, legacy_device, &legacy_output);
         backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
         backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
         let mut state = c0_3ci_core_state(backend);
-        Backend::on_vt_release(backend, &mut state);
-        c0_3bi_core_driver_until_with_state(
+        c0_3ci_release_owner_to_suspended(
             backend,
             &mut state,
-            "finish release before interim acquire",
-            std::time::Duration::from_secs(2),
-            &|backend| backend.vt_state == VtState::Suspended,
-            None,
-        )
-        .expect("release is handed off before acquire");
-        let live_sends = backend.lifecycle_drivers[&device].topology_test_stats().1;
-        let client_sends = backend.lifecycle_drivers[&device].client_modeset_test_stats();
-        // The helper does not issue Owner DRM atomics, signal out-fences, or
-        // perform VT master operations; only the scoped Legacy test seam does.
-        Backend::on_vt_acquire(backend, &mut state);
+            device,
+            "finish release before acquire",
+        );
+        c0_3ci_acquire_through_core_driver(backend, &mut state, "mixed acquire backend entry");
         assert_eq!(backend.vt_state, VtState::Active);
-        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
-        assert_eq!(
-            backend.lifecycle_drivers[&device].topology_test_stats().1,
-            live_sends
-        );
-        assert_eq!(
-            backend.lifecycle_drivers[&device].client_modeset_test_stats(),
-            client_sends
-        );
         assert_eq!(
             backend.platform.dpms_output_calls_for_tests,
             Some(vec![
                 (false, vec![legacy_output.clone()]),
                 (true, vec![legacy_output.clone()]),
             ]),
-            "the interim acquire relights only the Legacy output"
+            "the mixed acquire relights the Legacy output before Owner reinstall"
         );
         assert_eq!(
             backend.platform.dpms_output_scopes_for_tests,
@@ -95264,10 +96141,1211 @@ mod tests {
                 Some(HashSet::from([legacy_device])),
             ])
         );
+        assert_eq!(
+            backend.vt_call_trace_for_tests.last(),
+            Some(&"resume_input"),
+            "input resumes after the scoped Legacy relight"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .map(|transition| transition.kind),
+            Some(crate::kms::owner::lifecycle::LifecycleKind::VTAcquire),
+            "the Owner reinstall transition starts after scoped Legacy resume"
+        );
         c0_3bi_assert_end_state(
             backend,
-            "c0_3ci_interim_acquire_leaves_owner_closed_vulkan",
-            &c0_3bi_expected_end_state(outputs.into_iter().chain([legacy_output])),
+            "c0_3ci_mixed_server_acquire_runs_scoped_legacy_resume_vulkan",
+            &c0_3ci_expected_end_state_with_acquire_preparation(
+                backend,
+                outputs.into_iter().chain([legacy_output]),
+            ),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_probe_error_withdraws_owner_device_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_core::core_loop::{Message, channel};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "failed-probe acquire known release",
+        );
+        backend
+            .platform
+            .connector_snapshots_per_device_for_tests
+            .as_mut()
+            .expect("scripted per-device probe map")
+            .insert(device, Err(io::ErrorKind::Other));
+        let (_poll, sender, receiver) = channel().expect("core wake channel");
+        Backend::set_input_sender(backend, sender);
+
+        // The executor stub only models IPC failure handling. It does not
+        // perform drmSetMaster, the device probe ioctls, or VT_ACKACQ.
+        c0_3ci_acquire_through_core_driver(backend, &mut state, "Owner connector probe failure");
+        assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
+        assert!(backend.vt_call_trace_for_tests.contains(&"resume_input"));
+        assert_eq!(
+            backend
+                .platform
+                .transport_gate(&device)
+                .map(|gate| gate.state()),
+            Some(crate::kms::render::resources::TransportState::Closed),
+            "a failed Owner probe closes this incarnation"
+        );
+        assert_eq!(backend.urgent_requesterless_publications.len(), 1);
+        let ids = backend.randr_id_alloc.ids_for(&outputs[0]);
+        assert_eq!(
+            backend.urgent_requesterless_publications[0].urgent_withdrawal_ids(),
+            Some((&[ids.output_id][..], &[ids.crtc_id][..]))
+        );
+        let events = Backend::drain_topology_episode_events(backend);
+        assert!(matches!(
+            events.first(),
+            Some(yserver_core::backend::TopologyEpisodeEvent::EpisodeBegin(_))
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(
+                _,
+                None
+            ))
+        ));
+        assert!(
+            receiver
+                .try_recv_all_tagged()
+                .into_iter()
+                .all(|(_, message)| !matches!(message, Message::Shutdown)),
+            "an Owner probe failure withdraws only that device and keeps the server running"
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_probe_error_withdraws_owner_device_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_input_resumes_before_owner_reinstall_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "input-resume acquire known release",
+        );
+        c0_3ci_acquire_through_core_driver(backend, &mut state, "start unresolved reinstall");
+
+        assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
+        assert_eq!(
+            backend.vt_call_trace_for_tests.last(),
+            Some(&"resume_input"),
+            "input resumes before any asynchronous Owner commit completion"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .map(|transition| transition.kind),
+            Some(crate::kms::owner::lifecycle::LifecycleKind::VTAcquire),
+            "Owner acquire remains pending: gate={:?}, owner_incarnations={:?}, live_owners={:?}, arbiter={:?}, target={:?}, owner_record={:?}, pending_acquire={:?}, topology_stats={:?}",
+            backend
+                .platform
+                .transport_gate(&device)
+                .map(|gate| gate.state()),
+            backend.lifecycle_owner_incarnation_devices(),
+            backend.lifecycle_owner_devices(),
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .map(|arbiter| (arbiter.state(), arbiter.desired().device_presence())),
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .map(|arbiter| arbiter.desired().seat_target()),
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .map(|record| (record.commit_id(), record.milestones())),
+            backend.lifecycle_drivers[&device].pending_topology_descriptions_for_tests(),
+            backend.lifecycle_drivers[&device].topology_test_stats(),
+        );
+        assert!(
+            backend.admission_conductors[&device].lifecycle_admission_closed,
+            "scanout admission stays closed until Applied"
+        );
+        assert!(
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .is_some(),
+            "the acquire reinstall has not reached a terminal result"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .acquire_topology_descriptions_for_tests()
+                .len(),
+            1
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_input_resumes_before_owner_reinstall_vulkan",
+            &c0_3ci_expected_end_state_with_acquire_preparation(backend, outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_reinstalls_from_scratch_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        let output_key = outputs[0].clone();
+        let desired = match backend
+            .randr_id_alloc
+            .entry(&output_key)
+            .expect("desired Owner output entry")
+            .config
+        {
+            super::ConnectorConfig::Enabled {
+                mode_w,
+                mode_h,
+                vrefresh,
+                x,
+                y,
+            } => (mode_w, mode_h, vrefresh, x, y),
+            super::ConnectorConfig::Off => panic!("fixture output starts configured"),
+        };
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "from-scratch acquire known release",
+        );
+        let layout = backend
+            .platform
+            .outputs
+            .iter_mut()
+            .find(|layout| layout.key == output_key)
+            .expect("Owner output layout remains present while released");
+        let foreign_mode = layout
+            .output
+            .modes
+            .iter()
+            .find(|mode| {
+                (mode.width, mode.height, mode.vrefresh) != (desired.0, desired.1, desired.2)
+            })
+            .cloned()
+            .expect("fixture advertises a second mode");
+        // Another master changed the old installed-mode cache while the VT
+        // was away. The desired RandR configuration above remains authoritative.
+        layout.output.picked = foreign_mode.clone();
+        layout.width = foreign_mode.width;
+        layout.height = foreign_mode.height;
+        let connector_id = u32::from(layout.output.connector);
+        let crtc_id = u32::from(layout.output.crtc);
+        let plane_id = u32::from(layout.output.plane);
+
+        c0_3ci_acquire_through_core_driver(
+            backend,
+            &mut state,
+            "build from-scratch acquire reinstall",
+        );
+        let description = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .last()
+            .expect("acquire description is prepared");
+        assert_eq!(
+            description.objects.len(),
+            3,
+            "connector, CRTC, primary plane"
+        );
+        assert!(description.objects.iter().any(|object| {
+            object.kind == crate::kms::owner::closure::ObjectKind::Connector
+                && object.object == connector_id
+                && object.old_crtc_id == Some(0)
+        }));
+        assert!(description.objects.iter().any(|object| {
+            object.kind == crate::kms::owner::closure::ObjectKind::Crtc && object.object == crtc_id
+        }));
+        assert!(description.objects.iter().any(|object| {
+            object.kind == crate::kms::owner::closure::ObjectKind::Plane
+                && object.object == plane_id
+                && object.old_crtc_id == Some(0)
+        }));
+        assert!(
+            description
+                .crtc_state
+                .iter()
+                .all(|power| !power.old_active && power.new_active)
+        );
+
+        let commit = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device,
+            "accept from-scratch acquire reinstall",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            commit,
+            "apply from-scratch acquire reinstall",
+        );
+        let installed = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == output_key)
+            .expect("reinstalled Owner output");
+        assert_eq!(
+            (
+                installed.width,
+                installed.height,
+                installed.output.picked.vrefresh
+            ),
+            (desired.0, desired.1, desired.2),
+            "Applied reinstalls the desired mode instead of replaying the changed cache"
+        );
+        assert!(!backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert!(backend.acquire_episode.is_none());
+        let expected = c0_3bi_expected_end_state(outputs);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "retire the displaced acquire resources",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .expect("the acquire's displaced resources reach a clean end state");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_reinstalls_from_scratch_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_honours_dpms_off_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_core::core_loop::process_request::{RequestOutcome, process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber, dpms};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let _requester = c0_3aii_install_dpms_core_client(&mut state, 82);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "DPMS-off acquire known release",
+        );
+        let outcome = process_request(
+            &mut state,
+            backend,
+            ClientId(82),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 134,
+                data: dpms::FORCE_LEVEL,
+                length_units: 2,
+            },
+            &[dpms::DPMS_MODE_OFF as u8, 0, 0, 0],
+            None,
+        )
+        .expect("DPMSForceLevel while released");
+        assert!(matches!(outcome, RequestOutcome::Handled));
+        assert_eq!(
+            backend.lifecycle_coordinator.protocol_dpms_level(),
+            dpms::DPMS_MODE_OFF as u8
+        );
+
+        c0_3ci_acquire_through_core_driver(backend, &mut state, "prepare DPMS-off reinstall");
+        let description = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .last()
+            .expect("DPMS-off acquire description");
+        assert!(description.crtc_state.iter().all(|power| !power.new_active));
+        let crtc = description
+            .objects
+            .iter()
+            .find(|object| object.kind == crate::kms::owner::closure::ObjectKind::Crtc)
+            .expect("acquire CRTC object");
+        assert!(
+            crtc.props.iter().any(
+                |(property, value)| *property == description.property_ids.active && *value == 0
+            ),
+            "DPMS OFF projects ACTIVE=0 into the reinstall"
+        );
+        let commit = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device,
+            "accept DPMS-off acquire reinstall",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            commit,
+            "apply DPMS-off acquire reinstall",
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "DPMS-off acquire admits no frame",
+            std::time::Duration::from_millis(20),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .is_some_and(|owner| owner.live_record().is_none())
+            },
+            None,
+        )
+        .expect("DPMS-off output remains without an admitted Owner frame");
+        assert!(!backend.owner_outputs_powered_on(device));
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_honours_dpms_off_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_mixed_success_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device_a, device_b, _, _) =
+            c0_3bi_live_two_owner_position_backend(StubBehaviour::AcceptKernelCalls(1_000))
+                .expect("environmental skip: live two-Owner acquire fixture");
+        let backend = &mut fixture.backend;
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        let output_a = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.key.device_key == device_a)
+            .expect("Owner A output")
+            .key
+            .clone();
+        let output_b = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.key.device_key == device_b)
+            .expect("Owner B output")
+            .key
+            .clone();
+        let ids_b = backend.randr_id_alloc.ids_for(&output_b);
+        let mut probes = c0_3ci_test_probe_results(backend);
+        let snapshot_a = probes
+            .get_mut(&device_a)
+            .expect("Owner A probe result")
+            .as_mut()
+            .expect("Owner A probe succeeds")
+            .first_mut()
+            .expect("Owner A connector");
+        snapshot_a.mm_width = snapshot_a.mm_width.saturating_add(1);
+        probes.insert(device_b, Err(io::ErrorKind::Other));
+        backend.platform.connector_snapshots_per_device_for_tests = Some(probes);
+
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owners_to_suspended(
+            backend,
+            &mut state,
+            &[device_a, device_b],
+            "mixed-success acquire known release",
+        );
+        // Stub helpers accept protocol IPC; they do not perform master ioctls,
+        // connector probes, atomic KMS commits, or fence/page-flip signals.
+        c0_3ci_acquire_through_core_driver(backend, &mut state, "mixed-success acquire entry");
+
+        assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
+        assert_eq!(
+            backend
+                .platform
+                .transport_gate(&device_b)
+                .map(|gate| gate.state()),
+            Some(crate::kms::render::resources::TransportState::Closed)
+        );
+        assert_eq!(backend.urgent_requesterless_publications.len(), 1);
+        assert_eq!(
+            backend.urgent_requesterless_publications[0].urgent_withdrawal_ids(),
+            Some((&[ids_b.output_id][..], &[ids_b.crtc_id][..]))
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_a)
+                .and_then(|arbiter| arbiter.transition())
+                .map(|transition| transition.kind),
+            Some(crate::kms::owner::lifecycle::LifecycleKind::VTAcquire),
+            "A starts reinstall despite B's failed probe"
+        );
+        assert_eq!(
+            backend.acquire_episode.as_ref().map(|episode| {
+                (
+                    episode.remaining.clone(),
+                    episode.publication.as_ref().map(|draft| {
+                        draft
+                            .output_changed
+                            .iter()
+                            .map(|(output_id, _, _)| *output_id)
+                            .collect::<Vec<_>>()
+                    }),
+                )
+            }),
+            Some((
+                std::collections::BTreeSet::from([device_a]),
+                Some(vec![backend.randr_id_alloc.ids_for(&output_a).output_id]),
+            )),
+            "the episode keeps only A as a participant and stages only A's topology difference"
+        );
+
+        let acquire_commit = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device_a,
+            "accept healthy Owner A reinstall",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device_a,
+            acquire_commit,
+            "apply healthy Owner A reinstall",
+        );
+        assert!(backend.acquire_episode.is_none());
+        assert!(backend.topology_episode_events.iter().any(|event| matches!(
+            event,
+            yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(_, Some(_))
+        )));
+
+        let offers_before = backend.core_driver_composed_offers_for_tests.len();
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "compose an Owner A frame after acquire Applied",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.core_driver_composed_offers_for_tests[offers_before..]
+                    .iter()
+                    .any(|(device, _, _, _)| *device == device_a)
+                    && backend
+                        .platform
+                        .owner_ref(device_a)
+                        .is_some_and(|owner| owner.live_record().is_some())
+            },
+            None,
+        )
+        .expect("healthy Owner A composes after its Applied reinstall");
+        assert!(
+            backend
+                .platform
+                .owner_ref(device_b)
+                .is_some_and(|owner| owner.live_record().is_none())
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_mixed_success_vulkan",
+            &c0_3ci_expected_end_state_with_acquire_preparation(
+                backend,
+                backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .map(|output| output.key.clone()),
+            ),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_episode_waits_for_every_participant_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device_a, device_b, _, _) =
+            c0_3bi_live_two_owner_position_backend(StubBehaviour::AcceptKernelCalls(1_000))
+                .expect("environmental skip: live two-Owner acquire fixture");
+        let backend = &mut fixture.backend;
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        let output_a = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.key.device_key == device_a)
+            .expect("Owner A output")
+            .key
+            .clone();
+        let output_b = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|output| output.key.device_key == device_b)
+            .expect("Owner B output")
+            .key
+            .clone();
+        let mut probes = c0_3ci_test_probe_results(backend);
+        let changed = probes
+            .get_mut(&device_a)
+            .expect("Owner A probe result")
+            .as_mut()
+            .expect("Owner A probe succeeds")
+            .first_mut()
+            .expect("Owner A connector");
+        changed.mm_width = changed.mm_width.saturating_add(1);
+        backend.platform.connector_snapshots_per_device_for_tests = Some(probes);
+
+        let mut state = c0_3ci_core_state(backend);
+        let mut client = c0_3aii_install_dpms_core_client(&mut state, 83);
+        c0_3ci_release_owners_to_suspended(
+            backend,
+            &mut state,
+            &[device_a, device_b],
+            "episode-waits acquire known release",
+        );
+        c0_3ci_acquire_through_core_driver(
+            backend,
+            &mut state,
+            "begin multi-Owner acquire episode",
+        );
+
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .and_then(|arbiter| arbiter.transition())
+                .map(|transition| transition.kind),
+            Some(crate::kms::owner::lifecycle::LifecycleKind::VTAcquire),
+            "B stays in VTAcquire until its own terminal result; arbiter={:?}, gate={:?}, slot={:?}, admission={:?}, stats={:?}, calls={:?}",
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .map(|arbiter| {
+                    (
+                        arbiter.state(),
+                        arbiter.transition(),
+                        arbiter
+                            .desired()
+                            .representative(crate::kms::owner::lifecycle::DesiredField::Seat),
+                    )
+                }),
+            backend
+                .platform
+                .transport_gate(&device_b)
+                .map(|gate| gate.state()),
+            backend
+                .platform
+                .owner_ref(device_b)
+                .map(|owner| owner.slot()),
+            backend.admission_trace_for_tests(device_b),
+            backend.lifecycle_drivers[&device_b].topology_test_stats(),
+            backend.host_call_events_for_tests.lock().unwrap(),
+        );
+        assert!(
+            backend
+                .platform
+                .owner_ref(device_b)
+                .and_then(|owner| owner.live_record())
+                .is_some(),
+            "B's reinstall is live while A is still in flight"
+        );
+
+        let commit_a = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device_a,
+            "accept Owner A reinstall while B remains in flight",
+        );
+        let _commit_b = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device_b,
+            "accept Owner B reinstall and hold its kernel completion",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device_a,
+            commit_a,
+            "apply Owner A before Owner B",
+        );
+
+        let episode = backend
+            .acquire_episode
+            .as_ref()
+            .expect("Owner B remains a participant");
+        assert_eq!(
+            episode.remaining,
+            std::collections::BTreeSet::from([device_b])
+        );
+        let draft = episode
+            .publication
+            .as_ref()
+            .expect("changed topology is staged");
+        let output_a_id = backend.randr_id_alloc.ids_for(&output_a).output_id;
+        assert!(
+            draft
+                .output_changed
+                .iter()
+                .any(|(id, _, _)| *id == output_a_id)
+        );
+        assert!(
+            !draft
+                .output_changed
+                .iter()
+                .any(|(id, _, _)| { *id == backend.randr_id_alloc.ids_for(&output_b).output_id })
+        );
+        assert!(
+            backend
+                .topology_episode_events
+                .iter()
+                .all(|event| !matches!(
+                    event,
+                    yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(_, _)
+                )),
+            "A Applied cannot publish while B is nonterminal"
+        );
+        assert!(
+            kbd_map_drain(&mut client).is_empty(),
+            "no RANDR bytes reach clients while the episode remains open"
+        );
+        assert!(
+            backend
+                .platform
+                .owner_ref(device_b)
+                .and_then(|owner| owner.live_record())
+                .is_some_and(|record| !record.milestones().hardware_complete),
+            "B's accepted reinstall remains in flight without a synthetic kernel completion"
+        );
+
+        let commit_b = backend
+            .platform
+            .owner_ref(device_b)
+            .and_then(|owner| owner.live_record())
+            .expect("B's held acquire commit")
+            .commit_id();
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device_b,
+            commit_b,
+            "apply Owner B to finish the acquire episode",
+        );
+        assert!(backend.acquire_episode.is_none());
+        assert_eq!(
+            backend
+                .topology_episode_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(_, Some(_))
+                ))
+                .count(),
+            1,
+            "exactly one combined publication is emitted after all participants are terminal"
+        );
+        let expected = c0_3bi_expected_end_state([output_a, output_b]);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "retire both participants' displaced acquire resources",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .expect("both acquire participants reach a clean end state");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_episode_waits_for_every_participant_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_direct_does_not_survive_the_switch_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, _output_id, connector, _mode, direct) =
+            c0_3bi_live_direct_modeset_fixture(StubBehaviour::AcceptKernelCalls(1_000))
+                .expect("environmental skip: live Vulkan direct modeset fixture");
+        let backend = &mut fixture.backend;
+        // The helper accepts executor IPC; it does not perform VT_RELDISP,
+        // drmDropMaster/drmSetMaster, atomic modesets, or kernel page flips.
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        backend.platform.connector_snapshots_per_device_for_tests =
+            Some(c0_3ci_test_probe_results(backend));
+        let output = OutputKey::new(device, connector);
+        let fb_id_property = u32::from(backend.platform.outputs[0].output.plane_fb_id_prop);
+        let retired_instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("pre-release composed scene instance");
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .any(|resources| {
+                    resources.direct_role.as_ref().is_some_and(|role| {
+                        role.role() == crate::kms::render::resources::DirectRole::Current
+                    })
+                }),
+            "the release begins with a current direct frame"
+        );
+
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "direct-frame acquire known release",
+        );
+        c0_3ci_acquire_through_core_driver(
+            backend,
+            &mut state,
+            "begin composed acquire after direct release",
+        );
+        let reinstall = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device,
+            "accept composed acquire after direct release",
+        );
+        let description = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .last()
+            .expect("acquire records its from-scratch primary-plane install");
+        assert!(
+            description.objects.iter().any(|object| {
+                object.kind == crate::kms::owner::closure::ObjectKind::Plane
+                    && object.old_crtc_id == Some(0)
+                    && object
+                        .props
+                        .iter()
+                        .any(|(property, _)| *property == fb_id_property)
+            }),
+            "the acquire installs a primary framebuffer from scratch"
+        );
+        assert!(
+            description.crtc_state.iter().all(|power| power.new_active),
+            "the default coordinator DPMS level relights the acquire output: {:?}",
+            description.crtc_state
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            reinstall,
+            "apply composed acquire after direct release",
+        );
+        assert!(backend.scanout_m2.current.is_none());
+        assert!(
+            backend
+                .commit_consumer
+                .current_resources
+                .iter()
+                .all(|resources| {
+                    resources.direct_role.as_ref().is_none_or(|role| {
+                        role.role() != crate::kms::render::resources::DirectRole::Current
+                    })
+                }),
+            "Applied acquire has replaced the direct current with composed scanout; current={:?}, releasing={:?}",
+            backend.commit_consumer.current_resources,
+            backend.commit_consumer.releasing_resources
+        );
+        assert!(!backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true),
+            "DPMS On remains installed after acquire; protocol level={}",
+            backend.lifecycle_coordinator.protocol_dpms_level()
+        );
+
+        c0_3bi_repaint_after_owner_unflip(backend, device);
+        let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
+        let clock_key = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(crtc_id))
+            .expect("Applied acquire installs a fresh CRTC clock epoch");
+        c0_3bi_core_driver_until(
+            backend,
+            "complete the post-acquire CRTC clock probe",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock(clock_key))
+                    .is_some_and(|clock| {
+                        clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                    })
+            },
+            None,
+        )
+        .expect("core driver routes the new-epoch clock probe reply");
+        let randr_crtc_id = backend.randr_id_alloc.ids_for(&output).crtc_id;
+        assert_eq!(
+            backend.present_crtc_clock_epoch(randr_crtc_id),
+            clock_key.epoch.get()
+        );
+        let mut reentry = owner_direct_candidate_with_real_import(backend, 0x3b21)
+            .expect("new Present reimports its direct framebuffer after acquire");
+        owner_direct_candidate_use_root_window(&mut reentry, direct.candidate.paint_dst_host_xid);
+        reentry.candidate.crtc_id = randr_crtc_id;
+        reentry.event.crtc_id = randr_crtc_id;
+        reentry.candidate.crtc_epoch = clock_key.epoch.get();
+        reentry.event.crtc_epoch = clock_key.epoch.get();
+        let eligibility = backend.direct_present_eligibility(reentry.candidate);
+        assert!(
+            eligibility.eligible,
+            "new Present eligibility after acquire: {eligibility:?}; output={:?}; epoch={}; active={}; topology={}; composed={:?}; cursor={:?}; overlay_empty={}; owner_active={:?}; target={}",
+            backend.present_crtc_output(reentry.candidate.crtc_id),
+            backend.present_crtc_clock_epoch(reentry.candidate.crtc_id),
+            backend.crtc_outputs_powered_on(reentry.candidate.crtc_id),
+            backend.direct_scanout_topology_eligible(),
+            backend.direct_entry_composed_return_established(device),
+            backend.scene.cursor_mode(),
+            backend.scene.root_overlay.is_empty(),
+            backend.owner_dpms_installed_active.get(&device),
+            reentry.candidate.paint_dst_host_xid,
+        );
+        // Eligibility after the reinstall establishes that a fresh Present
+        // can re-enter direct. Drop its imported candidate before the final
+        // state check; this fixture does not reproduce a real kernel flip.
+        drop(reentry);
+        let mut expected = c0_3bi_expected_end_state([output]);
+        expected.retained_bundles.push(C0ExpectedRetiredBundle {
+            instance: retired_instance,
+            proofs: vec![
+                C0RetiredProofKind::KmsRelease,
+                C0RetiredProofKind::OwnerBuffer,
+            ],
+        });
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_direct_does_not_survive_the_switch_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_mixed_acquire_stages_legacy_changes_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, owner_device, owner_outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let (legacy_device, legacy_output) = c0_3ci_add_legacy_output(backend, 121, 0x3b1_922);
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        let mut probes = c0_3ci_test_probe_results(backend);
+        let owner_probe = probes
+            .get_mut(&owner_device)
+            .expect("Owner probe result")
+            .as_mut()
+            .expect("Owner probe succeeds")
+            .first_mut()
+            .expect("Owner connector");
+        owner_probe.mm_width = owner_probe.mm_width.saturating_add(1);
+        let mut owner_extra_mode = owner_probe
+            .modes
+            .first()
+            .expect("Owner connector mode")
+            .clone();
+        owner_extra_mode.width = owner_extra_mode
+            .width
+            .checked_add(8)
+            .expect("fixture mode width has room for an advertised mode");
+        owner_probe.modes.push(owner_extra_mode);
+        let legacy_probe = probes
+            .get_mut(&legacy_device)
+            .expect("Legacy probe result")
+            .as_mut()
+            .expect("Legacy probe succeeds")
+            .first_mut()
+            .expect("Legacy connector");
+        legacy_probe.mm_width = legacy_probe.mm_width.saturating_add(1);
+        let mut legacy_extra_mode = legacy_probe
+            .modes
+            .first()
+            .expect("Legacy connector mode")
+            .clone();
+        legacy_extra_mode.width = legacy_extra_mode
+            .width
+            .checked_add(8)
+            .expect("fixture mode width has room for an advertised mode");
+        legacy_probe.modes.push(legacy_extra_mode);
+        backend.platform.connector_snapshots_per_device_for_tests = Some(probes);
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
+
+        let mut state = c0_3ci_core_state(backend);
+        let mut listener = c0_3aii_install_dpms_core_client(&mut state, 84);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            owner_device,
+            "mixed-staging acquire known release",
+        );
+        let published_modes = state
+            .randr
+            .outputs
+            .iter()
+            .map(|output| (output.output_id, output.mode_ids.clone()))
+            .collect::<Vec<_>>();
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
+        c0_3ci_acquire_through_core_driver(backend, &mut state, "stage mixed acquire changes");
+
+        assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
+        assert_eq!(
+            backend.platform.dpms_output_calls_for_tests,
+            Some(vec![(true, vec![legacy_output.clone()])]),
+            "the scoped Legacy resume completes before input resumes"
+        );
+        assert_eq!(
+            backend.platform.dpms_output_scopes_for_tests,
+            Some(vec![Some(HashSet::from([legacy_device]))])
+        );
+        let owner_id = backend.randr_id_alloc.ids_for(&owner_outputs[0]).output_id;
+        let legacy_id = backend.randr_id_alloc.ids_for(&legacy_output).output_id;
+        let episode = backend
+            .acquire_episode
+            .as_ref()
+            .expect("Owner reinstall is pending");
+        assert_eq!(
+            episode.remaining,
+            std::collections::BTreeSet::from([owner_device])
+        );
+        let draft = episode
+            .publication
+            .as_ref()
+            .expect("mixed topology changes are staged");
+        assert!(
+            draft
+                .output_changed
+                .iter()
+                .any(|(id, _, _)| *id == owner_id)
+        );
+        assert!(
+            draft
+                .output_changed
+                .iter()
+                .any(|(id, _, _)| *id == legacy_id)
+        );
+        assert_eq!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .map(|output| (output.output_id, output.mode_ids.clone()))
+                .collect::<Vec<_>>(),
+            published_modes,
+            "read requests keep seeing the published mode projection during the episode"
+        );
+        assert!(kbd_map_drain(&mut listener).is_empty());
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_mixed_acquire_stages_legacy_changes_vulkan",
+            &c0_3ci_expected_end_state_with_acquire_preparation(
+                backend,
+                owner_outputs.into_iter().chain([legacy_output]),
+            ),
+        );
+
+        let commit = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            owner_device,
+            "accept mixed Owner reinstall",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            owner_device,
+            commit,
+            "apply mixed Owner reinstall and end episode",
+        );
+        assert!(backend.acquire_episode.is_none());
+        assert_eq!(
+            backend
+                .topology_episode_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(_, Some(_))
+                ))
+                .count(),
+            1,
+            "EpisodeEnd publishes both scoped Legacy and Owner differences together"
+        );
+        assert!(kbd_map_drain(&mut listener).is_empty());
+        let expected = c0_3bi_expected_end_state(
+            backend
+                .platform
+                .outputs
+                .iter()
+                .map(|output| output.key.clone()),
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "retire the mixed acquire's displaced Owner resources",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .expect("the mixed acquire's displaced resources reach a clean end state");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_mixed_acquire_stages_legacy_changes_vulkan after EpisodeEnd",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_vt_switch_emits_nothing_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use std::io::Read;
+
+        fn drain(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            while let Ok(read) = peer.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            bytes
+        }
+
+        let (mut fixture, owner_device, owner_outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let owner = &mut fixture.backend;
+        owner.vt_skip_master_ioctls_for_tests = true;
+        let mut owner_state = c0_3ci_core_state(owner);
+        let mut owner_peer = c0_3aii_install_dpms_core_client(&mut owner_state, 85);
+        c0_3ci_release_owner_to_suspended(
+            owner,
+            &mut owner_state,
+            owner_device,
+            "quiet Owner acquire release",
+        );
+        c0_3ci_acquire_through_core_driver(owner, &mut owner_state, "quiet Owner acquire entry");
+        let owner_commit = c0_3ci_wait_owner_acquire_accepted(
+            owner,
+            &mut owner_state,
+            owner_device,
+            "accept quiet Owner reinstall",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            owner,
+            owner_device,
+            owner_commit,
+            "apply quiet Owner reinstall",
+        );
+        let owner_expected = c0_3bi_expected_end_state(owner_outputs);
+        c0_3bi_core_driver_until_with_state(
+            owner,
+            &mut owner_state,
+            "retire quiet acquire's displaced Owner resources",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &owner_expected).is_empty(),
+            None,
+        )
+        .expect("quiet Owner acquire reaches a clean end state");
+        assert!(matches!(
+            owner.topology_episode_events.back(),
+            Some(yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(
+                _,
+                None
+            ))
+        ));
+        assert!(
+            drain(&mut owner_peer).is_empty(),
+            "Owner emits no RandR bytes"
+        );
+
+        let mut legacy = super::KmsBackend::for_tests();
+        legacy.vt_skip_master_ioctls_for_tests = true;
+        // This Legacy-only seam reports a successful resume without issuing
+        // connector-probe or DPMS modeset ioctls; V14 covers scoped relight.
+        legacy.vt_resume_succeeds_for_tests = true;
+        let legacy_output = legacy.platform.outputs[0].key.clone();
+        let legacy_device = legacy_output.device_key;
+        c0_3ci_install_legacy_probe_snapshot(&mut legacy, legacy_device, &legacy_output);
+        let mut legacy_state = c0_3ci_core_state(&mut legacy);
+        let mut legacy_peer = c0_3aii_install_dpms_core_client(&mut legacy_state, 86);
+        legacy.core_driver_vt_releases_for_tests += 1;
+        c0_3bi_core_driver_until_with_state(
+            &mut legacy,
+            &mut legacy_state,
+            "Legacy VT release entry",
+            std::time::Duration::from_secs(1),
+            &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
+            None,
+        )
+        .expect("Legacy release runs through the core entry driver");
+        legacy.core_driver_vt_acquires_for_tests += 1;
+        c0_3bi_core_driver_until_with_state(
+            &mut legacy,
+            &mut legacy_state,
+            "Legacy VT acquire entry",
+            std::time::Duration::from_secs(1),
+            &|backend| {
+                backend.core_driver_vt_acquires_for_tests == 0
+                    && backend.vt_state == crate::vt::state::VtState::Active
+            },
+            None,
+        )
+        .expect("Legacy acquire runs through the core entry driver");
+        assert!(
+            drain(&mut legacy_peer).is_empty(),
+            "Legacy emits no RandR bytes"
+        );
+        c0_3bi_assert_end_state(
+            owner,
+            "c0_3ci_vt_switch_emits_nothing_vulkan Owner",
+            &owner_expected,
+        );
+        c0_3bi_assert_end_state(
+            &legacy,
+            "c0_3ci_vt_switch_emits_nothing_vulkan Legacy",
+            &c0_3bi_expected_end_state([legacy_output]),
         );
     }
 

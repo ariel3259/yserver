@@ -233,6 +233,15 @@ impl<O: Ord> LifecycleDesired<O> {
         self.seat_epoch = Some(epoch);
     }
 
+    /// A successful probe of an already open DRM incarnation confirms its
+    /// presence without creating a DeviceAddedOrReplaced transition. Keep an
+    /// explicit removal authoritative; only seed a previously unknown value.
+    pub(crate) fn observe_device_present(&mut self) {
+        if self.device_presence.is_none() {
+            self.device_presence = Some(true);
+        }
+    }
+
     pub const fn administrative_reprobe_epoch(&self) -> Option<u64> {
         self.administrative_reprobe_epoch
     }

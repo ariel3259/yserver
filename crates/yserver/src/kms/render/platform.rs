@@ -2816,6 +2816,15 @@ pub struct PlatformBackend {
     /// without issuing GETCONNECTOR ioctls to synthetic device fds.
     #[cfg(test)]
     pub(crate) connector_snapshot_for_tests: Option<Vec<ConnectorSnapshot>>,
+    /// Per-device acquire probe script. `ErrorKind` keeps the hook cloneable
+    /// while each call still returns a fresh `io::Error`.
+    #[cfg(test)]
+    pub(crate) connector_snapshots_per_device_for_tests: Option<
+        std::collections::BTreeMap<
+            crate::platform::drm::DrmDeviceKey,
+            Result<Vec<ConnectorSnapshot>, io::ErrorKind>,
+        >,
+    >,
     /// Records synchronous connector modesets without issuing a DRM commit.
     /// Used by differential tests that exercise the production Legacy path.
     #[cfg(test)]
@@ -3652,6 +3661,8 @@ impl PlatformBackend {
             #[cfg(test)]
             connector_snapshot_for_tests: None,
             #[cfg(test)]
+            connector_snapshots_per_device_for_tests: None,
+            #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
             owner_completion_poller,
@@ -3814,6 +3825,8 @@ impl PlatformBackend {
             drm_event_drain_for_tests: None,
             #[cfg(test)]
             connector_snapshot_for_tests: None,
+            #[cfg(test)]
+            connector_snapshots_per_device_for_tests: None,
             #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
@@ -5075,6 +5088,53 @@ impl PlatformBackend {
             );
         }
         Ok(snapshot)
+    }
+
+    /// Synchronously probe every opened KMS device independently. The result
+    /// preserves each device's failure so the acquire caller can apply the
+    /// Legacy and Owner policies separately.
+    pub(crate) fn probe_connector_snapshots_per_device(
+        &self,
+    ) -> std::collections::BTreeMap<
+        crate::platform::drm::DrmDeviceKey,
+        io::Result<Vec<ConnectorSnapshot>>,
+    > {
+        let mut results = std::collections::BTreeMap::new();
+        for device in &self.devices {
+            #[cfg(test)]
+            let result =
+                if let Some(scripted) = self.connector_snapshots_per_device_for_tests.as_ref() {
+                    scripted
+                        .get(&device.key)
+                        .cloned()
+                        .unwrap_or(Err(io::ErrorKind::NotFound))
+                        .map_err(|kind| io::Error::new(kind, "scripted connector probe failure"))
+                } else {
+                    self.probe_one_connector_snapshot(device.key, device.device.as_ref())
+                };
+            #[cfg(not(test))]
+            let result = self.probe_one_connector_snapshot(device.key, device.device.as_ref());
+
+            results.insert(device.key, result);
+        }
+        results
+    }
+
+    fn probe_one_connector_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        device: &drm::Device,
+    ) -> io::Result<Vec<ConnectorSnapshot>> {
+        let probes = crate::platform::drm::probe_connector_snapshots(device).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("probe connector snapshot on DRM device {key}: {error}"),
+            )
+        })?;
+        Ok(probes
+            .iter()
+            .map(|probe| ConnectorSnapshot::from_probe(key, probe))
+            .collect())
     }
 
     pub(crate) fn output_index_for_crtc(&self, crtc_key: CrtcKey) -> Option<usize> {

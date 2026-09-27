@@ -455,6 +455,22 @@ struct PendingTopologyValidation {
     cancelled: bool,
 }
 
+pub(crate) struct PreparedAcquireTopology {
+    pub(crate) description: CommitDescription,
+    pub(crate) dpms_active: bool,
+    pub(crate) outputs: Vec<PreparedAcquireOutput>,
+}
+
+pub(crate) struct PreparedAcquireOutput {
+    pub(crate) key: crate::kms::backend::OutputKey,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) projection: StagedDpmsProjection,
+    pub(crate) prepared_set: PreparedClientModesetSet,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientModesetPhase {
     Queued,
@@ -535,6 +551,7 @@ pub(crate) struct LifecycleDriver {
     pending_topology_validations: BTreeMap<CommitId, PendingTopologyValidation>,
     pending_client_modeset_validations: BTreeMap<CommitId, PendingClientModesetValidation>,
     topology_commits: BTreeMap<CommitId, TransitionTag<IncarnationId>>,
+    topology_prepared_acquire: BTreeMap<CommitId, PreparedAcquireTopology>,
     client_modeset_commits: BTreeMap<CommitId, ClientModesetTag<IncarnationId>>,
     topology_dpms_active: BTreeMap<CommitId, bool>,
     owner_commit_power_changes: BTreeMap<CommitId, Vec<OwnerCrtcPowerChange>>,
@@ -574,6 +591,8 @@ pub(crate) struct LifecycleDriver {
     pub(crate) client_modeset_promotion_steps: Vec<ClientModesetPromotionStep>,
     #[cfg(test)]
     client_modeset_topology_dispatches: Vec<(ClientModesetTag<IncarnationId>, Tier, usize, usize)>,
+    #[cfg(test)]
+    acquire_topology_descriptions: Vec<CommitDescription>,
 }
 
 impl LifecycleDriver {
@@ -585,6 +604,7 @@ impl LifecycleDriver {
             pending_topology_validations: BTreeMap::new(),
             pending_client_modeset_validations: BTreeMap::new(),
             topology_commits: BTreeMap::new(),
+            topology_prepared_acquire: BTreeMap::new(),
             client_modeset_commits: BTreeMap::new(),
             topology_dpms_active: BTreeMap::new(),
             owner_commit_power_changes: BTreeMap::new(),
@@ -624,7 +644,25 @@ impl LifecycleDriver {
             client_modeset_promotion_steps: Vec::new(),
             #[cfg(test)]
             client_modeset_topology_dispatches: Vec::new(),
+            #[cfg(test)]
+            acquire_topology_descriptions: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_topology_descriptions_for_tests(&self) -> &[CommitDescription] {
+        &self.acquire_topology_descriptions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_acquire_allocation_keys_for_tests(
+        &self,
+    ) -> Vec<crate::kms::render::resources::AllocationKey> {
+        self.topology_prepared_acquire
+            .values()
+            .flat_map(|prepared| prepared.outputs.iter())
+            .flat_map(|output| output.prepared_set.allocation_keys.iter().copied())
+            .collect()
     }
 
     #[cfg(test)]
@@ -1419,7 +1457,17 @@ impl KmsBackend {
                 return true;
             }
         };
+        let live_owner_devices = self
+            .lifecycle_owner_devices()
+            .into_iter()
+            .collect::<HashSet<_>>();
         for dispatch in dispatches {
+            if !live_owner_devices.contains(&dispatch.device) {
+                // A device closed by the synchronous acquire probe remains
+                // withdrawn. The coordinator still records the seat target,
+                // but must not run a lifecycle commit on that incarnation.
+                continue;
+            }
             let requester = self.lifecycle_current_tag(dispatch.device);
             self.lifecycle_queue_actions(dispatch.device, dispatch.actions, requester);
         }
@@ -1681,7 +1729,15 @@ impl KmsBackend {
                     {
                         owner.carry_resolved_clock_context(epoch);
                     }
-                    self.activate_admission_clock_probes(device);
+                    if !current.is_some_and(|transition| {
+                        matches!(
+                            transition.kind,
+                            crate::kms::owner::lifecycle::LifecycleKind::VTRelease
+                                | crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                        )
+                    }) {
+                        self.activate_admission_clock_probes(device);
+                    }
                 }
             }
             LifecycleAction::WithdrawOutputs(_) => self.withdraw_outputs_for_device(device),
@@ -2854,6 +2910,435 @@ impl KmsBackend {
         })
     }
 
+    fn lifecycle_prepare_acquire_topology(
+        &mut self,
+        device: DrmDeviceKey,
+    ) -> Result<PreparedAcquireTopology, String> {
+        #[cfg(not(test))]
+        use crate::drm::modeset::{
+            PropMap, discover_output_for_connector, output_for_exact_probe_assignment,
+        };
+        #[cfg(not(test))]
+        use crate::kms::render::composed_commit::{ComposedPlane, discover_composed_property_ids};
+        use crate::kms::render::{
+            admission::PreparedAcquireOutput,
+            client_modeset::{
+                ClientModesetDescriptionInput, ClientModesetObjects, ClientModesetOperation,
+                ClientModesetPropertyIds, build_client_modeset_description, stage_dpms_projection,
+            },
+        };
+        #[cfg(not(test))]
+        use ::drm::control::Device as _;
+
+        let desired_keys = self
+            .lifecycle_coordinator
+            .device(&device)
+            .ok_or_else(|| "VTAcquire device has no coordinator projection".to_string())?
+            .desired()
+            .dpms_targets()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let requests = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, layout)| {
+                layout.key.device_key == device && desired_keys.contains(&layout.key)
+            })
+            .map(|(index, layout)| {
+                let desired = self
+                    .randr_id_alloc
+                    .entry(&layout.key)
+                    .and_then(|entry| match &entry.config {
+                        crate::kms::render::backend::ConnectorConfig::Enabled {
+                            mode_w,
+                            mode_h,
+                            vrefresh,
+                            x,
+                            y,
+                        } => Some((*mode_w, *mode_h, *vrefresh, *x, *y)),
+                        crate::kms::render::backend::ConnectorConfig::Off => None,
+                    })
+                    .or(Some((
+                        layout.width,
+                        layout.height,
+                        layout.output.picked.vrefresh,
+                        layout.x,
+                        layout.y,
+                    )));
+                let (width, height, vrefresh, x, y) = desired.unwrap_or((
+                    layout.width,
+                    layout.height,
+                    layout.output.picked.vrefresh,
+                    layout.x,
+                    layout.y,
+                ));
+                (
+                    index,
+                    layout.key.clone(),
+                    layout.output.clone(),
+                    layout.scanout_route,
+                    width,
+                    height,
+                    vrefresh,
+                    x,
+                    y,
+                )
+            })
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return Err("VTAcquire has no desired outputs to reinstall".to_string());
+        }
+
+        #[cfg(not(test))]
+        let drm_device = self
+            .platform
+            .device_for_key(device)
+            .map(|entry| std::rc::Rc::clone(&entry.device))
+            .ok_or_else(|| "VTAcquire DRM device disappeared".to_string())?;
+        let level = self.lifecycle_coordinator.protocol_dpms_level();
+        let epoch = self.lifecycle_coordinator.dpms_epoch();
+        let dpms_active = crate::kms::owner::lifecycle::dpms_target_for_level(level)
+            == Some(crate::kms::owner::lifecycle::DpmsTarget::On);
+        let mut descriptions = Vec::with_capacity(requests.len());
+        let mut crtc_state = Vec::with_capacity(requests.len());
+        let mut prepared_sets = Vec::with_capacity(requests.len());
+        let mut common_property_ids = None;
+        #[cfg(not(test))]
+        let mut reserved_routes = requests
+            .iter()
+            .map(|(_, _, output, _, _, _, _, _, _)| (output.encoder, output.crtc, output.plane))
+            .collect::<Vec<_>>();
+
+        let prepare_outputs = (|| -> Result<(), String> {
+            for (_index, key, old_output, _route, width, height, vrefresh, x, y) in requests {
+                #[cfg(not(test))]
+                let requested_mode = yserver_core::backend::ModeSpec {
+                    width,
+                    height,
+                    vrefresh,
+                };
+                #[cfg(test)]
+                let output = {
+                    let mut output = old_output;
+                    let selected = output
+                        .modes
+                        .iter()
+                        .find(|mode| {
+                            mode.width == width
+                                && mode.height == height
+                                && mode.vrefresh == vrefresh
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| output.picked.clone());
+                    output.picked = selected;
+                    output
+                };
+                #[cfg(not(test))]
+                let output = {
+                    reserved_routes.retain(|(_, crtc, _)| *crtc != old_output.crtc);
+                    let discovered = discover_output_for_connector(
+                        &drm_device,
+                        &key.connector_name,
+                        &reserved_routes,
+                    )
+                    .map_err(|error| format!("acquire output discovery for {key:?}: {error}"))?;
+                    let output = output_for_exact_probe_assignment(
+                        &drm_device,
+                        discovered.connector,
+                        discovered.encoder,
+                        discovered.crtc,
+                        discovered.plane,
+                        requested_mode,
+                    )
+                    .map_err(|error| format!("acquire exact mode for {key:?}: {error}"))?;
+                    reserved_routes.push((output.encoder, output.crtc, output.plane));
+                    output
+                };
+                let projection = stage_dpms_projection(key.clone(), level, epoch)
+                    .map_err(|error| format!("acquire DPMS projection for {key:?}: {error}"))?;
+                let properties = {
+                    #[cfg(not(test))]
+                    let device_entry = self
+                        .platform
+                        .devices
+                        .iter_mut()
+                        .find(|entry| entry.key == device)
+                        .ok_or_else(|| "VTAcquire device entry disappeared".to_string())?;
+                    #[cfg(test)]
+                    let common = crate::kms::owner::closure::PropertyIds {
+                        crtc_id: u32::from(output.plane_crtc_id_prop),
+                        active: 21,
+                        out_fence_ptr: output.crtc_out_fence_ptr_prop.map(u32::from).unwrap_or(22),
+                    };
+                    #[cfg(not(test))]
+                    let common = discover_composed_property_ids(
+                        &drm_device,
+                        &[ComposedPlane {
+                            output: &output,
+                            framebuffer: ::drm::control::from_u32(1)
+                                .expect("property discovery framebuffer is nonzero"),
+                        }],
+                        &mut device_entry.active_property_cache,
+                    )
+                    .map_err(|error| format!("acquire KMS properties for {key:?}: {error}"))?;
+                    #[cfg(test)]
+                    let (connector_crtc_id, crtc_mode_id) = (23, 24);
+                    #[cfg(not(test))]
+                    let (connector_crtc_id, crtc_mode_id) = (
+                        u32::from(
+                            PropMap::for_object(&drm_device, output.connector)
+                                .and_then(|properties| properties.id("CRTC_ID"))
+                                .map_err(|error| {
+                                    format!("acquire connector CRTC_ID for {key:?}: {error}")
+                                })?,
+                        ),
+                        u32::from(
+                            PropMap::for_object(&drm_device, output.crtc)
+                                .and_then(|properties| properties.id("MODE_ID"))
+                                .map_err(|error| {
+                                    format!("acquire CRTC MODE_ID for {key:?}: {error}")
+                                })?,
+                        ),
+                    );
+                    ClientModesetPropertyIds {
+                        connector_crtc_id,
+                        crtc_mode_id,
+                        plane_fb_id: u32::from(output.plane_fb_id_prop),
+                        plane_crtc_id: u32::from(output.plane_crtc_id_prop),
+                        plane_src_x: u32::from(output.plane_src_x_prop),
+                        plane_src_y: u32::from(output.plane_src_y_prop),
+                        plane_src_w: u32::from(output.plane_src_w_prop),
+                        plane_src_h: u32::from(output.plane_src_h_prop),
+                        plane_crtc_x: u32::from(output.plane_crtc_x_prop),
+                        plane_crtc_y: u32::from(output.plane_crtc_y_prop),
+                        plane_crtc_w: u32::from(output.plane_crtc_w_prop),
+                        plane_crtc_h: u32::from(output.plane_crtc_h_prop),
+                        common,
+                    }
+                };
+                let common = properties.common;
+                common_property_ids.get_or_insert(common);
+                #[cfg(test)]
+                let (mode_blob_id, mode_blob) =
+                    (0x1000u32.saturating_add(u32::from(output.crtc)), None);
+                #[cfg(not(test))]
+                let (mode_blob_id, mode_blob) = {
+                    let raw: u64 = drm_device
+                        .create_property_blob(&output.mode)
+                        .map_err(|error| format!("acquire MODE_ID blob for {key:?}: {error}"))?
+                        .into();
+                    let blob = crate::kms::render::client_modeset::OwnedModeBlob::new(
+                        std::rc::Rc::clone(&drm_device),
+                        raw,
+                    );
+                    let id = u32::try_from(raw)
+                        .map_err(|_| format!("acquire MODE_ID blob handle overflow for {key:?}"))?;
+                    (id, Some(blob))
+                };
+                let mut scanout = {
+                    #[cfg(test)]
+                    {
+                        let vk = self.platform.vk.as_ref().cloned().ok_or_else(|| {
+                            "VTAcquire test fixture has no Vulkan context".to_string()
+                        })?;
+                        self.platform
+                            .allocate_test_output_scanout(vk, _index)
+                            .map_err(|error| {
+                                format!("acquire fresh test scanout for {key:?}: {error}")
+                            })?
+                    }
+                    #[cfg(not(test))]
+                    {
+                        self.platform
+                            .allocate_prepared_client_scanout_pool(
+                                std::rc::Rc::clone(&drm_device),
+                                &output,
+                                _route,
+                                u32::from(width),
+                                u32::from(height),
+                            )
+                            .map_err(|error| {
+                                format!("acquire fresh scanout pool for {key:?}: {error}")
+                            })?
+                    }
+                };
+                let framebuffer = scanout
+                    .display_pool()
+                    .bos
+                    .first()
+                    .and_then(|bo| bo.fb_handle)
+                    .map(u32::from)
+                    .filter(|framebuffer| *framebuffer != 0)
+                    .ok_or_else(|| {
+                        format!("acquire scanout for {key:?} has no front framebuffer")
+                    })?;
+                let Some(front) = scanout.display_pool_mut().bos.first_mut() else {
+                    return Err(format!("acquire scanout for {key:?} has no BOs"));
+                };
+                front.state.mark_on_screen_after_modeset();
+                scanout
+                    .note_kms_modeset_installed(0)
+                    .map_err(|error| format!("acquire scanout front for {key:?}: {error}"))?;
+                let output_instance_id = self
+                    .platform
+                    .allocate_output_instance_id(&key)
+                    .map_err(|error| format!("acquire output identity for {key:?}: {error}"))?;
+                let scene = self
+                    .scene
+                    .stage_client_output_scene_state(
+                        &key,
+                        output_instance_id,
+                        width,
+                        height,
+                        x,
+                        y,
+                        &scanout,
+                    )
+                    .map_err(|error| format!("acquire scene state for {key:?}: {error}"))?;
+                let incarnation = self
+                    .platform
+                    .owner_ref(device)
+                    .ok_or_else(|| "VTAcquire Owner disappeared during preparation".to_string())?
+                    .incarnation();
+                let clock_key = {
+                    let owner = self.platform.owner_ref(device).ok_or_else(|| {
+                        "VTAcquire Owner disappeared before clock allocation".to_string()
+                    })?;
+                    let hardware_crtc = u32::from(output.crtc);
+                    crate::kms::owner::clock::ClockKey {
+                        hardware_crtc,
+                        epoch: owner.next_clock_epoch_after(
+                            hardware_crtc,
+                            self.next_present_crtc_clock_epoch,
+                        ),
+                    }
+                };
+                let built = build_client_modeset_description(ClientModesetDescriptionInput {
+                    objects: ClientModesetObjects {
+                        connector: u32::from(output.connector),
+                        crtc: u32::from(output.crtc),
+                        primary_plane: u32::from(output.plane),
+                        old_crtc_id: 0,
+                    },
+                    properties,
+                    old_active: false,
+                    operation: ClientModesetOperation::Configure {
+                        width,
+                        height,
+                        framebuffer,
+                        mode_blob: mode_blob_id,
+                        projection: projection.clone(),
+                    },
+                })
+                .map_err(|error| format!("acquire atomic description for {key:?}: {error}"))?;
+                if !self.lifecycle_acquire_resources_match(device, incarnation) {
+                    return Err("VTAcquire resource service is unavailable".to_string());
+                }
+                let service = self
+                    .resource_service
+                    .as_mut()
+                    .expect("acquire resource identity was checked");
+                let registry = self
+                    .drm_cleanup_registry
+                    .as_mut()
+                    .expect("acquire cleanup identity was checked");
+                let allocation_keys = self
+                    .platform
+                    .register_prepared_client_scanout_pool(&mut scanout, service, registry)
+                    .map_err(|error| {
+                        format!("acquire resource registration for {key:?}: {error}")
+                    })?;
+                descriptions.extend(built.description.objects);
+                crtc_state.extend(built.description.crtc_state);
+                prepared_sets.push(PreparedAcquireOutput {
+                    key: key.clone(),
+                    x,
+                    y,
+                    width,
+                    height,
+                    projection,
+                    prepared_set: PreparedClientModesetSet {
+                        output: Some(output),
+                        output_instance_id: Some(output_instance_id),
+                        scanout: Some(scanout),
+                        scene: Some(scene),
+                        clock_key: Some(clock_key),
+                        mode_blob,
+                        allocation_keys,
+                        #[cfg(test)]
+                        framebuffer_handles_for_tests: Vec::new(),
+                    },
+                });
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepare_outputs {
+            self.lifecycle_release_acquire_outputs(prepared_sets);
+            return Err(error);
+        }
+        let Some(property_ids) = common_property_ids else {
+            self.lifecycle_release_acquire_outputs(prepared_sets);
+            return Err("VTAcquire prepared no outputs".to_string());
+        };
+        Ok(PreparedAcquireTopology {
+            description: CommitDescription {
+                objects: descriptions,
+                crtc_state,
+                present_consumers: Vec::new(),
+                page_flip_event: false,
+                property_ids,
+            },
+            dpms_active,
+            outputs: prepared_sets,
+        })
+    }
+
+    fn lifecycle_acquire_resources_match(
+        &self,
+        device: DrmDeviceKey,
+        incarnation: crate::kms::owner::identity::IncarnationId,
+    ) -> bool {
+        let (Some(service), Some(registry)) = (
+            self.resource_service.as_ref(),
+            self.drm_cleanup_registry.as_ref(),
+        ) else {
+            return false;
+        };
+        if service.device() == device
+            && service.incarnation() == incarnation
+            && registry.device_key() == device
+            && registry.incarnation() == incarnation
+        {
+            return true;
+        }
+
+        #[cfg(test)]
+        {
+            use std::os::fd::{AsFd as _, AsRawFd as _};
+
+            // Multi-Owner lifecycle fixtures model a second device identity
+            // by giving it another Owner over the same open DRM fd. Sharing
+            // the fixture service is safe only when the fd is literally the
+            // same and both fixture incarnations match.
+            let same_fd = self
+                .platform
+                .device_for_key(device)
+                .zip(self.platform.device_for_key(service.device()))
+                .is_some_and(|(target, service_device)| {
+                    target.device.as_fd().as_raw_fd() == service_device.device.as_fd().as_raw_fd()
+                });
+            same_fd
+                && service.incarnation() == incarnation
+                && registry.device_key() == service.device()
+                && registry.incarnation() == service.incarnation()
+        }
+        #[cfg(not(test))]
+        false
+    }
+
     fn lifecycle_clock_readiness(
         &self,
         device: DrmDeviceKey,
@@ -3042,7 +3527,47 @@ impl KmsBackend {
             return AdmissionOutcome::NothingAdmissible;
         }
         self.lifecycle_sync_owner_tag(device, tag);
-        let description = match self.lifecycle_topology_description(device) {
+        let acquire_install = self
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .is_some_and(|transition| {
+                transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+            });
+        let prepared_acquire = if acquire_install {
+            match self.lifecycle_prepare_acquire_topology(device) {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    log::warn!("VTAcquire topology preparation refused: {error}");
+                    self.admission_abort(device, token);
+                    self.lifecycle_queue_input(
+                        device,
+                        ArbiterInput::CommitOutcome {
+                            tag,
+                            outcome: LifecycleCommitOutcome::Rejected {
+                                topology_latched_generation: None,
+                            },
+                        },
+                    );
+                    return AdmissionOutcome::PreparationRefused;
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(prepared) = prepared_acquire.as_ref()
+            && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+        {
+            driver
+                .acquire_topology_descriptions
+                .push(prepared.description.clone());
+        }
+        let description = match prepared_acquire
+            .as_ref()
+            .map(|prepared| Ok(prepared.description.clone()))
+            .unwrap_or_else(|| self.lifecycle_topology_description(device))
+        {
             Ok(description) => description,
             Err(error) => {
                 log::warn!("lifecycle topology description refused: {error}");
@@ -3098,14 +3623,20 @@ impl KmsBackend {
                 return AdmissionOutcome::BeginRefused;
             }
         }
-        let dpms_active = self.lifecycle_coordinator.protocol_dpms_level() == 0
-            && self
-                .lifecycle_coordinator
-                .device(&device)
-                .and_then(|arbiter| arbiter.transition())
-                .is_none_or(|transition| {
-                    transition.kind != crate::kms::owner::lifecycle::LifecycleKind::VTRelease
-                });
+        let dpms_active = prepared_acquire.as_ref().map_or_else(
+            || {
+                self.lifecycle_coordinator.protocol_dpms_level() == 0
+                    && self
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .and_then(|arbiter| arbiter.transition())
+                        .is_none_or(|transition| {
+                            transition.kind
+                                != crate::kms::owner::lifecycle::LifecycleKind::VTRelease
+                        })
+            },
+            |prepared| prepared.dpms_active,
+        );
         let validation_result = self.platform.owner_for(device).map(|owner| {
             owner.begin_validation_with_options(
                 &description,
@@ -3116,6 +3647,9 @@ impl KmsBackend {
         let validation_commit = match validation_result {
             Some(Ok(commit)) => commit,
             Some(Err(error)) => {
+                if let Some(prepared) = prepared_acquire {
+                    self.lifecycle_release_acquire_topology(prepared);
+                }
                 self.admission_abort(device, token);
                 if Self::lifecycle_dispatch_error_is_transient(&error) {
                     return AdmissionOutcome::BeginRefused;
@@ -3127,6 +3661,9 @@ impl KmsBackend {
                 return AdmissionOutcome::BeginRefused;
             }
             None => {
+                if let Some(prepared) = prepared_acquire {
+                    self.lifecycle_release_acquire_topology(prepared);
+                }
                 log::error!(
                     "lifecycle validation for {device:?} was never dispatched: owner disappeared"
                 );
@@ -3148,6 +3685,11 @@ impl KmsBackend {
                     cancelled: false,
                 },
             );
+            if let Some(prepared) = prepared_acquire {
+                driver
+                    .topology_prepared_acquire
+                    .insert(validation_commit, prepared);
+            }
         }
 
         #[cfg(test)]
@@ -4184,6 +4726,7 @@ impl KmsBackend {
         {
             let _ = conductor.admission.abort(token);
         }
+        self.lifecycle_release_acquire_prepared_for_commit(device, commit);
     }
 
     fn lifecycle_finish_client_modeset_validation(
@@ -4845,6 +5388,14 @@ impl KmsBackend {
                 return;
             }
         };
+        if let Some(prepared) = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.topology_prepared_acquire.remove(&validation_commit))
+            && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+        {
+            driver.topology_prepared_acquire.insert(commit, prepared);
+        }
         let dependencies_ready = self.resource_service.as_mut().is_some_and(|service| {
             register_commit_dependencies(commit, Vec::new(), Vec::new(), service).is_ok()
         });
@@ -5412,6 +5963,13 @@ impl KmsBackend {
         tag: TransitionTag<IncarnationId>,
         terminal: TerminalState,
     ) {
+        let acquire_install = self
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .is_some_and(|transition| {
+                transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+            });
         let transient_refusal = matches!(
             terminal,
             TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
@@ -5448,6 +6006,17 @@ impl KmsBackend {
             }
         }
         let current = self.lifecycle_tag_current(device, tag);
+        let prepared_acquire = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.topology_prepared_acquire.remove(&commit));
+        if let Some(prepared) = prepared_acquire {
+            if current && terminal == TerminalState::Completed {
+                self.lifecycle_promote_acquire_topology(device, prepared);
+            } else {
+                self.lifecycle_release_acquire_topology(prepared);
+            }
+        }
         #[cfg(test)]
         if !current && let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.stale_results = driver.stale_results.saturating_add(1);
@@ -5498,6 +6067,9 @@ impl KmsBackend {
                     );
                 }
                 TerminalState::CompletionUnknown(_) => {
+                    if acquire_install {
+                        self.close_owner_after_acquire_probe_failure(device);
+                    }
                     self.lifecycle_report_completion_loss(device);
                 }
             }
@@ -5522,13 +6094,277 @@ impl KmsBackend {
                     },
                 ),
                 TerminalState::CompletionUnknown(_) => {
+                    if acquire_install {
+                        self.close_owner_after_acquire_probe_failure(device);
+                    }
                     self.lifecycle_report_completion_loss(device)
                 }
             }
         }
+        if acquire_install {
+            self.acquire_episode_participant_terminal(device);
+        }
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.topology_commits.remove(&commit);
             driver.topology_dpms_active.remove(&commit);
+        }
+    }
+
+    fn lifecycle_release_acquire_topology(&mut self, prepared: PreparedAcquireTopology) {
+        self.lifecycle_release_acquire_outputs(prepared.outputs);
+    }
+
+    fn lifecycle_release_acquire_outputs(&mut self, outputs: Vec<PreparedAcquireOutput>) {
+        let Some(device) = outputs.first().map(|output| output.key.device_key) else {
+            return;
+        };
+        let incarnation = outputs
+            .iter()
+            .find_map(|output| output.prepared_set.output.as_ref())
+            .and_then(|_| self.platform.owner_ref(device))
+            .map(|owner| owner.incarnation());
+        let Some(incarnation) = incarnation else {
+            return;
+        };
+        if !self.lifecycle_acquire_resources_match(device, incarnation) {
+            return;
+        }
+        let Some(service) = self.resource_service.as_mut() else {
+            return;
+        };
+        let Some(registry) = self.drm_cleanup_registry.as_mut() else {
+            return;
+        };
+        for output in outputs {
+            output.prepared_set.release(service, registry);
+        }
+    }
+
+    fn lifecycle_release_acquire_prepared_for_commit(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+    ) {
+        if let Some(prepared) = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.topology_prepared_acquire.remove(&commit))
+        {
+            self.lifecycle_release_acquire_topology(prepared);
+        }
+    }
+
+    fn lifecycle_promote_acquire_topology(
+        &mut self,
+        device: DrmDeviceKey,
+        prepared: PreparedAcquireTopology,
+    ) {
+        use crate::kms::backend::ActiveOutput;
+
+        let mut identity_map = self.scene.stage_output_identity_map();
+        let replacement_keys = prepared
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect::<BTreeSet<_>>();
+        let mut retired_instances = Vec::new();
+        let mut installed_clocks = Vec::new();
+
+        for output in prepared.outputs {
+            let mut set = output.prepared_set;
+            let new_output = set
+                .output
+                .take()
+                .expect("prepared acquire owns each discovered KMS output");
+            let instance_id = set
+                .output_instance_id
+                .take()
+                .expect("prepared acquire owns each reserved output instance");
+            let scanout = set
+                .scanout
+                .take()
+                .expect("prepared acquire owns each fresh scanout pool");
+            let staged_scene = set
+                .scene
+                .take()
+                .expect("prepared acquire owns each staged scene state");
+            let clock_key = set
+                .clock_key
+                .take()
+                .expect("prepared acquire owns each new clock epoch");
+            let route = scanout.route();
+            let bo_count = scanout.display_pool().bos.len();
+            assert!(bo_count != 0, "acquire pool has an initial scanout BO");
+
+            if let Some(index) = self
+                .platform
+                .outputs
+                .iter()
+                .position(|layout| layout.key == output.key)
+            {
+                retired_instances.push(self.platform.output_instance_ids[index]);
+                let old_pool = self.platform.scanout_pools[index]
+                    .take()
+                    .expect("a surviving Owner route retains its prior pool");
+                identity_map.replace(&output.key, staged_scene, old_pool);
+                let layout = &mut self.platform.outputs[index];
+                layout.output = new_output;
+                layout.scanout_route = route;
+                layout.x = output.x;
+                layout.y = output.y;
+                layout.width = output.width;
+                layout.height = output.height;
+                self.platform.scanout_pools[index] = Some(scanout);
+                self.platform.output_instance_ids[index] = instance_id;
+                self.platform.bo_generations[index] = vec![Default::default(); bo_count];
+                self.platform.first_pageflip_logged[index] = false;
+            } else {
+                identity_map.insert(output.key.clone(), staged_scene);
+                self.platform.outputs.push(ActiveOutput::new(
+                    route,
+                    new_output,
+                    crate::drm::Swapchain::empty_for_tests(),
+                    output.x,
+                    output.y,
+                ));
+                self.platform
+                    .outputs
+                    .last_mut()
+                    .expect("new output appended")
+                    .width = output.width;
+                self.platform
+                    .outputs
+                    .last_mut()
+                    .expect("new output appended")
+                    .height = output.height;
+                self.platform.scanout_pools.push(Some(scanout));
+                self.platform.output_instance_ids.push(instance_id);
+                self.platform
+                    .bo_generations
+                    .push(vec![Default::default(); bo_count]);
+                self.platform.first_pageflip_logged.push(false);
+            }
+
+            let entry = self.randr_id_alloc.entry_mut(&output.key);
+            entry.config = crate::kms::render::backend::ConnectorConfig::Enabled {
+                mode_w: output.width,
+                mode_h: output.height,
+                vrefresh: self
+                    .platform
+                    .outputs
+                    .iter()
+                    .find(|layout| layout.key == output.key)
+                    .expect("installed acquire output exists")
+                    .output
+                    .picked
+                    .vrefresh,
+                x: output.x,
+                y: output.y,
+            };
+            entry.crtc_associated = true;
+            entry.client_configured = true;
+            entry.connected = true;
+            entry.last_enabled = None;
+            let installed_clock = self
+                .platform
+                .owner_for(device)
+                .expect("Owner remains live through acquire promotion");
+            installed_clock.install_modeset_clock_epoch(clock_key);
+            self.next_present_crtc_clock_epoch = self.next_present_crtc_clock_epoch.max(
+                clock_key
+                    .epoch
+                    .get()
+                    .checked_add(1)
+                    .expect("clock epoch reserved"),
+            );
+            installed_clocks.push(clock_key);
+            self.lifecycle_coordinator
+                .commit_staged_protocol_output(&device, output.projection.output);
+            set.mode_blob.take();
+        }
+
+        let mut index = self.platform.outputs.len();
+        while index > 0 {
+            index -= 1;
+            let key = self.platform.outputs[index].key.clone();
+            if key.device_key != device || replacement_keys.contains(&key) {
+                continue;
+            }
+            if let Some(pool) = self.platform.scanout_pools[index].take() {
+                identity_map.remove(&key, pool);
+            }
+            retired_instances.push(self.platform.output_instance_ids[index]);
+            self.platform.outputs.remove(index);
+            self.platform.scanout_pools.remove(index);
+            self.platform.output_instance_ids.remove(index);
+            self.platform.bo_generations.remove(index);
+            self.platform.first_pageflip_logged.remove(index);
+            let entry = self.randr_id_alloc.entry_mut(&key);
+            entry.config = crate::kms::render::backend::ConnectorConfig::Off;
+            entry.crtc_associated = false;
+            entry.client_configured = false;
+            entry.last_enabled = None;
+        }
+
+        let old_extent = (self.platform.fb_w, self.platform.fb_h);
+        let (fb_w, fb_h) = crate::kms::render::platform::recompute_fb_extent_from(
+            &self
+                .platform
+                .outputs
+                .iter()
+                .map(|layout| (layout.x, layout.y, layout.width, layout.height))
+                .collect::<Vec<_>>(),
+        );
+        self.platform.fb_w = fb_w;
+        self.platform.fb_h = fb_h;
+        self.update_input_extent(fb_w, fb_h);
+        let root_extent_changed = old_extent != (fb_w, fb_h);
+        let affected_devices = if root_extent_changed {
+            self.lifecycle_conductors_devices_for_root_change()
+        } else {
+            std::collections::HashSet::from([device])
+        };
+        for affected in affected_devices {
+            let _ = self.admission_advance_layout_generation(affected);
+        }
+
+        let retired_offers = self
+            .scene
+            .promote_output_identity_map(&self.platform, identity_map);
+        self.withdraw_retired_composed_offers(retired_offers);
+        for instance in retired_instances {
+            self.scene.retire_current_owner_buffer_in_bundle(instance);
+        }
+        self.commit_consumer.retire_current_for_device(device);
+        self.clear_scanout_m1_after_topology_replacement();
+        self.stop_direct_after_scanout_replaced("Owner VT acquire reinstall");
+        self.scene.invalidate_all_scanout_damage();
+        self.scene.wake_for_damage();
+        self.owner_dpms_installed_active
+            .insert(device, prepared.dpms_active);
+        self.kms_outputs_active = self
+            .platform
+            .outputs
+            .iter()
+            .any(|layout| layout.key.device_key == device && prepared.dpms_active);
+        self.update_resource_service_activity();
+        self.refresh_present_crtc_clock_epochs();
+
+        if prepared.dpms_active {
+            for key in installed_clocks {
+                self.modeset_lit_clock_probes
+                    .insert((device, key.hardware_crtc, key.epoch.get()));
+                self.retain_waiting_clock_probe(device, key);
+                self.promote_waiting_clock_probe(device);
+            }
+        }
+        let affected_devices = if root_extent_changed {
+            self.lifecycle_conductors_devices_for_root_change()
+        } else {
+            std::collections::HashSet::from([device])
+        };
+        for affected in affected_devices {
+            let _ = self.admission_wake(affected, false);
         }
     }
 

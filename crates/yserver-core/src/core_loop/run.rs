@@ -2384,6 +2384,16 @@ pub fn run_core(
                             Message::VtAcquire => {
                                 if backend.vt_switching_armed() {
                                     backend.on_vt_acquire(state);
+                                    // Owner acquire reserves RANDR mutations
+                                    // inside the backend entry. Consume the
+                                    // begin marker before this channel batch
+                                    // reaches the pending-request drain below.
+                                    drain_requesterless_publications(
+                                        state,
+                                        backend,
+                                        &mut randr_mutation_gate,
+                                        true,
+                                    );
                                 }
                             }
                             Message::SwitchVt(vt) => {
@@ -7644,6 +7654,142 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1]
         );
+    }
+
+    #[test]
+    fn c0_3ci_acquire_reserves_the_turn_before_pending_requests() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::{UnixListener, UnixStream},
+            time::Duration,
+        };
+
+        use crate::{
+            backend::{
+                TopologyEpisodeEvent,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            core_loop::{Message, channel},
+        };
+
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "yserver-c0-vt-episode-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let listener = UnixListener::bind(&path).expect("bind core-loop test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("make core-loop test listener nonblocking");
+        let (poll, sender, receiver) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let mut state = make_c0_randr_state();
+        let mut backend = RecordingBackend::new();
+        backend.crtc_config_is_install_capable = true;
+        let token = crate::backend::CrtcConfigToken(773);
+        backend.pending_crtc_config = Some(token);
+        let calls = std::sync::Arc::clone(&backend.calls);
+        let episodes = backend.topology_episode_producer(sender.clone_handle());
+        backend.arm_vt_acquire_episode_for_tests(episodes.clone(), 77);
+        let core = std::thread::spawn(move || {
+            let result = run_core(
+                poll,
+                receiver,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                [Listener::Unix(listener)],
+                &ClientIdAllocator::new(),
+                AuthState::new(None),
+                ResetPolicy::NoReset,
+                None,
+            );
+            (result, backend)
+        });
+
+        let establish_client = || {
+            let mut peer = UnixStream::connect(&path).expect("connect core-loop test client");
+            peer.set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set core-loop test client timeout");
+            peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .expect("send X11 setup request");
+            let mut setup_header = [0; 8];
+            peer.read_exact(&mut setup_header)
+                .expect("read X11 setup reply");
+            assert_eq!(setup_header[0], 1, "X11 setup succeeded");
+            let setup_body_len =
+                usize::from(u16::from_le_bytes([setup_header[6], setup_header[7]])) * 4;
+            peer.read_exact(&mut vec![0; setup_body_len])
+                .expect("read X11 setup body");
+            peer.write_all(&[43, 0, 1, 0])
+                .expect("send setup GetInputFocus");
+            let mut setup_query_reply = [0; 32];
+            peer.read_exact(&mut setup_query_reply)
+                .expect("read setup GetInputFocus reply");
+            peer
+        };
+        let mut mutation_peer = establish_client();
+        let mut query_peer = establish_client();
+
+        sender.send(Message::VtAcquire).unwrap();
+        let mut set_request = vec![128, yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG, 8, 0];
+        set_request.extend_from_slice(&set_crtc_body(3));
+        mutation_peer
+            .write_all(&set_request)
+            .expect("send SetCrtcConfig");
+        // The round trip proves the core has processed the preceding
+        // mutation request. It bypasses the RANDR gate, while the mutation
+        // remains parked behind the episode begun by VtAcquire.
+        query_peer
+            .write_all(&[43, 0, 1, 0])
+            .expect("send GetInputFocus");
+        let mut before_end = [0; 32];
+        query_peer
+            .read_exact(&mut before_end)
+            .expect("query replies while acquire episode is open");
+        assert_eq!(before_end[0], 1, "query received an X11 reply");
+        assert_eq!(
+            u16::from_le_bytes(before_end[2..4].try_into().unwrap()),
+            2,
+            "query replies while SetCrtcConfig stays parked"
+        );
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::ApplyCrtcConfig { .. })),
+            "SetCrtcConfig must not dispatch before EpisodeEnd"
+        );
+
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeEnd(77, None))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::ApplyCrtcConfig { .. }))
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::ApplyCrtcConfig { .. })),
+            "EpisodeEnd releases the queued mutation"
+        );
+        sender.send(Message::Shutdown).unwrap();
+        let (result, _backend) = core.join().unwrap();
+        result.unwrap();
+        drop(mutation_peer);
+        drop(query_peer);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

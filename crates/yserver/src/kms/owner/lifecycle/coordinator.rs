@@ -529,6 +529,18 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
             .collect()
     }
 
+    /// Record that a successful synchronous probe confirmed an existing open
+    /// device incarnation. This is an observation, not a hotplug lifecycle
+    /// event, so it cannot create a second install ahead of VTAcquire.
+    pub fn observe_device_present(&mut self, device: &D) -> Result<(), CoordinatorError> {
+        self.devices
+            .get_mut(device)
+            .ok_or(CoordinatorError::UnknownDevice)?
+            .arbiter
+            .observe_device_present();
+        Ok(())
+    }
+
     /// Feed acknowledged driver/executor inputs to one arbiter. Event and
     /// completion-loss inputs stay coordinator-owned.
     pub fn apply_device_input(

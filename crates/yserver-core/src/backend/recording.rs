@@ -297,7 +297,7 @@ impl TopologyEpisodeProducer {
 
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
-    pub calls: Mutex<Vec<RecordedCall>>,
+    pub calls: Arc<Mutex<Vec<RecordedCall>>>,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -401,6 +401,8 @@ pub struct RecordingBackend {
     /// Script whether the current pending CRTC token may still install.
     /// Defaults to `false`, like backends that only park a PRIME probe.
     pub crtc_config_is_install_capable: bool,
+    vt_switching_armed_for_tests: bool,
+    vt_acquire_episode_for_tests: Option<(TopologyEpisodeProducer, u64)>,
     /// Script what requester abandonment does for the current token.
     pub crtc_config_requester_abandon: RequesterAbandon,
     /// Number of forced RANDR connector reprobes performed by tests.
@@ -613,7 +615,7 @@ impl Default for RecordingBackend {
 impl RecordingBackend {
     pub fn new() -> Self {
         Self {
-            calls: Mutex::new(Vec::new()),
+            calls: Arc::new(Mutex::new(Vec::new())),
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -655,6 +657,8 @@ impl RecordingBackend {
             finished_crtc_configs: Vec::new(),
             cancelled_crtc_configs: Vec::new(),
             crtc_config_is_install_capable: false,
+            vt_switching_armed_for_tests: false,
+            vt_acquire_episode_for_tests: None,
             crtc_config_requester_abandon: RequesterAbandon::Cancelled,
             reprobe_connectors_calls: 0,
             reprobe_connectors_changes_state: false,
@@ -749,6 +753,17 @@ impl RecordingBackend {
             events: Arc::clone(&self.topology_episode_events),
             sender,
         }
+    }
+
+    /// Make the core-loop harness's VtAcquire entry enqueue EpisodeBegin,
+    /// matching the KMS backend's synchronous acquire-entry contract.
+    pub fn arm_vt_acquire_episode_for_tests(
+        &mut self,
+        producer: TopologyEpisodeProducer,
+        episode_id: u64,
+    ) {
+        self.vt_switching_armed_for_tests = true;
+        self.vt_acquire_episode_for_tests = Some((producer, episode_id));
     }
 
     /// Configure the backend-owned fds exposed to the core poller and a
@@ -920,6 +935,20 @@ impl Backend for RecordingBackend {
 
     fn window_id(&self) -> u32 {
         self.fake_window_id
+    }
+
+    fn vt_switching_armed(&self) -> bool {
+        self.vt_switching_armed_for_tests
+    }
+
+    fn on_vt_acquire(&mut self, _state: &mut crate::server::ServerState) {
+        if let Some((producer, episode_id)) = self.vt_acquire_episode_for_tests.take() {
+            producer
+                .enqueue(crate::backend::TopologyEpisodeEvent::EpisodeBegin(
+                    episode_id,
+                ))
+                .expect("test topology episode wake reaches the core loop");
+        }
     }
 
     fn reprobe_connectors(&mut self, state: &mut crate::server::ServerState) -> io::Result<()> {
