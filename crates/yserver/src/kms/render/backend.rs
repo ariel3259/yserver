@@ -87283,7 +87283,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     struct C0VtSwitchGuard {
         control_tty: std::fs::File,
-        _target_tty: std::fs::File,
+        _target_tty: Option<std::fs::File>,
         original_vt: libc::c_int,
     }
 
@@ -87401,15 +87401,20 @@ mod tests {
                 return;
             }
             let target_tty_path = format!("/dev/tty{free_vt}");
+            // Holding the target VT open is optional: VT_ACTIVATE on the
+            // controlling tty allocates it. Spare VTs are root-owned on a
+            // logind system, so a failed open must not skip the test.
             let target_tty = match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&target_tty_path)
             {
-                Ok(file) => file,
+                Ok(file) => Some(file),
                 Err(error) => {
-                    eprintln!("environmental skip: cannot open {target_tty_path}: {error}");
-                    return;
+                    eprintln!(
+                        "VT test: not holding {target_tty_path} open ({error}); VT_ACTIVATE allocates it"
+                    );
+                    None
                 }
             };
 
