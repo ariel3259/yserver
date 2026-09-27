@@ -88371,7 +88371,15 @@ mod tests {
                     None,
                 )
                 .unwrap_or_else(|error| {
-                    panic!("cycle {cycle}: acquire end state did not settle: {error}")
+                    panic!(
+                        "cycle {cycle}: acquire end state did not settle: {error}; errors: {:#?}; \
+                         retired bundles: {:?}",
+                        c0_3bi_end_state_errors(
+                            backend,
+                            &c0_3bi_expected_end_state(expected_live_outputs.clone()),
+                        ),
+                        backend.scene.retired_output_end_states_for_tests()
+                    )
                 });
                 c0_3bi_assert_end_state(
                     backend,
