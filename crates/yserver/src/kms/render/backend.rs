@@ -87547,16 +87547,31 @@ mod tests {
                 Backend::request_vt_switch(backend, u32::try_from(free_vt).unwrap());
                 signal_mask.wait_for(libc::SIGUSR1, Duration::from_secs(5));
                 Backend::on_vt_release(backend, &mut state);
-                let release_commit = backend
-                    .device_owner_for_tests(0)
-                    .live_record()
-                    .map(|record| record.commit_id());
+                // The release commit is dispatched by the lifecycle driver on a
+                // later core entry, not inside on_vt_release: record it while
+                // driving to the hand-off.
+                let release_commit = std::cell::Cell::new(
+                    backend
+                        .device_owner_for_tests(0)
+                        .live_record()
+                        .map(|record| record.commit_id()),
+                );
                 c0_3bi_core_driver_until_with_state(
                     backend,
                     &mut state,
                     "card1 Owner release hand-off",
                     Duration::from_secs(2),
-                    &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
+                    &|backend| {
+                        if release_commit.get().is_none() {
+                            release_commit.set(
+                                backend
+                                    .device_owner_for_tests(0)
+                                    .live_record()
+                                    .map(|record| record.commit_id()),
+                            );
+                        }
+                        backend.vt_state == crate::vt::state::VtState::Suspended
+                    },
                     None,
                 )
                 .unwrap_or_else(|error| panic!("cycle {cycle}: release hand-off failed: {error}"));
@@ -87575,7 +87590,7 @@ mod tests {
                 );
                 if cycle == 1 {
                     assert!(
-                        release_commit.is_some(),
+                        release_commit.get().is_some(),
                         "first release dispatched ACTIVE=0"
                     );
                     assert!(
