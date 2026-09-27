@@ -87859,6 +87859,12 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
+            // Block VT_PROCESS signals before any Vulkan, DRM, or executor
+            // fixture can create worker threads. They inherit this mask, and
+            // this test consumes the pending signals with sigtimedwait.
+            let signal_mask = C0VtSignalMaskGuard::block()
+                .expect("block SIGUSR1/SIGUSR2 before creating hardware worker threads");
+
             use std::{
                 os::fd::{AsFd, AsRawFd},
                 path::PathBuf,
@@ -87878,9 +87884,6 @@ mod tests {
                 eprintln!("environmental skip: /dev/dri/card1 is unavailable: {error}");
                 return;
             }
-
-            let signal_mask = C0VtSignalMaskGuard::block()
-                .expect("block SIGUSR1/SIGUSR2 before creating hardware worker threads");
             let console_guard = match ConsoleGuard::acquire(None) {
                 Ok(Some(guard)) => guard,
                 Ok(None) => {
@@ -88131,6 +88134,7 @@ mod tests {
                     .expect("pre-acquire scene instance");
                 let composed_offers_before = backend.core_driver_composed_offers_for_tests.len();
 
+                let reinstall_seen = std::cell::Cell::new(false);
                 Backend::request_vt_switch(backend, u32::try_from(original_vt).unwrap());
                 signal_mask.wait_for(libc::SIGUSR2, Duration::from_secs(5));
                 backend.core_driver_vt_acquires_for_tests += 1;
@@ -88140,24 +88144,72 @@ mod tests {
                     "card1 Owner acquire starts its lifecycle reinstall",
                     Duration::from_secs(15),
                     &|backend| {
+                        // On real hardware the reinstall may be dispatched and
+                        // complete between two checks; latch having seen it.
+                        if backend.device_owner_for_tests(0).live_record().is_some_and(|record| {
+                            record.completion_context().class
+                                == crate::kms::owner::completion::CompletionClass::LifecycleInstallRestore
+                                && record.completion_context().allow_modeset
+                        }) {
+                            reinstall_seen.set(true);
+                        }
                         backend.core_driver_vt_acquires_for_tests == 0
                             && backend.lifecycle_drivers[&device]
                                 .acquire_topology_descriptions_for_tests()
                                 .len()
                                 > acquire_description_count
-                            && backend
-                                .device_owner_for_tests(0)
-                                .live_record()
-                                .is_some_and(|record| {
-                                    record.completion_context().class
-                                        == crate::kms::owner::completion::CompletionClass::LifecycleInstallRestore
-                                        && record.completion_context().allow_modeset
-                                })
+                            && reinstall_seen.get()
                     },
                     None,
                 )
                 .unwrap_or_else(|error| {
-                    panic!("cycle {cycle}: acquire reinstall was not dispatched: {error}")
+                    let stats = backend.lifecycle_drivers[&device].topology_test_stats();
+                    let arbiter = backend.lifecycle_coordinator.device(&device);
+                    panic!(
+                        "{}",
+                        format!(
+                        "cycle {cycle}: acquire reinstall was not dispatched: {error}; \
+                         vt_acquires_pending={}; vt_state={:?}; reinstall_seen={}; \
+                         acquire_descriptions={} (before {}); arbiter_transition={:?}; \
+                         live_record={:?}; admission_closed={}; dpms_installed={:?}",
+                        backend.core_driver_vt_acquires_for_tests,
+                        backend.vt_state,
+                        reinstall_seen.get(),
+                        backend.lifecycle_drivers[&device]
+                            .acquire_topology_descriptions_for_tests()
+                            .len(),
+                        acquire_description_count,
+                        backend
+                            .lifecycle_coordinator
+                            .device(&device)
+                            .map(|arbiter| arbiter.transition()),
+                        backend.device_owner_for_tests(0).live_record().map(|record| (
+                            record.commit_id(),
+                            record.state(),
+                            record.completion_context().class,
+                            record.milestones(),
+                        )),
+                        backend.admission_conductors[&device].lifecycle_admission_closed,
+                        backend.owner_dpms_installed_active.get(&device),
+                    ) + &format!(
+                        "; validation_sends={} live_sends={} stale_before_test_only={} \
+                         stale_before_live_dispatch={} stale_results={}; \
+                         pending_validation_commits={:?}; arbiter_state={:?}; \
+                         seat_target={:?}; device_presence={:?}; admission_trace_tail={:?}",
+                        stats.0.len(),
+                        stats.1.len(),
+                        stats.2,
+                        stats.3,
+                        stats.4,
+                        backend.lifecycle_drivers[&device].pending_topology_validation_commits_for_tests(),
+                        arbiter.map(|arbiter| arbiter.state()),
+                        arbiter.and_then(|arbiter| arbiter.desired().seat_target()),
+                        arbiter.and_then(|arbiter| arbiter.desired().device_presence()),
+                        {
+                            let trace = backend.admission_trace_for_tests(device);
+                            trace[trace.len().saturating_sub(12)..].to_vec()
+                        },
+                    ))
                 });
                 assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
                 assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
