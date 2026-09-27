@@ -87726,62 +87726,176 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    struct C0VtSignalMaskGuard {
-        signals: libc::sigset_t,
-        previous: libc::sigset_t,
+    static C0_VT_SIGUSR1_RECORDED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(target_os = "linux")]
+    static C0_VT_SIGUSR2_RECORDED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" fn c0_vt_test_signal_handler(signal: libc::c_int) {
+        use std::sync::atomic::Ordering;
+
+        match signal {
+            libc::SIGUSR1 => C0_VT_SIGUSR1_RECORDED.store(true, Ordering::Relaxed),
+            libc::SIGUSR2 => C0_VT_SIGUSR2_RECORDED.store(true, Ordering::Relaxed),
+            _ => {}
+        }
     }
 
     #[cfg(target_os = "linux")]
-    impl C0VtSignalMaskGuard {
-        fn block() -> io::Result<Self> {
+    struct C0VtSignalGuard {
+        signals: libc::sigset_t,
+        previous_mask: libc::sigset_t,
+        previous_usr1: libc::sigaction,
+        previous_usr2: libc::sigaction,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl C0VtSignalGuard {
+        fn install_and_block() -> io::Result<Self> {
+            use std::sync::atomic::Ordering;
+
             let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-            let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-            // SAFETY: both sigset pointers refer to writable stack storage.
+            // SAFETY: sigemptyset initializes the writable sigset and
+            // sigaddset only reads that initialized value.
             let initialized = unsafe { libc::sigemptyset(signals.as_mut_ptr()) } == 0
                 && unsafe { libc::sigaddset(signals.as_mut_ptr(), libc::SIGUSR1) } == 0
                 && unsafe { libc::sigaddset(signals.as_mut_ptr(), libc::SIGUSR2) } == 0;
             if !initialized {
                 return Err(io::Error::last_os_error());
             }
-            // SAFETY: the signal sets are initialized and the previous set
-            // points to writable storage.
+            // SAFETY: sigaction is a C struct whose zero initialization gives
+            // empty flags/mask and a null restorer before fields are assigned.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: the action mask is writable and initialized here.
+            if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            action.sa_sigaction = c0_vt_test_signal_handler as *const () as usize;
+            action.sa_flags = 0;
+
+            let mut previous_usr1 = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+            // SAFETY: action is initialized and previous_usr1 points to
+            // writable storage for the prior process-wide disposition.
+            if unsafe { libc::sigaction(libc::SIGUSR1, &action, previous_usr1.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the successful sigaction call initialized previous_usr1.
+            let previous_usr1 = unsafe { previous_usr1.assume_init() };
+
+            let mut previous_usr2 = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+            // SAFETY: action is initialized and previous_usr2 points to
+            // writable storage for the prior process-wide disposition.
+            if unsafe { libc::sigaction(libc::SIGUSR2, &action, previous_usr2.as_mut_ptr()) } != 0 {
+                let error = io::Error::last_os_error();
+                // SAFETY: previous_usr1 was captured above.
+                let _ =
+                    unsafe { libc::sigaction(libc::SIGUSR1, &previous_usr1, std::ptr::null_mut()) };
+                return Err(error);
+            }
+            // SAFETY: the successful sigaction call initialized previous_usr2.
+            let previous_usr2 = unsafe { previous_usr2.assume_init() };
+
+            let mut previous_mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: signals is initialized and previous_mask is writable.
             let result = unsafe {
-                libc::pthread_sigmask(libc::SIG_BLOCK, signals.as_ptr(), previous.as_mut_ptr())
+                libc::pthread_sigmask(
+                    libc::SIG_BLOCK,
+                    signals.as_ptr(),
+                    previous_mask.as_mut_ptr(),
+                )
             };
             if result != 0 {
-                return Err(io::Error::from_raw_os_error(result));
+                let error = io::Error::from_raw_os_error(result);
+                // SAFETY: both previous dispositions were captured above.
+                let _ =
+                    unsafe { libc::sigaction(libc::SIGUSR2, &previous_usr2, std::ptr::null_mut()) };
+                // SAFETY: previous_usr1 was captured above.
+                let _ =
+                    unsafe { libc::sigaction(libc::SIGUSR1, &previous_usr1, std::ptr::null_mut()) };
+                return Err(error);
             }
-            // SAFETY: pthread_sigmask succeeded and initialized both sets.
+            // SAFETY: pthread_sigmask succeeded and initialized previous_mask.
+            let previous_mask = unsafe { previous_mask.assume_init() };
+            C0_VT_SIGUSR1_RECORDED.store(false, Ordering::Relaxed);
+            C0_VT_SIGUSR2_RECORDED.store(false, Ordering::Relaxed);
             Ok(Self {
                 signals: unsafe { signals.assume_init() },
-                previous: unsafe { previous.assume_init() },
+                previous_mask,
+                previous_usr1,
+                previous_usr2,
             })
         }
 
         fn wait_for(&self, expected: libc::c_int, timeout: std::time::Duration) {
-            let wait = libc::timespec {
-                tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
-                tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+            use std::sync::atomic::Ordering;
+
+            let recorded = match expected {
+                libc::SIGUSR1 => &C0_VT_SIGUSR1_RECORDED,
+                libc::SIGUSR2 => &C0_VT_SIGUSR2_RECORDED,
+                _ => panic!("unsupported VT signal {expected}"),
             };
-            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
-            // SAFETY: the set is initialized, and sigtimedwait writes at most
-            // one siginfo value to the provided stack storage.
-            let signal = unsafe { libc::sigtimedwait(&self.signals, info.as_mut_ptr(), &wait) };
-            assert_eq!(
-                signal,
-                expected,
-                "timed out or received the wrong VT signal: expected {expected}, got {signal}: {}",
-                io::Error::last_os_error()
-            );
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if recorded.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    if recorded.swap(false, Ordering::Relaxed) {
+                        return;
+                    }
+                    panic!("timed out waiting for VT signal {expected}");
+                }
+                let slice = remaining.min(std::time::Duration::from_millis(10));
+                let wait = libc::timespec {
+                    tv_sec: libc::time_t::try_from(slice.as_secs()).unwrap_or(libc::time_t::MAX),
+                    tv_nsec: libc::c_long::from(slice.subsec_nanos()),
+                };
+                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+                // SAFETY: the signal set is initialized, and sigtimedwait
+                // writes at most one siginfo value to this writable storage.
+                let signal = unsafe { libc::sigtimedwait(&self.signals, info.as_mut_ptr(), &wait) };
+                if signal == expected {
+                    let _ = recorded.swap(false, Ordering::Relaxed);
+                    return;
+                }
+                if signal >= 0 {
+                    panic!("received the wrong VT signal: expected {expected}, got {signal}");
+                }
+                let error = io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) {
+                    continue;
+                }
+                panic!("sigtimedwait for VT signal {expected} failed: {error}");
+            }
         }
     }
 
     #[cfg(target_os = "linux")]
-    impl Drop for C0VtSignalMaskGuard {
+    impl Drop for C0VtSignalGuard {
         fn drop(&mut self) {
-            // SAFETY: previous was filled by pthread_sigmask in `block`.
+            // Restore the process-wide handlers while SIGUSR1/SIGUSR2 remain
+            // blocked in this thread, then restore its previous mask.
+            // SAFETY: both prior actions were filled by sigaction above.
+            let usr2 = unsafe {
+                libc::sigaction(libc::SIGUSR2, &self.previous_usr2, std::ptr::null_mut())
+            };
+            // SAFETY: previous_usr1 was filled by sigaction above.
+            let usr1 = unsafe {
+                libc::sigaction(libc::SIGUSR1, &self.previous_usr1, std::ptr::null_mut())
+            };
+            if usr1 != 0 || usr2 != 0 {
+                log::warn!(
+                    "hardware VT test could not restore signal dispositions: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            // SAFETY: previous_mask was filled by pthread_sigmask above.
             let result = unsafe {
-                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous_mask, std::ptr::null_mut())
             };
             if result != 0 {
                 log::warn!("hardware VT test could not restore the signal mask: {result}");
@@ -87873,11 +87987,12 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            // Block VT_PROCESS signals before any Vulkan, DRM, or executor
-            // fixture can create worker threads. They inherit this mask, and
-            // this test consumes the pending signals with sigtimedwait.
-            let signal_mask = C0VtSignalMaskGuard::block()
-                .expect("block SIGUSR1/SIGUSR2 before creating hardware worker threads");
+            // Install process-wide handlers before any Vulkan, DRM, or
+            // executor fixture can create worker threads. Existing harness
+            // threads may receive process-directed signals, so their handler
+            // records arrivals while this test thread consumes blocked ones.
+            let signal_guard = C0VtSignalGuard::install_and_block()
+                .expect("handle and block SIGUSR1/SIGUSR2 before hardware setup");
 
             use std::{
                 os::fd::{AsFd, AsRawFd},
@@ -88078,7 +88193,7 @@ mod tests {
             for cycle in 1..=4 {
                 let release_started = Instant::now();
                 Backend::request_vt_switch(backend, u32::try_from(free_vt).unwrap());
-                signal_mask.wait_for(libc::SIGUSR1, Duration::from_secs(5));
+                signal_guard.wait_for(libc::SIGUSR1, Duration::from_secs(5));
                 Backend::on_vt_release(backend, &mut state);
                 // The release commit is dispatched by the lifecycle driver on a
                 // later core entry, not inside on_vt_release: record it while
@@ -88150,7 +88265,7 @@ mod tests {
 
                 let reinstall_seen = std::cell::Cell::new(false);
                 Backend::request_vt_switch(backend, u32::try_from(original_vt).unwrap());
-                signal_mask.wait_for(libc::SIGUSR2, Duration::from_secs(5));
+                signal_guard.wait_for(libc::SIGUSR2, Duration::from_secs(5));
                 backend.core_driver_vt_acquires_for_tests += 1;
                 c0_3bi_core_driver_until_with_state(
                     backend,
@@ -88393,9 +88508,6 @@ mod tests {
                 "c0_hw_3c_vt_switch_on_card1_drm",
                 &c0_3bi_expected_end_state(outputs),
             );
-            // The switch guard restores VT_AUTO and the original text VT
-            // before the live-KMS fixture restores its captured CRTC.
-            let _ = &signal_mask;
         }
     }
 
@@ -94555,9 +94667,37 @@ mod tests {
         Vec<OutputKey>,
         yserver_core::backend::ModeSpec,
     ) {
-        let (mut fixture, device, _, _, target_mode) =
+        let (fixture, device, _, _, target_mode) =
             c0_3bi_live_modeset_backend(behaviour, two_outputs)
                 .expect("environmental skip: live Vulkan release fixture");
+        c0_3ci_finish_live_release_fixture(fixture, device, target_mode, two_outputs)
+    }
+
+    fn c0_3ci_live_release_fixture_with_completed_front(
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> (
+        OwnerLiveFixture,
+        DrmDeviceKey,
+        Vec<OutputKey>,
+        yserver_core::backend::ModeSpec,
+    ) {
+        let (fixture, device, _, _, target_mode) =
+            c0_3bi_live_modeset_backend_with_completed_composed_front(behaviour)
+                .expect("environmental skip: live Vulkan release fixture with composed front");
+        c0_3ci_finish_live_release_fixture(fixture, device, target_mode, false)
+    }
+
+    fn c0_3ci_finish_live_release_fixture(
+        mut fixture: OwnerLiveFixture,
+        device: DrmDeviceKey,
+        target_mode: yserver_core::backend::ModeSpec,
+        two_outputs: bool,
+    ) -> (
+        OwnerLiveFixture,
+        DrmDeviceKey,
+        Vec<OutputKey>,
+        yserver_core::backend::ModeSpec,
+    ) {
         if two_outputs {
             // The second output is synthetic but shares the real device's
             // property schema. The executor stub does not issue a real
@@ -96708,6 +96848,128 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_releases_the_displaced_released_front_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, _) = c0_3ci_live_release_fixture_with_completed_front(
+            StubBehaviour::AcceptKernelCalls(1_000),
+        );
+        let backend = &mut fixture.backend;
+        let output_key = outputs[0].clone();
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == output_key)
+            .expect("the live Owner output");
+        let old_instance = backend
+            .scene
+            .output_instance_id_for_tests(output_idx)
+            .expect("the pre-release output instance");
+        let old_allocations =
+            c0_3bi_scanout_allocation_keys(backend, device, &output_key.connector_name);
+        assert!(
+            backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .expect("pre-release scanout pool")
+                .display_pool()
+                .bos
+                .iter()
+                .any(|bo| bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen),
+            "the setup has a composed front framebuffer attached to KMS"
+        );
+
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "release with an onscreen framebuffer",
+        );
+        assert_eq!(
+            backend.scene.output_instance_id_for_tests(output_idx),
+            Some(old_instance),
+            "the ACTIVE=0 release keeps the old output pool installed"
+        );
+        assert!(
+            backend.platform.scanout_pools[output_idx]
+                .as_ref()
+                .expect("release retains its scanout pool")
+                .display_pool()
+                .bos
+                .iter()
+                .any(|bo| bo.state.phase == crate::kms::vk::scanout::BoPhase::OnScreen),
+            "the release commit leaves the primary framebuffer attached"
+        );
+
+        c0_3ci_acquire_through_core_driver(
+            backend,
+            &mut state,
+            "start acquire that displaces the released front buffer",
+        );
+        let reinstall = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device,
+            "accept acquire that displaces the released front buffer",
+        );
+        let registered_allocations = c0_3bi_kms_displacements(backend, device, reinstall)
+            .into_iter()
+            .map(|registration| registration.allocation)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            reinstall,
+            "complete acquire that displaces the released front buffer",
+        );
+        let expected = c0_3bi_expected_end_state(outputs);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "acquire releases the displaced output pool",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; errors: {:#?}; retired bundles: {:?}",
+                c0_3bi_end_state_errors(backend, &expected),
+                backend.scene.retired_output_end_states_for_tests()
+            )
+        });
+        assert_eq!(
+            registered_allocations,
+            old_allocations
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the reinstall registers every allocation in the displaced old pool"
+        );
+        assert!(
+            backend
+                .scene
+                .retired_output_end_states_for_tests()
+                .iter()
+                .all(|bundle| bundle.instance != old_instance),
+            "the displaced output bundle is destroyed after reinstall completion"
+        );
+        assert!(old_allocations.iter().all(|key| {
+            backend
+                .resource_service()
+                .is_none_or(|service| !service.contains(key))
+        }));
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_releases_the_displaced_released_front_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
     fn c0_3ci_acquire_reinstalls_from_scratch_vulkan() {
         use crate::kms::executor::test_support::StubBehaviour;
 
@@ -97276,7 +97538,13 @@ mod tests {
             &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
             None,
         )
-        .expect("both acquire participants reach a clean end state");
+        .unwrap_or_else(|error| {
+            panic!(
+                "both acquire participants reach a clean end state: {error}; errors: {:#?}; retired bundles: {:?}",
+                c0_3bi_end_state_errors(backend, &expected),
+                backend.scene.retired_output_end_states_for_tests()
+            )
+        });
         c0_3bi_assert_end_state(
             backend,
             "c0_3ci_acquire_episode_waits_for_every_participant_vulkan",

@@ -1876,14 +1876,32 @@ impl KmsBackend {
         )>,
         ResourceError,
     > {
-        let Some(output_idx) = self.platform.outputs.iter().position(|output| {
-            output.key == crate::kms::backend::OutputKey::new(device, connector)
-        }) else {
+        let output_key = crate::kms::backend::OutputKey::new(device, connector);
+        self.modeset_displaced_pool_for_output(&output_key, target_crtc)
+    }
+
+    fn modeset_displaced_pool_for_output(
+        &self,
+        output_key: &crate::kms::backend::OutputKey,
+        target_crtc: u32,
+    ) -> Result<
+        Option<(
+            GroupMember,
+            Vec<crate::kms::render::resources::AllocationKey>,
+        )>,
+        ResourceError,
+    > {
+        let Some(output_idx) = self
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key == *output_key)
+        else {
             return Ok(None);
         };
         let output = &self.platform.outputs[output_idx];
-        let crtc = CrtcKey::for_output(output);
-        if u32::from(crtc.crtc) != target_crtc {
+        let device = output_key.device_key;
+        if u32::from(output.output.crtc) != target_crtc {
             return Err(ResourceError::InvalidState);
         }
         let scanout = self
@@ -1905,6 +1923,20 @@ impl KmsBackend {
             .iter()
             .map(|bo| bo.managed_key().ok_or(ResourceError::InvalidState))
             .collect::<Result<Vec<_>, _>>()?;
+        let resource_device = allocations
+            .first()
+            .map(|allocation| allocation.device)
+            .ok_or(ResourceError::InvalidState)?;
+        if allocations.iter().any(|allocation| {
+            allocation.device != resource_device
+                || allocation.incarnation != allocations[0].incarnation
+        }) {
+            return Err(ResourceError::InvalidState);
+        }
+        // Use the physical device identity carried by the allocations. Test
+        // fixtures can expose a logical Owner output over a shared DRM fd, but
+        // the resource service's KMS proof must still name that fd's device.
+        let crtc = CrtcKey::new(resource_device, output.output.crtc);
         let owner = self
             .platform
             .owner_ref(device)
@@ -1916,6 +1948,74 @@ impl KmsBackend {
             .get();
         let member = GroupMember::new(crtc, owner.topology_generation(), clock_epoch);
         Ok(Some((member, allocations)))
+    }
+
+    fn lifecycle_acquire_displaced_pools(
+        &self,
+        device: DrmDeviceKey,
+        validation_commit: CommitId,
+    ) -> Result<
+        Vec<(
+            GroupMember,
+            Vec<crate::kms::render::resources::AllocationKey>,
+        )>,
+        ResourceError,
+    > {
+        let Some(prepared) = self
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.topology_prepared_acquire.get(&validation_commit))
+        else {
+            return Ok(Vec::new());
+        };
+        let mut displaced = Vec::new();
+        for output in &prepared.outputs {
+            let target_crtc = output
+                .prepared_set
+                .output
+                .as_ref()
+                .map(|output| u32::from(output.crtc))
+                .ok_or(ResourceError::InvalidState)?;
+            if let Some(pool) = self.modeset_displaced_pool_for_output(&output.key, target_crtc)? {
+                displaced.push(pool);
+            }
+        }
+        Ok(displaced)
+    }
+
+    fn lifecycle_register_topology_resources(
+        &mut self,
+        commit: CommitId,
+        displaced_pools: &[(
+            GroupMember,
+            Vec<crate::kms::render::resources::AllocationKey>,
+        )],
+    ) -> Result<Vec<crate::kms::render::resources::KmsReleaseObligation>, ResourceError> {
+        let service = self
+            .resource_service
+            .as_mut()
+            .ok_or(ResourceError::InvalidState)?;
+        register_commit_dependencies(commit, Vec::new(), Vec::new(), service)
+            .map_err(|(error, _, _)| error)?;
+
+        let mut registrations = Vec::new();
+        for (member, allocations) in displaced_pools {
+            match crate::kms::render::resources::register_kms_displacements(
+                commit,
+                *member,
+                allocations,
+                service,
+            ) {
+                Ok(mut registered) => registrations.append(&mut registered),
+                Err(error) => {
+                    for registration in registrations.drain(..) {
+                        let _ = service.cancel(registration.allocation, registration.obligation);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(registrations)
     }
 
     pub(crate) fn lifecycle_complete_kms_displacements(
@@ -5314,6 +5414,31 @@ impl KmsBackend {
         let Some(token) = pending.token.take() else {
             return;
         };
+        let displaced_pools = match self
+            .lifecycle_acquire_displaced_pools(device, validation_commit)
+        {
+            Ok(displaced_pools) => displaced_pools,
+            Err(error) => {
+                if let Some(owner) = self.platform.owner_for(device) {
+                    let _ = owner.abandon_validation(validation_commit);
+                }
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                log::error!(
+                    "lifecycle topology displacement resources were not ready for {device:?}: {error:?}"
+                );
+                self.lifecycle_dispose_topology_result(
+                    device,
+                    validation_commit,
+                    tag,
+                    TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                        RefusalCause::OwnerInternalError,
+                    )),
+                );
+                return;
+            }
+        };
         let expected_crtcs = pending
             .description
             .crtc_state
@@ -5478,42 +5603,50 @@ impl KmsBackend {
         {
             driver.topology_prepared_acquire.insert(commit, prepared);
         }
-        let dependencies_ready = self.resource_service.as_mut().is_some_and(|service| {
-            register_commit_dependencies(commit, Vec::new(), Vec::new(), service).is_ok()
-        });
-        if !dependencies_ready {
-            let events = self
-                .platform
-                .owner_for(device)
-                .and_then(|owner| owner.cancel_live(commit).ok())
-                .unwrap_or_default();
-            if let Some(conductor) = self.admission_conductors.get_mut(&device) {
-                let _ = conductor.admission.abort(token);
+        let registrations = match self
+            .lifecycle_register_topology_resources(commit, &displaced_pools)
+        {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                log::error!(
+                    "lifecycle topology resource obligations were not ready for {device:?}: {error:?}"
+                );
+                let events = self
+                    .platform
+                    .owner_for(device)
+                    .and_then(|owner| owner.cancel_live(commit).ok())
+                    .unwrap_or_default();
+                if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                    let _ = conductor.admission.abort(token);
+                }
+                self.lifecycle_drivers
+                    .get_mut(&device)
+                    .expect("Owner lifecycle driver")
+                    .topology_commits
+                    .insert(commit, tag);
+                self.lifecycle_drivers
+                    .get_mut(&device)
+                    .expect("Owner lifecycle driver")
+                    .topology_dpms_active
+                    .insert(commit, dpms_active);
+                self.lifecycle_drivers
+                    .get_mut(&device)
+                    .expect("Owner lifecycle driver")
+                    .owner_commit_power_changes
+                    .insert(commit, owner_commit_power_changes);
+                let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
+                return;
             }
-            self.lifecycle_drivers
-                .get_mut(&device)
-                .expect("Owner lifecycle driver")
-                .topology_commits
-                .insert(commit, tag);
-            self.lifecycle_drivers
-                .get_mut(&device)
-                .expect("Owner lifecycle driver")
-                .topology_dpms_active
-                .insert(commit, dpms_active);
-            self.lifecycle_drivers
-                .get_mut(&device)
-                .expect("Owner lifecycle driver")
-                .owner_commit_power_changes
-                .insert(commit, owner_commit_power_changes);
-            let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
-            return;
-        }
+        };
         if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
             driver.topology_commits.insert(commit, tag);
             driver.topology_dpms_active.insert(commit, dpms_active);
             driver
                 .owner_commit_power_changes
                 .insert(commit, owner_commit_power_changes);
+            if !registrations.is_empty() {
+                driver.kms_displacements.insert(commit, registrations);
+            }
         }
 
         #[cfg(test)]
