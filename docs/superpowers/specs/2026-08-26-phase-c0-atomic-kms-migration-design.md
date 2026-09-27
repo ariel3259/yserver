@@ -395,10 +395,17 @@ continuous cursor motion:
 
 - `CursorServiceRate`, the distinct cursor generations retired per second, falls
   below `DemotionRatio` of the CRTC's mode-derived refresh rate; **and**
-- the p99 helper-measured duration of that window's cursor-affecting host calls
-  exceeds `CursorHostCallMax`.
+- the cause is attributable to the cursor path: the p99 helper-measured
+  duration of that window's cursor-affecting host calls exceeds
+  `CursorHostCallMax`, **or** *(revision 5 review, B-1)* the p99 latency from
+  dispatch to canonical out-fence completion of that window's **cursor-only**
+  commits (commits whose only changed state is cursor-plane state) exceeds
+  `CursorCompletionMax` = two mode periods of that CRTC. A prompt ioctl whose
+  cursor update retires late is therefore a cause, not only a slow ioctl.
+  Cursor-only commits carry no client primary, so a slow client's cadence and
+  unrelated primary work cannot enter this latency term.
 
-Both are required. Section 9.2.1 tier-3 absorption can pin cursor updates to a
+Both the symptom and a cause are required. Section 9.2.1 tier-3 absorption can pin cursor updates to a
 slow client's cadence on healthy hardware, so the symptom alone does not demote
 a correct device; helper-measured host-call duration separates a slow driver
 call from ordinary scheduling. Demotion requires consecutive qualifying
@@ -878,6 +885,16 @@ when `SynchronousAtomicMove` keeps a hardware cursor visible over a direct frame
 it preserves the production-tested direct-frame composition beneath the cursor,
 while the device's single atomic slot serializes cursor and primary updates.
 
+*(Revision 5 review, M-1.)* **The direct primary composes below the cursor.**
+Structural capability for `AtomicHardware` over direct scanout requires that
+the selected primary plane stack below the selected cursor plane: when both
+planes expose `zpos`, the cursor's value must exceed the primary's (an
+immutable `zpos` that violates it makes the pair structurally incapable, and
+a mutable one is set explicitly in the commit); when `zpos` is absent, DRM's
+plane-type order (primary below cursor) is the assumption, recorded in the
+capability record. A pair that fails the check keeps the ordered
+software/unflip transition for a visible cursor.
+
 ### 7.1. Coordinate transport qualification
 
 (Removed in revision 5 — see §16.3.)
@@ -1204,8 +1221,10 @@ overtake.
 
 Every admitted synchronous request includes only compatible persistent cursor
 or gamma generations that actually changed. An unchanged cursor plane is
-omitted from the atomic request rather than copied defensively, and coordinate-
-only intent is never absorbed. A tier-3 retirement successor must additionally
+omitted from the atomic request rather than copied defensively. *(Revision 5
+review, m-1.)* A changed cursor position is ordinary persistent cursor-plane
+state: a compatible changed position may be absorbed like any other changed
+cursor generation. A tier-3 retirement successor must additionally
 absorb every changed aged maintenance identity that would precede it; otherwise
 it is ineligible for that tier. A retirement-promoted successor that absorbs a maintenance
 generation consumes that generation's ticket exactly as a maintenance-selected
@@ -2790,6 +2809,18 @@ watchdog, and timeout never becomes acceptance-unknown hardware state.
     invalidate, or applying to an output the transaction did not stage, fails.
     A direct transaction's milestones apply to no composed buffer's damage
     state.
+85. [`CAP-4`] *(Revision 5 review, B-1.)* Continuous cursor motion whose
+    cursor-only commits get prompt ioctl replies but retire their out-fences
+    later than two mode periods demotes the device after consecutive windows;
+    the same late retirement caused by a slow client's absorbed cadence or
+    by unrelated primary work does not demote. Mutation: drop the
+    completion-latency cause term, and the first case stays on hardware.
+86. [`CAP-1`, `CURSOR-LIFECYCLE`] *(Revision 5 review, M-1.)* A direct
+    candidate whose primary would stack above the cursor (an immutable
+    `zpos` ordering primary over cursor) is not eligible for `AtomicHardware`
+    over direct scanout and takes the ordered software/unflip transition for a
+    visible cursor; a mutable `zpos` is set explicitly in the commit. Mutation:
+    skip the stacking check, and the cursor is hidden under the direct frame.
 
 ### 16.3. Hardware validation
 
