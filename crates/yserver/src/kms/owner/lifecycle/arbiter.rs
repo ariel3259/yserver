@@ -191,6 +191,10 @@ pub enum LifecycleCommitOutcome {
         /// `None` closes readiness until another lifecycle transition.
         topology_latched_generation: Option<u64>,
     },
+    /// A `VTAcquire` reinstall's `TEST_ONLY` or submit was explicitly rejected.
+    /// No KMS state changed, so the acquire attempt ends closed and withdrawn;
+    /// it must not strand a no-transition `Quiescing` arbiter or retry itself.
+    AcquireInstallRejected,
 }
 
 /// Typed actions for the 3a-ii driver. Actions assert obligations only; the
@@ -1014,6 +1018,38 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                 if self.admission_open && self.transition.is_none() {
                     actions.push(LifecycleAction::ReopenAdmission(self.current_work_tag()));
                 }
+            }
+            LifecycleCommitOutcome::AcquireInstallRejected => {
+                debug_assert_eq!(active.kind, LifecycleKind::VTAcquire);
+                if let Some(representative) = self
+                    .desired
+                    .representative(DesiredField::Seat)
+                    .filter(|representative| representative.kind == LifecycleKind::VTAcquire)
+                {
+                    self.set_disposition(
+                        representative.event_id,
+                        Disposition::Invalidated(super::InvalidationReason::RecoveryFailed),
+                        &mut actions,
+                    );
+                    self.pending_recovery_allocation = Some((
+                        representative.event_id,
+                        super::IncidentSeed {
+                            origin: super::IncidentOrigin::Boundary,
+                            initial_state: super::RecoveryIncidentState::RecoveryFailed,
+                        },
+                    ));
+                    actions.push(LifecycleAction::AllocateRecoveryIncident {
+                        event_id: representative.event_id,
+                        seed: super::IncidentSeed {
+                            origin: super::IncidentOrigin::Boundary,
+                            initial_state: super::RecoveryIncidentState::RecoveryFailed,
+                        },
+                    });
+                }
+                self.state = DeviceLifecycleState::RecoveryFailed;
+                self.admission_open = false;
+                self.transition = None;
+                self.coalesced_epoch_bumped = false;
             }
         }
         actions

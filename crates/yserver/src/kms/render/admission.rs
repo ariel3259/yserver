@@ -2910,24 +2910,24 @@ impl KmsBackend {
         })
     }
 
-    fn lifecycle_prepare_acquire_topology(
+    pub(super) fn lifecycle_prepare_acquire_topology(
         &mut self,
         device: DrmDeviceKey,
     ) -> Result<PreparedAcquireTopology, String> {
-        #[cfg(not(test))]
-        use crate::drm::modeset::{
-            PropMap, discover_output_for_connector, output_for_exact_probe_assignment,
-        };
-        #[cfg(not(test))]
-        use crate::kms::render::composed_commit::{ComposedPlane, discover_composed_property_ids};
-        use crate::kms::render::{
-            admission::PreparedAcquireOutput,
-            client_modeset::{
-                ClientModesetDescriptionInput, ClientModesetObjects, ClientModesetOperation,
-                ClientModesetPropertyIds, build_client_modeset_description, stage_dpms_projection,
+        use crate::{
+            drm::modeset::{
+                PropMap, discover_output_for_connector, output_for_exact_probe_assignment,
+            },
+            kms::render::{
+                admission::PreparedAcquireOutput,
+                client_modeset::{
+                    ClientModesetDescriptionInput, ClientModesetObjects, ClientModesetOperation,
+                    ClientModesetPropertyIds, build_client_modeset_description,
+                    stage_dpms_projection,
+                },
+                composed_commit::{ComposedPlane, discover_composed_property_ids},
             },
         };
-        #[cfg(not(test))]
         use ::drm::control::Device as _;
 
         let desired_keys = self
@@ -2992,7 +2992,6 @@ impl KmsBackend {
             return Err("VTAcquire has no desired outputs to reinstall".to_string());
         }
 
-        #[cfg(not(test))]
         let drm_device = self
             .platform
             .device_for_key(device)
@@ -3006,7 +3005,6 @@ impl KmsBackend {
         let mut crtc_state = Vec::with_capacity(requests.len());
         let mut prepared_sets = Vec::with_capacity(requests.len());
         let mut common_property_ids = None;
-        #[cfg(not(test))]
         let mut reserved_routes = requests
             .iter()
             .map(|(_, _, output, _, _, _, _, _, _)| (output.encoder, output.crtc, output.plane))
@@ -3014,14 +3012,40 @@ impl KmsBackend {
 
         let prepare_outputs = (|| -> Result<(), String> {
             for (_index, key, old_output, _route, width, height, vrefresh, x, y) in requests {
-                #[cfg(not(test))]
                 let requested_mode = yserver_core::backend::ModeSpec {
                     width,
                     height,
                     vrefresh,
                 };
                 #[cfg(test)]
-                let output = {
+                let use_live_kms_discovery = self.acquire_uses_live_kms_discovery_for_tests
+                    && drm_device.resource_handles().is_ok_and(|resources| {
+                        resources.connectors().contains(&old_output.connector)
+                    });
+                // Live-KMS fixtures can also carry synthetic secondary Owner
+                // outputs. Keep those on their seeded schema; real connectors
+                // use the same fresh object/property discovery as production.
+                #[cfg(test)]
+                let output = if use_live_kms_discovery {
+                    reserved_routes.retain(|(_, crtc, _)| *crtc != old_output.crtc);
+                    let discovered = discover_output_for_connector(
+                        &drm_device,
+                        &key.connector_name,
+                        &reserved_routes,
+                    )
+                    .map_err(|error| format!("acquire output discovery for {key:?}: {error}"))?;
+                    let output = output_for_exact_probe_assignment(
+                        &drm_device,
+                        discovered.connector,
+                        discovered.encoder,
+                        discovered.crtc,
+                        discovered.plane,
+                        requested_mode,
+                    )
+                    .map_err(|error| format!("acquire exact mode for {key:?}: {error}"))?;
+                    reserved_routes.push((output.encoder, output.crtc, output.plane));
+                    output
+                } else {
                     let mut output = old_output;
                     let selected = output
                         .modes
@@ -3060,7 +3084,6 @@ impl KmsBackend {
                 let projection = stage_dpms_projection(key.clone(), level, epoch)
                     .map_err(|error| format!("acquire DPMS projection for {key:?}: {error}"))?;
                 let properties = {
-                    #[cfg(not(test))]
                     let device_entry = self
                         .platform
                         .devices
@@ -3068,10 +3091,26 @@ impl KmsBackend {
                         .find(|entry| entry.key == device)
                         .ok_or_else(|| "VTAcquire device entry disappeared".to_string())?;
                     #[cfg(test)]
-                    let common = crate::kms::owner::closure::PropertyIds {
-                        crtc_id: u32::from(output.plane_crtc_id_prop),
-                        active: 21,
-                        out_fence_ptr: output.crtc_out_fence_ptr_prop.map(u32::from).unwrap_or(22),
+                    let common = if use_live_kms_discovery {
+                        discover_composed_property_ids(
+                            &drm_device,
+                            &[ComposedPlane {
+                                output: &output,
+                                framebuffer: ::drm::control::from_u32(1)
+                                    .expect("property discovery framebuffer is nonzero"),
+                            }],
+                            &mut device_entry.active_property_cache,
+                        )
+                        .map_err(|error| format!("acquire KMS properties for {key:?}: {error}"))?
+                    } else {
+                        crate::kms::owner::closure::PropertyIds {
+                            crtc_id: u32::from(output.plane_crtc_id_prop),
+                            active: 21,
+                            out_fence_ptr: output
+                                .crtc_out_fence_ptr_prop
+                                .map(u32::from)
+                                .unwrap_or(22),
+                        }
                     };
                     #[cfg(not(test))]
                     let common = discover_composed_property_ids(
@@ -3085,7 +3124,26 @@ impl KmsBackend {
                     )
                     .map_err(|error| format!("acquire KMS properties for {key:?}: {error}"))?;
                     #[cfg(test)]
-                    let (connector_crtc_id, crtc_mode_id) = (23, 24);
+                    let (connector_crtc_id, crtc_mode_id) = if use_live_kms_discovery {
+                        (
+                            u32::from(
+                                PropMap::for_object(&drm_device, output.connector)
+                                    .and_then(|properties| properties.id("CRTC_ID"))
+                                    .map_err(|error| {
+                                        format!("acquire connector CRTC_ID for {key:?}: {error}")
+                                    })?,
+                            ),
+                            u32::from(
+                                PropMap::for_object(&drm_device, output.crtc)
+                                    .and_then(|properties| properties.id("MODE_ID"))
+                                    .map_err(|error| {
+                                        format!("acquire CRTC MODE_ID for {key:?}: {error}")
+                                    })?,
+                            ),
+                        )
+                    } else {
+                        (23, 24)
+                    };
                     #[cfg(not(test))]
                     let (connector_crtc_id, crtc_mode_id) = (
                         u32::from(
@@ -3122,8 +3180,21 @@ impl KmsBackend {
                 let common = properties.common;
                 common_property_ids.get_or_insert(common);
                 #[cfg(test)]
-                let (mode_blob_id, mode_blob) =
-                    (0x1000u32.saturating_add(u32::from(output.crtc)), None);
+                let (mode_blob_id, mode_blob) = if use_live_kms_discovery {
+                    let raw: u64 = drm_device
+                        .create_property_blob(&output.mode)
+                        .map_err(|error| format!("acquire MODE_ID blob for {key:?}: {error}"))?
+                        .into();
+                    let blob = crate::kms::render::client_modeset::OwnedModeBlob::new(
+                        std::rc::Rc::clone(&drm_device),
+                        raw,
+                    );
+                    let id = u32::try_from(raw)
+                        .map_err(|_| format!("acquire MODE_ID blob handle overflow for {key:?}"))?;
+                    (id, Some(blob))
+                } else {
+                    (0x1000u32.saturating_add(u32::from(output.crtc)), None)
+                };
                 #[cfg(not(test))]
                 let (mode_blob_id, mode_blob) = {
                     let raw: u64 = drm_device
@@ -6044,6 +6115,22 @@ impl KmsBackend {
                     },
                 ),
                 TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno }) => {
+                    if acquire_install {
+                        self.close_owner_after_acquire_probe_failure(device);
+                        self.lifecycle_queue_input(
+                            device,
+                            ArbiterInput::CommitOutcome {
+                                tag,
+                                outcome: LifecycleCommitOutcome::AcquireInstallRejected,
+                            },
+                        );
+                        self.acquire_episode_participant_terminal(device);
+                        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+                            driver.topology_commits.remove(&commit);
+                            driver.topology_dpms_active.remove(&commit);
+                        }
+                        return;
+                    }
                     let topology_latched_generation =
                         (errno == libc::EINVAL || errno == libc::EOPNOTSUPP).then(|| {
                             self.platform
@@ -6067,6 +6154,22 @@ impl KmsBackend {
                     self.lifecycle_retry_topology_without_consuming_attempt(device, tag);
                 }
                 TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(_)) => {
+                    if acquire_install {
+                        self.close_owner_after_acquire_probe_failure(device);
+                        self.lifecycle_queue_input(
+                            device,
+                            ArbiterInput::CommitOutcome {
+                                tag,
+                                outcome: LifecycleCommitOutcome::AcquireInstallRejected,
+                            },
+                        );
+                        self.acquire_episode_participant_terminal(device);
+                        if let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
+                            driver.topology_commits.remove(&commit);
+                            driver.topology_dpms_active.remove(&commit);
+                        }
+                        return;
+                    }
                     self.lifecycle_queue_input(
                         device,
                         ArbiterInput::CommitOutcome {
@@ -6121,7 +6224,7 @@ impl KmsBackend {
         }
     }
 
-    fn lifecycle_release_acquire_topology(&mut self, prepared: PreparedAcquireTopology) {
+    pub(super) fn lifecycle_release_acquire_topology(&mut self, prepared: PreparedAcquireTopology) {
         self.lifecycle_release_acquire_outputs(prepared.outputs);
     }
 

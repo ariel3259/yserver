@@ -1754,6 +1754,11 @@ pub struct KmsBackend {
         u64,
         crate::kms::backend::OutputInstanceId,
     )>,
+    /// Use real connector/CRTC/plane and property discovery for the live-KMS
+    /// fixtures. The ordinary Vulkan fixture intentionally keeps synthetic
+    /// KMS object ids and must continue to use its seeded property schema.
+    #[cfg(test)]
+    pub(crate) acquire_uses_live_kms_discovery_for_tests: bool,
     /// Per-window geometry tracked outside `KmsCore` (v1 doesn't
     /// need it). Keyed by host xid; mutated by
     /// `register_top_level` / `register_subwindow` /
@@ -7339,6 +7344,8 @@ impl KmsBackend {
             core_entry_trace_for_tests: RefCell::new(Vec::new()),
             #[cfg(test)]
             core_driver_composed_offers_for_tests: Vec::new(),
+            #[cfg(test)]
+            acquire_uses_live_kms_discovery_for_tests: false,
             cow_id: None,
             deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
@@ -8483,6 +8490,7 @@ impl KmsBackend {
             0,
             0,
         )];
+        backend.acquire_uses_live_kms_discovery_for_tests = true;
         backend.platform.rebuild_output_instance_ids_for_tests()?;
         backend.platform.fb_w = backend.platform.outputs[0].width;
         backend.platform.fb_h = backend.platform.outputs[0].height;
@@ -8736,6 +8744,8 @@ impl KmsBackend {
             core_entry_trace_for_tests: RefCell::new(Vec::new()),
             #[cfg(test)]
             core_driver_composed_offers_for_tests: Vec::new(),
+            #[cfg(test)]
+            acquire_uses_live_kms_discovery_for_tests: false,
             cow_id: None,
             deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
@@ -66007,6 +66017,7 @@ mod tests {
             0,
             0,
         );
+        backend.acquire_uses_live_kms_discovery_for_tests = true;
         backend.platform.scanout_pools[0] =
             Some(crate::kms::vk::scanout::OutputScanout::Shared(pool));
         let pool_depth = backend.platform.scanout_pools[0]
@@ -94775,6 +94786,76 @@ mod tests {
         expected
     }
 
+    fn c0_3ci_object_property_membership_error(
+        device: &crate::drm::Device,
+        description: &crate::kms::owner::build::CommitDescription,
+    ) -> Result<(), String> {
+        use crate::kms::owner::closure::ObjectKind;
+        use ::drm::control::Device as _;
+
+        for object in &description.objects {
+            let discovered_property_ids = match object.kind {
+                ObjectKind::Connector => {
+                    let handle = ::drm::control::from_u32::<::drm::control::connector::Handle>(
+                        object.object,
+                    )
+                    .ok_or_else(|| format!("connector object id is zero: {object:?}"))?;
+                    device
+                        .get_properties(handle)
+                        .and_then(|properties| properties.as_hashmap(device))
+                        .map_err(|error| {
+                            format!(
+                                "connector object {} was not discovered: {error}",
+                                object.object
+                            )
+                        })?
+                }
+                ObjectKind::Crtc => {
+                    let handle =
+                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(object.object)
+                            .ok_or_else(|| format!("CRTC object id is zero: {object:?}"))?;
+                    device
+                        .get_properties(handle)
+                        .and_then(|properties| properties.as_hashmap(device))
+                        .map_err(|error| {
+                            format!("CRTC object {} was not discovered: {error}", object.object)
+                        })?
+                }
+                ObjectKind::Plane => {
+                    let handle =
+                        ::drm::control::from_u32::<::drm::control::plane::Handle>(object.object)
+                            .ok_or_else(|| format!("plane object id is zero: {object:?}"))?;
+                    device
+                        .get_properties(handle)
+                        .and_then(|properties| properties.as_hashmap(device))
+                        .map_err(|error| {
+                            format!("plane object {} was not discovered: {error}", object.object)
+                        })?
+                }
+            }
+            .values()
+            .map(|property| u32::from(property.handle()))
+            .collect::<HashSet<_>>();
+            for (property, _) in &object.props {
+                if !discovered_property_ids.contains(property) {
+                    return Err(format!(
+                        "object {} ({:?}) carries property id {property}, absent from its discovered property cache",
+                        object.object, object.kind
+                    ));
+                }
+            }
+            if object.kind == ObjectKind::Crtc
+                && !discovered_property_ids.contains(&description.property_ids.out_fence_ptr)
+            {
+                return Err(format!(
+                    "CRTC object {} will carry OUT_FENCE_PTR property id {}, absent from its discovered property cache",
+                    object.object, description.property_ids.out_fence_ptr
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn c0_3ci_test_probe_results(
         backend: &super::KmsBackend,
     ) -> std::collections::BTreeMap<DrmDeviceKey, Result<Vec<ConnectorSnapshot>, io::ErrorKind>>
@@ -94801,6 +94882,118 @@ mod tests {
                 (device.key, Ok(snapshot))
             })
             .collect()
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_description_uses_discovered_object_properties_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        assert!(backend.acquire_uses_live_kms_discovery_for_tests);
+
+        // This fixture has real DRM connector/CRTC/plane handles and live
+        // Vulkan scanout allocations, but its helper is an IPC stub. Preparing
+        // the description exercises the acquire builder without a modeset or
+        // DRM-master operation.
+        let prepared = backend
+            .lifecycle_prepare_acquire_topology(device)
+            .expect("prepare the acquire reinstall on the live-KMS Owner fixture");
+        let description = prepared.description.clone();
+        let rediscovered_object_ids = prepared
+            .outputs
+            .iter()
+            .flat_map(|prepared| {
+                let output = prepared
+                    .prepared_set
+                    .output
+                    .as_ref()
+                    .expect("acquire output was rediscovered");
+                [
+                    (
+                        crate::kms::owner::closure::ObjectKind::Connector,
+                        u32::from(output.connector),
+                    ),
+                    (
+                        crate::kms::owner::closure::ObjectKind::Crtc,
+                        u32::from(output.crtc),
+                    ),
+                    (
+                        crate::kms::owner::closure::ObjectKind::Plane,
+                        u32::from(output.plane),
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let drm_device = backend
+            .platform
+            .device_for_key(device)
+            .expect("live fixture device")
+            .device
+            .clone();
+        let object_ids = description
+            .objects
+            .iter()
+            .map(|object| (object.kind, object.object))
+            .collect::<Vec<_>>();
+        let property_pairs = description
+            .objects
+            .iter()
+            .flat_map(|object| {
+                object
+                    .props
+                    .iter()
+                    .map(move |(property, _)| (object.kind, object.object, *property))
+            })
+            .collect::<Vec<_>>();
+        backend.lifecycle_release_acquire_topology(prepared);
+
+        c0_3ci_object_property_membership_error(&drm_device, &description).unwrap_or_else(|error| {
+            panic!(
+                "acquire reinstall must use this incarnation's object/property cache; objects={object_ids:?}; properties={property_pairs:?}; error={error}"
+            )
+        });
+        assert_eq!(description.objects.len(), 3);
+        assert_eq!(
+            object_ids, rediscovered_object_ids,
+            "serialized object IDs come from this acquire's connector/CRTC/plane discovery"
+        );
+        assert_eq!(
+            object_ids.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            [
+                crate::kms::owner::closure::ObjectKind::Connector,
+                crate::kms::owner::closure::ObjectKind::Crtc,
+                crate::kms::owner::closure::ObjectKind::Plane,
+            ],
+            "acquire and 3b's client modeset builder serialize one connector, CRTC, and primary plane"
+        );
+
+        // Mutation guard: put back the two old test-only IDs that belonged to
+        // other objects on this device. The connector lacks property 23, and
+        // this CRTC lacks property 21 (which is its plane's CRTC_ID).
+        for (kind, old_property_id, property_index) in [
+            (crate::kms::owner::closure::ObjectKind::Connector, 23, 0),
+            (crate::kms::owner::closure::ObjectKind::Crtc, 21, 1),
+        ] {
+            let mut mutated = description.clone();
+            let object = mutated
+                .objects
+                .iter_mut()
+                .find(|object| object.kind == kind)
+                .expect("object emitted by acquire description");
+            object.props[property_index].0 = old_property_id;
+            assert!(
+                c0_3ci_object_property_membership_error(&drm_device, &mutated).is_err(),
+                "the guard rejects old test-only property id {old_property_id} on {kind:?}"
+            );
+        }
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_description_uses_discovered_object_properties_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
     }
 
     fn c0_3ci_wait_owner_acquire_accepted(
@@ -96286,6 +96479,143 @@ mod tests {
         c0_3bi_assert_end_state(
             backend,
             "c0_3ci_acquire_probe_error_withdraws_owner_device_vulkan",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_rejected_acquire_test_only_withdraws_once_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_core::core_loop::{Message, channel};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "rejected acquire known release",
+        );
+        let (validation_before, live_before, ..) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+
+        // Only the acquire validation is rejected: replace the accepting IPC
+        // helper after the completed release. The stub reports a known kernel
+        // rejection and performs no DRM call itself.
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::RejectValidationWith {
+                sequence: 1_000,
+                errno: libc::ENOENT,
+            },
+        );
+        let (_poll, sender, receiver) = channel().expect("core wake channel");
+        Backend::set_input_sender(backend, sender);
+        c0_3ci_acquire_through_core_driver(
+            backend,
+            &mut state,
+            "Owner acquire reinstall TEST_ONLY rejection",
+        );
+
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "terminalize rejected Owner acquire reinstall",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                let stats = backend.lifecycle_drivers[&device].topology_test_stats();
+                stats.0.len() == validation_before.len() + 1
+                    && stats.1.len() == live_before.len()
+                    && backend
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .is_some_and(|arbiter| {
+                            arbiter.state()
+                                == crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed
+                                && arbiter.transition().is_none()
+                                && !arbiter.admission_open()
+                        })
+                    && backend
+                        .platform
+                        .owner_ref(device)
+                        .is_some_and(|owner| owner.live_record().is_none())
+                    && backend.acquire_episode.is_none()
+            },
+            None,
+        )
+        .expect("explicit TEST_ONLY rejection reaches a terminal acquire disposition");
+
+        let arbiter = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner arbiter");
+        assert_eq!(
+            arbiter.state(),
+            crate::kms::owner::lifecycle::DeviceLifecycleState::RecoveryFailed,
+            "a known failed acquire install is terminal; it does not remain Quiescing"
+        );
+        assert!(arbiter.transition().is_none());
+        assert!(!arbiter.admission_open());
+        assert_eq!(
+            arbiter
+                .recovery()
+                .map(crate::kms::owner::lifecycle::RecoveryIncident::state),
+            Some(crate::kms::owner::lifecycle::RecoveryIncidentState::RecoveryFailed),
+            "the failed acquire boundary has spent its one install attempt"
+        );
+        assert!(backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert_eq!(
+            backend
+                .platform
+                .transport_gate(&device)
+                .map(|gate| gate.state()),
+            Some(crate::kms::render::resources::TransportState::Closed)
+        );
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&false)
+        );
+        assert_eq!(backend.urgent_requesterless_publications.len(), 1);
+        let ids = backend.randr_id_alloc.ids_for(&outputs[0]);
+        assert_eq!(
+            backend.urgent_requesterless_publications[0].urgent_withdrawal_ids(),
+            Some((&[ids.output_id][..], &[ids.crtc_id][..]))
+        );
+        let events = Backend::drain_topology_episode_events(backend);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    yserver_core::backend::TopologyEpisodeEvent::EpisodeBegin(_)
+                ))
+                .count(),
+            1,
+            "the acquire episode begins once"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(_, None)
+                ))
+                .count(),
+            1,
+            "the failed participant terminalizes the acquire episode once"
+        );
+        assert!(
+            receiver
+                .try_recv_all_tagged()
+                .into_iter()
+                .all(|(_, message)| !matches!(message, Message::Shutdown))
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_rejected_acquire_test_only_withdraws_once_vulkan",
             &c0_3bi_expected_end_state(outputs),
         );
     }
