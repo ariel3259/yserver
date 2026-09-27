@@ -28,6 +28,16 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-09-27 Phase C.0 spec revision 5:** `OwnerMediatedLegacyMove` is gone
+  (user decision of 2026-09-19): Owner devices issue no legacy cursor ioctl, and
+  above-vblank cursor motion belongs to Phase C.2. `SynchronousAtomicMove` is the
+  only Owner hardware-cursor path, selected by structural capability plus
+  per-incarnation runtime qualification and withdrawn by CAP-4's measured
+  demotion, which now also triggers on late cursor-only completion. The
+  direct-scanout shape contract (full-output 1:1 XRGB8888, primary below the
+  cursor) stays. Legacy keeps its own cursor ioctls as the stage 5 fallback.
+  Earlier status entries that mention `OwnerMediatedLegacyMove` are history.
+  Finding: `docs/superpowers/findings/2026-09-27-phase-c0-revision5-review-round1.md`.
 - **2026-09-26 Phase C.0 stage 3b (client modeset and the RANDR protocol on
   the Owner) ACCEPTED** at `68cffa47`. A client `SetCrtcConfig` on an Owner
   device is one atomic `ALLOW_MODESET` transaction per device: validated with

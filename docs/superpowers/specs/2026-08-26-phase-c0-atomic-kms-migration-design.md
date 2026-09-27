@@ -2860,6 +2860,13 @@ cursor. C.0 serializes cursor and primary mutations through one atomic slot, so
 none of the removed concurrency contract carries over. The §7.1 heading and
 stage 2c-ii door retain one-line stubs for existing cross-references.
 
+Revision 5's review (`docs/superpowers/findings/2026-09-27-phase-c0-revision5-review-round1.md`)
+added three rules: CAP-4's cause may also be late cursor-only completion (p99
+dispatch-to-fence latency above two mode periods, `CursorCompletionMax`), so a
+prompt ioctl with a late cursor still demotes; `AtomicHardware` over direct
+scanout requires the primary to stack below the cursor; and a compatible
+changed cursor position is absorbed like any other changed cursor generation.
+
 C.0 Owner devices issue no legacy cursor ioctl, including `MOVECURSOR` and the
 legacy set/move calls. Stage 5's capability-activated `Legacy` route remains the
 permanent fallback for devices that cannot enter the Owner model. The GTX 1050
