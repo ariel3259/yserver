@@ -41,6 +41,13 @@ use crate::{
 /// assert against `Vec<RecordedCall>` snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedCall {
+    /// A key event handed to `on_host_input`; `repeat` distinguishes
+    /// `HostInputEvent::KeyRepeat` from device `HostInputEvent::Key`.
+    HostKey {
+        keycode: u8,
+        pressed: bool,
+        repeat: bool,
+    },
     CreateSubwindow {
         parent: u32,
         x: i16,
@@ -149,6 +156,11 @@ pub enum RecordedCall {
         width: u16,
         height: u16,
     },
+    ReplaceCursor {
+        old_host_xid: u32,
+        new_host_xid: u32,
+    },
+    SetCursorHidden(bool),
     DefineCursor {
         host_window_xid: u32,
         cursor_host_xid: u32,
@@ -298,6 +310,10 @@ impl TopologyEpisodeProducer {
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Arc<Mutex<Vec<RecordedCall>>>,
+    /// Queued "the sprite now shows this cursor" report handed out by
+    /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
+    /// sprite change.
+    pub displayed_cursor_change: Option<crate::backend::DisplayedCursor>,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -462,6 +478,13 @@ pub struct RecordingBackend {
     /// DRI3 fence xids passed to `dri3_trigger_fence`, in call order, so
     /// teardown/lifecycle tests can assert idle-fence release.
     pub triggered_dri3_fences: Vec<u32>,
+    /// Shared-memory fences (DRI3 FenceFromFD xshmfences) by xid, with
+    /// their in-memory triggered state; tests flip it to model the client
+    /// calling `xshmfence_trigger` / `xshmfence_reset` itself.
+    pub shm_fences: std::collections::HashMap<u32, bool>,
+    /// `(xid, triggered)` of each shared-memory fence `dri3_destroy_fence`
+    /// unmapped, with its in-memory state at unmap time.
+    pub destroyed_shm_fences: Vec<(u32, bool)>,
     /// `(syncobj_xid, value)` passed to `dri3_signal_syncobj`, in call
     /// order — Task 8: lets a `PixmapSynced` supersession/copy-failure
     /// release be asserted the same way `triggered_dri3_fences` covers
@@ -616,6 +639,7 @@ impl RecordingBackend {
     pub fn new() -> Self {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
+            displayed_cursor_change: None,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -680,6 +704,8 @@ impl RecordingBackend {
             ready_present_source_waits: Vec::new(),
             finished_present_source_waits: Vec::new(),
             triggered_dri3_fences: Vec::new(),
+            shm_fences: std::collections::HashMap::new(),
+            destroyed_shm_fences: Vec::new(),
             signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
@@ -1024,7 +1050,26 @@ impl Backend for RecordingBackend {
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
         self.triggered_dri3_fences.push(fence_xid);
+        if let Some(triggered) = self.shm_fences.get_mut(&fence_xid) {
+            *triggered = true;
+        }
         Ok(())
+    }
+
+    fn dri3_fence_triggered(&self, fence_xid: u32) -> Option<bool> {
+        self.shm_fences.get(&fence_xid).copied()
+    }
+
+    fn dri3_reset_fence(&mut self, fence_xid: u32) {
+        if let Some(triggered) = self.shm_fences.get_mut(&fence_xid) {
+            *triggered = false;
+        }
+    }
+
+    fn dri3_destroy_fence(&mut self, fence_xid: u32) {
+        if self.shm_fences.remove(&fence_xid).is_some() {
+            self.destroyed_shm_fences.push((fence_xid, true));
+        }
     }
 
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> std::io::Result<()> {
@@ -1365,8 +1410,19 @@ impl Backend for RecordingBackend {
     fn on_host_input(
         &mut self,
         _state: &mut crate::server::ServerState,
-        _ev: crate::core_loop::HostInputEvent,
+        ev: crate::core_loop::HostInputEvent,
     ) {
+        use crate::core_loop::HostInputEvent;
+        let (key, repeat) = match ev {
+            HostInputEvent::Key(key) => (key, false),
+            HostInputEvent::KeyRepeat(key) => (key, true),
+            _ => return,
+        };
+        self.record(RecordedCall::HostKey {
+            keycode: key.keycode,
+            pressed: key.pressed,
+            repeat,
+        });
     }
 
     fn on_page_flip_ready(
@@ -2516,13 +2572,25 @@ impl Backend for RecordingBackend {
         Ok(None)
     }
 
-    fn xfixes_change_cursor_by_name(
+    fn replace_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_cursor_xid: u32,
-        _name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::ReplaceCursor {
+            old_host_xid,
+            new_host_xid,
+        });
         Ok(())
+    }
+
+    fn set_cursor_hidden(&mut self, hidden: bool) {
+        self.record(RecordedCall::SetCursorHidden(hidden));
+    }
+
+    fn take_displayed_cursor_change(&mut self) -> Option<crate::backend::DisplayedCursor> {
+        self.displayed_cursor_change.take()
     }
 
     fn set_shape_rectangles(

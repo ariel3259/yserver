@@ -46,6 +46,7 @@ pub(crate) mod submit_trace;
 pub(crate) mod target;
 pub(crate) mod telemetry;
 pub(crate) mod unflip_owner;
+pub(crate) mod upload_arena;
 
 pub use backend::{KmsBackend, LegacyEventCancellation, LegacyEventDisposition};
 pub use platform::PlatformBackend;

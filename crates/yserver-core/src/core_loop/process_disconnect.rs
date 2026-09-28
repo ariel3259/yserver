@@ -353,22 +353,45 @@ pub fn process_disconnect_reporting(
     state
         .xfixes_cursor_masks
         .retain(|(owner, _), _| *owner != client_id.0);
+    crate::core_loop::process_request::release_xfixes_client_state(state, backend, client_id);
     state
         .shape_windows
         .retain(|window, _| !dead_windows.contains(window));
     state
         .shape_select_masks
         .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
-    state
+    // SYNC: the client's own await dies with it (Xorg `FreeAwait`); its
+    // alarms are destroyed, telling the other clients that selected them
+    // (`FreeAlarm`), and it leaves other alarms' event lists
+    // (`FreeAlarmClient`); its counters and fences are destroyed, which
+    // fires other clients' awaits on them with destroyed CounterNotify and
+    // deactivates alarms watching its counters (Xorg `FreeCounter` /
+    // `miSyncDestroyFence`).
+    state.sync_awaits.remove(&client_id.0);
+    crate::core_loop::sync_await::release_client_alarms(state, client_id);
+    let mut dead_counters: Vec<(u32, i64)> = state
         .sync_counters
-        .retain(|_, counter| counter.owner != client_id);
-    state
-        .sync_alarms
-        .retain(|_, alarm| alarm.owner != client_id);
-    state
+        .iter()
+        .filter(|(_, counter)| counter.owner == client_id)
+        .map(|(id, counter)| (*id, counter.value))
+        .collect();
+    dead_counters.sort_unstable();
+    for (counter, last) in dead_counters {
+        state.sync_counters.remove(&counter);
+        crate::core_loop::sync_await::counter_destroyed(state, counter, last);
+    }
+    let mut dead_fences: Vec<u32> = state
         .sync_fences
-        .retain(|_, fence| fence.owner != client_id);
-    state.sync_pending_awaits.retain(|a| a.client != client_id);
+        .iter()
+        .filter(|(_, fence)| fence.owner == client_id)
+        .map(|(id, _)| *id)
+        .collect();
+    dead_fences.sort_unstable();
+    for fence in dead_fences {
+        crate::core_loop::sync_await::fence_destroyed(state, fence);
+        state.sync_fences.remove(&fence);
+        backend.dri3_destroy_fence(fence);
+    }
     state.glx_contexts.retain(|_, c| c.owner != client_id);
     // Release export-lifetime refs for any GLXPixmaps the client still held.
     // Use the host_xid stored at glXCreatePixmap acquire time — NOT a
@@ -477,11 +500,13 @@ pub fn process_disconnect_reporting(
         .mit_shm_segments
         .retain(|_, seg| seg.owner != client_id);
     state.vidmode_client_versions.remove(&client_id);
+    state.xi2_client_versions.remove(&client_id);
     state
         .randr_select_masks
         .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
+    state.xkb_clients.remove(&client_id.0);
     state
-        .xkb_select_event_masks
+        .xkb_interests
         .retain(|(owner, _), _| *owner != client_id.0);
     state.dpms.selected_by.remove(&client_id);
     state.screensaver.selected_by.remove(&client_id);
@@ -1617,6 +1642,23 @@ mod tests {
             Some(&(1, 0)),
             "a surviving client must keep its negotiated version"
         );
+    }
+
+    #[test]
+    fn disconnect_removes_only_the_dead_clients_xi2_version() {
+        // A recycled id must not inherit a dead client's XI 2.0 version:
+        // it would lose XI2 raw events under every keyboard grab.
+        let mut state = ServerState::new();
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+        state.xi2_client_versions.insert(ClientId(7), (2, 0));
+        state.xi2_client_versions.insert(ClientId(8), (2, 2));
+
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert!(!state.xi2_client_versions.contains_key(&ClientId(7)));
+        assert_eq!(state.xi2_client_versions.get(&ClientId(8)), Some(&(2, 2)));
     }
 
     #[test]

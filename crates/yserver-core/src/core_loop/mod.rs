@@ -24,6 +24,7 @@ pub mod reset;
 pub mod run;
 pub mod sender;
 pub mod setup_thread;
+pub mod sync_await;
 // The real service, or the inert stub of the same shape — see
 // `xdmcp_stub.rs`. Selecting the module here is what keeps `run.rs` free
 // of any `cfg`.
@@ -35,6 +36,7 @@ pub mod xdmcp;
 pub mod xi1_focus;
 pub mod xi1_state_notify;
 pub mod xkb_layout;
+pub mod xkb_select;
 
 pub use generation::{Generation, GenerationCounter};
 pub use input_inventory::{DeviceNode, InputInventory};
