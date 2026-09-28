@@ -2379,6 +2379,17 @@ pub fn run_core(
                                 // Ctrl-Alt-F12 hotkeys, not this path.)
                                 if backend.vt_switching_armed() {
                                     backend.on_vt_release(state);
+                                    // VTRelease can supersede an in-progress
+                                    // Owner acquire. Consume its EpisodeEnd
+                                    // now so the RANDR gate turn is released
+                                    // even when no reinstall result will
+                                    // publish a topology update.
+                                    drain_requesterless_publications(
+                                        state,
+                                        backend,
+                                        &mut randr_mutation_gate,
+                                        true,
+                                    );
                                 }
                             }
                             Message::VtAcquire => {

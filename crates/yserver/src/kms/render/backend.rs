@@ -24032,6 +24032,11 @@ impl KmsBackend {
         // Owner slot.
         let _owner_route =
             self.lifecycle_set_seat_target(crate::kms::owner::lifecycle::SeatTarget::Released);
+        // A higher-priority VT release aborts any acquire episode that has
+        // not reached its terminal publication point. The lifecycle arbiter
+        // has already superseded the reinstall above; close the core gate
+        // turn without publishing its staged topology.
+        self.end_acquire_episode_without_publication();
 
         let legacy_devices = self.dpms_legacy_devices();
         if !legacy_devices.is_empty() {
@@ -98282,6 +98287,334 @@ mod tests {
             &legacy,
             "c0_3ci_vt_switch_emits_nothing_vulkan Legacy",
             &c0_3bi_expected_end_state([legacy_output]),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_release_supersedes_undispatched_acquire_vulkan() {
+        use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
+        use std::time::{Duration, Instant};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "rapid-switch initial release",
+        );
+
+        // This executor accepts kernel-faithful requests, but delays the
+        // first validation reply. It models an acquire reinstall that has
+        // prepared its pool and submitted TEST_ONLY, but has not submitted
+        // the ALLOW_MODESET install commit when VTRelease arrives.
+        c0_3aii_replace_owner_executor(
+            backend,
+            StubBehaviour::AcceptKernelCallsAfter(Duration::from_millis(250)),
+        );
+        let live_sends_before_acquire = backend.lifecycle_drivers[&device]
+            .topology_test_stats()
+            .1
+            .len();
+        c0_3ci_acquire_through_core_driver(
+            backend,
+            &mut state,
+            "rapid-switch acquire entry before delayed validation",
+        );
+        assert_eq!(backend.vt_state, VtState::Active);
+        let episode_id = backend
+            .acquire_episode
+            .as_ref()
+            .expect("acquire episode remains open while reinstall validation is pending")
+            .id;
+        let prepared_allocations =
+            backend.lifecycle_drivers[&device].prepared_acquire_allocation_keys_for_tests();
+        assert!(
+            !prepared_allocations.is_empty(),
+            "the acquire has prepared its replacement pool before release supersedes it"
+        );
+        let acquire_live_sends = backend.lifecycle_drivers[&device]
+            .topology_test_stats()
+            .1
+            .len();
+        assert_eq!(
+            acquire_live_sends, live_sends_before_acquire,
+            "the acquire reinstall has not reached the live atomic-commit send"
+        );
+
+        let acquires_before_release = backend
+            .core_entry_trace_for_tests
+            .borrow()
+            .iter()
+            .filter(|entry| **entry == "vt_acquire")
+            .count();
+        backend.core_driver_vt_releases_for_tests += 1;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "deliver release that supersedes prepared acquire",
+            Duration::from_secs(2),
+            &|backend| backend.core_driver_vt_releases_for_tests == 0,
+            None,
+        )
+        .expect("VTRelease enters through the core-entry driver");
+        let release_deadline = backend
+            .owner_vt_release
+            .as_ref()
+            .expect("release retains its absolute hand-off bound")
+            .deadline;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "finish superseding release hand-off for the already-dark device",
+            Duration::from_secs(2),
+            &|backend| backend.vt_state == VtState::Suspended,
+            None,
+        )
+        .expect("release hand-off follows cancellation of the acquire validation");
+        assert!(Instant::now() <= release_deadline);
+        assert_eq!(backend.vt_state, VtState::Suspended);
+        assert!(backend.acquire_episode.is_none());
+        assert!(backend.topology_episode_events.iter().any(|event| {
+            matches!(
+                event,
+                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, None)
+                    if *id == episode_id
+            )
+        }));
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .1
+                .len(),
+            live_sends_before_acquire,
+            "the already-dark device sends neither the superseded reinstall nor a release commit"
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .prepared_acquire_allocation_keys_for_tests()
+                .is_empty(),
+            "the superseded reinstall releases its prepared pool"
+        );
+        assert!(prepared_allocations.iter().all(|key| {
+            backend
+                .resource_service()
+                .is_none_or(|service| !service.contains(key))
+        }));
+        assert_eq!(
+            backend
+                .core_entry_trace_for_tests
+                .borrow()
+                .iter()
+                .filter(|entry| **entry == "vt_acquire")
+                .count(),
+            acquires_before_release,
+            "VTRelease reaches VT_RELDISP(1) without a later acquire signal; the kernel only sends that acquire after our acknowledgement"
+        );
+        let expected = c0_3bi_expected_end_state(outputs);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "rapid-switch superseded acquire clean end state",
+            Duration::from_secs(3),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .expect("the cancelled acquire pool and the release resources retire cleanly");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_release_supersedes_undispatched_acquire_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_release_after_dispatched_reinstall_vulkan() {
+        use crate::{kms::executor::test_support::StubBehaviour, vt::state::VtState};
+        use std::time::{Duration, Instant};
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        backend.vt_skip_master_ioctls_for_tests = true;
+        backend.platform.owner_completion_detached = true;
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "rapid-switch dispatched acquire initial release",
+        );
+        c0_3ci_acquire_through_core_driver(backend, &mut state, "rapid-switch acquire entry");
+        let reinstall = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device,
+            "dispatch and accept rapid-switch reinstall",
+        );
+        assert!(
+            !backend.lifecycle_drivers[&device]
+                .prepared_acquire_allocation_keys_for_tests()
+                .is_empty(),
+            "the dispatched reinstall retains its prepared pool until its terminal result"
+        );
+        let live_sends_before_release = backend.lifecycle_drivers[&device]
+            .topology_test_stats()
+            .1
+            .len();
+        let acquires_before_release = backend
+            .core_entry_trace_for_tests
+            .borrow()
+            .iter()
+            .filter(|entry| **entry == "vt_acquire")
+            .count();
+
+        backend.core_driver_vt_releases_for_tests += 1;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "deliver VTRelease while reinstall owns the slot",
+            Duration::from_secs(2),
+            &|backend| backend.core_driver_vt_releases_for_tests == 0,
+            None,
+        )
+        .expect("VTRelease enters through the core-entry driver");
+        let release_deadline = backend
+            .owner_vt_release
+            .as_ref()
+            .expect("the release owns an absolute deadline while reinstall is in flight")
+            .deadline;
+        assert_eq!(backend.vt_state, VtState::Suspending);
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .map(|record| record.commit_id()),
+            Some(reinstall),
+            "VTRelease does not preempt an already dispatched reinstall"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .1
+                .len(),
+            live_sends_before_release,
+            "the VTRelease commit waits while the reinstall occupies the Owner slot"
+        );
+        assert!(backend.acquire_episode.is_none());
+        assert!(backend.topology_episode_events.iter().any(|event| {
+            matches!(
+                event,
+                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(_, None)
+            )
+        }));
+        assert_eq!(
+            backend
+                .core_entry_trace_for_tests
+                .borrow()
+                .iter()
+                .filter(|entry| **entry == "vt_acquire")
+                .count(),
+            acquires_before_release,
+            "no acquire signal arrives before the release hand-off is acknowledged"
+        );
+        assert!(
+            !backend.vt_call_trace_for_tests[backend.vt_call_trace_for_tests.len() - 2..]
+                .contains(&"vt_reldisp"),
+            "the release hand-off waits for the dispatched reinstall's terminal result"
+        );
+
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            reinstall,
+            "terminalize dispatched acquire before VTRelease commit",
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "dispatch release commit after acquire terminal result",
+            Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .is_some_and(|record| {
+                        record.commit_id() != reinstall && record.milestones().accepted
+                    })
+            },
+            None,
+        )
+        .expect("the release commit follows the reinstall's terminal result");
+        let release_commit = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .expect("release commit after reinstall terminal")
+            .commit_id();
+        assert_ne!(release_commit, reinstall);
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            release_commit,
+            "complete release commit after dispatched reinstall",
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "finish rapid-switch release hand-off",
+            Duration::from_secs(1),
+            &|backend| backend.vt_state == VtState::Suspended,
+            None,
+        )
+        .expect("the release hands off after both commits reach terminal results");
+        assert!(
+            Instant::now() <= release_deadline,
+            "the complete release hand-off stays inside its original absolute 1 s bound"
+        );
+        assert_eq!(
+            &backend.vt_call_trace_for_tests[backend.vt_call_trace_for_tests.len() - 2..],
+            ["drop_master", "vt_reldisp"],
+            "release drops master before acknowledging VT_RELDISP(1)"
+        );
+        assert_eq!(
+            backend
+                .core_entry_trace_for_tests
+                .borrow()
+                .iter()
+                .filter(|entry| **entry == "vt_acquire")
+                .count(),
+            acquires_before_release,
+            "the release hand-off does not require an acquire signal before VT_RELDISP(1)"
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .prepared_acquire_allocation_keys_for_tests()
+                .is_empty(),
+            "the terminal acquire releases or installs its prepared pool exactly once"
+        );
+        let expected = c0_3bi_expected_end_state(outputs);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "rapid-switch dispatched acquire clean end state",
+            Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .expect("the dispatched acquire and release leave no retired bundles or allocations");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_release_after_dispatched_reinstall_vulkan",
+            &expected,
         );
     }
 
