@@ -2,6 +2,13 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null` inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3cii_`, `c0_3ci_`, `c0_3bi_`, `c0_3bii_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm`, `c0_merge_` — with `--include-ignored --skip _drm` only when the prompt records the user's GPU approval; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, a VT switch, or anything that performs a modeset or takes DRM master: the hardware tests are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code, the kernel or C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 5 (2026-09-28, coordinator)** — codex round 4 (1 blocking, 1 major,
+confirmed, `../findings/2026-09-28-stage-3c-ii-plan-review-round4.md`; all
+eleven earlier findings audited, round 3's B-1 PARTIAL): KMS work uses Legacy's
+own `preserves_active_output` predicate, so a present connector with no mode
+loses its route (B-1); a forced reprobe requested while the seat is released
+answers at once from the published state (M-1).
+
 **Revision 4 (2026-09-28, coordinator)** — codex round 3 (1 blocking, 1 major,
 confirmed, `../findings/2026-09-28-stage-3c-ii-plan-review-round3.md`; all nine
 findings of rounds 1–2 audited APPLIED): Task 2 judges KMS work against the
@@ -317,9 +324,12 @@ must not hide an unplug. **KMS work** is decided against the installed and
 remembered routes, as Legacy's rescan does (`apply_connector_snapshot` drops
 every installed output absent from the snapshot even when a forced probe
 already marked its connector disconnected, `render/platform.rs`): a device has
-KMS work when an installed output's connector is absent from the answer, or a
-remembered route's connector is present with a compatible mode, **whatever the
-registry says**. **Logical change** is decided against the registry
+KMS work when an installed output is **not preserved** by the answer — no
+answer entry satisfies Legacy's own predicate
+`ConnectorSnapshot::preserves_active_output` (same connector, **at least one
+mode**; a connector still present but advertising no mode loses its route, as
+on Legacy) *(rev 5, B-1 of round 4)* — or a remembered route's connector is
+present with a compatible mode, **whatever the registry says**. **Logical change** is decided against the registry
 (connection bits, modes, EDID). A device with either starts the topology
 episode. Classification of a changed device: connector set or EDID changed
 (against the installed routes and the registry) → `IdentityChangingHotplug`;
@@ -397,6 +407,7 @@ coordinator runs it × 3 after this task, with the user handling the cable, and
 | `c0_3cii_kept_output_is_not_a_lifecycle_object_vulkan` | an unplug beside a kept lit output whose layout position changes: the commit names no object of the kept CRTC; the kept output gets full damage and an ordinary composed repaint | **H11** include the kept CRTC in the hotplug commit |
 | `c0_3cii_hotplug_uses_its_own_description_vulkan` | a hotplug transition is dispatched: the committed description disables/enables connectors and planes, not the `ACTIVE`-only DPMS shape | **H12** build hotplug commits with `lifecycle_topology_description` |
 | `c0_3cii_relight_under_dpms_off_vulkan` | protocol DPMS off, the remembered connector returns: installed with `ACTIVE=0`, no frame admitted | **H13** relight lit regardless of DPMS |
+| `c0_3cii_zero_mode_connector_loses_its_route_vulkan` | *(rev 5, B-1 of round 4)* a lit output's connector is still present in the answer but advertises no mode: one commit detaches it and retires its pool, the connector stays connected in RANDR, one publication, as Legacy's rescan | **H64** decide KMS work on connector presence alone |
 | `c0_3cii_logical_only_change_needs_no_commit_vulkan` | a connector appears with no remembered route: no transition, no executor send; one publication with the new connected output | **H14** send a commit (or an empty one) for a logical-only change |
 | `c0_3cii_episode_publishes_once_after_every_commit_vulkan` | two Owner devices both change; A `Applied`, B held in flight: no RANDR bytes to clients and a client `SetCrtcConfig` stays queued; B terminal: exactly one publication, then the queued request proceeds | **H15** publish when the first participant applies |
 | `c0_3cii_episode_partial_commit_failure_vulkan` | two Owner devices: A's commit rejected with known completion (a connector gone on A), B's commit unknown: A shows its previous topology minus the gone output, B is withdrawn (`ExecutorStalled`, one urgent withdrawal), the episode publishes once, per the outcome table | **H16** publish A's staged change after its rejection |
@@ -517,7 +528,16 @@ when it comes), the token resolves `Expired`, the turn ends, and a
 **background rescan** is armed (an ordinary `Hotplug` probe episode, decisions
 6 and 8) so a real change is published requester-less in its own topology
 episode (spec §5.2). A probe failure resolves `Failed` (Legacy's `BadAlloc`).
-A release while parked follows decision 12. `L_reprobe` leaves the synchronous
+A release while parked follows decision 12. *(Rev 5, M-1 of round 4.)* **A
+forced reprobe requested while the seat is released** starts no probe and no
+worker (decision 12) and does not park: the backend completes it
+synchronously with no change and the core replies at once from the published
+state, holding no turn; the change, if any, is found by the acquire probe and
+published by the acquire episode. This is a narrow extension of spec §5
+exception 2 (a reply carrying the published state, the change arriving by a
+later publication) — Legacy's synchronous probe while released runs without
+master, so the kernel demotes it to a read-only probe of cached connector
+state (decision 2), which may already show an HPD-detected change. `L_reprobe` leaves the synchronous
 term of 3b-ii's bound (update the bound's accounting/comment where it is
 stated).
 
@@ -529,9 +549,10 @@ stated).
 | `c0_3cii_forced_reprobe_parks_and_expires_vulkan` | Owner, the prober blocked past the deadline: the reply carries the published state at the deadline; the queued mutation proceeds; a background rescan is armed | **H43** leave the reply parked past the deadline |
 | `c0_3cii_forced_reprobe_timeout_discards_late_result_vulkan` | after the expiry, a client mutation is validated against the old state and applied; then the late answer arrives: it changes nothing; once the stuck worker is joined, the retry's topology episode publishes the real change requester-less (decision 6) | **H44** apply the late forced-reprobe answer; **H55** lose the background rescan to the stuck worker |
 | `c0_3cii_forced_reprobe_never_commits_vulkan` | the forced reprobe finds an active output's connector gone: registry and publication as Legacy's reprobe, no transition, no executor send, the output stays enabled until the udev edge's episode | **H45** run a lifecycle transaction for a forced reprobe |
-| `c0_3cii_forced_reprobe_then_edge_still_detaches_and_relights_vulkan` | *(rev 4, B-1 of round 3)* a lit output's connector vanishes; a `GetScreenResources` forced reprobe records it disconnected in the registry first; then the udev edge's episode runs: it still detaches the output in one commit, retires its pool and publishes; second case, the replug is first seen by a forced reprobe, then the edge's episode relights the remembered route | **H63** judge the edge's KMS work against the registry alone |
+| `c0_3cii_forced_reprobe_then_edge_still_detaches_and_relights_vulkan` | *(rev 4, B-1 of round 3)* a lit output's connector vanishes; a `GetScreenResources` forced reprobe records it disconnected in the registry first; then the udev edge's episode runs: it still detaches the output in one commit, retires its pool and publishes; second case, the replug is first seen by a forced reprobe, then the edge's episode relights the remembered route; third case, the connector stays present with zero modes, seen first by a forced reprobe, then the edge's episode detaches it | **H63** judge the edge's KMS work against the registry alone |
 | `c0_3cii_forced_reprobe_failure_is_badalloc_vulkan` | the probe fails (`EIO`): the client receives `BadAlloc` as on Legacy; nothing published | **H46** reply success on a failed probe |
 | `c0_3cii_release_resolves_parked_forced_reprobe_vulkan` | a forced reprobe is parked; `on_vt_release`: the token resolves `Expired`, the requester gets the published state, the turn is released, the late answer is discarded and no background rescan is armed while released | **H56** leave the forced reprobe parked across a release |
+| `c0_3cii_forced_reprobe_while_released_replies_at_once_vulkan` | *(rev 5, M-1 of round 4)* the seat is released and a connector changed while away; a client sends `GetScreenResources`: it is answered at once from the published state, no worker is spawned, no turn is held and a queued `SetCrtcConfig` gets its released-seat `Failed` normally; after the acquire, the acquire episode publishes the change | **H65** spawn a probe or park the request while released |
 | `c0_3cii_legacy_only_reprobe_unchanged` | Legacy-only server: `GetScreenResources` runs `reprobe_connectors` synchronously (recorded seam) | **H47** route a Legacy-only reprobe through the worker |
 
 **Hardware:** this task writes **`c0_hw_3cii_forced_reprobe_on_card1_drm`**
@@ -601,5 +622,11 @@ reaches, and report each one.
 - **Real monitor test (Task 4):** it rides on the physical HDMI replug in the
   hardware test, because the udev library here refuses injected messages from
   an unprivileged process.
+- **Forced reprobe while the VT is away (rev 5):** on Owner, a
+  `GetScreenResources` sent while the seat is released answers at once from
+  the published state and the change arrives with the acquire's publication;
+  Legacy instead probes without master (the kernel returns cached state). The
+  plan counts this as a narrow extension of the spec's §5 exception 2 — say so
+  if it should be listed as its own exception.
 - **Task order (rev 3):** the acquire moves onto the worker first (Task 1),
   so the VT test runs early; the hotplug route then switches in one task.
