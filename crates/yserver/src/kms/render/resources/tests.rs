@@ -2797,8 +2797,23 @@ fn c0_2ci_completion_waiter_registration_and_recheck() {
 /// `c0_3bi_modeset_on_a_leaves_b_alone_vulkan` from 3b-i-2. The 3b-i-2
 /// `c0_3bi_enable_on_b_unflips_a_vulkan` obligation is carried to activation
 /// for per-Owner-device resource services; this evidence does not claim
-/// two-device enable coverage. Every class is an owner-mediated mock here; a
-/// test that needs one disabled builds its own evidence.
+/// two-device enable coverage.
+///
+/// VT coverage cites the 3c-i release tests `c0_3ci_prompt_obligations_never_wait_vulkan`,
+/// `c0_3ci_release_commit_is_active_off_vulkan`,
+/// `c0_3ci_release_hands_off_at_the_bound_vulkan`, and
+/// `c0_3ci_unknown_release_closes_the_incarnation_vulkan`; the acquire tests
+/// `c0_3ci_acquire_reinstalls_from_scratch_vulkan` and
+/// `c0_3ci_acquire_episode_waits_for_every_participant_vulkan`; and the rapid
+/// switch tests `c0_3ci_release_supersedes_undispatched_acquire_vulkan` and
+/// `c0_3ci_release_after_dispatched_reinstall_vulkan`. The hardware test
+/// `c0_hw_3c_vt_switch_on_card1_drm` is written here and run by the
+/// coordinator. This evidence does not claim the deferred real-server row
+/// `3b-ii Task 5 (plan rev 9)`, specifically its VT-released Legacy/Owner wire
+/// parity case in `docs/phase-c0-deferred-real-server-tests.md`.
+///
+/// Every class is an owner-mediated mock here; a test that needs one disabled
+/// builds its own evidence.
 pub(crate) fn writer_coverage_evidence_for_tests() -> super::transport::TestWriterCoverageEvidence {
     use super::transport::{TestWriterCoverage::OwnerMediatedMock, TestWriterCoverageEvidence};
     TestWriterCoverageEvidence {
@@ -2829,6 +2844,18 @@ fn c0_3bi_modeset_writer_coverage_proven() {
         evidence.coverage(WriterClass::Modeset),
         OwnerMediatedMock,
         "3b-i-1 modeset execution/parity plus 3b-i-2 cross-device isolation prove the field; F15 remains explicitly carried"
+    );
+}
+
+#[test]
+fn c0_3ci_vt_writer_coverage_proven() {
+    use super::transport::TestWriterCoverage::OwnerMediatedMock;
+
+    let evidence = writer_coverage_evidence_for_tests();
+    assert_eq!(
+        evidence.coverage(WriterClass::Vt),
+        OwnerMediatedMock,
+        "3c-i release, acquire, and rapid-switch tests prove VT writer coverage; the deferred 3b-ii Task 5 VT-released real-server wire-parity row remains unclaimed"
     );
 }
 

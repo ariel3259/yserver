@@ -88195,7 +88195,7 @@ mod tests {
                 .1
                 .len();
 
-            for cycle in 1..=4 {
+            for cycle in 1..=5 {
                 let release_started = Instant::now();
                 Backend::request_vt_switch(backend, u32::try_from(free_vt).unwrap());
                 signal_guard.wait_for(libc::SIGUSR1, Duration::from_secs(5));
@@ -88259,7 +88259,7 @@ mod tests {
                     .topology_test_stats()
                     .1
                     .len();
-                let acquire_description_count = backend.lifecycle_drivers[&device]
+                let mut acquire_description_count = backend.lifecycle_drivers[&device]
                     .acquire_topology_descriptions_for_tests()
                     .len();
                 let retired_instance = backend
@@ -88267,6 +88267,124 @@ mod tests {
                     .output_instance_id_for_tests(0)
                     .expect("pre-acquire scene instance");
                 let composed_offers_before = backend.core_driver_composed_offers_for_tests.len();
+
+                if cycle == 5 {
+                    // Leave the four ordinary release/acquire cycles above
+                    // intact, then force Task 5's undispatched-acquire race
+                    // on card1. on_vt_acquire synchronously prepares the new
+                    // pool and sends TEST_ONLY; withholding the next core
+                    // entry keeps its reply from dispatching the reinstall.
+                    let validation_sends_before = backend.lifecycle_drivers[&device]
+                        .topology_test_stats()
+                        .0
+                        .len();
+                    let live_sends_before = backend.lifecycle_drivers[&device]
+                        .topology_test_stats()
+                        .1
+                        .len();
+                    Backend::request_vt_switch(backend, u32::try_from(original_vt).unwrap());
+                    signal_guard.wait_for(libc::SIGUSR2, Duration::from_secs(5));
+                    Backend::on_vt_acquire(backend, &mut state);
+                    assert_eq!(
+                        backend.vt_state,
+                        crate::vt::state::VtState::Active,
+                        "rapid card1 acquire reaches Active before its reinstall is dispatched"
+                    );
+                    let rapid_episode_id = backend
+                        .acquire_episode
+                        .as_ref()
+                        .expect("rapid acquire owns an open AcquireEpisode")
+                        .id;
+                    let rapid_prepared_allocations = backend.lifecycle_drivers[&device]
+                        .prepared_acquire_allocation_keys_for_tests();
+                    assert!(
+                        !rapid_prepared_allocations.is_empty(),
+                        "rapid acquire prepared replacement scanout pools before release"
+                    );
+                    assert!(
+                        backend.lifecycle_drivers[&device]
+                            .topology_test_stats()
+                            .0
+                            .len()
+                            > validation_sends_before,
+                        "rapid acquire submitted topology TEST_ONLY through the card1 executor"
+                    );
+                    assert_eq!(
+                        backend.lifecycle_drivers[&device]
+                            .topology_test_stats()
+                            .1
+                            .len(),
+                        live_sends_before,
+                        "rapid acquire has not sent its ALLOW_MODESET reinstall"
+                    );
+
+                    // Request the next switch before running another core
+                    // entry, so the acquire validation remains undispatched.
+                    Backend::request_vt_switch(backend, u32::try_from(free_vt).unwrap());
+                    signal_guard.wait_for(libc::SIGUSR1, Duration::from_secs(5));
+                    let rapid_release_signal_received = Instant::now();
+                    Backend::on_vt_release(backend, &mut state);
+                    c0_3bi_core_driver_until_with_state(
+                        backend,
+                        &mut state,
+                        "card1 rapid release supersedes its undispatched acquire",
+                        Duration::from_secs(2),
+                        &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
+                        None,
+                    )
+                    .unwrap_or_else(|error| panic!("rapid card1 release hand-off failed: {error}"));
+                    let rapid_handoff_at = Instant::now();
+                    assert!(
+                        rapid_handoff_at <= rapid_release_signal_received + Duration::from_secs(1),
+                        "rapid card1 VT hand-off exceeded the absolute one-second release bound"
+                    );
+                    assert!(backend.acquire_episode.is_none());
+                    assert!(
+                        backend.topology_episode_events.iter().any(|event| {
+                            matches!(
+                                event,
+                                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, None)
+                                    if *id == rapid_episode_id
+                            )
+                        }),
+                        "rapid acquire episode ended without a publication"
+                    );
+                    assert!(
+                        !backend.topology_episode_events.iter().any(|event| {
+                            matches!(
+                                event,
+                                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, Some(_))
+                                    if *id == rapid_episode_id
+                            )
+                        }),
+                        "rapid acquire episode published no topology change"
+                    );
+                    assert_eq!(
+                        backend.lifecycle_drivers[&device]
+                            .topology_test_stats()
+                            .1
+                            .len(),
+                        live_sends_before,
+                        "the superseded reinstall never reached the card1 executor"
+                    );
+                    assert!(
+                        backend.lifecycle_drivers[&device]
+                            .prepared_acquire_allocation_keys_for_tests()
+                            .is_empty(),
+                        "the superseded acquire released its prepared pool"
+                    );
+                    assert!(
+                        rapid_prepared_allocations.iter().all(|key| {
+                            backend
+                                .resource_service()
+                                .is_none_or(|service| !service.contains(key))
+                        }),
+                        "the released prepared pool is absent from the resource service"
+                    );
+                    acquire_description_count = backend.lifecycle_drivers[&device]
+                        .acquire_topology_descriptions_for_tests()
+                        .len();
+                }
 
                 let reinstall_seen = std::cell::Cell::new(false);
                 Backend::request_vt_switch(backend, u32::try_from(original_vt).unwrap());
