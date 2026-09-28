@@ -2,6 +2,14 @@
 
 > **Implementer:** codex (model `gpt-6-luna`, reasoning effort `xhigh`; `max` from the first send-back), run with `< /dev/null` inside `systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0`. Hard rules, restated in every prompt: **no git write commands** (the coordinator verifies and commits); of the `#[ignore]` tests run only this plan's filters, each by its own command — `c0_3cii_`, `c0_3ci_`, `c0_3bi_`, `c0_3bii_`, `c0_3aii_`, `c0_3a_`, `c0_2b_add_`, `c0_conv_ciii_`, `c0_conv_cii_`, `c0_conv_cfb_`, `c0_conv_cp_`, `c0_adm`, `c0_merge_` — with `--include-ignored --skip _drm` only when the prompt records the user's GPU approval; **never** `_drm` tests, `render_acceptance`, an unfiltered `--ignored`, a VT switch, or anything that performs a modeset or takes DRM master: the hardware tests are **written, never run**, by the implementer; no deletes outside the worktree; remove temporary instrumentation before finishing; never edit `docs/status.md`. **You write the implementation and the tests**; this plan gives the interfaces, the invariants, the named tests with the scenario each must exercise, and the mutations each must catch. Execute tasks in order, one at a time; stop with the tree dirty after each task. **Do not ask for approval inside a run** — if the plan leaves a real design choice open, or something it states does not hold in the code, the kernel or C.0, stop and report it (F8); never silently substitute a test shape, never weaken an existing assertion.
 
+**Revision 4 (2026-09-28, coordinator)** — codex round 3 (1 blocking, 1 major,
+confirmed, `../findings/2026-09-28-stage-3c-ii-plan-review-round3.md`; all nine
+findings of rounds 1–2 audited APPLIED): Task 2 judges KMS work against the
+installed and remembered routes, not only the registry a forced reprobe may
+already have updated, with a forced-reprobe-then-edge test in Task 5 (B-1);
+Task 1's stuck-worker test asserts the §3.3 closure and the reaping, and the
+no-second-worker mutation moves to Task 2's still-open hotplug scenario (M-1).
+
 **Revision 3 (2026-09-28, coordinator)** — codex round 2 (2 blocking, 2 major,
 all confirmed, `../findings/2026-09-28-stage-3c-ii-plan-review-round2.md`),
 written as one fresh unit rather than patched: a result consumed at
@@ -281,7 +289,7 @@ the reinstall.
 | `c0_3cii_probe_worker_shares_the_master_file` | the fd handed to the prober shares the open file description of the device's master fd (proved by `kcmp(KCMP_FILE)`, or a file-status flag set on one fd visible on the other) | **H2** open the device node afresh for the worker |
 | `c0_3cii_stale_probe_discarded_vulkan` | an acquire probe episode is superseded by a release and a new acquire; the first episode's answer arrives during the second, and a result tagged with an older incarnation arrives: neither changes the second episode's results or its dispositions | **H3** accept a result without checking epoch and incarnation |
 | `c0_3ci_acquire_probe_no_reply_withdraws_owner_device_vulkan` | two Owner devices, B never answers: at the probe deadline (through `next_wakeup`) A reinstalls and composes, B is closed and urgently withdrawn, the episode publishes A only; the server continues; the late answer changes nothing | **H4** leave the deadline unarmed / apply the late answer; **H36** end the server (or wait forever) when an Owner device does not answer |
-| `c0_3cii_stuck_worker_fails_next_probe_fast_vulkan` | B's worker is stuck past a first acquire's deadline; release and acquire again: B fails at once in the new episode (no second thread in the ledger), A still probes and reinstalls; the barrier opens: the stuck worker returns, is joined, its fd closed, the ledger empty | **H5** spawn a second worker for a device with a stuck one |
+| `c0_3cii_stuck_acquire_worker_closes_and_is_reaped_vulkan` | *(rev 4, M-1 of round 3)* B's worker is stuck past the acquire's deadline: B is closed and urgently withdrawn (spec §3.3) while its worker stays in the ledger as stuck; release and acquire again: B, being closed, is not probed (no new worker), A probes and reinstalls; the barrier opens: B's worker returns, is joined, its fd closed, the ledger empty, and its answer changes nothing | **H61** probe a closed device at the next acquire; **H62** never join a stuck worker |
 | `c0_3cii_acquire_enodev_on_receipt_vulkan` | two Owner devices; B answers `ENODEV` while A's worker is blocked: B's urgent withdrawal reaches the listener **before** A answers; A then answers and reinstalls; an `EIO` answer is a failed probe with the same disposition at resolution, never treated as `ENODEV` | **H6** classify every probe error as `ENODEV`; **H6b** act on `ENODEV` only at episode resolution |
 | `c0_3cii_release_during_acquire_probe_vulkan` | acquire, then release before the probe answers: no reinstall reaches the executor, the episode aborts without publishing, hand-off as 3c-i; the late answer changes nothing; no worker is spawned while released | **H39** run the continuation after a superseding release |
 | `c0_3cii_hotplug_while_released_waits_for_acquire_vulkan` | while released, A's connector vanishes (edge recorded, no worker spawned); at acquire the probe sees it, the reinstall installs the remaining outputs and one publication shows the change | **H38** probe while the seat is released |
@@ -301,12 +309,23 @@ and the user runs `c0_hw_3c_vt_switch_on_card1_drm` × 3 from tty4
 Co-delivered: the Owner hotplug route switches on only with its whole
 application, so no tree exposes a half route.
 
-**Deliver — classification:** per device, a complete answer is compared with
-the device's discovered topology (connector set by name, connection state,
-EDID identity, mode lists): connector set or EDID changed →
-`IdentityChangingHotplug`; only mode lists or other discovered objects changed →
-`TopologyRebuild`; unchanged → none. `desired.rs`'s `TopologyChangeClass` is
-the vocabulary. (Task 5 adds the forced reprobe's `AdministrativeReprobe`.)
+**Deliver — the baseline and classification** *(rev 4, B-1 of round 3)*: a
+complete answer is judged against **two baselines, never only the RANDR
+registry** — Task 5's forced reprobe updates the registry without touching any
+installed output (decision 8), so a registry that already says "disconnected"
+must not hide an unplug. **KMS work** is decided against the installed and
+remembered routes, as Legacy's rescan does (`apply_connector_snapshot` drops
+every installed output absent from the snapshot even when a forced probe
+already marked its connector disconnected, `render/platform.rs`): a device has
+KMS work when an installed output's connector is absent from the answer, or a
+remembered route's connector is present with a compatible mode, **whatever the
+registry says**. **Logical change** is decided against the registry
+(connection bits, modes, EDID). A device with either starts the topology
+episode. Classification of a changed device: connector set or EDID changed
+(against the installed routes and the registry) → `IdentityChangingHotplug`;
+only mode lists or other discovered objects changed → `TopologyRebuild`;
+neither baseline differs → none. `desired.rs`'s `TopologyChangeClass` is the
+vocabulary. (Task 5 adds the forced reprobe's `AdministrativeReprobe`.)
 
 **Deliver — the route:** on a server with an Owner device, the debounced udev
 rescan starts a probe episode of cause `Hotplug` instead of
@@ -383,7 +402,7 @@ coordinator runs it × 3 after this task, with the user handling the cable, and
 | `c0_3cii_episode_partial_commit_failure_vulkan` | two Owner devices: A's commit rejected with known completion (a connector gone on A), B's commit unknown: A shows its previous topology minus the gone output, B is withdrawn (`ExecutorStalled`, one urgent withdrawal), the episode publishes once, per the outcome table | **H16** publish A's staged change after its rejection |
 | `c0_3cii_episode_mixed_legacy_owner_vulkan` | Legacy + Owner, both change: the Legacy steps touch only the Legacy device and stage their difference; the Owner transaction runs; one publication carries both | **H17** let the scoped Legacy steps publish directly |
 | `c0_3cii_one_failed_probe_applies_nothing_vulkan` | two devices, one probe fails (and, second case, one is late past the deadline): no staged change, no `EpisodeBegin`, no transition, no publication; the next edge starts a fresh episode that applies both | **H18** apply the devices that answered |
-| `c0_3cii_edge_fails_stuck_device_fast_then_retries_vulkan` | *(rev 3, B-2)* B's worker is stuck from an earlier episode; an edge arrives: its episode **starts at once** and B fails in it at once (no second thread), so nothing is applied; then the barrier opens: B's worker is joined and exactly **one** retry episode runs and applies the change | **H51** hold the edge until the worker returns; **H58** drop the retry after the fast failure |
+| `c0_3cii_edge_fails_stuck_device_fast_then_retries_vulkan` | *(rev 3, B-2)* B's worker is stuck from an earlier episode; an edge arrives: its episode **starts at once** and B fails in it at once — the ledger still holds exactly one thread for B — so nothing is applied; then the barrier opens: B's worker is joined and exactly **one** retry episode runs and applies the change | **H5** spawn a second worker for a device with a stuck one; **H51** hold the edge until the worker returns; **H58** drop the retry after the fast failure |
 | `c0_3cii_hotplug_waits_for_dispatched_client_modeset_vulkan` | a client modeset dispatched on A and unanswered; A's connector vanishes: A's change is not staged and A's transaction not dispatched until the modeset is terminal; the modeset's reply and publication come first | **H19** stage the hotplug change against the pre-modeset model |
 | `c0_3cii_hotplug_on_b_waits_for_modeset_on_a_vulkan` | a client modeset dispatched on A and unanswered; B's connector vanishes: B's change is not staged and no B commit is sent until A's modeset is terminal and published; then one episode publication for B | **H53** stage or dispatch before the core's grant |
 | `c0_3cii_core_episode_begin_waits_for_in_flight_mutation` (yserver-core) | a mutation is in flight when `EpisodeBegin` arrives: no grant until the mutation finishes; a later client mutation queues behind the episode; `EpisodeEnd(None)` before the grant withdraws the request and the queue proceeds | **H54** grant `EpisodeBegin` while a mutation is in flight |
@@ -510,6 +529,7 @@ stated).
 | `c0_3cii_forced_reprobe_parks_and_expires_vulkan` | Owner, the prober blocked past the deadline: the reply carries the published state at the deadline; the queued mutation proceeds; a background rescan is armed | **H43** leave the reply parked past the deadline |
 | `c0_3cii_forced_reprobe_timeout_discards_late_result_vulkan` | after the expiry, a client mutation is validated against the old state and applied; then the late answer arrives: it changes nothing; once the stuck worker is joined, the retry's topology episode publishes the real change requester-less (decision 6) | **H44** apply the late forced-reprobe answer; **H55** lose the background rescan to the stuck worker |
 | `c0_3cii_forced_reprobe_never_commits_vulkan` | the forced reprobe finds an active output's connector gone: registry and publication as Legacy's reprobe, no transition, no executor send, the output stays enabled until the udev edge's episode | **H45** run a lifecycle transaction for a forced reprobe |
+| `c0_3cii_forced_reprobe_then_edge_still_detaches_and_relights_vulkan` | *(rev 4, B-1 of round 3)* a lit output's connector vanishes; a `GetScreenResources` forced reprobe records it disconnected in the registry first; then the udev edge's episode runs: it still detaches the output in one commit, retires its pool and publishes; second case, the replug is first seen by a forced reprobe, then the edge's episode relights the remembered route | **H63** judge the edge's KMS work against the registry alone |
 | `c0_3cii_forced_reprobe_failure_is_badalloc_vulkan` | the probe fails (`EIO`): the client receives `BadAlloc` as on Legacy; nothing published | **H46** reply success on a failed probe |
 | `c0_3cii_release_resolves_parked_forced_reprobe_vulkan` | a forced reprobe is parked; `on_vt_release`: the token resolves `Expired`, the requester gets the published state, the turn is released, the late answer is discarded and no background rescan is armed while released | **H56** leave the forced reprobe parked across a release |
 | `c0_3cii_legacy_only_reprobe_unchanged` | Legacy-only server: `GetScreenResources` runs `reprobe_connectors` synchronously (recorded seam) | **H47** route a Legacy-only reprobe through the worker |
