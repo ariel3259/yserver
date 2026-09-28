@@ -28,6 +28,18 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+- **2026-09-27 Phase C.0 stage 3c-i (VT switching on the Owner) ACCEPTED**
+  at `a461096b`. On an Owner device a VT switch is a lifecycle transition: the
+  release runs its prompt obligations at once, commits `ACTIVE=0` and hands the
+  VT off at the first of "every slot terminal" and an absolute 1 s bound; the
+  acquire reinstalls the desired topology from scratch through one gate turn
+  and publishes only if the topology changed; a release supersedes an
+  undispatched acquire. The card1 test passes 3/3 with six real VT switches per
+  run (incl. a rapid cycle). Hardware found six defects the fixtures missed,
+  among them a `cfg(test)` branch that made the hardware test run synthetic
+  property ids (`ENOENT`), a reinstall rejection that hung the device, two pool
+  leaks and a stuck acquire after supersession — all fixed with red-first tests.
+  Finding: `docs/superpowers/findings/2026-09-27-stage-3c-i-accepted.md`.
 - **2026-09-27 Phase C.0 spec revision 5:** `OwnerMediatedLegacyMove` is gone
   (user decision of 2026-09-19): Owner devices issue no legacy cursor ioctl, and
   above-vblank cursor motion belongs to Phase C.2. `SynchronousAtomicMove` is the
