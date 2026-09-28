@@ -596,6 +596,12 @@ pub(crate) struct LifecycleDriver {
 }
 
 impl LifecycleDriver {
+    pub(crate) fn has_cancelled_sent_topology_validation(&self) -> bool {
+        self.pending_topology_validations
+            .values()
+            .any(|pending| pending.sent && pending.cancelled)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             queue: VecDeque::new(),
@@ -662,6 +668,17 @@ impl LifecycleDriver {
             .values()
             .flat_map(|prepared| prepared.outputs.iter())
             .flat_map(|output| output.prepared_set.allocation_keys.iter().copied())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_acquire_clock_keys_for_tests(
+        &self,
+    ) -> Vec<crate::kms::owner::clock::ClockKey> {
+        self.topology_prepared_acquire
+            .values()
+            .flat_map(|prepared| prepared.outputs.iter())
+            .filter_map(|output| output.prepared_set.clock_key)
             .collect()
     }
 
@@ -1666,7 +1683,22 @@ impl KmsBackend {
                     },
                 );
             }
-            LifecycleAction::AwaitTerminalState(_tag) => {}
+            LifecycleAction::AwaitTerminalState(tag) => {
+                let release_superseded_validation = self
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .and_then(|arbiter| arbiter.transition())
+                    .is_some_and(|transition| {
+                        transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTRelease
+                    });
+                if release_superseded_validation
+                    && !self.lifecycle_cancel_sent_topology_validation(device, tag)
+                {
+                    log::error!(
+                        "could not release lifecycle admission for superseded TEST_ONLY on {device:?}"
+                    );
+                }
+            }
             LifecycleAction::TerminalizePresents(tag) => {
                 let succeeded = self.lifecycle_terminalize_presents(device);
                 self.lifecycle_receipt(
@@ -2454,6 +2486,29 @@ impl KmsBackend {
             self.lifecycle_superseding_kind(device),
         );
         success
+    }
+
+    fn lifecycle_cancel_sent_topology_validation(
+        &mut self,
+        device: DrmDeviceKey,
+        tag: TransitionTag<IncarnationId>,
+    ) -> bool {
+        let validation = self.lifecycle_drivers.get_mut(&device).and_then(|driver| {
+            driver
+                .pending_topology_validations
+                .values_mut()
+                .find(|pending| pending.tag == tag && pending.sent)
+                .map(|pending| {
+                    pending.cancelled = true;
+                    pending.token.take()
+                })
+        });
+        let Some(Some(token)) = validation else {
+            return true;
+        };
+        self.admission_conductors
+            .get_mut(&device)
+            .is_some_and(|conductor| conductor.admission.abort(token).is_ok())
     }
 
     fn lifecycle_terminalize_presents(&mut self, device: DrmDeviceKey) -> bool {
@@ -3387,6 +3442,17 @@ impl KmsBackend {
                         ),
                     }
                 };
+                // Reserve the epoch while this prepared reinstall is in
+                // flight. A later lifecycle event can install a clock before
+                // this TEST_ONLY result arrives; if the acquire is then
+                // superseded, its replacement must not reuse that epoch.
+                let next_epoch = clock_key
+                    .epoch
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| "VTAcquire clock epoch exhausted".to_string())?;
+                self.next_present_crtc_clock_epoch =
+                    self.next_present_crtc_clock_epoch.max(next_epoch);
                 let built = build_client_modeset_description(ClientModesetDescriptionInput {
                     objects: ClientModesetObjects {
                         connector: u32::from(output.connector),
@@ -6435,10 +6501,28 @@ impl KmsBackend {
                 .scene
                 .take()
                 .expect("prepared acquire owns each staged scene state");
-            let clock_key = set
+            let reserved_clock_key = set
                 .clock_key
                 .take()
                 .expect("prepared acquire owns each new clock epoch");
+            // The lifecycle request may have waited on TEST_ONLY while the
+            // server refreshed Present's clock projection. Allocate the
+            // installed epoch at promotion from the owner's latest monotonic
+            // state; the prepared key only reserves space while validation is
+            // pending.
+            let clock_key = {
+                let owner = self
+                    .platform
+                    .owner_ref(device)
+                    .expect("Owner remains live through acquire promotion");
+                crate::kms::owner::clock::ClockKey {
+                    hardware_crtc: reserved_clock_key.hardware_crtc,
+                    epoch: owner.next_clock_epoch_after(
+                        reserved_clock_key.hardware_crtc,
+                        self.next_present_crtc_clock_epoch,
+                    ),
+                }
+            };
             let route = scanout.route();
             let bo_count = scanout.display_pool().bos.len();
             assert!(bo_count != 0, "acquire pool has an initial scanout BO");
@@ -6598,7 +6682,12 @@ impl KmsBackend {
         self.refresh_present_crtc_clock_epochs();
 
         if prepared.dpms_active {
-            for key in installed_clocks {
+            for promoted_key in installed_clocks {
+                let key = self
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock_key_for_hardware_crtc(promoted_key.hardware_crtc))
+                    .expect("promoted acquire CRTC retains its refreshed clock epoch");
                 self.modeset_lit_clock_probes
                     .insert((device, key.hardware_crtc, key.epoch.get()));
                 self.retain_waiting_clock_probe(device, key);

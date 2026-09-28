@@ -990,8 +990,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                     self.topology_latch = Some(generation);
                     self.state = DeviceLifecycleState::Ready;
                     self.admission_open = true;
-                    if let Some(representative) =
-                        self.desired.representative(field_for_kind(active.kind))
+                    if let Some(representative) = self
+                        .desired
+                        .representative(field_for_kind(active.kind))
+                        .filter(|representative| representative.kind == active.kind)
                     {
                         self.set_disposition(
                             representative.event_id,
@@ -1002,8 +1004,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                 } else {
                     self.state = DeviceLifecycleState::Quiescing;
                     self.admission_open = false;
-                    if let Some(representative) =
-                        self.desired.representative(field_for_kind(active.kind))
+                    if let Some(representative) = self
+                        .desired
+                        .representative(field_for_kind(active.kind))
+                        .filter(|representative| representative.kind == active.kind)
                     {
                         self.set_disposition(
                             representative.event_id,

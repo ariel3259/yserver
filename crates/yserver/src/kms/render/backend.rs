@@ -24056,10 +24056,14 @@ impl KmsBackend {
         let mut all_terminal = true;
         let mut unknown = Vec::new();
         for device in &release.devices {
-            let slot_idle = self
-                .platform
-                .owner_ref(*device)
-                .is_none_or(|owner| owner.slot().is_idle());
+            let slot_terminal_for_handoff = self.platform.owner_ref(*device).is_none_or(|owner| {
+                owner.slot().is_idle()
+                    || owner.live_record().is_none()
+                        && self
+                            .lifecycle_drivers
+                            .get(device)
+                            .is_some_and(|driver| driver.has_cancelled_sent_topology_validation())
+            });
             let executor_live = self
                 .platform
                 .device_for_key(*device)
@@ -24083,10 +24087,12 @@ impl KmsBackend {
                                 && arbiter.desired().seat_target()
                                     == Some(crate::kms::owner::lifecycle::SeatTarget::Released)
                     });
-            if !slot_idle || release_transition_pending {
+            if !slot_terminal_for_handoff || release_transition_pending {
                 all_terminal = false;
             }
-            if !executor_live || deadline_expired && (!slot_idle || release_transition_pending) {
+            if !executor_live
+                || deadline_expired && (!slot_terminal_for_handoff || release_transition_pending)
+            {
                 unknown.push(*device);
             }
         }
@@ -24575,6 +24581,25 @@ impl KmsBackend {
             return;
         }
 
+        // If this acquire arrived while the superseding VTRelease still owns
+        // a PhysicalReady transition, give that release its terminal
+        // disposition now. Its rejected no-op topology attempt must then
+        // converge directly into the newest acquire representative.
+        for device in &install_devices {
+            if self
+                .lifecycle_coordinator
+                .device(device)
+                .and_then(|arbiter| arbiter.transition())
+                .is_some_and(|transition| {
+                    transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTRelease
+                        && transition.phase
+                            == crate::kms::owner::lifecycle::LifecycleTransitionPhase::PhysicalReady
+                })
+            {
+                let _ = self.admission_wake(*device, false);
+            }
+        }
+
         if self.vt_state.resume_complete(&mut self.vt_pending) != VtAction::Nothing {
             // Rapid-switch precedence is completed in Task 5. Until then,
             // leave the scanout gate closed if a release arrived mid-resume.
@@ -24601,14 +24626,25 @@ impl KmsBackend {
             self.acquire_episode_participant_terminal(device);
         }
         for device in owner_devices {
-            let transition_pending = self
+            // A lower-priority acquire can be the current desired seat
+            // representative while a superseding release is still reaching
+            // its terminal disposition. Keep its topology episode open; the
+            // release result may then converge into this acquire.
+            let acquire_pending = self
                 .lifecycle_coordinator
                 .device(&device)
-                .and_then(|arbiter| arbiter.transition())
-                .is_some_and(|transition| {
-                    transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                .and_then(|arbiter| {
+                    arbiter
+                        .desired()
+                        .representative(crate::kms::owner::lifecycle::DesiredField::Seat)
+                })
+                .is_some_and(|representative| {
+                    representative.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                        && !representative
+                            .disposition
+                            .is_some_and(crate::kms::owner::lifecycle::Disposition::is_terminal)
                 });
-            if !transition_pending {
+            if !acquire_pending {
                 self.acquire_episode_participant_terminal(device);
             }
         }
@@ -98433,12 +98469,24 @@ mod tests {
         // the ALLOW_MODESET install commit when VTRelease arrives.
         c0_3aii_replace_owner_executor(
             backend,
-            StubBehaviour::AcceptKernelCallsAfter(Duration::from_millis(250)),
+            StubBehaviour::AcceptKernelCallsAfter(Duration::from_millis(1_500)),
         );
+        let acquire_descriptions_before = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .len();
         let live_sends_before_acquire = backend.lifecycle_drivers[&device]
             .topology_test_stats()
             .1
             .len();
+        let stale_results_before_acquire =
+            backend.lifecycle_drivers[&device].topology_test_stats().4;
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let clock_epoch_before_acquire = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(crtc))
+            .expect("fixture output starts with an installed clock")
+            .epoch;
         c0_3ci_acquire_through_core_driver(
             backend,
             &mut state,
@@ -98452,10 +98500,18 @@ mod tests {
             .id;
         let prepared_allocations =
             backend.lifecycle_drivers[&device].prepared_acquire_allocation_keys_for_tests();
+        let prepared_clock_keys =
+            backend.lifecycle_drivers[&device].prepared_acquire_clock_keys_for_tests();
         assert!(
             !prepared_allocations.is_empty(),
             "the acquire has prepared its replacement pool before release supersedes it"
         );
+        assert_eq!(
+            prepared_clock_keys.len(),
+            1,
+            "the pending reinstall has one reserved clock epoch"
+        );
+        let superseded_clock_epoch = prepared_clock_keys[0].epoch;
         let acquire_live_sends = backend.lifecycle_drivers[&device]
             .topology_test_stats()
             .1
@@ -98471,6 +98527,7 @@ mod tests {
             .iter()
             .filter(|entry| **entry == "vt_acquire")
             .count();
+        let release_deadline_bound = Instant::now() + Duration::from_secs(1);
         backend.core_driver_vt_releases_for_tests += 1;
         c0_3bi_core_driver_until_with_state(
             backend,
@@ -98481,11 +98538,6 @@ mod tests {
             None,
         )
         .expect("VTRelease enters through the core-entry driver");
-        let release_deadline = backend
-            .owner_vt_release
-            .as_ref()
-            .expect("release retains its absolute hand-off bound")
-            .deadline;
         c0_3bi_core_driver_until_with_state(
             backend,
             &mut state,
@@ -98495,8 +98547,44 @@ mod tests {
             None,
         )
         .expect("release hand-off follows cancellation of the acquire validation");
-        assert!(Instant::now() <= release_deadline);
+        assert!(
+            Instant::now() <= release_deadline_bound,
+            "VT release exceeded its deadline: slot_idle={:?}; canceled_validation={:?}; live={:?}; dpms_active={:?}; arbiter={:?}",
+            backend
+                .platform
+                .owner_ref(device)
+                .map(|owner| owner.slot().is_idle()),
+            backend.lifecycle_drivers[&device].has_cancelled_sent_topology_validation(),
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .map(|record| (record.commit_id(), record.milestones())),
+            backend.owner_dpms_installed_active.get(&device),
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .map(|arbiter| {
+                    (
+                        arbiter.state(),
+                        arbiter.transition(),
+                        arbiter.desired().seat_target(),
+                    )
+                })
+        );
         assert_eq!(backend.vt_state, VtState::Suspended);
+        assert_eq!(
+            backend.lifecycle_drivers[&device].topology_test_stats().4,
+            stale_results_before_acquire,
+            "the superseded TEST_ONLY has not answered when VT hand-off completes"
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_validation_commits_for_tests()
+                .len(),
+            1,
+            "VT hand-off leaves the canceled helper validation pending for its stale reply"
+        );
         assert!(backend.acquire_episode.is_none());
         assert!(backend.topology_episode_events.iter().any(|event| {
             matches!(
@@ -98513,17 +98601,11 @@ mod tests {
             live_sends_before_acquire,
             "the already-dark device sends neither the superseded reinstall nor a release commit"
         );
-        assert!(
-            backend.lifecycle_drivers[&device]
-                .prepared_acquire_allocation_keys_for_tests()
-                .is_empty(),
-            "the superseded reinstall releases its prepared pool"
+        assert_eq!(
+            backend.lifecycle_drivers[&device].prepared_acquire_allocation_keys_for_tests(),
+            prepared_allocations,
+            "the pending TEST_ONLY retains its prepared pool until the stale result arrives"
         );
-        assert!(prepared_allocations.iter().all(|key| {
-            backend
-                .resource_service()
-                .is_none_or(|service| !service.contains(key))
-        }));
         assert_eq!(
             backend
                 .core_entry_trace_for_tests
@@ -98534,19 +98616,278 @@ mod tests {
             acquires_before_release,
             "VTRelease reaches VT_RELDISP(1) without a later acquire signal; the kernel only sends that acquire after our acknowledgement"
         );
-        let expected = c0_3bi_expected_end_state(outputs);
         c0_3bi_core_driver_until_with_state(
             backend,
             &mut state,
-            "rapid-switch superseded acquire clean end state",
-            Duration::from_secs(3),
+            "receive superseded TEST_ONLY after VT release hand-off",
+            Duration::from_secs(5),
+            &|backend| {
+                backend.lifecycle_drivers[&device].topology_test_stats().4
+                    > stale_results_before_acquire
+            },
+            None,
+        )
+        .expect("the canceled TEST_ONLY reply arrives after VT release completes");
+        let (_, _, _, _, stale_results_after_release) =
+            backend.lifecycle_drivers[&device].topology_test_stats();
+        assert_eq!(
+            stale_results_after_release,
+            stale_results_before_acquire + 1,
+            "the superseded TEST_ONLY reply arrives after VTRelease and is disposed as stale"
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .pending_topology_validation_commits_for_tests()
+                .is_empty()
+        );
+        assert!(
+            backend.lifecycle_drivers[&device]
+                .prepared_acquire_allocation_keys_for_tests()
+                .is_empty(),
+            "the superseded reinstall releases its prepared pool after the stale result"
+        );
+        assert!(prepared_allocations.iter().all(|key| {
+            backend
+                .resource_service()
+                .is_none_or(|service| !service.contains(key))
+        }));
+        let expected = c0_3bi_expected_end_state(outputs);
+        assert!(
+            c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            "the canceled acquire pool and release resources retire before reacquire"
+        );
+        assert_eq!(
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.clock_key_for_hardware_crtc(crtc))
+                .expect("the superseded acquire did not remove the installed clock")
+                .epoch,
+            clock_epoch_before_acquire,
+            "a superseded TEST_ONLY cannot install its prepared clock epoch"
+        );
+        assert!(
+            c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            "the cancelled acquire pool and release resources retire before reacquire"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.transition())
+                .map(|transition| transition.kind),
+            Some(crate::kms::owner::lifecycle::LifecycleKind::VTRelease),
+            "the release lifecycle transition is still awaiting admission after its hand-off"
+        );
+
+        let offers_before_reacquire = backend.core_driver_composed_offers_for_tests.len();
+        let descriptions_before_reacquire = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .len();
+        Backend::on_vt_acquire(backend, &mut state);
+        assert_eq!(backend.vt_state, VtState::Active);
+        let reacquire_episode_id = backend
+            .acquire_episode
+            .as_ref()
+            .expect("the later acquire remains open while VTRelease is terminalized")
+            .id;
+        assert!(
+            backend
+                .acquire_episode
+                .as_ref()
+                .is_some_and(|episode| episode.remaining.contains(&device))
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .and_then(|arbiter| arbiter.desired().seat_target()),
+            Some(crate::kms::owner::lifecycle::SeatTarget::Owned)
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "later acquire after superseded TEST_ONLY and release disposition",
+            Duration::from_secs(5),
+            &|backend| {
+                backend.lifecycle_drivers[&device]
+                    .acquire_topology_descriptions_for_tests()
+                    .len()
+                    > descriptions_before_reacquire
+                    && backend
+                        .lifecycle_coordinator
+                        .device(&device)
+                        .and_then(|arbiter| arbiter.transition())
+                        .is_some_and(|transition| {
+                            transition.kind
+                                == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                        })
+            },
+            None,
+        )
+        .unwrap_or_else(|error| {
+            let arbiter = backend.lifecycle_coordinator.device(&device);
+            panic!(
+                "a release result cannot strand the later acquire in Quiescing: {error}; \
+                 transition={:?}; state={:?}; seat={:?}; admission_closed={}; \
+                 validation_stats={:?}; pending_validation={:?}; admission_trace={:?}",
+                arbiter.and_then(|arbiter| arbiter.transition()),
+                arbiter.map(|arbiter| arbiter.state()),
+                arbiter.and_then(|arbiter| arbiter
+                    .desired()
+                    .representative(crate::kms::owner::lifecycle::DesiredField::Seat)),
+                backend.admission_conductors[&device].lifecycle_admission_closed,
+                backend.lifecycle_drivers[&device].topology_test_stats(),
+                backend.lifecycle_drivers[&device].pending_topology_validation_commits_for_tests(),
+                {
+                    let trace = backend.admission_trace_for_tests(device);
+                    trace[trace.len().saturating_sub(12)..].to_vec()
+                },
+            )
+        });
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .acquire_topology_descriptions_for_tests()
+                .len(),
+            acquire_descriptions_before + 2,
+            "the later acquire builds a fresh reinstall description"
+        );
+        let description = backend.lifecycle_drivers[&device]
+            .acquire_topology_descriptions_for_tests()
+            .last()
+            .expect("later acquire description is available");
+        assert!(description.objects.iter().any(|object| {
+            object.kind == crate::kms::owner::closure::ObjectKind::Connector
+                && object.old_crtc_id == Some(0)
+        }));
+        assert!(description.objects.iter().any(|object| {
+            object.kind == crate::kms::owner::closure::ObjectKind::Plane
+                && object.old_crtc_id == Some(0)
+        }));
+        assert!(
+            description
+                .crtc_state
+                .iter()
+                .all(|power| !power.old_active && power.new_active)
+        );
+
+        let reinstall = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device,
+            "accept acquire after superseded acquire",
+        );
+        assert_eq!(
+            backend.lifecycle_drivers[&device]
+                .topology_test_stats()
+                .1
+                .len(),
+            live_sends_before_acquire + 1,
+            "only the later acquire reaches the ALLOW_MODESET send"
+        );
+        let installed_clock_epoch = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(crtc))
+            .expect("the release retained its installed CRTC clock")
+            .epoch;
+        let prepared_clock_keys =
+            backend.lifecycle_drivers[&device].prepared_acquire_clock_keys_for_tests();
+        assert_eq!(prepared_clock_keys.len(), 1);
+        assert!(
+            prepared_clock_keys[0].epoch > installed_clock_epoch,
+            "fresh acquire reserves a clock epoch beyond the still-installed one: \
+             prepared={:?}; installed={installed_clock_epoch:?}",
+            prepared_clock_keys[0]
+        );
+        assert!(
+            prepared_clock_keys[0].epoch > superseded_clock_epoch,
+            "later acquire must not reuse the superseded reinstall's reserved clock epoch: \
+             later={:?}; superseded={superseded_clock_epoch:?}",
+            prepared_clock_keys[0]
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            reinstall,
+            "apply acquire after superseded acquire",
+        );
+        assert!(backend.acquire_episode.is_none());
+        assert!(backend.topology_episode_events.iter().any(|event| {
+            matches!(
+                event,
+                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, None)
+                    if *id == reacquire_episode_id
+            )
+        }));
+        let arbiter = backend
+            .lifecycle_coordinator
+            .device(&device)
+            .expect("Owner lifecycle arbiter remains registered");
+        assert_eq!(
+            arbiter.state(),
+            crate::kms::owner::lifecycle::DeviceLifecycleState::Ready
+        );
+        assert!(arbiter.transition().is_none());
+        assert!(
+            arbiter
+                .desired()
+                .representative(crate::kms::owner::lifecycle::DesiredField::Seat)
+                .is_some_and(|representative| {
+                    representative.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
+                        && matches!(
+                            representative.disposition,
+                            Some(crate::kms::owner::lifecycle::Disposition::Applied(_))
+                        )
+                })
+        );
+        assert!(!backend.admission_conductors[&device].lifecycle_admission_closed);
+        assert_eq!(
+            backend.owner_dpms_installed_active.get(&device),
+            Some(&true)
+        );
+
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "compose a frame after the post-supersession acquire",
+            Duration::from_secs(5),
+            &|backend| {
+                let output_idx = backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .position(|output| output.key.device_key == device);
+                backend.core_driver_composed_offers_for_tests[offers_before_reacquire..]
+                    .iter()
+                    .any(|(offered_device, _, _, _)| *offered_device == device)
+                    && output_idx.is_some()
+                    && backend
+                        .platform
+                        .owner_ref(device)
+                        .is_some_and(|owner| owner.live_record().is_some())
+            },
+            None,
+        )
+        .expect("the reinstalled output composes and dispatches a new frame");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_release_supersedes_undispatched_acquire_vulkan after composed frame",
+            &expected,
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "post-supersession acquire clean end state",
+            Duration::from_secs(5),
             &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
             None,
         )
-        .expect("the cancelled acquire pool and the release resources retire cleanly");
+        .expect("the later acquire retires all displaced resources cleanly");
         c0_3bi_assert_end_state(
             backend,
-            "c0_3ci_release_supersedes_undispatched_acquire_vulkan",
+            "c0_3ci_release_supersedes_undispatched_acquire_vulkan after reacquire",
             &expected,
         );
     }
