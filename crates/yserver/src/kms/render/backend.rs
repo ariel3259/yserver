@@ -94658,6 +94658,281 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3ci_acquire_releases_displaced_composed_work_vulkan() {
+        use crate::kms::{
+            executor::test_support::StubBehaviour,
+            render::{owner_buffer::OwnerBufferState, platform::ScanoutRenderCompletionStage},
+            vk::scanout::BoPhase,
+        };
+
+        // A completed render with an admission offer becomes Displaced when
+        // VT acquire retires its old output instance.
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let output_key = outputs[0].clone();
+        let (instance, crtc, bo_idx, generation) =
+            c0_3bi_prepare_unsubmitted_desired_frame(backend, device);
+        let allocations =
+            c0_3bi_scanout_allocation_keys(backend, device, &output_key.connector_name);
+        assert_eq!(
+            backend
+                .scene
+                .owner_state_for_generation_for_tests(0, generation),
+            Some(OwnerBufferState::Desired)
+        );
+        let render_fence = backend
+            .scene
+            .hold_owner_render_fence_for_tests(0, generation)
+            .expect("the queued generation retains its render fence");
+
+        let mut state = c0_3ci_core_state(backend);
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "release with a displaced composed frame",
+        );
+        c0_3ci_acquire_through_core_driver(
+            backend,
+            &mut state,
+            "acquire with a displaced composed frame",
+        );
+        let reinstall = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device,
+            "accept acquire with a displaced composed frame",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            reinstall,
+            "complete acquire with a displaced composed frame",
+        );
+
+        c0_3bi_core_driver_until(
+            backend,
+            "retain displaced frame while its render fence is withheld",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                backend
+                    .scene
+                    .retired_output_end_states_for_tests()
+                    .iter()
+                    .any(|bundle| bundle.instance == instance)
+            },
+            None,
+        )
+        .expect("the withheld render fence keeps the retired bundle observable");
+        let retired = backend
+            .scene
+            .retired_output_end_states_for_tests()
+            .into_iter()
+            .find(|bundle| bundle.instance == instance)
+            .expect("the old instance has a retired bundle");
+        assert_eq!(
+            retired.owner_buffers,
+            vec![(bo_idx, OwnerBufferState::Displaced)]
+        );
+        assert_eq!(retired.phases[bo_idx], BoPhase::Owner);
+        assert_eq!(retired.gpu_fence_proofs, 1);
+        c0_3bi_assert_no_retired_instance_offer(backend, device, crtc, instance, generation);
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_releases_displaced_composed_work_vulkan while withheld",
+            &C0EndStateExpectation {
+                installed_outputs: outputs.clone(),
+                retained_bundles: vec![C0ExpectedRetiredBundle {
+                    instance,
+                    proofs: vec![C0RetiredProofKind::GpuFence],
+                }],
+                ..C0EndStateExpectation::default()
+            },
+        );
+
+        render_fence.release_polling_for_tests();
+        c0_3bi_core_driver_until(
+            backend,
+            "free displaced composed work after its render fence",
+            std::time::Duration::from_secs(4),
+            &|backend| {
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            },
+            None,
+        )
+        .expect("the retired bundle drains after the render fence signals");
+        assert!(allocations.iter().all(|key| {
+            backend
+                .resource_service()
+                .is_none_or(|service| !service.contains(key))
+        }));
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_releases_displaced_composed_work_vulkan after signal",
+            &c0_3bi_expected_end_state(outputs),
+        );
+
+        // A Rendering buffer can reach VT release before its render
+        // completion is serviced. The inactive-seat completion entry drops
+        // that notification; retired-bundle service must still consume its
+        // GPU batch when the fence later proves the work is finished.
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        let backend = &mut fixture.backend;
+        let output_key = outputs[0].clone();
+        let instance = backend
+            .scene
+            .output_instance_id_for_tests(0)
+            .expect("old output instance");
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("active admission conductor")
+            .lifecycle_admission_closed = true;
+        backend
+            .platform
+            .hold_next_scanout_render_completion_for_tests(
+                instance,
+                ScanoutRenderCompletionStage::Render,
+            );
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        let (bo_idx, generation, waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("the live Owner fixture composed a frame");
+        assert!(waiting, "the render is still pending");
+        assert_eq!(
+            backend
+                .scene
+                .owner_state_for_generation_for_tests(0, generation),
+            Some(OwnerBufferState::Rendering)
+        );
+        let allocations =
+            c0_3bi_scanout_allocation_keys(backend, device, &output_key.connector_name);
+        let render_fence = backend
+            .scene
+            .hold_owner_render_fence_for_tests(0, generation)
+            .expect("the Rendering generation retains its render fence");
+        backend.platform.wait_idle_bounded();
+        let completion = backend
+            .platform
+            .held_scanout_render_completion_for_tests(
+                instance,
+                ScanoutRenderCompletionStage::Render,
+            )
+            .expect("the render completion remains held before VT release");
+
+        let mut state = c0_3ci_core_state(backend);
+        Backend::on_vt_release(backend, &mut state);
+        backend
+            .platform
+            .release_scanout_render_completion_for_tests(completion)
+            .expect("make the completed render notification visible");
+        backend.drain_scanout_render_completions_for_tests();
+        assert_eq!(
+            backend
+                .platform
+                .pending_scanout_render_completion_count_for_tests(),
+            0,
+            "the inactive-seat drain consumed the notification before promotion"
+        );
+        c0_3ci_release_owner_to_suspended(
+            backend,
+            &mut state,
+            device,
+            "finish release after the render notification was dropped",
+        );
+        c0_3ci_acquire_through_core_driver(
+            backend,
+            &mut state,
+            "acquire after the render notification was dropped",
+        );
+        let reinstall = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device,
+            "accept acquire after the render notification was dropped",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver(
+            backend,
+            device,
+            reinstall,
+            "complete acquire after the render notification was dropped",
+        );
+
+        c0_3bi_core_driver_until(
+            backend,
+            "retain Rendering work as Displaced behind its render fence",
+            std::time::Duration::from_secs(2),
+            &|backend| {
+                backend
+                    .scene
+                    .retired_output_end_states_for_tests()
+                    .iter()
+                    .any(|bundle| bundle.instance == instance)
+            },
+            None,
+        )
+        .expect("the second old instance has a retired bundle");
+        let retired = backend
+            .scene
+            .retired_output_end_states_for_tests()
+            .into_iter()
+            .find(|bundle| bundle.instance == instance)
+            .expect("the old Rendering instance remains retired");
+        assert_eq!(
+            retired.owner_buffers,
+            vec![(bo_idx, OwnerBufferState::Displaced)]
+        );
+        assert_eq!(retired.phases[bo_idx], BoPhase::Owner);
+        assert_eq!(retired.gpu_fence_proofs, 1);
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_releases_displaced_composed_work_vulkan Rendering withheld",
+            &C0EndStateExpectation {
+                installed_outputs: outputs.clone(),
+                retained_bundles: vec![C0ExpectedRetiredBundle {
+                    instance,
+                    proofs: vec![
+                        C0RetiredProofKind::GpuFence,
+                        C0RetiredProofKind::ResourceProof,
+                    ],
+                }],
+                ..C0EndStateExpectation::default()
+            },
+        );
+
+        render_fence.release_polling_for_tests();
+        c0_3bi_core_driver_until(
+            backend,
+            "release dropped Rendering work after its render fence",
+            std::time::Duration::from_secs(4),
+            &|backend| {
+                !backend
+                    .scene
+                    .retired_output_has_instance_for_tests(instance)
+            },
+            None,
+        )
+        .expect("the retired bundle registers and discharges the completed render batch");
+        assert!(allocations.iter().all(|key| {
+            backend
+                .resource_service()
+                .is_none_or(|service| !service.contains(key))
+        }));
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_releases_displaced_composed_work_vulkan Rendering after signal",
+            &c0_3bi_expected_end_state(outputs),
+        );
+    }
+
     fn c0_3ci_live_release_fixture(
         behaviour: crate::kms::executor::test_support::StubBehaviour,
         two_outputs: bool,

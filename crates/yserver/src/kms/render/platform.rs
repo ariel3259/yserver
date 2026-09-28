@@ -5637,6 +5637,21 @@ impl PlatformBackend {
         Ok(job_id)
     }
 
+    /// Whether the completion notification for a scanout job is still owned
+    /// by the platform queue. A retired bundle may take over its GPU batch
+    /// only after the notification was drained without reaching the scene.
+    pub(crate) fn scanout_render_completion_pending(
+        &self,
+        output_instance_id: OutputInstanceId,
+        job_id: u64,
+    ) -> bool {
+        self.pending_scanout_render_completions
+            .iter()
+            .any(|pending| {
+                pending.output_instance_id == output_instance_id && pending.job_id == job_id
+            })
+    }
+
     /// Drain every currently readable copied-scanout render completion.
     /// Different outputs are independent, so readiness is not constrained by
     /// queue-front order.

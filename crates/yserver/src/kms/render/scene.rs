@@ -6572,8 +6572,27 @@ fn retire_owner_buffers_in_bundle(
             };
             match ticket.poll_signaled_result(vk) {
                 Ok(true) => {
-                    if let Some(ack) = bundle.scene.owner_buffers[index].pending_ack_mut() {
-                        ack.retired_unsubmitted_fence_proven = true;
+                    let ack = bundle.scene.owner_buffers[index]
+                        .pending_ack_mut()
+                        .expect("a retired render-fence owner buffer has an acknowledgement");
+                    ack.retired_unsubmitted_fence_proven = true;
+                    let render_completion_pending = match ack.stage {
+                        InFlightStage::OwnerRenderWaiting { job_id } => {
+                            platform.scanout_render_completion_pending(bundle.instance, job_id)
+                        }
+                        _ => false,
+                    };
+                    if !render_completion_pending && let Some(batch) = ack.managed_batch.take() {
+                        // A render-completion notification may be drained
+                        // without reaching the scene. The retired buffer still
+                        // owns the batch, so register it here only after the
+                        // same fence proves the never-submitted work is done.
+                        service.register_batch(batch);
+                        if let Err(error) = service.service_completions(std::time::Instant::now()) {
+                            log::warn!(
+                                "render retired output: unsubmitted GPU batch completion failed: {error:?}"
+                            );
+                        }
                     }
                 }
                 Ok(false) => {
@@ -6588,6 +6607,28 @@ fn retire_owner_buffers_in_bundle(
                     index += 1;
                     continue;
                 }
+            }
+        }
+        let copy_receipt = bundle.scene.owner_buffers[index]
+            .pending_ack()
+            .filter(|ack| ack.retired_unsubmitted_copy_pending)
+            .and_then(|ack| ack.copied_receipt.as_ref())
+            .map(|receipt| (receipt.destination, receipt.source));
+        if let Some((destination, source)) = copy_receipt {
+            if let Err(error) = service.service_completions(std::time::Instant::now()) {
+                log::warn!(
+                    "render retired output: unsubmitted copied batch completion failed: {error:?}"
+                );
+            }
+            // The copied completion notification can also be drained while
+            // scanout is inactive. ResourceService owns its exact sink-fence
+            // proof; both obligations must be discharged before the lost
+            // notification is treated as complete.
+            if !service.has_pending_obligation(&destination.0, destination.1)
+                && !service.has_pending_obligation(&source.0, source.1)
+                && let Some(ack) = bundle.scene.owner_buffers[index].pending_ack_mut()
+            {
+                ack.retired_unsubmitted_copy_pending = false;
             }
         }
         let releasable_state = matches!(
