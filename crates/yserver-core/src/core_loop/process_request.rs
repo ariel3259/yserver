@@ -497,6 +497,10 @@ pub fn process_request(
         152 => handle_xcmisc_request(state, client_id, sequence, header, body),
         // ── XFree86-VidModeExtension dispatcher ──
         153 => handle_xf86vidmode_request(state, backend, client_id, sequence, header, body),
+        // ── RECORD extension dispatcher ──
+        154 => crate::core_loop::record::handle_record_request(
+            state, client_id, sequence, header, body,
+        ),
         opcode => {
             debug!(
                 "client {} #{} unknown opcode {} ({} bytes) -> BadRequest",
@@ -24490,7 +24494,7 @@ fn emit_property_change(
     dropped
 }
 
-fn emit_x11_error_with_minor(
+pub(crate) fn emit_x11_error_with_minor(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
@@ -33316,7 +33320,7 @@ fn handle_translate_coordinates(
     Ok(write_to_client(client, client_id, &buf))
 }
 
-fn write_to_client(
+pub(crate) fn write_to_client(
     client: &mut crate::server::ClientState,
     client_id: ClientId,
     bytes: &[u8],
@@ -46262,6 +46266,7 @@ mod tests {
             (151, "XINERAMA"),
             (152, "XC-MISC"),
             (153, "XFree86-VidModeExtension"),
+            (154, "RECORD"),
         ];
 
         for (opcode, name) in extensions {
