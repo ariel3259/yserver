@@ -97714,6 +97714,11 @@ mod tests {
             deadline,
             "a coalesced release cannot extend the absolute hand-off bound"
         );
+        // Since upstream #177 the paint frame's timeout is a wakeup even while
+        // the VT is away. The fixture's open frame is already due, so let the
+        // core's per-iteration tick close it first; the release deadline must
+        // then be the next wakeup on its own.
+        Backend::maybe_composite(backend).unwrap();
         assert_eq!(Backend::next_wakeup(backend), Some(deadline));
         c0_3bi_core_driver_until_with_state(
             backend,
