@@ -43,7 +43,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(test)]
 use std::os::fd::FromRawFd;
 
 use ash::vk;
@@ -2556,6 +2555,290 @@ pub(crate) struct KmsDevice {
     >,
 }
 
+/// A connector probe runs with the duplicated KMS file description supplied
+/// by the backend. Implementations are selected while the backend is built;
+/// the worker path itself has no test-only fork.
+pub(crate) trait ConnectorProber: Send + Sync {
+    fn probe_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<ConnectorSnapshot>>;
+
+    fn probe_connectors(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<crate::platform::drm::ConnectorProbe>>;
+}
+
+pub(crate) struct DrmConnectorProber;
+
+impl ConnectorProber for DrmConnectorProber {
+    fn probe_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<ConnectorSnapshot>> {
+        let device = drm::Device::from_inherited_kms_fd(fd, format!("probe {key}"));
+        crate::platform::drm::probe_connector_snapshots(&device)
+            .map(|probes| {
+                probes
+                    .iter()
+                    .map(|probe| ConnectorSnapshot::from_probe(key, probe))
+                    .collect()
+            })
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("probe connector snapshot on DRM device {key}: {error}"),
+                )
+            })
+    }
+
+    fn probe_connectors(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<crate::platform::drm::ConnectorProbe>> {
+        let device = drm::Device::from_inherited_kms_fd(fd, format!("probe {key}"));
+        crate::platform::drm::probe_connectors(&device).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("probe connectors on DRM device {key}: {error}"),
+            )
+        })
+    }
+}
+
+pub(crate) fn duplicate_connector_probe_fd(device: &drm::Device) -> io::Result<OwnedFd> {
+    let source = device.as_fd().as_raw_fd();
+    // SAFETY: fcntl borrows the device descriptor; a successful
+    // F_DUPFD_CLOEXEC returns a new descriptor owned by the caller.
+    let duplicated = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful fcntl call created this fresh descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+#[derive(Clone)]
+pub(crate) struct ScriptedConnectorProber {
+    answers: Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                crate::platform::drm::DrmDeviceKey,
+                std::collections::VecDeque<ScriptedProbeAnswer>,
+            >,
+        >,
+    >,
+    observations: Arc<std::sync::Mutex<Vec<ProbeObservation>>>,
+}
+
+enum ScriptedProbeAnswer {
+    Snapshot(Result<Vec<ConnectorSnapshot>, i32>),
+    BlockSnapshot {
+        result: Result<Vec<ConnectorSnapshot>, i32>,
+        barrier: ProbeBarrier,
+    },
+    Connectors(Result<Vec<crate::platform::drm::ConnectorProbe>, i32>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProbeBarrier {
+    state: Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
+}
+
+impl ProbeBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new((
+                std::sync::Mutex::new((false, false)),
+                std::sync::Condvar::new(),
+            )),
+        }
+    }
+
+    pub(crate) fn wait_started(&self, timeout: std::time::Duration) -> bool {
+        let (lock, ready) = &*self.state;
+        let state = lock.lock().expect("probe barrier lock");
+        let (state, _) = ready
+            .wait_timeout_while(state, timeout, |(started, _)| !*started)
+            .expect("probe barrier wait");
+        state.0
+    }
+
+    pub(crate) fn release(&self) {
+        let (lock, ready) = &*self.state;
+        lock.lock().expect("probe barrier lock").1 = true;
+        ready.notify_all();
+    }
+
+    fn block_worker(&self) {
+        let (lock, ready) = &*self.state;
+        let mut state = lock.lock().expect("probe barrier lock");
+        state.0 = true;
+        ready.notify_all();
+        while !state.1 {
+            state = ready.wait(state).expect("probe barrier wait");
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProbeObservation {
+    pub(crate) key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) fd: RawFd,
+    pub(crate) thread: std::thread::ThreadId,
+    pub(crate) fd_closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ScriptedConnectorProber {
+    pub(crate) fn new() -> Self {
+        Self {
+            answers: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(crate) fn push_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<ConnectorSnapshot>>,
+    ) {
+        let answer = result.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        self.answers
+            .lock()
+            .expect("scripted prober lock")
+            .entry(key)
+            .or_default()
+            .push_back(ScriptedProbeAnswer::Snapshot(answer));
+    }
+
+    pub(crate) fn set_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<ConnectorSnapshot>>,
+    ) {
+        let answer = result.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        self.answers.lock().expect("scripted prober lock").insert(
+            key,
+            std::collections::VecDeque::from([ScriptedProbeAnswer::Snapshot(answer)]),
+        );
+    }
+
+    pub(crate) fn push_blocked_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<ConnectorSnapshot>>,
+        barrier: ProbeBarrier,
+    ) {
+        let answer = result.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        self.answers
+            .lock()
+            .expect("scripted prober lock")
+            .entry(key)
+            .or_default()
+            .push_back(ScriptedProbeAnswer::BlockSnapshot {
+                result: answer,
+                barrier,
+            });
+    }
+
+    pub(crate) fn set_blocked_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<ConnectorSnapshot>>,
+        barrier: ProbeBarrier,
+    ) {
+        let answer = result.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        self.answers.lock().expect("scripted prober lock").insert(
+            key,
+            std::collections::VecDeque::from([ScriptedProbeAnswer::BlockSnapshot {
+                result: answer,
+                barrier,
+            }]),
+        );
+    }
+
+    pub(crate) fn observations(&self) -> Vec<ProbeObservation> {
+        self.observations
+            .lock()
+            .expect("scripted prober lock")
+            .clone()
+    }
+
+    fn next_answer(&self, key: crate::platform::drm::DrmDeviceKey) -> ScriptedProbeAnswer {
+        self.answers
+            .lock()
+            .expect("scripted prober lock")
+            .get_mut(&key)
+            .and_then(std::collections::VecDeque::pop_front)
+            .unwrap_or(ScriptedProbeAnswer::Snapshot(Err(libc::EIO)))
+    }
+
+    fn observe(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: RawFd,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let fd_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.observations
+            .lock()
+            .expect("scripted prober lock")
+            .push(ProbeObservation {
+                key,
+                fd,
+                thread: std::thread::current().id(),
+                fd_closed: Arc::clone(&fd_closed),
+            });
+        fd_closed
+    }
+}
+
+impl ConnectorProber for ScriptedConnectorProber {
+    fn probe_snapshot(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<ConnectorSnapshot>> {
+        let fd_closed = self.observe(key, fd.as_raw_fd());
+        let result = match self.next_answer(key) {
+            ScriptedProbeAnswer::Snapshot(result) => scripted_probe_result(result),
+            ScriptedProbeAnswer::BlockSnapshot { result, barrier } => {
+                barrier.block_worker();
+                scripted_probe_result(result)
+            }
+            ScriptedProbeAnswer::Connectors(_) => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+        drop(fd);
+        fd_closed.store(true, std::sync::atomic::Ordering::Release);
+        result
+    }
+
+    fn probe_connectors(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        fd: OwnedFd,
+    ) -> io::Result<Vec<crate::platform::drm::ConnectorProbe>> {
+        let fd_closed = self.observe(key, fd.as_raw_fd());
+        let result = match self.next_answer(key) {
+            ScriptedProbeAnswer::Connectors(result) => scripted_probe_result(result),
+            ScriptedProbeAnswer::Snapshot(_) | ScriptedProbeAnswer::BlockSnapshot { .. } => {
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            }
+        };
+        drop(fd);
+        fd_closed.store(true, std::sync::atomic::Ordering::Release);
+        result
+    }
+}
+
+fn scripted_probe_result<T>(result: Result<T, i32>) -> io::Result<T> {
+    result.map_err(io::Error::from_raw_os_error)
+}
+
 fn install_cursor_plane_for_device(
     kms_device: &mut KmsDevice,
     crtcs: &[::drm::control::crtc::Handle],
@@ -2732,6 +3015,9 @@ pub struct PlatformBackend {
     initial_scanout_rollback_armed: bool,
     // DRM / output side
     pub(crate) devices: Vec<KmsDevice>,
+    pub(crate) connector_prober: Arc<dyn ConnectorProber>,
+    #[cfg(test)]
+    scripted_connector_prober: Option<ScriptedConnectorProber>,
     /// Immutable same-instance Vulkan inventory of graphics+transfer
     /// queue-capable render-identified devices. Handles are valid for exactly
     /// the lifetime of `vk` below.
@@ -2812,19 +3098,6 @@ pub struct PlatformBackend {
     /// allowance without polling a test DRM fd.
     #[cfg(test)]
     pub(crate) drm_event_drain_for_tests: Option<(Vec<std::time::Duration>, bool)>,
-    /// Supplies a device-qualified connector result to mixed VT-resume tests
-    /// without issuing GETCONNECTOR ioctls to synthetic device fds.
-    #[cfg(test)]
-    pub(crate) connector_snapshot_for_tests: Option<Vec<ConnectorSnapshot>>,
-    /// Per-device acquire probe script. `ErrorKind` keeps the hook cloneable
-    /// while each call still returns a fresh `io::Error`.
-    #[cfg(test)]
-    pub(crate) connector_snapshots_per_device_for_tests: Option<
-        std::collections::BTreeMap<
-            crate::platform::drm::DrmDeviceKey,
-            Result<Vec<ConnectorSnapshot>, io::ErrorKind>,
-        >,
-    >,
     /// Records synchronous connector modesets without issuing a DRM commit.
     /// Used by differential tests that exercise the production Legacy path.
     #[cfg(test)]
@@ -3086,7 +3359,7 @@ pub(crate) struct ConnectorSnapshot {
 }
 
 impl ConnectorSnapshot {
-    fn from_probe(
+    pub(crate) fn from_probe(
         device_key: crate::platform::drm::DrmDeviceKey,
         probe: &crate::platform::drm::ConnectorSnapshotProbe,
     ) -> Self {
@@ -3629,6 +3902,9 @@ impl PlatformBackend {
         let mut platform = Self {
             initial_scanout_rollback_armed,
             devices,
+            connector_prober: Arc::new(DrmConnectorProber),
+            #[cfg(test)]
+            scripted_connector_prober: None,
             render_devices,
             selected_render_device: Some(selected_render_device),
             outputs,
@@ -3658,10 +3934,6 @@ impl PlatformBackend {
             dpms_output_scopes_for_tests: None,
             #[cfg(test)]
             drm_event_drain_for_tests: None,
-            #[cfg(test)]
-            connector_snapshot_for_tests: None,
-            #[cfg(test)]
-            connector_snapshots_per_device_for_tests: None,
             #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
@@ -3730,6 +4002,7 @@ impl PlatformBackend {
             RenderKmsRelationship::Unknown,
         );
         let device = Rc::new(drm::Device::for_tests().expect("test drm device"));
+        let scripted_connector_prober = ScriptedConnectorProber::new();
         let mut platform = Self {
             initial_scanout_rollback_armed: false,
             devices: vec![KmsDevice {
@@ -3744,6 +4017,9 @@ impl PlatformBackend {
                     1,
                 )),
             }],
+            connector_prober: Arc::new(scripted_connector_prober.clone()),
+            #[cfg(test)]
+            scripted_connector_prober: Some(scripted_connector_prober),
             render_devices: Vec::new(),
             selected_render_device: None,
             outputs: vec![ActiveOutput::new(
@@ -3823,10 +4099,6 @@ impl PlatformBackend {
             dpms_output_scopes_for_tests: None,
             #[cfg(test)]
             drm_event_drain_for_tests: None,
-            #[cfg(test)]
-            connector_snapshot_for_tests: None,
-            #[cfg(test)]
-            connector_snapshots_per_device_for_tests: None,
             #[cfg(test)]
             modeset_calls_for_tests: None,
             next_scanout_render_job_id: 1,
@@ -5064,28 +5336,10 @@ impl PlatformBackend {
     /// quiesce GPU/page-flip/direct work only after every device probe has
     /// succeeded, and before applying removals.
     pub(crate) fn probe_connector_snapshot(&self) -> io::Result<Vec<ConnectorSnapshot>> {
-        #[cfg(test)]
-        if let Some(snapshot) = self.connector_snapshot_for_tests.as_ref() {
-            return Ok(snapshot.clone());
-        }
         let mut snapshot = Vec::new();
         for device in &self.devices {
-            let probes = crate::platform::drm::probe_connector_snapshots(&device.device).map_err(
-                |error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "probe connector snapshot on DRM device {}: {error}",
-                            device.key
-                        ),
-                    )
-                },
-            )?;
-            snapshot.extend(
-                probes
-                    .iter()
-                    .map(|probe| ConnectorSnapshot::from_probe(device.key, probe)),
-            );
+            let fd = duplicate_connector_probe_fd(device.device.as_ref())?;
+            snapshot.extend(self.connector_prober.probe_snapshot(device.key, fd)?);
         }
         Ok(snapshot)
     }
@@ -5101,40 +5355,70 @@ impl PlatformBackend {
     > {
         let mut results = std::collections::BTreeMap::new();
         for device in &self.devices {
-            #[cfg(test)]
-            let result =
-                if let Some(scripted) = self.connector_snapshots_per_device_for_tests.as_ref() {
-                    scripted
-                        .get(&device.key)
-                        .cloned()
-                        .unwrap_or(Err(io::ErrorKind::NotFound))
-                        .map_err(|kind| io::Error::new(kind, "scripted connector probe failure"))
-                } else {
-                    self.probe_one_connector_snapshot(device.key, device.device.as_ref())
-                };
-            #[cfg(not(test))]
-            let result = self.probe_one_connector_snapshot(device.key, device.device.as_ref());
+            let result = duplicate_connector_probe_fd(device.device.as_ref())
+                .and_then(|fd| self.connector_prober.probe_snapshot(device.key, fd));
 
             results.insert(device.key, result);
         }
         results
     }
 
-    fn probe_one_connector_snapshot(
+    #[cfg(test)]
+    pub(crate) fn script_connector_probe_for_tests(
         &self,
         key: crate::platform::drm::DrmDeviceKey,
-        device: &drm::Device,
-    ) -> io::Result<Vec<ConnectorSnapshot>> {
-        let probes = crate::platform::drm::probe_connector_snapshots(device).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("probe connector snapshot on DRM device {key}: {error}"),
-            )
-        })?;
-        Ok(probes
-            .iter()
-            .map(|probe| ConnectorSnapshot::from_probe(key, probe))
-            .collect())
+        result: io::Result<Vec<ConnectorSnapshot>>,
+    ) {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("test platform uses its construction-time scripted prober")
+            .set_snapshot(key, result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_connector_probe_for_tests(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<ConnectorSnapshot>>,
+    ) {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("test platform uses its construction-time scripted prober")
+            .push_snapshot(key, result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn script_blocked_connector_probe_for_tests(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<ConnectorSnapshot>>,
+        barrier: ProbeBarrier,
+    ) {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("test platform uses its construction-time scripted prober")
+            .set_blocked_snapshot(key, result, barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_blocked_connector_probe_for_tests(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+        result: io::Result<Vec<ConnectorSnapshot>>,
+        barrier: ProbeBarrier,
+    ) {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("test platform uses its construction-time scripted prober")
+            .push_blocked_snapshot(key, result, barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connector_probe_observations_for_tests(&self) -> Vec<ProbeObservation> {
+        self.scripted_connector_prober
+            .as_ref()
+            .expect("test platform uses its construction-time scripted prober")
+            .observations()
     }
 
     pub(crate) fn output_index_for_crtc(&self, crtc_key: CrtcKey) -> Option<usize> {
