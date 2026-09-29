@@ -41,6 +41,7 @@ use crate::{
 /// assert against `Vec<RecordedCall>` snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedCall {
+    TopologyEpisodeGranted(u64),
     /// A key event handed to `on_host_input`; `repeat` distinguishes
     /// `HostInputEvent::KeyRepeat` from device `HostInputEvent::Key`.
     HostKey {
@@ -1563,6 +1564,14 @@ impl Backend for RecordingBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain(..)
             .collect()
+    }
+
+    fn on_topology_episode_granted(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        episode_id: u64,
+    ) {
+        self.record(RecordedCall::TopologyEpisodeGranted(episode_id));
     }
 
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {

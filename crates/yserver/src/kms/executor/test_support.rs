@@ -70,6 +70,12 @@ pub enum StubBehaviour {
         sequence: u64,
         errno: i32,
     },
+    /// Accept non-lifecycle calls and TEST_ONLY validation, then reject a
+    /// lifecycle commit with a known atomic completion.
+    RejectLifecycleWith {
+        sequence: u64,
+        errno: i32,
+    },
     /// Accept every kernel call after delaying the first reply, so a higher
     /// priority lifecycle request can supersede an in-flight validation.
     AcceptKernelCallsAfter(Duration),
@@ -78,6 +84,9 @@ pub enum StubBehaviour {
         sequence: u64,
         errno: i32,
     },
+    /// Accept ordinary calls and TEST_ONLY validation, then withhold the live
+    /// atomic reply so the backend exercises its CompletionUnknown closure.
+    AcceptCallsUntilValidationThenNeverReply,
     ProbeThenRejectAtomic {
         sequence: u64,
         errno: i32,
@@ -144,11 +153,17 @@ impl StubBehaviour {
             Self::RejectAtomicWith { sequence, errno } => {
                 format!("reject-atomic:{sequence}:{errno}")
             }
+            Self::RejectLifecycleWith { sequence, errno } => {
+                format!("reject-lifecycle:{sequence}:{errno}")
+            }
             Self::AcceptKernelCallsAfter(delay) => {
                 format!("accept-kernel-calls-after:{}", delay.as_millis())
             }
             Self::AcceptValidationThenRejectWith { sequence, errno } => {
                 format!("accept-validation-then-reject:{sequence}:{errno}")
+            }
+            Self::AcceptCallsUntilValidationThenNeverReply => {
+                "accept-calls-until-validation-then-never-reply".to_string()
             }
             Self::ProbeThenRejectAtomic { sequence, errno } => {
                 format!("probe-then-reject-atomic:{sequence}:{errno}")
@@ -255,6 +270,12 @@ impl StubBehaviour {
                 sequence: sequence.parse::<u64>().ok()?,
                 errno: errno.parse::<i32>().ok()?,
             })
+        } else if let Some(rest) = s.strip_prefix("reject-lifecycle:") {
+            let (sequence, errno) = rest.split_once(':')?;
+            Some(Self::RejectLifecycleWith {
+                sequence: sequence.parse::<u64>().ok()?,
+                errno: errno.parse::<i32>().ok()?,
+            })
         } else if let Some(delay) = s.strip_prefix("accept-kernel-calls-after:") {
             delay
                 .parse::<u64>()
@@ -266,6 +287,8 @@ impl StubBehaviour {
                 sequence: sequence.parse::<u64>().ok()?,
                 errno: errno.parse::<i32>().ok()?,
             })
+        } else if s == "accept-calls-until-validation-then-never-reply" {
+            Some(Self::AcceptCallsUntilValidationThenNeverReply)
         } else if let Some(rest) = s.strip_prefix("probe-then-reject-atomic:") {
             let (sequence, errno) = rest.split_once(':')?;
             Some(Self::ProbeThenRejectAtomic {
@@ -837,19 +860,55 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             serve_probes_then_wait(&control, sequence)
         }
         StubBehaviour::AcceptKernelCalls(sequence) => {
-            serve_kernel_faithful_calls(&control, sequence, None, None, None, None)
+            serve_kernel_faithful_calls(&control, sequence, None, None, None, None, None, false)
         }
-        StubBehaviour::RejectValidationWith { sequence, errno } => {
-            serve_kernel_faithful_calls(&control, sequence, Some(errno), None, None, None)
-        }
-        StubBehaviour::RejectAtomicWith { sequence, errno } => {
-            serve_kernel_faithful_calls(&control, sequence, None, None, None, Some(errno))
-        }
+        StubBehaviour::RejectValidationWith { sequence, errno } => serve_kernel_faithful_calls(
+            &control,
+            sequence,
+            Some(errno),
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        StubBehaviour::RejectAtomicWith { sequence, errno } => serve_kernel_faithful_calls(
+            &control,
+            sequence,
+            None,
+            None,
+            None,
+            Some(errno),
+            None,
+            false,
+        ),
+        StubBehaviour::RejectLifecycleWith { sequence, errno } => serve_kernel_faithful_calls(
+            &control,
+            sequence,
+            None,
+            None,
+            None,
+            None,
+            Some(errno),
+            false,
+        ),
         StubBehaviour::AcceptKernelCallsAfter(delay) => {
-            serve_kernel_faithful_calls(&control, 1_000, None, None, Some(delay), None)
+            serve_kernel_faithful_calls(&control, 1_000, None, None, Some(delay), None, None, false)
         }
         StubBehaviour::AcceptValidationThenRejectWith { sequence, errno } => {
-            serve_kernel_faithful_calls(&control, sequence, None, Some(errno), None, None)
+            serve_kernel_faithful_calls(
+                &control,
+                sequence,
+                None,
+                Some(errno),
+                None,
+                None,
+                None,
+                false,
+            )
+        }
+        StubBehaviour::AcceptCallsUntilValidationThenNeverReply => {
+            serve_kernel_faithful_calls(&control, 1_000, None, None, None, None, None, true)
         }
         StubBehaviour::RejectFirstProbeThenAccept { sequence, errno } => {
             serve_call_families(&control, sequence, false, None, Some(errno))
@@ -1051,6 +1110,8 @@ fn serve_kernel_faithful_calls(
     reject_after_validation_errno: Option<i32>,
     first_reply_delay: Option<Duration>,
     reject_ordinary_errno: Option<i32>,
+    reject_lifecycle_errno: Option<i32>,
+    stall_after_validation: bool,
 ) -> io::Result<()> {
     use super::HostCallClass;
 
@@ -1072,16 +1133,30 @@ fn serve_kernel_faithful_calls(
         let correlation = request.correlation();
         let (reply, fence_count) = match request {
             protocol::HostCallRequest::Atomic(request) => {
+                let is_lifecycle = matches!(
+                    request.correlation,
+                    super::HostCallCorrelation::Atomic {
+                        transition: Some(_),
+                        ..
+                    }
+                );
                 let is_validation = matches!(
                     request.class,
                     HostCallClass::SeatActiveValidation
                         | HostCallClass::ColdStartOrOfflineValidation
                 );
+                if stall_after_validation && is_lifecycle && !is_validation {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                }
                 let rejection = if is_validation {
                     validation_seen = true;
                     reject_validation_errno
                 } else if let Some(errno) = reject_ordinary_errno {
                     Some(errno)
+                } else if is_lifecycle && !is_validation {
+                    reject_lifecycle_errno
                 } else if validation_seen && !rejected_after_validation {
                     let rejection = reject_after_validation_errno;
                     rejected_after_validation |= rejection.is_some();

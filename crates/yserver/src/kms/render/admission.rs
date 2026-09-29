@@ -461,6 +461,14 @@ pub(crate) struct PreparedAcquireTopology {
     pub(crate) outputs: Vec<PreparedAcquireOutput>,
 }
 
+pub(crate) struct PreparedHotplugTopology {
+    pub(crate) description: CommitDescription,
+    pub(crate) dpms_active: bool,
+    pub(crate) snapshots: Vec<crate::kms::render::platform::ConnectorSnapshot>,
+    pub(crate) outputs: Vec<PreparedAcquireOutput>,
+    pub(crate) disabled_keys: Vec<crate::kms::backend::OutputKey>,
+}
+
 pub(crate) struct PreparedAcquireOutput {
     pub(crate) key: crate::kms::backend::OutputKey,
     pub(crate) x: i32,
@@ -552,6 +560,7 @@ pub(crate) struct LifecycleDriver {
     pending_client_modeset_validations: BTreeMap<CommitId, PendingClientModesetValidation>,
     topology_commits: BTreeMap<CommitId, TransitionTag<IncarnationId>>,
     topology_prepared_acquire: BTreeMap<CommitId, PreparedAcquireTopology>,
+    topology_prepared_hotplug: BTreeMap<CommitId, PreparedHotplugTopology>,
     client_modeset_commits: BTreeMap<CommitId, ClientModesetTag<IncarnationId>>,
     topology_dpms_active: BTreeMap<CommitId, bool>,
     owner_commit_power_changes: BTreeMap<CommitId, Vec<OwnerCrtcPowerChange>>,
@@ -593,6 +602,7 @@ pub(crate) struct LifecycleDriver {
     client_modeset_topology_dispatches: Vec<(ClientModesetTag<IncarnationId>, Tier, usize, usize)>,
     #[cfg(test)]
     acquire_topology_descriptions: Vec<CommitDescription>,
+    hotplug_topology_description: Option<CommitDescription>,
 }
 
 impl LifecycleDriver {
@@ -611,6 +621,7 @@ impl LifecycleDriver {
             pending_client_modeset_validations: BTreeMap::new(),
             topology_commits: BTreeMap::new(),
             topology_prepared_acquire: BTreeMap::new(),
+            topology_prepared_hotplug: BTreeMap::new(),
             client_modeset_commits: BTreeMap::new(),
             topology_dpms_active: BTreeMap::new(),
             owner_commit_power_changes: BTreeMap::new(),
@@ -652,12 +663,18 @@ impl LifecycleDriver {
             client_modeset_topology_dispatches: Vec::new(),
             #[cfg(test)]
             acquire_topology_descriptions: Vec::new(),
+            hotplug_topology_description: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn acquire_topology_descriptions_for_tests(&self) -> &[CommitDescription] {
         &self.acquire_topology_descriptions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hotplug_topology_descriptions_for_tests(&self) -> &[CommitDescription] {
+        self.hotplug_topology_description.as_slice()
     }
 
     #[cfg(test)]
@@ -1491,13 +1508,16 @@ impl KmsBackend {
         true
     }
 
-    fn lifecycle_current_tag(&self, device: DrmDeviceKey) -> Option<TransitionTag<IncarnationId>> {
+    pub(super) fn lifecycle_current_tag(
+        &self,
+        device: DrmDeviceKey,
+    ) -> Option<TransitionTag<IncarnationId>> {
         self.lifecycle_coordinator
             .device(&device)
             .and_then(|arbiter| arbiter.transition_tag())
     }
 
-    fn lifecycle_queue_actions(
+    pub(super) fn lifecycle_queue_actions(
         &mut self,
         device: DrmDeviceKey,
         actions: Vec<LifecycleAction<IncarnationId>>,
@@ -3533,6 +3553,490 @@ impl KmsBackend {
         })
     }
 
+    pub(super) fn lifecycle_prepare_hotplug_topology(
+        &mut self,
+        device: DrmDeviceKey,
+    ) -> Result<PreparedHotplugTopology, String> {
+        use crate::{
+            kms::render::{
+                admission::PreparedAcquireOutput,
+                client_modeset::{
+                    ClientModesetDescriptionInput, ClientModesetObjects, ClientModesetOperation,
+                    ClientModesetPropertyIds, OwnedModeBlob, build_client_modeset_description,
+                    stage_dpms_projection,
+                },
+                composed_commit::{ComposedPlane, discover_composed_property_ids},
+            },
+            platform::drm::Output,
+        };
+        use ::drm::control::Device as _;
+
+        let participant = self
+            .hotplug_episode
+            .as_ref()
+            .and_then(|episode| episode.participants.get(&device))
+            .ok_or_else(|| "hotplug participant disappeared before preparation".to_string())?;
+        let snapshots = participant.snapshots.clone();
+        let snapshot_by_key = snapshots
+            .iter()
+            .map(|snapshot| (&snapshot.key, snapshot))
+            .collect::<BTreeMap<_, _>>();
+        let disabled = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| {
+                layout.key.device_key == device
+                    && !snapshots
+                        .iter()
+                        .any(|snapshot| snapshot.preserves_active_output(layout))
+            })
+            .map(|layout| {
+                (
+                    layout.key.clone(),
+                    layout.output.clone(),
+                    layout.x,
+                    layout.y,
+                )
+            })
+            .collect::<Vec<_>>();
+        let kept_keys = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| {
+                layout.key.device_key == device
+                    && snapshots
+                        .iter()
+                        .any(|snapshot| snapshot.preserves_active_output(layout))
+            })
+            .map(|layout| layout.key.clone())
+            .collect::<BTreeSet<_>>();
+        let relights = self
+            .randr_id_alloc
+            .entries()
+            .filter_map(|(key, entry)| {
+                if key.device_key != device || kept_keys.contains(key) {
+                    return None;
+                }
+                let route = entry
+                    .last_enabled
+                    .and_then(crate::kms::render::backend::ConnectorConfig::restorable_route)?;
+                let snapshot = snapshot_by_key.get(key)?;
+                snapshot
+                    .modes
+                    .iter()
+                    .any(|mode| {
+                        mode.width == route.mode.width
+                            && mode.height == route.mode.height
+                            && mode.vrefresh == route.mode.vrefresh
+                    })
+                    .then(|| {
+                        (
+                            key.clone(),
+                            yserver_core::backend::ModeSpec {
+                                width: route.mode.width,
+                                height: route.mode.height,
+                                vrefresh: route.mode.vrefresh,
+                            },
+                            route.x,
+                            route.y,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if disabled.is_empty() && relights.is_empty() {
+            return Err("hotplug transaction has no KMS objects".to_string());
+        }
+
+        let drm_device = self
+            .platform
+            .device_for_key(device)
+            .map(|entry| std::rc::Rc::clone(&entry.device))
+            .ok_or_else(|| "hotplug DRM device disappeared".to_string())?;
+        let level = self.lifecycle_coordinator.protocol_dpms_level();
+        let epoch = self.lifecycle_coordinator.dpms_epoch();
+        let dpms_active = crate::kms::owner::lifecycle::dpms_target_for_level(level)
+            == Some(crate::kms::owner::lifecycle::DpmsTarget::On);
+        let seeded = self.hotplug_seeded_route_discovery;
+        let mut description: Option<CommitDescription> = None;
+        let mut outputs = Vec::new();
+        let mut common_property_ids = None;
+
+        let property_ids_for = |backend: &mut KmsBackend,
+                                output: &Output|
+         -> Result<ClientModesetPropertyIds, String> {
+            let common = if seeded {
+                crate::kms::owner::closure::PropertyIds {
+                    crtc_id: u32::from(output.plane_crtc_id_prop),
+                    active: 21,
+                    out_fence_ptr: output.crtc_out_fence_ptr_prop.map(u32::from).unwrap_or(22),
+                }
+            } else {
+                let entry = backend
+                    .platform
+                    .devices
+                    .iter_mut()
+                    .find(|entry| entry.key == device)
+                    .ok_or_else(|| "hotplug device entry disappeared".to_string())?;
+                discover_composed_property_ids(
+                    &drm_device,
+                    &[ComposedPlane {
+                        output,
+                        framebuffer: ::drm::control::from_u32(1)
+                            .expect("property discovery framebuffer is nonzero"),
+                    }],
+                    &mut entry.active_property_cache,
+                )
+                .map_err(|error| format!("hotplug KMS properties: {error}"))?
+            };
+            let (connector_crtc_id, crtc_mode_id) = if seeded {
+                (23, 24)
+            } else {
+                (
+                    u32::from(
+                        crate::drm::modeset::PropMap::for_object(&drm_device, output.connector)
+                            .and_then(|properties| properties.id("CRTC_ID"))
+                            .map_err(|error| format!("hotplug connector CRTC_ID: {error}"))?,
+                    ),
+                    u32::from(
+                        crate::drm::modeset::PropMap::for_object(&drm_device, output.crtc)
+                            .and_then(|properties| properties.id("MODE_ID"))
+                            .map_err(|error| format!("hotplug CRTC MODE_ID: {error}"))?,
+                    ),
+                )
+            };
+            Ok(ClientModesetPropertyIds {
+                connector_crtc_id,
+                crtc_mode_id,
+                plane_fb_id: u32::from(output.plane_fb_id_prop),
+                plane_crtc_id: u32::from(output.plane_crtc_id_prop),
+                plane_src_x: u32::from(output.plane_src_x_prop),
+                plane_src_y: u32::from(output.plane_src_y_prop),
+                plane_src_w: u32::from(output.plane_src_w_prop),
+                plane_src_h: u32::from(output.plane_src_h_prop),
+                plane_crtc_x: u32::from(output.plane_crtc_x_prop),
+                plane_crtc_y: u32::from(output.plane_crtc_y_prop),
+                plane_crtc_w: u32::from(output.plane_crtc_w_prop),
+                plane_crtc_h: u32::from(output.plane_crtc_h_prop),
+                common,
+            })
+        };
+        let append_description = |target: &mut Option<CommitDescription>,
+                                  mut next: CommitDescription| {
+            if let Some(target) = target {
+                for object in next.objects.drain(..) {
+                    if let Some(existing) = target.objects.iter_mut().find(|existing| {
+                        existing.object == object.object && existing.kind == object.kind
+                    }) {
+                        for (property, value) in object.props {
+                            if let Some(existing) = existing
+                                .props
+                                .iter_mut()
+                                .find(|(existing_property, _)| *existing_property == property)
+                            {
+                                existing.1 = value;
+                            } else {
+                                existing.props.push((property, value));
+                            }
+                        }
+                    } else {
+                        target.objects.push(object);
+                    }
+                }
+                for crtc in next.crtc_state {
+                    if let Some(existing) = target
+                        .crtc_state
+                        .iter_mut()
+                        .find(|existing| existing.crtc_id == crtc.crtc_id)
+                    {
+                        existing.new_active = crtc.new_active;
+                    } else {
+                        target.crtc_state.push(crtc);
+                    }
+                }
+            } else {
+                *target = Some(next);
+            }
+        };
+
+        for (_key, output, _x, _y) in &disabled {
+            let properties = property_ids_for(self, output)?;
+            common_property_ids.get_or_insert(properties.common);
+            let built = build_client_modeset_description(ClientModesetDescriptionInput {
+                objects: ClientModesetObjects {
+                    connector: u32::from(output.connector),
+                    crtc: u32::from(output.crtc),
+                    primary_plane: u32::from(output.plane),
+                    old_crtc_id: u32::from(output.crtc),
+                },
+                properties,
+                old_active: self
+                    .owner_dpms_installed_active
+                    .get(&device)
+                    .copied()
+                    .unwrap_or(true),
+                operation: ClientModesetOperation::Disable,
+            })
+            .map_err(|error| format!("hotplug disable description: {error}"))?;
+            append_description(&mut description, built.description);
+        }
+
+        let mut reserved_routes = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| kept_keys.contains(&layout.key))
+            .map(|layout| {
+                (
+                    layout.output.encoder,
+                    layout.output.crtc,
+                    layout.output.plane,
+                )
+            })
+            .collect::<Vec<_>>();
+        let scanout_route = self
+            .platform
+            .scanout_route_for_kms(device)
+            .map_err(|error| format!("hotplug scanout route: {error}"))?;
+        let prepare_outputs = (|| -> Result<(), String> {
+            for (key, mode, x, y) in relights {
+                let output = if seeded {
+                    let mut output = self
+                        .hotplug_route_catalog
+                        .get(&key)
+                        .cloned()
+                        .ok_or_else(|| format!("seeded hotplug route missing for {key:?}"))?;
+                    output.picked = output
+                        .modes
+                        .iter()
+                        .find(|candidate| {
+                            candidate.width == mode.width
+                                && candidate.height == mode.height
+                                && candidate.vrefresh == mode.vrefresh
+                        })
+                        .cloned()
+                        .ok_or_else(|| format!("remembered mode disappeared for {key:?}"))?;
+                    output
+                } else {
+                    let discovered = crate::drm::modeset::discover_output_for_connector(
+                        &drm_device,
+                        &key.connector_name,
+                        &reserved_routes,
+                    )
+                    .map_err(|error| format!("hotplug discovery for {key:?}: {error}"))?;
+                    let output = crate::drm::modeset::output_for_exact_probe_assignment(
+                        &drm_device,
+                        discovered.connector,
+                        discovered.encoder,
+                        discovered.crtc,
+                        discovered.plane,
+                        mode,
+                    )
+                    .map_err(|error| format!("hotplug exact mode for {key:?}: {error}"))?;
+                    reserved_routes.push((output.encoder, output.crtc, output.plane));
+                    output
+                };
+                let properties = property_ids_for(self, &output)?;
+                common_property_ids.get_or_insert(properties.common);
+                let projection = stage_dpms_projection(key.clone(), level, epoch)
+                    .map_err(|error| format!("hotplug DPMS projection for {key:?}: {error}"))?;
+                let (mode_blob, mode_blob_id) = if seeded {
+                    (None, 0x1000u32.saturating_add(u32::from(output.crtc)))
+                } else {
+                    let raw: u64 = drm_device
+                        .create_property_blob(&output.mode)
+                        .map_err(|error| format!("hotplug MODE_ID blob for {key:?}: {error}"))?
+                        .into();
+                    let id = u32::try_from(raw)
+                        .map_err(|_| format!("hotplug MODE_ID blob overflow for {key:?}"))?;
+                    (
+                        Some(OwnedModeBlob::new(std::rc::Rc::clone(&drm_device), raw)),
+                        id,
+                    )
+                };
+                let mut scanout = self
+                    .platform
+                    .allocate_prepared_client_scanout_pool(
+                        std::rc::Rc::clone(&drm_device),
+                        &output,
+                        scanout_route,
+                        u32::from(mode.width),
+                        u32::from(mode.height),
+                    )
+                    .map_err(|error| format!("hotplug scanout pool for {key:?}: {error}"))?;
+                let framebuffer = scanout
+                    .display_pool()
+                    .bos
+                    .first()
+                    .and_then(|bo| bo.fb_handle)
+                    .map(u32::from)
+                    .filter(|framebuffer| *framebuffer != 0)
+                    .ok_or_else(|| format!("hotplug pool for {key:?} has no front framebuffer"))?;
+                let Some(front) = scanout.display_pool_mut().bos.first_mut() else {
+                    return Err(format!("hotplug pool for {key:?} has no BOs"));
+                };
+                front.state.mark_on_screen_after_modeset();
+                scanout
+                    .note_kms_modeset_installed(0)
+                    .map_err(|error| format!("hotplug front BO for {key:?}: {error}"))?;
+                let instance_id = self
+                    .platform
+                    .allocate_output_instance_id(&key)
+                    .map_err(|error| format!("hotplug output identity for {key:?}: {error}"))?;
+                let scene = self
+                    .scene
+                    .stage_client_output_scene_state(
+                        &key,
+                        instance_id,
+                        mode.width,
+                        mode.height,
+                        x,
+                        y,
+                        &scanout,
+                    )
+                    .map_err(|error| format!("hotplug scene state for {key:?}: {error}"))?;
+                let owner = self
+                    .platform
+                    .owner_ref(device)
+                    .ok_or_else(|| "hotplug Owner disappeared".to_string())?;
+                let hardware_crtc = u32::from(output.crtc);
+                let clock_key = crate::kms::owner::clock::ClockKey {
+                    hardware_crtc,
+                    epoch: owner
+                        .next_clock_epoch_after(hardware_crtc, self.next_present_crtc_clock_epoch),
+                };
+                let next_epoch = clock_key
+                    .epoch
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| "hotplug clock epoch exhausted".to_string())?;
+                self.next_present_crtc_clock_epoch =
+                    self.next_present_crtc_clock_epoch.max(next_epoch);
+                let built = build_client_modeset_description(ClientModesetDescriptionInput {
+                    objects: ClientModesetObjects {
+                        connector: u32::from(output.connector),
+                        crtc: u32::from(output.crtc),
+                        primary_plane: u32::from(output.plane),
+                        old_crtc_id: 0,
+                    },
+                    properties,
+                    old_active: false,
+                    operation: ClientModesetOperation::Configure {
+                        width: mode.width,
+                        height: mode.height,
+                        framebuffer,
+                        mode_blob: mode_blob_id,
+                        projection: projection.clone(),
+                    },
+                })
+                .map_err(|error| format!("hotplug enable description for {key:?}: {error}"))?;
+                append_description(&mut description, built.description);
+                let incarnation = owner.incarnation();
+                if !self.lifecycle_acquire_resources_match(device, incarnation) {
+                    return Err("hotplug resource service identity changed".to_string());
+                }
+                let service = self.resource_service.as_mut().expect("identity checked");
+                let registry = self
+                    .drm_cleanup_registry
+                    .as_mut()
+                    .expect("identity checked");
+                let allocation_keys = self
+                    .platform
+                    .register_prepared_client_scanout_pool(&mut scanout, service, registry)
+                    .map_err(|error| {
+                        format!("hotplug resource registration for {key:?}: {error}")
+                    })?;
+                outputs.push(PreparedAcquireOutput {
+                    key,
+                    x,
+                    y,
+                    width: mode.width,
+                    height: mode.height,
+                    projection,
+                    prepared_set: PreparedClientModesetSet {
+                        output: Some(output),
+                        output_instance_id: Some(instance_id),
+                        scanout: Some(scanout),
+                        scene: Some(scene),
+                        clock_key: Some(clock_key),
+                        mode_blob,
+                        allocation_keys,
+                        #[cfg(test)]
+                        framebuffer_handles_for_tests: Vec::new(),
+                    },
+                });
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepare_outputs {
+            self.lifecycle_release_acquire_outputs(outputs);
+            return Err(error);
+        }
+        let Some(mut description) = description else {
+            self.lifecycle_release_acquire_outputs(outputs);
+            return Err("hotplug prepared no atomic objects".to_string());
+        };
+        if let Some(properties) = common_property_ids {
+            description.property_ids = properties;
+        }
+        Ok(PreparedHotplugTopology {
+            description,
+            dpms_active,
+            snapshots,
+            outputs,
+            disabled_keys: disabled.into_iter().map(|(key, ..)| key).collect(),
+        })
+    }
+
+    fn lifecycle_hotplug_displaced_pools(
+        &self,
+        device: DrmDeviceKey,
+        validation_commit: CommitId,
+    ) -> Result<
+        Vec<(
+            GroupMember,
+            Vec<crate::kms::render::resources::AllocationKey>,
+        )>,
+        ResourceError,
+    > {
+        let Some(prepared) = self
+            .lifecycle_drivers
+            .get(&device)
+            .and_then(|driver| driver.topology_prepared_hotplug.get(&validation_commit))
+        else {
+            return Ok(Vec::new());
+        };
+        let mut displaced = Vec::new();
+        for output in &prepared.outputs {
+            let target_crtc = output
+                .prepared_set
+                .output
+                .as_ref()
+                .map(|output| u32::from(output.crtc))
+                .ok_or(ResourceError::InvalidState)?;
+            if let Some(pool) = self.modeset_displaced_pool_for_output(&output.key, target_crtc)? {
+                displaced.push(pool);
+            }
+        }
+        for key in &prepared.disabled_keys {
+            let Some(layout) = self
+                .platform
+                .outputs
+                .iter()
+                .find(|layout| layout.key == *key)
+            else {
+                continue;
+            };
+            if let Some(pool) =
+                self.modeset_displaced_pool_for_output(key, u32::from(layout.output.crtc))?
+            {
+                displaced.push(pool);
+            }
+        }
+        Ok(displaced)
+    }
+
     fn lifecycle_acquire_resources_match(
         &self,
         device: DrmDeviceKey,
@@ -3771,11 +4275,43 @@ impl KmsBackend {
             .is_some_and(|transition| {
                 transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
             });
+        let hotplug_install = self
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .is_some_and(|transition| {
+                matches!(
+                    transition.kind,
+                    crate::kms::owner::lifecycle::LifecycleKind::IdentityChangingHotplug
+                        | crate::kms::owner::lifecycle::LifecycleKind::TopologyRebuild
+                )
+            });
         let prepared_acquire = if acquire_install {
             match self.lifecycle_prepare_acquire_topology(device) {
                 Ok(prepared) => Some(prepared),
                 Err(error) => {
                     log::warn!("VTAcquire topology preparation refused: {error}");
+                    self.admission_abort(device, token);
+                    self.lifecycle_queue_input(
+                        device,
+                        ArbiterInput::CommitOutcome {
+                            tag,
+                            outcome: LifecycleCommitOutcome::Rejected {
+                                topology_latched_generation: None,
+                            },
+                        },
+                    );
+                    return AdmissionOutcome::PreparationRefused;
+                }
+            }
+        } else {
+            None
+        };
+        let prepared_hotplug = if hotplug_install {
+            match self.lifecycle_prepare_hotplug_topology(device) {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    log::warn!("hotplug topology preparation refused: {error}");
                     self.admission_abort(device, token);
                     self.lifecycle_queue_input(
                         device,
@@ -3800,9 +4336,14 @@ impl KmsBackend {
                 .acquire_topology_descriptions
                 .push(prepared.description.clone());
         }
-        let description = match prepared_acquire
+        let description = match prepared_hotplug
             .as_ref()
             .map(|prepared| Ok(prepared.description.clone()))
+            .or_else(|| {
+                prepared_acquire
+                    .as_ref()
+                    .map(|prepared| Ok(prepared.description.clone()))
+            })
             .unwrap_or_else(|| self.lifecycle_topology_description(device))
         {
             Ok(description) => description,
@@ -3821,6 +4362,11 @@ impl KmsBackend {
                 return AdmissionOutcome::PreparationRefused;
             }
         };
+        if prepared_hotplug.is_some()
+            && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+        {
+            driver.hotplug_topology_description = Some(description.clone());
+        }
         let required_clock_crtcs = description
             .crtc_state
             .iter()
@@ -3860,8 +4406,15 @@ impl KmsBackend {
                 return AdmissionOutcome::BeginRefused;
             }
         }
-        let dpms_active = prepared_acquire.as_ref().map_or_else(
-            || {
+        let dpms_active = prepared_hotplug
+            .as_ref()
+            .map(|prepared| prepared.dpms_active)
+            .or_else(|| {
+                prepared_acquire
+                    .as_ref()
+                    .map(|prepared| prepared.dpms_active)
+            })
+            .unwrap_or_else(|| {
                 self.lifecycle_coordinator.protocol_dpms_level() == 0
                     && self
                         .lifecycle_coordinator
@@ -3871,9 +4424,7 @@ impl KmsBackend {
                             transition.kind
                                 != crate::kms::owner::lifecycle::LifecycleKind::VTRelease
                         })
-            },
-            |prepared| prepared.dpms_active,
-        );
+            });
         let validation_result = self.platform.owner_for(device).map(|owner| {
             owner.begin_validation_with_options(
                 &description,
@@ -3886,6 +4437,9 @@ impl KmsBackend {
             Some(Err(error)) => {
                 if let Some(prepared) = prepared_acquire {
                     self.lifecycle_release_acquire_topology(prepared);
+                }
+                if let Some(prepared) = prepared_hotplug {
+                    self.lifecycle_release_hotplug_topology(prepared);
                 }
                 self.admission_abort(device, token);
                 if Self::lifecycle_dispatch_error_is_transient(&error) {
@@ -3900,6 +4454,9 @@ impl KmsBackend {
             None => {
                 if let Some(prepared) = prepared_acquire {
                     self.lifecycle_release_acquire_topology(prepared);
+                }
+                if let Some(prepared) = prepared_hotplug {
+                    self.lifecycle_release_hotplug_topology(prepared);
                 }
                 log::error!(
                     "lifecycle validation for {device:?} was never dispatched: owner disappeared"
@@ -3925,6 +4482,11 @@ impl KmsBackend {
             if let Some(prepared) = prepared_acquire {
                 driver
                     .topology_prepared_acquire
+                    .insert(validation_commit, prepared);
+            }
+            if let Some(prepared) = prepared_hotplug {
+                driver
+                    .topology_prepared_hotplug
                     .insert(validation_commit, prepared);
             }
         }
@@ -4964,6 +5526,7 @@ impl KmsBackend {
             let _ = conductor.admission.abort(token);
         }
         self.lifecycle_release_acquire_prepared_for_commit(device, commit);
+        self.lifecycle_release_hotplug_prepared_for_commit(device, commit);
     }
 
     fn lifecycle_finish_client_modeset_validation(
@@ -5480,9 +6043,17 @@ impl KmsBackend {
         let Some(token) = pending.token.take() else {
             return;
         };
-        let displaced_pools = match self
-            .lifecycle_acquire_displaced_pools(device, validation_commit)
-        {
+        let prepared_hotplug = self.lifecycle_drivers.get(&device).is_some_and(|driver| {
+            driver
+                .topology_prepared_hotplug
+                .contains_key(&validation_commit)
+        });
+        let displaced_result = if prepared_hotplug {
+            self.lifecycle_hotplug_displaced_pools(device, validation_commit)
+        } else {
+            self.lifecycle_acquire_displaced_pools(device, validation_commit)
+        };
+        let displaced_pools = match displaced_result {
             Ok(displaced_pools) => displaced_pools,
             Err(error) => {
                 if let Some(owner) = self.platform.owner_for(device) {
@@ -5668,6 +6239,14 @@ impl KmsBackend {
             && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
         {
             driver.topology_prepared_acquire.insert(commit, prepared);
+        }
+        if let Some(prepared) = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.topology_prepared_hotplug.remove(&validation_commit))
+            && let Some(driver) = self.lifecycle_drivers.get_mut(&device)
+        {
+            driver.topology_prepared_hotplug.insert(commit, prepared);
         }
         let registrations = match self
             .lifecycle_register_topology_resources(commit, &displaced_pools)
@@ -6251,6 +6830,17 @@ impl KmsBackend {
             .is_some_and(|transition| {
                 transition.kind == crate::kms::owner::lifecycle::LifecycleKind::VTAcquire
             });
+        let hotplug_install = self
+            .lifecycle_coordinator
+            .device(&device)
+            .and_then(|arbiter| arbiter.transition())
+            .is_some_and(|transition| {
+                matches!(
+                    transition.kind,
+                    crate::kms::owner::lifecycle::LifecycleKind::IdentityChangingHotplug
+                        | crate::kms::owner::lifecycle::LifecycleKind::TopologyRebuild
+                )
+            });
         let transient_refusal = matches!(
             terminal,
             TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
@@ -6297,6 +6887,67 @@ impl KmsBackend {
             } else {
                 self.lifecycle_release_acquire_topology(prepared);
             }
+        }
+        let prepared_hotplug = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.topology_prepared_hotplug.remove(&commit));
+        if hotplug_install {
+            let snapshots = self
+                .hotplug_episode
+                .as_ref()
+                .and_then(|episode| episode.participants.get(&device))
+                .map(|participant| participant.snapshots.clone())
+                .unwrap_or_default();
+            match &terminal {
+                TerminalState::Completed if current => {
+                    if let Some(prepared) = prepared_hotplug {
+                        self.pending_hotplug_terminals.push_back(
+                            crate::kms::render::backend::PendingHotplugTerminal::Applied {
+                                device,
+                                prepared,
+                            },
+                        );
+                    } else {
+                        self.pending_hotplug_terminals.push_back(
+                            crate::kms::render::backend::PendingHotplugTerminal::Rejected {
+                                device,
+                                snapshots,
+                            },
+                        );
+                    }
+                }
+                TerminalState::CompletionUnknown(_) => {
+                    self.pending_hotplug_terminals.push_back(
+                        crate::kms::render::backend::PendingHotplugTerminal::Unknown {
+                            device,
+                            prepared: prepared_hotplug,
+                        },
+                    );
+                }
+                _ => {
+                    if let Some(prepared) = prepared_hotplug {
+                        self.lifecycle_release_hotplug_topology(prepared);
+                    }
+                    if current
+                        && !matches!(
+                            &terminal,
+                            TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                                RefusalCause::AlreadyInFlight
+                            ))
+                        )
+                    {
+                        self.pending_hotplug_terminals.push_back(
+                            crate::kms::render::backend::PendingHotplugTerminal::Rejected {
+                                device,
+                                snapshots,
+                            },
+                        );
+                    }
+                }
+            }
+        } else if let Some(prepared) = prepared_hotplug {
+            self.lifecycle_release_hotplug_topology(prepared);
         }
         #[cfg(test)]
         if !current && let Some(driver) = self.lifecycle_drivers.get_mut(&device) {
@@ -6380,10 +7031,23 @@ impl KmsBackend {
                     );
                 }
                 TerminalState::CompletionUnknown(_) => {
-                    if acquire_install {
+                    if acquire_install || hotplug_install {
                         self.close_owner_after_acquire_probe_failure(device);
                     }
                     self.lifecycle_report_completion_loss(device);
+                    if hotplug_install {
+                        // An unknown hotplug install cannot keep using the
+                        // executor or publishing routes from that device.
+                        // Resolve the lifecycle participant as stalled after
+                        // the normal completion-loss table has recorded the
+                        // incident, matching the VT hand-off closure path.
+                        self.lifecycle_queue_input(
+                            device,
+                            ArbiterInput::DeviceStateChanged(
+                                crate::kms::owner::lifecycle::DeviceLifecycleState::ExecutorStalled,
+                            ),
+                        );
+                    }
                 }
             }
         } else {
@@ -6407,10 +7071,18 @@ impl KmsBackend {
                     },
                 ),
                 TerminalState::CompletionUnknown(_) => {
-                    if acquire_install {
+                    if acquire_install || hotplug_install {
                         self.close_owner_after_acquire_probe_failure(device);
                     }
-                    self.lifecycle_report_completion_loss(device)
+                    self.lifecycle_report_completion_loss(device);
+                    if hotplug_install {
+                        self.lifecycle_queue_input(
+                            device,
+                            ArbiterInput::DeviceStateChanged(
+                                crate::kms::owner::lifecycle::DeviceLifecycleState::ExecutorStalled,
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -6424,6 +7096,10 @@ impl KmsBackend {
     }
 
     pub(super) fn lifecycle_release_acquire_topology(&mut self, prepared: PreparedAcquireTopology) {
+        self.lifecycle_release_acquire_outputs(prepared.outputs);
+    }
+
+    fn lifecycle_release_hotplug_topology(&mut self, prepared: PreparedHotplugTopology) {
         self.lifecycle_release_acquire_outputs(prepared.outputs);
     }
 
@@ -6464,6 +7140,20 @@ impl KmsBackend {
             .and_then(|driver| driver.topology_prepared_acquire.remove(&commit))
         {
             self.lifecycle_release_acquire_topology(prepared);
+        }
+    }
+
+    fn lifecycle_release_hotplug_prepared_for_commit(
+        &mut self,
+        device: DrmDeviceKey,
+        commit: CommitId,
+    ) {
+        if let Some(prepared) = self
+            .lifecycle_drivers
+            .get_mut(&device)
+            .and_then(|driver| driver.topology_prepared_hotplug.remove(&commit))
+        {
+            self.lifecycle_release_hotplug_topology(prepared);
         }
     }
 

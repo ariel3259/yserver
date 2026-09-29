@@ -716,6 +716,7 @@ pub(crate) struct RandrMutationGate {
     waiting: VecDeque<RandrGateWaiter>,
     in_flight: Option<RandrGateFlight>,
     topology_episode: Option<u64>,
+    requested_topology_episodes: VecDeque<u64>,
     requesterless_publications: VecDeque<RequesterlessPublication>,
     next_ticket: u64,
 }
@@ -728,16 +729,60 @@ impl RandrMutationGate {
     }
 
     fn holds_requesterless_turn(&self, backend: &dyn Backend) -> bool {
-        self.topology_episode.is_some() || self.active_install_capable(backend)
+        self.topology_episode.is_some()
+            || !self.requested_topology_episodes.is_empty()
+            || self.active_install_capable(backend)
     }
 
-    fn begin_topology_episode(&mut self, episode_id: u64) {
+    fn request_topology_episode(&mut self, episode_id: u64) {
+        if self.topology_episode == Some(episode_id)
+            || self.requested_topology_episodes.contains(&episode_id)
+        {
+            log::error!("topology episode {episode_id} was requested twice");
+            return;
+        }
+        self.requested_topology_episodes.push_back(episode_id);
+    }
+
+    fn begin_topology_episode(
+        &mut self,
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+        episode_id: u64,
+    ) {
         if let Some(active) = self.topology_episode {
             log::error!("topology episode {episode_id} began while episode {active} is still open");
             debug_assert!(false, "only one topology episode may be open at a time");
             return;
         }
         self.topology_episode = Some(episode_id);
+        backend.on_topology_episode_granted(state, episode_id);
+    }
+
+    fn withdraw_topology_episode_request(&mut self, episode_id: u64) -> bool {
+        let Some(index) = self
+            .requested_topology_episodes
+            .iter()
+            .position(|requested| *requested == episode_id)
+        else {
+            return false;
+        };
+        self.requested_topology_episodes.remove(index);
+        true
+    }
+
+    fn grant_requested_topology_episode(
+        &mut self,
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+    ) {
+        if self.in_flight.is_some() || self.topology_episode.is_some() {
+            return;
+        }
+        let Some(episode_id) = self.requested_topology_episodes.pop_front() else {
+            return;
+        };
+        self.begin_topology_episode(state, backend, episode_id);
     }
 
     fn finish_topology_episode(&mut self, episode_id: u64) -> bool {
@@ -823,7 +868,9 @@ impl RandrMutationGate {
             };
             return match request_class {
                 RandrRequestClass::Mutation => {
-                    self.in_flight.is_none() && self.topology_episode.is_none()
+                    self.in_flight.is_none()
+                        && self.topology_episode.is_none()
+                        && self.requested_topology_episodes.is_empty()
                 }
                 RandrRequestClass::ForcedReprobe => !self.holds_requesterless_turn(backend),
                 RandrRequestClass::NonGate => true,
@@ -836,6 +883,7 @@ impl RandrMutationGate {
             RandrRequestClass::Mutation => {
                 self.in_flight.is_none()
                     && self.topology_episode.is_none()
+                    && self.requested_topology_episodes.is_empty()
                     && self
                         .waiting
                         .front()
@@ -878,6 +926,7 @@ impl RandrMutationGate {
             RandrRequestClass::Mutation => {
                 if self.in_flight.is_some()
                     || self.topology_episode.is_some()
+                    || !self.requested_topology_episodes.is_empty()
                     || self
                         .waiting
                         .front()
@@ -955,6 +1004,7 @@ impl RandrMutationGate {
         self.waiting.clear();
         self.in_flight = None;
         self.topology_episode = None;
+        self.requested_topology_episodes.clear();
         self.requesterless_publications.clear();
         self.next_ticket = 0;
     }
@@ -1697,7 +1747,7 @@ fn drain_ready_crtc_configs_with_gate_policy(
     reset_trigger: &mut ResetTrigger,
     publish_old_generation: bool,
 ) {
-    drain_requesterless_publications(state, backend, gate, publish_old_generation);
+    drain_requesterless_publications(state, backend, gate, publish_old_generation, None);
     for token in backend.drain_ready_crtc_configs() {
         let parked = pending.take_crtc_reply(token);
         let Some(publication) = gate.take_publication(token) else {
@@ -1705,7 +1755,7 @@ fn drain_ready_crtc_configs_with_gate_policy(
             // gate-owned publication was cancelled or otherwise superseded.
             backend.cancel_crtc_config(token);
             gate.finish_pending(token);
-            drain_requesterless_publications(state, backend, gate, publish_old_generation);
+            drain_requesterless_publications(state, backend, gate, publish_old_generation, None);
             continue;
         };
 
@@ -1716,7 +1766,7 @@ fn drain_ready_crtc_configs_with_gate_policy(
             // cancel it before the reset snapshot instead of advancing it.
             backend.cancel_crtc_config(token);
             gate.finish_pending(token);
-            drain_requesterless_publications(state, backend, gate, publish_old_generation);
+            drain_requesterless_publications(state, backend, gate, publish_old_generation, None);
             continue;
         }
 
@@ -1741,7 +1791,7 @@ fn drain_ready_crtc_configs_with_gate_policy(
         // A publication queued behind dispatched work is released immediately
         // after that work's state publication and before its client reply or
         // any waiting request can be admitted.
-        drain_requesterless_publications(state, backend, gate, publish_old_generation);
+        drain_requesterless_publications(state, backend, gate, publish_old_generation, None);
         let outcome = if let Some(status) = status {
             let timestamp = state.randr.timestamp;
             parked.map_or(
@@ -1791,22 +1841,65 @@ fn drain_ready_crtc_configs_with_gate_policy(
     }
 }
 
+/// What the core-entry test driver actually consumed from a backend.
+///
+/// This signature lets integration tests prove the delivery path without
+/// reaching into a backend's private publication queue after the core drains
+/// it. Ordinary state publications remain represented by the resulting
+/// server state; this trace records event multiplicity and urgent resource
+/// identities.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreEntryDelivery {
+    UrgentWithdrawal {
+        output_ids: Vec<u32>,
+        crtc_ids: Vec<u32>,
+    },
+    TopologyEpisodeBegin(u64),
+    TopologyEpisodeEnd {
+        episode_id: u64,
+        published: bool,
+    },
+}
+
 fn drain_requesterless_publications(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     gate: &mut RandrMutationGate,
     publish_old_generation: bool,
+    mut delivery_trace: Option<&mut Vec<CoreEntryDelivery>>,
 ) {
     let urgent_publications = backend.drain_urgent_requesterless_publications();
     let episode_events = backend.drain_topology_episode_events();
     if publish_old_generation {
         for publication in urgent_publications {
+            if let Some(trace) = delivery_trace.as_mut()
+                && let Some((output_ids, crtc_ids)) = publication.urgent_withdrawal_ids()
+            {
+                trace.push(CoreEntryDelivery::UrgentWithdrawal {
+                    output_ids: output_ids.to_vec(),
+                    crtc_ids: crtc_ids.to_vec(),
+                });
+            }
             publish_requesterless_publication(state, backend, publication);
         }
         for event in episode_events {
+            if let Some(trace) = delivery_trace.as_mut() {
+                match &event {
+                    crate::backend::TopologyEpisodeEvent::EpisodeBegin(episode_id) => {
+                        trace.push(CoreEntryDelivery::TopologyEpisodeBegin(*episode_id));
+                    }
+                    crate::backend::TopologyEpisodeEvent::EpisodeEnd(episode_id, publication) => {
+                        trace.push(CoreEntryDelivery::TopologyEpisodeEnd {
+                            episode_id: *episode_id,
+                            published: publication.is_some(),
+                        });
+                    }
+                }
+            }
             match event {
                 crate::backend::TopologyEpisodeEvent::EpisodeBegin(episode_id) => {
-                    gate.begin_topology_episode(episode_id);
+                    gate.request_topology_episode(episode_id);
                 }
                 crate::backend::TopologyEpisodeEvent::EpisodeEnd(episode_id, publication) => {
                     if gate.topology_episode == Some(episode_id) {
@@ -1814,15 +1907,24 @@ fn drain_requesterless_publications(
                             publish_requesterless_publication(state, backend, publication);
                         }
                         gate.finish_topology_episode(episode_id);
+                    } else if !gate.withdraw_topology_episode_request(episode_id) {
+                        // A stale end has no authority to release another
+                        // episode's turn or publish an ungranted change.
+                        log::error!(
+                            "topology episode {episode_id} ended without an active or requested turn"
+                        );
                     } else {
-                        // Contract violations are diagnosed by the gate, but
-                        // an unmatched publication must never enter state.
-                        gate.finish_topology_episode(episode_id);
+                        if publication.is_some() {
+                            log::error!(
+                                "ungranted topology episode {episode_id} carried a publication"
+                            );
+                        }
                     }
                 }
             }
         }
     }
+    gate.grant_requested_topology_episode(state, backend);
 
     let publications = backend.drain_requesterless_publications();
     if !publish_old_generation {
@@ -2422,6 +2524,7 @@ pub fn run_core(
                                         backend,
                                         &mut randr_mutation_gate,
                                         true,
+                                        None,
                                     );
                                 }
                             }
@@ -2437,6 +2540,7 @@ pub fn run_core(
                                         backend,
                                         &mut randr_mutation_gate,
                                         true,
+                                        None,
                                     );
                                 }
                             }
@@ -2776,8 +2880,29 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
 /// bounded driver on the same tail path without exposing the core loop's
 /// private request queues.
 #[doc(hidden)]
-pub fn run_iteration_tail_for_tests(state: &mut ServerState, backend: &mut dyn Backend) {
+pub fn run_iteration_tail_for_tests(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    delivery_trace: &mut Vec<CoreEntryDelivery>,
+) {
     run_iteration_tail(state, backend);
+    TEST_CORE_RANDR_GATE.with(|gate| {
+        drain_requesterless_publications(
+            state,
+            backend,
+            &mut gate.borrow_mut(),
+            true,
+            Some(delivery_trace),
+        );
+    });
+}
+
+thread_local! {
+    // The existing KMS core-entry driver calls this tail repeatedly on one
+    // test thread. Keep the same mutation gate across those iterations so
+    // its backend entries observe the production EpisodeBegin/grant/End path.
+    static TEST_CORE_RANDR_GATE: std::cell::RefCell<RandrMutationGate> =
+        std::cell::RefCell::new(RandrMutationGate::default());
 }
 
 /// Idle vblank arming for parked Present work — MUST run after
@@ -7650,7 +7775,10 @@ mod tests {
             call,
             crate::backend::recording::RecordedCall::ApplyCrtcConfig { .. }
         )));
-        assert_eq!(state.randr.outputs[0].mode_id, 4);
+        assert_eq!(
+            state.randr.outputs[0].mode_id, 4,
+            "EpisodeEnd publishes its generation before the queued mutation starts"
+        );
         assert_eq!(
             state
                 .randr
@@ -7659,6 +7787,516 @@ mod tests {
                 .map(|output| output.output_id)
                 .collect::<Vec<_>>(),
             [1]
+        );
+    }
+
+    #[test]
+    fn c0_3cii_core_episode_begin_waits_for_in_flight_mutation() {
+        use crate::{
+            backend::{
+                CrtcConfigToken, TopologyEpisodeEvent,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            core_loop::channel,
+        };
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut first_client = install_c0_client(&mut state, 1);
+        let mut later_client = install_c0_client(&mut state, 2);
+        let mutation = CrtcConfigToken(234);
+        let episode_id = 54;
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(mutation);
+        backend.crtc_config_is_install_capable = true;
+        backend.crtc_config_results.insert(mutation, Ok(true));
+        let (_poll, sender, _rx) = channel().unwrap();
+        let episodes = backend.topology_episode_producer(sender.clone_handle());
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_SET_CRTC_CONFIG, set_crtc_body(4), 8),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(
+            gate.in_flight.and_then(|flight| flight.token),
+            Some(mutation)
+        );
+
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeBegin(episode_id))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert_eq!(gate.topology_episode, None);
+        assert!(
+            !backend
+                .calls
+                .lock()
+                .unwrap()
+                .contains(&RecordedCall::TopologyEpisodeGranted(episode_id)),
+            "the core must not notify the backend while the earlier mutation is in flight"
+        );
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(2, 2, rr::RR_SET_CRTC_CONFIG, set_crtc_body(4), 8),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, RecordedCall::ApplyCrtcConfig { .. }))
+                .count(),
+            1,
+            "a later mutation remains queued behind the requested episode"
+        );
+
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeEnd(episode_id, None))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert_eq!(gate.topology_episode, None);
+        assert!(
+            gate.requested_topology_episodes.is_empty(),
+            "EpisodeEnd(None) withdraws the ungranted request"
+        );
+        backend.ready_crtc_configs.push(mutation);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert_eq!(gate.topology_episode, None);
+        assert!(
+            !backend
+                .calls
+                .lock()
+                .unwrap()
+                .contains(&RecordedCall::TopologyEpisodeGranted(episode_id)),
+            "a withdrawn episode is never granted when the earlier mutation finishes"
+        );
+        assert!(!read_c0_available(&mut first_client).is_empty());
+        assert!(read_c0_available(&mut later_client).is_empty());
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(gate.topology_episode, None);
+        assert_eq!(
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, RecordedCall::ApplyCrtcConfig { .. }))
+                .count(),
+            2,
+            "withdrawing the episode before grant releases the later mutation"
+        );
+        assert!(!read_c0_available(&mut later_client).is_empty());
+    }
+
+    fn c0_3cii_assert_modeset_precedes_hotplug_grant(
+        episode_id: u64,
+        first_client_id: u32,
+        later_client_id: u32,
+        label: &str,
+    ) {
+        use crate::{
+            backend::{
+                CrtcConfigToken, TopologyEpisodeEvent,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            core_loop::channel,
+        };
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut requester = install_c0_client(&mut state, first_client_id);
+        let mut later_requester = install_c0_client(&mut state, later_client_id);
+        let mutation = CrtcConfigToken(235 + episode_id);
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(mutation);
+        backend.crtc_config_is_install_capable = true;
+        backend.crtc_config_results.insert(mutation, Ok(true));
+        let (_poll, sender, _rx) = channel().unwrap();
+        let episodes = backend.topology_episode_producer(sender.clone_handle());
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        // This accepted SetCrtcConfig models the client modeset already in
+        // flight on A. The gate is server-wide, so a hotplug episode for A or
+        // B must both wait for its terminal result.
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(
+                first_client_id,
+                1,
+                rr::RR_SET_CRTC_CONFIG,
+                set_crtc_body(4),
+                8,
+            ),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(
+            gate.in_flight.and_then(|flight| flight.token),
+            Some(mutation)
+        );
+
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeBegin(episode_id))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert_eq!(gate.topology_episode, None, "{label}: no early grant");
+        assert!(
+            !backend
+                .calls
+                .lock()
+                .unwrap()
+                .contains(&RecordedCall::TopologyEpisodeGranted(episode_id)),
+            "{label}: the hotplug backend has not been called before modeset completion"
+        );
+        assert!(read_c0_available(&mut requester).is_empty());
+        assert_eq!(state.randr.outputs[0].mode_id, 3);
+        assert_eq!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .map(|output| output.output_id)
+                .collect::<Vec<_>>(),
+            [1],
+            "{label}: expected live output IDs while the modeset is in flight: [1]"
+        );
+
+        backend.ready_crtc_configs.push(mutation);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(gate.topology_episode, Some(episode_id));
+        assert!(
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .contains(&RecordedCall::TopologyEpisodeGranted(episode_id))
+        );
+        assert_eq!(state.randr.outputs[0].mode_id, 3);
+        assert!(!read_c0_available(&mut requester).is_empty());
+
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeEnd(episode_id, None))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert_eq!(gate.topology_episode, None);
+        assert_eq!(state.randr.outputs[0].mode_id, 3);
+        assert_eq!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .map(|output| output.output_id)
+                .collect::<Vec<_>>(),
+            [1],
+            "{label}: expected live output IDs at terminal state: [1]"
+        );
+        assert!(read_c0_available(&mut later_requester).is_empty());
+    }
+
+    #[test]
+    fn c0_3cii_same_device_hotplug_waits_for_modeset_gate() {
+        c0_3cii_assert_modeset_precedes_hotplug_grant(
+            19,
+            1,
+            2,
+            "same-device hotplug waits for the dispatched modeset",
+        );
+    }
+
+    #[test]
+    fn c0_3cii_cross_device_hotplug_waits_for_modeset_gate() {
+        c0_3cii_assert_modeset_precedes_hotplug_grant(
+            53,
+            3,
+            4,
+            "device B hotplug waits for device A's dispatched modeset",
+        );
+    }
+
+    #[test]
+    fn c0_3cii_release_withdraws_hotplug_waiting_for_modeset_gate() {
+        use crate::{
+            backend::{
+                CrtcConfigToken, TopologyEpisodeEvent,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            core_loop::channel,
+        };
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut requester = install_c0_client(&mut state, 1);
+        let mutation = CrtcConfigToken(287);
+        let episode_id = 52;
+        let mut backend = RecordingBackend::new();
+        backend.pending_crtc_config = Some(mutation);
+        backend.crtc_config_is_install_capable = true;
+        backend.crtc_config_results.insert(mutation, Ok(true));
+        let (_poll, sender, _rx) = channel().unwrap();
+        let episodes = backend.topology_episode_producer(sender.clone_handle());
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_SET_CRTC_CONFIG, set_crtc_body(4), 8),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeBegin(episode_id))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert_eq!(gate.topology_episode, None);
+        assert!(gate.requested_topology_episodes.contains(&episode_id));
+
+        // VT release invalidates the hotplug participant before the core
+        // grants its requested turn. EpisodeEnd(None) is the backend's
+        // withdrawal notification; the outstanding client modeset remains
+        // independently serialized by the same gate.
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeEnd(episode_id, None))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert_eq!(gate.topology_episode, None);
+        assert!(gate.requested_topology_episodes.is_empty());
+        assert!(
+            !backend
+                .calls
+                .lock()
+                .unwrap()
+                .contains(&RecordedCall::TopologyEpisodeGranted(episode_id))
+        );
+
+        backend.ready_crtc_configs.push(mutation);
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        drain_c0_requests(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut queue,
+        );
+        assert_eq!(gate.topology_episode, None);
+        assert_eq!(state.randr.outputs[0].mode_id, 3);
+        assert_eq!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .map(|output| output.output_id)
+                .collect::<Vec<_>>(),
+            [1],
+            "release leaves the client's output as the expected live set: [1]"
+        );
+        assert!(!read_c0_available(&mut requester).is_empty());
+    }
+
+    #[test]
+    fn c0_3cii_acquire_episode_granted_at_once() {
+        use crate::{
+            backend::{
+                TopologyEpisodeEvent,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            core_loop::channel,
+        };
+        use yserver_protocol::x11::randr as rr;
+
+        let mut state = make_c0_randr_state();
+        let mut client = install_c0_client(&mut state, 1);
+        let episode_id = 59;
+        let mut backend = RecordingBackend::new();
+        let (_poll, sender, _rx) = channel().unwrap();
+        let episodes = backend.topology_episode_producer(sender.clone_handle());
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let mut queue = FairRequestQueue::default();
+
+        accept_c0_request(
+            &backend,
+            &mut gate,
+            &mut queue,
+            c0_randr_request(1, 1, rr::RR_SET_CRTC_CONFIG, set_crtc_body(4), 8),
+        );
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeBegin(episode_id))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+
+        assert_eq!(gate.topology_episode, Some(episode_id));
+        assert!(
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .contains(&RecordedCall::TopologyEpisodeGranted(episode_id))
+        );
+        assert!(
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::ApplyCrtcConfig { .. })),
+            "the acquire turn is granted before already accepted client requests drain"
+        );
+        assert!(read_c0_available(&mut client).is_empty());
+    }
+
+    #[test]
+    fn c0_3cii_episode_end_none_withdraws_before_grant() {
+        use crate::{
+            backend::{
+                TopologyEpisodeEvent,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            core_loop::channel,
+        };
+
+        let mut state = make_c0_randr_state();
+        let mut backend = RecordingBackend::new();
+        let (_poll, sender, _rx) = channel().unwrap();
+        let episodes = backend.topology_episode_producer(sender.clone_handle());
+        let mut pending = PendingBackendRequests::default();
+        let mut gate = RandrMutationGate::default();
+        let episode_id = 64;
+
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeBegin(episode_id))
+            .unwrap();
+        episodes
+            .enqueue(TopologyEpisodeEvent::EpisodeEnd(episode_id, None))
+            .unwrap();
+        drain_ready_crtc_configs_with_gate(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut gate,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+
+        assert_eq!(gate.topology_episode, None);
+        assert!(gate.requested_topology_episodes.is_empty());
+        assert!(
+            !backend
+                .calls
+                .lock()
+                .unwrap()
+                .contains(&RecordedCall::TopologyEpisodeGranted(episode_id))
         );
     }
 

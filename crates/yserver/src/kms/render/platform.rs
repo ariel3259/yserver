@@ -9665,6 +9665,26 @@ impl PlatformBackend {
         }
     }
 
+    pub(crate) fn recompact_horizontal_layout_for_devices(
+        &mut self,
+        client_configured: &HashSet<OutputKey>,
+        reserved: &[LayoutRect],
+        devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) {
+        let mut next_x: i32 = 0;
+        for layout in &mut self.outputs {
+            if !devices.contains(&layout.key.device_key) || client_configured.contains(&layout.key)
+            {
+                next_x = next_x.max(layout.x.saturating_add(i32::from(layout.width)));
+                continue;
+            }
+            next_x = advance_past_reservations(next_x, layout.width, reserved);
+            layout.x = next_x;
+            layout.y = 0;
+            next_x = next_x.saturating_add(i32::from(layout.width));
+        }
+    }
+
     /// Recompute the virtual-screen extent over the live layouts unioned with
     /// `reserved`. A reserved slot keeps the extent from shrinking while its
     /// monitor is away, which is what stops the `SetScreenSize` churn the

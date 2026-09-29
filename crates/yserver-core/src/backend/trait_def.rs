@@ -938,6 +938,15 @@ pub trait Backend {
         Vec::new()
     }
 
+    /// Notify the backend that the core granted a requested topology episode.
+    /// A backend must defer staging and dispatch until this callback arrives.
+    fn on_topology_episode_granted(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        _episode_id: u64,
+    ) {
+    }
+
     /// Finish a ready asynchronous CRTC operation on the core thread.
     /// Returns the same changed/no-op result as `apply_crtc_config`.
     fn finish_crtc_config(&mut self, _token: CrtcConfigToken) -> io::Result<bool> {
