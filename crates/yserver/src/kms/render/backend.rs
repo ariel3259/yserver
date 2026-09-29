@@ -2309,6 +2309,23 @@ struct ProbeWorkerLedger {
 }
 
 impl ProbeWorkerLedger {
+    /// A result is sent immediately before its worker returns. Join that
+    /// worker while consuming the result so the ledger cannot retain a
+    /// completed answer until a later, unrelated core wakeup. The worker has
+    /// already returned from the prober (and dropped its duplicated fd), so
+    /// the join only covers its final result wake and thread exit.
+    fn join_result(&mut self, result: &ProbeWorkerResult) {
+        let matches_result = self.workers.get(&result.device).is_some_and(|worker| {
+            worker.incarnation == result.incarnation && worker.epoch == result.epoch
+        });
+        if !matches_result {
+            return;
+        }
+        if let Some(worker) = self.workers.remove(&result.device) {
+            let _ = worker.join.join();
+        }
+    }
+
     fn reap_finished(&mut self) -> Vec<(DrmDeviceKey, IncarnationId, u64, bool)> {
         let finished = self
             .workers
@@ -24785,6 +24802,7 @@ impl KmsBackend {
     fn poll_acquire_probe_episode(&mut self, state: &mut ServerState) {
         let mut consumed = false;
         while let Ok(result) = self.probe_result_receiver.try_recv() {
+            self.probe_workers.join_result(&result);
             consumed |= self.consume_probe_worker_result(state, result);
         }
         self.probe_workers.reap_finished();
@@ -68899,12 +68917,15 @@ mod tests {
             }
 
             let wakeup = Backend::next_wakeup(backend).unwrap_or(end).min(end);
-            // This test driver has no Mio Poll for CoreSender's Waker. While
-            // a probe is outstanding, short core-entry iterations model the
-            // producer wake without adding a production polling timer.
-            let wakeup = backend.probe_episode.as_ref().map_or(wakeup, |_| {
+            // This test driver has no Mio Poll for CoreSender's Waker.
+            // Production workers send CrtcConfigReady even when their result
+            // is late and the episode has already ended, so model that wake
+            // while any worker remains in the ledger.
+            let wakeup = if !backend.probe_workers.workers.is_empty() {
                 wakeup.min(Instant::now() + std::time::Duration::from_millis(2))
-            });
+            } else {
+                wakeup
+            };
             let wait = wakeup.saturating_duration_since(Instant::now());
             let timeout_ms = if wait.is_zero() {
                 0
@@ -96769,6 +96790,139 @@ mod tests {
     }
 
     #[test]
+    fn c0_3cii_probe_answer_joins_worker_in_consuming_iteration() {
+        let mut backend = KmsBackend::for_tests();
+        let device = DrmDeviceKey {
+            major: 0x7fff_ff03,
+            minor: 73,
+        };
+        push_test_device(&mut backend, device);
+        let incarnation = backend
+            .probe_incarnation(device)
+            .expect("test Owner incarnation");
+        let deferred_device = DrmDeviceKey {
+            major: device.major,
+            minor: device.minor + 1,
+        };
+        let epoch = 73;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        backend.probe_episode = Some(super::ProbeEpisode {
+            cause: super::ProbeEpisodeCause::Acquire,
+            epoch,
+            deadline,
+            participants: [
+                (device, incarnation),
+                (deferred_device, IncarnationId::first()),
+            ]
+            .into_iter()
+            .collect(),
+            remaining: [device, deferred_device].into_iter().collect(),
+            owner_devices: HashSet::new(),
+            legacy_devices: HashSet::new(),
+            results: Default::default(),
+        });
+
+        // Hold the worker just after its answer is visible. This makes the
+        // send/exit race deterministic: the iteration consuming the answer
+        // must join it rather than leave it for a later core wakeup.
+        let (result_sent_tx, result_sent_rx) = std::sync::mpsc::channel();
+        let (controller_ready_tx, controller_ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let result_sender = backend.probe_result_sender.clone();
+        let join = std::thread::Builder::new()
+            .name("c0-3cii-probe-answer-fixture".into())
+            .spawn(move || {
+                result_sender
+                    .send(super::ProbeWorkerResult {
+                        device,
+                        incarnation,
+                        epoch,
+                        result: Ok(Vec::new()),
+                    })
+                    .expect("fixture result receiver remains open");
+                result_sent_tx.send(()).expect("signal sent result");
+                controller_ready_tx
+                    .send(())
+                    .expect("signal release controller");
+                release_rx
+                    .recv()
+                    .expect("test releases worker after result consumption");
+            })
+            .expect("spawn controlled probe worker");
+        backend.probe_workers.workers.insert(
+            device,
+            super::ProbeWorker {
+                incarnation,
+                epoch,
+                join,
+                stuck: false,
+            },
+        );
+        let release_controller = std::thread::spawn(move || {
+            controller_ready_rx
+                .recv()
+                .expect("worker publishes its answer before waiting");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = release_tx.send(());
+        });
+        result_sent_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker result is queued before the core iteration");
+
+        let output_keys = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect::<Vec<_>>();
+        let expected_end_state = c0_3bi_expected_end_state(output_keys);
+        let mut state = ServerState::new();
+        let poll_entries_before = backend
+            .core_entry_trace_for_tests
+            .borrow()
+            .iter()
+            .filter(|entry| **entry == "poll_deferred_input")
+            .count();
+        c0_3bi_core_driver_iteration_tail(&mut backend, &mut state, None);
+        release_controller
+            .join()
+            .expect("release controller completes");
+
+        assert!(
+            backend
+                .probe_episode
+                .as_ref()
+                .expect("second participant keeps episode open")
+                .results
+                .get(&device)
+                .expect("same core iteration consumed the answer")
+                .as_ref()
+                .is_ok_and(Vec::is_empty),
+            "the consumed fixture answer is the expected empty snapshot"
+        );
+        assert!(
+            backend.probe_workers.workers.is_empty(),
+            "the answer's worker is joined in the iteration that consumes it"
+        );
+        assert_eq!(
+            backend
+                .core_entry_trace_for_tests
+                .borrow()
+                .iter()
+                .filter(|entry| **entry == "poll_deferred_input")
+                .count(),
+            poll_entries_before + 1,
+            "one core-driver iteration consumed the queued answer"
+        );
+        backend.probe_episode = None;
+        c0_3bi_assert_end_state(
+            &backend,
+            "c0_3cii_probe_answer_joins_worker_in_consuming_iteration",
+            &expected_end_state,
+        );
+    }
+
+    #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn c0_3cii_worker_answer_alone_reaches_clients_vulkan() {
         use crate::kms::executor::test_support::StubBehaviour;
@@ -97688,19 +97842,25 @@ mod tests {
 
     #[test]
     #[ignore = "hardware probe only; do not run in the implementation pass"]
+    #[cfg(target_os = "linux")]
     fn c0_hw_3cii_probe_worker_on_card1_drm() {
         use std::{
-            fs::OpenOptions,
-            os::fd::{AsRawFd, OwnedFd},
+            fs,
+            os::{
+                fd::{AsFd, AsRawFd, OwnedFd},
+                unix::fs::{FileTypeExt, MetadataExt},
+            },
             sync::{Arc, Mutex},
             time::Instant,
         };
 
         struct RecordingProductionProber {
             answer: Mutex<Option<Vec<ConnectorSnapshot>>>,
-            worker_fd: Mutex<Option<std::os::fd::RawFd>>,
             worker_thread: Mutex<Option<std::thread::ThreadId>>,
-            worker_fd_closed: Arc<std::sync::atomic::AtomicBool>,
+            worker_probe_duration: Mutex<Option<std::time::Duration>>,
+            master_fd: std::os::fd::RawFd,
+            worker_saw_master_file_status_flag: Mutex<Option<bool>>,
+            master_file_status_flag_restored: Mutex<Option<bool>>,
         }
 
         impl crate::kms::render::platform::ConnectorProber for RecordingProductionProber {
@@ -97709,14 +97869,66 @@ mod tests {
                 key: DrmDeviceKey,
                 fd: OwnedFd,
             ) -> io::Result<Vec<ConnectorSnapshot>> {
-                *self.worker_fd.lock().expect("record probe fd") = Some(fd.as_raw_fd());
                 *self.worker_thread.lock().expect("record worker thread") =
                     Some(std::thread::current().id());
-                let answer =
-                    crate::kms::render::platform::DrmConnectorProber.probe_snapshot(key, fd)?;
+
+                // F_SETFL status flags belong to the open file description.
+                // Device::open set O_NONBLOCK on the master. Clear and then
+                // set it through the master only after the worker fd exists,
+                // observe it through that fd, then restore the original flags.
+                // A fresh blocking open of card1 would not inherit this marker.
+                // SAFETY: fcntl borrows both live descriptors; the master fd
+                // remains owned by the test while the worker runs.
+                let master_flags = unsafe { libc::fcntl(self.master_fd, libc::F_GETFL) };
+                let (marker_visible, restored) =
+                    if master_flags >= 0 && master_flags & libc::O_NONBLOCK != 0 {
+                        let clear_result = unsafe {
+                            libc::fcntl(
+                                self.master_fd,
+                                libc::F_SETFL,
+                                master_flags & !libc::O_NONBLOCK,
+                            )
+                        };
+                        let set_result = if clear_result == 0 {
+                            unsafe { libc::fcntl(self.master_fd, libc::F_SETFL, master_flags) }
+                        } else {
+                            -1
+                        };
+                        let worker_flags = if set_result == 0 {
+                            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }
+                        } else {
+                            -1
+                        };
+                        let restore_result =
+                            unsafe { libc::fcntl(self.master_fd, libc::F_SETFL, master_flags) };
+                        (
+                            clear_result == 0
+                                && set_result == 0
+                                && worker_flags >= 0
+                                && worker_flags & libc::O_NONBLOCK != 0,
+                            restore_result == 0,
+                        )
+                    } else {
+                        (false, false)
+                    };
+                *self
+                    .worker_saw_master_file_status_flag
+                    .lock()
+                    .expect("record master file-status observation") = Some(marker_visible);
+                *self
+                    .master_file_status_flag_restored
+                    .lock()
+                    .expect("record master file-status restoration") = Some(restored);
+
+                let probe_started = Instant::now();
+                let probe_result =
+                    crate::kms::render::platform::DrmConnectorProber.probe_snapshot(key, fd);
+                *self
+                    .worker_probe_duration
+                    .lock()
+                    .expect("record worker probe duration") = Some(probe_started.elapsed());
+                let answer = probe_result?;
                 *self.answer.lock().expect("record worker answer") = Some(answer.clone());
-                self.worker_fd_closed
-                    .store(true, std::sync::atomic::Ordering::Release);
                 Ok(answer)
             }
 
@@ -97730,64 +97942,220 @@ mod tests {
         }
 
         let card1 = "/dev/dri/card1";
-        let key =
-            hardware_drm_key(card1).unwrap_or_else(|error| panic!("card1 is unavailable: {error}"));
-        // Open the node as a read-only probe client. This hardware test never
-        // takes DRM master, switches VT, or submits a modeset; both probes
-        // therefore see the same kernel read-only/cached connector snapshot.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(card1)
-            .unwrap_or_else(|error| panic!("open card1 without DRM master: {error}"));
-        let source = std::rc::Rc::new(crate::drm::Device::from_file_for_tests(file));
-        let mut backend = super::KmsBackend::for_tests();
-        let device = DrmDeviceKey {
-            major: 0x7fff_ff03,
-            minor: 71,
+        // Device::open is the production Owner path: it acquires DRM master,
+        // enables the KMS client capabilities and marks the master's OFD
+        // nonblocking. The worker must dup this fd so the kernel performs the
+        // forced connector probe rather than demoting it to its cached probe.
+        let source = std::rc::Rc::new(
+            crate::drm::Device::open(card1)
+                .unwrap_or_else(|error| panic!("open card1 as DRM Owner: {error}")),
+        );
+        let key = crate::platform::drm::primary_device_key_from_fd(source.as_fd())
+            .unwrap_or_else(|error| panic!("identify card1 Owner fd: {error}"));
+        let card1_identity = fs::metadata(card1).expect("stat card1 device node");
+        let count_card1_fds = || {
+            fs::read_dir("/proc/self/fd")
+                .expect("read this process's fd directory")
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::metadata(entry.path()).ok())
+                .filter(|metadata| {
+                    metadata.file_type().is_char_device()
+                        && metadata.dev() == card1_identity.dev()
+                        && metadata.ino() == card1_identity.ino()
+                        && metadata.rdev() == card1_identity.rdev()
+                })
+                .count()
         };
-        push_test_device(&mut backend, device);
-        backend.platform.devices[1].key = key;
-        backend.platform.devices[1].device = std::rc::Rc::clone(&source);
+
+        // The full live-KMS fixture requires a connected mode and performs an
+        // initial modeset. Reuse the headless state fixture, replacing its
+        // sole device with card1 so no `/dev/null` Legacy device can
+        // participate in this acquire episode.
+        let mut backend = super::KmsBackend::for_tests();
+        assert_eq!(backend.platform.devices.len(), 1);
+        // A successful Owner continuation may dispatch a topology reinstall.
+        // This fixture helper accepts the executor protocol request but never
+        // issues a DRM commit, so the test cannot modeset card1.
+        let executor = crate::kms::executor::test_support::spawn_stub_helper(
+            crate::kms::executor::test_support::StubBehaviour::AcceptKernelCalls(1_000),
+        )
+        .expect("spawn card1 acquire fixture executor");
+        let (incarnation, lifecycle) = executor.owner_identity();
+        backend.platform.devices[0].key = key;
+        backend.platform.devices[0].device = std::rc::Rc::clone(&source);
+        backend.platform.devices[0].executor = Some(executor);
+        backend.platform.devices[0].owner = Some(
+            crate::kms::owner::device::DeviceCommitOwner::new(incarnation, lifecycle, 1),
+        );
+        backend.platform.outputs[0].key.device_key = key;
+        backend.platform.outputs[0].scanout_route.kms_device_key = key;
+        backend
+            .platform
+            .rebuild_output_instance_ids_for_tests()
+            .expect("rekey the synthetic output instance to card1");
+        backend.platform.reap_executors_on_drop_for_tests();
         install_admission_owner_gate(&mut backend, key);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            key,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend
+            .lifecycle_register_owner_device(key)
+            .expect("register card1 Owner lifecycle");
         let prober = Arc::new(RecordingProductionProber {
             answer: Mutex::new(None),
-            worker_fd: Mutex::new(None),
             worker_thread: Mutex::new(None),
-            worker_fd_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker_probe_duration: Mutex::new(None),
+            master_fd: source.as_fd().as_raw_fd(),
+            worker_saw_master_file_status_flag: Mutex::new(None),
+            master_file_status_flag_restored: Mutex::new(None),
         });
         backend.platform.connector_prober = prober.clone();
+        // Device::open already holds DRM master. Avoid a second SET_MASTER in
+        // the simulated VT-acquire entry while retaining the real master fd.
         backend.vt_skip_master_ioctls_for_tests = true;
         backend.vt_state = crate::vt::state::VtState::Suspended;
+        let input_control = Arc::new(
+            crate::input_thread::InputThreadControl::new().expect("input control eventfd"),
+        );
+        input_control.pause();
+        backend.set_input_thread_control(Arc::clone(&input_control));
         let mut state = ServerState::new();
         backend.rebuild_randr_state(&mut state, None, false);
-        let expected_end_state = c0_3bi_expected_end_state(
-            backend
-                .platform
-                .outputs
-                .iter()
-                .map(|output| output.key.clone()),
-        );
+        let initial_output_keys = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.key.clone())
+            .collect::<Vec<_>>();
 
+        let card1_fds_before_probe = count_card1_fds();
         let started = Instant::now();
         backend.core_driver_vt_acquires_for_tests += 1;
         c0_3bi_core_driver_until_with_state(
             &mut backend,
             &mut state,
-            "card1 production probe worker",
-            std::time::Duration::from_secs(3),
-            &|backend| backend.probe_episode.is_none() && backend.probe_workers.workers.is_empty(),
+            "card1 production probe worker starts",
+            std::time::Duration::from_secs(1),
+            &|backend| {
+                backend.probe_episode.is_some() && backend.probe_workers.workers.contains_key(&key)
+            },
             None,
         )
-        .expect("the production connector probe worker completes and is joined");
+        .expect("the card1 worker starts within the acquire episode");
+        let episode = backend
+            .probe_episode
+            .as_ref()
+            .expect("card1 worker belongs to an open acquire episode");
+        assert_eq!(
+            episode.participants.keys().copied().collect::<Vec<_>>(),
+            [key],
+            "card1 is the acquire episode's only participant"
+        );
+        assert_eq!(
+            episode.owner_devices,
+            HashSet::from([key]),
+            "card1 participates through the Owner route"
+        );
+        assert!(
+            episode.legacy_devices.is_empty(),
+            "the acquire episode has no Legacy or /dev/null participant"
+        );
+        let episode_epoch = episode.epoch;
+        let episode_incarnation = episode.participants[&key];
+        let worker = backend
+            .probe_workers
+            .workers
+            .get(&key)
+            .expect("card1 worker remains in the ledger");
+        assert_eq!(worker.epoch, episode_epoch);
+        assert_eq!(worker.incarnation, episode_incarnation);
+
+        c0_3bi_core_driver_until_with_state(
+            &mut backend,
+            &mut state,
+            "card1 production probe answer and acquire continuation",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.probe_episode.is_none()
+                    && backend.probe_workers.workers.is_empty()
+                    && backend.vt_state == crate::vt::state::VtState::Active
+                    && backend.vt_call_trace_for_tests.contains(&"resume_input")
+            },
+            None,
+        )
+        .expect("the card1 probe answer resolves the episode and resumes the seat");
         let elapsed = started.elapsed();
+        let worker_probe_duration = prober
+            .worker_probe_duration
+            .lock()
+            .expect("worker probe duration lock")
+            .expect("production probe duration recorded around DrmConnectorProber");
+        assert!(
+            worker_probe_duration < super::PROBE_EPISODE_DEADLINE,
+            "WORKER PROBE took {worker_probe_duration:?}, above the {:?} episode deadline",
+            super::PROBE_EPISODE_DEADLINE
+        );
+        assert!(
+            elapsed < super::PROBE_EPISODE_DEADLINE,
+            "the acquire episode resolved from its worker answer in {elapsed:?}, before its deadline"
+        );
+
+        assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
+        assert!(backend.vt_call_trace_for_tests.contains(&"resume_input"));
+        assert_eq!(
+            input_control.drain(),
+            Some(crate::input_thread::InputThreadCommand::Resume),
+            "the successful acquire continuation resumes the input thread"
+        );
+        assert_eq!(
+            backend
+                .platform
+                .transport_gate(&key)
+                .map(|gate| gate.state()),
+            Some(crate::kms::render::resources::TransportState::Owner),
+            "card1's successful answer keeps its Owner transport open"
+        );
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&key)
+                .is_some_and(|arbiter| {
+                    arbiter.desired().device_presence() == Some(true)
+                        && arbiter.desired().seat_target()
+                            == Some(crate::kms::owner::lifecycle::SeatTarget::Owned)
+                }),
+            "card1's answer is consumed by the current episode and reaches the Owner continuation"
+        );
+
+        assert!(
+            backend.probe_workers.workers.is_empty(),
+            "the completed probe worker was joined and removed from the ledger"
+        );
+        let card1_fds_after_join = count_card1_fds();
+        assert_eq!(
+            card1_fds_after_join, card1_fds_before_probe,
+            "joining the worker closes its duplicate of the card1 master fd"
+        );
 
         let worker_snapshot = prober
             .answer
             .lock()
             .expect("worker answer lock")
             .clone()
-            .expect("production worker answered");
+            .expect("production worker answered successfully");
+        assert!(
+            worker_snapshot
+                .iter()
+                .all(|snapshot| snapshot.key.device_key == key)
+        );
+        let expected_end_state =
+            c0_3bi_expected_end_state(initial_output_keys.into_iter().filter(|output| {
+                output.device_key != key
+                    || worker_snapshot
+                        .iter()
+                        .any(|snapshot| &snapshot.key == output && !snapshot.modes.is_empty())
+            }));
         let synchronous_snapshot = crate::platform::drm::probe_connector_snapshots(&source)
             .unwrap_or_else(|error| panic!("synchronous card1 comparison probe: {error}"))
             .iter()
@@ -97808,19 +98176,25 @@ mod tests {
             .expect("worker thread lock")
             .expect("production worker thread recorded");
         assert_ne!(worker_thread, std::thread::current().id());
-        let worker_fd = prober
-            .worker_fd
-            .lock()
-            .expect("worker fd lock")
-            .expect("worker descriptor recorded");
-        assert!(worker_fd >= 0);
         assert!(
             prober
-                .worker_fd_closed
-                .load(std::sync::atomic::Ordering::Acquire)
+                .worker_saw_master_file_status_flag
+                .lock()
+                .expect("master file-status observation lock")
+                .expect("worker master file-status observation recorded"),
+            "the worker fd sees O_NONBLOCK set through the master fd after the worker fd exists"
         );
-        assert!(backend.probe_workers.workers.is_empty());
-        eprintln!("card1 connector worker probe duration: {elapsed:?}");
+        assert!(
+            prober
+                .master_file_status_flag_restored
+                .lock()
+                .expect("master file-status restoration lock")
+                .expect("master file-status restoration recorded"),
+            "the master's original file-status flags are restored"
+        );
+        eprintln!(
+            "card1 WORKER PROBE duration: {worker_probe_duration:?}; acquire episode completion: {elapsed:?}"
+        );
         c0_3bi_assert_end_state(
             &backend,
             "c0_hw_3cii_probe_worker_on_card1_drm",
