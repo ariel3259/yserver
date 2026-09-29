@@ -29,10 +29,12 @@ clean verdict. This is a prompt-level reading allowance, **not an enforced
 token, time or dollar cap**. Model, reasoning effort and single-pass dispatch
 remain unchanged by the brief itself; the effort was raised from `medium` to
 `xhigh` on 2026-09-18 and the allowance from 12 to 24 excerpts on 2026-09-19,
-and the model from `gpt-5.6-sol` to `gpt-6-sol` on 2026-09-22, all at the user's
-request (see Lineage). The effort stayed at `xhigh` across the model change on
-purpose: moving two variables at once would make the break impossible to read,
-and `gpt-6-sol` also offers `ultra`, which is deliberately not taken here.
+the model from `gpt-5.6-sol` to `gpt-6-sol` on 2026-09-22, and from `gpt-6-sol`
+to `gpt-6.1-sol` on 2026-09-29, all at the user's request (see Lineage). The
+effort stayed at `xhigh` across each model change on purpose: moving two
+variables at once would make the break impossible to read, and the Sol models
+also offer `ultra`, which is deliberately not taken here. `gpt-6.1-sol` needs
+codex-cli 0.159.0 or later with a ChatGPT account.
 
 Do not automatically chain correction/review rounds or retry interrupted
 reviews. After a pass, verify findings locally, fix the design issues, and
@@ -122,6 +124,7 @@ this is enforced rather than remembered.
 | **v2 / effort xhigh** (2026-09-18) | Codex reviews from stage 2c-ii on; the user set reviews to `gpt-5.6-sol` at `xhigh` | reviews citing the new instrument SHA only; never a `medium` round |
 | **v2 / 24 excerpts** (2026-09-19) | Codex reviews from stage 2c-iii round 3 on; two 2c-iii design rounds had exhausted 12/12 and returned INCOMPLETE coverage | reviews citing the new instrument SHA only; never a 12-excerpt round |
 | **v2 / gpt-6-sol** (2026-09-22) | Codex reviews from the first stage-3 document on; the user moved to GPT-6, which is half the price of the 5.6 family at the same reasoning effort | reviews citing the new instrument SHA only; never a `gpt-5.6-sol` round |
+| **v2 / gpt-6.1-sol** (2026-09-29) | Codex reviews after the stage 3c-ii plan loop closed; GPT-6.1 Sol has the same API price as GPT-6 Sol and near-Astra results on software-engineering evaluations | reviews citing the new instrument SHA only; never a `gpt-6-sol` round (the 3c-ii plan rounds 1-6 cite `067a1c12`) |
 
 v1 reconstructed the five-check brief used for stage 2a round 2. Earlier briefs
 were not preserved, so their historical counts are not comparable. v2 removes
