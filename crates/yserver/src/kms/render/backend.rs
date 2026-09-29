@@ -8470,6 +8470,17 @@ impl KmsBackend {
         for kms_device in &mut base.platform.devices {
             kms_device.device = Rc::clone(&real_device);
         }
+        // The seed backend uses the scripted prober because its fd is a test
+        // stand-in. Once the live DRM fd is installed, use the same prober as
+        // the production backend; hardware fixtures that need synthetic
+        // answers must opt back into the script explicitly.
+        base.platform
+            .use_production_connector_prober_for_live_drm_fixture();
+        #[cfg(test)]
+        assert!(
+            !base.platform.connector_prober_is_scripted_for_tests(),
+            "a live-DRM fixture must start with DrmConnectorProber"
+        );
 
         let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
         let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
@@ -96479,6 +96490,52 @@ mod tests {
     }
 
     #[test]
+    fn c0_3cii_live_fixture_prober_selection_uses_production() {
+        // `for_tests_with_vk_live_scene_real_drm_using` calls this selector
+        // immediately after replacing its test fd with a real DRM node. Keep
+        // the selection covered without opening hardware so a scripted-prober
+        // mutation fails in the ordinary test suite.
+        let mut backend = super::KmsBackend::for_tests();
+        assert!(backend.platform.connector_prober_is_scripted_for_tests());
+
+        backend
+            .platform
+            .use_production_connector_prober_for_live_drm_fixture();
+        assert!(
+            !backend.platform.connector_prober_is_scripted_for_tests(),
+            "real-DRM fixture selection must choose DrmConnectorProber"
+        );
+
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        assert!(
+            backend.platform.connector_prober_is_scripted_for_tests(),
+            "tests that need synthetic answers explicitly select ScriptedConnectorProber"
+        );
+    }
+
+    #[test]
+    fn c0_3cii_unscripted_probe_answer_is_not_kernel_eio() {
+        let backend = super::KmsBackend::for_tests();
+        let device = backend.platform.devices[0].key;
+        let error = backend
+            .platform
+            .probe_connector_snapshots_per_device()
+            .remove(&device)
+            .expect("test fixture device result")
+            .expect_err("an empty scripted answer is an explicit fixture error");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.raw_os_error(), None);
+        assert!(
+            error
+                .to_string()
+                .contains("unscripted connector snapshot probe")
+        );
+    }
+
+    #[test]
     fn c0_3cii_probe_worker_shares_the_master_file() {
         use std::os::fd::{AsFd, AsRawFd};
 
@@ -96593,6 +96650,9 @@ mod tests {
             .remove(&device)
             .expect("Owner probe result")
             .expect("healthy Owner snapshot");
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         let barrier = crate::kms::render::platform::ProbeBarrier::new();
         backend.platform.script_blocked_connector_probe_for_tests(
             device,
@@ -96711,6 +96771,9 @@ mod tests {
             .remove(&device)
             .expect("Owner probe result")
             .expect("healthy Owner snapshot");
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         let barrier = crate::kms::render::platform::ProbeBarrier::new();
         backend.platform.script_blocked_connector_probe_for_tests(
             device,
@@ -96952,6 +97015,9 @@ mod tests {
         let mut added_connector = snapshot[0].clone();
         added_connector.key = OutputKey::new(device, "worker-only-added-connector");
         snapshot.push(added_connector);
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         let barrier = crate::kms::render::platform::ProbeBarrier::new();
         backend.platform.script_blocked_connector_probe_for_tests(
             device,
@@ -97049,6 +97115,9 @@ mod tests {
         let (mut fixture, device, outputs, _) =
             c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), true);
         let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         backend.vt_skip_master_ioctls_for_tests = true;
         let mut state = c0_3ci_core_state(backend);
         c0_3ci_release_owner_to_suspended(
@@ -97100,7 +97169,7 @@ mod tests {
         backend
             .platform
             .script_connector_probe_for_tests(device, Ok(vec![snapshot]));
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "acquire covers the released-seat hotplug",
@@ -97173,6 +97242,9 @@ mod tests {
             .remove(&owner)
             .expect("Owner probe result")
             .expect("healthy Owner snapshot");
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         backend.platform.script_blocked_connector_probe_for_tests(
             owner,
             Ok(owner_snapshot),
@@ -97223,6 +97295,9 @@ mod tests {
         let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
             c0_3cii_released_two_owner_fixture();
         let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         let probes = c0_3ci_test_probe_results(backend);
         let snapshot_a = probes[&device_a]
             .as_ref()
@@ -97354,6 +97429,9 @@ mod tests {
         let (mut fixture, device_a, device_b, outputs_a, _outputs_b, mut state) =
             c0_3cii_released_two_owner_fixture();
         let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         let output_a_index = backend
             .platform
             .outputs
@@ -97545,6 +97623,9 @@ mod tests {
         let (mut fixture, device_a, device_b, outputs_a, _outputs_b, mut state) =
             c0_3cii_released_two_owner_fixture();
         let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         let probes = c0_3ci_test_probe_results(backend);
         let snapshot_a = probes[&device_a]
             .as_ref()
@@ -97724,6 +97805,9 @@ mod tests {
             let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
                 c0_3cii_released_two_owner_fixture();
             let backend = &mut fixture.backend;
+            backend
+                .platform
+                .install_scripted_connector_prober_for_tests();
             let output_a_index = backend
                 .platform
                 .outputs
@@ -98282,7 +98366,7 @@ mod tests {
             device,
             "release with a displaced composed frame",
         );
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "acquire with a displaced composed frame",
@@ -98435,7 +98519,7 @@ mod tests {
             device,
             "finish release after the render notification was dropped",
         );
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "acquire after the render notification was dropped",
@@ -98592,32 +98676,6 @@ mod tests {
         }
         fixture.backend.vt_skip_master_ioctls_for_tests = true;
         fixture.backend.platform.owner_completion_detached = true;
-        let mut per_device_snapshots =
-            std::collections::BTreeMap::<DrmDeviceKey, io::Result<Vec<ConnectorSnapshot>>>::new();
-        for device in &fixture.backend.platform.devices {
-            let snapshot = fixture
-                .backend
-                .platform
-                .outputs
-                .iter()
-                .filter(|layout| layout.key.device_key == device.key)
-                .map(|layout| ConnectorSnapshot {
-                    key: layout.key.clone(),
-                    modes: layout.output.modes.clone(),
-                    mm_width: layout.output.mm_width,
-                    mm_height: layout.output.mm_height,
-                    edid: layout.output.edid.clone(),
-                    connector_type: layout.output.connector_type.clone(),
-                })
-                .collect::<Vec<_>>();
-            per_device_snapshots.insert(device.key, Ok(snapshot));
-        }
-        for (device, result) in per_device_snapshots {
-            fixture
-                .backend
-                .platform
-                .script_connector_probe_for_tests(device, result);
-        }
         fixture
             .backend
             .lifecycle_register_owner_device(device)
@@ -98658,15 +98716,18 @@ mod tests {
         state
     }
 
-    fn c0_3ci_acquire_through_core_driver(
+    fn c0_3ci_acquire_with_scripted_layout_through_core_driver(
         backend: &mut super::KmsBackend,
         state: &mut ServerState,
         label: &str,
     ) {
-        // Existing 3c-i fixtures modeled successful discovery by reading the
-        // live layout synchronously. Queue the same snapshots through the
-        // construction-selected seam; any test-specific `set` answer remains
-        // first in line and keeps its original assertion path.
+        // The live fixture starts with DrmConnectorProber. Acquire tests that
+        // model synthetic connector discovery opt into the script here and
+        // queue the exact current layout; any test-specific `set` answer
+        // remains first in line and keeps its original assertion path.
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         for (device, result) in c0_3ci_test_probe_results(backend) {
             let Ok(snapshot) = result else {
                 continue;
@@ -99046,12 +99107,18 @@ mod tests {
     }
 
     fn c0_3ci_script_probe_results_for_tests(
-        backend: &super::KmsBackend,
+        backend: &mut super::KmsBackend,
         results: std::collections::BTreeMap<
             DrmDeviceKey,
             Result<Vec<ConnectorSnapshot>, io::ErrorKind>,
         >,
     ) {
+        // This helper is used only by synthetic acquire tests over a live
+        // allocation fixture, so make the test-only prober opt-in explicit.
+        // The actual live fixture itself retains DrmConnectorProber.
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         for (device, result) in results {
             backend.platform.script_connector_probe_for_tests(
                 device,
@@ -99718,6 +99785,9 @@ mod tests {
         device: DrmDeviceKey,
         output: &OutputKey,
     ) {
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         let layout = backend
             .platform
             .outputs
@@ -100255,7 +100325,7 @@ mod tests {
             .as_ref()
             .expect("executor retained while unreaped")
             .child_pid();
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "acquire after the closed Owner incarnation release",
@@ -100552,7 +100622,11 @@ mod tests {
             device,
             "finish release before acquire",
         );
-        c0_3ci_acquire_through_core_driver(backend, &mut state, "mixed acquire backend entry");
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            backend,
+            &mut state,
+            "mixed acquire backend entry",
+        );
         assert_eq!(backend.vt_state, VtState::Active);
         assert_eq!(
             backend.platform.dpms_output_calls_for_tests,
@@ -100602,6 +100676,9 @@ mod tests {
         let (mut fixture, device, outputs, _) =
             c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
         let backend = &mut fixture.backend;
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
         let mut state = c0_3ci_core_state(backend);
         c0_3ci_release_owner_to_suspended(
             backend,
@@ -100617,7 +100694,11 @@ mod tests {
 
         // The executor stub only models IPC failure handling. It does not
         // perform drmSetMaster, the device probe ioctls, or VT_ACKACQ.
-        c0_3ci_acquire_through_core_driver(backend, &mut state, "Owner connector probe failure");
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            backend,
+            &mut state,
+            "Owner connector probe failure",
+        );
         assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
         assert!(backend.vt_call_trace_for_tests.contains(&"resume_input"));
         assert_eq!(
@@ -100691,7 +100772,7 @@ mod tests {
         );
         let (_poll, sender, receiver) = channel().expect("core wake channel");
         Backend::set_input_sender(backend, sender);
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "Owner acquire reinstall TEST_ONLY rejection",
@@ -100812,7 +100893,11 @@ mod tests {
             device,
             "input-resume acquire known release",
         );
-        c0_3ci_acquire_through_core_driver(backend, &mut state, "start unresolved reinstall");
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            backend,
+            &mut state,
+            "start unresolved reinstall",
+        );
         c0_3bi_core_driver_until_with_state(
             backend,
             &mut state,
@@ -100946,7 +101031,7 @@ mod tests {
             "the release commit leaves the primary framebuffer attached"
         );
 
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "start acquire that displaces the released front buffer",
@@ -101067,7 +101152,7 @@ mod tests {
         let crtc_id = u32::from(layout.output.crtc);
         let plane_id = u32::from(layout.output.plane);
 
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "build from-scratch acquire reinstall",
@@ -101187,7 +101272,11 @@ mod tests {
             dpms::DPMS_MODE_OFF as u8
         );
 
-        c0_3ci_acquire_through_core_driver(backend, &mut state, "prepare DPMS-off reinstall");
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            backend,
+            &mut state,
+            "prepare DPMS-off reinstall",
+        );
         let description = backend.lifecycle_drivers[&device]
             .acquire_topology_descriptions_for_tests()
             .last()
@@ -101287,7 +101376,11 @@ mod tests {
         );
         // Stub helpers accept protocol IPC; they do not perform master ioctls,
         // connector probes, atomic KMS commits, or fence/page-flip signals.
-        c0_3ci_acquire_through_core_driver(backend, &mut state, "mixed-success acquire entry");
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            backend,
+            &mut state,
+            "mixed-success acquire entry",
+        );
 
         assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
         assert_eq!(
@@ -101434,7 +101527,7 @@ mod tests {
             &[device_a, device_b],
             "episode-waits acquire known release",
         );
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "begin multi-Owner acquire episode",
@@ -101624,7 +101717,8 @@ mod tests {
         // drmDropMaster/drmSetMaster, atomic modesets, or kernel page flips.
         backend.vt_skip_master_ioctls_for_tests = true;
         backend.platform.owner_completion_detached = true;
-        c0_3ci_script_probe_results_for_tests(backend, c0_3ci_test_probe_results(backend));
+        let probe_results = c0_3ci_test_probe_results(backend);
+        c0_3ci_script_probe_results_for_tests(backend, probe_results);
         let output = OutputKey::new(device, connector);
         let fb_id_property = u32::from(backend.platform.outputs[0].output.plane_fb_id_prop);
         let retired_instance = backend
@@ -101651,7 +101745,7 @@ mod tests {
             device,
             "direct-frame acquire known release",
         );
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "begin composed acquire after direct release",
@@ -101847,7 +101941,11 @@ mod tests {
             .collect::<Vec<_>>();
         backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
         backend.platform.dpms_output_scopes_for_tests = Some(Vec::new());
-        c0_3ci_acquire_through_core_driver(backend, &mut state, "stage mixed acquire changes");
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            backend,
+            &mut state,
+            "stage mixed acquire changes",
+        );
 
         assert_eq!(backend.vt_state, crate::vt::state::VtState::Active);
         assert_eq!(
@@ -101984,7 +102082,11 @@ mod tests {
             owner_device,
             "quiet Owner acquire release",
         );
-        c0_3ci_acquire_through_core_driver(owner, &mut owner_state, "quiet Owner acquire entry");
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            owner,
+            &mut owner_state,
+            "quiet Owner acquire entry",
+        );
         let owner_commit = c0_3ci_wait_owner_acquire_accepted(
             owner,
             &mut owner_state,
@@ -102111,7 +102213,7 @@ mod tests {
             .and_then(|owner| owner.clock_key_for_hardware_crtc(crtc))
             .expect("fixture output starts with an installed clock")
             .epoch;
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "rapid-switch acquire entry before delayed validation",
@@ -102308,7 +102410,7 @@ mod tests {
         let descriptions_before_reacquire = backend.lifecycle_drivers[&device]
             .acquire_topology_descriptions_for_tests()
             .len();
-        c0_3ci_acquire_through_core_driver(
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
             backend,
             &mut state,
             "later acquire after superseded test-only and release disposition",
@@ -102538,7 +102640,11 @@ mod tests {
             device,
             "rapid-switch dispatched acquire initial release",
         );
-        c0_3ci_acquire_through_core_driver(backend, &mut state, "rapid-switch acquire entry");
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            backend,
+            &mut state,
+            "rapid-switch acquire entry",
+        );
         let reinstall = c0_3ci_wait_owner_acquire_accepted(
             backend,
             &mut state,

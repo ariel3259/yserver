@@ -2570,6 +2570,11 @@ pub(crate) trait ConnectorProber: Send + Sync {
         key: crate::platform::drm::DrmDeviceKey,
         fd: OwnedFd,
     ) -> io::Result<Vec<crate::platform::drm::ConnectorProbe>>;
+
+    #[cfg(test)]
+    fn is_scripted_for_tests(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct DrmConnectorProber;
@@ -2643,6 +2648,7 @@ enum ScriptedProbeAnswer {
         barrier: ProbeBarrier,
     },
     Connectors(Result<Vec<crate::platform::drm::ConnectorProbe>, i32>),
+    Unscripted,
 }
 
 #[derive(Clone, Debug)]
@@ -2775,7 +2781,7 @@ impl ScriptedConnectorProber {
             .expect("scripted prober lock")
             .get_mut(&key)
             .and_then(std::collections::VecDeque::pop_front)
-            .unwrap_or(ScriptedProbeAnswer::Snapshot(Err(libc::EIO)))
+            .unwrap_or(ScriptedProbeAnswer::Unscripted)
     }
 
     fn observe(
@@ -2810,6 +2816,9 @@ impl ConnectorProber for ScriptedConnectorProber {
                 barrier.block_worker();
                 scripted_probe_result(result)
             }
+            ScriptedProbeAnswer::Unscripted => Err(io::Error::other(format!(
+                "unscripted connector snapshot probe for {key}"
+            ))),
             ScriptedProbeAnswer::Connectors(_) => Err(io::Error::from_raw_os_error(libc::EINVAL)),
         };
         drop(fd);
@@ -2825,6 +2834,9 @@ impl ConnectorProber for ScriptedConnectorProber {
         let fd_closed = self.observe(key, fd.as_raw_fd());
         let result = match self.next_answer(key) {
             ScriptedProbeAnswer::Connectors(result) => scripted_probe_result(result),
+            ScriptedProbeAnswer::Unscripted => Err(io::Error::other(format!(
+                "unscripted connector probe for {key}"
+            ))),
             ScriptedProbeAnswer::Snapshot(_) | ScriptedProbeAnswer::BlockSnapshot { .. } => {
                 Err(io::Error::from_raw_os_error(libc::EINVAL))
             }
@@ -2832,6 +2844,11 @@ impl ConnectorProber for ScriptedConnectorProber {
         drop(fd);
         fd_closed.store(true, std::sync::atomic::Ordering::Release);
         result
+    }
+
+    #[cfg(test)]
+    fn is_scripted_for_tests(&self) -> bool {
+        true
     }
 }
 
@@ -5363,6 +5380,28 @@ impl PlatformBackend {
         results
     }
 
+    pub(crate) fn use_production_connector_prober_for_live_drm_fixture(&mut self) {
+        self.connector_prober = Arc::new(DrmConnectorProber);
+        #[cfg(test)]
+        {
+            self.scripted_connector_prober = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_scripted_connector_prober_for_tests(&mut self) {
+        let prober = self
+            .scripted_connector_prober
+            .get_or_insert_with(ScriptedConnectorProber::new)
+            .clone();
+        self.connector_prober = Arc::new(prober);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connector_prober_is_scripted_for_tests(&self) -> bool {
+        self.connector_prober.is_scripted_for_tests()
+    }
+
     #[cfg(test)]
     pub(crate) fn script_connector_probe_for_tests(
         &self,
@@ -5371,7 +5410,7 @@ impl PlatformBackend {
     ) {
         self.scripted_connector_prober
             .as_ref()
-            .expect("test platform uses its construction-time scripted prober")
+            .expect("install the scripted connector prober before scripting probe answers")
             .set_snapshot(key, result);
     }
 
@@ -5383,7 +5422,7 @@ impl PlatformBackend {
     ) {
         self.scripted_connector_prober
             .as_ref()
-            .expect("test platform uses its construction-time scripted prober")
+            .expect("install the scripted connector prober before scripting probe answers")
             .push_snapshot(key, result);
     }
 
@@ -5396,7 +5435,7 @@ impl PlatformBackend {
     ) {
         self.scripted_connector_prober
             .as_ref()
-            .expect("test platform uses its construction-time scripted prober")
+            .expect("install the scripted connector prober before scripting probe answers")
             .set_blocked_snapshot(key, result, barrier);
     }
 
@@ -5409,7 +5448,7 @@ impl PlatformBackend {
     ) {
         self.scripted_connector_prober
             .as_ref()
-            .expect("test platform uses its construction-time scripted prober")
+            .expect("install the scripted connector prober before scripting probe answers")
             .push_blocked_snapshot(key, result, barrier);
     }
 
@@ -5417,7 +5456,7 @@ impl PlatformBackend {
     pub(crate) fn connector_probe_observations_for_tests(&self) -> Vec<ProbeObservation> {
         self.scripted_connector_prober
             .as_ref()
-            .expect("test platform uses its construction-time scripted prober")
+            .expect("install the scripted connector prober before reading probe observations")
             .observations()
     }
 
