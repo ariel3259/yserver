@@ -847,7 +847,7 @@ impl StagingBuffer {
     /// Falls back to plain `HOST_COHERENT` when no cached type is available
     /// (e.g. some software ICDs). See `RenderEngine::get_image` and
     /// project_cinnamon_nvidia_chop_shm_getimage.
-    fn new_for_readback(vk: Arc<VkContext>, size: u64) -> Result<Self, vk::Result> {
+    pub(crate) fn new_for_readback(vk: Arc<VkContext>, size: u64) -> Result<Self, vk::Result> {
         Self::new_internal(
             vk,
             size,
@@ -977,7 +977,7 @@ impl StagingBuffer {
     /// the backing memory is `HOST_COHERENT`; otherwise issues
     /// `vkInvalidateMappedMemoryRanges` over the whole allocation. Call
     /// AFTER the readback fence has signalled and BEFORE reading `mapped`.
-    fn invalidate_for_read(&self) -> Result<(), vk::Result> {
+    pub(crate) fn invalidate_for_read(&self) -> Result<(), vk::Result> {
         if self.coherent {
             return Ok(());
         }
@@ -986,6 +986,24 @@ impl StagingBuffer {
             .offset(0)
             .size(vk::WHOLE_SIZE);
         unsafe { self.vk.device.invalidate_mapped_memory_ranges(&[range]) }
+    }
+}
+
+impl StagingBuffer {
+    pub(crate) fn buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    pub(crate) fn mapped(&self) -> NonNull<u8> {
+        self.mapped
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn vk(&self) -> &Arc<VkContext> {
+        &self.vk
     }
 }
 
@@ -17664,15 +17682,16 @@ mod tests {
         );
         assert_eq!(idle(&engine), 0);
 
-        // Closed but not submitted: the fence cannot have signalled.
+        // Closing submits frame A, whose fence may signal at any time; its
+        // block only goes back on the idle list through the retire walk, so
+        // don't run one until frame B has taken its block.
         engine
             .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
             .expect("close frame A");
-        engine.poll_retired(&platform);
         assert_eq!(
             idle(&engine),
             0,
-            "a frame whose fence has not signalled must not return its blocks"
+            "a closed frame must not return its blocks before retiring"
         );
 
         // Frame B, opened while A is in flight: a block of its own.

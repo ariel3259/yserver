@@ -687,7 +687,9 @@ fn classify_randr_minor(minor: u8) -> RandrRequestClass {
         | rr::RR_SET_PROVIDER_OUTPUT_SOURCE
         | rr::RR_SET_PROVIDER_OFFLOAD_SINK
         | rr::RR_SET_PANNING
-        | rr::RR_SET_CRTC_TRANSFORM => RandrRequestClass::Mutation,
+        | rr::RR_SET_CRTC_TRANSFORM
+        | rr::RR_SET_MONITOR
+        | rr::RR_DELETE_MONITOR => RandrRequestClass::Mutation,
         rr::RR_GET_SCREEN_RESOURCES => RandrRequestClass::ForcedReprobe,
         _ => RandrRequestClass::NonGate,
     }
@@ -702,7 +704,7 @@ struct RandrGateWaiter {
     expires_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RandrGateFlight {
     token: Option<CrtcConfigToken>,
     publication: Option<CrtcConfigPublication>,
@@ -724,6 +726,7 @@ pub(crate) struct RandrMutationGate {
 impl RandrMutationGate {
     fn active_install_capable(&self, backend: &dyn Backend) -> bool {
         self.in_flight
+            .as_ref()
             .and_then(|flight| flight.token)
             .is_some_and(|token| backend.crtc_config_install_capable(token))
     }
@@ -889,7 +892,7 @@ impl RandrMutationGate {
                         .front()
                         .is_some_and(|head| head.ticket == ticket)
             }
-            RandrRequestClass::ForcedReprobe => match self.in_flight {
+            RandrRequestClass::ForcedReprobe => match self.in_flight.as_ref() {
                 _ if self.topology_episode.is_some() => false,
                 Some(_) if self.active_install_capable(backend) => false,
                 Some(_) => true,
@@ -983,6 +986,7 @@ impl RandrMutationGate {
     fn finish_pending(&mut self, token: CrtcConfigToken) {
         if self
             .in_flight
+            .as_ref()
             .is_some_and(|flight| flight.token == Some(token))
         {
             self.in_flight = None;
@@ -3555,7 +3559,11 @@ pub(crate) fn notify_randr_output_property_changed(
 
     const RANDR_FIRST_EVENT: u8 = 89;
 
-    let timestamp = state.randr.timestamp;
+    // Xorg stamps property notifies with the current time and leaves
+    // lastSetTime alone (`rrproperty.c:75`): mutter/muffin compare
+    // lastSetTime with their own SetCrtcConfig reply to tell their
+    // configuration from an external one.
+    let timestamp = state.timestamp_now();
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
         .randr_select_masks
         .iter()
@@ -3770,8 +3778,9 @@ pub(crate) fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
     let mut max_y = 0i32;
     for output in state.randr.outputs.iter().filter(|o| o.mode_id != 0) {
         any = true;
-        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(output.width)));
-        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(output.height)));
+        let (width, height) = output.footprint();
+        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(width)));
+        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(height)));
     }
     any.then(|| {
         (
@@ -4010,6 +4019,8 @@ fn handle_setup_allocate(
             resource_id_mask: mask,
             screen_width_px: state.randr.screen_width,
             screen_height_px: state.randr.screen_height,
+            screen_width_mm: u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX),
+            screen_height_mm: u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX),
             current_input_masks: state
                 .clients
                 .values()
@@ -4021,6 +4032,8 @@ fn handle_setup_allocate(
             resource_id_mask: 0,
             screen_width_px: 0,
             screen_height_px: 0,
+            screen_width_mm: 0,
+            screen_height_mm: 0,
             current_input_masks: 0,
         },
     };
@@ -4545,6 +4558,21 @@ fn _hint(_: Transport) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #132: `xrandr --dpi` (RRSetScreenSize with the same pixels, new mm)
+    /// reaches NEW clients' setup reply, as Xorg's `pScreen->mmWidth`.
+    /// Measured in vng (tools/vng-scenarios/xrandr-dpi.sh): 1280x800 at
+    /// `--dpi 108` → 301x188 mm on Xorg 21.1.24 and on yserver.
+    #[test]
+    fn setup_allocate_reports_randr_screen_mm() {
+        let mut state = ServerState::new();
+        let (w, h) = (state.randr.screen_width, state.randr.screen_height);
+        state.randr.set_logical_size(w, h, 301, 188);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        handle_setup_allocate(&mut state, yserver_protocol::x11::ClientId(1), tx);
+        let resp = rx.try_recv().expect("setup allocate response");
+        assert_eq!((resp.screen_width_mm, resp.screen_height_mm), (301, 188));
+    }
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -4950,6 +4978,7 @@ mod tests {
             y: 0,
             set_time: 0,
             output_bbox_before: None,
+            apply_transform: None,
         }
     }
 
@@ -4982,6 +5011,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3, 4],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         let modes = vec![
             RandrMode {
@@ -5232,6 +5263,8 @@ mod tests {
             rr::RR_SET_PROVIDER_OFFLOAD_SINK,
             rr::RR_SET_PANNING,
             rr::RR_SET_CRTC_TRANSFORM,
+            rr::RR_SET_MONITOR,
+            rr::RR_DELETE_MONITOR,
         ];
         for minor in 0..=47 {
             let expected = if minor == rr::RR_GET_SCREEN_RESOURCES {
@@ -7830,7 +7863,7 @@ mod tests {
             &mut queue,
         );
         assert_eq!(
-            gate.in_flight.and_then(|flight| flight.token),
+            gate.in_flight.as_ref().and_then(|flight| flight.token),
             Some(mutation)
         );
 
@@ -7987,7 +8020,7 @@ mod tests {
             &mut queue,
         );
         assert_eq!(
-            gate.in_flight.and_then(|flight| flight.token),
+            gate.in_flight.as_ref().and_then(|flight| flight.token),
             Some(mutation)
         );
 
@@ -8743,6 +8776,7 @@ mod tests {
             y: 0,
             set_time: 123,
             output_bbox_before: enabled_output_bbox(&state),
+            apply_transform: None,
         };
         let reply = CrtcConfigReply {
             byte_order: ClientByteOrder::LittleEndian,

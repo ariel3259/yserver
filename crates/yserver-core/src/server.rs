@@ -1033,6 +1033,9 @@ pub struct ServerState {
     /// See [`RandrOutputProperty`] for why this lives beside `randr` rather
     /// than inside `RandrState`.
     pub randr_output_properties: HashMap<u32, Vec<(AtomId, RandrOutputProperty)>>,
+    /// RANDR 1.5 client-defined monitors in `SetMonitor` order. See
+    /// [`crate::randr::ClientMonitor`] for why this lives beside `randr`.
+    pub randr_client_monitors: Vec<crate::randr::ClientMonitor>,
     /// One bit per RANDR minor opcode whose unsupported behavior has already
     /// produced a warning. Repeated requests remain visible at debug level
     /// without flooding ordinary desktop layout reapplication logs.
@@ -1584,6 +1587,7 @@ impl ServerState {
             randr_select_masks: HashMap::new(),
             randr_primary_output_explicit: false,
             randr_output_properties: HashMap::new(),
+            randr_client_monitors: Vec::new(),
             randr_unsupported_warned_mask: 0,
             xkb_clients: HashMap::new(),
             xkb_interests: HashMap::new(),

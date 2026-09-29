@@ -407,6 +407,11 @@ pub struct RecordingBackend {
     /// Test controls and observations for asynchronous CRTC configuration.
     /// `None` preserves the synchronous `apply_crtc_config` path.
     pub pending_crtc_config: Option<CrtcConfigToken>,
+    /// When set, a synchronous `apply_crtc_config` reports a change and the
+    /// following `refresh_randr_state_set_time` installs it into
+    /// `state.randr`, carrying client-owned state as the KMS rebuild does.
+    pub apply_crtc_configs: bool,
+    applied_crtc_config: Option<(u32, Option<ModeSpec>, i32, i32)>,
     pub ready_crtc_configs: Vec<CrtcConfigToken>,
     requesterless_publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
     urgent_requesterless_publications: Arc<Mutex<VecDeque<RequesterlessPublication>>>,
@@ -674,6 +679,8 @@ impl RecordingBackend {
             provider_output_source_changed: true,
             provider_output_source_error: None,
             pending_crtc_config: None,
+            apply_crtc_configs: false,
+            applied_crtc_config: None,
             ready_crtc_configs: Vec::new(),
             requesterless_publications: Arc::new(Mutex::new(VecDeque::new())),
             urgent_requesterless_publications: Arc::new(Mutex::new(VecDeque::new())),
@@ -1512,7 +1519,58 @@ impl Backend for RecordingBackend {
             x,
             y,
         });
-        Ok(false)
+        if self.apply_crtc_configs {
+            self.applied_crtc_config = Some((output_id, mode, x, y));
+        }
+        Ok(self.apply_crtc_configs)
+    }
+
+    fn refresh_randr_state_set_time(
+        &mut self,
+        state: &mut crate::server::ServerState,
+        set_time: u32,
+    ) {
+        let Some((output_id, mode, x, y)) = self.applied_crtc_config.take() else {
+            state.randr.timestamp = set_time;
+            return;
+        };
+        let prev = &state.randr;
+        let mut outputs = prev.outputs.clone();
+        if let Some(output) = outputs.iter_mut().find(|o| o.output_id == output_id) {
+            let resolved = mode.and_then(|m| {
+                prev.mode_table.iter().find(|t| {
+                    output.mode_ids.contains(&t.mode_id)
+                        && (t.width, t.height, t.vrefresh) == (m.width, m.height, m.vrefresh)
+                })
+            });
+            // An off KMS output reports mode 0 at 0,0 with no size.
+            let (mode_id, width, height, vrefresh) =
+                resolved.map_or((0, 0, 0, 0), |m| (m.mode_id, m.width, m.height, m.vrefresh));
+            let (x, y) = if resolved.is_some() { (x, y) } else { (0, 0) };
+            output.mode_id = mode_id;
+            output.width = width;
+            output.height = height;
+            output.vrefresh = vrefresh;
+            output.x = i16::try_from(x).unwrap_or(i16::MAX);
+            output.y = i16::try_from(y).unwrap_or(i16::MAX);
+        }
+        let screen = (
+            prev.screen_width,
+            prev.screen_height,
+            prev.width_mm,
+            prev.height_mm,
+        );
+        let transforms = prev.crtc_transforms();
+        let mode_table = prev.mode_table.clone();
+        state.randr =
+            crate::randr::RandrState::from_outputs_with_modes(set_time, outputs, mode_table);
+        state.randr.restore_crtc_transforms(transforms);
+        (
+            state.randr.screen_width,
+            state.randr.screen_height,
+            state.randr.width_mm,
+            state.randr.height_mm,
+        ) = screen;
     }
 
     fn begin_crtc_config(
@@ -1596,14 +1654,6 @@ impl Backend for RecordingBackend {
 
     fn crtc_config_install_capable(&self, _token: CrtcConfigToken) -> bool {
         self.crtc_config_is_install_capable
-    }
-
-    fn refresh_randr_state_set_time(
-        &mut self,
-        state: &mut crate::server::ServerState,
-        set_time: u32,
-    ) {
-        state.randr.timestamp = set_time;
     }
 
     fn set_crtc_gamma(

@@ -288,6 +288,8 @@ pub(crate) fn submit_owner_copied_scanout_frame(
             overlay_ops,
             xor_pipeline,
             xor_layout,
+            None,
+            None,
         )
     });
     let (submitted, previous_gpu_ns) = match render_result {
