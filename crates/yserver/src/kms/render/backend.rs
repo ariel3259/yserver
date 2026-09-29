@@ -89444,6 +89444,86 @@ mod tests {
         std::sync::atomic::AtomicBool::new(false);
 
     #[cfg(target_os = "linux")]
+    #[derive(Clone)]
+    struct C0HardwareProbeAnswerGate {
+        state: std::sync::Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl C0HardwareProbeAnswerGate {
+        fn new() -> Self {
+            Self {
+                state: std::sync::Arc::new((
+                    std::sync::Mutex::new((false, false)),
+                    std::sync::Condvar::new(),
+                )),
+            }
+        }
+
+        fn wait_started(&self, timeout: std::time::Duration) -> bool {
+            let (lock, ready) = &*self.state;
+            let state = lock.lock().expect("hardware probe gate lock");
+            let (state, _) = ready
+                .wait_timeout_while(state, timeout, |(started, _)| !*started)
+                .expect("hardware probe gate wait");
+            state.0
+        }
+
+        fn release(&self) {
+            let (lock, ready) = &*self.state;
+            lock.lock().expect("hardware probe gate lock").1 = true;
+            ready.notify_all();
+        }
+
+        fn block_answer(&self) {
+            let (lock, ready) = &*self.state;
+            let mut state = lock.lock().expect("hardware probe gate lock");
+            state.0 = true;
+            ready.notify_all();
+            while !state.1 {
+                state = ready.wait(state).expect("hardware probe gate wait");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for C0HardwareProbeAnswerGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct C0HardwareGatedDrmConnectorProber {
+        answer_gate: C0HardwareProbeAnswerGate,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl crate::kms::render::platform::ConnectorProber for C0HardwareGatedDrmConnectorProber {
+        fn probe_snapshot(
+            &self,
+            key: DrmDeviceKey,
+            fd: std::os::fd::OwnedFd,
+        ) -> io::Result<Vec<ConnectorSnapshot>> {
+            use crate::kms::render::platform::DrmConnectorProber;
+
+            let result = DrmConnectorProber.probe_snapshot(key, fd);
+            self.answer_gate.block_answer();
+            result
+        }
+
+        fn probe_connectors(
+            &self,
+            key: DrmDeviceKey,
+            fd: std::os::fd::OwnedFd,
+        ) -> io::Result<Vec<crate::platform::drm::ConnectorProbe>> {
+            use crate::kms::render::platform::DrmConnectorProber;
+
+            DrmConnectorProber.probe_connectors(key, fd)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     unsafe extern "C" fn c0_vt_test_signal_handler(signal: libc::c_int) {
         use std::sync::atomic::Ordering;
 
@@ -89975,10 +90055,12 @@ mod tests {
 
                 if cycle == 5 {
                     // Leave the four ordinary release/acquire cycles above
-                    // intact, then force Task 5's undispatched-acquire race
-                    // on card1. on_vt_acquire synchronously prepares the new
-                    // pool and sends TEST_ONLY; withholding the next core
-                    // entry keeps its reply from dispatching the reinstall.
+                    // intact, then stage the original 3c-i undispatched-
+                    // reinstall race on card1. Acquire probing and its
+                    // continuation are asynchronous, so drive core entries
+                    // until the continuation has prepared pools and sent
+                    // TEST_ONLY, then stop before another entry can dispatch
+                    // the reinstall.
                     let validation_sends_before = backend.lifecycle_drivers[&device]
                         .topology_test_stats()
                         .0
@@ -89992,14 +90074,50 @@ mod tests {
                     Backend::on_vt_acquire(backend, &mut state);
                     assert_eq!(
                         backend.vt_state,
-                        crate::vt::state::VtState::Active,
-                        "rapid card1 acquire reaches Active before its reinstall is dispatched"
+                        crate::vt::state::VtState::Resuming,
+                        "rapid card1 acquire waits for its asynchronous probe"
                     );
                     let rapid_episode_id = backend
                         .acquire_episode
                         .as_ref()
                         .expect("rapid acquire owns an open AcquireEpisode")
                         .id;
+                    assert!(
+                        backend.probe_episode.is_some(),
+                        "rapid acquire starts a connector probe episode"
+                    );
+                    c0_3bi_core_driver_until_with_state(
+                        backend,
+                        &mut state,
+                        "card1 rapid acquire continuation sends TEST_ONLY before reinstall",
+                        Duration::from_secs(3),
+                        &|backend| {
+                            backend.probe_episode.is_none()
+                                && backend.vt_state == crate::vt::state::VtState::Active
+                                && backend
+                                    .acquire_episode
+                                    .as_ref()
+                                    .is_some_and(|episode| episode.id == rapid_episode_id)
+                                && !backend.lifecycle_drivers[&device]
+                                    .prepared_acquire_allocation_keys_for_tests()
+                                    .is_empty()
+                                && backend.lifecycle_drivers[&device]
+                                    .topology_test_stats()
+                                    .0
+                                    .len()
+                                    > validation_sends_before
+                                && backend.lifecycle_drivers[&device]
+                                    .topology_test_stats()
+                                    .1
+                                    .len()
+                                    == live_sends_before
+                        },
+                        None,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("rapid card1 acquire continuation did not stage TEST_ONLY: {error}")
+                    });
+                    assert!(backend.probe_episode.is_none());
                     let rapid_prepared_allocations = backend.lifecycle_drivers[&device]
                         .prepared_acquire_allocation_keys_for_tests();
                     assert!(
@@ -90089,6 +90207,206 @@ mod tests {
                     acquire_description_count = backend.lifecycle_drivers[&device]
                         .acquire_topology_descriptions_for_tests()
                         .len();
+
+                    // Decision 12's second rapid variant deliberately holds
+                    // the real card1 probe result after the probe has run but
+                    // before the worker answers. This makes the outstanding
+                    // probe window deterministic on hardware without
+                    // replacing the production KMS probe.
+                    let answer_gate = C0HardwareProbeAnswerGate::new();
+                    backend.platform.connector_prober =
+                        std::sync::Arc::new(C0HardwareGatedDrmConnectorProber {
+                            answer_gate: answer_gate.clone(),
+                        });
+                    let pending_validation_sends = backend.lifecycle_drivers[&device]
+                        .topology_test_stats()
+                        .0
+                        .len();
+                    let pending_live_sends = backend.lifecycle_drivers[&device]
+                        .topology_test_stats()
+                        .1
+                        .len();
+                    let pending_acquire_descriptions = backend.lifecycle_drivers[&device]
+                        .acquire_topology_descriptions_for_tests()
+                        .len();
+                    let output_keys_before_late_answer = backend
+                        .platform
+                        .outputs
+                        .iter()
+                        .map(|output| output.key.clone())
+                        .collect::<Vec<_>>();
+                    Backend::request_vt_switch(backend, u32::try_from(original_vt).unwrap());
+                    signal_guard.wait_for(libc::SIGUSR2, Duration::from_secs(5));
+                    Backend::on_vt_acquire(backend, &mut state);
+                    assert_eq!(
+                        backend.vt_state,
+                        crate::vt::state::VtState::Resuming,
+                        "decision 12 rapid acquire remains Resuming during its probe"
+                    );
+                    let invalidated_acquire_id = backend
+                        .acquire_episode
+                        .as_ref()
+                        .expect("decision 12 rapid acquire owns an AcquireEpisode")
+                        .id;
+                    let invalidated_probe_epoch = backend
+                        .probe_episode
+                        .as_ref()
+                        .expect("decision 12 rapid acquire owns a probe episode")
+                        .epoch;
+                    assert!(
+                        backend
+                            .probe_episode
+                            .as_ref()
+                            .is_some_and(|episode| episode.remaining.contains(&device))
+                    );
+                    assert!(
+                        answer_gate.wait_started(Duration::from_secs(5)),
+                        "the production card1 probe reached the held answer gate"
+                    );
+                    assert!(backend.probe_episode.as_ref().is_some_and(|episode| {
+                        episode.epoch == invalidated_probe_epoch
+                            && episode.remaining.contains(&device)
+                    }));
+                    assert_eq!(
+                        backend.lifecycle_drivers[&device]
+                            .topology_test_stats()
+                            .1
+                            .len(),
+                        pending_live_sends,
+                        "the outstanding acquire probe has not sent a reinstall"
+                    );
+
+                    Backend::request_vt_switch(backend, u32::try_from(free_vt).unwrap());
+                    signal_guard.wait_for(libc::SIGUSR1, Duration::from_secs(5));
+                    let outstanding_release_signal_received = Instant::now();
+                    Backend::on_vt_release(backend, &mut state);
+                    c0_3bi_core_driver_until_with_state(
+                        backend,
+                        &mut state,
+                        "card1 release invalidates its outstanding acquire probe",
+                        Duration::from_secs(2),
+                        &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
+                        None,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("decision 12 card1 release hand-off failed: {error}")
+                    });
+                    assert!(
+                        Instant::now()
+                            <= outstanding_release_signal_received + Duration::from_secs(1),
+                        "decision 12 card1 hand-off stays within the one-second release bound"
+                    );
+                    assert!(backend.probe_episode.is_none());
+                    assert!(backend.acquire_episode.is_none());
+                    assert!(backend.topology_episode_events.iter().any(|event| {
+                        matches!(
+                            event,
+                            yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, None)
+                                if *id == invalidated_acquire_id
+                        )
+                    }));
+                    assert!(
+                        backend
+                            .probe_workers
+                            .workers
+                            .get(&device)
+                            .is_some_and(|worker| {
+                                worker.epoch == invalidated_probe_epoch && worker.stuck
+                            }),
+                        "release invalidates the epoch and retains the unanswered worker as stuck"
+                    );
+                    assert!(!backend.topology_episode_events.iter().any(|event| {
+                        matches!(
+                            event,
+                            yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, Some(_))
+                                if *id == invalidated_acquire_id
+                        )
+                    }));
+                    assert_eq!(
+                        backend.lifecycle_drivers[&device]
+                            .topology_test_stats()
+                            .1
+                            .len(),
+                        pending_live_sends,
+                        "the invalidated probe dispatches no reinstall"
+                    );
+                    assert_eq!(
+                        backend.lifecycle_drivers[&device]
+                            .acquire_topology_descriptions_for_tests()
+                            .len(),
+                        pending_acquire_descriptions,
+                        "the invalidated probe prepares no acquire reinstall"
+                    );
+                    assert_eq!(
+                        backend.lifecycle_drivers[&device]
+                            .topology_test_stats()
+                            .0
+                            .len(),
+                        pending_validation_sends,
+                        "the invalidated probe never reaches lifecycle TEST_ONLY"
+                    );
+                    assert!(
+                        backend.lifecycle_drivers[&device]
+                            .prepared_acquire_allocation_keys_for_tests()
+                            .is_empty()
+                    );
+                    let episode_ends_none_after_release = backend
+                        .topology_episode_events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event,
+                                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(_, None)
+                            )
+                        })
+                        .count();
+                    answer_gate.release();
+                    c0_3cii_finish_probe_workers(
+                        backend,
+                        &mut state,
+                        "discard the late card1 acquire probe answer",
+                    );
+                    assert!(backend.probe_workers.workers.is_empty());
+                    assert!(backend.probe_episode.is_none());
+                    assert!(backend.acquire_episode.is_none());
+                    assert_eq!(
+                        backend
+                            .platform
+                            .outputs
+                            .iter()
+                            .map(|output| output.key.clone())
+                            .collect::<Vec<_>>(),
+                        output_keys_before_late_answer,
+                        "the late probe answer leaves the installed card1 outputs unchanged"
+                    );
+                    assert_eq!(
+                        backend
+                            .topology_episode_events
+                            .iter()
+                            .filter(|event| {
+                                matches!(
+                                    event,
+                                    yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(
+                                        _,
+                                        None
+                                    )
+                                )
+                            })
+                            .count(),
+                        episode_ends_none_after_release,
+                        "the late answer adds no topology-episode disposition"
+                    );
+                    assert_eq!(
+                        backend.lifecycle_drivers[&device]
+                            .topology_test_stats()
+                            .1
+                            .len(),
+                        pending_live_sends,
+                        "the late answer sends no reinstall"
+                    );
+                    backend
+                        .platform
+                        .use_production_connector_prober_for_live_drm_fixture();
                 }
 
                 let reinstall_seen = std::cell::Cell::new(false);
@@ -97264,9 +97582,26 @@ mod tests {
             &barrier,
             "mixed acquire blocked Owner and failed Legacy probe",
         );
-        let messages = receiver.try_recv_all_tagged().collect::<Vec<_>>();
+        let messages = std::cell::RefCell::new(Vec::new());
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "consume Legacy EIO while the Owner probe worker stays blocked",
+            std::time::Duration::from_secs(1),
+            &|_| {
+                messages.borrow_mut().extend(receiver.try_recv_all_tagged());
+                messages
+                    .borrow()
+                    .iter()
+                    .any(|(_, message)| matches!(message, Message::Shutdown))
+            },
+            None,
+        )
+        .expect("Legacy EIO reaches the shutdown channel while Owner remains blocked");
+        messages.borrow_mut().extend(receiver.try_recv_all_tagged());
         assert!(
             messages
+                .borrow()
                 .iter()
                 .any(|(_, message)| matches!(message, Message::Shutdown)),
             "the Legacy EIO requests server exit while the Owner worker is still blocked"
@@ -98909,81 +99244,108 @@ mod tests {
         devices: &[DrmDeviceKey],
         label: &str,
     ) {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         // AcceptKernelCalls cannot issue the kernel atomic commit, signal its
         // out-fence/page-flip, or perform VT_RELDISP/drmDropMaster. The
-        // established core-entry helper models commit completion; fixture
-        // flags skip the real VT/master ioctls.
+        // established core-entry helper models every commit that must retire
+        // before the release transition can hand off; fixture flags skip the
+        // real VT/master ioctls. A release can supersede an accepted acquire
+        // commit, so completing the first accepted record alone is not enough:
+        // its terminal callback can dispatch the actual VTRelease commit.
         backend.core_driver_vt_releases_for_tests += 1;
-        let mut commits = Vec::with_capacity(devices.len());
-        for device in devices.iter().copied() {
-            let accepted_label = format!("{label}: accept release commit on {device}");
+        let handoff_deadline = Instant::now() + Duration::from_secs(1);
+        let is_settled =
+            |backend: &super::KmsBackend| {
+                backend.vt_state == crate::vt::state::VtState::Suspended
+                    && devices.iter().all(|device| {
+                        backend.platform.transport_gate(device).is_some_and(|gate| {
+                            gate.state() == crate::kms::render::resources::TransportState::Owner
+                        }) && backend.platform.owner_ref(*device).is_some_and(|owner| {
+                            !owner.is_poisoned() && owner.live_record().is_none()
+                        }) && backend
+                            .lifecycle_coordinator
+                            .device(device)
+                            .is_none_or(|arbiter| arbiter.transition().is_none())
+                    })
+            };
+        loop {
+            if is_settled(backend) {
+                break;
+            }
+
+            let mut completed_record = false;
+            for device in devices.iter().copied() {
+                let Some(commit) = backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.live_record())
+                    .map(|record| record.commit_id())
+                else {
+                    continue;
+                };
+                let completion_label =
+                    format!("{label}: synthetic kernel completion on {device} for {commit:?}");
+                c0_3bi_complete_owner_commit_through_core_driver(
+                    backend,
+                    device,
+                    commit,
+                    &completion_label,
+                );
+                completed_record = true;
+            }
+            if completed_record || is_settled(backend) {
+                continue;
+            }
+
+            let remaining = handoff_deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "release hand-off did not settle within the test bound; devices={:?}",
+                devices
+                    .iter()
+                    .map(|device| {
+                        (
+                            device,
+                            backend
+                                .platform
+                                .transport_gate(device)
+                                .map(|gate| gate.state()),
+                            backend.lifecycle_coordinator.device(device).map(|arbiter| {
+                                (
+                                    arbiter.state(),
+                                    arbiter.transition(),
+                                    arbiter.desired().seat_target(),
+                                )
+                            }),
+                            backend
+                                .platform
+                                .owner_ref(*device)
+                                .and_then(|owner| owner.live_record())
+                                .map(|record| (record.commit_id(), record.milestones())),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
             c0_3bi_core_driver_until_with_state(
                 backend,
                 state,
-                &accepted_label,
-                Duration::from_secs(3),
+                &format!("{label}: wait for the next release transaction"),
+                remaining,
                 &|backend| {
-                    backend
-                        .platform
-                        .owner_ref(device)
-                        .and_then(|owner| owner.live_record())
-                        .is_some_and(|record| record.milestones().accepted)
+                    is_settled(backend)
+                        || devices.iter().any(|device| {
+                            backend
+                                .platform
+                                .owner_ref(*device)
+                                .and_then(|owner| owner.live_record())
+                                .is_some()
+                        })
                 },
                 None,
             )
-            .expect("release commit reaches accepted state through core entries");
-            let commit = backend
-                .platform
-                .owner_ref(device)
-                .and_then(|owner| owner.live_record())
-                .expect("accepted release commit remains live")
-                .commit_id();
-            commits.push((device, commit));
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
         }
-        for (device, commit) in commits {
-            let completion_label = format!("{label}: synthetic kernel completion on {device}");
-            c0_3bi_complete_owner_commit_through_core_driver(
-                backend,
-                device,
-                commit,
-                &completion_label,
-            );
-        }
-        let suspended_label = format!("{label}: release hand-off");
-        c0_3bi_core_driver_until_with_state(
-            backend,
-            state,
-            &suspended_label,
-            Duration::from_secs(1),
-            &|backend| backend.vt_state == crate::vt::state::VtState::Suspended,
-            None,
-        )
-        .unwrap_or_else(|error| {
-            let devices = devices
-                .iter()
-                .map(|device| {
-                    (
-                        device,
-                        backend.lifecycle_coordinator.device(device).map(|arbiter| {
-                            (
-                                arbiter.state(),
-                                arbiter.transition(),
-                                arbiter.desired().seat_target(),
-                            )
-                        }),
-                        backend
-                            .platform
-                            .owner_ref(*device)
-                            .and_then(|owner| owner.live_record())
-                            .map(|record| (record.commit_id(), record.milestones())),
-                        backend.owner_dpms_installed_active.get(device).copied(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            panic!("release reaches Suspended through core entries: {error}; devices={devices:?}")
-        });
         for device in devices {
             assert!(
                 backend
@@ -98991,6 +99353,14 @@ mod tests {
                     .owner_ref(*device)
                     .is_some_and(|owner| !owner.is_poisoned()),
                 "known release completion keeps the Owner incarnation healthy"
+            );
+            assert_eq!(
+                backend
+                    .platform
+                    .transport_gate(device)
+                    .map(|gate| gate.state()),
+                Some(crate::kms::render::resources::TransportState::Owner),
+                "a successfully released Owner remains available for the next acquire"
             );
         }
     }
