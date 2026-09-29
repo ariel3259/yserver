@@ -15,6 +15,7 @@ pub(crate) mod composed_commit;
 pub(crate) mod composite_pool_ring;
 pub(crate) mod copied_owner;
 pub(crate) mod cursor;
+pub(crate) mod cursor_save;
 pub(crate) mod descriptor_pool_ring;
 pub(crate) mod direct_owner;
 pub(crate) mod engine;
@@ -29,6 +30,7 @@ pub(crate) mod owner_buffer;
 mod part3_tests;
 #[doc(hidden)]
 pub mod platform;
+pub(crate) mod pointer_confine;
 pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
 pub(crate) mod probe_executor;
@@ -45,6 +47,7 @@ pub(crate) mod submit_group;
 pub(crate) mod submit_trace;
 pub(crate) mod target;
 pub(crate) mod telemetry;
+pub(crate) mod transform_intermediate;
 pub(crate) mod unflip_owner;
 pub(crate) mod upload_arena;
 
