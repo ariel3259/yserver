@@ -105309,6 +105309,13 @@ mod tests {
             !backend.platform.connector_prober_is_scripted_for_tests(),
             "the hardware route uses DrmConnectorProber on the duplicated master fd"
         );
+        // The test constructor leaves the monitor unset; the hardware route
+        // needs the production udev monitor that the real platform opens.
+        backend.platform.hotplug_monitor = Some(
+            crate::kms::hotplug::DrmHotplugMonitor::new()
+                .expect("open the production udev monitor")
+                .expect("udev monitor available on this host"),
+        );
         assert!(
             Backend::poll_fds(backend)
                 .iter()
