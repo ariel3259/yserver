@@ -1642,7 +1642,7 @@ pub fn run_core(
                                 // Process-lifetime bookkeeping: maintain
                                 // `InputInventory` regardless of
                                 // generation (it always dispatches, see
-                                // above) so a device add/remove is never
+                                // above) so a device lifecycle transition is never
                                 // missed, even mid-reset once resets
                                 // exist. Nothing consumes the inventory
                                 // yet — purely additive.
@@ -1650,8 +1650,14 @@ pub fn run_core(
                                     HostInputEvent::DeviceAdded(info) => {
                                         input_inventory.add(info.clone());
                                     }
-                                    HostInputEvent::DeviceRemoved { device_node } => {
-                                        input_inventory.remove(device_node);
+                                    HostInputEvent::DeviceSuspended { source_id, .. } => {
+                                        input_inventory.suspend(*source_id);
+                                    }
+                                    HostInputEvent::DeviceResumed(info) => {
+                                        input_inventory.resume(info.clone());
+                                    }
+                                    HostInputEvent::DeviceRemoved { source_id, .. } => {
+                                        input_inventory.remove(*source_id);
                                     }
                                     _ => {}
                                 }
@@ -5129,6 +5135,7 @@ mod tests {
 
         let key = |keycode: u8, pressed: bool| {
             HostInputEvent::Key(HostKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed,
                 keycode,
                 time: 0,
@@ -5188,6 +5195,7 @@ mod tests {
             &mut state,
             &mut backend,
             HostInputEvent::Key(HostKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed: true,
                 keycode: 38,
                 time: 0,
@@ -5235,6 +5243,7 @@ mod tests {
             &mut state,
             &mut backend,
             HostInputEvent::Key(HostKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed: true,
                 keycode: 38,
                 time: 0,
@@ -5284,6 +5293,8 @@ mod tests {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
         crate::core_loop::DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,

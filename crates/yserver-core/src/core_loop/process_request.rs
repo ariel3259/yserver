@@ -10579,6 +10579,7 @@ fn dispatch_fake_input_with_body(
                 backend.on_host_input(
                     state,
                     HostInputEvent::Key(HostKeyEvent {
+                        origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_KEYBOARD),
                         pressed,
                         keycode: fi.detail,
                         time: fi.time,
@@ -10601,7 +10602,7 @@ fn dispatch_fake_input_with_body(
                     },
                     ..fi
                 };
-                dispatch_fake_input_with_body(state, backend, fake, &[]);
+                dispatch_fake_input_with_body(state, backend, fake, body);
             }
             crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET => {
                 // Device-motion fakes are DEVICE-coordinate space and
@@ -10667,7 +10668,7 @@ fn dispatch_fake_input_with_body(
                 let _ = crate::core_loop::pointer_fanout::xi1_route_device_event(
                     state,
                     crate::server::Xi1QueuedEvent {
-                        deviceid: crate::xinput::DEVICEID_SLAVE_POINTER,
+                        deviceid: fake_input_device_id(body, crate::xinput::DEVICEID_SLAVE_POINTER),
                         evcode: crate::server::XI_FIRST_EVENT
                             + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET,
                         detail: 0,
@@ -10701,6 +10702,7 @@ fn dispatch_fake_input_with_body(
             backend.on_host_input(
                 state,
                 HostInputEvent::Key(HostKeyEvent {
+                    origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_KEYBOARD),
                     pressed,
                     keycode: fi.detail,
                     time: fi.time,
@@ -10737,6 +10739,7 @@ fn dispatch_fake_input_with_body(
             backend.on_host_input(
                 state,
                 HostInputEvent::PointerButton {
+                    origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_POINTER),
                     button: linux_code,
                     pressed,
                     time: fi.time,
@@ -10752,23 +10755,27 @@ fn dispatch_fake_input_with_body(
             // raw relative motion, so XI2 RawMotion reports it.
             let motion = if fi.detail == 0 {
                 HostInputEvent::PointerMotion {
+                    origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_POINTER),
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
                     time: fi.time,
                     relative: false,
                     dx: 0,
                     dy: 0,
+                    motion_delta: None,
                 }
             } else {
                 let (x, y) = state.pointer_root;
                 let (dx, dy) = (i32::from(fi.root_x), i32::from(fi.root_y));
                 HostInputEvent::PointerMotion {
+                    origin: fake_input_origin(body, crate::xinput::DEVICEID_SLAVE_POINTER),
                     x: i32::from(x) + dx,
                     y: i32::from(y) + dy,
                     time: fi.time,
                     relative: true,
                     dx,
                     dy,
+                    motion_delta: None,
                 }
             };
             backend.on_host_input(state, motion);
@@ -10780,6 +10787,18 @@ fn dispatch_fake_input_with_body(
             log::debug!("XTEST FakeInput: unknown event type {other}, dropping");
         }
     }
+}
+
+fn fake_input_origin(body: &[u8], default_device: u16) -> crate::core_loop::InputOrigin {
+    crate::core_loop::InputOrigin::XTest(fake_input_device_id(body, default_device))
+}
+
+fn fake_input_device_id(body: &[u8], default_device: u16) -> u16 {
+    body.first()
+        .copied()
+        .filter(|event_type| event_type & 0x7f >= crate::server::XI_FIRST_EVENT)
+        .and_then(|_| body.get(31).copied())
+        .map_or(default_device, u16::from)
 }
 
 /// Apply a DPMS level transition. Updates `state.dpms.power_level`
@@ -44418,6 +44437,8 @@ mod tests {
         // A legacy touchpad add must not repurpose virtual device 4.
         let touchpad_info = crate::core_loop::DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -45555,6 +45576,8 @@ mod tests {
     fn seed_touchpad_for_t3(state: &mut ServerState) -> u16 {
         let info = crate::core_loop::DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -61938,6 +61961,7 @@ mod tests {
         state.sync_pending.push_back(PendingSyncEvent {
             device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
             event: QueuedInputEvent::HostKey(HostKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed: false,
                 keycode: 38,
                 time: 0x1000,
@@ -63303,6 +63327,7 @@ mod tests {
         const APP: u32 = 9;
         const WM: u32 = 7;
         let key_event = |pressed: bool, keycode: u8| HostKeyEvent {
+            origin: crate::core_loop::InputOrigin::NestedHost,
             pressed,
             keycode,
             time: 1,
@@ -63687,6 +63712,7 @@ mod tests {
                 .or_default();
             f.state = crate::server::Xi1SyncState::FrozenWithEvent;
             f.stored = Some(crate::server::QueuedInputEvent::HostKey(HostKeyEvent {
+                origin: crate::core_loop::InputOrigin::NestedHost,
                 pressed: true,
                 keycode: 33,
                 time: 0x1234,
@@ -63787,6 +63813,7 @@ mod tests {
         });
 
         let key = |pressed, keycode| HostKeyEvent {
+            origin: crate::core_loop::InputOrigin::NestedHost,
             pressed,
             keycode,
             time: 1,
@@ -63889,6 +63916,7 @@ mod tests {
                 .push_back(crate::server::PendingSyncEvent {
                     device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
                     event: crate::server::QueuedInputEvent::HostKey(HostKeyEvent {
+                        origin: crate::core_loop::InputOrigin::NestedHost,
                         pressed: true,
                         keycode: 38,
                         time: 0x2222,

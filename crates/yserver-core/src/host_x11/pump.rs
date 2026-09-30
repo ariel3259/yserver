@@ -126,6 +126,7 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
     let event_type = event[0] & 0x7f;
     match event_type {
         2 | 3 => Some(HostEvent::Key(HostKeyEvent {
+            origin: crate::core_loop::message::InputOrigin::NestedHost,
             pressed: event_type == 2,
             keycode: event[1],
             time: read_u32(&event[4..8]),
@@ -292,6 +293,7 @@ pub struct HostPointerEvent {
 
 #[derive(Clone, Copy, Debug)]
 pub struct HostKeyEvent {
+    pub origin: crate::core_loop::message::InputOrigin,
     pub pressed: bool,
     pub keycode: u8,
     pub time: u32,

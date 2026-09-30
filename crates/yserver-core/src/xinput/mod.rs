@@ -1456,6 +1456,8 @@ mod tests {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
         DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -1492,6 +1494,8 @@ mod tests {
         use crate::core_loop::message::LibinputConfigSnapshot;
         DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -1544,6 +1548,8 @@ mod tests {
         };
         DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -1899,6 +1905,8 @@ mod tests {
         };
         let phantom = DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -2037,6 +2045,8 @@ mod tests {
         let float_atom = atoms.intern("FLOAT", false);
         let info = DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -2122,6 +2132,8 @@ mod tests {
         };
         let info = DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -2170,6 +2182,8 @@ mod tests {
         };
         let info = DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
@@ -2221,6 +2235,8 @@ mod tests {
         };
         let info = DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,

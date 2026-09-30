@@ -33,15 +33,23 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-09-30 dynamic XI device registry, Tasks 1–2 staged (branch
+- **2026-09-30 dynamic XI device registry, Tasks 1–3 staged (branch
   `feat/xi-dynamic-registry-implementation`):** `XiRegistry` now owns the
   live XI device vector plus `InputSourceId` metadata and atomic lowest-free
   keyboard/pointer facet allocation in IDs 6..=127. `DeviceInfo` carries
   source identity and independent keyboard/pointer/touch capability bits.
   The libinput producer now allocates attachment IDs against `input::Device`
   handle identity and tags physical `InputEvent`s; unknown/removed handles
-  are dropped without matching by node. Task 3 still needs to carry those IDs
-  through `HostInputEvent` and the inventory. Server startup
+  are dropped without matching by node. Task 3 now carries source IDs through
+  `HostInputEvent`, coalesces motion by origin/mode with fractional physical
+  deltas, keeps wheel fractions by source, and keys the process-lifetime
+  inventory by source. VT suspend/resume retains disabled facts and recognized
+  settings, proves continuation only by canonical sysfs endpoint-instance
+  paths within one token-checked 2500 ms window, and expires unmatched sources
+  before forwarding late dispatch input. Pause/resume commands use a FIFO
+  queue. Task 6 facet enable/disable and driver-property refresh, Task 8
+  config completion, Task 11 coordinate authority, and Task 14 guarded
+  per-source held-state releases remain later work. Server startup
   seeds virtual devices 4/5 with the XTEST pointer/keyboard names and
   `XTEST Device` INTEGER/8 value 1; writes and direct
   deletes of that marker are guarded by atom identity even after a

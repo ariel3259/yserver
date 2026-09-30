@@ -12919,6 +12919,7 @@ impl KmsBackend {
                 xkbcommon::xkb::KeyDirection::Up,
             );
             let ev = HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 pressed: false,
                 keycode,
                 time: crate::clock::server_time_ms(),
@@ -20852,21 +20853,19 @@ impl Backend for KmsBackend {
             HostInputEvent::PointerMotion {
                 x,
                 y,
-                time: _,
                 relative,
                 dx,
                 dy,
+                ..
             } => {
                 self.process_pointer_absolute(state, x as f32, y as f32, relative, dx, dy);
             }
             HostInputEvent::PointerButton {
-                button,
-                pressed,
-                time: _,
+                button, pressed, ..
             } => {
                 self.process_pointer_button(u32::from(button), pressed, state);
             }
-            HostInputEvent::PointerScrollStop { time: _ } => {
+            HostInputEvent::PointerScrollStop { .. } => {
                 // Fingers lifted from a two-finger scroll. Emit a delta-0 XI2
                 // scroll motion (→ GDK `scroll.is_stop`) so Firefox's
                 // SwipeTracker commits a horizontal history-swipe (bug
@@ -20976,8 +20975,43 @@ impl Backend for KmsBackend {
                     );
                 return;
             }
-            HostInputEvent::DeviceRemoved { device_node } => {
-                log::info!("xi-device: removed node={device_node}");
+            HostInputEvent::DeviceResumed(info) => {
+                log::info!(
+                    "xi-device: resumed {:?} node={} touchpad={}",
+                    info.name,
+                    info.device_node,
+                    info.is_touchpad,
+                );
+                state.xi_seed_touchpad(&info);
+                let _dropped =
+                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
+                        state, 137,
+                    );
+                return;
+            }
+            HostInputEvent::DeviceSuspended {
+                source_id,
+                device_node,
+            } => {
+                log::info!(
+                    "xi-device: suspended source={} node={device_node}",
+                    source_id.0
+                );
+                state.xi_clear_touchpad(&device_node);
+                let _dropped =
+                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
+                        state, 137,
+                    );
+                return;
+            }
+            HostInputEvent::DeviceRemoved {
+                source_id,
+                device_node,
+            } => {
+                log::info!(
+                    "xi-device: removed source={} node={device_node}",
+                    source_id.0
+                );
                 state.xi_clear_touchpad(&device_node);
                 let _dropped =
                     yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
@@ -22242,21 +22276,6 @@ impl Backend for KmsBackend {
         log::info!("kms: VT acquire — resumed; resume input");
         self.resume_input_thread();
 
-        // Xorg VT-enter resync: forget all held keys/modifiers. Keys held
-        // across the switch (e.g. the Ctrl+Alt of the switch combo) were
-        // released while we weren't reading, so xkb_state would keep them
-        // depressed and stamp every subsequent key with stale modifiers
-        // ("can't type at the greeter after a switch"). Rebuild a fresh
-        // state from the keymap; new key events repopulate it cleanly.
-        // The before-mask log proves whether the latch was actually stuck.
-        let mods_before = self.serialize_modifiers();
-        self.core.down_keys.clear();
-        self.core.xkb_state =
-            crate::kms::core::XkbState(xkbcommon::xkb::State::new(&self.core.xkb_keymap.0));
-        log::info!(
-            "kms: VT acquire — xkb resync: modifiers were 0x{mods_before:04x}, now 0x{:04x}",
-            self.serialize_modifiers()
-        );
         log::info!("kms: VT acquire — done");
     }
 
@@ -29622,12 +29641,14 @@ impl Backend for KmsBackend {
         self.on_host_input(
             state,
             yserver_core::core_loop::HostInputEvent::PointerMotion {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 x,
                 y,
                 time: 0,
                 relative: false,
                 dx: 0,
                 dy: 0,
+                motion_delta: None,
             },
         );
         // Resync the direct-mode input thread's cursor accumulator to the
@@ -39238,6 +39259,7 @@ mod tests {
         b.core.cursor_x = 100.0;
         b.core.cursor_y = 200.0;
         let key = |keycode: u8, pressed: bool| HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode,
             pressed,
             state: 0,
@@ -39312,6 +39334,7 @@ mod tests {
 
         let key = |keycode, pressed| {
             HostInputEvent::Key(HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 keycode,
                 pressed,
                 state: 0,
@@ -39369,6 +39392,7 @@ mod tests {
         let mut state = ServerState::new();
         let key = |keycode, pressed| {
             HostInputEvent::Key(HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 keycode,
                 pressed,
                 state: 0,
@@ -39453,6 +39477,7 @@ mod tests {
             .insert((ROOT_WINDOW, 3), (1 << 2) | (1 << 3));
         let key = |pressed| {
             HostInputEvent::Key(HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 keycode: 71, // F5, as in the report
                 pressed,
                 state: 0,
@@ -39514,6 +39539,7 @@ mod tests {
             .insert((ROOT_WINDOW, 3), (1 << 2) | (1 << 3));
         let key = |keycode, pressed| {
             HostInputEvent::Key(HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 keycode,
                 pressed,
                 state: 0,
@@ -39579,6 +39605,7 @@ mod tests {
             .xi2_masks
             .insert((ROOT_WINDOW, 3), (1 << 2) | (1 << 3));
         let ev = |pressed| HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode: 38,
             pressed,
             state: 0,
@@ -39623,6 +39650,7 @@ mod tests {
         kbd_map_request(&mut state, &mut b, 154, 1, &create);
         kbd_map_request(&mut state, &mut b, 154, 5, &1u32.to_le_bytes());
         let ev = |pressed| HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode: 38,
             pressed,
             state: 0,
@@ -39726,6 +39754,7 @@ mod tests {
         assert_eq!(b.core.locked_group, 0, "fresh state is on group 0");
 
         let key = |keycode, pressed| HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode,
             pressed,
             state: 0,
@@ -39770,6 +39799,7 @@ mod tests {
         assert_eq!(b.current_led_bits(), 0, "fresh state: all lock LEDs off");
         // 66 == X keycode for Caps Lock (evdev KEY_CAPSLOCK 58 + 8).
         let key = |pressed| HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode: 66,
             pressed,
             state: 0,
@@ -39794,6 +39824,7 @@ mod tests {
     fn caps_key(pressed: bool) -> yserver_core::host_x11::HostKeyEvent {
         // 66 == X keycode for Caps Lock (evdev KEY_CAPSLOCK 58 + 8).
         yserver_core::host_x11::HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode: 66,
             pressed,
             state: 0,
@@ -40000,6 +40031,7 @@ mod tests {
         // 50 == evdev KEY_LEFTSHIFT — proven to flip a modifier bit in
         // the test keymap by `cook_host_key_fills_coords_and_modifier_state`.
         let raw = HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode: 50,
             pressed: true,
             state: 0,
@@ -40268,12 +40300,14 @@ mod tests {
         b.on_host_input(
             &mut state,
             HostInputEvent::PointerMotion {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 x: 110,
                 y: 50,
                 time: 0,
                 relative: false,
                 dx: 0,
                 dy: 0,
+                motion_delta: None,
             },
         );
 
@@ -40492,12 +40526,14 @@ mod tests {
         b.on_host_input(
             &mut state,
             HostInputEvent::PointerMotion {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 x: 10,
                 y: 20,
                 time: 0,
                 relative: false,
                 dx: 0,
                 dy: 0,
+                motion_delta: None,
             },
         );
         assert!(
@@ -47509,6 +47545,7 @@ mod tests {
         let mut state = ServerState::new();
 
         let raw_press = HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode: 38, // evdev 'a' (US layout)
             pressed: true,
             state: 0,
@@ -47526,6 +47563,7 @@ mod tests {
         assert_eq!(b.core.down_keys.len(), 1);
 
         let raw_release = HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode: 38,
             pressed: false,
             state: 0,
@@ -52409,6 +52447,7 @@ mod tests {
                 let _ = self
                     .backend
                     .cook_host_key(yserver_core::host_x11::HostKeyEvent {
+                        origin: yserver_core::core_loop::InputOrigin::NestedHost,
                         keycode,
                         pressed,
                         state: 0,
@@ -52630,6 +52669,7 @@ mod tests {
     fn xkbcomp_compat_upload_reaches_leds_and_cooking() {
         use yserver_core::host_x11::HostKeyEvent;
         let key = |keycode: u8, pressed: bool| HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode,
             pressed,
             state: 0,
@@ -52845,6 +52885,7 @@ mod tests {
     fn xkbcomp_set_map_reaches_key_cooking() {
         use yserver_core::host_x11::HostKeyEvent;
         let key = |keycode: u8, pressed: bool| HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode,
             pressed,
             state: 0,
@@ -52914,6 +52955,7 @@ mod tests {
         );
         let _ = kbd_map_drain(&mut peer);
         let key = |keycode: u8, pressed: bool| HostKeyEvent {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             keycode,
             pressed,
             state: 0,
@@ -53203,6 +53245,7 @@ mod tests {
             state,
             yserver_core::core_loop::message::HostInputEvent::Key(
                 yserver_core::host_x11::HostKeyEvent {
+                    origin: yserver_core::core_loop::InputOrigin::NestedHost,
                     keycode: kc,
                     pressed,
                     state: 0,
@@ -53519,6 +53562,7 @@ mod tests {
             }
             let _ = kbd_map_drain(&mut peer);
             let key = |keycode: u8, pressed: bool| HostKeyEvent {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 keycode,
                 pressed,
                 state: 0,
@@ -53886,6 +53930,8 @@ mod tests {
         let root_cursor = b.effective_cursor_xid;
 
         let motion = |x: i32, y: i32| HostInputEvent::PointerMotion {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
+            motion_delta: None,
             x,
             y,
             time: 0,
@@ -53906,6 +53952,7 @@ mod tests {
         b.on_host_input(
             &mut state,
             HostInputEvent::PointerButton {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 button: 0x110,
                 pressed: true,
                 time: 0,
@@ -53932,6 +53979,7 @@ mod tests {
         b.on_host_input(
             &mut state,
             HostInputEvent::PointerButton {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
                 button: 0x110,
                 pressed: false,
                 time: 0,
@@ -53992,6 +54040,8 @@ mod tests {
         b.core.cursor_y = 150.0;
         b.windows_restructured(&mut state);
         let motion = |x: i32, y: i32| HostInputEvent::PointerMotion {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
+            motion_delta: None,
             x,
             y,
             time: 0,

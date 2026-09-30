@@ -412,7 +412,7 @@ pub(crate) fn reset_generation(
     // The inventory loop remains for the legacy seed hook, which now leaves
     // virtual XTEST devices untouched. Rebuilding physical facets and their
     // property atoms belongs to the later registry reset migration.
-    for info in inventory.devices_by_node() {
+    for info in inventory.devices_by_source() {
         fresh.xi_seed_touchpad(info);
     }
     *state = fresh;
@@ -865,6 +865,8 @@ mod tests {
     fn touchpad(node: &str, name: &str) -> DeviceInfo {
         DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
             capabilities: crate::xinput::InputCapabilities {
                 keyboard: false,
                 pointer: true,
