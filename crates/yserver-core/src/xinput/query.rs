@@ -60,7 +60,7 @@ pub(crate) fn encode_reply(
     let num_devices = u16::try_from(devices.len())
         .map_err(|_| Error::new(ErrorKind::InvalidData, "too many XI devices"))?;
     let reply_length = u32::from(x11::checked_units(infos.len())?);
-    let mut reply = x11::fixed_reply(byte_order, sequence, 0, reply_length);
+    let mut reply = x11::fixed_reply(byte_order, sequence, 48, reply_length);
     x11::write_u16(byte_order, &mut reply, num_devices);
     reply.extend_from_slice(&[0; 22]);
     reply.extend_from_slice(&infos);
