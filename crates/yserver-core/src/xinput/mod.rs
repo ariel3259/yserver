@@ -12,8 +12,10 @@ use yserver_protocol::x11::{AtomId, ClientByteOrder, SequenceNumber};
 use crate::core_loop::DeviceInfo;
 
 pub mod libinput_props;
+pub mod query;
 pub mod registry;
 
+pub use query::XiQueryError;
 pub use registry::{InputCapabilities, InputSourceId, XiFacetKind, XiRegistry};
 
 // ---------------------------------------------------------------------------
@@ -114,6 +116,8 @@ pub struct XiProperty {
 pub struct XiDevice {
     pub id: u16,
     pub name: String,
+    /// Whether the device is currently enabled and can receive input.
+    pub enabled: bool,
     /// Physical source owning this facet; virtual and master devices have none.
     pub source_id: Option<InputSourceId>,
     /// Physical capability represented by this facet.
@@ -141,6 +145,7 @@ impl XiDevice {
         Self {
             id,
             name: name.to_owned(),
+            enabled: true,
             source_id: None,
             facet: None,
             attached_master: match id {
@@ -162,6 +167,7 @@ impl XiDevice {
         Self {
             id,
             name: info.name.clone(),
+            enabled: info.enabled,
             source_id: Some(info.source_id),
             facet: Some(facet),
             attached_master: Some(attached_master),

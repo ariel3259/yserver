@@ -13,7 +13,7 @@ use crate::core_loop::DeviceInfo;
 
 use super::{
     DEVICEID_MASTER_KEYBOARD, DEVICEID_MASTER_POINTER, DEVICEID_SLAVE_KEYBOARD,
-    DEVICEID_SLAVE_POINTER, XiDevice,
+    DEVICEID_SLAVE_POINTER, XiDevice, XiQueryError,
 };
 
 const FIRST_PHYSICAL_DEVICE_ID: u16 = 6;
@@ -89,6 +89,11 @@ impl XiRegistry {
                     .get_mut(&info.source_id)
                     .expect("source record observed above")
                     .info = info.clone();
+                for id in &ids {
+                    if let Some(device) = self.device_mut(*id) {
+                        device.enabled = info.enabled;
+                    }
+                }
                 return ids;
             }
             // A prior registration may have retained metadata without facets
@@ -154,6 +159,31 @@ impl XiRegistry {
         self.devices
             .iter_mut()
             .find(|device| device.id == device_id)
+    }
+
+    /// Select live devices using the XI2 `XIQueryDevice` selectors.
+    ///
+    /// `XIAllDevices` (0) returns every live device, `XIAllMasterDevices`
+    /// (1) returns the paired masters, and any other value selects one exact
+    /// live ID. Removed and otherwise unknown IDs report `BadDevice`.
+    pub fn query(&self, device_id: u16) -> Result<Vec<&XiDevice>, XiQueryError> {
+        match device_id {
+            0 => Ok(self.devices.iter().collect()),
+            1 => Ok(self
+                .devices
+                .iter()
+                .filter(|device| {
+                    matches!(
+                        device.id,
+                        DEVICEID_MASTER_POINTER | DEVICEID_MASTER_KEYBOARD
+                    )
+                })
+                .collect()),
+            id => self
+                .device(id)
+                .map(|device| vec![device])
+                .ok_or(XiQueryError::BadDevice(id)),
+        }
     }
 
     #[must_use]

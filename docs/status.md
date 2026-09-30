@@ -33,7 +33,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-09-30 dynamic XI device registry, Tasks 1–3 staged (branch
+- **2026-09-30 dynamic XI device registry, Tasks 1–4 staged (branch
   `feat/xi-dynamic-registry-implementation`):** `XiRegistry` now owns the
   live XI device vector plus `InputSourceId` metadata and atomic lowest-free
   keyboard/pointer facet allocation in IDs 6..=127. `DeviceInfo` carries
@@ -53,13 +53,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   seeds virtual devices 4/5 with the XTEST pointer/keyboard names and
   `XTEST Device` INTEGER/8 value 1; writes and direct
   deletes of that marker are guarded by atom identity even after a
-  GetProperty(delete) unlink. Existing query, source routing, and hotplug
-  publication remain fixed-topology work for later tasks, so this stage does
-  **not** fix the physical-mouse enumeration/configuration issue. The current
-  GDK query comment in `core_loop/process_request.rs` still expects device 4
-  to be the first generic attached pointer; revisit that compatibility point
-  when XI1/XI2 query behavior migrates. Behavioral tests were not added or
-  run under the current authorization constraint.
+  GetProperty(delete) unlink. Task 4 makes XI2 `XIQueryDevice` select from
+  the registry for XIAllDevices, XIAllMasterDevices, and exact live IDs,
+  reporting BadDevice for unknown IDs and encoding descriptors/classes in
+  the requesting client's byte order. Device 4/5 remain named virtual XTEST
+  pointer/keyboard devices; the shared generic pointer class shape remains
+  for GDK compatibility without assigning physical ownership to 4. XI1
+  `XListInputDevices`, production physical add/remove publication and driver
+  property seeding remain later work, so physical sources are not yet
+  published by production. Behavioral tests were not added or run under the
+  current authorization constraint.
 
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
