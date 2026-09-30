@@ -10798,7 +10798,8 @@ fn fake_input_device_id(body: &[u8], default_device: u16) -> u16 {
         .copied()
         .filter(|event_type| event_type & 0x7f >= crate::server::XI_FIRST_EVENT)
         .and_then(|_| body.get(31).copied())
-        .map_or(default_device, u16::from)
+        // XI1 reserves the top device-byte bit for MORE_EVENTS.
+        .map_or(default_device, |device_id| u16::from(device_id & 0x7f))
 }
 
 /// Apply a DPMS level transition. Updates `state.dpms.power_level`
