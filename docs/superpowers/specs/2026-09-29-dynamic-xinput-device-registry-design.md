@@ -1,6 +1,8 @@
 # Dynamic XInput device registry for KMS input
 
-**Status:** design for user review, 2026-09-29.  **Branch:** `feat/xi-dynamic-registry`.
+**Status:** approved design, 2026-09-29.  **Branch:** `feat/xi-dynamic-registry`.
+
+**Implementation:** authorized by the user on 2026-09-30. Further Opus reviews are canceled. Local reset/VT questions are settled by the concrete contracts in keyboard/pointer Tasks 3 and 18; task implementation/review proceeds with the previously chosen workers. The interrupted round-4 record remains historical, without a convergence verdict.
 
 ## Purpose and observed failure
 
@@ -43,25 +45,32 @@ every eligible mouse function, including newly connected devices.
   uses XI1 `DevicePresenceNotify` to reapply settings after hotplug. XI2-only
   registration is insufficient.
 
-This scope is the direct KMS/libinput backend. Nested and synthetic input
-retain their existing behavior unless they have a distinct host source that
-can be represented by the same registry interface.
+This scope is the direct KMS/libinput backend. Nested host input retains
+master/core delivery and produces master XI device/raw forms with
+`deviceid=sourceid=2` for pointer and `3` for keyboard, without a physical
+slave form. XTEST retains its virtual or explicitly requested XI device
+identity; nested input is never attributed to XTEST.
 
 ## Model and ownership
 
-The input backend assigns a monotonic `SourceId` to every libinput
-`DeviceAdded` instance. `SourceId` is internal and lives only for that
-attachment, including its removal event. The evdev node is a descriptive
-property and a fallback diagnostic key, not the runtime identity; `eventN`
-can change after reconnection. The libinput group is optional physical
-correlation metadata, never a key for XI routing or a reason to merge event
+The input backend assigns a monotonic `SourceId` to each new physical
+endpoint attachment. `SourceId` is internal and lives through that
+attachment's removal. Libinput handle identity binds ordinary events to
+the source; evdev node is descriptive metadata, not the runtime identity,
+and `eventN` can change or be reused after reconnection. An explicit VT
+suspend/resume pair may rebind a new libinput handle to the existing source
+only after proving the same kernel endpoint instance, as described below.
+Every ordinary physical remove/add creates a new source. The libinput group
+is optional physical correlation metadata, never a key for XI routing or a reason to merge event
 nodes. Vendor/product and name are metadata, not device selectors.
 
 The central registry owns:
 
 - `SourceId -> SourceRecord`: live capability set, group metadata if
-  available, evdev node, name, vendor/product, libinput configuration
-  snapshot, and the XI facet IDs created from that source.
+  available, evdev node, name, vendor/product, enabled/suspended state,
+  current confirmed libinput configuration snapshot, and the XI facet IDs
+  created from that source. A bounded VT continuation key is metadata used
+  only while pairing one explicit suspend with its resume.
 - `XiId -> XiDevice`: role, attached master, source/facet reference for
   physical slaves, classes, enabled state, and independent property map.
 - `SourceId + facet -> XiId`: event attribution and property routing.
@@ -105,25 +114,95 @@ Every translated keyboard, pointer, scroll, and touch event carries its
 facet; core keyboard/pointer delivery continues through masters 3/2.
 XI2 device and raw events use the actual physical facet as their source,
 with Xorg-compatible `deviceid`/`sourceid` fields and selection behavior.
-XTEST events use 4/5. Unknown or already removed source IDs are dropped;
+XTEST defaults to its virtual slaves 4/5; a valid explicit XI device target
+retains that target, as in Xorg. Nested host input keeps master/core delivery
+without being labeled as XTEST. Unknown or already removed source IDs are dropped;
 known sources without an allocated facet retain core/master delivery where
-core delivery exists, but have no physical XI source event. They must never
-be attributed to another device. Touch begin/update/end preserve contact
+core delivery exists, with master-only XI device/raw forms using
+`deviceid=sourceid=2` or `3`, but no physical slave form. Unknown, removed,
+or suspended physical input is rejected before cursor, XKB, held state,
+recording or fanout can change. It must never be attributed to another
+device. Touch begin/update/end preserve contact
 IDs for the lifetime of each contact. Removing a source
 releases held keys/buttons and active contacts through the existing
 master/focus paths before the facets disappear.
 
-At `DeviceRemoved`, remove all facets for that `SourceId` atomically, drop
-their properties and live backend handle, then publish the new hierarchy.
-Suspend/resume and server reset rebuild the registry from the live input
-inventory without retaining stale source bindings. A libinput remove/add
-sequence is a new source instance even if name, group, or evdev node match.
+Held state belongs to each XI slave, including XTEST and explicit XTEST
+targets; unpublished physical sources retain equivalent internal state.
+Slave duplicate guards are separate from master guards. Master button
+release is suppressed while another attached slave holds that mapped
+button. Master key press is suppressed if the key is already down, but the
+first valid attached-slave release releases the master key even if another
+slave still holds it, matching Xorg. Floating slaves do not modify master
+state and floating keyboards have separate XKB state. Master XKB/core
+modifiers change only on accepted master transitions; a slave press whose
+master press is suppressed cannot increment the master's XKB down count.
+KMS integrates
+physical relative motion from accelerated fractional deltas into the
+current master or floating-slave position; an input-thread cursor must not
+feed stale absolute positions back after touch, warp or floating motion.
+
+One guarded cleanup owner drains held keys/buttons and touch contacts
+before disabling a source. Synchronous VT release invokes it before
+yielding the session; later suspend messages are idempotent. Pause/resume
+commands are delivered in FIFO order, including when both arrive within
+one input-thread drain. Drain physical devices only, including injected
+holds targeting those physical facets; enabled masters and virtual XTEST
+4/5 retain their holds. Preserve master locked Caps/Num state and restore
+current locks/LEDs on resumed keyboards without a fresh XKB-state reset.
+There are no origin-less synthetic modifier releases on resume. Clear the
+master's last-slave reference on disable as well as removal. Physical removal then
+removes all facets/properties atomically and publishes Removed after
+Disabled, without allocating their IDs again before publication.
+
+VT suspend preserves source/XI identities, properties, selections and
+current settings, marks inventory facts disabled, and retires libinput
+handle bindings. Resume drains initial enumeration and, on Linux, proves
+continuation by the captured canonical `/sys/class/input/<sysname>` target
+including the kernel `inputN/eventM` instance, never by name, vendor/product,
+group or a reused evdev node. This internal proof is bounded to that one VT
+pair; it adds no user selector. Keep unmatched provable sources disabled
+through a fixed 2500 ms resume retry window and match late opens during
+that window, with the existing 250 ms dispatch retry even after an empty
+initial enumeration. Only deadline expiry removes still-unmatched sources;
+unrelated hotplug cannot extend this continuation deadline. Unprovable
+keys follow safe logged remove/add. A proven continuation first runs normal
+touchpad setup, then restores saved recognized settings on the new handle
+before gathering actual values and enabling the same facets. Failed
+restorations are logged and queries report actual gathered values. Preserve
+ordinary properties and deleted-property absence on continuation; refresh
+only present driver properties. Lifecycle precedes that source's buffered
+input. New writes to suspended sources fail BadMatch in Xorg's validation
+order, without waiting for the global lane. Only backend commands already
+submitted before pause may resolve after rebind or as SourceGone at failed
+continuation. Ended active grabs and contacts are not resurrected.
+
+Server reset replays enabled and suspended sources from the process-lifetime
+inventory with their attachment identity and current confirmed config.
+Before destroying the old clients/facets, a backend input-session reset
+hook retires old held state, repeats, queued input and touch ownership.
+Fresh XI IDs never inherit those maps. New-session XKB/LED state is
+initialized from startup defaults; VT lock preservation does not apply
+to a server-generation reset. Live source identity/configuration and
+in-progress process-level recovery remain intact. A new VT pause preserves
+unmatched recovery facts and invalidates the old timer; expiry is checked
+against the current monotonic window token, and failed resume starts no
+window. These contracts have explicit checks in the implementation plan.
+
+Submitted configuration completions remain process-lifetime and update
+live source facts even if their original client or server generation has
+ended; old atom/sequence metadata cannot leak into the new generation.
 
 Publish XI2 `XI_HierarchyChanged` on physical facet add/remove and
 `XI_DeviceChanged` when an existing device's classes change. Publish XI1
 `DevicePresenceNotify` at `first_event + 15`, with its special
-`0x10000 | _devicePresence` event class and `DeviceEnabled`/`DeviceRemoved`
-transitions, so MATE reapplies settings after hotplug. XI1
+`0x10000 | _devicePresence` event class and Xorg's Added then Enabled,
+Disabled then Removed transitions, so MATE reapplies settings after hotplug. XI2
+publishes the corresponding hierarchy steps with the full live-device list
+and removed descriptors where required. Disabled precedes registry deletion;
+Removed follows it. Before an attached master's source changes, publish
+`XI_DeviceChanged` with reason SlaveSwitch and that source's classes; scroll
+values belong to each source. XI1
 `SelectExtensionEvent` must retain this selection rather than silently
 discard it. Property changes continue to emit XI1
 `DevicePropertyNotify` and XI2 `XI_PropertyEvent` for the affected facet.
@@ -142,15 +221,39 @@ an arbitrary list; its current four-entry layout cannot remain.
 
 `XIListProperties`, `XIGetProperty`, XI1 property requests,
 `xinput list-props`, `XIChangeProperty`, and `XIDeleteProperty` resolve the requested
-XI ID to its own property map. Physical pointer/touch facets expose only
-properties supported by that libinput source, including `Device Node` and
-`Device Product ID`. Keyboard facets do not inherit pointer acceleration
-properties just because the same source also has pointer capability.
+XI ID to its own property map. Every physical facet, including keyboard,
+exposes read-only `Device Node` and `Device Product ID`. Pointer/touch
+facets expose only configuration supported by that source's capability
+snapshot. Seeded driver properties reject direct deletion; defaults,
+availability and metadata descriptors reject writes. GetProperty(delete)
+follows Xorg's separate reply-and-unlink path without checking deletable;
+XI2 Deleted notification requires nonzero returned length, while XI1 sends
+it whenever delete && bytes_after == 0. Recognized write support and
+read-only rules derive from source facts/descriptor identity, independent
+of whether a map entry exists. A supported writable property deleted by
+GetProperty is recreated after backend success with Created notification
+and Xorg's default deletable=true; existing entries retain their flags.
+Ordinary application properties remain writable/deletable. Keyboard facets
+do not inherit pointer acceleration properties merely because the source
+also has pointer capability.
 Writes to recognized libinput properties validate, apply to that source's
 live handle, and commit the XI value only after backend success, preserving
-the existing Tier 2b rule. XI device IDs, rather than a global pointer
-slot, select the target. Virtual devices 4/5 have no physical `Device Node`
-or libinput acceleration property.
+the existing Tier 2b rule. Queueing a KMS input-thread command is not backend
+success: its completion must carry the libinput result back to the core.
+Confirmed changes also update the atom-free input inventory; a client
+disconnect or server reset cannot erase an already applied backend change.
+XI device IDs, rather than a global pointer
+slot, select the target. A queued recognized write captures its source at
+receipt, validates and merges when it reaches the runner's serialized
+configuration lane, and commits through the same inventory update for
+synchronous and asynchronous success. It cannot follow a reused XI ID to
+another source. Removed-source queued requests report BadDevice using the
+original request sequence. Virtual devices 4/5 have no seeded physical
+metadata or driver configuration. Masters/XTEST may store ordinary
+application properties with libinput names, as Xorg permits, but these
+never invoke a physical backend. The `XTEST Device` marker on 4/5 is
+read-only by atom identity and protected against direct deletion; its
+GetProperty(delete) path follows the same Xorg behavior.
 
 Audit yserver code paths that hardcode 4/5 as physical slave IDs: XI1
 device validity/open/grabs and event classes; XI2 selections, hierarchy,
@@ -173,14 +276,84 @@ source, retain its libinput default and log the skipped source. Invalid
 values are startup errors with the allowed values in the diagnostic.
 
 The global setting is an initial default. Later XI property writes from a
-client such as MATE override that source until removal. On reconnection,
-the global default is applied to the new source before its properties are
-published. This is the yserver counterpart of Xorg's `InputClass` plus
-`AccelProfile` setting; it does not require an i3 script or an exact device
+client such as MATE override that source until physical removal. A proven
+VT continuation restores those settings without reapplying the initial
+default. On physical reconnection, the global default is applied to the
+new source before its properties are published. This is the yserver
+counterpart of Xorg's `InputClass` plus `AccelProfile` setting; it does not require an i3 script or an exact device
 selector. The existing i3 `set-prop 4` line should be removed from the
 user's configuration when this behavior is deployed; changing yserver
 cannot make that line configure a physical mouse while preserving 4 as a
 virtual device.
+
+## Touch protocol details clarified by the adversarial review
+
+These details refine the approved topology using Xorg and the official
+[xf86-input-libinput 1.5.0 source](https://www.x.org/releases/individual/driver/xf86-input-libinput-1.5.0.tar.xz).
+A touch-capable pointer/touch facet uses axes 0/1 labeled `Abs MT Position X/Y`,
+Absolute, range 0..65535, resolution 0. A touch-only facet has seven buttons,
+four valuators (0/1 absolute MT, 2/3 relative scroll labels), no ScrollClass,
+and TouchClass. A combined pointer/touch source uses that same X/Y axis
+model with both pointer-initialized ScrollClasses on 2/3, matching the
+driver's unconditional horizontal/vertical setup; pointer-only sources retain
+their existing axis model. Relative motion on a combined absolute-axis
+source follows Xorg's integration in native device units and scaling,
+rather than pointer-only pixel speed. Master copies keep the slave's
+native valuator values/classes; only root/event coordinates use root pixels.
+All fixed-point values preserve fractional precision.
+
+Ordinary End retains the last contact position. RawTouchEnd includes axes
+0/1 with that last processed native position and raw values zero, matching
+GetTouchEvents' backfill after an empty raw driver mask. Forced physical
+End on disable/removal also emits RawTouchEnd; ownership-only artificial
+End does not. The driver uses 15 contacts when libinput reports an unknown
+count; clamp the advertised count to 255 for the protocol's one-byte field.
+
+Touch maps native values (`norm × 65535`) to the entire client root using
+`native × state.randr.screen_width/height ÷ 65536`, matching Xorg's
+inclusive declared axis range, and uses the common root hit-test path. Default
+input mapping adds no per-output rotation, mode or scanout transform
+without a Coordinate Transformation Matrix. Only the pointer-emulating
+contact uses pointer root/confinement processing; report its normal touch
+coordinates after confinement while raw processed coordinates retain their
+pre-confinement native values. Other contacts retain their own unconstrained
+positions, including intentional gaps between outputs. Restricted pointer
+emulation delivery restricts only Motion/Button through the ordinary KMS
+queue to the retained pointer listener, without an unrestricted duplicate.
+Enter/Leave crossings, cursor updates and XFIXES cursor notifications retain
+ordinary delivery to their selecting clients. A regular touch owner gets
+sprite/crossing movement without an additional pointer stream; the
+no-listener Motion fallback follows Xorg DeliverEmulatedMotionEvent.
+Touch-emulated cookies do not add raw pointer events to the raw touch stream.
+
+Emulated button state is separate TouchClass accounting per device/master,
+combined with physical state only in reported core/button masks. Emulated
+Press/Release reach their chosen listener regardless of another physical or
+touch hold of the same button. Physical-button aggregation never suppresses
+an emulated terminal Release; replay and pending ownership do not count a
+hold or terminal transition twice.
+
+Regular touch delivery follows Xorg's ordered listener chain and chooses
+at most one regular listener per device-form sequence. It retains its target
+from Begin. Raw subscribers are independent. XISelectEvents requires the
+Begin/Update/End triplet when any regular touch or ownership bit is selected
+and enforces Xorg's per-window selector conflicts. TouchBegin passive grabs,
+accept/reject, early acceptance, ownership transfer and pending-End replay
+must be implemented before claiming touch support. Pointer emulation follows
+the chosen pointer listener; it is not a separate broadcast to every client
+without a touch mask. Only the first concurrently active direct-touch contact
+on each source emulates the pointer; later contacts are not promoted.
+
+## Review correction record
+
+The 2026-09-30 corrections and their task mapping are recorded in
+[the first adversarial findings](../findings/2026-09-30-dynamic-xinput-adversarial-plan-review.md)
+and [round 2](../findings/2026-09-30-dynamic-xinput-adversarial-review-round-2.md)
+and [round 3](../findings/2026-09-30-dynamic-xinput-adversarial-review-round-3.md)
+with their correction dispositions.
+They preserve the approved registry topology, virtual 4/5 and absence of an
+exact selector. The keyboard/pointer plan contains 18 separate task boundaries;
+the touch plan follows with 10. Implementation has not started.
 
 ## Acceptance criteria for the implementation plan
 
@@ -203,6 +376,9 @@ virtual device.
   behavior, focus, grabs, scroll, XTEST, and existing touchpad properties
   continue to work. Touch contacts from a touch-capable source generate
   begin/update/end with a stable contact ID and are removed cleanly.
+- VT switching releases held keys/buttons/contacts exactly once, preserves
+  IDs, selection masks and confirmed settings for proven continuations,
+  and exposes Disabled/Enabled without false Removed/Added transitions.
 - Capacity exhaustion, unsupported properties, duplicate/stale events,
   and rapid unplug/replug do not rebind an old XI facet to another source.
 
