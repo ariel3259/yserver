@@ -18690,8 +18690,7 @@ fn handle_xi2_request(
                     XI2_MAJOR_OPCODE,
                 );
             }
-            let Some(device) = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
-            else {
+            if crate::xinput::find_device(&state.xi_devices, deviceid).is_none() {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -18701,7 +18700,20 @@ fn handle_xi2_request(
                     58,
                     XI2_MAJOR_OPCODE,
                 );
-            };
+            }
+            if is_xtest_marker_property(state, deviceid, property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    10, // BadAccess: XTEST Device is protected by atom identity.
+                    property.0,
+                    58,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+                .expect("device existence verified above");
             if let Some(what) = crate::xinput::apply_delete_property(device, property) {
                 // Notify on a real removal only; a redundant delete of
                 // an absent property must stay silent — xiproperty.c
@@ -20017,8 +20029,7 @@ fn handle_xi2_request(
                     XI2_MAJOR_OPCODE,
                 );
             }
-            let Some(device) = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
-            else {
+            if crate::xinput::find_device(&state.xi_devices, deviceid).is_none() {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -20028,7 +20039,20 @@ fn handle_xi2_request(
                     38,
                     XI2_MAJOR_OPCODE,
                 );
-            };
+            }
+            if is_xtest_marker_property(state, deviceid, property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    10, // BadAccess: XTEST Device is protected by atom identity.
+                    property.0,
+                    38,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+                .expect("device existence verified above");
             if let Some(what) = crate::xinput::apply_delete_property(device, property) {
                 // Same XI2 fan-out the minor-58 arm runs.
                 let _ = emit_property_change(state, deviceid, property, what);
@@ -25211,6 +25235,13 @@ enum PropertyDispatchError {
 /// exist before this write) or `Modified` (it did) — the caller feeds
 /// it straight into the `XI_PropertyEvent` / `DevicePropertyNotify`
 /// `what` byte.
+fn is_xtest_marker_property(state: &ServerState, deviceid: u16, property: AtomId) -> bool {
+    matches!(
+        deviceid,
+        crate::xinput::DEVICEID_SLAVE_POINTER | crate::xinput::DEVICEID_SLAVE_KEYBOARD
+    ) && property == state.xtest_device_atom
+}
+
 fn dispatch_change_property(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -25224,6 +25255,9 @@ fn dispatch_change_property(
     // 1. BadAtom.
     if !state.atoms.exists(property) {
         return Err(PropertyDispatchError::BadAtom { atom: property.0 });
+    }
+    if is_xtest_marker_property(state, deviceid, property) {
+        return Err(PropertyDispatchError::BadAccess { atom: property.0 });
     }
     // 2. Descriptor lookup. Borrow the name as `&str` from the atom
     //    table, copy it out before any `find_device_mut` reborrow.
@@ -44356,13 +44390,10 @@ mod tests {
         result
     }
 
-    /// `XListInputDevices` device-type atoms: before seeding, device 4
-    /// (slave pointer) must carry the MOUSE atom; after `xi_seed_touchpad`
-    /// it must carry the TOUCHPAD atom; after `xi_clear_touchpad` it must
-    /// revert to MOUSE.  Devices 2 (master ptr) and 3/5 (keyboards) are
-    /// always MOUSE/KEYBOARD respectively.
+    /// Device 4 remains the virtual XTEST pointer during the staged source
+    /// migration, so its XI1 type stays MOUSE after legacy add/remove hooks.
     #[test]
-    fn list_input_devices_device4_type_atom_matches_touchpad_state() {
+    fn list_input_devices_device4_keeps_xtest_mouse_type() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
 
@@ -44384,8 +44415,14 @@ mod tests {
         );
         assert_eq!(types[3], kbd_atom, "device 5 = KEYBOARD");
 
-        // Seed a touchpad onto device 4: type must become TOUCHPAD.
+        // A legacy touchpad add must not repurpose virtual device 4.
         let touchpad_info = crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "SynPS/2 Synaptics TouchPad".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -44413,12 +44450,29 @@ mod tests {
         };
         state.xi_seed_touchpad(&touchpad_info);
         let types = list_input_devices_type_atoms(&mut state, &mut peer);
-        assert_eq!(types[2], touchpad_atom, "device 4 = TOUCHPAD after seed");
+        assert_eq!(types[2], mouse_atom, "device 4 remains the XTEST pointer");
+        assert_eq!(
+            state
+                .xi_devices
+                .device(crate::xinput::DEVICEID_SLAVE_POINTER)
+                .unwrap()
+                .name,
+            crate::xinput::registry::NAME_XTEST_POINTER
+        );
+        assert!(
+            state
+                .xi_devices
+                .device(crate::xinput::DEVICEID_SLAVE_POINTER)
+                .unwrap()
+                .properties
+                .contains_key(&state.xtest_device_atom)
+        );
 
-        // Clear it: device 4 must revert to MOUSE.
+        // Removal still leaves the virtual device intact.
         state.xi_clear_touchpad("/dev/input/event4");
         let types = list_input_devices_type_atoms(&mut state, &mut peer);
-        assert_eq!(types[2], mouse_atom, "device 4 = MOUSE after clear");
+        assert_eq!(types[2], mouse_atom, "device 4 remains MOUSE after clear");
+        assert_ne!(touchpad_atom, mouse_atom);
     }
 
     /// Drive XIQueryDevice (opcode 48) and return the RAW class-block
@@ -44595,7 +44649,7 @@ mod tests {
     }
 
     #[test]
-    fn device_changed_emitted_to_selecting_client_on_touchpad_add_and_remove() {
+    fn legacy_device_changed_fanout_emits_for_selected_slave_pointer() {
         use crate::{
             core_loop::fanout::emit_xi2_device_changed_slave_pointer,
             xinput::DEVICEID_SLAVE_POINTER,
@@ -44603,6 +44657,19 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
+        let xtest_pointer = state
+            .xi_devices
+            .device(DEVICEID_SLAVE_POINTER)
+            .expect("XTEST pointer");
+        assert_eq!(
+            xtest_pointer.name,
+            crate::xinput::registry::NAME_XTEST_POINTER
+        );
+        assert!(
+            xtest_pointer
+                .properties
+                .contains_key(&state.xtest_device_atom)
+        );
         // Client selects XI_DeviceChanged on the slave pointer (device 4)
         // at the root window — the way GDK/Chromium subscribe.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
@@ -44610,53 +44677,26 @@ mod tests {
             u64::from(XI2_DEVICE_CHANGED_MASK),
         );
 
-        // Touchpad add → DeviceChanged for device 4.
-        let info = crate::core_loop::DeviceInfo {
-            name: "SynPS/2 Synaptics TouchPad".into(),
-            device_node: "/dev/input/event4".into(),
-            sysname: "event4".into(),
-            vendor_id: 0x046d,
-            product_id: 0xc52f,
-            is_touchpad: true,
-            config: crate::core_loop::message::LibinputConfigSnapshot {
-                tap: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: true,
-                    default: false,
-                },
-                natural_scroll: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: false,
-                    default: true,
-                },
-                dwt: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: true,
-                    default: true,
-                },
-                ..Default::default()
-            },
-        };
-        state.xi_seed_touchpad(&info);
+        // This legacy helper still emits its fixed slave-pointer event during
+        // the staged migration; device 4 remains virtual XTEST.
         let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
         assert!(dropped.is_empty());
         let wire = read_all_available(&mut peer);
         let off = (0..wire.len().saturating_sub(32))
             .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
-            .expect("XI_DeviceChanged on add");
+            .expect("legacy XI_DeviceChanged fanout");
         assert_eq!(wire[off + 10], 4, "deviceid = slave pointer");
-        assert_eq!(wire[off + 18], 4, "sourceid = the device itself");
+        assert_eq!(wire[off + 18], 4, "sourceid = the XTEST pointer itself");
         assert_eq!(wire[off + 20], 2, "reason = XIDeviceChange");
         assert_eq!(wire[off + 16], 7, "num_classes low byte");
 
-        // Touchpad remove → DeviceChanged again.
-        state.xi_clear_touchpad(&info.device_node);
+        // A second helper call exercises the same selected-device fanout.
         let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
         assert!(dropped.is_empty());
         let wire = read_all_available(&mut peer);
         let off = (0..wire.len().saturating_sub(32))
             .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
-            .expect("XI_DeviceChanged on remove");
+            .expect("second legacy XI_DeviceChanged fanout");
         assert_eq!(wire[off + 10], 4, "deviceid = slave pointer");
     }
 
@@ -45080,45 +45120,18 @@ mod tests {
     }
 
     #[test]
-    fn xi1_get_device_property_tapping_enabled_wire() {
-        // Mirrors MATE's read of "libinput Tapping Enabled" on the
-        // seeded touchpad (device 4): INTEGER/8/[1], deviceid echoed.
+    fn xi1_get_xtest_marker_property_wire() {
+        // Reads the XTEST Device INTEGER/8/[1] marker from virtual device 4.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        state.xi_seed_touchpad(&crate::core_loop::DeviceInfo {
-            name: "SynPS/2 Synaptics TouchPad".into(),
-            device_node: "/dev/input/event4".into(),
-            sysname: "event4".into(),
-            vendor_id: 0x046d,
-            product_id: 0xc52f,
-            is_touchpad: true,
-            config: crate::core_loop::message::LibinputConfigSnapshot {
-                tap: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: true,
-                    default: false,
-                },
-                natural_scroll: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: false,
-                    default: true,
-                },
-                dwt: crate::core_loop::message::BoolSetting {
-                    available: true,
-                    current: true,
-                    default: true,
-                },
-                ..Default::default()
-            },
-        });
-        let tap_atom = state
+        let marker_atom = state
             .atoms
-            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .intern(crate::xinput::PROP_XTEST_DEVICE, false)
             .0;
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
-        let body = xi1_get_property_body(tap_atom, 0 /* AnyPropertyType */, 0, 100, 4, 0);
+        let body = xi1_get_property_body(marker_atom, 0 /* AnyPropertyType */, 0, 100, 4, 0);
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -45157,7 +45170,7 @@ mod tests {
         assert_eq!(wire[20], 8, "format = 8");
         assert_eq!(wire[21], 4, "deviceid echoed (XI1-specific byte)");
         assert!(wire[22..32].iter().all(|&b| b == 0), "pad1..pad3 zero");
-        assert_eq!(wire[32], 1, "value = tap enabled");
+        assert_eq!(wire[32], 1, "value = XTEST marker");
         assert_eq!(&wire[33..36], &[0, 0, 0], "value padding");
     }
 
@@ -45500,10 +45513,53 @@ mod tests {
         body
     }
 
-    /// Seed a touchpad onto device 4 with tap available+current+default.
-    /// Mirrors the MATE test fixture used elsewhere in this module.
-    fn seed_touchpad_for_t3(state: &mut ServerState) {
-        state.xi_seed_touchpad(&crate::core_loop::DeviceInfo {
+    const TEST_PHYSICAL_POINTER_ID: u16 = 6;
+
+    /// Seed the legacy property fixture, then copy its values onto a real
+    /// registry-owned physical facet so property dispatch tests do not
+    /// assign libinput metadata to virtual XTEST device 4.
+    fn seed_physical_pointer_fixture(
+        state: &mut ServerState,
+        info: &crate::core_loop::DeviceInfo,
+    ) -> u16 {
+        state.xi_devices.register(info);
+        let device_id = state
+            .xi_devices
+            .facet(info.source_id, crate::xinput::XiFacetKind::PointerTouch)
+            .expect("test source publishes a pointer facet");
+        let mut legacy_devices = crate::xinput::initial_xi_devices();
+        crate::xinput::seed_touchpad(
+            &mut legacy_devices,
+            &mut state.atoms,
+            state.float_atom,
+            info,
+        );
+        let seeded = legacy_devices
+            .iter()
+            .find(|device| device.id == crate::xinput::DEVICEID_SLAVE_POINTER)
+            .expect("legacy property fixture has a pointer slot")
+            .clone();
+        let physical = state
+            .xi_devices
+            .device_mut(device_id)
+            .expect("registered physical pointer exists");
+        physical.name = seeded.name;
+        physical.is_touchpad = seeded.is_touchpad;
+        physical.device_node = seeded.device_node;
+        physical.properties = seeded.properties;
+        device_id
+    }
+
+    /// Seed a touchpad on physical XI ID 6 with tap available+current+default.
+    /// Mirrors the MATE test fixture without using virtual XTEST device 4.
+    fn seed_touchpad_for_t3(state: &mut ServerState) -> u16 {
+        let info = crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "SynPS/2 Synaptics TouchPad".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -45533,7 +45589,8 @@ mod tests {
                 },
                 ..Default::default()
             },
-        });
+        };
+        seed_physical_pointer_fixture(state, &info)
     }
 
     #[test]
@@ -45550,7 +45607,7 @@ mod tests {
 
         // Write `[0]` (disable tap) to a writable Bool descriptor.
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -45572,7 +45629,11 @@ mod tests {
             "successful XIChangeProperty has no reply"
         );
         // Registry now holds the new value.
-        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let dev = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
+            .unwrap();
         let prop = dev.properties.get(&AtomId(tap_atom)).expect("tap stored");
         assert_eq!(prop.format, 8);
         assert_eq!(prop.data, vec![0], "tap toggled off");
@@ -45868,7 +45929,7 @@ mod tests {
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             atom,
@@ -45898,7 +45959,11 @@ mod tests {
             "reaches the backend as AccelProfile(Some(1)) — flat"
         );
 
-        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let dev = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
+            .unwrap();
         let prop = dev
             .properties
             .get(&AtomId(atom))
@@ -45926,7 +45991,7 @@ mod tests {
         let body = xi1_change_property_body(
             atom,
             integer_atom,
-            4,
+            u8::try_from(TEST_PHYSICAL_POINTER_ID).unwrap(),
             8,
             crate::xinput::XI_PROP_MODE_REPLACE,
             &[0, 1],
@@ -45954,7 +46019,11 @@ mod tests {
             "reaches the backend as AccelProfile(Some(1)) — flat"
         );
 
-        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let dev = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
+            .unwrap();
         let prop = dev
             .properties
             .get(&AtomId(atom))
@@ -45985,7 +46054,7 @@ mod tests {
 
         // Seed a full-width value first (Replace [1, 0, 0] = adaptive).
         let seed_body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             atom,
@@ -46006,7 +46075,7 @@ mod tests {
 
         // Append [1] → merged length 4 > n=3 → BadValue, untouched.
         let append_body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_APPEND,
             8,
             atom,
@@ -46032,7 +46101,11 @@ mod tests {
             "BadValue: merged length 4 > n"
         );
 
-        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let dev = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
+            .unwrap();
         let prop = dev.properties.get(&AtomId(atom)).unwrap();
         assert_eq!(
             prop.data,
@@ -46062,7 +46135,7 @@ mod tests {
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_APPEND,
             8,
             atom,
@@ -46084,7 +46157,11 @@ mod tests {
             "no error: absent property + Append behaves like Replace"
         );
 
-        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let dev = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
+            .unwrap();
         let prop = dev.properties.get(&AtomId(atom)).unwrap();
         assert_eq!(prop.data, vec![0, 1, 0]);
     }
@@ -46113,9 +46190,8 @@ mod tests {
         })
     }
 
-    /// Subscribe `client_id` to `XI_PropertyEventMask` on the slave
-    /// pointer (device 4) at the root window — the selection MATE /
-    /// GDK make once they have learned the device id.
+    /// Subscribe `client_id` to `XI_PropertyEventMask` for one device at
+    /// the root window — the selection MATE / GDK make after learning its id.
     fn select_xi2_property_event_on_root(state: &mut ServerState, client_id: u32, deviceid: u16) {
         state
             .clients
@@ -46135,7 +46211,7 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_touchpad_for_t3(&mut state);
-        select_xi2_property_event_on_root(&mut state, 1, 4);
+        select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -46143,7 +46219,7 @@ mod tests {
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -46168,7 +46244,11 @@ mod tests {
         assert_eq!(ev[0], 35, "GenericEvent");
         assert_eq!(ev[1], 137, "extension = XInputExtension major");
         assert_eq!(u16::from_le_bytes([ev[8], ev[9]]), 12, "evtype");
-        assert_eq!(u16::from_le_bytes([ev[10], ev[11]]), 4, "deviceid");
+        assert_eq!(
+            u16::from_le_bytes([ev[10], ev[11]]),
+            TEST_PHYSICAL_POINTER_ID,
+            "deviceid"
+        );
         assert_eq!(
             u32::from_le_bytes([ev[16], ev[17], ev[18], ev[19]]),
             tap_atom,
@@ -46376,7 +46456,7 @@ mod tests {
     #[test]
     fn t5_xi2_change_property_not_selected_client_gets_nothing() {
         // A client that did NOT select `XI_PropertyEventMask` for
-        // device 4 must not receive the event, even if it has other
+        // this physical device must not receive the event, even if it has other
         // XI2 selections on the same window.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -46386,7 +46466,7 @@ mod tests {
         // `XI2_PROPERTY_EVENT_MASK` bit is NOT set, so this client
         // must be skipped.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
-            (ROOT_WINDOW, 4),
+            (ROOT_WINDOW, TEST_PHYSICAL_POINTER_ID),
             u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK),
         );
         let tap_atom = state
@@ -46396,7 +46476,7 @@ mod tests {
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -46422,7 +46502,7 @@ mod tests {
     #[test]
     fn t5_xi2_change_property_other_device_does_not_match() {
         // Selecting `XI_PropertyEvent` for device 3 (master keyboard)
-        // must NOT route a device-4 property change to that client.
+        // must NOT route a physical pointer property change to that client.
         // The wildcards `XIAllDevices(0)` / `XIAllMasterDevices(1)` are
         // followed by `xi2mask_isset` (xserver dix/inpututils.c:1153),
         // but device 3 is neither, so this client stays unselected.
@@ -46430,7 +46510,7 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_touchpad_for_t3(&mut state);
-        // Client subscribes to property events on device 3, not 4.
+        // Client subscribes to property events on device 3, not the physical pointer.
         state
             .clients
             .get_mut(&1)
@@ -46444,7 +46524,7 @@ mod tests {
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -46463,7 +46543,7 @@ mod tests {
         .unwrap();
         assert!(
             read_all_available(&mut peer).is_empty(),
-            "device-3 selection must not see device-4 events"
+            "device-3 selection must not see physical pointer events"
         );
     }
 
@@ -46480,7 +46560,7 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_touchpad_for_t3(&mut state);
-        // Select on the wildcard, NOT on device 4 directly.
+        // Select on the wildcard, NOT on the physical pointer directly.
         state
             .clients
             .get_mut(&1)
@@ -46493,7 +46573,7 @@ mod tests {
             .0;
         let integer_atom = crate::xinput::XA_INTEGER.0;
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -46527,7 +46607,7 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_touchpad_for_t3(&mut state);
-        select_xi2_property_event_on_root(&mut state, 1, 4);
+        select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -46540,7 +46620,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&tap_atom.to_le_bytes());
         body.extend_from_slice(&integer_atom.to_le_bytes());
-        body.push(4); // deviceid
+        body.push(u8::try_from(TEST_PHYSICAL_POINTER_ID).unwrap()); // deviceid
         body.push(8); // format
         body.push(crate::xinput::XI_PROP_MODE_REPLACE);
         body.push(0); // pad
@@ -46576,7 +46656,7 @@ mod tests {
         // Subscribe via a non-root window — anything keyed by the
         // device id wins.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
-            (ResourceId(0xdead_beef), 4),
+            (ResourceId(0xdead_beef), TEST_PHYSICAL_POINTER_ID),
             u64::from(XI2_PROPERTY_EVENT_MASK),
         );
         let tap_atom = state
@@ -46586,7 +46666,7 @@ mod tests {
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -46908,10 +46988,10 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_touchpad_for_t3(&mut state);
+        let physical_class = (u32::from(TEST_PHYSICAL_POINTER_ID) << 8) | 82;
         // Subscribe via SelectExtensionEvent only (no XI2 mask), so the
         // ONLY event on the wire is the XI1 one.
-        let select_body =
-            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        let select_body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[physical_class]);
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -46935,7 +47015,7 @@ mod tests {
             .0;
         let integer_atom = crate::xinput::XA_INTEGER.0;
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -46962,7 +47042,11 @@ mod tests {
             tap_atom,
             "atom"
         );
-        assert_eq!(ev[31], 4, "deviceid (last byte)");
+        assert_eq!(
+            ev[31],
+            u8::try_from(TEST_PHYSICAL_POINTER_ID).unwrap(),
+            "deviceid (last byte)"
+        );
     }
 
     #[test]
@@ -47029,7 +47113,7 @@ mod tests {
             .0;
         let integer_atom = crate::xinput::XA_INTEGER.0;
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -47081,7 +47165,7 @@ mod tests {
             .0;
         let integer_atom = crate::xinput::XA_INTEGER.0;
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -47169,11 +47253,11 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         seed_touchpad_for_t3(&mut state);
+        let physical_class = (u32::from(TEST_PHYSICAL_POINTER_ID) << 8) | 82;
         // XI2 selection.
-        select_xi2_property_event_on_root(&mut state, 1, 4);
+        select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
         // XI1 selection.
-        let select_body =
-            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        let select_body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[physical_class]);
         handle_xi2_request(
             &mut state,
             &mut backend,
@@ -47195,7 +47279,7 @@ mod tests {
             .0;
         let integer_atom = crate::xinput::XA_INTEGER.0;
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             tap_atom,
@@ -47218,10 +47302,18 @@ mod tests {
         let xi2 = find_xi2_property_event(&wire).expect("XI2 GenericEvent present");
         assert_eq!(xi2[0], 35, "GenericEvent");
         assert_eq!(u16::from_le_bytes([xi2[8], xi2[9]]), 12, "evtype = 12");
-        assert_eq!(u16::from_le_bytes([xi2[10], xi2[11]]), 4, "deviceid");
+        assert_eq!(
+            u16::from_le_bytes([xi2[10], xi2[11]]),
+            TEST_PHYSICAL_POINTER_ID,
+            "deviceid"
+        );
         let xi1 = find_xi1_device_property_notify(&wire).expect("XI1 event present");
         assert_eq!(xi1[0], 82, "XI_FIRST_EVENT + 16");
-        assert_eq!(xi1[31], 4, "XI1 deviceid (last byte)");
+        assert_eq!(
+            xi1[31],
+            u8::try_from(TEST_PHYSICAL_POINTER_ID).unwrap(),
+            "XI1 deviceid (last byte)"
+        );
     }
 
     #[test]
@@ -47242,7 +47334,7 @@ mod tests {
         let before = state
             .xi_devices
             .iter()
-            .find(|d| d.id == 4)
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
             .unwrap()
             .properties
             .get(&AtomId(default_atom))
@@ -47250,7 +47342,7 @@ mod tests {
             .expect("default seeded");
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             default_atom,
@@ -47275,7 +47367,7 @@ mod tests {
         let after = state
             .xi_devices
             .iter()
-            .find(|d| d.id == 4)
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
             .unwrap()
             .properties
             .get(&AtomId(default_atom))
@@ -47587,10 +47679,10 @@ mod tests {
         // Atom 0xdeadbeef has never been interned → BadAtom.
         let bogus_atom = 0xdead_beefu32;
         assert!(!state.atoms.exists(AtomId(bogus_atom)), "precondition");
-        // XIGetProperty body: deviceid(2)=4, delete(1)=0, pad(1),
+        // XIGetProperty body: physical deviceid(2), delete(1)=0, pad(1),
         // property(4), type(4)=0, offset(4)=0, len(4)=100.
         let mut body = Vec::new();
-        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&TEST_PHYSICAL_POINTER_ID.to_le_bytes());
         body.push(0); // delete
         body.push(0); // pad
         body.extend_from_slice(&bogus_atom.to_le_bytes());
@@ -47634,7 +47726,7 @@ mod tests {
         let before = state
             .xi_devices
             .iter()
-            .find(|d| d.id == 4)
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
             .unwrap()
             .properties
             .get(&AtomId(scroll_atom))
@@ -47642,7 +47734,7 @@ mod tests {
             .expect("scroll method seeded");
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             scroll_atom,
@@ -47667,7 +47759,7 @@ mod tests {
         let after = state
             .xi_devices
             .iter()
-            .find(|d| d.id == 4)
+            .find(|d| d.id == TEST_PHYSICAL_POINTER_ID)
             .unwrap()
             .properties
             .get(&AtomId(scroll_atom))

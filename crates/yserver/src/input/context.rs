@@ -32,7 +32,10 @@ use yserver_core::{
         DeviceInfo,
         message::{LibinputConfigSnapshot, device_node_from_sysname},
     },
-    xinput::libinput_props::{DeviceConfigChange, DeviceConfigError},
+    xinput::{
+        InputCapabilities, InputSourceId,
+        libinput_props::{DeviceConfigChange, DeviceConfigError},
+    },
 };
 
 use crate::input::{event::InputEvent, libinput_config};
@@ -101,6 +104,9 @@ pub struct Context {
     /// seat-denied) is dead on arrival and can't even be zapped. Add/remove
     /// tracked so the count stays accurate across hotplug.
     usable_input_nodes: HashSet<String>,
+    /// Process-local source identity allocator. IDs are never reused during
+    /// this libinput context's lifetime, even when an evdev node is reused.
+    next_source_id: u64,
 }
 
 /// Newtype wrapper around `Context` that implements `Send`.
@@ -192,6 +198,7 @@ impl Context {
             keyboard_devices: HashMap::new(),
             last_leds: Led::empty(),
             usable_input_nodes: HashSet::new(),
+            next_source_id: 1,
         })
     }
 
@@ -302,7 +309,20 @@ impl Context {
                     {
                         self.usable_input_nodes.insert(device_node.clone());
                     }
+                    let source_id = InputSourceId(self.next_source_id);
+                    self.next_source_id = self
+                        .next_source_id
+                        .checked_add(1)
+                        .expect("libinput source identity exhausted");
                     let info = DeviceInfo {
+                        source_id,
+                        capabilities: InputCapabilities {
+                            keyboard: dev.has_capability(DeviceCapability::Keyboard),
+                            pointer: dev.has_capability(DeviceCapability::Pointer),
+                            // Task 2 gathers the touch capability from
+                            // libinput alongside the other source facts.
+                            touch: false,
+                        },
                         name,
                         device_node,
                         sysname,

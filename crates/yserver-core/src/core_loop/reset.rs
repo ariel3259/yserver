@@ -409,13 +409,9 @@ pub(crate) fn reset_generation(
     // go backwards: a client reconnecting a millisecond after a reset
     // would otherwise see the server clock jump.
     fresh.start_instant = state.start_instant;
-    // Input is seeded from the process-lifetime inventory, not
-    // re-probed: `probe_input_devices` is a no-op in Direct mode
-    // (libinput's enumeration burst is one-shot, at process start), so
-    // a generation that re-probed would come back with no devices at
-    // all. Property-name atoms are interned HERE, against the fresh
-    // table -- carrying `xi_devices` across instead would leave every
-    // device property pointing at an atom id that no longer exists.
+    // The inventory loop remains for the legacy seed hook, which now leaves
+    // virtual XTEST devices untouched. Rebuilding physical facets and their
+    // property atoms belongs to the later registry reset migration.
     for info in inventory.devices_by_node() {
         fresh.xi_seed_touchpad(info);
     }
@@ -868,6 +864,12 @@ mod tests {
     /// is the property this module's atom assertion turns on.
     fn touchpad(node: &str, name: &str) -> DeviceInfo {
         DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: name.into(),
             device_node: node.into(),
             sysname: node.trim_start_matches("/dev/input/").into(),
@@ -1047,12 +1049,11 @@ mod tests {
         );
     }
 
-    /// The devices come back — from the process-lifetime inventory, not
-    /// a re-probe — and their property-name atoms are interned in the
-    /// NEW atom table. Carrying `xi_devices` instead would leave those
-    /// properties pointing at ids the fresh table never issued.
+    /// A process-lifetime source must not be restored by overwriting the
+    /// virtual XTEST pointer. Physical registry/property restoration is a
+    /// later migration stage.
     #[test]
-    fn reset_generation_reseeds_devices_with_atoms_in_the_new_table() {
+    fn reset_generation_keeps_virtual_xtest_pointer_intact() {
         let mut state = ServerState::new();
         let mut backend = backend_with_topology();
         // Burn atom ids in the OLD table so a carried-over property atom
@@ -1086,24 +1087,19 @@ mod tests {
             .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
             .expect("slave pointer");
         assert_eq!(
-            slave.name, "SynPS/2 Touchpad",
-            "the device set must be present again after a reset"
+            slave.name,
+            crate::xinput::registry::NAME_XTEST_POINTER,
+            "reset must keep the virtual device as XTEST instead of publishing a source there"
         );
-        assert!(slave.is_touchpad);
-
-        // `intern(only_if_exists = true)` returns the live id: the
-        // property must resolve through the NEW table.
+        assert!(!slave.is_touchpad);
+        assert!(slave.properties.contains_key(&state.xtest_device_atom));
         let tap = state.atoms.intern("libinput Tapping Enabled", true);
-        assert_ne!(
+        assert_eq!(
             tap,
             yserver_protocol::x11::AtomId(0),
-            "the property atom must exist in the new table"
+            "physical touchpad properties are not seeded on XTEST"
         );
-        assert!(
-            slave.properties.contains_key(&tap),
-            "device properties must be keyed by atoms interned in the new \
-             table, not ids carried from the destroyed one"
-        );
+        assert!(!slave.properties.contains_key(&tap));
     }
 
     /// The quarantine case with teeth. `release_server_grab_waiters`

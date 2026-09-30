@@ -14,6 +14,10 @@ use crate::{core_loop::generation::Generation, host_x11::HostKeyEvent, transport
 /// so that Task 2 can seed the XI2 device-property registry.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
+    /// Process-local identity for this physical source attachment.
+    pub source_id: crate::xinput::InputSourceId,
+    /// Input functions libinput reports for this source.
+    pub capabilities: crate::xinput::InputCapabilities,
     /// Human-readable name (e.g. `"SynPS/2 Synaptics TouchPad"`).
     pub name: String,
     /// Evdev device node (e.g. `/dev/input/event4`).
@@ -346,6 +350,12 @@ mod tests {
     #[test]
     fn device_info_is_clone_and_debug() {
         let info = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "Test Touchpad".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -375,6 +385,12 @@ mod tests {
     #[test]
     fn host_input_event_device_variants() {
         let info = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "Mouse".into(),
             device_node: "/dev/input/event1".into(),
             sysname: "event1".into(),
