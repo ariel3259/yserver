@@ -16882,11 +16882,10 @@ const XI1_POINTER_AXES: u8 = 4;
 /// accepted wherever a modifier_device byte is taken.
 const XI1_USE_X_KEYBOARD: u16 = 255;
 
-/// The fixed 4-device registry: 2 = master (core) pointer, 3 = master
-/// (core) keyboard, 4 = slave/extension pointer, 5 = slave/extension
-/// keyboard. Mirrors `crate::xinput::initial_xi_devices`.
-fn xi1_device_valid(id: u16) -> bool {
-    (2..=5).contains(&id)
+/// An XI1 device is valid exactly while its ID is present in the shared
+/// registry snapshot used by XI1 and XI2 enumeration.
+fn xi1_device_valid(devices: &crate::xinput::XiRegistry, id: u16) -> bool {
+    devices.device(id).is_some()
 }
 
 /// The virtual core pointer (2) and keyboard (3) are the masters.
@@ -16909,18 +16908,34 @@ fn xi2_first_invalid_mask_bit(mask: &[u8]) -> Option<u32> {
     })
 }
 
-/// Keyboards (3, 5) carry a KeyClass; pointers don't.
-pub(crate) fn xi1_device_has_keys(id: u16) -> bool {
-    matches!(id, 3 | 5)
+/// Keyboard masters, XTEST keyboards, and registered keyboard facets carry
+/// a KeyClass.
+pub(crate) fn xi1_device_has_keys(devices: &crate::xinput::XiRegistry, id: u16) -> bool {
+    devices.device(id).is_some_and(|device| {
+        matches!(
+            (device.id, device.facet),
+            (crate::xinput::DEVICEID_MASTER_KEYBOARD, _)
+                | (crate::xinput::DEVICEID_SLAVE_KEYBOARD, _)
+                | (_, Some(crate::xinput::XiFacetKind::Keyboard))
+        )
+    })
 }
 
-/// Pointers (2, 4) carry Button + Valuator classes; keyboards don't.
-pub(crate) fn xi1_device_has_buttons(id: u16) -> bool {
-    matches!(id, 2 | 4)
+/// Pointer masters, XTEST pointer, and registered pointer facets carry
+/// Button and Valuator classes.
+pub(crate) fn xi1_device_has_buttons(devices: &crate::xinput::XiRegistry, id: u16) -> bool {
+    devices.device(id).is_some_and(|device| {
+        matches!(
+            (device.id, device.facet),
+            (crate::xinput::DEVICEID_MASTER_POINTER, _)
+                | (crate::xinput::DEVICEID_SLAVE_POINTER, _)
+                | (_, Some(crate::xinput::XiFacetKind::PointerTouch))
+        )
+    })
 }
 
-pub(crate) fn xi1_device_has_valuators(id: u16) -> bool {
-    matches!(id, 2 | 4)
+pub(crate) fn xi1_device_has_valuators(devices: &crate::xinput::XiRegistry, id: u16) -> bool {
+    xi1_device_has_buttons(devices, id)
 }
 
 /// Core grab-modifier validity: any combination of the 8 modifier
@@ -17115,7 +17130,7 @@ fn handle_xi_warp_pointer(
 /// Pointers and unknown ids are BadDevice (Xorg sets no errorValue).
 ///
 /// The master keyboard's focus is the core focus, so device 3 runs core
-/// SetInputFocus. The slave keyboard (5) keeps its own focus
+/// SetInputFocus. Slave keyboard facets keep their own focus
 /// (`xi1_device_focus`, shared with XI1 SetDeviceFocus) and may follow
 /// the keyboard. FollowKeyboard on the master keyboard itself would make
 /// it follow itself: Xorg stores `FollowKeyboardWin` and then crashes
@@ -17133,7 +17148,7 @@ fn handle_xi_set_focus(
     let focus = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
     let req_time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
     let deviceid = u16::from_le_bytes([body[8], body[9]]);
-    if !xi1_device_has_keys(deviceid) {
+    if !xi1_device_has_keys(&state.xi_devices, deviceid) {
         return xi1_error(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, 0, MINOR);
     }
     let revert_to = xi1_focus::REVERT_TO_PARENT;
@@ -17270,7 +17285,9 @@ fn handle_xi_change_hierarchy(
                 // A slave is "not a master" (errorValue = id); the virtual
                 // core pair can't be removed and unknown ids don't exist
                 // (Xorg sets no errorValue for either).
-                let value = if xi1_device_valid(deviceid) && !xi1_device_is_master(deviceid) {
+                let value = if xi1_device_valid(&state.xi_devices, deviceid)
+                    && !xi1_device_is_master(deviceid)
+                {
                     u32::from(deviceid)
                 } else {
                     0
@@ -17284,7 +17301,7 @@ fn handle_xi_change_hierarchy(
                 let deviceid = rd16(pos + 4);
                 // Masters and the fixed slaves report their id; unknown
                 // ids report 0.
-                let value = if xi1_device_valid(deviceid) {
+                let value = if xi1_device_valid(&state.xi_devices, deviceid) {
                     u32::from(deviceid)
                 } else {
                     0
@@ -18770,38 +18787,97 @@ fn handle_xi2_request(
             );
             return Ok(RequestOutcome::Handled);
         }
-        // XI 1.x ListInputDevices (minor 2). Returns the real 4-device
-        // model (mirrors XIQueryDevice). A previous empty-list stub
+        // XI 1.x ListInputDevices (minor 2). It selects the same live
+        // registry entries as XIQueryDevice. A previous empty-list stub
         // crashed Chromium/Electron: Ozone-X11 cross-checks XI1's
         // ListInputDevices against XI2's XIQueryDevice and fatal-CHECKs
         // when XI2 has a master pointer but XI1 reports zero devices.
         2 => {
             debug!("client {} #{} XListInputDevices", client_id.0, sequence.0);
-            // Names come from the SAME source as XIQueryDevice (the
-            // `xi_devices` registry, ids 2/3/4/5) so the XI1 and XI2
-            // enumerations report identical device names — clients
-            // cross-check and fatal-CHECK on a mismatch.
-            let names = [
-                crate::xinput::device_name(&state.xi_devices, 2),
-                crate::xinput::device_name(&state.xi_devices, 3),
-                crate::xinput::device_name(&state.xi_devices, 4),
-                crate::xinput::device_name(&state.xi_devices, 5),
+            // Keep the same descriptor order as XIQueryDevice selector 0.
+            // XI1 has no enabled field; it does preserve Xorg's type/use
+            // values and the existing master, XTEST, and physical class
+            // shapes.
+            const POINTER_AXES: [(i32, i32); 4] = [(-1, -1), (-1, -1), (-1, 0), (-1, 0)];
+            let pointer_classes = [
+                x11::Xi1DeviceClass::Button { num_buttons: 7 },
+                x11::Xi1DeviceClass::Valuator {
+                    mode: 0,
+                    axes: &POINTER_AXES,
+                },
             ];
-            // Device-type atoms (MOUSE / KEYBOARD / TOUCHPAD) were
-            // interned at ServerState construction, so these lookups are
-            // infallible (only_if_exists=true still finds them).
-            let mouse_atom = state.atoms.intern(crate::xinput::XI_ATOM_MOUSE, true).0;
-            let kbd_atom = state.atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, true).0;
-            let touchpad_atom = state.atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, true).0;
-            // id 4 (slave pointer) is TOUCHPAD when active, otherwise MOUSE.
-            let slave_ptr_type = if crate::xinput::device_is_touchpad(&state.xi_devices, 4) {
-                touchpad_atom
-            } else {
-                mouse_atom
-            };
-            let types = [mouse_atom, kbd_atom, slave_ptr_type, kbd_atom];
+            let keyboard_classes = [x11::Xi1DeviceClass::Key {
+                min_keycode: 8,
+                max_keycode: 255,
+                num_keys: 248,
+            }];
+            let mouse_atom = state.atoms.intern(crate::xinput::XI_ATOM_MOUSE, true);
+            let keyboard_atom = state.atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, true);
+            let touchpad_atom = state.atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, true);
+            let devices = state
+                .xi_devices
+                .query(0)
+                .expect("XIAllDevices selector is always valid")
+                .into_iter()
+                .map(|device| {
+                    let (use_code, type_atom, classes) = match device.id {
+                        crate::xinput::DEVICEID_MASTER_POINTER => {
+                            (0, mouse_atom, &pointer_classes[..])
+                        }
+                        crate::xinput::DEVICEID_MASTER_KEYBOARD => {
+                            (1, keyboard_atom, &keyboard_classes[..])
+                        }
+                        crate::xinput::DEVICEID_SLAVE_POINTER => (
+                            4,
+                            if device.is_touchpad {
+                                touchpad_atom
+                            } else {
+                                mouse_atom
+                            },
+                            &pointer_classes[..],
+                        ),
+                        crate::xinput::DEVICEID_SLAVE_KEYBOARD => {
+                            (3, keyboard_atom, &keyboard_classes[..])
+                        }
+                        _ => match device
+                            .facet
+                            .expect("registered physical XI device has a facet")
+                        {
+                            crate::xinput::XiFacetKind::PointerTouch => (
+                                4,
+                                if device.is_touchpad {
+                                    touchpad_atom
+                                } else {
+                                    mouse_atom
+                                },
+                                &pointer_classes[..],
+                            ),
+                            crate::xinput::XiFacetKind::Keyboard => {
+                                (3, keyboard_atom, &keyboard_classes[..])
+                            }
+                        },
+                    };
+                    let attachment = match device.id {
+                        crate::xinput::DEVICEID_MASTER_POINTER => {
+                            crate::xinput::DEVICEID_MASTER_KEYBOARD
+                        }
+                        crate::xinput::DEVICEID_MASTER_KEYBOARD => {
+                            crate::xinput::DEVICEID_MASTER_POINTER
+                        }
+                        _ => device.attached_master.unwrap_or(0),
+                    };
+                    x11::Xi1DeviceDescriptor {
+                        id: device.id,
+                        use_code,
+                        attachment,
+                        type_atom,
+                        name: &device.name,
+                        classes,
+                    }
+                })
+                .collect::<Vec<_>>();
             buf.extend_from_slice(&x11::encode_list_input_devices_reply(
-                byte_order, sequence, names, types,
+                byte_order, sequence, &devices,
             ));
         }
         // XI 1.x SelectExtensionEvent (minor 6; xSelectExtensionEventReq,
@@ -18878,7 +18954,7 @@ fn handle_xi2_request(
                 let off = 8 + i * 4;
                 let class =
                     u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
-                if !xi1_device_valid(xi1_event_class_device(class)) {
+                if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(class)) {
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
@@ -19253,22 +19329,18 @@ fn handle_xi2_request(
         // list (our pre-fix stub) leaves _class = 0, and `xinput
         // watch-props` silently subscribes to nothing.
         //
-        // Verified against `mate-asahi-xorg.xtrace`: Xorg returns four
-        // entries — Button(1)/Valuator(2)/Feedback(3)/Other(6) with
-        // `event_type_base = 0x4c = 76` — and xinput's subsequent
+        // Verified against `mate-asahi-xorg.xtrace`: pointer devices return
+        // Button(1)/Valuator(2)/Feedback(3)/Other(6), while keyboards return
+        // Key(0)/Feedback(3)/Focus(5)/Other(6). The Other entry uses
+        // `event_type_base = 0x4c = 76`, and xinput's subsequent
         // `SelectExtensionEvent` carries class `(deviceid<<8)|82`.
-        // We return the minimum compatible reply (one OtherClass entry)
-        // so watch-props gets DevicePropertyNotify events; the other
-        // three classes carry trailing per-class data (button count,
-        // valuator axes, feedback) we don't emit yet, so they stay out
-        // until a client is found to need them.
         3 => {
-            // Xorg Xi/opendev.c: an unknown device id AND the core
-            // (master) pointer/keyboard both yield BadDevice — XOpenDevice
-            // only opens extension devices (XTS XOpenDevice-3/-4).
+            // Xorg Xi/opendev.c: unknown IDs and master devices yield
+            // BadDevice. XOpenDevice opens the listed slave devices,
+            // including each live physical facet.
             {
                 let deviceid = u16::from(*body.first().unwrap_or(&0));
-                if !xi1_device_valid(deviceid)
+                if !xi1_device_valid(&state.xi_devices, deviceid)
                     || deviceid == crate::xinput::DEVICEID_MASTER_POINTER
                     || deviceid == crate::xinput::DEVICEID_MASTER_KEYBOARD
                 {
@@ -19324,8 +19396,7 @@ fn handle_xi2_request(
             // OpenDevice replies). Returning pointer classes for a keyboard
             // contradicts ListInputDevices and trips clients' device model.
             let deviceid = u16::from(*body.first().unwrap_or(&0));
-            let is_keyboard = deviceid == crate::xinput::DEVICEID_MASTER_KEYBOARD
-                || deviceid == crate::xinput::DEVICEID_SLAVE_KEYBOARD;
+            let is_keyboard = xi1_device_has_keys(&state.xi_devices, deviceid);
             let entries: [u8; 8] = if is_keyboard {
                 [
                     KEY_CLASS,
@@ -19358,7 +19429,7 @@ fn handle_xi2_request(
             // OpenDevice contradict ListInputDevices' per-device class
             // count → Chromium fatal CHECK / SIGTRAP on startup.
             // length=2 = two extra 4-byte units (8 bytes of class entries).
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 2);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 3, 2);
             reply.push(4); // byte 8: num_classes
             reply.extend_from_slice(&[0u8; 23]); // bytes 9..=31: header pad
             reply.extend_from_slice(&entries);
@@ -19381,7 +19452,7 @@ fn handle_xi2_request(
         // CloseDevice (void): xCloseDeviceReq { deviceid }.
         4 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19400,7 +19471,7 @@ fn handle_xi2_request(
         // sense for devices with valuators (Xorg Xi/setmode.c).
         5 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19410,7 +19481,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_valuators(dev) {
+            if !xi1_device_has_valuators(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             // Store the mode (Relative=0 / Absolute=1) —
@@ -19530,7 +19601,7 @@ fn handle_xi2_request(
                 }
                 let class =
                     u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
-                if !xi1_device_valid(xi1_event_class_device(class)) {
+                if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(class)) {
                     return xi1_error(
                         state,
                         client_id,
@@ -19613,7 +19684,7 @@ fn handle_xi2_request(
         // history needs valuators (Xorg Xi/getmev.c).
         10 => {
             let dev = u16::from(*body.get(8).unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19623,7 +19694,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_valuators(dev) {
+            if !xi1_device_has_valuators(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             let start = u32::from_le_bytes(body[0..4].try_into().expect("four bytes"));
@@ -19668,7 +19739,7 @@ fn handle_xi2_request(
         // — in that order on the wire.
         11 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19678,7 +19749,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_keys(dev) {
+            if !xi1_device_has_keys(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             // 1. ChangeDeviceNotify for originator (if selected) + fanout.
@@ -19724,7 +19795,7 @@ fn handle_xi2_request(
             let xaxis = *body.first().unwrap_or(&0);
             let yaxis = *body.get(1).unwrap_or(&0);
             let dev = u16::from(*body.get(2).unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19734,7 +19805,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_valuators(dev)
+            if !xi1_device_has_valuators(&state.xi_devices, dev)
                 || xaxis >= XI1_POINTER_AXES
                 || yaxis >= XI1_POINTER_AXES
             {
@@ -19778,7 +19849,7 @@ fn handle_xi2_request(
                 return Ok(RequestOutcome::Handled);
             }
             let dev = u16::from(body[13]);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19841,7 +19912,7 @@ fn handle_xi2_request(
                 let class =
                     u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
                 let class_dev = xi1_event_class_device(class);
-                if !xi1_device_valid(class_dev) || class_dev != dev {
+                if !xi1_device_valid(&state.xi_devices, class_dev) || class_dev != dev {
                     return xi1_error(
                         state,
                         client_id,
@@ -19920,7 +19991,7 @@ fn handle_xi2_request(
                 *body.get(3).unwrap_or(&0),
             ]);
             let dev = u16::from(*body.get(4).unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19967,7 +20038,7 @@ fn handle_xi2_request(
             let this_mode = body[11];
             let other_mode = body[12];
             let owner_events = body[13];
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19977,7 +20048,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_valid(mod_dev) {
+            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_valid(&state.xi_devices, mod_dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -19987,7 +20058,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_has_keys(mod_dev) {
+            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_has_keys(&state.xi_devices, mod_dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             // key: AnyKey (0) or within the advertised keycode range.
@@ -20040,7 +20111,7 @@ fn handle_xi2_request(
                 }
                 let class =
                     u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
-                if !xi1_device_valid(xi1_event_class_device(class)) {
+                if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(class)) {
                     return xi1_error(
                         state,
                         client_id,
@@ -20097,7 +20168,7 @@ fn handle_xi2_request(
             let mod_dev = u16::from(body[6]);
             let key = body[7];
             let dev = u16::from(body[8]);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20107,7 +20178,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_valid(mod_dev) {
+            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_valid(&state.xi_devices, mod_dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20117,8 +20188,9 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_keys(dev)
-                || (mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_has_keys(mod_dev))
+            if !xi1_device_has_keys(&state.xi_devices, dev)
+                || (mod_dev != XI1_USE_X_KEYBOARD
+                    && !xi1_device_has_keys(&state.xi_devices, mod_dev))
             {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
@@ -20179,7 +20251,7 @@ fn handle_xi2_request(
             let this_mode = body[10];
             let other_mode = body[11];
             let owner_events = body[13];
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20189,7 +20261,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_valid(mod_dev) {
+            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_valid(&state.xi_devices, mod_dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20199,7 +20271,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_has_keys(mod_dev) {
+            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_has_keys(&state.xi_devices, mod_dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             if !xi1_modifiers_valid(mods) {
@@ -20248,7 +20320,7 @@ fn handle_xi2_request(
                     break;
                 };
                 let class = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-                if !xi1_device_valid(xi1_event_class_device(class)) {
+                if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(class)) {
                     return xi1_error(
                         state,
                         client_id,
@@ -20302,7 +20374,7 @@ fn handle_xi2_request(
             let mods = u16::from_le_bytes([body[4], body[5]]);
             let mod_dev = u16::from(body[6]);
             let dev = u16::from(body[8]);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20312,7 +20384,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_valid(mod_dev) {
+            if mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_valid(&state.xi_devices, mod_dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20322,8 +20394,9 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_buttons(dev)
-                || (mod_dev != XI1_USE_X_KEYBOARD && !xi1_device_has_keys(mod_dev))
+            if !xi1_device_has_buttons(&state.xi_devices, dev)
+                || (mod_dev != XI1_USE_X_KEYBOARD
+                    && !xi1_device_has_keys(&state.xi_devices, mod_dev))
             {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
@@ -20367,7 +20440,7 @@ fn handle_xi2_request(
         19 => {
             let mode = *body.get(4).unwrap_or(&0);
             let dev = u16::from(*body.get(5).unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20590,7 +20663,7 @@ fn handle_xi2_request(
         // maps focus->win back to the sentinel, never resolving it).
         20 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20632,7 +20705,7 @@ fn handle_xi2_request(
             let req_time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             let revert_to = body[8];
             let dev = u16::from(body[9]);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20699,7 +20772,7 @@ fn handle_xi2_request(
         // control.
         22 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20709,7 +20782,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            let feedbacks = if xi1_device_has_keys(dev) {
+            let feedbacks = if xi1_device_has_keys(&state.xi_devices, dev) {
                 let kc = &state.keyboard_control;
                 x11::encode_kbd_feedback_state(
                     byte_order,
@@ -20741,7 +20814,7 @@ fn handle_xi2_request(
         // keyboard/pointer control, just like Xorg.
         23 => {
             let dev = u16::from(*body.get(4).unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20770,7 +20843,7 @@ fn handle_xi2_request(
                             minor,
                         );
                     }
-                    if !xi1_device_has_keys(dev) || body[9] != 0 {
+                    if !xi1_device_has_keys(&state.xi_devices, dev) || body[9] != 0 {
                         return xi1_error(
                             state,
                             client_id,
@@ -20883,7 +20956,7 @@ fn handle_xi2_request(
                             minor,
                         );
                     }
-                    if !xi1_device_has_valuators(dev) || body[9] != 0 {
+                    if !xi1_device_has_valuators(&state.xi_devices, dev) || body[9] != 0 {
                         return xi1_error(
                             state,
                             client_id,
@@ -20948,7 +21021,7 @@ fn handle_xi2_request(
             let dev = u16::from(*body.first().unwrap_or(&0));
             let first = *body.get(1).unwrap_or(&0);
             let count = *body.get(2).unwrap_or(&0);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -20958,7 +21031,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_keys(dev) {
+            if !xi1_device_has_keys(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             if first < XI1_KEY_MIN {
@@ -20995,7 +21068,7 @@ fn handle_xi2_request(
             let dev = u16::from(*body.first().unwrap_or(&0));
             let first = *body.get(1).unwrap_or(&0);
             let count = *body.get(3).unwrap_or(&0);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21111,7 +21184,7 @@ fn handle_xi2_request(
         // byte-1 data slot — followed by 8*numKeyPerModifier keycodes.
         26 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21121,7 +21194,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_keys(dev) {
+            if !xi1_device_has_keys(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             // Prefer the per-device override stored by
@@ -21155,7 +21228,7 @@ fn handle_xi2_request(
         27 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             let kpm = *body.get(1).unwrap_or(&0);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21165,7 +21238,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_keys(dev) {
+            if !xi1_device_has_keys(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             let need = 8usize * usize::from(kpm);
@@ -21250,7 +21323,7 @@ fn handle_xi2_request(
         // this length.
         28 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21260,7 +21333,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_buttons(dev) {
+            if !xi1_device_has_buttons(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             // nElts lives at byte 8 (first byte after the reply header);
@@ -21288,7 +21361,7 @@ fn handle_xi2_request(
         29 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             let map_length = *body.get(1).unwrap_or(&0);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21298,7 +21371,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_buttons(dev) {
+            if !xi1_device_has_buttons(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             // Xorg's `setbmap.c::ProcXSetDeviceButtonMapping` does NOT
@@ -21390,7 +21463,7 @@ fn handle_xi2_request(
         // against that, so mirror it.
         30 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21407,7 +21480,7 @@ fn handle_xi2_request(
                 .unwrap_or_default();
             let mut data: Vec<u8> = Vec::new();
             let mut num_classes = 0u8;
-            if xi1_device_has_keys(dev) {
+            if xi1_device_has_keys(&state.xi_devices, dev) {
                 // xKeyState: keycodes 8..=255 → num_keys = 248.
                 data.push(0); // class = KeyClass
                 data.push(36); // length
@@ -21416,7 +21489,7 @@ fn handle_xi2_request(
                 data.extend_from_slice(&dev_state.keys_down);
                 num_classes += 1;
             }
-            if xi1_device_has_buttons(dev) {
+            if xi1_device_has_buttons(&state.xi_devices, dev) {
                 data.push(1); // class = ButtonClass
                 data.push(36); // length
                 data.push(7); // num_buttons
@@ -21424,7 +21497,7 @@ fn handle_xi2_request(
                 data.extend_from_slice(&dev_state.buttons_down);
                 num_classes += 1;
             }
-            if xi1_device_has_valuators(dev) {
+            if xi1_device_has_valuators(&state.xi_devices, dev) {
                 // 4 axes: X / Y are the sprite position, the two
                 // scroll axes carry no accumulated state.
                 data.push(2); // class = ValuatorClass
@@ -21461,7 +21534,7 @@ fn handle_xi2_request(
             let dev = u16::from(body[4]);
             let class_count = usize::from(u16::from_le_bytes([body[6], body[7]]));
             let num_events = usize::from(body[8]);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21496,7 +21569,7 @@ fn handle_xi2_request(
                 let Some(class) = read_class(off) else {
                     break;
                 };
-                if !xi1_device_valid(xi1_event_class_device(class)) {
+                if !xi1_device_valid(&state.xi_devices, xi1_event_class_device(class)) {
                     return xi1_error(
                         state,
                         client_id,
@@ -21665,7 +21738,7 @@ fn handle_xi2_request(
             let feedback_class = *body.get(2).unwrap_or(&0);
             #[allow(clippy::cast_possible_wrap)]
             let percent = *body.get(3).unwrap_or(&0) as i8;
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21696,8 +21769,9 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            let feedback_exists =
-                feedback_class == 0 && feedback_id == 0 && xi1_device_has_keys(dev);
+            let feedback_exists = feedback_class == 0
+                && feedback_id == 0
+                && xi1_device_has_keys(&state.xi_devices, dev);
             if !feedback_exists {
                 return xi1_error(
                     state,
@@ -21718,7 +21792,7 @@ fn handle_xi2_request(
             let dev = u16::from(*body.first().unwrap_or(&0));
             let first = *body.get(1).unwrap_or(&0);
             let num = *body.get(2).unwrap_or(&0);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21728,7 +21802,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_valuators(dev) {
+            if !xi1_device_has_valuators(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             if u16::from(first) + u16::from(num) > u16::from(XI1_POINTER_AXES) {
@@ -21795,7 +21869,7 @@ fn handle_xi2_request(
             let control =
                 u16::from_le_bytes([*body.first().unwrap_or(&0), *body.get(1).unwrap_or(&0)]);
             let dev = u16::from(*body.get(2).unwrap_or(&0));
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21815,7 +21889,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !xi1_device_has_valuators(dev) {
+            if !xi1_device_has_valuators(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             let num_axes = usize::from(XI1_POINTER_AXES);
@@ -21861,7 +21935,7 @@ fn handle_xi2_request(
             }
             let control = u16::from_le_bytes([body[0], body[1]]);
             let dev = u16::from(body[2]);
-            if !xi1_device_valid(dev) {
+            if !xi1_device_valid(&state.xi_devices, dev) {
                 return xi1_error(
                     state,
                     client_id,
@@ -21890,7 +21964,7 @@ fn handle_xi2_request(
                     return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
                 }
             }
-            if !xi1_device_has_valuators(dev) {
+            if !xi1_device_has_valuators(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
             // Xorg initializes relative axes without physical resolution
@@ -21983,7 +22057,7 @@ fn handle_xi2_request(
             } else {
                 0
             };
-            if !xi1_device_has_keys(dev) {
+            if !xi1_device_has_keys(&state.xi_devices, dev) {
                 return xi1_error(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, 0, minor);
             }
             let focus = if dev == crate::xinput::DEVICEID_MASTER_KEYBOARD {

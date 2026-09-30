@@ -62,9 +62,12 @@ pub fn deliver_state_notify(state: &mut ServerState, deviceid: u16, window: Reso
         .get(&deviceid)
         .copied()
         .unwrap_or_default();
-    let has_keys = crate::core_loop::process_request::xi1_device_has_keys(deviceid);
-    let has_buttons = crate::core_loop::process_request::xi1_device_has_buttons(deviceid);
-    let has_valuators = crate::core_loop::process_request::xi1_device_has_valuators(deviceid);
+    let has_keys =
+        crate::core_loop::process_request::xi1_device_has_keys(&state.xi_devices, deviceid);
+    let has_buttons =
+        crate::core_loop::process_request::xi1_device_has_buttons(&state.xi_devices, deviceid);
+    let has_valuators =
+        crate::core_loop::process_request::xi1_device_has_valuators(&state.xi_devices, deviceid);
     // Stored axis values (Xorg `axisVal`): real motion keeps axes 0/1
     // at the sprite position, device-motion fakes write their payload.
     let axes = dev_state.valuators;

@@ -210,14 +210,20 @@ discard it. Property changes continue to emit XI1
 ## Query and property protocol
 
 `XIQueryDevice` and XI1 `XListInputDevices` iterate one registry snapshot.
-They return the same live ID set, names, roles, attachments, and compatible
-class/type information. XI1 reports `MOUSE`, `KEYBOARD`, `TOUCHPAD`, or
+They return the same live ID set, names, roles, and compatible class/type
+information. The XI1 descriptor retains registry attachment metadata, but
+Xorg's `Xi/listdev.c::ListDeviceInfo` leaves the legacy `xDeviceInfo.attached`
+wire byte zero; XI2 reports the live attachments. XI1 reports
+`MOUSE`, `KEYBOARD`, `TOUCHPAD`, or
 `TOUCHSCREEN` as appropriate; type atoms are interned at server start.
 XI2 emits the classes supported by each facet, including TouchClass only
 where libinput reports touch. Queries for one ID and XI wildcard IDs obey
 the same registry. A hotplugged device is visible in both APIs before its
 presence/hierarchy notification is delivered. The XI1 encoder must accept
 an arbitrary list; its current four-entry layout cannot remain.
+`XOpenDevice` opens listed slave devices and returns classes for the selected
+facet. Masters remain listed but return BadDevice, matching
+`Xi/opendev.c::ProcXOpenDevice`; unknown IDs return BadDevice as well.
 
 `XIListProperties`, `XIGetProperty`, XI1 property requests,
 `xinput list-props`, `XIChangeProperty`, and `XIDeleteProperty` resolve the requested
