@@ -395,12 +395,11 @@ const XI_REASON_DEVICE_CHANGE: u8 = 2;
 /// Emit an XI2 `XI_DeviceChanged` for the slave pointer (device 4) to
 /// every client that selected `XI_DeviceChanged` on it.
 ///
-/// Called after `xi_seed_touchpad` / `xi_clear_touchpad` so a running
-/// desktop re-reads device 4 (picking up the new name + libinput
-/// properties when a touchpad appears, or the reverted defaults when it
-/// disappears). The carried class set mirrors the device-4 classes the
-/// XIQueryDevice handler reports (button + 4 valuators + 2 scroll), so a
-/// client re-querying after the event sees a consistent device.
+/// This retained device-4 emitter is part of the legacy fixed-topology
+/// path. The current `ServerState::xi_seed_touchpad` hook leaves virtual
+/// XTEST device 4 untouched; production physical add/remove publication is
+/// handled by the later registry-lifecycle task. The carried class set keeps
+/// the query-compatible button + 4 valuator + 2 scroll shape.
 ///
 /// Selection matches device 4 explicitly, plus the `XIAllDevices` (0)
 /// and `XIAllMasterDevices` (1) wildcards a client may have used. If no
@@ -461,154 +460,39 @@ pub fn emit_xi2_device_changed_slave_pointer(
     })
 }
 
-/// Build the XI2 device-class block for the slave pointer (device 4),
-/// returning `(class_bytes, num_classes)`.
+/// Build the XI2 device-class block for virtual XTEST pointer 4.
 ///
-/// This is the SINGLE source of truth for device 4's class shape:
-/// Button(7) + Valuator×4 (X, Y, vert-scroll, horiz-scroll) + Scroll×2
-/// (vert, horiz). Both XIQueryDevice's device-4 path (opcode 48) and the
-/// touchpad-add/remove `XI_DeviceChanged` fanout call it, so the bytes can
-/// never drift apart (asserted byte-identical by
-/// `query_device_4_matches_device_changed_block`). `num_classes` is
-/// derived from the writes below, not hardcoded at the call sites.
-///
-/// The scroll valuators MUST stay declared — dropping them fires a
-/// Gdk-CRITICAL (`_gdk_x11_device_xi2_add_scroll_valuator` asserts the
-/// scroll axis index is within the valuator count).
+/// The query encoder owns the shared button/valuator/scroll class layout;
+/// both XIQueryDevice and DeviceChanged use it so their class blocks remain
+/// byte-identical for little-endian clients.
 pub(crate) fn build_slave_pointer_class_block(state: &mut ServerState) -> (Vec<u8>, u16) {
-    const DEVICEID: u16 = 4;
-
-    fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, label_atoms: &[x11::AtomId]) {
-        let le = ClientByteOrder::LittleEndian;
-        let num_buttons = u16::try_from(label_atoms.len()).unwrap_or(u16::MAX);
-        let state_words = num_buttons.div_ceil(32) as usize;
-        let byte_len = 8 + 4 * state_words + 4 * num_buttons as usize;
-        x11::write_u16(le, buf, 1); // type = Button
-        x11::write_u16(le, buf, (byte_len / 4) as u16);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, num_buttons);
-        buf.extend(std::iter::repeat_n(0u8, 4 * state_words));
-        for atom in label_atoms {
-            x11::write_u32(le, buf, atom.0);
-        }
-    }
-
-    fn write_valuator_class(
-        buf: &mut Vec<u8>,
-        sourceid: u16,
-        number: u16,
-        label_atom: x11::AtomId,
-        min_int: i32,
-        max_int: i32,
-        mode: u8,
-        value: i32,
-    ) {
-        let le = ClientByteOrder::LittleEndian;
-        x11::write_u16(le, buf, 2); // type = Valuator
-        x11::write_u16(le, buf, 11);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, number);
-        x11::write_u32(le, buf, label_atom.0);
-        x11::write_u32(le, buf, min_int as u32);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, max_int as u32);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, value as u32);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, 0); // resolution
-        buf.push(mode);
-        buf.extend_from_slice(&[0u8; 3]);
-    }
-
-    fn write_scroll_class(buf: &mut Vec<u8>, sourceid: u16, number: u16, scroll_type: u16) {
-        let le = ClientByteOrder::LittleEndian;
-        x11::write_u16(le, buf, 3); // type = Scroll
-        x11::write_u16(le, buf, 6);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, number);
-        x11::write_u16(le, buf, scroll_type);
-        x11::write_u16(le, buf, 0); // pad
-        x11::write_u32(le, buf, 0); // flags
-        x11::write_u32(le, buf, 1); // increment = 1.0
-        x11::write_u32(le, buf, 0);
-    }
-
-    let pointer = (
-        i32::from(state.randr.screen_width) / 2,
-        i32::from(state.randr.screen_height) / 2,
-    );
-    let button_labels = [
-        state.atoms.intern("Button Left", false),
-        state.atoms.intern("Button Middle", false),
-        state.atoms.intern("Button Right", false),
-        state.atoms.intern("Button Wheel Up", false),
-        state.atoms.intern("Button Wheel Down", false),
-        state.atoms.intern("Button Horiz Wheel Left", false),
-        state.atoms.intern("Button Horiz Wheel Right", false),
-    ];
-    let axis_labels = [
-        state.atoms.intern("Rel X", false),
-        state.atoms.intern("Rel Y", false),
-        state.atoms.intern("Rel Vert Scroll", false),
-        state.atoms.intern("Rel Horiz Scroll", false),
-    ];
-    let scroll = state.scroll_axis_value;
-
-    // `num_classes` is incremented per class written below so the count
-    // can never drift from the actual byte content.
-    let mut classes = Vec::new();
-    let mut num_classes = 0u16;
-    write_button_class(&mut classes, DEVICEID, &button_labels);
-    num_classes += 1;
-    write_valuator_class(
-        &mut classes,
-        DEVICEID,
-        0,
-        axis_labels[0],
-        -1,
-        -1,
-        0,
-        pointer.0,
-    );
-    num_classes += 1;
-    write_valuator_class(
-        &mut classes,
-        DEVICEID,
-        1,
-        axis_labels[1],
-        -1,
-        -1,
-        0,
-        pointer.1,
-    );
-    num_classes += 1;
-    write_valuator_class(
-        &mut classes,
-        DEVICEID,
-        2,
-        axis_labels[2],
-        -1,
-        0,
-        0,
-        scroll[0],
-    );
-    num_classes += 1;
-    write_valuator_class(
-        &mut classes,
-        DEVICEID,
-        3,
-        axis_labels[3],
-        -1,
-        0,
-        0,
-        scroll[1],
-    );
-    num_classes += 1;
-    write_scroll_class(&mut classes, DEVICEID, 2, 1); // vertical
-    num_classes += 1;
-    write_scroll_class(&mut classes, DEVICEID, 3, 2); // horizontal
-    num_classes += 1;
-    (classes, num_classes)
+    let class_data = crate::xinput::query::XiQueryClassData {
+        button_labels: [
+            state.atoms.intern("Button Left", false),
+            state.atoms.intern("Button Middle", false),
+            state.atoms.intern("Button Right", false),
+            state.atoms.intern("Button Wheel Up", false),
+            state.atoms.intern("Button Wheel Down", false),
+            state.atoms.intern("Button Horiz Wheel Left", false),
+            state.atoms.intern("Button Horiz Wheel Right", false),
+        ],
+        axis_labels: [
+            state.atoms.intern("Rel X", false),
+            state.atoms.intern("Rel Y", false),
+            state.atoms.intern("Rel Vert Scroll", false),
+            state.atoms.intern("Rel Horiz Scroll", false),
+        ],
+        pointer: (
+            i32::from(state.randr.screen_width) / 2,
+            i32::from(state.randr.screen_height) / 2,
+        ),
+        scroll: state.scroll_axis_value,
+    };
+    crate::xinput::query::build_pointer_classes(
+        ClientByteOrder::LittleEndian,
+        crate::xinput::DEVICEID_SLAVE_POINTER,
+        class_data,
+    )
 }
 
 /// State-borrowing replacement for `nested::expose_event_fanout`.

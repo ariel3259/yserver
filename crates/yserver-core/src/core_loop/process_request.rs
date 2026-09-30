@@ -17585,283 +17585,62 @@ fn handle_xi2_request(
             buf.extend_from_slice(&reply);
         }
         48 => {
-            // XIQueryDevice. Class type ids per XI2:
-            //   0=Key, 1=Button, 2=Valuator, 3=Scroll.
-            // ATOM=0 (None) is spec-legal for unlabeled buttons/axes —
-            // GDK falls back to a default string. Length fields are in
-            // 4-byte units and include the 8-byte class header (type +
-            // length + sourceid + a class-specific u16).
+            // XIQueryDevice: 0 means all live devices, 1 means the master
+            // pair, and every other ID selects one exact registry entry.
             debug!("client {} #{} XIQueryDevice", client_id.0, sequence.0);
-            let le = ClientByteOrder::LittleEndian;
-            let pointer = (
-                i32::from(state.randr.screen_width) / 2,
-                i32::from(state.randr.screen_height) / 2,
-            );
-            let button_labels = [
-                state.atoms.intern("Button Left", false),
-                state.atoms.intern("Button Middle", false),
-                state.atoms.intern("Button Right", false),
-                state.atoms.intern("Button Wheel Up", false),
-                state.atoms.intern("Button Wheel Down", false),
-                state.atoms.intern("Button Horiz Wheel Left", false),
-                state.atoms.intern("Button Horiz Wheel Right", false),
-            ];
-            let axis_labels = [
-                state.atoms.intern("Rel X", false),
-                state.atoms.intern("Rel Y", false),
-                state.atoms.intern("Rel Vert Scroll", false),
-                state.atoms.intern("Rel Horiz Scroll", false),
-            ];
-
-            // Device names come from the XI2 registry (`state.xi_devices`)
-            // so a seeded touchpad's real name is reported, and so the XI1
-            // `XListInputDevices` reply (which reads the SAME registry)
-            // can never disagree (the ListInputDevices fatal-CHECK class).
-            // Snapshot to owned Strings up front: the registry borrow must
-            // end before `infos`/`classes` are populated below.
-            let name_master_pointer = crate::xinput::device_name(&state.xi_devices, 2).to_owned();
-            let name_master_keyboard = crate::xinput::device_name(&state.xi_devices, 3).to_owned();
-            let name_slave_pointer = crate::xinput::device_name(&state.xi_devices, 4).to_owned();
-            let name_slave_keyboard = crate::xinput::device_name(&state.xi_devices, 5).to_owned();
-
-            fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, label_atoms: &[AtomId]) {
-                let le = ClientByteOrder::LittleEndian;
-                let num_buttons = u16::try_from(label_atoms.len()).unwrap_or(u16::MAX);
-                let state_words = num_buttons.div_ceil(32) as usize;
-                let byte_len = 8 + 4 * state_words + 4 * num_buttons as usize;
-                let units = byte_len / 4;
-                x11::write_u16(le, buf, 1); // type = Button
-                x11::write_u16(le, buf, units as u16);
-                x11::write_u16(le, buf, sourceid);
-                x11::write_u16(le, buf, num_buttons);
-                buf.extend(std::iter::repeat_n(0u8, 4 * state_words));
-                for atom in label_atoms {
-                    x11::write_u32(le, buf, atom.0);
+            if body.len() < 2 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    48,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let request_device_id = match byte_order {
+                ClientByteOrder::LittleEndian => u16::from_le_bytes([body[0], body[1]]),
+                ClientByteOrder::BigEndian => u16::from_be_bytes([body[0], body[1]]),
+            };
+            let devices = match state.xi_devices.query(request_device_id) {
+                Ok(devices) => devices,
+                Err(crate::xinput::XiQueryError::BadDevice(device_id)) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        XI2_FIRST_ERROR, // XI_BadDevice
+                        u32::from(device_id),
+                        48,
+                        XI2_MAJOR_OPCODE,
+                    );
                 }
-            }
-
-            fn write_valuator_class(
-                buf: &mut Vec<u8>,
-                sourceid: u16,
-                number: u16,
-                label_atom: AtomId,
-                min_int: i32,
-                max_int: i32,
-                mode: u8,
-                value: i32,
-            ) {
-                let le = ClientByteOrder::LittleEndian;
-                x11::write_u16(le, buf, 2); // type = Valuator
-                x11::write_u16(le, buf, 11);
-                x11::write_u16(le, buf, sourceid);
-                x11::write_u16(le, buf, number);
-                x11::write_u32(le, buf, label_atom.0);
-                x11::write_u32(le, buf, min_int as u32);
-                x11::write_u32(le, buf, 0);
-                x11::write_u32(le, buf, max_int as u32);
-                x11::write_u32(le, buf, 0);
-                x11::write_u32(le, buf, value as u32);
-                x11::write_u32(le, buf, 0);
-                x11::write_u32(le, buf, 0); // resolution
-                buf.push(mode);
-                buf.extend_from_slice(&[0u8; 3]); // pad
-            }
-
-            // Scroll class: declares one of the device's valuators as
-            // a scroll axis. Length is 6 4-byte units (24 bytes).
-            // `number` references the valuator class; `scroll_type`:
-            // 1 = Vertical, 2 = Horizontal. Increment is 1.0 (one
-            // logical click per unit), matching our button-4/5
-            // synthesis at v120 boundaries.
-            fn write_scroll_class(buf: &mut Vec<u8>, sourceid: u16, number: u16, scroll_type: u16) {
-                let le = ClientByteOrder::LittleEndian;
-                x11::write_u16(le, buf, 3); // type = Scroll
-                x11::write_u16(le, buf, 6); // length = 6 units = 24 bytes
-                x11::write_u16(le, buf, sourceid);
-                x11::write_u16(le, buf, number);
-                x11::write_u16(le, buf, scroll_type);
-                x11::write_u16(le, buf, 0); // pad
-                // Flags: 0 (no NoEmulation, no Preferred). yserver
-                // emits BOTH the XI_Motion-with-scroll-axis update AND
-                // the legacy XI_ButtonPress/Release(4..7), with the
-                // `XIPointerEmulated` flag set on the latter (see
-                // `pointer_fanout` + `XI_POINTER_EMULATED`). This
-                // matches Xorg's modesetting/evdev declaration: the
-                // device class advertises "I emit emulated button
-                // events too," and clients use the per-event
-                // PointerEmulated flag to discard them after consuming
-                // the smooth-scroll Motion.
-                //
-                // Setting `NoEmulation` here while still emitting
-                // XI_ButtonPress(4..7) is a contract violation that
-                // crashed release Chrome on bee (Chrome's input
-                // dispatcher trusts the class declaration; receiving
-                // an event the class says can never come hits an
-                // internal invariant). Fixed 2026-05-29.
-                x11::write_u32(le, buf, 0); // flags = 0
-                // FP3232 increment = 1.0 → (1, 0)
-                x11::write_u32(le, buf, 1);
-                x11::write_u32(le, buf, 0);
-            }
-
-            fn write_key_class(buf: &mut Vec<u8>, sourceid: u16) {
-                let le = ClientByteOrder::LittleEndian;
-                // Header(8) + num_keycodes(implicit via pad u16 slot...) —
-                // actually: header = type+length+sourceid+num_keycodes (8B).
-                // Body = num_keycodes * CARD32 keycodes.
-                // X11 keycodes 8..=255 (248 of them) — matches the
-                // min_keycode/max_keycode advertised in the setup reply.
-                const NUM_KEYCODES: u16 = 248;
-                let body_bytes = 4 * NUM_KEYCODES as usize;
-                let units = (8 + body_bytes) / 4;
-                x11::write_u16(le, buf, 0); // type = Key
-                x11::write_u16(le, buf, units as u16);
-                x11::write_u16(le, buf, sourceid);
-                x11::write_u16(le, buf, NUM_KEYCODES);
-                for kc in 8u32..=255 {
-                    x11::write_u32(le, buf, kc);
-                }
-            }
-
-            fn write_device_info(
-                buf: &mut Vec<u8>,
-                deviceid: u16,
-                use_type: u16,
-                attachment: u16,
-                name: &str,
-                classes: &[u8],
-                num_classes: u16,
-            ) {
-                let le = ClientByteOrder::LittleEndian;
-                x11::write_u16(le, buf, deviceid);
-                x11::write_u16(le, buf, use_type);
-                x11::write_u16(le, buf, attachment);
-                x11::write_u16(le, buf, num_classes);
-                x11::write_u16(le, buf, name.len() as u16);
-                buf.push(1); // enabled
-                buf.push(0); // pad
-                buf.extend_from_slice(name.as_bytes());
-                x11::pad_vec4(buf);
-                buf.extend_from_slice(classes);
-            }
-
-            let mut infos = Vec::new();
-
-            // Master Pointer (deviceid=2):
-            //   Button(7) + Valuator(0 X Absolute) + Valuator(1 Y
-            //   Absolute) + Valuator(2 vscroll Relative) + Valuator(3
-            //   hscroll Relative) + Scroll(2 Vertical) + Scroll(3
-            //   Horizontal).
-            //
-            // Earlier attempt `20fd361` declared the Scroll classes
-            // referencing axes 2/3 but only declared valuators 0/1 —
-            // GDK's `_gdk_x11_device_xi2_add_scroll_valuator` asserts
-            // `scroll_number < n_axes`, firing Gdk-CRITICAL on every
-            // GTK startup. That regression was reverted in `e690ca0`.
-            // This time the scroll valuators ARE declared, so GDK
-            // registers them as scroll axes and processes wheel input
-            // through its modern path instead of the legacy
-            // button-4/5 fallback (which left caja / appearance
-            // settings ignoring the wheel until a view-switch).
-            {
-                let deviceid: u16 = 2;
-                let name = name_master_pointer.as_str();
-                let mut classes = Vec::new();
-                write_button_class(&mut classes, deviceid, &button_labels);
-                write_valuator_class(
-                    &mut classes,
-                    deviceid,
-                    0,
-                    axis_labels[0],
-                    -1,
-                    -1,
-                    0,
-                    pointer.0,
-                );
-                write_valuator_class(
-                    &mut classes,
-                    deviceid,
-                    1,
-                    axis_labels[1],
-                    -1,
-                    -1,
-                    0,
-                    pointer.1,
-                );
-                write_valuator_class(
-                    &mut classes,
-                    deviceid,
-                    2,
-                    axis_labels[2],
-                    -1,
-                    0,
-                    0,
-                    state.scroll_axis_value[0],
-                );
-                write_valuator_class(
-                    &mut classes,
-                    deviceid,
-                    3,
-                    axis_labels[3],
-                    -1,
-                    0,
-                    0,
-                    state.scroll_axis_value[1],
-                );
-                write_scroll_class(&mut classes, deviceid, 2, 1); // vertical
-                write_scroll_class(&mut classes, deviceid, 3, 2); // horizontal
-                write_device_info(&mut infos, deviceid, 1, 3, name, &classes, 7);
-            }
-
-            // Master Keyboard (deviceid=3): Key with keycodes 8..=255.
-            {
-                let deviceid: u16 = 3;
-                let name = name_master_keyboard.as_str();
-                let mut classes = Vec::new();
-                write_key_class(&mut classes, deviceid);
-                write_device_info(&mut infos, deviceid, 2, 2, name, &classes, 1);
-            }
-
-            // Attached slave devices. GTK/GDK builds its seat/device
-            // tables from the XI2 master/slave hierarchy and also
-            // probes the first slave pointer for libinput-ish
-            // properties. Device 4 therefore needs to look like a
-            // generic attached pointer, not like XTEST.
-            {
-                let deviceid: u16 = 4;
-                // Name from the XI2 registry: a seeded touchpad reports its
-                // real libinput name here; the XI1 ListInputDevices encoder
-                // reads the same source so the two enumerations agree.
-                let name = name_slave_pointer.as_str();
-                // Device 4's class block is built by the SINGLE shared
-                // builder in `fanout` so this reply and the touchpad
-                // add/remove XI_DeviceChanged event can never drift
-                // (asserted byte-identical by
-                // `query_device_4_matches_device_changed_block`). The
-                // local `write_*_class` helpers above are still used by
-                // devices 2/3/5, which have different shapes.
-                let (classes, num_classes) =
-                    crate::core_loop::fanout::build_slave_pointer_class_block(state);
-                write_device_info(&mut infos, deviceid, 3, 2, name, &classes, num_classes);
-            }
-
-            {
-                let deviceid: u16 = 5;
-                let name = name_slave_keyboard.as_str();
-                let mut classes = Vec::new();
-                write_key_class(&mut classes, deviceid);
-                write_device_info(&mut infos, deviceid, 4, 3, name, &classes, 1);
-            }
-
-            let mut reply = x11::fixed_reply(
-                byte_order,
-                sequence,
-                0,
-                x11::checked_units(infos.len())? as u32,
-            );
-            x11::write_u16(le, &mut reply, 4); // num_devices
-            reply.extend_from_slice(&[0; 22]);
-            reply.extend_from_slice(&infos);
+            };
+            let class_data = crate::xinput::query::XiQueryClassData {
+                button_labels: [
+                    state.atoms.intern("Button Left", false),
+                    state.atoms.intern("Button Middle", false),
+                    state.atoms.intern("Button Right", false),
+                    state.atoms.intern("Button Wheel Up", false),
+                    state.atoms.intern("Button Wheel Down", false),
+                    state.atoms.intern("Button Horiz Wheel Left", false),
+                    state.atoms.intern("Button Horiz Wheel Right", false),
+                ],
+                axis_labels: [
+                    state.atoms.intern("Rel X", false),
+                    state.atoms.intern("Rel Y", false),
+                    state.atoms.intern("Rel Vert Scroll", false),
+                    state.atoms.intern("Rel Horiz Scroll", false),
+                ],
+                pointer: (
+                    i32::from(state.randr.screen_width) / 2,
+                    i32::from(state.randr.screen_height) / 2,
+                ),
+                scroll: state.scroll_axis_value,
+            };
+            let reply =
+                crate::xinput::query::encode_reply(byte_order, sequence, &devices, class_data)?;
             buf.extend_from_slice(&reply);
         }
         56 => {
