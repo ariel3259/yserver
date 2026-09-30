@@ -8733,6 +8733,12 @@ impl KmsBackend {
         // The existing fixture's pool is deliberately non-master and sized
         // for its synthetic 800x600 output. Release it before installing the
         // real topology; no CRTC has been touched yet.
+        // Its root fill is still in the fixture engine's open frame. Drain it
+        // before replacing the pool/engine so the old storage is never dropped
+        // with an unsubmitted initialization write.
+        backend
+            .engine
+            .shutdown(&mut backend.store, &mut backend.platform);
         backend.platform.scanout_pools.clear();
         backend.platform.bo_generations.clear();
         backend.platform.devices[0].key = actual_primary;
@@ -8812,12 +8818,7 @@ impl KmsBackend {
             pool_len
         ]];
         backend.platform.first_pageflip_logged = vec![false];
-        backend.engine = RenderEngine::new(&backend.platform).map_err(|error| {
-            io::Error::other(format!("live-KMS fixture: RenderEngine: {error:?}"))
-        })?;
-        backend.scene = SceneCompositor::new(&backend.platform).map_err(|error| {
-            io::Error::other(format!("live-KMS fixture: SceneCompositor: {error:?}"))
-        })?;
+        backend.reinitialize_live_kms_fixture_render_state()?;
 
         Ok(LiveKmsFixture {
             backend,
@@ -8825,6 +8826,22 @@ impl KmsBackend {
             _master: master,
             _exclusive: exclusive,
         })
+    }
+
+    /// The Vulkan scene fixture starts with a synthetic 800x600 root. A live
+    /// KMS fixture replaces that topology and discards the original engine,
+    /// which also held the initial root fill. Recreate the renderer around the
+    /// adopted output extent and initialize fresh root storage before the
+    /// first compose can sample it.
+    #[cfg(test)]
+    fn reinitialize_live_kms_fixture_render_state(&mut self) -> io::Result<()> {
+        self.engine = RenderEngine::new(&self.platform).map_err(|error| {
+            io::Error::other(format!("live-KMS fixture: RenderEngine: {error:?}"))
+        })?;
+        self.scene = SceneCompositor::new(&self.platform).map_err(|error| {
+            io::Error::other(format!("live-KMS fixture: SceneCompositor: {error:?}"))
+        })?;
+        self.apply_virtual_screen_extent(self.platform.fb_w, self.platform.fb_h)
     }
 
     /// Stage 4b — test-only read of the alias registry. Returns
@@ -20628,6 +20645,24 @@ fn select_scanout_read_route(
             continue;
         };
         let pool = pool.display_pool();
+        // An Owner current frame is the buffer the kernel confirmed on screen.
+        // Adopted BOs retain legacy phase metadata from their former route,
+        // which can leave an older OnScreen BO ahead of the actual Owner frame
+        // in phase-based selection.
+        if let Some(bo_idx) = backend.scene.owner_current_bo_idx(pool_idx) {
+            let local = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: i32::try_from(rx0 - lx0).unwrap_or(i32::MAX),
+                    y: i32::try_from(ry0 - ly0).unwrap_or(i32::MAX),
+                },
+                extent: rect.extent,
+            };
+            return Ok(ScanoutReadRoute::Pool {
+                pool_idx,
+                bo_idx,
+                local,
+            });
+        }
         for phase in phases {
             if let Some(bo_idx) = pool.bos.iter().position(|bo| bo.state.phase == *phase) {
                 let local = vk::Rect2D {
@@ -105443,8 +105478,11 @@ mod tests {
         );
         drop(preflight);
 
-        let base = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+        let mut base = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
             .unwrap_or_else(|error| panic!("card1 Vulkan base fixture failed: {error}"));
+        // Set the diagnostic root colour before the live-KMS fixture rebuilds
+        // root storage at the HDMI-2 extent.
+        base.core.bg_pixel = Some(0x0010_50E0);
         let mut fixture =
             super::KmsBackend::for_tests_with_live_kms_from_backend(base, Some("HDMI-2"))
                 .unwrap_or_else(|error| panic!("card1 HDMI-2 live fixture failed: {error}"));
@@ -105564,6 +105602,12 @@ mod tests {
             &hardware_complete,
         )
         .unwrap_or_else(|error| panic!("initial HDMI-2 clock probe failed: {error}"));
+        // Keep the live fixture's diagnostic root colour vivid so a person
+        // watching the monitor can distinguish yserver's frame from the
+        // black console. The fixture initialized the root storage in this
+        // colour before the Owner clock probe.
+        backend.core.bg_pixel = Some(0x0010_50E0);
+        c0_3cii_dump_kernel_planes(backend, device, "before the initial composed commit");
         c0_3cii_hotplug_initial_composed_commit(
             backend,
             device,
@@ -105577,6 +105621,9 @@ mod tests {
                 c0_3cii_hotplug_diagnostics_for_tests(backend, device, output_idx, hardware_crtc);
             panic!("initial HDMI-2 composition failed: {error}; {diagnostics}");
         });
+        c0_3cii_dump_kernel_planes(backend, device, "after the initial composed commit");
+        c0_3cii_report_pool_bos(backend, output_idx, "after initial composed commit");
+        Backend::dump_scanout(backend);
 
         // Keep startup composition on the same known-ready Owner path as 3b.
         // Hotplug observation and RANDR publication are needed only for the
@@ -105792,6 +105839,24 @@ mod tests {
                 &hardware_complete,
             )
             .unwrap_or_else(|error| panic!("cycle {cycle}: relit HDMI-2 frame failed: {error}"));
+            if cycle == 1 {
+                let relit_output_idx = backend
+                    .platform
+                    .outputs
+                    .iter()
+                    .position(|output| output.key == output_key)
+                    .expect("relit HDMI-2 output");
+                c0_3cii_dump_kernel_planes(
+                    backend,
+                    device,
+                    "after the first relight composed commit",
+                );
+                c0_3cii_report_pool_bos(
+                    backend,
+                    relit_output_idx,
+                    "after first relight composed commit",
+                );
+            }
         }
     }
 
@@ -106005,6 +106070,481 @@ mod tests {
             resource_service_holds_adopted_bos,
             scanout_bos_with_service,
         )
+    }
+
+    /// What the kernel reports it is scanning out: every plane's CRTC and
+    /// framebuffer, and every CRTC's mode. A person watching the monitor sees
+    /// the screen; this prints the kernel's side of the same moment.
+    fn c0_3cii_dump_kernel_planes(backend: &super::KmsBackend, device: DrmDeviceKey, label: &str) {
+        use ::drm::control::Device as _;
+
+        let Some(kms) = backend
+            .platform
+            .devices
+            .iter()
+            .find(|entry| entry.key == device)
+        else {
+            eprintln!("kernel planes {label}: device {device} is absent");
+            return;
+        };
+        let drm = kms.device.as_ref();
+        let planes = drm
+            .plane_handles()
+            .map(|handles| {
+                handles
+                    .iter()
+                    .filter_map(|handle| drm.get_plane(*handle).ok().map(|plane| (*handle, plane)))
+                    .map(|(handle, plane)| {
+                        format!(
+                            "plane {}: crtc={:?} fb={:?}",
+                            u32::from(handle),
+                            plane.crtc().map(u32::from),
+                            plane.framebuffer().map(u32::from)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let crtcs = drm
+            .resource_handles()
+            .map(|resources| {
+                resources
+                    .crtcs()
+                    .iter()
+                    .filter_map(|handle| drm.get_crtc(*handle).ok().map(|crtc| (*handle, crtc)))
+                    .map(|(handle, crtc)| {
+                        format!(
+                            "crtc {}: mode={:?} fb={:?}",
+                            u32::from(handle),
+                            crtc.mode().map(|mode| (mode.size(), mode.vrefresh())),
+                            crtc.framebuffer().map(u32::from)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        eprintln!("kernel planes {label}: {planes:?}; {crtcs:?}");
+    }
+
+    /// Read one particular managed Shared scanout BO, bypassing legacy
+    /// `BoPhase` selection. The caller's `Read` lease stays alive through the
+    /// synchronous staging copy, so this reports the allocation that owns the
+    /// image rather than whichever BO a screenshot helper happens to choose.
+    fn c0_3cii_read_pool_bo(
+        backend: &mut super::KmsBackend,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> Result<(Option<u32>, Vec<u8>, u32, u32), String> {
+        use crate::kms::render::resources::UseKind;
+
+        let (key, width, height, initialized) = {
+            let scanout = backend
+                .platform
+                .scanout_pools
+                .get(output_idx)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| format!("output {output_idx} has no pool"))?;
+            let crate::kms::vk::scanout::OutputScanout::Shared(pool) = scanout else {
+                return Err(format!("output {output_idx} does not use Shared scanout"));
+            };
+            let bo = pool
+                .bos
+                .get(bo_idx)
+                .ok_or_else(|| format!("output {output_idx} has no BO {bo_idx}"))?;
+            let key = bo
+                .managed_key()
+                .ok_or_else(|| format!("output {output_idx} BO {bo_idx} is not managed"))?;
+            let legacy_written = backend
+                .platform
+                .bo_generations
+                .get(output_idx)
+                .and_then(|entries| entries.get(bo_idx))
+                .is_some_and(|entry| entry.last_present_generation.is_some());
+            let owner_written = backend
+                .scene
+                .owner_generation_for_tests(output_idx, bo_idx)
+                .is_some();
+            (
+                key,
+                pool.width,
+                pool.height,
+                legacy_written || owner_written,
+            )
+        };
+        let byte_len = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| format!("output {output_idx} BO {bo_idx} byte size overflow"))?;
+
+        let (read_lease, image, framebuffer) = {
+            let service = backend
+                .resource_service
+                .as_mut()
+                .ok_or_else(|| "Owner fixture has no resource service".to_string())?;
+            let lease = service
+                .reserve(key, UseKind::Read)
+                .map_err(|error| format!("reserve output {output_idx} BO {bo_idx}: {error:?}"))?;
+            let (image, framebuffer) = service
+                .with_scanout_read(&lease, |allocation| {
+                    (
+                        allocation.shared().image,
+                        allocation
+                            .file_owned()
+                            .and_then(|file_owned| file_owned.fb_handle())
+                            .map(u32::from),
+                    )
+                })
+                .map_err(|error| format!("resolve output {output_idx} BO {bo_idx}: {error:?}"))?;
+            (lease, image, framebuffer)
+        };
+
+        let vk = backend
+            .platform
+            .vk
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Owner fixture has no Vulkan context".to_string())?;
+        let command_pool = backend
+            .platform
+            .ops_command_pool_handle()
+            .ok_or_else(|| "Owner fixture has no readback command pool".to_string())?;
+        let (staging_buffer, staging_mapped) =
+            super::ensure_scanout_readback(&mut backend.platform, &vk, byte_len)
+                .map_err(|error| format!("allocate BO readback staging: {error}"))?;
+        let old_layout = if initialized {
+            ash::vk::ImageLayout::GENERAL
+        } else {
+            ash::vk::ImageLayout::UNDEFINED
+        };
+        let op = super::ensure_scanout_readback_op(&mut backend.platform, &vk, command_pool)
+            .map_err(|error| format!("allocate BO readback command: {error}"))?;
+        let copy_result = op.run(|vk, command_buffer| {
+            let (src_stage, src_access) = if old_layout == ash::vk::ImageLayout::UNDEFINED {
+                (
+                    ash::vk::PipelineStageFlags2::NONE,
+                    ash::vk::AccessFlags2::NONE,
+                )
+            } else {
+                (
+                    ash::vk::PipelineStageFlags2::ALL_COMMANDS,
+                    ash::vk::AccessFlags2::MEMORY_WRITE,
+                )
+            };
+            let before = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(old_layout)
+                .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let before_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&before);
+            unsafe { vk.device.cmd_pipeline_barrier2(command_buffer, &before_dep) };
+            let region = [ash::vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    ash::vk::ImageSubresourceLayers::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_offset(ash::vk::Offset3D::default())
+                .image_extent(ash::vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })];
+            unsafe {
+                vk.device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging_buffer,
+                    &region,
+                )
+            };
+            let after = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+                .src_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+                .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(ash::vk::ImageLayout::GENERAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let after_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&after);
+            unsafe { vk.device.cmd_pipeline_barrier2(command_buffer, &after_dep) };
+            Ok(())
+        });
+        drop(read_lease);
+        if let Err(error) = copy_result {
+            return Err(format!("copy output {output_idx} BO {bo_idx}: {error:?}"));
+        }
+        if let Some(readback) = backend.platform.scanout_readback.as_ref() {
+            readback
+                .invalidate_for_read()
+                .map_err(|error| format!("invalidate BO readback: {error:?}"))?;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), byte_len).to_vec() };
+        Ok((framebuffer, bytes, width, height))
+    }
+
+    fn c0_3cii_sample_rgb(bytes: &[u8], width: u32, height: u32, x: u32, y: u32) -> Option<u32> {
+        if x >= width || y >= height {
+            return None;
+        }
+        let offset = usize::try_from(y)
+            .ok()?
+            .checked_mul(usize::try_from(width).ok()?)?
+            .checked_add(usize::try_from(x).ok()?)?
+            .checked_mul(4)?;
+        let pixel = bytes.get(offset..offset.checked_add(4)?)?;
+        Some((u32::from(pixel[2]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[0]))
+    }
+
+    /// Print identity and representative pixels for every scanout BO. The
+    /// samples come from the named managed allocation, not from phase-based
+    /// screenshot selection.
+    fn c0_3cii_report_pool_bos(backend: &mut super::KmsBackend, output_idx: usize, label: &str) {
+        let bo_count = backend
+            .platform
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .map(|pool| pool.display_pool().bos.len())
+            .unwrap_or(0);
+        for bo_idx in 0..bo_count {
+            let (phase, owner_state, owner_generation, legacy_generation) = {
+                let bo = &backend.platform.scanout_pools[output_idx]
+                    .as_ref()
+                    .expect("report output pool")
+                    .display_pool()
+                    .bos[bo_idx];
+                (
+                    bo.state.phase,
+                    backend.scene.owner_state_for_tests(output_idx, bo_idx),
+                    backend.scene.owner_generation_for_tests(output_idx, bo_idx),
+                    backend
+                        .platform
+                        .bo_generations
+                        .get(output_idx)
+                        .and_then(|entries| entries.get(bo_idx))
+                        .and_then(|entry| entry.last_present_generation),
+                )
+            };
+            match c0_3cii_read_pool_bo(backend, output_idx, bo_idx) {
+                Ok((framebuffer, bytes, width, height)) => {
+                    let samples = [
+                        ("top-left", 0, 0),
+                        ("top-right", width.saturating_sub(1), 0),
+                        ("bottom-left", 0, height.saturating_sub(1)),
+                        (
+                            "bottom-right",
+                            width.saturating_sub(1),
+                            height.saturating_sub(1),
+                        ),
+                        ("centre", width / 2, height / 2),
+                        ("inside-800x600", 400, 300),
+                        ("outside-800x600", 900, 700),
+                    ]
+                    .into_iter()
+                    .map(|(name, x, y)| {
+                        let value = c0_3cii_sample_rgb(&bytes, width, height, x, y).map_or_else(
+                            || "out-of-bounds".to_string(),
+                            |rgb| format!("#{rgb:06X}"),
+                        );
+                        format!("{name}=({x},{y}) {value}")
+                    })
+                    .collect::<Vec<_>>();
+                    eprintln!(
+                        "pool BO {label}: output={output_idx} bo={bo_idx} fb={framebuffer:?} \
+                         legacy_phase={phase:?} owner_state={owner_state:?} \
+                         owner_generation={owner_generation:?} \
+                         legacy_last_present_generation={legacy_generation:?} \
+                         extent={width}x{height} samples=[{}]",
+                        samples.join(", ")
+                    );
+                }
+                Err(error) => eprintln!(
+                    "pool BO {label}: output={output_idx} bo={bo_idx} \
+                     legacy_phase={phase:?} owner_state={owner_state:?} \
+                     owner_generation={owner_generation:?} \
+                     legacy_last_present_generation={legacy_generation:?} \
+                     readback_error={error}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_live_kms_fixture_first_owner_frame_and_readback_vulkan() {
+        use crate::kms::vk::scanout::BoPhase;
+
+        const ROOT_BLUE: u32 = 0x0010_50E0;
+        let mut fixture =
+            owner_live_fixture().expect("environmental skip: no live Vulkan ICD available");
+        let backend = &mut fixture.backend;
+        assert!(backend.platform.output_uses_owner_route(0));
+
+        // Mirror the live-KMS handoff without a master, connector probe or
+        // modeset: drain the synthetic root fill, install a larger framebuffer
+        // extent, then run the same engine/scene/root reconstruction used by
+        // the live fixture. The fresh root must be painted in the current
+        // background before the first Owner scene samples it.
+        assert!(
+            backend.engine.frame_builder_is_open(),
+            "the fixture's initial root fill is still in its open frame"
+        );
+        backend
+            .engine
+            .shutdown(&mut backend.store, &mut backend.platform);
+        backend.core.bg_pixel = Some(ROOT_BLUE);
+        backend.platform.fb_w = 1920;
+        backend.platform.fb_h = 1080;
+        backend
+            .reinitialize_live_kms_fixture_render_state()
+            .expect("reinitialize root for the live framebuffer extent");
+        assert_eq!(
+            backend
+                .root_storage_extent()
+                .map(|extent| (extent.width, extent.height)),
+            Some((1920, 1080))
+        );
+
+        let device = backend.platform.outputs[0].key.device_key;
+        backend.scene.mark_scene_structure_dirty();
+        backend.tick_maybe_composite_for_tests_without_render_completion_drain();
+        backend.platform.wait_idle_bounded();
+        backend.drain_scanout_render_completions_for_tests();
+        let (prepared_bo, generation, waiting) = backend
+            .scene
+            .owner_prepared_for_tests(0)
+            .expect("the first Owner composition has a prepared BO");
+        assert!(!waiting, "the first Owner render completed");
+        let commit = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .map(|record| record.commit_id())
+            .expect("the first composed generation reached Owner admission");
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::Accepted { commit }],
+            std::time::Instant::now(),
+        );
+        backend.route_owner_event_batch(
+            device,
+            vec![crate::kms::owner::device::OwnerEvent::HardwareComplete { commit }],
+            std::time::Instant::now(),
+        );
+        let device_index = backend
+            .platform
+            .devices
+            .iter()
+            .position(|entry| entry.key == device)
+            .expect("Owner device index");
+        let completion_events = backend.complete_owner_for_tests(device_index);
+        backend.route_owner_event_batch(device, completion_events, std::time::Instant::now());
+        assert_eq!(backend.scene.owner_current_bo_idx(0), Some(prepared_bo));
+        assert_eq!(
+            backend.scene.owner_generation_for_tests(0, prepared_bo),
+            Some(generation)
+        );
+
+        let (framebuffer, bytes, width, height) =
+            c0_3cii_read_pool_bo(backend, 0, prepared_bo).expect("read the current Owner BO");
+        assert!(framebuffer.is_some(), "the current Owner BO has a DRM FB");
+        for (label, x, y) in [
+            ("top-left", 0, 0),
+            ("centre", width / 2, height / 2),
+            ("inside-800x600", 400, 300),
+            ("bottom-right", width - 1, height - 1),
+        ] {
+            assert_eq!(
+                c0_3cii_sample_rgb(&bytes, width, height, x, y),
+                Some(ROOT_BLUE),
+                "the first Owner BO must contain the initialized root at {label}"
+            );
+        }
+
+        // Model a retained legacy OnScreen phase on a sibling BO. Before
+        // Owner-aware selection, both root GetImage and dumps picked this
+        // stale phase ahead of the buffer confirmed current by Owner.
+        let pool_len = backend.platform.scanout_pools[0]
+            .as_ref()
+            .expect("Owner pool")
+            .display_pool()
+            .bos
+            .len();
+        let stale_bo = (0..pool_len)
+            .find(|bo_idx| *bo_idx != prepared_bo)
+            .expect("pool has a sibling BO");
+        let previous_phase = {
+            let pool = backend.platform.scanout_pools[0]
+                .as_mut()
+                .expect("Owner pool")
+                .display_pool_mut();
+            let bo = &mut pool.bos[stale_bo];
+            let previous = bo.state.phase;
+            bo.state.phase = BoPhase::OnScreen;
+            previous
+        };
+        let requested = r(0, 0, 8, 8);
+        for selection in [
+            super::ScanoutReadSelection::OnScreenOnly,
+            super::ScanoutReadSelection::PermissiveDump,
+        ] {
+            let route = super::select_scanout_read_route(backend, requested, selection)
+                .expect("an Owner-current BO resolves the requested root rect");
+            assert_eq!(
+                route,
+                super::ScanoutReadRoute::Pool {
+                    pool_idx: 0,
+                    bo_idx: prepared_bo,
+                    local: requested,
+                },
+                "{selection:?} must select the Owner-current framebuffer"
+            );
+        }
+        let root_read = super::read_scanout_region(
+            backend,
+            requested,
+            super::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("root GetImage reads the Owner-current BO");
+        assert_eq!(root_read.len(), 8 * 8 * 4);
+        assert!(
+            root_read
+                .chunks_exact(4)
+                .all(|pixel| pixel[0] == 0xE0 && pixel[1] == 0x50 && pixel[2] == 0x10),
+            "root GetImage bytes come from the painted Owner-current BO"
+        );
+        backend.platform.scanout_pools[0]
+            .as_mut()
+            .expect("Owner pool")
+            .display_pool_mut()
+            .bos[stale_bo]
+            .state
+            .phase = previous_phase;
     }
 
     fn c0_3cii_hotplug_initial_composed_commit(

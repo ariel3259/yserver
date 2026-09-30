@@ -2502,6 +2502,18 @@ impl SceneCompositor {
             .position(|buffer| buffer.state() == OwnerBufferState::Current)
     }
 
+    /// BO that the Owner route has confirmed as current on this output.
+    /// Legacy `BoPhase` does not describe adopted Owner buffers, so scanout
+    /// readers must consult the Owner ledger once it has a current frame.
+    pub(crate) fn owner_current_bo_idx(&self, output_idx: usize) -> Option<usize> {
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        let index = Self::owner_current_index(state)?;
+        state
+            .owner_buffers
+            .get(index)
+            .map(|buffer| buffer.identity().bo_idx)
+    }
+
     fn insert_owner_buffer(
         state: &mut OutputSceneState,
         output_idx: usize,
@@ -4046,6 +4058,20 @@ impl SceneCompositor {
                     .and_then(|state| state.owner_buffers.get(index))
             })
             .map(OwnerBuffer::state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_generation_for_tests(
+        &self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> Option<u64> {
+        let state = self.inner.as_ref()?.outputs.get(output_idx)?;
+        let index = Self::owner_buffer_index(state, bo_idx)?;
+        state
+            .owner_buffers
+            .get(index)
+            .map(|buffer| buffer.identity().generation)
     }
 
     #[cfg(test)]
