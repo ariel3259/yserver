@@ -100,6 +100,7 @@ mod tests {
 
     fn device_removed(node: &str) -> Message {
         Message::HostInput(HostInputEvent::DeviceRemoved {
+            source_id: crate::xinput::InputSourceId(1),
             device_node: node.into(),
         })
     }

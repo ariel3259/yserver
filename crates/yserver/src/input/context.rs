@@ -17,6 +17,8 @@ use std::{
         unix::fs::OpenOptionsExt,
     },
     path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use input::{
@@ -29,9 +31,8 @@ use input::{
 };
 use libc::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
 use yserver_core::{
-    core_loop::{
-        DeviceInfo,
-        message::{LibinputConfigSnapshot, device_node_from_sysname},
+    core_loop::message::{
+        DeviceInfo, EndpointInstanceKey, LibinputConfigSnapshot, device_node_from_sysname,
     },
     xinput::{
         InputCapabilities, InputSourceId,
@@ -90,9 +91,13 @@ impl<K: Eq + Hash> SourceTracker<K> {
         Some(source_id)
     }
 
+    fn unbind_all(&mut self) {
+        self.bindings.clear();
+        self.live_ids.clear();
+    }
+
     /// Bind a replacement handle to an already allocated source after a
     /// caller has independently proven a paused continuation.
-    #[allow(dead_code)] // Used by the later VT continuation task.
     fn rebind(&mut self, key: K, source_id: InputSourceId) -> io::Result<()> {
         if self.bindings.contains_key(&key) || self.live_ids.contains(&source_id) {
             return Err(io::Error::new(
@@ -110,6 +115,97 @@ impl<K: Eq + Hash> SourceTracker<K> {
         self.bindings.insert(key, source_id);
         self.live_ids.insert(source_id);
         Ok(())
+    }
+}
+
+trait EndpointInstanceResolver: Send + Sync {
+    fn resolve(&self, sysname: &str) -> Option<EndpointInstanceKey>;
+}
+
+struct SysfsEndpointResolver;
+
+impl EndpointInstanceResolver for SysfsEndpointResolver {
+    fn resolve(&self, sysname: &str) -> Option<EndpointInstanceKey> {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::canonicalize(Path::new("/sys/class/input").join(sysname))
+                .ok()
+                .map(EndpointInstanceKey)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = sysname;
+            None
+        }
+    }
+}
+
+trait MonotonicClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+struct SystemMonotonicClock;
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResumeWindowToken(u64);
+
+struct ResumeWindow {
+    token: ResumeWindowToken,
+    deadline: Instant,
+}
+
+struct ResumeTracker {
+    /// Disabled source facts kept through the bounded continuation window.
+    paused: HashMap<InputSourceId, DeviceInfo>,
+    active: Option<ResumeWindow>,
+    next_token: Option<u64>,
+    clock: Arc<dyn MonotonicClock>,
+}
+
+impl ResumeTracker {
+    fn new(clock: Arc<dyn MonotonicClock>) -> Self {
+        Self {
+            paused: HashMap::new(),
+            active: None,
+            next_token: Some(1),
+            clock,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.active = None;
+    }
+
+    fn begin(&mut self) -> io::Result<()> {
+        let next = self
+            .next_token
+            .ok_or_else(|| io::Error::other("resume window token exhausted"))?;
+        let now = self.clock.now();
+        let deadline = now.checked_add(Duration::from_millis(2500)).unwrap_or(now);
+        self.next_token = next.checked_add(1);
+        self.active = Some(ResumeWindow {
+            token: ResumeWindowToken(next),
+            deadline,
+        });
+        Ok(())
+    }
+
+    fn window(&self) -> Option<(ResumeWindowToken, Instant)> {
+        self.active
+            .as_ref()
+            .map(|window| (window.token, window.deadline))
+    }
+
+    fn accepts_continuation(&self, now: Instant) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|window| now < window.deadline)
     }
 }
 
@@ -145,6 +241,11 @@ pub struct Context {
     /// Stable identity for each live libinput device handle. Device nodes are
     /// metadata and can be reused after an attachment is removed.
     sources: SourceTracker<Device>,
+    /// Latest atom-free source facts, including attachments retained while
+    /// libinput is suspended. Facts are keyed only by runtime source ID.
+    source_facts: HashMap<InputSourceId, DeviceInfo>,
+    resume_tracker: ResumeTracker,
+    endpoint_resolver: Arc<dyn EndpointInstanceResolver>,
     /// Live configurable pointer handles keyed by libinput handle identity.
     /// The device-node string is retained only for the legacy config-write
     /// API until the inventory migration replaces that selector.
@@ -203,12 +304,24 @@ impl SendContext {
         self.0.update_leds(leds);
     }
 
-    pub fn suspend(&mut self) {
-        self.0.suspend();
+    pub fn suspend(&mut self) -> Vec<InputEvent> {
+        self.0.suspend()
     }
 
-    pub fn resume(&mut self) -> io::Result<()> {
+    pub fn resume(&mut self) -> io::Result<Vec<InputEvent>> {
         self.0.resume()
+    }
+
+    pub(crate) fn resume_window(&self) -> Option<(ResumeWindowToken, Instant)> {
+        self.0.resume_window()
+    }
+
+    pub(crate) fn finish_resume_window(
+        &mut self,
+        token: ResumeWindowToken,
+        now: Instant,
+    ) -> Vec<InputEvent> {
+        self.0.finish_resume_window(token, now)
     }
 
     /// Route a `xinput set-prop` write to the wrapped libinput context.
@@ -236,6 +349,16 @@ impl AsFd for SendContext {
 
 impl Context {
     pub fn new() -> io::Result<Self> {
+        Self::new_with_runtime(
+            Arc::new(SysfsEndpointResolver),
+            Arc::new(SystemMonotonicClock),
+        )
+    }
+
+    fn new_with_runtime(
+        endpoint_resolver: Arc<dyn EndpointInstanceResolver>,
+        clock: Arc<dyn MonotonicClock>,
+    ) -> io::Result<Self> {
         // Access check (always-Direct: no libseat to grant device access).
         // If input nodes exist but any is permission-denied, yserver lacks
         // input access — the real keyboard/mouse won't open even if an odd
@@ -261,6 +384,9 @@ impl Context {
         Ok(Self {
             libinput,
             sources: SourceTracker::new(),
+            source_facts: HashMap::new(),
+            resume_tracker: ResumeTracker::new(clock),
+            endpoint_resolver,
             pointer_devices: HashMap::new(),
             keyboard_devices: HashMap::new(),
             last_leds: Led::empty(),
@@ -290,12 +416,62 @@ impl Context {
             match &event {
                 Event::Device(input::event::DeviceEvent::Added(d)) => {
                     let mut dev = d.device();
-                    let source_id = self.sources.add(dev.clone())?;
                     let name = dev.name().into_owned();
                     let tap_finger_count = dev.config_tap_finger_count();
                     let is_tp = is_touchpad(tap_finger_count);
+                    let sysname = dev.sysname().to_owned();
+                    let resume_key = self.endpoint_resolver.resolve(&sysname);
+                    if resume_key.is_none()
+                        && self
+                            .resume_tracker
+                            .accepts_continuation(self.resume_tracker.clock.now())
+                    {
+                        log::warn!(
+                            "libinput: cannot prove endpoint instance for {sysname:?} during VT recovery; adding a fresh source"
+                        );
+                    }
+                    let continuation = resume_key.as_ref().and_then(|key| {
+                        if !self
+                            .resume_tracker
+                            .accepts_continuation(self.resume_tracker.clock.now())
+                        {
+                            return None;
+                        }
+                        self.resume_tracker
+                            .paused
+                            .iter()
+                            .find(|(_, info)| info.resume_key.as_ref() == Some(key))
+                            .map(|(source_id, _)| *source_id)
+                    });
+                    let mut continued_source_id = None;
+                    let source_id = if let Some(source_id) = continuation {
+                        match self.sources.rebind(dev.clone(), source_id) {
+                            Ok(()) => {
+                                self.resume_tracker.paused.remove(&source_id);
+                                continued_source_id = Some(source_id);
+                                source_id
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "libinput: failed to rebind endpoint {sysname:?} to source {}: {err}; adding a fresh source",
+                                    source_id.0
+                                );
+                                self.sources.add(dev.clone())?
+                            }
+                        }
+                    } else {
+                        self.sources.add(dev.clone())?
+                    };
+                    let saved_config = continued_source_id
+                        .and_then(|source_id| self.source_facts.get(&source_id))
+                        .map(|info| info.config);
                     if is_tp {
                         configure_touchpad(&mut dev, &name);
+                    }
+                    if let Some(config) = saved_config {
+                        restore_config_snapshot(&mut dev, &name, config);
+                    }
+                    if is_tp {
                         log::info!(
                             "libinput: device added: {name:?} (touchpad — tap-to-click + \
                              disable-while-typing enabled)"
@@ -303,7 +479,6 @@ impl Context {
                     } else {
                         log::info!("libinput: device added: {name:?}");
                     }
-                    let sysname = dev.sysname().to_owned();
                     // Prefer the real udev devnode; fall back to the
                     // derived path (libinput sysname == `eventN`, so
                     // the node is always `/dev/input/eventN`).
@@ -331,23 +506,12 @@ impl Context {
                     } else {
                         LibinputConfigSnapshot::default()
                     };
-                    // A *real* relative pointer reports pointer acceleration.
-                    // The phantom HID "Consumer Control" / "System Control"
-                    // collections a keyboard or wireless receiver exposes are
-                    // pointer-capable to libinput but have no accel; excluding
-                    // them here keeps them from clobbering the single
-                    // slave-pointer slot (id 4, latest-wins) that the real
-                    // mouse must own, and keeps the write map to real devices.
-                    let is_real_pointer = is_tp || config.accel.available;
-                    // Stash the live device handle keyed by devnode so
-                    // `apply_device_config` (the KCM XIChangeProperty write
-                    // path) can route to the `config_*_set_*` setter.
-                    // `Device: Clone` is libinput's C-level refcount bump
-                    // (`libinput_device_ref`), so the handle survives after
-                    // this event's borrow drops. Stored for every real pointer
-                    // we seed props for — otherwise a mouse's write (accel,
-                    // left-handed, …) would silently no-op.
-                    if is_real_pointer {
+                    // Retain every pointer-capable handle so its full
+                    // recognized snapshot can be refreshed after successful
+                    // config writes and restored after a proven continuation.
+                    // Device identity, not the event-node string, joins it to
+                    // the source fact.
+                    if is_pointer || is_tp {
                         self.pointer_devices
                             .insert(dev.clone(), (device_node.clone(), dev.clone()));
                     }
@@ -377,6 +541,8 @@ impl Context {
                     }
                     let info = DeviceInfo {
                         source_id,
+                        enabled: true,
+                        resume_key,
                         capabilities: InputCapabilities {
                             keyboard: is_keyboard,
                             pointer: is_pointer,
@@ -390,7 +556,12 @@ impl Context {
                         is_touchpad: is_tp,
                         config,
                     };
-                    out.push(InputEvent::DeviceAdded(info));
+                    self.source_facts.insert(source_id, info.clone());
+                    if continued_source_id == Some(source_id) {
+                        out.push(InputEvent::DeviceResumed(info));
+                    } else {
+                        out.push(InputEvent::DeviceAdded(info));
+                    }
                 }
                 Event::Device(input::event::DeviceEvent::Removed(d)) => {
                     let dev = d.device();
@@ -413,6 +584,8 @@ impl Context {
                     self.pointer_devices.remove(&dev);
                     self.keyboard_devices.remove(&dev);
                     self.usable_input_devices.remove(&dev);
+                    self.source_facts.remove(&source_id);
+                    self.resume_tracker.paused.remove(&source_id);
                     out.push(InputEvent::DeviceRemoved {
                         source_id,
                         device_node,
@@ -473,10 +646,18 @@ impl Context {
         device_node: &str,
         change: DeviceConfigChange,
     ) -> Result<(), DeviceConfigError> {
-        self.pointer_devices
-            .values_mut()
-            .find(|(node, _)| node == device_node)
-            .map_or(Ok(()), |(_, dev)| libinput_config::apply(dev, change))
+        for (handle, (node, dev)) in &mut self.pointer_devices {
+            if node == device_node {
+                libinput_config::apply(dev, change)?;
+                if let Some(source_id) = self.sources.get(handle)
+                    && let Some(info) = self.source_facts.get_mut(&source_id)
+                {
+                    info.config = libinput_config::gather(dev);
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -513,19 +694,114 @@ fn configure_touchpad(dev: &mut Device, name: &str) {
     }
 }
 
+/// Reapply the confirmed pre-suspend libinput values after ordinary
+/// touchpad setup has run. The returned add/resume snapshot is gathered
+/// afterward, so failed setters are represented by the actual device state.
+fn restore_config_snapshot(dev: &mut Device, name: &str, config: LibinputConfigSnapshot) {
+    use DeviceConfigChange as C;
+
+    let mut changes = Vec::new();
+    changes.extend([
+        config.tap.available.then_some(C::Tap(config.tap.current)),
+        config
+            .tap_drag
+            .available
+            .then_some(C::TapDrag(config.tap_drag.current)),
+        config
+            .tap_drag_lock
+            .available
+            .then_some(C::TapDragLock(config.tap_drag_lock.current)),
+        config
+            .natural_scroll
+            .available
+            .then_some(C::NaturalScroll(config.natural_scroll.current)),
+        config.dwt.available.then_some(C::Dwt(config.dwt.current)),
+        config
+            .left_handed
+            .available
+            .then_some(C::LeftHanded(config.left_handed.current)),
+        config
+            .middle_emulation
+            .available
+            .then_some(C::MiddleEmulation(config.middle_emulation.current)),
+        config
+            .scroll_button_lock
+            .available
+            .then_some(C::ScrollButtonLock(config.scroll_button_lock.current)),
+        config
+            .accel
+            .available
+            .then_some(C::AccelSpeed(config.accel.current)),
+        config
+            .scroll_button
+            .available
+            .then_some(C::ScrollButton(config.scroll_button.current)),
+        (config.scroll_method.available_mask != 0)
+            .then_some(C::ScrollMethod(config.scroll_method.current)),
+        config
+            .click_method
+            .available
+            .then_some(C::ClickMethod(config.click_method.current)),
+        config
+            .accel_profile
+            .available
+            .then_some(C::AccelProfile(config.accel_profile.current)),
+        (config.send_events.available_mask != 0)
+            .then_some(C::SendEvents(config.send_events.current_mask)),
+    ]);
+    if config.tap_button_map.available
+        && let Some(index) = config.tap_button_map.current
+    {
+        changes.push(Some(C::TapButtonMap(index)));
+    }
+
+    for change in changes.into_iter().flatten() {
+        if let Err(err) = libinput_config::apply(dev, change) {
+            log::warn!(
+                "libinput: restoring saved config for {name:?} rejected ({change:?}): {err:?}"
+            );
+        }
+    }
+}
+
 impl Context {
     /// Suspend libinput: closes all open input device fds. The context remains
-    /// valid and can be resumed with [`Context::resume`].
-    ///
-    /// `pointer_devices` is intentionally left as-is — the stashed
-    /// handles point at devices whose fds are now closed, but
-    /// libinput's own `DeviceRemoved` (or a fresh `DeviceAdded` after
-    /// `resume`) will replace each entry the next time `dispatch()`
-    /// runs. Any `apply_device_config` write that races against an
-    /// open suspend window targets a closed device and returns
-    /// libinput's UNSUPPORTED — caller-visible as BadMatch.
-    pub fn suspend(&mut self) {
+    /// valid and can be resumed with [`Context::resume`]. Device facts remain
+    /// keyed by source while their live libinput bindings are retired.
+    pub fn suspend(&mut self) -> Vec<InputEvent> {
+        self.resume_tracker.invalidate();
+        let mut active: Vec<(Device, InputSourceId)> = self
+            .sources
+            .bindings
+            .iter()
+            .map(|(device, source_id)| (device.clone(), *source_id))
+            .collect();
+        active.sort_unstable_by_key(|(_, source_id)| source_id.0);
+        let mut out = Vec::with_capacity(active.len());
+        for (device, source_id) in active {
+            let Some(mut info) = self.source_facts.get(&source_id).cloned() else {
+                continue;
+            };
+            if let Some((_, pointer_device)) = self.pointer_devices.get(&device) {
+                info.config = libinput_config::gather(pointer_device);
+            }
+            info.enabled = false;
+            self.source_facts.insert(source_id, info.clone());
+            self.resume_tracker.paused.insert(source_id, info.clone());
+            out.push(InputEvent::DeviceSuspended {
+                source_id,
+                device_node: info.device_node,
+            });
+        }
+
+        // Clear only live handle bindings. The source allocator and paused
+        // facts are process-lifetime and remain available for continuation.
+        self.sources.unbind_all();
+        self.pointer_devices.clear();
+        self.keyboard_devices.clear();
+        self.usable_input_devices.clear();
         self.libinput.suspend();
+        out
     }
 
     /// Resume a suspended libinput context. Re-enables device monitoring and
@@ -534,10 +810,91 @@ impl Context {
     /// # Errors
     ///
     /// Returns `Err` if `libinput_resume` returns -1.
-    pub fn resume(&mut self) -> io::Result<()> {
+    pub fn resume(&mut self) -> io::Result<Vec<InputEvent>> {
+        if self.resume_tracker.next_token.is_none() {
+            return Err(io::Error::other("resume window token exhausted"));
+        }
         self.libinput
             .resume()
-            .map_err(|()| io::Error::other("libinput resume failed"))
+            .map_err(|()| io::Error::other("libinput resume failed"))?;
+        self.resume_tracker.begin()?;
+
+        let source_facts_before = self.source_facts.clone();
+        let paused_before = self.resume_tracker.paused.clone();
+        let mut out = match self.dispatch() {
+            Ok(events) => events,
+            Err(err) => {
+                self.resume_tracker.invalidate();
+                self.resume_tracker.paused = paused_before;
+                self.source_facts = source_facts_before;
+                // Keep any newly allocated IDs burned, but retire every
+                // partially rebound handle from this failed enumeration.
+                self.sources.unbind_all();
+                self.pointer_devices.clear();
+                self.keyboard_devices.clear();
+                self.usable_input_devices.clear();
+                self.libinput.suspend();
+                return Err(err);
+            }
+        };
+
+        // A source without a captured sysfs instance cannot be proven to be
+        // the same endpoint. Retire it as a removal; a newly enumerated
+        // handle receives a fresh source ID in the dispatch batch above.
+        let unprovable: Vec<InputSourceId> = self
+            .resume_tracker
+            .paused
+            .iter()
+            .filter_map(|(source_id, info)| info.resume_key.is_none().then_some(*source_id))
+            .collect();
+        let mut removals = Vec::with_capacity(unprovable.len());
+        for source_id in unprovable {
+            if let Some(info) = self.resume_tracker.paused.remove(&source_id) {
+                log::warn!(
+                    "libinput: cannot prove VT continuation for source {} node={}; removing old source",
+                    source_id.0,
+                    info.device_node
+                );
+                self.source_facts.remove(&source_id);
+                removals.push(InputEvent::DeviceRemoved {
+                    source_id,
+                    device_node: info.device_node,
+                });
+            }
+        }
+        removals.append(&mut out);
+        Ok(removals)
+    }
+
+    pub(crate) fn resume_window(&self) -> Option<(ResumeWindowToken, Instant)> {
+        self.resume_tracker.window()
+    }
+
+    pub(crate) fn finish_resume_window(
+        &mut self,
+        token: ResumeWindowToken,
+        now: Instant,
+    ) -> Vec<InputEvent> {
+        let Some(window) = self.resume_tracker.active.as_ref() else {
+            return Vec::new();
+        };
+        if window.token != token || now < window.deadline {
+            return Vec::new();
+        }
+        self.resume_tracker.active = None;
+        let mut sources: Vec<InputSourceId> = self.resume_tracker.paused.keys().copied().collect();
+        sources.sort_unstable_by_key(|source_id| source_id.0);
+        sources
+            .into_iter()
+            .filter_map(|source_id| {
+                let info = self.resume_tracker.paused.remove(&source_id)?;
+                self.source_facts.remove(&source_id);
+                Some(InputEvent::DeviceRemoved {
+                    source_id,
+                    device_node: info.device_node,
+                })
+            })
+            .collect()
     }
 }
 

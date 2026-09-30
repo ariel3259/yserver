@@ -1022,6 +1022,7 @@ mod tests {
 
     fn key_event(pressed: bool, keycode: u8) -> HostKeyEvent {
         HostKeyEvent {
+            origin: crate::core_loop::InputOrigin::NestedHost,
             pressed,
             keycode,
             time: 1,

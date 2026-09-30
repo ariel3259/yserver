@@ -51,9 +51,17 @@ pub enum InputEvent {
     /// this — `ScrollContinuous`/`ScrollWheel` have no finger-lift.
     PointerScrollStop { source_id: InputSourceId },
     /// A new input device has been enumerated by libinput.  Carries a
-    /// snapshot of its identity and configuration; forwarded to the core for
-    /// Task 2's XI2 device-property registry.
+    /// snapshot of its identity and configuration; forwarded to the
+    /// process-lifetime source inventory.
     DeviceAdded(DeviceInfo),
+    /// The source remains present but its libinput attachment was retired
+    /// for VT release.
+    DeviceSuspended {
+        source_id: InputSourceId,
+        device_node: String,
+    },
+    /// A paused source continued on its original kernel endpoint.
+    DeviceResumed(DeviceInfo),
     /// An input device has been removed. `source_id` is the attachment
     /// identity; `device_node` is descriptive compatibility metadata.
     DeviceRemoved {

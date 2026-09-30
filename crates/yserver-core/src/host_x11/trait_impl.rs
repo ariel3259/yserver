@@ -92,6 +92,7 @@ impl Backend for HostX11Backend {
         match ev {
             HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) => {
                 self.push_pending_host_event(HostEvent::Key(HostKeyEvent {
+                    origin: raw.origin,
                     pressed: raw.pressed,
                     keycode: raw.keycode,
                     time: raw.time,
@@ -131,6 +132,7 @@ impl Backend for HostX11Backend {
                 button,
                 pressed,
                 time,
+                ..
             } => {
                 // `button` is a Linux input code (BTN_LEFT = 0x110, …).
                 // Translate to X11 button numbers — same mapping as
@@ -175,7 +177,10 @@ impl Backend for HostX11Backend {
             }
             // Device add/remove are plumbing-only in the host-X11 backend;
             // the nested backend has no XI2 device registry of its own.
-            HostInputEvent::DeviceAdded(_) | HostInputEvent::DeviceRemoved { .. } => {}
+            HostInputEvent::DeviceAdded(_)
+            | HostInputEvent::DeviceSuspended { .. }
+            | HostInputEvent::DeviceResumed(_)
+            | HostInputEvent::DeviceRemoved { .. } => {}
         }
     }
 

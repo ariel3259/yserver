@@ -3,10 +3,10 @@
 //! The thread owns the `SendContext` and an `epoll` set wrapping the
 //! libinput fd. Each batch of `crate::input::InputEvent`s gets mapped
 //! to `HostInputEvent`s and pushed onto the core's message channel.
-//! Consecutive `PointerMotion` events are coalesced — at most one
-//! motion stays in flight to the core at any given moment, and the
-//! latest position wins. Buttons and keys are never coalesced and
-//! flush any pending motion immediately.
+//! Consecutive `PointerMotion` events from the same origin and motion mode
+//! are coalesced — at most one compatible motion stays in flight to the core
+//! at any given moment, and the latest position wins. Buttons and keys are
+//! never coalesced and flush any pending motion immediately.
 //!
 //! Cursor accumulation lives on this thread (relative deltas + clamped
 //! absolute mappings). The backend keeps its own cursor mirror updated
@@ -17,13 +17,11 @@
 //! Plan: `docs/superpowers/plans/2026-05-06-single-threaded-core.md` §E2.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
     os::fd::{AsFd, AsRawFd},
-    sync::{
-        Mutex,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::Mutex,
+    time::Instant,
 };
 
 #[cfg(target_os = "linux")]
@@ -33,11 +31,11 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use yserver_core::{
     core_loop::{
-        CoreSender, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT,
+        CoreSender, HostInputEvent, InputOrigin, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT,
         SYNTH_SCROLL_RIGHT, SYNTH_SCROLL_UP,
     },
     host_x11::HostKeyEvent,
-    xinput::libinput_props::DeviceConfigChange,
+    xinput::{InputSourceId, libinput_props::DeviceConfigChange},
 };
 
 use crate::input::{
@@ -47,7 +45,7 @@ use crate::input::{
 
 /// Cursor accumulator + framebuffer dimensions held on the libinput
 /// thread.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LibinputThreadState {
     cursor_x: f64,
     cursor_y: f64,
@@ -65,8 +63,7 @@ pub struct LibinputThreadState {
     /// press+release pair each time the absolute accumulator crosses
     /// 120. Sign convention matches libinput: positive Y = scroll down,
     /// positive X = scroll right.
-    scroll_accum_x_v120: i32,
-    scroll_accum_y_v120: i32,
+    scroll_accum_by_source: HashMap<InputSourceId, (i32, i32)>,
 }
 
 impl LibinputThreadState {
@@ -78,8 +75,7 @@ impl LibinputThreadState {
             fb_w,
             fb_h,
             hotkey: HotkeyDetector::new(),
-            scroll_accum_x_v120: 0,
-            scroll_accum_y_v120: 0,
+            scroll_accum_by_source: HashMap::new(),
         }
     }
 
@@ -119,7 +115,8 @@ impl LibinputThreadState {
     /// the wall clock.
     pub(crate) fn map(&mut self, ev: InputEvent, time_ms: u32) -> HostInputEvent {
         match ev {
-            InputEvent::KeyPress { keycode, .. } => HostInputEvent::Key(HostKeyEvent {
+            InputEvent::KeyPress { source_id, keycode } => HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(source_id),
                 pressed: true,
                 keycode: ((keycode + 8) & 0xff) as u8,
                 time: time_ms,
@@ -129,7 +126,8 @@ impl LibinputThreadState {
                 event_y: self.cursor_y as i16,
                 state: 0,
             }),
-            InputEvent::KeyRelease { keycode, .. } => HostInputEvent::Key(HostKeyEvent {
+            InputEvent::KeyRelease { source_id, keycode } => HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(source_id),
                 pressed: false,
                 keycode: ((keycode + 8) & 0xff) as u8,
                 time: time_ms,
@@ -139,12 +137,13 @@ impl LibinputThreadState {
                 event_y: self.cursor_y as i16,
                 state: 0,
             }),
-            InputEvent::PointerMotion { dx, dy, .. } => {
+            InputEvent::PointerMotion { source_id, dx, dy } => {
                 self.cursor_x =
                     (self.cursor_x + dx).clamp(0.0, f64::from(self.fb_w).max(1.0) - 1.0);
                 self.cursor_y =
                     (self.cursor_y + dy).clamp(0.0, f64::from(self.fb_h).max(1.0) - 1.0);
                 HostInputEvent::PointerMotion {
+                    origin: InputOrigin::Physical(source_id),
                     x: self.cursor_x as i32,
                     y: self.cursor_y as i32,
                     time: time_ms,
@@ -155,13 +154,19 @@ impl LibinputThreadState {
                     // rounded per-event; acceptable for relative-mode apps.)
                     dx: dx.round() as i32,
                     dy: dy.round() as i32,
+                    motion_delta: Some([dx, dy]),
                 }
             }
-            InputEvent::PointerMotionAbsolute { x_norm, y_norm, .. } => {
+            InputEvent::PointerMotionAbsolute {
+                source_id,
+                x_norm,
+                y_norm,
+            } => {
                 let (old_cx, old_cy) = (self.cursor_x, self.cursor_y);
                 self.cursor_x = x_norm.clamp(0.0, 1.0) * (f64::from(self.fb_w).max(1.0) - 1.0);
                 self.cursor_y = y_norm.clamp(0.0, 1.0) * (f64::from(self.fb_h).max(1.0) - 1.0);
                 HostInputEvent::PointerMotion {
+                    origin: InputOrigin::Physical(source_id),
                     x: self.cursor_x as i32,
                     y: self.cursor_y as i32,
                     time: time_ms,
@@ -171,9 +176,15 @@ impl LibinputThreadState {
                     // absolute-device raw events).
                     dx: (self.cursor_x - old_cx).round() as i32,
                     dy: (self.cursor_y - old_cy).round() as i32,
+                    motion_delta: None,
                 }
             }
-            InputEvent::Button { code, pressed, .. } => HostInputEvent::PointerButton {
+            InputEvent::Button {
+                source_id,
+                code,
+                pressed,
+            } => HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(source_id),
                 button: u16::try_from(code).unwrap_or(u16::MAX),
                 pressed,
                 time: time_ms,
@@ -182,7 +193,8 @@ impl LibinputThreadState {
             // because it can map to N (≥ 0) press+release pairs depending
             // on accumulated v120. Reaching here means a caller forgot
             // to route it; map to a no-op-ish placeholder.
-            InputEvent::PointerScroll { .. } => HostInputEvent::PointerButton {
+            InputEvent::PointerScroll { source_id, .. } => HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(source_id),
                 button: u16::MAX,
                 pressed: false,
                 time: time_ms,
@@ -194,7 +206,10 @@ impl LibinputThreadState {
             }
             // DeviceAdded/Removed are forwarded by process_batch before
             // reaching map(); reaching here is a routing bug, so fail loud.
-            InputEvent::DeviceAdded(_) | InputEvent::DeviceRemoved { .. } => {
+            InputEvent::DeviceAdded(_)
+            | InputEvent::DeviceSuspended { .. }
+            | InputEvent::DeviceResumed(_)
+            | InputEvent::DeviceRemoved { .. } => {
                 unreachable!("device events are forwarded before map(); must not reach map()")
             }
         }
@@ -212,55 +227,46 @@ impl LibinputThreadState {
     /// first then X clicks within a single call.
     pub(crate) fn drain_scroll(
         &mut self,
+        source_id: InputSourceId,
         dx_v120: i32,
         dy_v120: i32,
         time_ms: u32,
         out: &mut Vec<HostInputEvent>,
     ) {
-        self.scroll_accum_x_v120 = self.scroll_accum_x_v120.saturating_add(dx_v120);
-        self.scroll_accum_y_v120 = self.scroll_accum_y_v120.saturating_add(dy_v120);
+        let (accum_x, accum_y) = self.scroll_accum_by_source.entry(source_id).or_default();
+        *accum_x = accum_x.saturating_add(dx_v120);
+        *accum_y = accum_y.saturating_add(dy_v120);
 
         // Vertical first (more common; matches X11 button-4/5 priority).
-        while self.scroll_accum_y_v120 >= Self::V120_PER_CLICK {
-            self.scroll_accum_y_v120 -= Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_DOWN, time_ms);
+        while *accum_y >= Self::V120_PER_CLICK {
+            *accum_y -= Self::V120_PER_CLICK;
+            push_button_click(out, SYNTH_SCROLL_DOWN, time_ms, source_id);
         }
-        while self.scroll_accum_y_v120 <= -Self::V120_PER_CLICK {
-            self.scroll_accum_y_v120 += Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_UP, time_ms);
+        while *accum_y <= -Self::V120_PER_CLICK {
+            *accum_y += Self::V120_PER_CLICK;
+            push_button_click(out, SYNTH_SCROLL_UP, time_ms, source_id);
         }
-        while self.scroll_accum_x_v120 >= Self::V120_PER_CLICK {
-            self.scroll_accum_x_v120 -= Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_RIGHT, time_ms);
+        while *accum_x >= Self::V120_PER_CLICK {
+            *accum_x -= Self::V120_PER_CLICK;
+            push_button_click(out, SYNTH_SCROLL_RIGHT, time_ms, source_id);
         }
-        while self.scroll_accum_x_v120 <= -Self::V120_PER_CLICK {
-            self.scroll_accum_x_v120 += Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_LEFT, time_ms);
+        while *accum_x <= -Self::V120_PER_CLICK {
+            *accum_x += Self::V120_PER_CLICK;
+            push_button_click(out, SYNTH_SCROLL_LEFT, time_ms, source_id);
         }
     }
 }
 
-#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputThreadCommand {
-    Pause = 1,
-    Resume = 2,
-}
-
-impl InputThreadCommand {
-    fn from_raw(raw: u8) -> Option<Self> {
-        match raw {
-            1 => Some(Self::Pause),
-            2 => Some(Self::Resume),
-            _ => None,
-        }
-    }
+    Pause,
+    Resume,
 }
 
 /// Direct-mode input-thread control channel.
 ///
 /// Carries three kinds of message to the input thread, multiplexed on a
-/// single `eventfd` wakeup: the latched pause/resume `command` (for
+/// single `eventfd` wakeup: the FIFO pause/resume `commands` (for
 /// VT-switch suspend/resume), a queue of `configs` — client
 /// `xinput set-prop` device-config writes that must be applied on the
 /// thread that owns the libinput handles, and a
@@ -269,7 +275,7 @@ impl InputThreadCommand {
 /// this uses a pair of atomics rather than a queue).
 #[derive(Debug)]
 pub(crate) struct InputThreadControl {
-    command: AtomicU8,
+    commands: Mutex<VecDeque<InputThreadCommand>>,
     configs: Mutex<VecDeque<(String, DeviceConfigChange)>>,
     efd: EventFd,
     /// Latched pending resize. Written by the core thread via
@@ -295,7 +301,7 @@ impl InputThreadControl {
         let efd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
             .map_err(|e| io::Error::other(format!("InputThreadControl eventfd: {e}")))?;
         Ok(Self {
-            command: AtomicU8::new(0),
+            commands: Mutex::new(VecDeque::new()),
             configs: Mutex::new(VecDeque::new()),
             efd,
             pending_resize: Mutex::new(None),
@@ -304,14 +310,23 @@ impl InputThreadControl {
     }
 
     pub(crate) fn pause(&self) {
-        self.command
-            .store(InputThreadCommand::Pause as u8, Ordering::Release);
-        self.wake();
+        self.enqueue(InputThreadCommand::Pause);
     }
 
     pub(crate) fn resume(&self) {
-        self.command
-            .store(InputThreadCommand::Resume as u8, Ordering::Release);
+        self.enqueue(InputThreadCommand::Resume);
+    }
+
+    fn enqueue(&self, command: InputThreadCommand) {
+        let mut queue = match self.commands.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                log::error!("InputThreadControl: command queue mutex poisoned; recovering it");
+                poisoned.into_inner()
+            }
+        };
+        queue.push_back(command);
+        drop(queue);
         self.wake();
     }
 
@@ -330,9 +345,16 @@ impl InputThreadControl {
         self.efd.as_fd().as_raw_fd()
     }
 
-    pub(crate) fn drain(&self) -> Option<InputThreadCommand> {
+    pub(crate) fn drain(&self) -> Vec<InputThreadCommand> {
         let _ = self.efd.read();
-        InputThreadCommand::from_raw(self.command.swap(0, Ordering::AcqRel))
+        let mut queue = match self.commands.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                log::error!("InputThreadControl: command queue mutex poisoned; recovering it");
+                poisoned.into_inner()
+            }
+        };
+        queue.drain(..).collect()
     }
 
     /// Drain all queued device-config writes. The eventfd is consumed by
@@ -407,13 +429,20 @@ impl InputThreadControl {
     }
 }
 
-fn push_button_click(out: &mut Vec<HostInputEvent>, button: u16, time_ms: u32) {
+fn push_button_click(
+    out: &mut Vec<HostInputEvent>,
+    button: u16,
+    time_ms: u32,
+    source_id: InputSourceId,
+) {
     out.push(HostInputEvent::PointerButton {
+        origin: InputOrigin::Physical(source_id),
         button,
         pressed: true,
         time: time_ms,
     });
     out.push(HostInputEvent::PointerButton {
+        origin: InputOrigin::Physical(source_id),
         button,
         pressed: false,
         time: time_ms,
@@ -492,30 +521,61 @@ pub fn process_batch(
         // Device add/remove are forwarded directly — they carry their
         // own data and bypass the motion/scroll mapping entirely.
         // Flush any pending motion first to preserve chronological order.
-        if let InputEvent::DeviceAdded(info) = raw {
-            if let Some(m) = pending_motion.take() {
-                sender.send(Message::HostInput(m))?;
+        match raw {
+            InputEvent::DeviceAdded(info) => {
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                sender.send(Message::HostInput(HostInputEvent::DeviceAdded(info)))?;
+                continue;
             }
-            sender.send(Message::HostInput(HostInputEvent::DeviceAdded(info)))?;
-            continue;
-        }
-        if let InputEvent::DeviceRemoved { device_node, .. } = raw {
-            if let Some(m) = pending_motion.take() {
-                sender.send(Message::HostInput(m))?;
+            InputEvent::DeviceResumed(info) => {
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                sender.send(Message::HostInput(HostInputEvent::DeviceResumed(info)))?;
+                continue;
             }
-            sender.send(Message::HostInput(HostInputEvent::DeviceRemoved {
+            InputEvent::DeviceSuspended {
+                source_id,
                 device_node,
-            }))?;
-            continue;
+            } => {
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                state.scroll_accum_by_source.remove(&source_id);
+                sender.send(Message::HostInput(HostInputEvent::DeviceSuspended {
+                    source_id,
+                    device_node,
+                }))?;
+                continue;
+            }
+            InputEvent::DeviceRemoved {
+                source_id,
+                device_node,
+            } => {
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                state.scroll_accum_by_source.remove(&source_id);
+                sender.send(Message::HostInput(HostInputEvent::DeviceRemoved {
+                    source_id,
+                    device_node,
+                }))?;
+                continue;
+            }
+            _ => {}
         }
         // Scroll fans out separately because one InputEvent may map to
         // zero or many press+release pairs depending on accumulated v120.
         if let InputEvent::PointerScroll {
-            dx_v120, dy_v120, ..
+            source_id,
+            dx_v120,
+            dy_v120,
         } = raw
         {
             scroll_buf.clear();
-            state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
+            state.drain_scroll(source_id, dx_v120, dy_v120, time_ms, &mut scroll_buf);
             if !scroll_buf.is_empty() {
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
@@ -531,13 +591,13 @@ pub fn process_batch(
         // forward the stop so the backend emits a delta-0 XI2 scroll motion.
         // GDK reads that as `scroll.is_stop`, which commits a Firefox
         // history-swipe (bug 1539730).
-        if matches!(raw, InputEvent::PointerScrollStop { .. }) {
-            state.scroll_accum_x_v120 = 0;
-            state.scroll_accum_y_v120 = 0;
+        if let InputEvent::PointerScrollStop { source_id } = raw {
+            state.scroll_accum_by_source.remove(&source_id);
             if let Some(m) = pending_motion.take() {
                 sender.send(Message::HostInput(m))?;
             }
             sender.send(Message::HostInput(HostInputEvent::PointerScrollStop {
+                origin: InputOrigin::Physical(source_id),
                 time: time_ms,
             }))?;
             continue;
@@ -551,23 +611,59 @@ pub fn process_batch(
                 relative,
                 dx,
                 dy,
+                origin,
+                motion_delta,
             } => {
-                // Coalesce consecutive motions: keep the latest absolute
-                // position, but SUM the raw relative deltas so XI2 RawMotion
-                // doesn't lose distance when merged into one event.
-                let (sum_dx, sum_dy) = match pending_motion.as_ref() {
-                    Some(HostInputEvent::PointerMotion {
-                        dx: pdx, dy: pdy, ..
-                    }) => (dx + pdx, dy + pdy),
-                    _ => (dx, dy),
+                // Coalesce only within one producer and motion mode. Keep
+                // the latest absolute position while preserving both raw
+                // integer deltas and the fractional physical delta.
+                let compatible = pending_motion.as_ref().is_some_and(|pending| {
+                    matches!(pending,
+                        HostInputEvent::PointerMotion {
+                            origin: pending_origin,
+                            relative: pending_relative,
+                            motion_delta: pending_delta,
+                            ..
+                        } if *pending_origin == origin
+                            && *pending_relative == relative
+                            && pending_delta.is_some() == motion_delta.is_some())
+                });
+                let (sum_dx, sum_dy, sum_motion_delta) = if compatible {
+                    let Some(HostInputEvent::PointerMotion {
+                        dx: previous_dx,
+                        dy: previous_dy,
+                        motion_delta: previous_delta,
+                        ..
+                    }) = pending_motion.as_ref()
+                    else {
+                        unreachable!("compatible pending motion must be a motion")
+                    };
+                    (
+                        dx + previous_dx,
+                        dy + previous_dy,
+                        match (previous_delta, motion_delta) {
+                            (Some(previous), Some(current)) => {
+                                Some([previous[0] + current[0], previous[1] + current[1]])
+                            }
+                            (None, None) => None,
+                            _ => unreachable!("compatible motion deltas have matching modes"),
+                        },
+                    )
+                } else {
+                    if let Some(m) = pending_motion.take() {
+                        sender.send(Message::HostInput(m))?;
+                    }
+                    (dx, dy, motion_delta)
                 };
                 *pending_motion = Some(HostInputEvent::PointerMotion {
+                    origin,
                     x,
                     y,
                     time,
                     relative,
                     dx: sum_dx,
                     dy: sum_dy,
+                    motion_delta: sum_motion_delta,
                 });
             }
             non_motion => {
@@ -712,6 +808,7 @@ pub(crate) fn run(
     // would block until unrelated input arrives. While armed, give the poller
     // a ~250ms timeout so we re-dispatch and complete the deferred open.
     let mut hotplug_retry_until: Option<std::time::Instant> = None;
+    let mut resume_retry_window: Option<(crate::input::context::ResumeWindowToken, Instant)> = None;
 
     // Platform-specific event buffer.
     #[cfg(target_os = "linux")]
@@ -730,21 +827,35 @@ pub(crate) fn run(
     ];
 
     loop {
+        finish_expired_resume_window(
+            &mut input_ctx,
+            &mut resume_retry_window,
+            &mut state,
+            &sender,
+            &mut pending_motion,
+        )?;
+        if hotplug_retry_until.is_some_and(|until| Instant::now() >= until) {
+            hotplug_retry_until = None;
+        }
         // --- poll wait ---
         let (got_control, got_leds);
 
+        let poll_until = match (hotplug_retry_until, resume_retry_window) {
+            (Some(hotplug), Some((_, resume))) => Some(hotplug.max(resume)),
+            (Some(hotplug), None) => Some(hotplug),
+            (None, Some((_, resume))) => Some(resume),
+            (None, None) => None,
+        };
+
         #[cfg(target_os = "linux")]
         {
-            let timeout = match hotplug_retry_until {
+            let timeout = match poll_until {
                 Some(until) => {
                     let now = std::time::Instant::now();
-                    if now >= until {
-                        hotplug_retry_until = None;
-                        EpollTimeout::NONE
-                    } else {
-                        let ms = u16::try_from((until - now).as_millis().min(250)).unwrap_or(250);
-                        EpollTimeout::from(ms.max(1))
-                    }
+                    let ms =
+                        u16::try_from(until.saturating_duration_since(now).as_millis().min(250))
+                            .unwrap_or(250);
+                    EpollTimeout::from(ms.max(1))
                 }
                 None => EpollTimeout::NONE,
             };
@@ -763,20 +874,15 @@ pub(crate) fn run(
 
         #[cfg(target_os = "freebsd")]
         {
-            let timeout = match hotplug_retry_until {
+            let timeout = match poll_until {
                 Some(until) => {
                     let now = std::time::Instant::now();
-                    if now >= until {
-                        hotplug_retry_until = None;
-                        None
-                    } else {
-                        let dur = until - now;
-                        let ms = dur.as_millis().min(250) as i64;
-                        Some(libc::timespec {
-                            tv_sec: ms / 1000,
-                            tv_nsec: (ms % 1000) * 1_000_000,
-                        })
-                    }
+                    let dur = until.saturating_duration_since(now);
+                    let ms = dur.as_millis().min(250) as i64;
+                    Some(libc::timespec {
+                        tv_sec: ms / 1000,
+                        tv_nsec: (ms % 1000) * 1_000_000,
+                    })
                 }
                 None => None,
             };
@@ -797,7 +903,7 @@ pub(crate) fn run(
 
         // --- common dispatch (platform-independent) ---
         if got_control {
-            let command = control.drain();
+            let commands = control.drain();
             for (node, change) in control.take_configs() {
                 if let Err(err) = input_ctx.apply_device_config(&node, change) {
                     log::debug!(
@@ -819,31 +925,54 @@ pub(crate) fn run(
                 state.set_position(px, py);
                 pending_motion = None;
             }
-            if let Some(command) = command {
+            for command in commands {
                 paused = match command {
                     InputThreadCommand::Pause if !paused => {
-                        input_ctx.suspend();
+                        if let Some(m) = pending_motion.take() {
+                            sender.send(Message::HostInput(m))?;
+                        }
+                        let events = input_ctx.suspend();
+                        process_batch(
+                            &mut state,
+                            &sender,
+                            &mut pending_motion,
+                            events,
+                            current_time_ms(),
+                        )?;
+                        if let Some(m) = pending_motion.take() {
+                            sender.send(Message::HostInput(m))?;
+                        }
+                        resume_retry_window = None;
+                        hotplug_retry_until = None;
                         pending_motion = None;
                         state.hotkey.reset();
                         true
                     }
                     InputThreadCommand::Resume if paused => match input_ctx.resume() {
-                        Ok(()) => {
+                        Ok(events) => {
+                            resume_retry_window = input_ctx.resume_window();
+                            hotplug_retry_until = resume_retry_window.map(|(_, deadline)| deadline);
+                            // Context::resume performs the initial libinput
+                            // dispatch internally. If that dispatch returned
+                            // after the fixed continuation deadline, retire
+                            // unmatched sources before forwarding its batch.
+                            finish_expired_resume_window(
+                                &mut input_ctx,
+                                &mut resume_retry_window,
+                                &mut state,
+                                &sender,
+                                &mut pending_motion,
+                            )?;
                             state.hotkey.reset();
-                            let _ = input_ctx.dispatch();
-                            for kc in [37u8, 105, 64, 108, 50, 62, 133, 134] {
-                                let _ = sender.send(Message::HostInput(HostInputEvent::Key(
-                                    HostKeyEvent {
-                                        pressed: false,
-                                        keycode: kc,
-                                        time: current_time_ms(),
-                                        root_x: state.cursor_x as i16,
-                                        root_y: state.cursor_y as i16,
-                                        event_x: state.cursor_x as i16,
-                                        event_y: state.cursor_y as i16,
-                                        state: 0,
-                                    },
-                                )));
+                            process_batch(
+                                &mut state,
+                                &sender,
+                                &mut pending_motion,
+                                events,
+                                current_time_ms(),
+                            )?;
+                            if let Some(m) = pending_motion.take() {
+                                sender.send(Message::HostInput(m))?;
                             }
                             false
                         }
@@ -861,6 +990,14 @@ pub(crate) fn run(
             input_ctx.update_leds(leds);
         }
 
+        finish_expired_resume_window(
+            &mut input_ctx,
+            &mut resume_retry_window,
+            &mut state,
+            &sender,
+            &mut pending_motion,
+        )?;
+
         if !should_dispatch_batch(paused) {
             let _ = input_ctx.dispatch();
             continue;
@@ -873,6 +1010,14 @@ pub(crate) fn run(
                 continue;
             }
         };
+
+        finish_expired_resume_window(
+            &mut input_ctx,
+            &mut resume_retry_window,
+            &mut state,
+            &sender,
+            &mut pending_motion,
+        )?;
 
         let device_change = events.iter().any(|e| {
             matches!(
@@ -894,6 +1039,29 @@ pub(crate) fn run(
 
 fn should_dispatch_batch(paused: bool) -> bool {
     !paused
+}
+
+fn finish_expired_resume_window(
+    input_ctx: &mut SendContext,
+    window: &mut Option<(crate::input::context::ResumeWindowToken, Instant)>,
+    state: &mut LibinputThreadState,
+    sender: &CoreSender,
+    pending_motion: &mut Option<HostInputEvent>,
+) -> io::Result<()> {
+    let Some((token, deadline)) = *window else {
+        return Ok(());
+    };
+    let now = Instant::now();
+    if now < deadline {
+        return Ok(());
+    }
+    let events = input_ctx.finish_resume_window(token, now);
+    *window = None;
+    process_batch(state, sender, pending_motion, events, current_time_ms())?;
+    if let Some(motion) = pending_motion.take() {
+        sender.send(Message::HostInput(motion))?;
+    }
+    Ok(())
 }
 
 fn current_time_ms() -> u32 {
@@ -1124,6 +1292,7 @@ mod tests {
                 button,
                 pressed,
                 time,
+                ..
             } => {
                 assert_eq!(button, 0x110);
                 assert!(pressed);
@@ -1549,16 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_input_thread_command_and_batch_gate() {
-        assert!(matches!(
-            InputThreadCommand::from_raw(1),
-            Some(InputThreadCommand::Pause)
-        ));
-        assert!(matches!(
-            InputThreadCommand::from_raw(2),
-            Some(InputThreadCommand::Resume)
-        ));
-        assert!(InputThreadCommand::from_raw(0).is_none());
+    fn input_thread_batch_gate() {
         assert!(!should_dispatch_batch(true));
         assert!(should_dispatch_batch(false));
     }
@@ -1629,11 +1789,11 @@ mod tests {
         let mut state = LibinputThreadState::new(800, 600);
         let mut out = Vec::new();
         // 60 + 30 + 40 = 130 → one click; remainder 10 banked.
-        state.drain_scroll(0, 60, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, 60, 0, &mut out);
         assert!(out.is_empty(), "60 < 120, no emission yet");
-        state.drain_scroll(0, 30, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, 30, 0, &mut out);
         assert!(out.is_empty(), "60 + 30 = 90 < 120");
-        state.drain_scroll(0, 40, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, 40, 0, &mut out);
         assert_eq!(
             out.len(),
             2,
@@ -1653,7 +1813,7 @@ mod tests {
     fn scroll_negative_v120_emits_scroll_up() {
         let mut state = LibinputThreadState::new(800, 600);
         let mut out = Vec::new();
-        state.drain_scroll(0, -120, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, -120, 0, &mut out);
         assert_eq!(out.len(), 2);
         assert!(matches!(
             out[0],
@@ -1670,7 +1830,7 @@ mod tests {
         let mut state = LibinputThreadState::new(800, 600);
         let mut out = Vec::new();
         // 480 v120 = exactly 4 clicks down.
-        state.drain_scroll(0, 480, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, 480, 0, &mut out);
         assert_eq!(out.len(), 8, "4 clicks × (press + release)");
         for chunk in out.chunks_exact(2) {
             assert!(matches!(
@@ -1696,7 +1856,7 @@ mod tests {
     fn scroll_horizontal_emits_buttons_6_7() {
         let mut state = LibinputThreadState::new(800, 600);
         let mut out = Vec::new();
-        state.drain_scroll(120, 0, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 120, 0, 0, &mut out);
         assert!(matches!(
             out[0],
             HostInputEvent::PointerButton {
@@ -1706,7 +1866,7 @@ mod tests {
             }
         ));
         out.clear();
-        state.drain_scroll(-120, 0, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, -120, 0, 0, &mut out);
         assert!(matches!(
             out[0],
             HostInputEvent::PointerButton {
@@ -1730,7 +1890,7 @@ mod tests {
             DeviceConfigChange::NaturalScroll(false),
         );
         // No pause/resume was published, so the latched command is empty.
-        assert_eq!(control.drain(), None);
+        assert!(control.drain().is_empty());
         // The config write is still pending and drains FIFO.
         let configs = control.take_configs();
         assert_eq!(configs.len(), 1);
@@ -1754,7 +1914,7 @@ mod tests {
         );
         control.push_config("/dev/input/event2".into(), DeviceConfigChange::Tap(false));
         control.pause();
-        assert_eq!(control.drain(), Some(InputThreadCommand::Pause));
+        assert_eq!(control.drain(), vec![InputThreadCommand::Pause]);
         let configs = control.take_configs();
         assert_eq!(configs.len(), 2);
         assert!(matches!(
