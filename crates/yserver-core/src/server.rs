@@ -1026,6 +1026,9 @@ pub struct ServerState {
     /// See [`RandrOutputProperty`] for why this lives beside `randr` rather
     /// than inside `RandrState`.
     pub randr_output_properties: HashMap<u32, Vec<(AtomId, RandrOutputProperty)>>,
+    /// RANDR 1.5 client-defined monitors in `SetMonitor` order. See
+    /// [`crate::randr::ClientMonitor`] for why this lives beside `randr`.
+    pub randr_client_monitors: Vec<crate::randr::ClientMonitor>,
     /// One bit per RANDR minor opcode whose unsupported behavior has already
     /// produced a warning. Repeated requests remain visible at debug level
     /// without flooding ordinary desktop layout reapplication logs.
@@ -1284,6 +1287,11 @@ pub struct ServerState {
     /// to filter XI2 raw events under a grab (`FilterRawEvents`: an XI 2.0
     /// client gets no raw event from a grabbed device).
     pub xi2_client_versions: HashMap<ClientId, (u16, u16)>,
+    /// RANDR version each client last sent in QueryVersion (Xorg
+    /// `pRRClient->major_version/minor_version`, the client's own numbers).
+    /// Absent = never queried (0.0). `RRClientKnowsRates` (≥ 1.1) picks the
+    /// SetScreenConfig request size.
+    pub randr_client_versions: HashMap<ClientId, (u32, u32)>,
     /// `GLX_EXT_texture_from_pixmap` is advertised only when the backend
     /// confirmed at init that it can allocate and export a BGRA8 dma-buf.
     /// Set once from `backend.supports_dmabuf_export()` during startup;
@@ -1575,6 +1583,7 @@ impl ServerState {
             randr_select_masks: HashMap::new(),
             randr_primary_output_explicit: false,
             randr_output_properties: HashMap::new(),
+            randr_client_monitors: Vec::new(),
             randr_unsupported_warned_mask: 0,
             xkb_clients: HashMap::new(),
             xkb_interests: HashMap::new(),
@@ -1645,6 +1654,7 @@ impl ServerState {
             glx_drawables: HashMap::new(),
             vidmode_client_versions: HashMap::new(),
             xi2_client_versions: HashMap::new(),
+            randr_client_versions: HashMap::new(),
             glx_tfp_supported: false,
             glx_vendor_names: glx::VENDOR_NAMES.to_string(),
             sync_awaits: HashMap::new(),

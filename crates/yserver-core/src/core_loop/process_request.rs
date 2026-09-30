@@ -128,7 +128,7 @@ pub enum RequestOutcome {
 
 /// Continuation data needed to finish an asynchronous `RRSetCrtcConfig`
 /// without redispatching the original request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PendingCrtcConfig {
     pub token: CrtcConfigToken,
     pub completion: CrtcConfigCompletion,
@@ -137,12 +137,32 @@ pub struct PendingCrtcConfig {
 /// Protocol continuation shared by synchronous and asynchronous CRTC apply
 /// paths. It contains no backend token, so immediate completion never needs a
 /// sentinel token value.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CrtcConfigCompletion {
     pub output_id: u32,
     pub set_time: u32,
     pub output_bbox_before: Option<(u16, u16)>,
     pub byte_order: yserver_protocol::x11::ClientByteOrder,
+    /// The pending transform this enable applies, snapshotted at request
+    /// time, when it differs from the current one (`RRCrtcPendingTransform`,
+    /// rrcrtc.c:765).
+    pub apply_transform: Option<Box<crate::randr::CrtcTransform>>,
+    /// The rotation this enable sets, when it differs from the CRTC's
+    /// (`RRCrtcSet`'s `rotation != crtc->rotation`, rrcrtc.c:749). A
+    /// disable keeps the rotation, as `xf86RandR12CrtcSet` does.
+    pub apply_rotation: Option<u16>,
+    /// Which request is waiting for the reply.
+    pub reply: CrtcConfigReply,
+}
+
+/// The request a CRTC configuration answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrtcConfigReply {
+    /// `RRSetCrtcConfig`.
+    CrtcConfig,
+    /// RANDR 1.0 `RRSetScreenConfig`: its own reply, and `lastSetTime`
+    /// moves on every success (rrscreen.c:1099-1101).
+    ScreenConfig,
 }
 
 /// Dispatch one X11 request entirely on the core thread.
@@ -2923,57 +2943,48 @@ fn handle_render_request(
     Ok(RequestOutcome::Handled)
 }
 
-/// One monitor as reported by both RANDR `GetMonitors` and the XINERAMA
-/// extension. This is the single source of truth so their counts/order cannot
-/// diverge.
-#[derive(Clone)]
-pub(crate) struct ActiveMonitor {
-    pub name: String,
-    pub output_id: u32,
-    pub primary: bool,
-    pub x: i16,
-    pub y: i16,
-    pub width: u16,
-    pub height: u16,
-    pub width_mm: u32,
-    pub height_mm: u32,
-}
-
-fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
-    // One automatic monitor per ASSIGNED output (Xorg builds an automatic
-    // monitor for an output with a current CRTC). A lightweight connection
-    // query does not detach that CRTC, so a transient disconnected+assigned
-    // output remains present until the heavy topology path turns it off.
-    // `primary` is the RANDR primary output, which itself prefers an assigned
-    // output — the first output in the list may be off, so `i == 0` is wrong.
-    let primary = state.randr.primary_output;
+/// The protocol-visible monitor list (`RRMonitorMakeList`), shared by RANDR
+/// `GetMonitors` and XINERAMA so their counts/order cannot diverge.
+fn active_monitors(state: &ServerState, get_active: bool) -> Vec<crate::randr::Monitor> {
     state
         .randr
-        .enabled_outputs()
-        .map(|output| {
-            let width_mm = if output.mm_width > 0 {
-                output.mm_width
-            } else {
-                ((u32::from(output.width) * 254 + 480) / 960).max(1)
-            };
-            let height_mm = if output.mm_height > 0 {
-                output.mm_height
-            } else {
-                ((u32::from(output.height) * 254 + 480) / 960).max(1)
-            };
-            ActiveMonitor {
-                name: output.name.clone(),
-                output_id: output.output_id,
-                primary: output.output_id == primary,
-                x: output.x,
-                y: output.y,
-                width: output.width,
-                height: output.height,
-                width_mm,
-                height_mm,
-            }
-        })
-        .collect()
+        .monitors(&state.randr_client_monitors, get_active)
+}
+
+/// `RRSendConfigNotify` (rrscreen.c): a core ConfigureNotify on the root
+/// carrying its current geometry — all `SetMonitor`/`DeleteMonitor` send.
+/// No RANDR event: the monitor list has none of its own.
+fn send_root_config_notify(state: &mut ServerState) {
+    let Some(root) = state.resources.window(crate::resources::ROOT_WINDOW) else {
+        return;
+    };
+    let geometry = x11::Geometry {
+        root: crate::resources::ROOT_WINDOW,
+        x: 0,
+        y: 0,
+        width: root.width,
+        height: root.height,
+        border_width: root.border_width,
+        depth: root.depth,
+    };
+    let override_redirect = root.override_redirect;
+    let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+        state,
+        crate::resources::ROOT_WINDOW,
+        0x0002_0000, // StructureNotifyMask
+        |buf, seq, order| {
+            x11::encode_configure_notify_event(
+                buf,
+                seq,
+                order,
+                crate::resources::ROOT_WINDOW,
+                crate::resources::ROOT_WINDOW,
+                None,
+                geometry,
+                override_redirect,
+            );
+        },
+    );
 }
 
 /// Record an unsupported RANDR minor and report whether this is the first
@@ -3094,6 +3105,11 @@ fn handle_randr_request(
     let minor = header.data;
     match minor {
         x11randr::RR_QUERY_VERSION => {
+            if let Some(r) = x11randr::parse_query_version(body) {
+                state
+                    .randr_client_versions
+                    .insert(client_id, (r.major, r.minor));
+            }
             let (reply_major, reply_minor) = x11randr::parse_query_version(body)
                 .map(|r| {
                     let reply_major = x11randr::MAJOR_VERSION;
@@ -3287,8 +3303,8 @@ fn handle_randr_request(
                     width: crtc_data.width,
                     height: crtc_data.height,
                     mode: crtc_data.mode_id,
-                    rotation: 1,
-                    rotations: 1,
+                    rotation: state.randr.crtc_rotation(req.crtc),
+                    rotations: crate::randr::SUPPORTED_ROTATIONS,
                     outputs: &crtc_data.outputs,
                     possible: &crtc_data.possible_outputs,
                 },
@@ -3300,7 +3316,75 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SET_CRTC_TRANSFORM => {
+            // ProcRRSetCrtcTransform (rrcrtc.c:1755-1785) + RRCrtcTransformSet
+            // (rrcrtc.c:1091-1128), then the spec's D2 contract. Every yserver
+            // CRTC supports transforms, so Xorg's `!crtc->transforms`
+            // BadValue has no counterpart.
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
             let Some(req) = x11randr::parse_set_crtc_transform_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if !crtc_exists(state, req.crtc) {
+                return error(state, RANDR_BAD_CRTC, req.crtc);
+            }
+            if crtc_is_leased(state, req.crtc) {
+                return error(state, x11::error::BAD_ACCESS, 0);
+            }
+            if !crate::randr::CrtcTransform::invertible(&req.transform) {
+                return error(state, x11::error::BAD_MATCH, 0);
+            }
+            let Some(spec) = req.filter else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            let filter = if spec.name.is_empty() {
+                if !spec.params.is_empty() {
+                    return error(state, x11::error::BAD_MATCH, 0);
+                }
+                None
+            } else {
+                let Some(filter) = crate::randr::Filter::from_name(&spec.name) else {
+                    return error(state, x11::error::BAD_NAME, 0);
+                };
+                if !filter.params_valid(&spec.params) {
+                    return error(state, x11::error::BAD_MATCH, 0);
+                }
+                Some(filter)
+            };
+            let Some(transform) =
+                crate::randr::CrtcTransform::new(req.transform, filter, spec.params)
+            else {
+                return error(state, x11::error::BAD_MATCH, 0);
+            };
+            // D2: pure scale, nearest/bilinear only; the rest is refused on
+            // purpose rather than rendered approximately.
+            if !(transform.is_identity() || transform.is_pure_scale())
+                || filter == Some(crate::randr::Filter::Convolution)
+            {
+                return error(state, x11::error::BAD_MATCH, 0);
+            }
+            if let Some(output) = state
+                .randr
+                .outputs
+                .iter_mut()
+                .find(|o| o.crtc_id == req.crtc)
+            {
+                output.pending_transform = transform;
+            }
+            return Ok(RequestOutcome::Handled);
+        }
+        x11randr::RR_GET_CRTC_TRANSFORM => {
+            // REQUEST_SIZE_MATCH(xRRGetCrtcTransformReq) before the lookup.
+            if body.len() != 4 {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3310,55 +3394,7 @@ fn handle_randr_request(
                     u16::from(minor),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
-            if !crtc_exists(state, req.crtc) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    RANDR_BAD_CRTC,
-                    req.crtc,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
             }
-            if !req.is_identity_transform() {
-                // Arbitrary projective transforms need an internal
-                // composition path; they cannot be represented as direct
-                // KMS CRTC state.
-                warn_randr_unsupported_once(
-                    state,
-                    client_id,
-                    sequence,
-                    minor,
-                    "SetCrtcTransform",
-                    "rejecting non-identity transform with BadMatch",
-                );
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_MATCH,
-                    req.crtc,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
-            }
-            if req.filter_name_len != 0 || req.filter_param_count != 0 {
-                // The filter has no observable effect for an identity
-                // transform, but yserver does not retain it for GetCrtcTransform.
-                warn_randr_unsupported_once(
-                    state,
-                    client_id,
-                    sequence,
-                    minor,
-                    "SetCrtcTransform",
-                    "accepting identity transform but not retaining its filter",
-                );
-            }
-            return Ok(RequestOutcome::Handled);
-        }
-        x11randr::RR_GET_CRTC_TRANSFORM => {
             let crtc = request_xid(body);
             if !crtc_exists(state, crtc) {
                 return emit_x11_error_with_minor(
@@ -3371,7 +3407,24 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let buf = x11randr::encode_get_crtc_transform_reply(byte_order, sequence);
+            let Some(output) = state.randr.outputs.iter().find(|o| o.crtc_id == crtc) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            // `transform_filter_encode`: no filter, no name and no params.
+            fn part(t: &crate::randr::CrtcTransform) -> x11randr::CrtcTransformReplyPart<'_> {
+                x11randr::CrtcTransformReplyPart {
+                    matrix: t.matrix,
+                    filter_name: t.filter.map_or(&[][..], |f| f.canonical_name().as_bytes()),
+                    params: if t.filter.is_some() { &t.params } else { &[] },
+                }
+            }
+            let buf = x11randr::encode_get_crtc_transform_reply(
+                byte_order,
+                sequence,
+                true,
+                part(&output.pending_transform),
+                part(&output.current_transform),
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -3714,7 +3767,6 @@ fn handle_randr_request(
             // — only the unrelated `RRNoticePropertyChange` driver hook is
             // gated on `is_pending`. The wire notify fires regardless of
             // whether this write landed in `.current` or `.pending`.
-            state.randr.timestamp = state.timestamp_now();
             super::run::notify_randr_output_property_changed(
                 state,
                 req.output,
@@ -3788,7 +3840,6 @@ fn handle_randr_request(
                 );
             }
             entries.remove(index);
-            state.randr.timestamp = state.timestamp_now();
             super::run::notify_randr_output_property_changed(
                 state,
                 req.output,
@@ -4155,7 +4206,11 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
+            // RRMonitorTimestamp: lastConfigTime, which Set/DeleteMonitor
+            // leave alone ("XXX should take client monitor changes into
+            // account", rrmonitor.c).
             let t = state.randr.timestamp;
+            let get_active = body.get(4).is_some_and(|&b| b != 0);
             struct MonitorRow {
                 name_atom: u32,
                 primary: bool,
@@ -4168,20 +4223,25 @@ fn handle_randr_request(
                 height_mm: u32,
                 outputs: Vec<u32>,
             }
-            let monitors_list = active_monitors(state);
+            let monitors_list = active_monitors(state, get_active);
             let rows: Vec<MonitorRow> = monitors_list
-                .iter()
+                .into_iter()
                 .map(|monitor| MonitorRow {
-                    name_atom: state.atoms.intern(&monitor.name, false).0,
+                    name_atom: match monitor.name {
+                        crate::randr::MonitorName::Atom(atom) => atom,
+                        crate::randr::MonitorName::Output(name) => {
+                            state.atoms.intern(&name, false).0
+                        }
+                    },
                     primary: monitor.primary,
-                    automatic: true,
+                    automatic: monitor.automatic,
                     x: monitor.x,
                     y: monitor.y,
                     width: monitor.width,
                     height: monitor.height,
                     width_mm: monitor.width_mm,
                     height_mm: monitor.height_mm,
-                    outputs: vec![monitor.output_id],
+                    outputs: monitor.outputs,
                 })
                 .collect();
             let monitors: Vec<x11randr::MonitorInfo<'_>> = rows
@@ -4205,6 +4265,100 @@ fn handle_randr_request(
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_MONITOR => {
+            // ProcRRSetMonitor + RRMonitorAdd as shipped in Xorg 21.1
+            // (rrmonitor.c), measured by tools/vng-scenarios/xrandr-monitors.sh.
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
+            let Some(req) = x11randr::parse_set_monitor_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if usize::from(req.noutput) != req.outputs.len() {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            }
+            if state.resources.window(ResourceId(req.window)).is_none() {
+                return error(state, x11::error::BAD_WINDOW, req.window);
+            }
+            // !ValidAtom: Xorg sets no errorValue here, so the wire carries
+            // the window id the successful lookup just left in it.
+            if req.name == 0 || state.atoms.name(AtomId(req.name)).is_none() {
+                return error(state, x11::error::BAD_ATOM, req.window);
+            }
+            let name = state.atoms.name(AtomId(req.name)).unwrap_or_default();
+            // 'name' must match neither an Output nor an existing Monitor.
+            // (xserver main replaces a same-named monitor instead, 146bb9b2c;
+            // 21.1 refuses it.)
+            if state.randr.outputs.iter().any(|output| output.name == name)
+                || state
+                    .randr_client_monitors
+                    .iter()
+                    .any(|monitor| monitor.name == req.name)
+            {
+                return error(state, x11::error::BAD_VALUE, req.name);
+            }
+            if req.primary {
+                for monitor in &mut state.randr_client_monitors {
+                    monitor.primary = false;
+                }
+            }
+            state
+                .randr_client_monitors
+                .push(crate::randr::ClientMonitor {
+                    name: req.name,
+                    primary: req.primary,
+                    outputs: req.outputs,
+                    x: req.x,
+                    y: req.y,
+                    width: req.width,
+                    height: req.height,
+                    width_mm: req.width_mm,
+                    height_mm: req.height_mm,
+                });
+            send_root_config_notify(state);
+            return Ok(RequestOutcome::Handled);
+        }
+        x11randr::RR_DELETE_MONITOR => {
+            // ProcRRDeleteMonitor + RRMonitorDelete (rrmonitor.c).
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
+            let Some((window, name)) = x11randr::parse_delete_monitor_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if state.resources.window(ResourceId(window)).is_none() {
+                return error(state, x11::error::BAD_WINDOW, window);
+            }
+            if name == 0 || state.atoms.name(AtomId(name)).is_none() {
+                return error(state, x11::error::BAD_ATOM, name);
+            }
+            let Some(index) = state
+                .randr_client_monitors
+                .iter()
+                .position(|monitor| monitor.name == name)
+            else {
+                return error(state, x11::error::BAD_VALUE, name);
+            };
+            state.randr_client_monitors.remove(index);
+            send_root_config_notify(state);
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_CRTC_GAMMA_SIZE => {
             let Some(req) = x11randr::parse_crtc_id_request(body) else {
@@ -4576,23 +4730,60 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let timestamp = state.randr.timestamp;
-            let config_timestamp = state.randr.config_timestamp;
-            let width = state.randr.screen_width;
-            let height = state.randr.screen_height;
-            let mwidth = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-            let mheight = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
-            let buf = x11randr::encode_get_screen_info_reply(
-                byte_order,
-                sequence,
-                ROOT_WINDOW.0,
-                timestamp,
-                config_timestamp,
-                width,
-                height,
-                mwidth,
-                mheight,
-            );
+            // ProcRRGetScreenInfo (rrscreen.c:760-898) over RR10GetData.
+            let has_rate = randr_client_knows_rates(state, client_id);
+            let data = state.randr.rr10_data();
+            let rates: Vec<Vec<u16>> = data.as_ref().map_or_else(Vec::new, |d| {
+                d.sizes
+                    .iter()
+                    .map(|s| s.rates.iter().map(|(r, _)| *r).collect())
+                    .collect()
+            });
+            let sizes: Vec<x11randr::ScreenInfoSize<'_>> = data
+                .as_ref()
+                .map(|d| {
+                    d.sizes
+                        .iter()
+                        .zip(&rates)
+                        .map(|(s, rates)| x11randr::ScreenInfoSize {
+                            width: s.width,
+                            height: s.height,
+                            mm_width: s.mm_width,
+                            mm_height: s.mm_height,
+                            rates,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let now = state.timestamp_now();
+            #[allow(clippy::cast_possible_truncation)]
+            let info = match &data {
+                Some(d) => x11randr::ScreenInfoReply {
+                    root: ROOT_WINDOW.0,
+                    timestamp: state.randr.timestamp,
+                    config_timestamp: state.randr.config_timestamp,
+                    // setOfRotations is a CARD8.
+                    rotations: crate::randr::SUPPORTED_ROTATIONS as u8,
+                    rotation: state.randr.first_output_rotation(),
+                    size_id: d.size_id,
+                    rate: d.rate,
+                    sizes: &sizes,
+                    has_rate,
+                },
+                // No output with a CRTC: Rotate_0, no sizes, current time.
+                None => x11randr::ScreenInfoReply {
+                    root: ROOT_WINDOW.0,
+                    timestamp: now,
+                    config_timestamp: now,
+                    rotations: crate::randr::RR_ROTATE_0 as u8,
+                    rotation: crate::randr::RR_ROTATE_0,
+                    size_id: 0,
+                    rate: 0,
+                    sizes: &[],
+                    has_rate,
+                },
+            };
+            let buf = x11randr::encode_get_screen_info_reply(byte_order, sequence, &info);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -4687,62 +4878,20 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let ts = state.timestamp_now();
             state
                 .randr
-                .set_logical_size(ts, req.width, req.height, req.mm_width, req.mm_height);
+                .set_logical_size(req.width, req.height, req.mm_width, req.mm_height);
             // Pure screen-size change: fire root ConfigureNotify +
             // ScreenChangeNotify ONLY — no per-CRTC/Output change
             // (CRTC positions are unchanged). Pass an empty changed
             // list so only ScreenChangeNotify + root ConfigureNotify fire.
             super::run::apply_screen_size_side_effects(state, backend, req.width, req.height, &[]);
+            backend.randr_layout_changed(state);
             // RRSetScreenSize has NO reply (it is a void request).
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_SET_SCREEN_CONFIG => {
-            // Xorg looks this up as a DRAWABLE, not a window
-            // (`dixLookupDrawable`, rrscreen.c), so a pixmap is a legal
-            // target — it just resolves to its screen. An unknown xid comes
-            // back as `BadDrawable`, because dixLookupDrawable remaps
-            // dix's `BadValue` (dix/dixutils.c). Measured on real Xorg with
-            // `tools/randr-probe`: bogus xid -> code=9 (BadDrawable), and a
-            // real pixmap -> Success.
-            let drawable = request_xid(body);
-            let id = ResourceId(drawable);
-            if state.resources.window(id).is_none() && state.resources.pixmap(id).is_none() {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_DRAWABLE,
-                    drawable,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
-            }
-            // Legacy RANDR 1.0 form: SizeID + Rotation. yserver has a
-            // single screen size. mate's restore path passes the size
-            // we advertised, so accept across the board (no-op accept).
-            //
-            // SetScreenConfig reply (32 bytes): status (in data byte) +
-            // length=0 + new_timestamp(4) + config_timestamp(4) +
-            // root(4) + subpixel_order(2) + pad(10).
-            let ts = state.timestamp_now();
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0u8, 0);
-            x11::write_u32(byte_order, &mut reply, ts);
-            x11::write_u32(byte_order, &mut reply, state.randr.timestamp);
-            x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
-            x11::write_u16(byte_order, &mut reply, 0); // SubPixelUnknown
-            reply.extend_from_slice(&[0u8; 10]);
-            debug_assert_eq!(reply.len(), 32);
-            debug!(
-                "client {} #{} RANDR::SetScreenConfig -> status=0 timestamp={} (no-op accept)",
-                client_id.0, sequence.0, ts,
-            );
-            let Some(client) = state.clients.get_mut(&client_id.0) else {
-                return Ok(RequestOutcome::Handled);
-            };
-            return Ok(write_to_client(client, client_id, &reply));
+            return set_screen_config(state, backend, client_id, sequence, byte_order, body);
         }
         x11randr::RR_SET_CRTC_CONFIG => {
             // Body layout (post-header):
@@ -4799,8 +4948,8 @@ fn handle_randr_request(
                 }
                 Ok(r) => r,
             };
-            // (2)+(3) rotation + bounds only when enabling.
-            if let Some(ref m) = resolved {
+            // (2) rotation only when enabling.
+            if resolved.is_some() {
                 if !matches!(rotation & 0xf, 1 | 2 | 4 | 8) {
                     return emit_x11_error_with_minor(
                         state,
@@ -4812,8 +4961,8 @@ fn handle_randr_request(
                         RANDR_MAJOR_OPCODE,
                     );
                 }
-                if rotation != 1 {
-                    // RR_Rotate_0 only — our CRTC is identity-only.
+                if !crate::randr::SUPPORTED_ROTATIONS & rotation != 0 {
+                    // `(~crtc->rotations) & rotation` (rrcrtc.c:1403).
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
@@ -4824,17 +4973,9 @@ fn handle_randr_request(
                         RANDR_MAJOR_OPCODE,
                     );
                 }
-                if let Err((code, error_value)) = state.randr.screen_encompasses(m, x, y) {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        code,
-                        error_value,
-                        u16::from(header.data),
-                        RANDR_MAJOR_OPCODE,
-                    );
-                }
+                // No screen-bounds check: Xorg skips it for a CRTC with
+                // transform support (rrcrtc.c:1436), and every yserver CRTC
+                // has it; a screen may crop a CRTC.
             }
 
             // Resolve connector name from crtc_id (validated above →
@@ -4853,6 +4994,37 @@ fn handle_randr_request(
             };
             let output_id = output_row.output_id;
             let connector = output_row.name.clone();
+            // A disable keeps the current transform (xf86RandR12CrtcSet
+            // only installs one with a mode).
+            let apply_transform = (resolved.is_some()
+                && !output_row
+                    .pending_transform
+                    .equivalent(&output_row.current_transform))
+            .then(|| Box::new(output_row.pending_transform.applied()));
+            let apply_rotation =
+                (resolved.is_some() && rotation != output_row.rotation).then_some(rotation);
+            // The combined matrix drives the footprint and the scale pass; a
+            // pixman overflow (Xorg's rescaled projective fallback) is not
+            // rendered.
+            if let Some(m) = resolved
+                && crate::randr::crtc_matrix(
+                    rotation,
+                    m.width,
+                    m.height,
+                    &output_row.pending_transform.applied(),
+                )
+                .is_none()
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    u32::from(rotation),
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -4870,41 +5042,20 @@ fn handle_randr_request(
                 set_time,
                 output_bbox_before,
                 byte_order,
+                apply_transform,
+                apply_rotation,
+                reply: CrtcConfigReply::CrtcConfig,
             };
-            match backend.begin_crtc_config(
-                output_id,
+            return start_crtc_config(
+                state,
+                backend,
+                client_id,
+                sequence,
                 &connector,
                 mode_spec,
-                i32::from(x),
-                i32::from(y),
-            ) {
-                Ok(CrtcConfigApply::Applied(changed)) => {
-                    return complete_crtc_config(
-                        state,
-                        backend,
-                        client_id,
-                        sequence,
-                        completion,
-                        Ok(changed),
-                    );
-                }
-                Ok(CrtcConfigApply::Pending(token)) => {
-                    return Ok(RequestOutcome::PendingCrtcConfig(PendingCrtcConfig {
-                        token,
-                        completion,
-                    }));
-                }
-                Err(e) => {
-                    return complete_crtc_config(
-                        state,
-                        backend,
-                        client_id,
-                        sequence,
-                        completion,
-                        Err(e),
-                    );
-                }
-            }
+                (i32::from(x), i32::from(y)),
+                completion,
+            );
         }
         16 | 45 => {
             // TODO(unimplemented): RRCreateMode (16) / RRCreateLease (45)
@@ -5114,8 +5265,6 @@ fn handle_randr_request(
                 17 => "DestroyMode",
                 18 => "AddOutputMode",
                 19 => "DeleteOutputMode",
-                43 => "SetMonitor",
-                44 => "DeleteMonitor",
                 _ => "known request",
             };
             warn_randr_unsupported_once(
@@ -5131,6 +5280,241 @@ fn handle_randr_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// `ProcRRSetScreenConfig` (rrscreen.c:903-1130): the RANDR 1.0 size,
+/// rotation and rate, applied to `RRFirstOutput`'s CRTC at 0,0 through the
+/// SetCrtcConfig path.
+fn set_screen_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::randr as x11randr;
+    const STATUS_INVALID_CONFIG_TIME: u8 = 1;
+    const STATUS_INVALID_TIME: u8 = 2;
+    const STATUS_FAILED: u8 = 3;
+    let error = |state: &mut ServerState, code: u8, value: u32| {
+        emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(x11randr::RR_SET_SCREEN_CONFIG),
+            128,
+        )
+    };
+    let status_reply = |state: &mut ServerState, status: u8| {
+        let reply = x11randr_encode_set_screen_config(state, byte_order, sequence, status);
+        let Some(client) = state.clients.get_mut(&client_id.0) else {
+            return Ok(RequestOutcome::Handled);
+        };
+        Ok(write_to_client(client, client_id, &reply))
+    };
+    // REQUEST_SIZE_MATCH: the rate field exists only for a 1.1+ client.
+    let has_rate = randr_client_knows_rates(state, client_id);
+    if body.len() != if has_rate { 20 } else { 16 } {
+        return error(state, x11::error::BAD_LENGTH, 0);
+    }
+    // A DRAWABLE, not a window (`dixLookupDrawable`): a pixmap resolves to
+    // its screen, and an unknown xid is BadDrawable (measured with
+    // `tools/randr-probe`).
+    let drawable = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let id = ResourceId(drawable);
+    if state.resources.window(id).is_none() && state.resources.pixmap(id).is_none() {
+        return error(state, x11::error::BAD_DRAWABLE, drawable);
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+    let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
+    let (timestamp, config_timestamp) = (u32_at(4), u32_at(8));
+    let (size_id, rotation) = (u16_at(12), u16_at(14));
+    let rate = if has_rate { u16_at(16) } else { 0 };
+    // ClientTimeToServerTime: CurrentTime is now.
+    let time = if timestamp == 0 {
+        state.timestamp_now()
+    } else {
+        timestamp
+    };
+    let Some(data) = state.randr.rr10_data() else {
+        return status_reply(state, STATUS_FAILED);
+    };
+    if config_timestamp != state.randr.config_timestamp {
+        return status_reply(state, STATUS_INVALID_CONFIG_TIME);
+    }
+    let Some(size) = data.sizes.get(usize::from(size_id)) else {
+        return error(state, x11::error::BAD_VALUE, u32::from(size_id));
+    };
+    if !matches!(rotation & 0xf, 1 | 2 | 4 | 8) {
+        return error(state, x11::error::BAD_VALUE, u32::from(rotation));
+    }
+    if !crate::randr::SUPPORTED_ROTATIONS & rotation != 0 {
+        return error(state, x11::error::BAD_MATCH, u32::from(rotation));
+    }
+    let mode_id = if rate == 0 {
+        size.rates.first().map(|&(_, mode)| mode)
+    } else {
+        let Some(&(_, mode)) = size.rates.iter().find(|&&(r, _)| r == rate) else {
+            return error(state, x11::error::BAD_VALUE, u32::from(rate));
+        };
+        Some(mode)
+    };
+    let Some(mode) = mode_id.and_then(|id| {
+        state
+            .randr
+            .mode_table
+            .iter()
+            .find(|m| m.mode_id == id)
+            .copied()
+    }) else {
+        return status_reply(state, STATUS_FAILED);
+    };
+    if time < state.randr.timestamp {
+        return status_reply(state, STATUS_INVALID_TIME);
+    }
+    let (min_w, min_h, max_w, max_h) = state.randr.screen_size_range();
+    if !(min_w..=max_w).contains(&mode.width) {
+        return error(state, x11::error::BAD_VALUE, u32::from(mode.width));
+    }
+    if !(min_h..=max_h).contains(&mode.height) {
+        return error(state, x11::error::BAD_VALUE, u32::from(mode.height));
+    }
+    let (width, height) = if crate::randr::rotation_swaps_axes(rotation) {
+        (mode.height, mode.width)
+    } else {
+        (mode.width, mode.height)
+    };
+    let Some(target) = state
+        .randr
+        .outputs
+        .iter()
+        .find(|o| o.output_id == data.output_id)
+        .cloned()
+    else {
+        return status_reply(state, STATUS_FAILED);
+    };
+    if (width, height) != (state.randr.screen_width, state.randr.screen_height) {
+        // Every other CRTC goes off and the screen takes the new size, mm
+        // unchanged. The first output's own CRTC is reconfigured in place
+        // below rather than lit off and on.
+        let others: Vec<(u32, String)> = state
+            .randr
+            .enabled_outputs()
+            .filter(|o| o.output_id != target.output_id)
+            .map(|o| (o.output_id, o.name.clone()))
+            .collect();
+        let mut disabled = Vec::new();
+        for (output_id, name) in others {
+            match backend.begin_crtc_config(output_id, &name, None, 0, 0) {
+                Ok(CrtcConfigApply::Applied(_)) => disabled.push(output_id),
+                Ok(CrtcConfigApply::Pending(_)) | Err(_) => {
+                    return status_reply(state, STATUS_FAILED);
+                }
+            }
+        }
+        if !disabled.is_empty() {
+            let changed: Vec<(u32, u32, u32)> = state
+                .randr
+                .outputs
+                .iter()
+                .filter(|o| disabled.contains(&o.output_id))
+                .map(|o| (o.output_id, o.crtc_id, 0))
+                .collect();
+            backend.refresh_randr_state_set_time(state, time);
+            backend.randr_layout_changed(state);
+            super::run::emit_randr_change_notifications(state, &changed);
+        }
+        if let Err(e) = backend.set_logical_screen_size(width, height) {
+            log::warn!("RRSetScreenConfig: backend resize failed: {e}");
+            return status_reply(state, STATUS_FAILED);
+        }
+        let (mm_w, mm_h) = (state.randr.width_mm, state.randr.height_mm);
+        state.randr.set_logical_size(width, height, mm_w, mm_h);
+        super::run::apply_screen_size_side_effects(state, backend, width, height, &[]);
+        backend.randr_layout_changed(state);
+    }
+    // RRCrtcSet(crtc, mode, 0, 0, rotation, 1, &output) with the pending
+    // client transform, as SetCrtcConfig.
+    let Some(target) = state
+        .randr
+        .outputs
+        .iter()
+        .find(|o| o.output_id == data.output_id)
+        .cloned()
+    else {
+        return status_reply(state, STATUS_FAILED);
+    };
+    let pending = target.pending_transform.applied();
+    if crate::randr::crtc_matrix(rotation, mode.width, mode.height, &pending).is_none() {
+        return status_reply(state, STATUS_FAILED);
+    }
+    let completion = CrtcConfigCompletion {
+        output_id: target.output_id,
+        set_time: time,
+        output_bbox_before: super::run::enabled_output_bbox(state),
+        byte_order,
+        apply_transform: (!target
+            .pending_transform
+            .equivalent(&target.current_transform))
+        .then(|| Box::new(pending)),
+        apply_rotation: (rotation != target.rotation).then_some(rotation),
+        reply: CrtcConfigReply::ScreenConfig,
+    };
+    let mode_spec = ModeSpec {
+        width: mode.width,
+        height: mode.height,
+        vrefresh: mode.vrefresh,
+    };
+    let connector = target.name.clone();
+    start_crtc_config(
+        state,
+        backend,
+        client_id,
+        sequence,
+        &connector,
+        Some(mode_spec),
+        (0, 0),
+        completion,
+    )
+}
+
+/// Hand one CRTC configuration to the backend and complete it now, or park
+/// it until an asynchronous qualification finishes.
+#[allow(clippy::too_many_arguments)]
+fn start_crtc_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    connector: &str,
+    mode_spec: Option<ModeSpec>,
+    (x, y): (i32, i32),
+    completion: CrtcConfigCompletion,
+) -> io::Result<RequestOutcome> {
+    match backend.begin_crtc_config(completion.output_id, connector, mode_spec, x, y) {
+        Ok(CrtcConfigApply::Applied(changed)) => {
+            complete_crtc_config(state, backend, client_id, sequence, completion, Ok(changed))
+        }
+        Ok(CrtcConfigApply::Pending(token)) => {
+            Ok(RequestOutcome::PendingCrtcConfig(PendingCrtcConfig {
+                token,
+                completion,
+            }))
+        }
+        Err(e) => complete_crtc_config(state, backend, client_id, sequence, completion, Err(e)),
+    }
+}
+
+/// `RRClientKnowsRates` (rrdispatch.c:27): the client's QueryVersion was
+/// 1.1 or newer.
+fn randr_client_knows_rates(state: &ServerState, client_id: ClientId) -> bool {
+    state
+        .randr_client_versions
+        .get(&client_id)
+        .is_some_and(|&version| version >= (1, 1))
+}
+
 /// Complete the protocol-visible half of `RRSetCrtcConfig` after either a
 /// synchronous apply or an asynchronous backend result. Keeping this as one
 /// continuation prevents the async path from redispatching validation or
@@ -5144,11 +5528,36 @@ pub(crate) fn complete_crtc_config(
     result: io::Result<bool>,
 ) -> io::Result<RequestOutcome> {
     let status = match result {
-        Ok(true) => {
+        // A new transform is a change even with identical mode/x/y.
+        Ok(changed)
+            if changed
+                || completion.apply_transform.is_some()
+                || completion.apply_rotation.is_some() =>
+        {
             // Something actually changed. Single rebuild path: a CRTC set
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
             backend.refresh_randr_state_set_time(state, completion.set_time);
+            if let Some(transform) = completion.apply_transform
+                && let Some(output) = state
+                    .randr
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.output_id == completion.output_id)
+            {
+                // RRCrtcNotify: RRTransformCopy of pending into current.
+                output.current_transform = *transform;
+            }
+            if let Some(rotation) = completion.apply_rotation
+                && let Some(output) = state
+                    .randr
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.output_id == completion.output_id)
+            {
+                output.rotation = rotation;
+            }
+            backend.randr_layout_changed(state);
             let changed: Vec<(u32, u32, u32)> = state
                 .randr
                 .outputs
@@ -5164,7 +5573,7 @@ pub(crate) fn complete_crtc_config(
             );
             0
         }
-        Ok(false) => {
+        Ok(_) => {
             // A no-op succeeds without a rebuild or change notification.
             0
         }
@@ -5174,6 +5583,17 @@ pub(crate) fn complete_crtc_config(
             3
         }
     };
+    if completion.reply == CrtcConfigReply::ScreenConfig {
+        if status == 0 {
+            state.randr.timestamp = completion.set_time;
+        }
+        let reply =
+            x11randr_encode_set_screen_config(state, completion.byte_order, sequence, status);
+        let Some(client) = state.clients.get_mut(&client_id.0) else {
+            return Ok(RequestOutcome::Handled);
+        };
+        return Ok(write_to_client(client, client_id, &reply));
+    }
     let timestamp = state.randr.timestamp;
     reply_set_crtc_config(
         state,
@@ -5182,6 +5602,24 @@ pub(crate) fn complete_crtc_config(
         completion.byte_order,
         status,
         timestamp,
+    )
+}
+
+/// The `SetScreenConfig` reply for `status`: `lastSetTime`,
+/// `lastConfigTime` and the root, as they stand.
+fn x11randr_encode_set_screen_config(
+    state: &ServerState,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    sequence: SequenceNumber,
+    status: u8,
+) -> Vec<u8> {
+    yserver_protocol::x11::randr::encode_set_screen_config_reply(
+        byte_order,
+        sequence,
+        status,
+        state.randr.timestamp,
+        state.randr.config_timestamp,
+        ROOT_WINDOW.0,
     )
 }
 
@@ -6034,7 +6472,11 @@ fn handle_xinerama_request(
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
 
-    let screens: Vec<xin::ScreenInfo> = active_monitors(state)
+    // RRXineramaScreenCount counts every monitor (`RRMonitorCountList`,
+    // get_active FALSE); QueryScreens lists only the non-empty ones
+    // (rrxinerama.c) — a 0x0 client monitor is counted but not listed.
+    let screen_count = active_monitors(state, false).len();
+    let screens: Vec<xin::ScreenInfo> = active_monitors(state, true)
         .into_iter()
         .map(|monitor| xin::ScreenInfo {
             x_org: monitor.x,
@@ -6067,7 +6509,7 @@ fn handle_xinerama_request(
         }
         xin::IS_ACTIVE => {
             require_len!(0);
-            xin::encode_is_active_reply(byte_order, sequence, !screens.is_empty())
+            xin::encode_is_active_reply(byte_order, sequence, screen_count > 0)
         }
         xin::QUERY_SCREENS => {
             require_len!(0);
@@ -6104,7 +6546,7 @@ fn handle_xinerama_request(
                 );
             }
             #[allow(clippy::cast_possible_truncation)]
-            let count = screens.len() as u8;
+            let count = screen_count as u8;
             xin::encode_get_screen_count_reply(byte_order, sequence, count, window)
         }
         xin::GET_SCREEN_SIZE => {
@@ -11005,8 +11447,9 @@ fn default_present_crtc_for_window(state: &ServerState, window: ResourceId) -> u
     for output in state.randr.enabled_outputs() {
         let output_x = i32::from(output.x);
         let output_y = i32::from(output.y);
-        let output_right = output_x.saturating_add(i32::from(output.width));
-        let output_bottom = output_y.saturating_add(i32::from(output.height));
+        let (footprint_w, footprint_h) = output.footprint();
+        let output_right = output_x.saturating_add(i32::from(footprint_w));
+        let output_bottom = output_y.saturating_add(i32::from(footprint_h));
         let width = window_right.min(output_right) - window_x.max(output_x);
         let height = window_bottom.min(output_bottom) - window_y.max(output_y);
         let area = if width > 0 && height > 0 {
@@ -33546,6 +33989,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![crtc_id.wrapping_add(0x1000)],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }
     }
 
@@ -34566,6 +35012,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![1],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             crate::randr::RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -34583,10 +35032,13 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![1],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
 
-        let monitors = active_monitors(&state);
+        let monitors = active_monitors(&state, true);
         assert_eq!(monitors.len(), state.randr.outputs.len());
         assert_eq!(monitors.len(), 2);
         assert!(monitors[0].primary);
@@ -34597,6 +35049,712 @@ mod tests {
             (677, 381),
             "automatic monitor geometry still derives physical size from its retained CRTC",
         );
+    }
+
+    /// The two-output guest of `tools/vng-scenarios/xrandr-monitors.sh
+    /// --outputs 2` after `--right-of`: Virtual-1 1920x1440+0+0 (primary),
+    /// Virtual-2 1360x768+1920+0, both 325x203 mm.
+    fn monitor_fixture(byte_order: ClientByteOrder) -> (ServerState, UnixStream) {
+        let output =
+            |name: &str, id: u32, x: i16, width: u16, height: u16| crate::randr::RandrOutput {
+                name: name.into(),
+                output_id: id,
+                crtc_id: id + 2,
+                mode_id: id + 4,
+                connected: true,
+                x,
+                y: 0,
+                width,
+                height,
+                vrefresh: 60,
+                timing: None,
+                mm_width: 325,
+                mm_height: 203,
+                mode_ids: vec![id + 4],
+                num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
+            };
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            7,
+            vec![
+                output("Virtual-1", 1, 0, 1920, 1440),
+                output("Virtual-2", 2, 1920, 1360, 768),
+            ],
+        );
+        let peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).unwrap().byte_order = byte_order;
+        (state, peer)
+    }
+
+    /// A request body in the client's byte order.
+    struct WireBody(ClientByteOrder, Vec<u8>);
+
+    impl WireBody {
+        fn u32(mut self, v: u32) -> Self {
+            match self.0 {
+                ClientByteOrder::LittleEndian => self.1.extend_from_slice(&v.to_le_bytes()),
+                ClientByteOrder::BigEndian => self.1.extend_from_slice(&v.to_be_bytes()),
+            }
+            self
+        }
+        fn u16(mut self, v: u16) -> Self {
+            match self.0 {
+                ClientByteOrder::LittleEndian => self.1.extend_from_slice(&v.to_le_bytes()),
+                ClientByteOrder::BigEndian => self.1.extend_from_slice(&v.to_be_bytes()),
+            }
+            self
+        }
+        fn bytes(mut self, v: &[u8]) -> Self {
+            self.1.extend_from_slice(v);
+            self
+        }
+    }
+
+    fn wire_u32(bo: ClientByteOrder, b: &[u8]) -> u32 {
+        let b: [u8; 4] = b[..4].try_into().unwrap();
+        match bo {
+            ClientByteOrder::LittleEndian => u32::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u32::from_be_bytes(b),
+        }
+    }
+
+    fn wire_u16(bo: ClientByteOrder, b: &[u8]) -> u16 {
+        let b: [u8; 2] = b[..2].try_into().unwrap();
+        match bo {
+            ClientByteOrder::LittleEndian => u16::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u16::from_be_bytes(b),
+        }
+    }
+
+    /// Swap `body` as the reader would, then dispatch it as RANDR `minor`.
+    fn randr_wire_request(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        minor: u8,
+        body: WireBody,
+    ) -> Vec<u8> {
+        let WireBody(byte_order, mut body) = body;
+        yserver_protocol::x11::request_swap::swap_request_body(128, minor, byte_order, &mut body);
+        handle_randr_request(
+            state,
+            &mut RecordingBackend::new(),
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+        )
+        .expect("RANDR request");
+        read_all_available(peer)
+    }
+
+    /// `SetMonitor` body: window, then name primary automatic noutput x y
+    /// width height mm-width mm-height outputs.
+    #[allow(clippy::too_many_arguments)]
+    fn set_monitor_body(
+        bo: ClientByteOrder,
+        window: u32,
+        name: u32,
+        primary: bool,
+        noutput: u16,
+        geometry: (i16, i16, u16, u16),
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> WireBody {
+        #[allow(clippy::cast_sign_loss)]
+        let mut body = WireBody(bo, Vec::new())
+            .u32(window)
+            .u32(name)
+            .bytes(&[u8::from(primary), 0])
+            .u16(noutput)
+            .u16(geometry.0 as u16)
+            .u16(geometry.1 as u16)
+            .u16(geometry.2)
+            .u16(geometry.3)
+            .u32(mm.0)
+            .u32(mm.1);
+        for &output in outputs {
+            body = body.u32(output);
+        }
+        body
+    }
+
+    fn set_monitor(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        name: &str,
+        primary: bool,
+        geometry: (i16, i16, u16, u16),
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> Vec<u8> {
+        let bo = state.clients[&1].byte_order;
+        let atom = state.atoms.intern(name, false).0;
+        #[allow(clippy::cast_possible_truncation)]
+        let body = set_monitor_body(
+            bo,
+            ROOT_WINDOW.0,
+            atom,
+            primary,
+            outputs.len() as u16,
+            geometry,
+            mm,
+            outputs,
+        );
+        randr_wire_request(state, peer, x11randr_minor::SET_MONITOR, body)
+    }
+
+    fn delete_monitor(state: &mut ServerState, peer: &mut UnixStream, name: u32) -> Vec<u8> {
+        let bo = state.clients[&1].byte_order;
+        let body = WireBody(bo, Vec::new()).u32(ROOT_WINDOW.0).u32(name);
+        randr_wire_request(state, peer, x11randr_minor::DELETE_MONITOR, body)
+    }
+
+    mod x11randr_minor {
+        pub const SET_MONITOR: u8 = yserver_protocol::x11::randr::RR_SET_MONITOR;
+        pub const DELETE_MONITOR: u8 = yserver_protocol::x11::randr::RR_DELETE_MONITOR;
+    }
+
+    /// One decoded `GetMonitors` entry: name, primary, automatic,
+    /// "WxH+X+Y", "mmWxmmH", outputs.
+    type WireMonitor = (String, bool, bool, String, (u32, u32), Vec<u32>);
+
+    fn get_monitors(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        get_active: bool,
+    ) -> Vec<WireMonitor> {
+        let bo = state.clients[&1].byte_order;
+        let body =
+            WireBody(bo, Vec::new())
+                .u32(ROOT_WINDOW.0)
+                .bytes(&[u8::from(get_active), 0, 0, 0]);
+        let r = randr_wire_request(
+            state,
+            peer,
+            yserver_protocol::x11::randr::RR_GET_MONITORS,
+            body,
+        );
+        assert_eq!(r[0], 1, "GetMonitors reply: {r:02x?}");
+        assert_eq!(
+            wire_u32(bo, &r[4..]) as usize * 4 + 32,
+            r.len(),
+            "reply length"
+        );
+        let count = wire_u32(bo, &r[12..]);
+        let mut total_outputs = 0;
+        let mut offset = 32;
+        let mut monitors = Vec::new();
+        for _ in 0..count {
+            let m = &r[offset..];
+            let n_out = usize::from(wire_u16(bo, &m[6..]));
+            #[allow(clippy::cast_possible_wrap)]
+            let geometry = format!(
+                "{}x{}+{}+{}",
+                wire_u16(bo, &m[12..]),
+                wire_u16(bo, &m[14..]),
+                wire_u16(bo, &m[8..]) as i16,
+                wire_u16(bo, &m[10..]) as i16,
+            );
+            let name = state
+                .atoms
+                .name(AtomId(wire_u32(bo, m)))
+                .unwrap_or("?")
+                .to_string();
+            let outputs = (0..n_out).map(|i| wire_u32(bo, &m[24 + i * 4..])).collect();
+            monitors.push((
+                name,
+                m[4] != 0,
+                m[5] != 0,
+                geometry,
+                (wire_u32(bo, &m[16..]), wire_u32(bo, &m[20..])),
+                outputs,
+            ));
+            total_outputs += n_out;
+            offset += 24 + n_out * 4;
+        }
+        assert_eq!(offset, r.len());
+        assert_eq!(wire_u32(bo, &r[16..]) as usize, total_outputs, "noutputs");
+        monitors
+    }
+
+    fn wm(
+        name: &str,
+        primary: bool,
+        automatic: bool,
+        geometry: &str,
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> WireMonitor {
+        (
+            name.into(),
+            primary,
+            automatic,
+            geometry.into(),
+            mm,
+            outputs.to_vec(),
+        )
+    }
+
+    /// XINERAMA `(GetScreenCount, QueryScreens)` in the client's order.
+    fn xinerama_heads(state: &mut ServerState, peer: &mut UnixStream) -> (u8, Vec<String>) {
+        use yserver_protocol::x11::xinerama as xin;
+        let bo = state.clients[&1].byte_order;
+        let mut send = |state: &mut ServerState, minor: u8, body: &[u8]| {
+            handle_xinerama_request(
+                state,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 151,
+                    data: minor,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body,
+            )
+            .expect("XINERAMA request");
+            read_all_available(peer)
+        };
+        let window = WireBody(bo, Vec::new()).u32(ROOT_WINDOW.0).1;
+        let count = send(state, xin::GET_SCREEN_COUNT, &window);
+        let screens = send(state, xin::QUERY_SCREENS, &[]);
+        let n = wire_u32(bo, &screens[8..]) as usize;
+        #[allow(clippy::cast_possible_wrap)]
+        let heads = (0..n)
+            .map(|i| {
+                let s = &screens[32 + i * 8..];
+                format!(
+                    "{}x{}+{}+{}",
+                    wire_u16(bo, &s[4..]),
+                    wire_u16(bo, &s[6..]),
+                    wire_u16(bo, s) as i16,
+                    wire_u16(bo, &s[2..]) as i16,
+                )
+            })
+            .collect();
+        (count[1], heads)
+    }
+
+    const BOTH_ORDERS: [ClientByteOrder; 2] =
+        [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian];
+
+    /// Measured split: `--setmonitor left 960/170x1440/211+0+0 Virtual-1`
+    /// and `right ...+960+0 none` hide Virtual-1's automatic monitor, keep
+    /// Virtual-2's, and nobody is primary (the primary output is covered).
+    #[test]
+    fn set_monitor_split_replaces_the_covered_automatic_monitor() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            let r = set_monitor(
+                &mut state,
+                &mut peer,
+                "left",
+                false,
+                (0, 0, 960, 1440),
+                (170, 211),
+                &[1],
+            );
+            assert!(r.is_empty(), "{r:02x?}");
+            let r = set_monitor(
+                &mut state,
+                &mut peer,
+                "right",
+                false,
+                (960, 0, 960, 1440),
+                (170, 211),
+                &[],
+            );
+            assert!(r.is_empty(), "{r:02x?}");
+            let want = vec![
+                wm("left", false, false, "960x1440+0+0", (170, 211), &[1]),
+                wm("right", false, false, "960x1440+960+0", (170, 211), &[]),
+                wm(
+                    "Virtual-2",
+                    false,
+                    true,
+                    "1360x768+1920+0",
+                    (325, 203),
+                    &[2],
+                ),
+            ];
+            assert_eq!(get_monitors(&mut state, &mut peer, false), want, "{bo:?}");
+            assert_eq!(get_monitors(&mut state, &mut peer, true), want, "{bo:?}");
+            assert_eq!(
+                xinerama_heads(&mut state, &mut peer),
+                (
+                    3,
+                    vec![
+                        "960x1440+0+0".into(),
+                        "960x1440+960+0".into(),
+                        "1360x768+1920+0".into()
+                    ]
+                ),
+            );
+        }
+    }
+
+    /// Measured: a 0x0+0+0 monitor over both outputs is their union, and
+    /// its physical size is Xorg 21.1's integer `last_w / first_w *
+    /// first_mm` — 1360/1920 = 0 — so 0x0 mm. With Virtual-2 off it is
+    /// Virtual-1's geometry alone.
+    #[test]
+    fn automatic_geometry_client_monitor_follows_the_crtc_layout() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "both",
+                false,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1, 2],
+            );
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, false),
+                vec![wm("both", false, false, "3280x1440+0+0", (0, 0), &[1, 2])],
+            );
+            state.randr.outputs[1].mode_id = 0;
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, false),
+                vec![wm(
+                    "both",
+                    false,
+                    false,
+                    "1920x1440+0+0",
+                    (325, 203),
+                    &[1, 2]
+                )],
+            );
+        }
+    }
+
+    /// Measured `cprim`: a primary client monitor leads the list, and the
+    /// uncovered CRTC of the primary output is ALSO reported primary —
+    /// Xorg's leading entry does not count towards `has_primary`.
+    #[test]
+    fn client_primary_and_uncovered_primary_output_are_both_primary() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            state.randr.primary_output = 2;
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "autogeo",
+                false,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "cprim",
+                true,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1],
+            );
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, true),
+                vec![
+                    wm("cprim", true, false, "1920x1440+0+0", (325, 203), &[1]),
+                    wm("autogeo", false, false, "1920x1440+0+0", (325, 203), &[1]),
+                    wm("Virtual-2", true, true, "1360x768+1920+0", (325, 203), &[2]),
+                ],
+            );
+        }
+    }
+
+    /// Measured `extra-primary`: a new primary monitor clears the old one's
+    /// flag; deleting it leaves no primary client monitor behind.
+    #[test]
+    fn a_new_primary_client_monitor_clears_the_previous_one() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "left",
+                false,
+                (0, 0, 960, 1440),
+                (170, 211),
+                &[1],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "right",
+                true,
+                (960, 0, 960, 1440),
+                (100, 50),
+                &[],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "extra",
+                true,
+                (0, 0, 10, 10),
+                (100, 50),
+                &[],
+            );
+            let names = |m: Vec<WireMonitor>| m.into_iter().map(|m| (m.0, m.1)).collect::<Vec<_>>();
+            assert_eq!(
+                names(get_monitors(&mut state, &mut peer, false)),
+                vec![
+                    ("extra".into(), true),
+                    ("left".into(), false),
+                    ("right".into(), false),
+                    ("Virtual-2".into(), false),
+                ],
+            );
+            let extra = state.atoms.intern("extra", true).0;
+            assert!(delete_monitor(&mut state, &mut peer, extra).is_empty());
+            assert_eq!(
+                names(get_monitors(&mut state, &mut peer, false)),
+                vec![
+                    ("left".into(), false),
+                    ("right".into(), false),
+                    ("Virtual-2".into(), false),
+                ],
+            );
+        }
+    }
+
+    /// Measured `empty`: a 0x0 monitor with no outputs is listed by
+    /// `GetMonitors(get_active=0)` and counted by XINERAMA GetScreenCount,
+    /// but neither `get_active=1` nor QueryScreens reports it.
+    #[test]
+    fn an_empty_monitor_is_counted_but_not_active() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "empty",
+                false,
+                (0, 0, 0, 0),
+                (100, 50),
+                &[],
+            );
+            let all = get_monitors(&mut state, &mut peer, false);
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[1], wm("empty", false, false, "0x0+0+0", (100, 50), &[]));
+            assert_eq!(get_monitors(&mut state, &mut peer, true).len(), 2);
+            let (count, heads) = xinerama_heads(&mut state, &mut peer);
+            assert_eq!((count, heads.len()), (3, 2));
+        }
+    }
+
+    /// The error table measured on Xorg 21.1 (`mon.py errors`): codes and
+    /// wire values, no state change on failure, and no validation of the
+    /// output ids.
+    #[test]
+    fn set_and_delete_monitor_errors_match_xorg() {
+        use yserver_protocol::x11::error;
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            let err = |r: &[u8]| {
+                assert_eq!(r.len(), 32, "one error: {r:02x?}");
+                assert_eq!(r[0], 0);
+                (r[1], wire_u32(bo, &r[4..]), wire_u16(bo, &r[8..]), r[10])
+            };
+            let output_atom = state.atoms.intern("Virtual-1", false).0;
+            let name = state.atoms.intern("errmon", false).0;
+            let root = ROOT_WINDOW.0;
+            let set = |state: &mut ServerState,
+                       peer: &mut UnixStream,
+                       window,
+                       name,
+                       noutput,
+                       outputs: &[u32]| {
+                let body = set_monitor_body(
+                    bo,
+                    window,
+                    name,
+                    false,
+                    noutput,
+                    (0, 0, 10, 10),
+                    (100, 50),
+                    outputs,
+                );
+                randr_wire_request(state, peer, x11randr_minor::SET_MONITOR, body)
+            };
+            let cases: Vec<(&str, Vec<u8>, (u8, u32))> = vec![
+                (
+                    "name=output",
+                    set(&mut state, &mut peer, root, output_atom, 0, &[]),
+                    (error::BAD_VALUE, output_atom),
+                ),
+                (
+                    "name=None",
+                    set(&mut state, &mut peer, root, 0, 0, &[]),
+                    (error::BAD_ATOM, root),
+                ),
+                (
+                    "name=0x7fffff",
+                    set(&mut state, &mut peer, root, 0x7f_ffff, 0, &[]),
+                    (error::BAD_ATOM, root),
+                ),
+                (
+                    "bad window",
+                    set(&mut state, &mut peer, 0x7ff_fffe, name, 0, &[]),
+                    (error::BAD_WINDOW, 0x7ff_fffe),
+                ),
+                (
+                    "noutput=1, none sent",
+                    set(&mut state, &mut peer, root, name, 1, &[]),
+                    (error::BAD_LENGTH, 0),
+                ),
+                (
+                    "noutput=0, one sent",
+                    set(&mut state, &mut peer, root, name, 0, &[1]),
+                    (error::BAD_LENGTH, 0),
+                ),
+            ];
+            for (label, r, (code, value)) in cases {
+                assert_eq!(err(&r), (code, value, 43, 128), "SetMonitor {label} {bo:?}");
+            }
+            let short = randr_wire_request(
+                &mut state,
+                &mut peer,
+                x11randr_minor::SET_MONITOR,
+                WireBody(bo, Vec::new()).u32(root).u32(name),
+            );
+            assert_eq!(err(&short).0, error::BAD_LENGTH);
+            assert!(state.randr_client_monitors.is_empty());
+
+            // Output ids are not validated (measured: `bogusout` succeeded).
+            let bogus = state.atoms.intern("bogusout", false).0;
+            assert!(set(&mut state, &mut peer, root, bogus, 1, &[0x7777]).is_empty());
+            assert_eq!(
+                err(&set(&mut state, &mut peer, root, bogus, 0, &[])),
+                (error::BAD_VALUE, bogus, 43, 128),
+                "21.1 refuses a name already in use",
+            );
+
+            let never = state.atoms.intern("nosuchmon", false).0;
+            let del = |state: &mut ServerState, peer: &mut UnixStream, window: u32, name: u32| {
+                let body = WireBody(bo, Vec::new()).u32(window).u32(name);
+                randr_wire_request(state, peer, x11randr_minor::DELETE_MONITOR, body)
+            };
+            let cases: Vec<(&str, Vec<u8>, (u8, u32))> = vec![
+                (
+                    "never set",
+                    del(&mut state, &mut peer, root, never),
+                    (error::BAD_VALUE, never),
+                ),
+                (
+                    "None",
+                    del(&mut state, &mut peer, root, 0),
+                    (error::BAD_ATOM, 0),
+                ),
+                (
+                    "0x7fffff",
+                    del(&mut state, &mut peer, root, 0x7f_ffff),
+                    (error::BAD_ATOM, 0x7f_ffff),
+                ),
+                (
+                    "bad window",
+                    del(&mut state, &mut peer, 0x7ff_fffe, bogus),
+                    (error::BAD_WINDOW, 0x7ff_fffe),
+                ),
+                (
+                    "output name",
+                    del(&mut state, &mut peer, root, output_atom),
+                    (error::BAD_VALUE, output_atom),
+                ),
+            ];
+            for (label, r, (code, value)) in cases {
+                assert_eq!(
+                    err(&r),
+                    (code, value, 44, 128),
+                    "DeleteMonitor {label} {bo:?}"
+                );
+            }
+            let long = randr_wire_request(
+                &mut state,
+                &mut peer,
+                x11randr_minor::DELETE_MONITOR,
+                WireBody(bo, Vec::new()).u32(root).u32(bogus).u32(0),
+            );
+            assert_eq!(err(&long).0, error::BAD_LENGTH);
+            assert_eq!(
+                state.randr_client_monitors.len(),
+                1,
+                "bogusout survived every failure"
+            );
+            assert!(del(&mut state, &mut peer, root, bogus).is_empty());
+            assert!(state.randr_client_monitors.is_empty());
+        }
+    }
+
+    /// Measured `mon.py events`: each successful Set/DeleteMonitor sends one
+    /// core ConfigureNotify on the root (`RRSendConfigNotify`) and no RANDR
+    /// event; a failed one sends nothing.
+    #[test]
+    fn set_and_delete_monitor_notify_with_a_root_configure_notify() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            state
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .event_masks
+                .insert(ROOT_WINDOW, 0x0002_0000);
+            state.randr_select_masks.insert((1, ROOT_WINDOW), 0x1f);
+            let root = state
+                .resources
+                .window(ROOT_WINDOW)
+                .map(|w| (w.width, w.height))
+                .unwrap();
+            let configure_notify = |r: &[u8]| {
+                assert_eq!(r.len(), 32, "exactly one event: {r:02x?}");
+                assert_eq!(r[0], 22, "ConfigureNotify");
+                assert_eq!(wire_u32(bo, &r[4..]), ROOT_WINDOW.0, "event window");
+                assert_eq!(wire_u32(bo, &r[8..]), ROOT_WINDOW.0, "window");
+                assert_eq!(wire_u32(bo, &r[12..]), 0, "above-sibling None");
+                assert_eq!((wire_u16(bo, &r[20..]), wire_u16(bo, &r[22..])), root);
+            };
+            configure_notify(&set_monitor(
+                &mut state,
+                &mut peer,
+                "evmon",
+                false,
+                (0, 0, 100, 100),
+                (100, 50),
+                &[],
+            ));
+            let again = set_monitor(
+                &mut state,
+                &mut peer,
+                "evmon",
+                false,
+                (0, 0, 200, 100),
+                (100, 50),
+                &[],
+            );
+            assert_eq!(
+                (again.len(), again[0]),
+                (32, 0),
+                "reused name: an error, no event"
+            );
+            let evmon = state.atoms.intern("evmon", true).0;
+            configure_notify(&delete_monitor(&mut state, &mut peer, evmon));
+            let again = delete_monitor(&mut state, &mut peer, evmon);
+            assert_eq!(
+                (again.len(), again[0]),
+                (32, 0),
+                "unknown name: an error, no event"
+            );
+        }
     }
 
     #[test]
@@ -36563,91 +37721,1020 @@ mod tests {
         assert!(mark_randr_unsupported_warned(&mut state, 19));
     }
 
-    #[test]
-    fn randr_set_crtc_transform_accepts_only_direct_identity_state() {
-        use yserver_protocol::x11::randr as x11randr;
+    const RR_IDENTITY: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
 
-        let mut state = ServerState::new();
-        let crtc = state.randr.outputs[0].crtc_id;
-        let mut peer = install_client(&mut state, 1);
+    fn rr_scale(word: i32) -> [i32; 9] {
+        [word, 0, 0, 0, word, 0, 0, 0, 0x0001_0000]
+    }
+
+    fn randr_transform_body_with_params(
+        crtc: u32,
+        matrix: [i32; 9],
+        filter_name: &[u8],
+        params: &[i32],
+    ) -> Vec<u8> {
+        let mut body = randr_transform_body(crtc, matrix, filter_name);
+        for param in params {
+            body.extend_from_slice(&param.to_le_bytes());
+        }
+        body
+    }
+
+    /// Send one SetCrtcTransform; the error code it produced, if any.
+    fn randr_set_crtc_transform(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Option<u8> {
         let mut backend = RecordingBackend::new();
-        let identity = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
         let header = RequestHeader {
             opcode: 128,
-            data: x11randr::RR_SET_CRTC_TRANSFORM,
-            length_units: 12,
+            data: yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+            length_units: u32::try_from(1 + body.len() / 4).unwrap(),
         };
-
         handle_randr_request(
-            &mut state,
+            state,
             &mut backend,
             ClientId(1),
             SequenceNumber(1),
             header,
-            &randr_transform_body(crtc, identity, &[]),
+            body,
         )
-        .expect("identity transform");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
-        assert_eq!(
-            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
-            0,
-        );
+        .expect("SetCrtcTransform");
+        let out = read_all_available(peer);
+        if out.is_empty() {
+            return None;
+        }
+        assert_eq!(out.len(), 32, "one error");
+        assert_eq!(out[0], 0, "error packet");
+        assert_eq!(out[10], 128, "major = RANDR");
+        Some(out[1])
+    }
 
-        // An identity filter is harmless and remains a wire-success no-op,
-        // but its parameters are not retained for GetCrtcTransform, so even
-        // an empty filter name with a parameter tail must warn.
-        let mut parameter_only = randr_transform_body(crtc, identity, &[]);
-        parameter_only.extend_from_slice(&0x0001_0000i32.to_le_bytes());
+    #[test]
+    fn randr_set_crtc_transform_validates_in_xorg_order() {
+        // rrcrtc.c:1755-1785 and RRCrtcTransformSet, then D2. Each case
+        // also carries the fault of every later step, so it shows the
+        // earlier check wins. BadAccess (leased CRTC) is not reachable:
+        // yserver has no RANDR leases.
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+        let bad_crtc = RANDR_BAD_CRTC;
+        let singular = [0i32; 9];
+        let rotate = [0, -0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0x0001_0000];
+        let mut overrun = randr_transform_body(crtc, singular, b"");
+        overrun[40..42].copy_from_slice(&8u16.to_le_bytes());
+        let mut overrun_bad_crtc = overrun.clone();
+        overrun_bad_crtc[0..4].copy_from_slice(&0xdeadu32.to_le_bytes());
+        let mut overrun_invertible = randr_transform_body(crtc, RR_IDENTITY, b"");
+        overrun_invertible[40..42].copy_from_slice(&8u16.to_le_bytes());
+        let one = 0x0001_0000;
+        let cases: Vec<(&str, Vec<u8>, Option<u8>)> = vec![
+            ("BadCrtc", overrun_bad_crtc, Some(bad_crtc)),
+            ("non-invertible", overrun, Some(x11::error::BAD_MATCH)),
+            (
+                "negative nparams",
+                overrun_invertible,
+                Some(x11::error::BAD_LENGTH),
+            ),
+            (
+                "unknown filter",
+                randr_transform_body(crtc, rotate, b"box"),
+                Some(x11::error::BAD_NAME),
+            ),
+            (
+                "convolution parameter check",
+                randr_transform_body_with_params(crtc, RR_IDENTITY, b"convolution", &[one]),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "params without a filter",
+                randr_transform_body_with_params(crtc, rotate, b"", &[one]),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: valid convolution",
+                randr_transform_body_with_params(
+                    crtc,
+                    RR_IDENTITY,
+                    b"convolution",
+                    &[one, one, one],
+                ),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: rotation",
+                randr_transform_body(crtc, rotate, b"good"),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: translation",
+                randr_transform_body(crtc, [one, 0, 5 * one, 0, one, 0, 0, 0, one], b""),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "pure scale",
+                randr_transform_body(crtc, rr_scale(104_857), b"good"),
+                None,
+            ),
+            (
+                "bilinear keeps its parameters",
+                randr_transform_body_with_params(crtc, rr_scale(131_072), b"bilinear", &[one]),
+                None,
+            ),
+            (
+                "identity with a filter",
+                randr_transform_body(crtc, RR_IDENTITY, b"FAST"),
+                None,
+            ),
+        ];
+        for (name, body, expected) in cases {
+            assert_eq!(
+                randr_set_crtc_transform(&mut state, &mut peer, &body),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    fn randr_get_crtc_transform(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        crtc: u32,
+    ) -> Vec<u8> {
+        randr_get_crtc_transform_body(state, peer, &crtc.to_le_bytes())
+    }
+
+    fn randr_get_crtc_transform_body(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
         handle_randr_request(
-            &mut state,
+            state,
             &mut backend,
             ClientId(1),
             SequenceNumber(2),
             RequestHeader {
-                length_units: 13,
-                ..header
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
             },
-            &parameter_only,
+            body,
         )
-        .expect("identity transform with filter parameter");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
-        assert_ne!(
-            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
-            0,
+        .expect("GetCrtcTransform");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn get_crtc_transform_of_the_wrong_length_is_bad_length_before_bad_crtc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let crtc = state.randr.outputs[0].crtc_id;
+        // Short (header only) and oversized, for a real and a bogus CRTC.
+        for body in [
+            Vec::new(),
+            [crtc.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+            [0xdead_u32.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+        ] {
+            let reply = randr_get_crtc_transform_body(&mut state, &mut peer, &body);
+            assert_eq!(reply.len(), 32, "{body:?}");
+            assert_eq!(
+                (reply[0], reply[1]),
+                (0, x11::error::BAD_LENGTH),
+                "{body:?}"
+            );
+            assert_eq!(
+                (reply[8], reply[10]),
+                (yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM, 128)
+            );
+        }
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, 0xdead);
+        assert_eq!(
+            (reply[0], reply[1]),
+            (0, RANDR_BAD_CRTC),
+            "the right size looks up"
+        );
+    }
+
+    #[test]
+    fn randr_set_crtc_transform_stores_pending_for_get_crtc_transform() {
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+        assert_eq!(reply.len(), 96, "default: no filter bytes");
+        assert_eq!(reply[44], 1, "hasTransforms");
+        assert_eq!(&reply[88..96], &[0u8; 8]);
+
+        // muffin's scale-down 125% CRTC 6 request (spec table): `good`.
+        let body = randr_transform_body_with_params(crtc, rr_scale(104_857), b"good", &[0x8000]);
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        let output = &state.randr.outputs[0];
+        assert_eq!(output.pending_transform.matrix, rr_scale(104_857));
+        assert_eq!(
+            output.pending_transform.filter,
+            Some(crate::randr::Filter::Bilinear)
+        );
+        assert_eq!(
+            output.current_transform,
+            crate::randr::CrtcTransform::identity()
         );
 
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+        assert_eq!(reply.len(), 108);
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            104_857
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[48..52].try_into().unwrap()),
+            0x0001_0000
+        );
+        assert_eq!(&reply[88..96], &[8, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(&reply[96..104], b"bilinear", "canonical name, not `good`");
+        assert_eq!(&reply[104..108], &0x8000i32.to_le_bytes());
+
+        // A rejected request leaves the pending transform alone.
+        let rotate = [0, -0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0x0001_0000];
+        let body = randr_transform_body(crtc, rotate, b"");
+        assert_eq!(
+            randr_set_crtc_transform(&mut state, &mut peer, &body),
+            Some(x11::error::BAD_MATCH)
+        );
+        assert_eq!(
+            state.randr.outputs[0].pending_transform.matrix,
+            rr_scale(104_857)
+        );
+    }
+
+    fn randr_crtc_config_body(crtc: u32, x: i16, y: i16, mode: u32, outputs: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(24 + outputs.len() * 4);
+        body.extend_from_slice(&crtc.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        body.extend_from_slice(&0u32.to_le_bytes()); // config_timestamp
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&mode.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // RR_Rotate_0
+        body.extend_from_slice(&[0u8; 2]);
+        for output in outputs {
+            body.extend_from_slice(&output.to_le_bytes());
+        }
+        body
+    }
+
+    fn randr_set_crtc_config(
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+        body: &[u8],
+    ) -> io::Result<RequestOutcome> {
         handle_randr_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+        )
+    }
+
+    /// `(width, height)` of every CrtcChangeNotify in `wire`, and whether a
+    /// SetCrtcConfig Success reply is present.
+    fn randr_crtc_notifies_and_success(wire: &[u8]) -> (Vec<(u16, u16)>, bool) {
+        let u16_at = |c: &[u8], o: usize| u16::from_le_bytes(c[o..o + 2].try_into().unwrap());
+        let notifies = wire
+            .chunks_exact(32)
+            .filter(|c| c[0] == 89 + 1 && c[1] == yserver_protocol::x11::randr::NOTIFY_CRTC_CHANGE)
+            .map(|c| (u16_at(c, 28), u16_at(c, 30)))
+            .collect();
+        let success = wire.chunks_exact(32).any(|c| c[0] == 1 && c[1] == 0);
+        (notifies, success)
+    }
+
+    #[test]
+    fn randr_set_crtc_config_applies_a_pending_transform_as_a_change() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        state.randr_select_masks.insert(
+            (1, crate::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let mut backend = RecordingBackend::new();
+        let same_config =
+            randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+
+        // Nothing pending: the backend's no-op stays a no-op.
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success);
+        assert!(notifies.is_empty());
+
+        // xrandr --scale 2 (spec, "What Xorg does").
+        let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success);
+        assert_eq!(
+            notifies,
+            vec![(output.width, output.height)],
+            "one CrtcChangeNotify carrying the mode size"
+        );
+        let applied = &state.randr.outputs[0];
+        assert_eq!(applied.current_transform.matrix, rr_scale(131_072));
+        assert_eq!(applied.footprint(), (output.width * 2, output.height * 2));
+
+        // Applied: the same config is a no-op again.
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(notifies.is_empty());
+
+        // A disable leaves the current transform in place.
+        let body = randr_transform_body(crtc, rr_scale(32_768), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &randr_crtc_config_body(crtc, 0, 0, 0, &[]),
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+        assert_eq!(
+            state.randr.outputs[0].current_transform.matrix,
+            rr_scale(131_072)
+        );
+    }
+
+    fn randr_get_crtc_info(state: &mut ServerState, peer: &mut UnixStream, crtc: u32) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
+        let body = [crtc.to_le_bytes(), 0u32.to_le_bytes()].concat();
+        handle_randr_request(
+            state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(4),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_CRTC_INFO,
+                length_units: 3,
+            },
+            &body,
+        )
+        .expect("GetCrtcInfo");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn randr_set_crtc_config_rotation_is_a_change_reported_as_xorg() {
+        use crate::randr::{RR_REFLECT_X, RR_ROTATE_0, RR_ROTATE_90};
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        state.randr_select_masks.insert(
+            (1, crate::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let mut backend = RecordingBackend::new();
+        let rotated = |rotation: u16| {
+            let mut body =
+                randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+            body[20..22].copy_from_slice(&rotation.to_le_bytes());
+            body
+        };
+        let u16_at = |c: &[u8], o: usize| u16::from_le_bytes(c[o..o + 2].try_into().unwrap());
+
+        // `xrandr --rotate left`: same mode and origin, a new rotation.
+        randr_set_crtc_config(&mut state, &mut backend, &rotated(RR_ROTATE_90)).unwrap();
+        let wire = read_all_available(&mut peer);
+        let (notifies, success) = randr_crtc_notifies_and_success(&wire);
+        assert!(success);
+        assert_eq!(
+            notifies,
+            vec![(output.width, output.height)],
+            "CrtcChangeNotify keeps the mode size (rrcrtc.c:249)"
+        );
+        let notify = wire.chunks_exact(32).find(|c| c[0] == 90).unwrap();
+        assert_eq!(u16_at(notify, 20), RR_ROTATE_90, "and carries the rotation");
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90);
+        assert!(state.randr.outputs[0].current_transform.is_identity());
+
+        // GetCrtcInfo: the rotated footprint, rotation and modesetting's
+        // rotations 0x3f (measured, tools/vng-scenarios/xrandr-rotate.sh).
+        let reply = randr_get_crtc_info(&mut state, &mut peer, crtc);
+        assert_eq!(reply[0], 1);
+        assert_eq!(
+            (u16_at(&reply, 16), u16_at(&reply, 18)),
+            (output.height, output.width)
+        );
+        assert_eq!(u16_at(&reply, 24), RR_ROTATE_90);
+        assert_eq!(u16_at(&reply, 26), 0x3f);
+
+        // The same rotation again is a no-op.
+        randr_set_crtc_config(&mut state, &mut backend, &rotated(RR_ROTATE_90)).unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(notifies.is_empty());
+
+        // A reflection bit is a change too.
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &rotated(RR_ROTATE_90 | RR_REFLECT_X),
+        )
+        .unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert_eq!(notifies.len(), 1);
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90 | RR_REFLECT_X);
+
+        // A disable keeps the rotation, as xf86RandR12CrtcSet does.
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &randr_crtc_config_body(crtc, 0, 0, 0, &[]),
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90 | RR_REFLECT_X);
+        assert_ne!(state.randr.outputs[0].rotation, RR_ROTATE_0);
+    }
+
+    /// A SetScreenConfig from client 1: `(status, new_timestamp,
+    /// new_config_timestamp, root)` of the reply, or `Err(error code)`.
+    fn randr_set_screen_config(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Result<(u8, u32, u32, u32), u8> {
+        handle_randr_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(5),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_SCREEN_CONFIG,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+        )
+        .expect("SetScreenConfig");
+        let wire = read_all_available(peer);
+        let reply = wire
+            .chunks_exact(32)
+            .find(|c| c[0] <= 1)
+            .expect("a reply or an error");
+        let u32_at = |o: usize| u32::from_le_bytes(reply[o..o + 4].try_into().unwrap());
+        if reply[0] == 0 {
+            return Err(reply[1]);
+        }
+        Ok((reply[1], u32_at(8), u32_at(12), u32_at(16)))
+    }
+
+    /// drawable, timestamp, configTimestamp, sizeID, rotation[, rate, pad].
+    fn screen_config_body(
+        config_timestamp: u32,
+        timestamp: u32,
+        size_id: u16,
+        rotation: u16,
+        rate: Option<u16>,
+    ) -> Vec<u8> {
+        let mut body = crate::resources::ROOT_WINDOW.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&timestamp.to_le_bytes());
+        body.extend_from_slice(&config_timestamp.to_le_bytes());
+        body.extend_from_slice(&size_id.to_le_bytes());
+        body.extend_from_slice(&rotation.to_le_bytes());
+        if let Some(rate) = rate {
+            body.extend_from_slice(&rate.to_le_bytes());
+            body.extend_from_slice(&[0; 2]);
+        }
+        body
+    }
+
+    #[test]
+    fn randr_set_screen_config_rotates_the_first_output_as_xorg() {
+        use crate::randr::{RR_ROTATE_90, RR_ROTATE_180};
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.randr_client_versions.insert(ClientId(1), (1, 5));
+        let cts = state.randr.config_timestamp;
+        let (w, h) = (state.randr.screen_width, state.randr.screen_height);
+        let mm = (state.randr.width_mm, state.randr.height_mm);
+
+        // `xrandr -o left` (tools/vng-scenarios/xrandr-orientation.sh on
+        // Xorg): screen and CRTC 800×1280 from 1280×800, mm unchanged,
+        // CRTC at 0,0, rotation Rotate_90.
+        let reply = randr_set_screen_config(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            &screen_config_body(cts, 500, 0, RR_ROTATE_90, Some(0)),
+        )
+        .unwrap();
+        assert_eq!(reply, (0, 500, cts, crate::resources::ROOT_WINDOW.0));
+        assert_eq!(
+            (state.randr.screen_width, state.randr.screen_height),
+            (h, w)
+        );
+        assert_eq!((state.randr.width_mm, state.randr.height_mm), mm);
+        let applied = &state.randr.outputs[0];
+        assert_eq!(applied.rotation, RR_ROTATE_90);
+        assert_eq!(applied.footprint(), (output.height, output.width));
+        assert!(backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::ApplyCrtcConfig {
+                x: 0,
+                y: 0,
+                mode: Some(_),
+                ..
+            }
+        )));
+
+        // Xorg's statuses, in its order (same probe).
+        let body =
+            |cts, ts, size, rotation, rate| screen_config_body(cts, ts, size, rotation, Some(rate));
+        let mut call = |state: &mut ServerState, b: Vec<u8>| {
+            randr_set_screen_config(state, &mut backend, &mut peer, &b)
+        };
+        assert_eq!(
+            call(&mut state, body(cts + 1, 0, 0, 1, 0)).map(|r| r.0),
+            Ok(1)
+        );
+        assert_eq!(call(&mut state, body(cts, 1, 0, 1, 0)).map(|r| r.0), Ok(2));
+        assert_eq!(
+            call(&mut state, body(cts, 0, 1, 1, 0)),
+            Err(x11::error::BAD_VALUE),
+            "one mode size here"
+        );
+        assert_eq!(
+            call(&mut state, body(cts, 0, 0, 3, 0)),
+            Err(x11::error::BAD_VALUE)
+        );
+        assert_eq!(
+            call(&mut state, body(cts, 0, 0, 0x41, 0)),
+            Err(x11::error::BAD_MATCH)
+        );
+        assert_eq!(
+            call(&mut state, body(cts, 0, 0, 1, 1)),
+            Err(x11::error::BAD_VALUE)
+        );
+        let rate = state.randr.rr10_data().unwrap().rate;
+        assert_eq!(
+            call(&mut state, body(cts, 600, 0, RR_ROTATE_90, rate)).map(|r| (r.0, r.1)),
+            Ok((0, 600)),
+            "the current rate"
+        );
+        // A no-op success still moves lastSetTime (rrscreen.c:1100).
+        assert_eq!(
+            call(&mut state, body(cts, 700, 0, RR_ROTATE_90, 0)).map(|r| (r.0, r.1)),
+            Ok((0, 700))
+        );
+        assert_eq!(state.randr.timestamp, 700);
+        // `-o inverted`: back to the mode's own size.
+        assert_eq!(
+            call(&mut state, body(cts, 800, 0, RR_ROTATE_180, 0)).map(|r| r.0),
+            Ok(0)
+        );
+        assert_eq!(
+            (state.randr.screen_width, state.randr.screen_height),
+            (w, h)
+        );
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_180);
+    }
+
+    #[test]
+    fn randr_set_screen_config_size_follows_the_clients_randr_version() {
+        // REQUEST_SIZE_MATCH by RRClientKnowsRates (rrscreen.c:926-933).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let cts = state.randr.config_timestamp;
+        // Explicit times: CurrentTime is the test clock, behind lastSetTime.
+        let v10 = screen_config_body(cts, 1000, 0, 1, None);
+        let v11 = screen_config_body(cts, 1000, 0, 1, Some(0));
+        assert_eq!(
+            randr_set_screen_config(&mut state, &mut backend, &mut peer, &v11),
+            Err(x11::error::BAD_LENGTH),
+            "no QueryVersion: the 1.0 size"
+        );
+        assert_eq!(
+            randr_set_screen_config(&mut state, &mut backend, &mut peer, &v10).map(|r| r.0),
+            Ok(0)
+        );
+        state.randr_client_versions.insert(ClientId(1), (1, 1));
+        assert_eq!(
+            randr_set_screen_config(&mut state, &mut backend, &mut peer, &v10),
+            Err(x11::error::BAD_LENGTH),
+            "measured: a 1.0-sized request from a 1.5 client"
+        );
+        assert_eq!(
+            randr_set_screen_config(&mut state, &mut backend, &mut peer, &v11).map(|r| r.0),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn randr_get_screen_info_lists_mode_sizes_and_rates_by_client_version() {
+        use crate::randr::RR_ROTATE_90;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let output = state.randr.outputs[0].clone();
+        state.randr.outputs[0].rotation = RR_ROTATE_90;
+        let get =
+            |state: &mut ServerState, backend: &mut RecordingBackend, peer: &mut UnixStream| {
+                handle_randr_request(
+                    state,
+                    backend,
+                    ClientId(1),
+                    SequenceNumber(6),
+                    RequestHeader {
+                        opcode: 128,
+                        data: yserver_protocol::x11::randr::RR_GET_SCREEN_INFO,
+                        length_units: 2,
+                    },
+                    &crate::resources::ROOT_WINDOW.0.to_le_bytes(),
+                )
+                .expect("GetScreenInfo");
+                read_all_available(peer)
+            };
+        let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let rate = state.randr.rr10_data().unwrap().rate;
+        let v10 = get(&mut state, &mut backend, &mut peer);
+        assert_eq!(v10[1], 0x3f, "setOfRotations");
+        assert_eq!(u16_at(&v10, 20), 1, "nSizes");
+        assert_eq!(u16_at(&v10, 24), RR_ROTATE_90);
+        assert_eq!(u16_at(&v10, 26), rate);
+        assert_eq!(u16_at(&v10, 28), 2, "nrateEnts = nsize + nrefresh");
+        assert_eq!(v10.len(), 32 + 8, "no rate lists for a 1.0 client");
+        // The mode size, unswapped while rotated (measured).
+        assert_eq!(
+            (u16_at(&v10, 32), u16_at(&v10, 34)),
+            (output.width, output.height)
+        );
+
+        state.randr_client_versions.insert(ClientId(1), (1, 5));
+        let v11 = get(&mut state, &mut backend, &mut peer);
+        assert_eq!(v11.len(), 32 + 12);
+        assert_eq!((u16_at(&v11, 40), u16_at(&v11, 42)), (1, rate));
+    }
+
+    #[test]
+    fn an_asynchronous_crtc_config_applies_the_transform_pending_at_request_time() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        backend.pending_crtc_config = Some(CrtcConfigToken(7));
+        let config = randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+        let RequestOutcome::PendingCrtcConfig(pending) =
+            randr_set_crtc_config(&mut state, &mut backend, &config).unwrap()
+        else {
+            panic!("the enable must park");
+        };
+        // A new SetCrtcTransform while the enable is in flight stays pending.
+        let body = randr_transform_body(crtc, rr_scale(32_768), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        complete_crtc_config(
             &mut state,
             &mut backend,
             ClientId(1),
             SequenceNumber(3),
-            RequestHeader {
-                length_units: 13,
-                ..header
-            },
-            &randr_transform_body(crtc, identity, b"box"),
+            pending.completion,
+            Ok(true),
         )
-        .expect("identity transform with named filter");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+        .unwrap();
+        let output = &state.randr.outputs[0];
+        assert_eq!(output.current_transform.matrix, rr_scale(131_072));
+        assert_eq!(output.pending_transform.matrix, rr_scale(32_768));
+    }
 
-        let mut projective = identity;
-        projective[6] = 1;
-        handle_randr_request(
-            &mut state,
-            &mut backend,
-            ClientId(1),
-            SequenceNumber(4),
-            header,
-            &randr_transform_body(crtc, projective, &[]),
-        )
-        .expect("reject non-identity transform");
-        let error = read_all_available(&mut peer);
-        assert_eq!(error.len(), 32);
-        assert_eq!(error[0], 0);
-        assert_eq!(error[1], x11::error::BAD_MATCH);
-        assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), crtc);
-        assert_eq!(&error[8..10], &u16::from(header.data).to_le_bytes());
-        assert_eq!(error[10], 128);
+    #[test]
+    fn randr_set_crtc_config_does_not_bound_a_crtc_by_the_screen() {
+        // rrcrtc.c:1436 skips the bounds check for transform-capable CRTCs.
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let x = i16::try_from(state.randr.screen_width).unwrap();
+        let body =
+            randr_crtc_config_body(output.crtc_id, x, 0, output.mode_id, &[output.output_id]);
+        randr_set_crtc_config(&mut state, &mut backend, &body).unwrap();
+        let (_, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success, "past the screen edge is not BadValue");
+    }
+
+    /// The two 2560×1440 outputs of the muffin capture (spec, "What muffin
+    /// sends"): CRTC 4 at 0,0 and CRTC 6 at 2560,0, both mode 0x13.
+    const MUFFIN_MODE: u32 = 0x13;
+    const MUFFIN_MM: (u32, u32) = (597, 336);
+
+    fn muffin_output(output_id: u32, crtc_id: u32, x: i16) -> crate::randr::RandrOutput {
+        crate::randr::RandrOutput {
+            name: format!("DP-{output_id}"),
+            output_id,
+            crtc_id,
+            mode_id: MUFFIN_MODE,
+            connected: true,
+            x,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            timing: None,
+            mm_width: MUFFIN_MM.0,
+            mm_height: MUFFIN_MM.1,
+            mode_ids: vec![MUFFIN_MODE],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
+        }
+    }
+
+    struct MuffinReplay {
+        state: ServerState,
+        peer: UnixStream,
+        backend: RecordingBackend,
+    }
+
+    type Rect = (i16, i16, u16, u16);
+
+    impl MuffinReplay {
+        const OUTPUT_4: u32 = 3;
+        const OUTPUT_6: u32 = 5;
+
+        fn new() -> Self {
+            let mut state = ServerState::new();
+            state.randr = crate::randr::RandrState::from_outputs_with_modes(
+                1,
+                vec![
+                    muffin_output(Self::OUTPUT_4, 4, 0),
+                    muffin_output(Self::OUTPUT_6, 6, 2560),
+                ],
+                vec![crate::randr::RandrMode {
+                    mode_id: MUFFIN_MODE,
+                    width: 2560,
+                    height: 1440,
+                    vrefresh: 60,
+                    timing: None,
+                }],
+            );
+            let root = state.resources.window_mut(ROOT_WINDOW).unwrap();
+            (root.width, root.height) = (5120, 1440);
+            let peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            backend.apply_crtc_configs = true;
+            Self {
+                state,
+                peer,
+                backend,
+            }
+        }
+
+        fn send(&mut self, minor: u8, body: &[u8]) -> Vec<u8> {
+            handle_randr_request(
+                &mut self.state,
+                &mut self.backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body,
+            )
+            .expect("RANDR request");
+            read_all_available(&mut self.peer)
+        }
+
+        fn set_screen_size(&mut self, w: u16, h: u16, mm_w: u32, mm_h: u32) {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&w.to_le_bytes());
+            body.extend_from_slice(&h.to_le_bytes());
+            body.extend_from_slice(&mm_w.to_le_bytes());
+            body.extend_from_slice(&mm_h.to_le_bytes());
+            let out = self.send(yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE, &body);
+            assert!(
+                out.chunks_exact(32).all(|c| c[0] != 0),
+                "SetScreenSize {w}x{h} failed: {out:02x?}"
+            );
+        }
+
+        /// SetCrtcTransform then SetCrtcConfig, as muffin orders them.
+        fn configure(&mut self, crtc: u32, output: u32, x: i16, scale: i32, filter: &[u8]) {
+            let out = self.send(
+                yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+                &randr_transform_body(crtc, rr_scale(scale), filter),
+            );
+            assert!(out.is_empty(), "SetCrtcTransform crtc {crtc}: {out:02x?}");
+            self.set_crtc_config(crtc, x, MUFFIN_MODE, &[output]);
+        }
+
+        fn set_crtc_config(&mut self, crtc: u32, x: i16, mode: u32, outputs: &[u32]) {
+            let out = self.send(
+                yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                &randr_crtc_config_body(crtc, x, 0, mode, outputs),
+            );
+            let reply = out.chunks_exact(32).find(|c| c[0] != 0 && c[0] < 2);
+            assert_eq!(
+                reply.map(|c| (c[0], c[1])),
+                Some((1, 0)),
+                "SetCrtcConfig crtc {crtc} succeeds: {out:02x?}"
+            );
+        }
+
+        fn screen(&self) -> (u16, u16) {
+            let root = self.state.resources.window(ROOT_WINDOW).unwrap();
+            assert_eq!(
+                (root.width, root.height),
+                (
+                    self.state.randr.screen_width,
+                    self.state.randr.screen_height
+                ),
+                "root follows the RANDR screen"
+            );
+            (root.width, root.height)
+        }
+
+        /// GetCrtcInfo's `(x, y, width, height)`.
+        fn crtc_info(&mut self, crtc: u32) -> Rect {
+            let mut body = crtc.to_le_bytes().to_vec();
+            body.extend_from_slice(&0u32.to_le_bytes());
+            let r = self.send(yserver_protocol::x11::randr::RR_GET_CRTC_INFO, &body);
+            assert_eq!(r[0], 1, "GetCrtcInfo reply");
+            let i16_at = |o: usize| i16::from_le_bytes(r[o..o + 2].try_into().unwrap());
+            let u16_at = |o: usize| u16::from_le_bytes(r[o..o + 2].try_into().unwrap());
+            (i16_at(12), i16_at(14), u16_at(16), u16_at(18))
+        }
+
+        /// GetMonitors' `(x, y, width, height)` per monitor; asserts the
+        /// EDID mm are untouched by any transform.
+        fn monitors(&mut self) -> Vec<Rect> {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[1, 0, 0, 0]);
+            let r = self.send(yserver_protocol::x11::randr::RR_GET_MONITORS, &body);
+            assert_eq!(r[0], 1, "GetMonitors reply");
+            let count = u32::from_le_bytes(r[12..16].try_into().unwrap());
+            let mut offset = 32;
+            let mut rects = Vec::new();
+            for _ in 0..count {
+                let m = &r[offset..];
+                let n_out = usize::from(u16::from_le_bytes(m[6..8].try_into().unwrap()));
+                let i16_at = |o: usize| i16::from_le_bytes(m[o..o + 2].try_into().unwrap());
+                let u16_at = |o: usize| u16::from_le_bytes(m[o..o + 2].try_into().unwrap());
+                let u32_at = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+                assert_eq!((u32_at(16), u32_at(20)), MUFFIN_MM);
+                rects.push((i16_at(8), i16_at(10), u16_at(12), u16_at(14)));
+                offset += 24 + n_out * 4;
+            }
+            rects
+        }
+
+        fn assert_layout(
+            &mut self,
+            screen: (u16, u16),
+            crtc4: Rect,
+            crtc6: Rect,
+            monitors: &[Rect],
+        ) {
+            assert_eq!(self.screen(), screen, "screen");
+            assert_eq!(self.crtc_info(4), crtc4, "GetCrtcInfo 4");
+            assert_eq!(self.crtc_info(6), crtc6, "GetCrtcInfo 6");
+            assert_eq!(self.monitors(), monitors, "GetMonitors");
+        }
+    }
+
+    const MUFFIN_IDENTITY: i32 = 0x0001_0000;
+    const MUFFIN_2_0: i32 = 131_072;
+    const MUFFIN_1_599991: i32 = 104_857;
+    const MUFFIN_1_337494: i32 = 87_654;
+    const MUFFIN_0_5: i32 = 32_768;
+    const MUFFIN_0_799988: i32 = 52_428;
+
+    #[test]
+    fn randr_replays_muffin_scale_down_100_125_150() {
+        let mut r = MuffinReplay::new();
+        let left = (0, 0, 2560, 1440);
+        r.assert_layout(
+            (5120, 1440),
+            left,
+            (2560, 0, 2560, 1440),
+            &[left, (2560, 0, 2560, 1440)],
+        );
+
+        // Each row of the spec table: SetScreenSize, then CRTC 4, then CRTC 6.
+        for (screen, mm, scale6, crtc6) in [
+            ((7680, 2880), (1355, 508), MUFFIN_2_0, (2560, 0, 5120, 2880)),
+            (
+                (6656, 2304),
+                (1084, 375),
+                MUFFIN_1_599991,
+                (2560, 0, 4096, 2304),
+            ),
+            (
+                (5984, 1926),
+                (906, 292),
+                MUFFIN_1_337494,
+                (2560, 0, 3424, 1926),
+            ),
+        ] {
+            let before6 = r.crtc_info(6);
+            r.set_screen_size(screen.0, screen.1, mm.0, mm.1);
+            // A screen may crop the previous scaled footprint for a moment.
+            r.assert_layout(screen, left, before6, &[left, before6]);
+            r.configure(4, MuffinReplay::OUTPUT_4, 0, MUFFIN_IDENTITY, b"fast");
+            r.assert_layout(screen, left, before6, &[left, before6]);
+            r.configure(6, MuffinReplay::OUTPUT_6, 2560, scale6, b"good");
+            r.assert_layout(screen, left, crtc6, &[left, crtc6]);
+        }
+    }
+
+    #[test]
+    fn randr_replays_muffin_scale_up_125_through_both_crtcs_off() {
+        let mut r = MuffinReplay::new();
+        r.set_crtc_config(4, 0, 0, &[]);
+        r.assert_layout(
+            (5120, 1440),
+            (0, 0, 0, 0),
+            (2560, 0, 2560, 1440),
+            &[(2560, 0, 2560, 1440)],
+        );
+        r.set_crtc_config(6, 0, 0, &[]);
+        r.assert_layout((5120, 1440), (0, 0, 0, 0), (0, 0, 0, 0), &[]);
+        r.set_screen_size(4608, 1152, 750, 188);
+        r.assert_layout((4608, 1152), (0, 0, 0, 0), (0, 0, 0, 0), &[]);
+        // The mode is taller than the screen: this is what went dark.
+        r.configure(4, MuffinReplay::OUTPUT_4, 0, MUFFIN_0_5, b"nearest");
+        let left = (0, 0, 1280, 720);
+        r.assert_layout((4608, 1152), left, (0, 0, 0, 0), &[left]);
+        // CRTC 6 stays at 2560 although CRTC 4 is only 1280 wide.
+        r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_0_799988, b"good");
+        let right = (2560, 0, 2048, 1152);
+        r.assert_layout((4608, 1152), left, right, &[left, right]);
+        assert_eq!(
+            super::super::run::enabled_output_bbox(&r.state),
+            Some((4608, 1152))
+        );
+    }
+
+    #[test]
+    fn randr_client_screen_size_survives_a_larger_transformed_bbox() {
+        let mut r = MuffinReplay::new();
+        r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_2_0, b"good");
+        assert_eq!(
+            super::super::run::enabled_output_bbox(&r.state),
+            Some((7680, 2880))
+        );
+        let right = (2560, 0, 5120, 2880);
+        r.assert_layout(
+            (5120, 1440),
+            (0, 0, 2560, 1440),
+            right,
+            &[(0, 0, 2560, 1440), right],
+        );
+    }
+
+    #[test]
+    fn present_default_crtc_uses_the_transformed_footprint() {
+        const WINDOW: u32 = 0x0001_1001;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(1, 11, 0, 0, 2560, 1440, true),
+                present_test_output(2, 22, 2560, 0, 2560, 1440, true),
+            ],
+        );
+        state.randr.primary_output = 1;
+        // Below CRTC 22's mode but inside its 2.0 footprint.
+        create_present_test_window(&mut state, WINDOW, 2600, 1500, 500, 500);
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            11
+        );
+        state.randr.outputs[1].current_transform =
+            crate::randr::CrtcTransform::new(rr_scale(MUFFIN_2_0), None, Vec::new()).unwrap();
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            22
+        );
     }
 
     #[test]
@@ -37441,7 +39528,8 @@ mod tests {
             },
         );
 
-        let mut body = vec![0; 20];
+        // A client that never sent QueryVersion: the 1.0 request size.
+        let mut body = vec![0; 16];
         body[0..4].copy_from_slice(&PIXMAP.to_le_bytes());
         handle_randr_request(
             &mut state,
@@ -37451,7 +39539,7 @@ mod tests {
             RequestHeader {
                 opcode: 128,
                 data: 2,
-                length_units: 6,
+                length_units: 5,
             },
             &body,
         )
@@ -37470,7 +39558,8 @@ mod tests {
             // BadValue is remapped to BadDrawable — verified on real Xorg with
             // `tools/randr-probe` (bogus xid -> code=9). Every other minor here
             // takes a window and reports BadWindow.
-            (2, 20usize, x11::error::BAD_DRAWABLE),
+            // 16: the 1.0 size, for a client without QueryVersion.
+            (2, 16usize, x11::error::BAD_DRAWABLE),
             (4, 8, x11::error::BAD_WINDOW),
             (5, 4usize, x11::error::BAD_WINDOW),
             (6, 4, x11::error::BAD_WINDOW),
@@ -37804,6 +39893,60 @@ mod tests {
             .expect("property stored");
         assert_eq!(stored.current.as_ref().unwrap().data, 42u32.to_le_bytes());
         assert_eq!(stored.current.as_ref().unwrap().r#type, prop_type);
+    }
+
+    /// #185: an output property write must not move lastSetTime/lastConfigTime
+    /// (Xorg `rrproperty.c`). muffin treats a lastSetTime that no longer
+    /// matches its own SetCrtcConfig reply as an external reconfiguration and
+    /// rebuilds its monitor config (Cinnamon then comes back at 200%).
+    #[test]
+    fn randr_change_output_property_leaves_randr_timestamps_alone() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.randr.timestamp = 29_342;
+        state.randr.config_timestamp = 29_133;
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        for (seq, mode) in [(1, 0u8), (2, 2u8)] {
+            let body = change_output_property_body(
+                output,
+                property.0,
+                prop_type.0,
+                32,
+                mode,
+                &42u32.to_le_bytes(),
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(seq),
+                change_output_property_header(body.len()),
+                &body,
+            )
+            .expect("ChangeOutputProperty");
+        }
+        let mut delete = output.to_le_bytes().to_vec();
+        delete.extend_from_slice(&property.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_DELETE_OUTPUT_PROPERTY,
+                length_units: 3,
+            },
+            &delete,
+        )
+        .expect("DeleteOutputProperty");
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (29_342, 29_133)
+        );
     }
 
     #[test]
@@ -46137,6 +48280,9 @@ mod tests {
                 mm_height: 340,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             }],
         );
         let expected = current_vidmode_mode_line(&state).expect("active RandR mode");
@@ -62486,8 +64632,8 @@ mod tests {
     ///    → reply status=0.
     /// 3. bad mode (555 not in output's mode_ids)
     ///    → X11 error BadMatch (type byte = 0).
-    /// 4. bad rotation (rotation=2, i.e. RR_Rotate_90 which we don't support)
-    ///    → X11 error BadMatch (type byte = 0; rotation valid but not identity).
+    /// 4. bad rotation (0x41: a bit outside the CRTC's `rotations` 0x3f)
+    ///    → X11 error BadMatch (type byte = 0).
     #[test]
     fn randr_set_crtc_config_validates_mode_id() {
         use crate::randr::{RandrMode, RandrOutput, RandrState};
@@ -62517,6 +64663,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             // Equal connector names are legal across different DRM devices.
             // Address this second row by CRTC/XID to prove the core never
@@ -62537,6 +64686,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let mut state = ServerState::new();
@@ -62600,17 +64752,16 @@ mod tests {
         )
         .expect("bad mode → error");
 
-        // (4) Bad rotation (valid code but not RR_Rotate_0):
-        // rotation=2 (RR_Rotate_90) is valid but our CRTC is identity-only.
-        // validate_set_crtc_config succeeds (mode 3 known), then rotation check
-        // fires BadMatch.
+        // (4) Bad rotation: RR_Rotate_0 plus bit 6, which no CRTC
+        // advertises. validate_set_crtc_config succeeds (mode 3 known), then
+        // `(~crtc->rotations) & rotation` fires BadMatch (rrcrtc.c:1403).
         handle_randr_request(
             &mut state,
             &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(4),
             header,
-            &build_body(3, 2, &[4]),
+            &build_body(3, 0x41, &[4]),
         )
         .expect("bad rotation → error");
 
@@ -62716,6 +64867,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -62776,6 +64930,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -62856,6 +65013,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -75368,6 +77528,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -75456,6 +77619,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -75679,6 +77845,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);

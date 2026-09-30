@@ -440,7 +440,7 @@ impl FencePool {
         }
     }
 
-    fn acquire(&self) -> Result<FenceTicket, vk::Result> {
+    pub(crate) fn acquire(&self) -> Result<FenceTicket, vk::Result> {
         let mut pool = self.inner.borrow_mut();
         let fence = if let Some(f) = pool.free.pop() {
             f
@@ -2204,6 +2204,10 @@ pub(crate) struct PlatformBackend {
     pub(crate) outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
+    /// Non-identity current CRTC transforms (RANDR `SetCrtcTransform`),
+    /// client-owned like the logical screen size, so keyed by output and
+    /// kept across the `outputs` rebuilds of a topology change.
+    pub(crate) output_transforms: HashMap<OutputKey, yserver_core::randr::CrtcTransform>,
     /// Latest general kernel `(msc, ust_micros)` per device-qualified CRTC, updated
     /// by pageflip retirements and standalone sequence events. Drives
     /// `PresentNotifyMSC` (`present_get_ust_msc`): a compositor's
@@ -2261,12 +2265,19 @@ pub(crate) struct PlatformBackend {
     // skip Vk init (`for_tests`). Production `open_with_commit`
     // always returns `Some`. v2 has no pixman fallback.
     pub(crate) vk: Option<Arc<VkContext>>,
+    /// Command buffer + fence reused by scanout reads; allocated from
+    /// `ops_command_pool`, so declared before it to drop first.
+    pub(crate) scanout_readback_op: Option<crate::kms::vk::ops::ReusableOneShot>,
     /// Wrapped in `Option` for the same reason. Drop order
     /// matters: ops_command_pool BEFORE fence_pool BEFORE vk
     /// (handled by struct field order — Rust drops fields in
     /// declaration order).
     pub(crate) ops_command_pool: Option<OpsCommandPool>,
     pub(crate) fence_pool: Option<FencePool>,
+    /// Reused `HOST_CACHED`-preferred destination for synchronous scanout
+    /// reads (root GetImage / ShmGetImage). Idle between reads, which wait
+    /// on their own fence; grown on demand. Holds its own `Arc<VkContext>`.
+    pub(crate) scanout_readback: Option<crate::kms::render::engine::StagingBuffer>,
 
     /// Stage 3f.10: recycled `(image, view, memory)` triples for
     /// CreatePixmap. Reuses v1's `PixmapPool` verbatim — its
@@ -3011,6 +3022,7 @@ impl PlatformBackend {
             outputs,
             fb_w,
             fb_h,
+            output_transforms: HashMap::new(),
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
@@ -3023,8 +3035,10 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
             vk: Some(vk),
+            scanout_readback_op: None,
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
+            scanout_readback: None,
             pixmap_pool,
             copy_vk_contexts,
             scanout_pools,
@@ -3126,6 +3140,7 @@ impl PlatformBackend {
             )],
             fb_w: 800,
             fb_h: 600,
+            output_transforms: HashMap::new(),
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
@@ -3138,8 +3153,10 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
             vk: None,
+            scanout_readback_op: None,
             ops_command_pool: None,
             fence_pool: None,
+            scanout_readback: None,
             pixmap_pool: None,
             copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],
@@ -3841,6 +3858,31 @@ impl PlatformBackend {
 
     pub(crate) fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
         self.input_ctx.take()
+    }
+
+    /// The current CRTC transform of live output `idx`, `None` at identity.
+    pub(crate) fn output_transform(
+        &self,
+        idx: usize,
+    ) -> Option<&yserver_core::randr::CrtcTransform> {
+        self.output_transforms.get(&self.outputs.get(idx)?.key)
+    }
+
+    /// Whether any live output scans out through a transform.
+    pub(crate) fn any_output_transformed(&self) -> bool {
+        (0..self.outputs.len()).any(|idx| self.output_transform(idx).is_some())
+    }
+
+    /// The root rectangle live output `idx` shows: its mode at the CRTC
+    /// origin, or the transformed footprint there (spec D3).
+    pub(crate) fn output_root_rect(&self, idx: usize) -> (i32, i32, u32, u32) {
+        let layout = &self.outputs[idx];
+        let (w, h) = self
+            .output_transform(idx)
+            .map_or((layout.width, layout.height), |t| {
+                t.footprint(layout.width, layout.height)
+            });
+        (layout.x, layout.y, u32::from(w), u32::from(h))
     }
 
     pub(crate) fn primary_device(&self) -> Option<&KmsDevice> {

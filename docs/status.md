@@ -33,6 +33,57 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-29 RANDR CRTC rotation and reflection (branch
+  `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
+  `rotations = 0x3f`; GetCrtcInfo and the three RANDR events carry the
+  rotation. The rotation is combined with the client transform as
+  `RRTransformCompute` (`randr::crtc_matrix`, fixed point) and runs through
+  #185's intermediate + scale pass (now a full affine pass, pixman-exact
+  nearest), SW cursor, confinement and framebuffer-space GetImage.
+  SetScreenSize's crop box swaps for 90/270 (measured). Client matrices stay
+  pure scale (D2). RANDR 1.0 (`xrandr -o`) is real now: GetScreenInfo lists
+  the first output's mode sizes and `RRVerticalRefresh` rates (rate lists
+  only for a ≥ 1.1 client, per-client QueryVersion kept), SetScreenConfig
+  follows `ProcRRSetScreenConfig` (size-by-version BadLength, statuses
+  InvalidConfigTime/InvalidTime/Failed, lastSetTime moves on every success,
+  other CRTCs off + screen resized when the size changes, CRTC at 0,0) over
+  the SetCrtcConfig path. vng A/B (`xrandr-rotate*.sh`,
+  `xrandr-orientation.sh`, `pointer-rotate*.sh`): geometry, root captures,
+  scanout-vs-matrix and pointer deltas identical to Xorg. Divergences: Xorg
+  keeps a rotated HW cursor for rotation without a client transform (we use
+  the SW cursor); SetScreenConfig reconfigures the first CRTC in place, so
+  Xorg's intermediate disable notifies (Screen/Crtc off/Output) are not
+  sent; an in-place rotation also sends OutputChangeNotify (Xorg: Crtc
+  only); yserver's initial `lastSetTime` is 1, not server start, so a stale
+  client time before the first set is not InvalidTime; screen mm at startup
+  round (339×212) where Xorg truncates (338×211). Two-output vng runs hang in
+  the known blocking DRM read when a CRTC is re-enabled (not this branch).
+  Spec addendum in the #185 design doc.
+
+- **2026-09-29 RANDR CRTC transforms / fractional scaling, partial (#185,
+  branch `feat/185-crtc-transform`):** `hasTransforms = 1`; SetCrtcTransform
+  / GetCrtcTransform with Xorg's validation order and pending→current on
+  SetCrtcConfig; footprint = `pixman_transform_bounds` port
+  (`randr/transform.rs`). Accepted: pure scale, filters nearest/bilinear
+  (+ fast/good/best); client matrices with translation, rotation, shear,
+  reflection or projection, and convolution → BadMatch on purpose (CRTC
+  rotation/reflection through SetCrtcConfig is supported, see the entry
+  above). A transformed output composites into a
+  footprint-sized intermediate, then a scale pass writes the mode-sized
+  scanout; direct scanout off and SW cursor on every output while any CRTC is
+  transformed; root reads in framebuffer space with the SW cursor removed
+  (save-under, as misprite). SetScreenSize's crop check stays on the
+  untransformed box (measured). Design + measurements:
+  `docs/superpowers/specs/2026-09-29-randr-crtc-transform-design.md`; probes
+  `tools/vng-scenarios/xrandr-scale*.sh`, `pointer-scale*.sh`. ★ RANDR
+  timestamps: muffin compares `timestamp` with its last SetCrtcConfig reply
+  (`meta-monitor-manager-xrandr.c:1427`) and rebuilds its config on a
+  mismatch (Cinnamon came back at 200%); only SetCrtcConfig/SetScreenConfig
+  may move `timestamp`, never SetScreenSize or output-property writes, as
+  Xorg. Also: GetMonitors/GetScreenResources replies now honour the client's
+  byte order. HW: silence, two 2560×1440, Cinnamon scale-down 100/125/150%
+  and back, screenshot without pointer.
+
 - **2026-09-28 RECORD 1.13, partial (#180, branch `feat/180-record`):**
   advertised (major 154, first error 189) so python-xlib/pynput find it.
   All eight requests with Xorg's validation order and GetContext range
