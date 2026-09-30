@@ -1,27 +1,9 @@
-//! XI2 device and property registry.
+//! XI device/source registry and per-device property state.
 //!
-//! Stores per-device XI2 property state in `ServerState::xi_devices`.
-//! Seeded at device-add time from libinput `DeviceInfo`; cleared on
-//! device removal.  Task 3 will add the protocol handlers
-//! (XIListProperties / XIGetProperty / XIChangeProperty /
-//! XIDeleteProperty) that read from this registry.
-//!
-//! # Device model
-//!
-//! yserver's XI2 device table is static: four devices mirror the
-//! XIQueryDevice reply (opcode 48):
-//!
-//! | id | type          | name                         |
-//! |----|---------------|------------------------------|
-//! |  2 | MasterPointer | Virtual core pointer         |
-//! |  3 | MasterKbd     | Virtual core keyboard        |
-//! |  4 | SlavePointer  | Virtual core slave pointer   |
-//! |  5 | SlaveKbd      | Virtual core slave keyboard  |
-//!
-//! When a libinput touchpad is added the slave-pointer entry (id 4) is
-//! updated: its name is set to the real device name and its property
-//! map is populated with the libinput property set.  On removal the
-//! entry reverts to its generic defaults.
+//! [`XiRegistry`] owns the live device vector, source metadata, and physical
+//! facet allocation. Existing protocol consumers retain temporary slice
+//! compatibility while their fixed-topology query and event paths migrate.
+//! The property map remains on each [`XiDevice`].
 
 use std::collections::BTreeMap;
 
@@ -30,6 +12,9 @@ use yserver_protocol::x11::{AtomId, ClientByteOrder, SequenceNumber};
 use crate::core_loop::DeviceInfo;
 
 pub mod libinput_props;
+pub mod registry;
+
+pub use registry::{InputCapabilities, InputSourceId, XiFacetKind, XiRegistry};
 
 // ---------------------------------------------------------------------------
 // X11 predefined atom ids for property type annotation
@@ -129,14 +114,20 @@ pub struct XiProperty {
 pub struct XiDevice {
     pub id: u16,
     pub name: String,
-    /// True when the device is a touchpad (set by `seed_touchpad`, cleared
-    /// by `clear_touchpad`).  Used to select the XI 1.x device-type atom
+    /// Physical source owning this facet; virtual and master devices have none.
+    pub source_id: Option<InputSourceId>,
+    /// Physical capability represented by this facet.
+    pub facet: Option<XiFacetKind>,
+    /// Master this slave is attached to, when it is a slave device.
+    pub attached_master: Option<u16>,
+    /// True when the pointer facet is a touchpad. Set from source metadata
+    /// when registered; the legacy slice helper also maintains it. Used to
+    /// select the XI 1.x device-type atom
     /// (`TOUCHPAD` vs `MOUSE`) in the `XListInputDevices` reply.
     pub is_touchpad: bool,
-    /// Evdev device node (`/dev/input/eventN`) for the live libinput device
-    /// bound to this entry, or `None` when the slot is generic. Set by
-    /// `seed_touchpad`, cleared by `clear_touchpad`. Used by T3 to map a
-    /// `Binding` write back to the libinput device handle.
+    /// Evdev device node (`/dev/input/eventN`) for the physical source bound
+    /// to this facet, or `None` for a master or virtual device. Used by T3 to
+    /// map a `Binding` write back to the libinput device handle.
     pub device_node: Option<String>,
     /// Properties keyed by their name-atom (`AtomId`).  `BTreeMap` gives
     /// stable, sorted iteration order for XIListProperties (Task 3);
@@ -150,8 +141,32 @@ impl XiDevice {
         Self {
             id,
             name: name.to_owned(),
+            source_id: None,
+            facet: None,
+            attached_master: match id {
+                DEVICEID_SLAVE_POINTER => Some(DEVICEID_MASTER_POINTER),
+                DEVICEID_SLAVE_KEYBOARD => Some(DEVICEID_MASTER_KEYBOARD),
+                _ => None,
+            },
             is_touchpad: false,
             device_node: None,
+            properties: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn physical(id: u16, info: &DeviceInfo, facet: XiFacetKind) -> Self {
+        let attached_master = match facet {
+            XiFacetKind::Keyboard => DEVICEID_MASTER_KEYBOARD,
+            XiFacetKind::PointerTouch => DEVICEID_MASTER_POINTER,
+        };
+        Self {
+            id,
+            name: info.name.clone(),
+            source_id: Some(info.source_id),
+            facet: Some(facet),
+            attached_master: Some(attached_master),
+            is_touchpad: facet == XiFacetKind::PointerTouch && info.is_touchpad,
+            device_node: Some(info.device_node.clone()),
             properties: BTreeMap::new(),
         }
     }
@@ -161,7 +176,8 @@ impl XiDevice {
 // Initial registry (mirrors the static XIQueryDevice device list)
 // ---------------------------------------------------------------------------
 
-/// Build the initial device registry from the four static XI2 devices.
+/// Build the historical four-entry device slice for legacy property helpers.
+/// Server state uses [`XiRegistry::new`] for its live device ownership.
 pub fn initial_xi_devices() -> Vec<XiDevice> {
     vec![
         XiDevice::new(DEVICEID_MASTER_POINTER, NAME_MASTER_POINTER),
@@ -181,6 +197,8 @@ pub fn initial_xi_devices() -> Vec<XiDevice> {
 /// XListInputDevices encoder share a single canonical spelling with the
 /// descriptor table.
 pub const PROP_TAPPING_ENABLED: &str = "libinput Tapping Enabled";
+/// XTEST's predefined virtual-device marker property.
+pub const PROP_XTEST_DEVICE: &str = "XTEST Device";
 const PROP_DEVICE_NODE: &str = "Device Node";
 const PROP_DEVICE_PRODUCT_ID: &str = "Device Product ID";
 
@@ -1437,6 +1455,12 @@ mod tests {
     fn touchpad_info(tap_enabled: bool) -> DeviceInfo {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
         DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "SynPS/2 Synaptics TouchPad".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -1467,6 +1491,12 @@ mod tests {
     fn mouse_info() -> DeviceInfo {
         use crate::core_loop::message::LibinputConfigSnapshot;
         DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "USB Mouse".into(),
             device_node: "/dev/input/event1".into(),
             sysname: "event1".into(),
@@ -1513,6 +1543,12 @@ mod tests {
             ..Default::default()
         };
         DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "USB Mouse".into(),
             device_node: "/dev/input/event1".into(),
             sysname: "event1".into(),
@@ -1746,9 +1782,8 @@ mod tests {
 
     #[test]
     fn xi_seed_touchpad_gate_skips_non_touchpad() {
-        // Exercises the GATED path on the real ServerState method: a
-        // non-touchpad DeviceInfo (`is_touchpad = false`) must be ignored,
-        // leaving the slave-pointer entry (id 4) at its generic defaults.
+        // Device 4 stays virtual even when the legacy add hook sees a
+        // non-touchpad source.
         let mut state = crate::server::ServerState::new();
         state.xi_seed_touchpad(&mouse_info());
         let slave = state
@@ -1756,8 +1791,16 @@ mod tests {
             .iter()
             .find(|d| d.id == DEVICEID_SLAVE_POINTER)
             .unwrap();
-        assert_eq!(slave.name, NAME_SLAVE_POINTER);
-        assert!(slave.properties.is_empty());
+        assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
+        let marker = state.xtest_device_atom;
+        assert_eq!(
+            slave.properties.get(&marker),
+            Some(&XiProperty {
+                type_atom: XA_INTEGER,
+                format: 8,
+                data: vec![1],
+            })
+        );
     }
 
     /// A configurable mouse (a pointer that is NOT a touchpad, e.g. accel
@@ -1820,12 +1863,10 @@ mod tests {
         assert_eq!(prop.data.len(), 3, "seeded width is 3 bytes");
     }
 
-    /// The `ServerState` gate must ADMIT a configurable mouse (accel
-    /// available) even though `is_touchpad == false`, so the KCM finds
-    /// `libinput Accel Speed`. Counterpart to the default-config mouse skip
-    /// test above (a mouse with no configurable knobs is still skipped).
+    /// The legacy `ServerState` hook must not turn virtual XTEST device 4
+    /// into a physical mouse, even for a configurable mouse source.
     #[test]
-    fn xi_seed_touchpad_gate_admits_configurable_mouse() {
+    fn xi_seed_touchpad_preserves_xtest_for_configurable_mouse() {
         let mut state = crate::server::ServerState::new();
         state.xi_seed_touchpad(&mouse_info_with_accel());
         let slave = state
@@ -1833,21 +1874,17 @@ mod tests {
             .iter()
             .find(|d| d.id == DEVICEID_SLAVE_POINTER)
             .unwrap();
-        assert_eq!(slave.name, "USB Mouse");
-        let accel = state.atoms.intern("libinput Accel Speed", true);
+        assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
         assert!(
-            slave.properties.contains_key(&accel),
-            "configurable mouse must pass the gate and seed libinput Accel Speed"
+            !slave
+                .properties
+                .contains_key(&state.atoms.intern("libinput Accel Speed", true)),
+            "physical libinput properties do not belong to XTEST"
         );
         assert!(!slave.is_touchpad);
     }
 
-    /// A phantom HID pointer collection (e.g. a keyboard's "Consumer
-    /// Control" — pointer-capable to libinput, some scroll knob, but NO
-    /// pointer acceleration) must be SKIPPED, so it can't clobber the
-    /// single latest-wins slave-pointer slot the real mouse owns. Regression
-    /// for the "left-handed does nothing" bug: such a device had overwritten
-    /// the Dell mouse's config on id 4, leaving only Natural Scrolling.
+    /// A phantom HID pointer collection must not alter XTEST device 4 either.
     #[test]
     fn xi_seed_touchpad_gate_skips_phantom_pointer_without_accel() {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
@@ -1861,6 +1898,12 @@ mod tests {
             ..Default::default()
         };
         let phantom = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "Keychron K1 Pro Consumer Control".into(),
             device_node: "/dev/input/event5".into(),
             sysname: "event5".into(),
@@ -1870,7 +1913,7 @@ mod tests {
             config,
         };
         let mut state = crate::server::ServerState::new();
-        // Seed the real mouse first, then the phantom must NOT overwrite it.
+        // Neither source may be represented by virtual device 4.
         state.xi_seed_touchpad(&mouse_info_with_accel());
         state.xi_seed_touchpad(&phantom);
         let slave = state
@@ -1878,11 +1921,15 @@ mod tests {
             .iter()
             .find(|d| d.id == DEVICEID_SLAVE_POINTER)
             .unwrap();
-        assert_eq!(slave.name, "USB Mouse", "phantom must not seize the slot");
+        assert_eq!(
+            slave.name,
+            registry::NAME_XTEST_POINTER,
+            "phantom must not seize the virtual slot"
+        );
         let accel = state.atoms.intern("libinput Accel Speed", true);
         assert!(
-            slave.properties.contains_key(&accel),
-            "the real mouse's Accel Speed must survive the phantom device-add"
+            !slave.properties.contains_key(&accel),
+            "physical Accel Speed must not be seeded on XTEST"
         );
     }
 
@@ -1961,9 +2008,9 @@ mod tests {
     }
 
     #[test]
-    fn xi_seed_touchpad_gate_admits_touchpad() {
-        // Counterpart to the skip test: a touchpad DeviceInfo passes the
-        // gate and populates the slave-pointer entry.
+    fn xi_seed_touchpad_preserves_xtest_for_touchpad() {
+        // The later source-property migration will publish this touchpad on
+        // its own pointer facet; Task 1 keeps virtual ID 4 untouched.
         let mut state = crate::server::ServerState::new();
         state.xi_seed_touchpad(&touchpad_info(true));
         let slave = state
@@ -1971,8 +2018,9 @@ mod tests {
             .iter()
             .find(|d| d.id == DEVICEID_SLAVE_POINTER)
             .unwrap();
-        assert_eq!(slave.name, "SynPS/2 Synaptics TouchPad");
-        assert!(!slave.properties.is_empty());
+        assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
+        assert_eq!(slave.properties.len(), 1);
+        assert!(slave.properties.contains_key(&state.xtest_device_atom));
     }
 
     /// T2: seeding is driven entirely by the descriptor table. Available
@@ -1988,6 +2036,12 @@ mod tests {
         // uses `state.float_atom`.
         let float_atom = atoms.intern("FLOAT", false);
         let info = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "SynPS/2 Synaptics TouchPad".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -2067,6 +2121,12 @@ mod tests {
             ..Default::default()
         };
         let info = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "tp".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -2109,6 +2169,12 @@ mod tests {
             ..Default::default()
         };
         let info = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "tp".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -2154,6 +2220,12 @@ mod tests {
             ..Default::default()
         };
         let info = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "tp".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),

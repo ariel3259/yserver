@@ -33,6 +33,23 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-30 dynamic XI device registry, Task 1 staged (branch
+  `feat/xi-dynamic-registry-implementation`):** `XiRegistry` now owns the
+  live XI device vector plus `InputSourceId` metadata and atomic lowest-free
+  keyboard/pointer facet allocation in IDs 6..=127. `DeviceInfo` carries
+  source identity and capability bits; the producer currently reports
+  `touch = false` pending Task 2's capability collection. Server startup
+  seeds virtual devices 4/5 with the XTEST pointer/keyboard names and
+  `XTEST Device` INTEGER/8 value 1; writes and direct
+  deletes of that marker are guarded by atom identity even after a
+  GetProperty(delete) unlink. Existing query, source routing, and hotplug
+  publication remain fixed-topology work for later tasks, so this stage does
+  **not** fix the physical-mouse enumeration/configuration issue. The current
+  GDK query comment in `core_loop/process_request.rs` still expects device 4
+  to be the first generic attached pointer; revisit that compatibility point
+  when XI1/XI2 query behavior migrates. Behavioral tests were not run for
+  this staged implementation.
+
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
   `rotations = 0x3f`; GetCrtcInfo and the three RANDR events carry the

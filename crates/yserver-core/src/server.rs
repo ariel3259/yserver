@@ -1397,12 +1397,12 @@ pub struct ServerState {
     /// `ROOT_COLORMAP` at startup per X11 spec ("the default colormap
     /// for the screen is installed when the server first starts up").
     pub installed_colormaps: Vec<ResourceId>,
-    /// XI2 device and property registry.  One entry per static XI2
-    /// device (ids 2–5, mirroring the XIQueryDevice reply).  The slave-
-    /// pointer entry (id 4) is updated by `xi_seed_touchpad` /
-    /// `xi_clear_touchpad` when libinput reports a touchpad device.
-    /// Read by the XIListProperties / XIGetProperty handlers.
-    pub xi_devices: Vec<crate::xinput::XiDevice>,
+    /// Central XI registry. It owns the static masters/XTEST devices, live
+    /// physical facets, and source metadata. Existing property/query helpers
+    /// temporarily use its slice compatibility while consumers migrate.
+    pub xi_devices: crate::xinput::XiRegistry,
+    /// Atom identity for the read-only XTEST marker on virtual devices 4/5.
+    pub xtest_device_atom: AtomId,
     /// Pre-interned atom for the property-type literal `"FLOAT"`.
     ///
     /// `FLOAT` is **not** a predefined X atom, so the libinput
@@ -1567,11 +1567,30 @@ impl ServerState {
         atoms.intern(crate::xinput::XI_ATOM_MOUSE, false);
         atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, false);
         atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, false);
+        let xtest_device_atom = atoms.intern(crate::xinput::PROP_XTEST_DEVICE, false);
         // FLOAT is not a predefined X atom; intern it now so the
         // libinput accel-speed property family can stamp
         // type=float_atom on its wire replies without a per-request
         // intern dance.
         let float_atom = atoms.intern("FLOAT", false);
+        let mut xi_devices = crate::xinput::XiRegistry::new();
+        for device_id in [
+            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+        ] {
+            xi_devices
+                .device_mut(device_id)
+                .expect("XiRegistry creates both XTEST devices")
+                .properties
+                .insert(
+                    xtest_device_atom,
+                    crate::xinput::XiProperty {
+                        type_atom: crate::xinput::XA_INTEGER,
+                        format: 8,
+                        data: vec![1],
+                    },
+                );
+        }
         Self {
             atoms,
             resources,
@@ -1671,7 +1690,8 @@ impl ServerState {
             cow_teardown_failed: false,
             scroll_axis_value: [0; 2],
             installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
-            xi_devices: crate::xinput::initial_xi_devices(),
+            xi_devices,
+            xtest_device_atom,
             float_atom,
         }
     }
@@ -1742,28 +1762,18 @@ impl ServerState {
         generation
     }
 
-    /// Seed the XI2 device-property registry from a libinput pointer
-    /// device-add event.
-    ///
-    /// The single slave-pointer entry (id 4) receives the real device name
-    /// and the libinput-style properties for whichever knobs libinput
-    /// reports available. Admitted for a touchpad OR a **real relative
-    /// pointer** — one that reports pointer acceleration (`accel.available`,
-    /// the hallmark of a mouse/trackpoint). This deliberately EXCLUDES the
-    /// phantom HID "Consumer Control" / "System Control" collections that a
-    /// keyboard or wireless receiver exposes: libinput tags them
-    /// pointer-capable but they carry almost no config, and — because id 4
-    /// is a single latest-wins slot — one of them would otherwise clobber
-    /// the real mouse's rich config (left-handed, middle-emulation, …),
-    /// leaving the KDE Mouse KCM unable to configure the mouse.
-    ///
-    /// Seeding a real mouse is required because the KDE Mouse KCM reads
-    /// `libinput Accel Speed` on the pointer; a missing atom made it
-    /// SIGSEGV (see `project_kcm_mouse_crash_libinput_accel`).
-    ///
-    /// Property-name atoms are interned via `self.atoms` so they share
-    /// the same atom namespace as all other server atoms.
+    /// Temporary compatibility hook for the old add path. Physical property
+    /// and query migration is staged separately; registry devices 4/5 are
+    /// virtual XTEST devices and must never receive physical metadata or
+    /// libinput properties here.
     pub fn xi_seed_touchpad(&mut self, info: &crate::core_loop::DeviceInfo) {
+        if self
+            .xi_devices
+            .device(crate::xinput::DEVICEID_SLAVE_POINTER)
+            .is_some_and(|device| device.name == crate::xinput::registry::NAME_XTEST_POINTER)
+        {
+            return;
+        }
         if !info.is_touchpad && !info.config.accel.available {
             return;
         }

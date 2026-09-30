@@ -5283,6 +5283,12 @@ mod tests {
     fn probe_touchpad_info() -> crate::core_loop::DeviceInfo {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
         crate::core_loop::DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "SynPS/2 Synaptics TouchPad".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),

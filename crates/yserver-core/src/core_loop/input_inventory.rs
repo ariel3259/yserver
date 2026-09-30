@@ -120,6 +120,12 @@ mod tests {
 
     fn device(node: &str, name: &str) -> DeviceInfo {
         DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: name.into(),
             device_node: node.into(),
             sysname: node.trim_start_matches("/dev/input/").into(),
