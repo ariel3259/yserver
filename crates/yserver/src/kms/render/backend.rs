@@ -11725,6 +11725,7 @@ impl KmsBackend {
                 num_preferred,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: 1,
             });
         }
 
@@ -11838,6 +11839,7 @@ impl KmsBackend {
                 num_preferred,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: yserver_core::randr::RR_ROTATE_0,
             });
         }
         outs.sort_by_key(|o| o.output_id);
@@ -29552,20 +29554,19 @@ impl Backend for KmsBackend {
             (self.platform.fb_w, self.platform.fb_h) = root;
             self.update_input_extent(root.0, root.1);
         }
+        // Rotation and reflection combined with the client transform, as
+        // `RRTransformCompute`: one matrix for footprint, pass and readback.
         let transforms: HashMap<OutputKey, yserver_core::randr::CrtcTransform> = state
             .randr
             .outputs
             .iter()
             .enumerate()
-            // Transform composition is upstream's Legacy renderer feature.
-            // Owner output layout and commit ledgers stay mode-sized in C.0.
-            .filter(|(idx, output)| {
-                !self.platform.output_uses_owner_route(*idx)
-                    && !output.current_transform.is_identity()
-            })
-            .filter_map(|(_, o)| {
+            .filter(|(idx, _)| !self.platform.output_uses_owner_route(*idx))
+            .map(|(_, output)| (output, output.crtc_transform()))
+            .filter(|(_, transform)| !transform.is_identity())
+            .filter_map(|(o, t)| {
                 let key = self.output_key_by_id.get(&o.output_id)?.clone();
-                Some((key, o.current_transform.clone()))
+                Some((key, t))
             })
             .collect();
         let transforms_changed = transforms != self.platform.output_transforms;
@@ -91305,6 +91306,43 @@ mod tests {
         }
     }
 
+    /// Episode ends that reached the core or still wait in the backend queue.
+    /// Since 3c-ii the core-entry driver delivers queued topology-episode
+    /// events like the real loop and records them in
+    /// `core_entry_deliveries_for_tests`, so a test must look at both.
+    fn c0_3ci_episode_end_count(
+        backend: &super::KmsBackend,
+        episode: Option<u64>,
+        published: bool,
+    ) -> usize {
+        let queued = backend
+            .topology_episode_events
+            .iter()
+            .filter(|event| match event {
+                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, publication) => {
+                    episode.is_none_or(|episode| *id == episode)
+                        && publication.is_some() == published
+                }
+                yserver_core::backend::TopologyEpisodeEvent::EpisodeBegin(_) => false,
+            })
+            .count();
+        let delivered = backend
+            .core_entry_deliveries_for_tests
+            .iter()
+            .filter(|delivery| {
+                matches!(
+                    delivery,
+                    yserver_core::core_loop::run::CoreEntryDelivery::TopologyEpisodeEnd {
+                        episode_id,
+                        published: delivered_published,
+                    } if episode.is_none_or(|episode| *episode_id == episode)
+                        && *delivered_published == published
+                )
+            })
+            .count();
+        queued + delivered
+    }
+
     #[test]
     #[ignore = "needs card1, a controlling text VT, and live Vulkan; NEVER run by the implementer"]
     fn c0_hw_3c_vt_switch_on_card1_drm() {
@@ -91704,23 +91742,11 @@ mod tests {
                     );
                     assert!(backend.acquire_episode.is_none());
                     assert!(
-                        backend.topology_episode_events.iter().any(|event| {
-                            matches!(
-                                event,
-                                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, None)
-                                    if *id == rapid_episode_id
-                            )
-                        }),
+                        c0_3ci_episode_end_count(backend, Some(rapid_episode_id), false) > 0,
                         "rapid acquire episode ended without a publication"
                     );
                     assert!(
-                        !backend.topology_episode_events.iter().any(|event| {
-                            matches!(
-                                event,
-                                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, Some(_))
-                                    if *id == rapid_episode_id
-                            )
-                        }),
+                        !c0_3ci_episode_end_count(backend, Some(rapid_episode_id), true) > 0,
                         "rapid acquire episode published no topology change"
                     );
                     assert_eq!(
@@ -91839,13 +91865,9 @@ mod tests {
                     );
                     assert!(backend.probe_episode.is_none());
                     assert!(backend.acquire_episode.is_none());
-                    assert!(backend.topology_episode_events.iter().any(|event| {
-                        matches!(
-                            event,
-                            yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, None)
-                                if *id == invalidated_acquire_id
-                        )
-                    }));
+                    assert!(
+                        c0_3ci_episode_end_count(backend, Some(invalidated_acquire_id), false) > 0
+                    );
                     assert!(
                         backend
                             .probe_workers
@@ -91856,13 +91878,9 @@ mod tests {
                             }),
                         "release invalidates the epoch and retains the unanswered worker as stuck"
                     );
-                    assert!(!backend.topology_episode_events.iter().any(|event| {
-                        matches!(
-                            event,
-                            yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(id, Some(_))
-                                if *id == invalidated_acquire_id
-                        )
-                    }));
+                    assert!(
+                        !c0_3ci_episode_end_count(backend, Some(invalidated_acquire_id), true) > 0
+                    );
                     assert_eq!(
                         backend.lifecycle_drivers[&device]
                             .topology_test_stats()
@@ -91891,16 +91909,8 @@ mod tests {
                             .prepared_acquire_allocation_keys_for_tests()
                             .is_empty()
                     );
-                    let episode_ends_none_after_release = backend
-                        .topology_episode_events
-                        .iter()
-                        .filter(|event| {
-                            matches!(
-                                event,
-                                yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(_, None)
-                            )
-                        })
-                        .count();
+                    let episode_ends_none_after_release =
+                        c0_3ci_episode_end_count(backend, None, false);
                     answer_gate.release();
                     c0_3cii_finish_probe_workers(
                         backend,
@@ -91921,19 +91931,7 @@ mod tests {
                         "the late probe answer leaves the installed card1 outputs unchanged"
                     );
                     assert_eq!(
-                        backend
-                            .topology_episode_events
-                            .iter()
-                            .filter(|event| {
-                                matches!(
-                                    event,
-                                    yserver_core::backend::TopologyEpisodeEvent::EpisodeEnd(
-                                        _,
-                                        None
-                                    )
-                                )
-                            })
-                            .count(),
+                        c0_3ci_episode_end_count(backend, None, false),
                         episode_ends_none_after_release,
                         "the late answer adds no topology-episode disposition"
                     );
@@ -93678,6 +93676,7 @@ mod tests {
                 height: screen.1,
                 width_mm: screen.2,
                 height_mm: screen.3,
+                rotation: 1,
             },
         );
         let expected_crtc = rr::encode_crtc_change_notify_event(
@@ -93693,6 +93692,7 @@ mod tests {
                 y,
                 width: mode.width,
                 height: mode.height,
+                rotation: yserver_core::randr::RR_ROTATE_0,
             },
         );
         let expected_output = rr::encode_output_change_notify_event(
@@ -93707,6 +93707,7 @@ mod tests {
                 crtc: crtc_id,
                 mode: mode_id,
                 connection: rr::CONNECTION_CONNECTED,
+                rotation: yserver_core::randr::RR_ROTATE_0,
             },
         );
         let mut expected_events = Vec::with_capacity(96);
