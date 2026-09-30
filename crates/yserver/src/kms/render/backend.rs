@@ -98628,6 +98628,160 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn c0_3cii_composed_readiness_waits_for_clock_probe_vulkan() {
+        use crate::kms::owner::{
+            admission::{IntentKey, Readiness, WaitReason},
+            clock::{ClockSource, ProbeOutcome, ProbeState},
+        };
+
+        let mut fixture = owner_live_fixture().expect("environmental skip: no live Vulkan ICD");
+        let backend = &mut fixture.backend;
+        let device = backend.platform.outputs[0].key.device_key;
+        let crtc = u32::from(backend.platform.outputs[0].output.crtc);
+        let clock_key = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(crtc))
+            .expect("the live Owner output has an installed clock epoch");
+
+        // Compose and offer a real backend-owned generation while lifecycle
+        // admission is held, so the test can put the clock epoch into the
+        // failed-probe state before asking the admission snapshot.
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("Owner conductor")
+            .lifecycle_admission_closed = true;
+        backend.scene.mark_scene_structure_dirty();
+        let mut state = ServerState::new();
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "prepare composed generation behind the Owner startup gate",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                let Some((_, generation, waiting)) = backend.scene.owner_prepared_for_tests(0)
+                else {
+                    return false;
+                };
+                !waiting
+                    && backend
+                        .scene
+                        .owner_state_for_generation_for_tests(0, generation)
+                        == Some(crate::kms::render::owner_buffer::OwnerBufferState::Desired)
+                    && backend
+                        .admission_conductors
+                        .get(&device)
+                        .is_some_and(|conductor| conductor.composed.contains_key(&crtc))
+            },
+            None,
+        )
+        .expect("the composed Owner generation is offered while admission is closed");
+        let clock_state = {
+            let clock = backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.clock(clock_key))
+                .expect("installed Owner clock");
+            (
+                clock.source,
+                clock.probe,
+                clock.probe_outcome,
+                clock.reference,
+                clock.queue_failed,
+            )
+        };
+        {
+            let clock = backend
+                .platform
+                .owner_for(device)
+                .expect("Owner")
+                .clock_mut(clock_key)
+                .expect("installed Owner clock");
+            clock.source = ClockSource::Unresolved;
+            clock.probe = ProbeState::Failed;
+            clock.probe_outcome = Some(ProbeOutcome::Rejected {
+                errno: libc::EINVAL,
+            });
+            clock.reference = None;
+            clock.queue_failed = false;
+        }
+
+        let snapshot = backend
+            .admission_snapshot(device, false)
+            .expect("active Owner readiness snapshot");
+        assert_eq!(
+            snapshot.readiness(IntentKey::Composed {
+                crtc,
+                generation: backend
+                    .admission_conductors
+                    .get(&device)
+                    .and_then(|conductor| conductor.composed.get(&crtc))
+                    .copied()
+                    .expect("queued composed generation"),
+            }),
+            Some(Readiness::Waiting(WaitReason::SourceWaits)),
+            "a composed generation cannot be ready until its Owner clock probe succeeds"
+        );
+        assert!(
+            backend
+                .admission_conductors
+                .get(&device)
+                .is_some_and(|conductor| conductor.composed.contains_key(&crtc)),
+            "the scene damage has produced and retained the composed generation"
+        );
+
+        backend
+            .admission_conductors
+            .get_mut(&device)
+            .expect("Owner conductor")
+            .lifecycle_admission_closed = false;
+        assert_eq!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::NothingAdmissible,
+            "the queued generation stays in the conductor until its clock probe succeeds"
+        );
+        assert!(
+            backend
+                .admission_trace_for_tests(device)
+                .iter()
+                .all(|step| !matches!(
+                    step,
+                    crate::kms::render::admission::AdmissionTraceStep::Decided
+                )),
+            "a clock-blocked composed generation does not reach an admission decision"
+        );
+        assert!(
+            backend
+                .platform
+                .owner_ref(device)
+                .is_some_and(|owner| owner.live_record().is_none()),
+            "an unresolved Owner clock cannot reach begin/send"
+        );
+
+        {
+            let clock = backend
+                .platform
+                .owner_for(device)
+                .expect("Owner")
+                .clock_mut(clock_key)
+                .expect("installed Owner clock");
+            (
+                clock.source,
+                clock.probe,
+                clock.probe_outcome,
+                clock.reference,
+                clock.queue_failed,
+            ) = clock_state;
+        }
+        assert!(matches!(
+            backend.admission_wake(device, false),
+            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+        ));
+    }
+
     /// Keep the unrelated Owner's accepted repaint from reaching its watchdog
     /// while the other device is intentionally stalled for CompletionUnknown.
     fn c0_3cii_wait_for_partial_unknown_while_settling_peer(
@@ -105180,6 +105334,47 @@ mod tests {
     }
 
     #[test]
+    fn c0_3cii_hotplug_initial_diagnostics_include_required_sections() {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.outputs[0].key.device_key;
+        let diagnostic = c0_3cii_hotplug_diagnostics_for_tests(&mut backend, device, 0, 0);
+
+        for field in [
+            "vt_state=",
+            "arbiter_state=",
+            "transition=",
+            "lifecycle_admission_closed=",
+            "recovery_stopped=",
+            "transport_gate_state=",
+            "composed=",
+            "admission_trace_tail=",
+            "last_decision_by_tier=",
+            "last_readiness_by_tier=",
+            "composed_readiness=",
+            "live_record=",
+            "clock=",
+            "owner_dpms_installed_active=",
+            "poisoned=",
+            "scene_composed_generation_exists=",
+            "scene_newest_generation=",
+            "damage_pending=",
+            "scanout_bos=",
+            "owner_composed_ready=",
+            "validation_sends=",
+            "live_sends=",
+            "replies=",
+            "core_driver_composed_offers_len=",
+            "last_offers=",
+            "resource_service_holds_adopted_bos=",
+        ] {
+            assert!(
+                diagnostic.contains(field),
+                "missing {field} in {diagnostic}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "hardware proof only; the implementer must never run this real-modeset test"]
     #[cfg(target_os = "linux")]
     fn c0_hw_3c_hotplug_on_card1_drm() {
@@ -105302,26 +105497,6 @@ mod tests {
             device,
             AdmissionSourceFixture::new_source().0,
         );
-        backend
-            .platform
-            .use_production_connector_prober_for_live_drm_fixture();
-        assert!(
-            !backend.platform.connector_prober_is_scripted_for_tests(),
-            "the hardware route uses DrmConnectorProber on the duplicated master fd"
-        );
-        // The test constructor leaves the monitor unset; the hardware route
-        // needs the production udev monitor that the real platform opens.
-        backend.platform.hotplug_monitor = Some(
-            crate::kms::hotplug::DrmHotplugMonitor::new()
-                .expect("open the production udev monitor")
-                .expect("udev monitor available on this host"),
-        );
-        assert!(
-            Backend::poll_fds(backend)
-                .iter()
-                .any(|(_, kind)| *kind == yserver_core::backend::BackendFdKind::DrmHotplug),
-            "the production udev monitor is registered in the core poll set"
-        );
 
         let output_idx = backend
             .platform
@@ -105335,20 +105510,21 @@ mod tests {
         backend
             .output_key_by_id
             .insert(output_id, output_key.clone());
-        {
+        let config = {
             let output = &backend.platform.outputs[output_idx];
-            let config = super::ConnectorConfig::Enabled {
+            super::ConnectorConfig::Enabled {
                 mode_w: output.width,
                 mode_h: output.height,
                 vrefresh: output.output.picked.vrefresh,
                 x: output.x,
                 y: output.y,
-            };
+            }
+        };
+        {
+            let output = &backend.platform.outputs[output_idx];
             let entry = backend.randr_id_alloc.entry_mut(&output_key);
             entry.connected = true;
             entry.config = config;
-            entry.last_enabled = Some(config);
-            entry.crtc_associated = true;
             entry.modes = output.output.modes.clone();
             entry.edid = output.output.edid.clone();
             entry.mm_width = output.output.mm_width;
@@ -105363,13 +105539,32 @@ mod tests {
             .as_fd()
             .as_raw_fd();
         let hardware_complete = Rc::new(RefCell::new(HashSet::new()));
-        let mut state = c0_3ci_core_state(backend);
-        let mut listener = c0_3aii_install_dpms_core_client(&mut state, 74);
-        state.randr_select_masks.insert(
-            (74, yserver_core::resources::ROOT_WINDOW),
-            rr::NOTIFY_MASK_OUTPUT_CHANGE | rr::NOTIFY_MASK_CRTC_CHANGE,
-        );
-        c0_hw_3b_compose_and_complete_through_core_driver(
+        let hardware_crtc =
+            u32::from(CrtcKey::for_output(&backend.platform.outputs[output_idx]).crtc);
+        let clock_key = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(hardware_crtc))
+            .expect("HDMI-2 CRTC has a production clock record");
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            "initial HDMI-2 clock probe",
+            Duration::from_secs(20),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock(clock_key))
+                    .is_some_and(|clock| {
+                        clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                    })
+            },
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("initial HDMI-2 clock probe failed: {error}"));
+        c0_3cii_hotplug_initial_composed_commit(
             backend,
             device,
             drm_fd,
@@ -105377,7 +105572,46 @@ mod tests {
             "compose the initial HDMI-2 frame before hotplug cycles",
             &hardware_complete,
         )
-        .unwrap_or_else(|error| panic!("initial HDMI-2 composition failed: {error}"));
+        .unwrap_or_else(|error| {
+            let diagnostics =
+                c0_3cii_hotplug_diagnostics_for_tests(backend, device, output_idx, hardware_crtc);
+            panic!("initial HDMI-2 composition failed: {error}; {diagnostics}");
+        });
+
+        // Keep startup composition on the same known-ready Owner path as 3b.
+        // Hotplug observation and RANDR publication are needed only for the
+        // unplug/replug cycles below; attaching them before the baseline frame
+        // lets startup topology work race that first ordinary admission.
+        backend
+            .platform
+            .use_production_connector_prober_for_live_drm_fixture();
+        assert!(
+            !backend.platform.connector_prober_is_scripted_for_tests(),
+            "the hardware route uses DrmConnectorProber on the duplicated master fd"
+        );
+        backend.platform.hotplug_monitor = Some(
+            crate::kms::hotplug::DrmHotplugMonitor::new()
+                .expect("open the production udev monitor")
+                .expect("udev monitor available on this host"),
+        );
+        assert!(
+            Backend::poll_fds(backend)
+                .iter()
+                .any(|(_, kind)| *kind == yserver_core::backend::BackendFdKind::DrmHotplug),
+            "the production udev monitor is registered in the core poll set"
+        );
+
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&output_key);
+            entry.last_enabled = Some(config);
+            entry.crtc_associated = true;
+        }
+        let mut state = c0_3ci_core_state(backend);
+        let mut listener = c0_3aii_install_dpms_core_client(&mut state, 74);
+        state.randr_select_masks.insert(
+            (74, yserver_core::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_OUTPUT_CHANGE | rr::NOTIFY_MASK_CRTC_CHANGE,
+        );
 
         let durations = Arc::new(Mutex::new(Vec::new()));
         backend.platform.connector_prober = Arc::new(TimedProductionProber {
@@ -105559,6 +105793,395 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("cycle {cycle}: relit HDMI-2 frame failed: {error}"));
         }
+    }
+
+    fn c0_3cii_hotplug_diagnostics_for_tests(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        output_idx: usize,
+        crtc: u32,
+    ) -> String {
+        let trace = backend.admission_trace_for_tests(device);
+        let trace_tail = trace
+            .iter()
+            .skip(trace.len().saturating_sub(12))
+            .cloned()
+            .collect::<Vec<_>>();
+        let composed = backend
+            .admission_conductors
+            .get(&device)
+            .map(|conductor| conductor.composed.clone());
+        let composed_generation = composed
+            .as_ref()
+            .and_then(|generations| generations.get(&crtc))
+            .copied();
+        let composed_readiness = composed_generation
+            .and_then(|generation| backend.composed_readiness_for_tests(device, crtc, generation));
+        let arbiter = backend.lifecycle_coordinator.device(&device);
+        let arbiter_state = arbiter.map(|arbiter| arbiter.state());
+        let arbiter_admission_open = arbiter.map(|arbiter| arbiter.admission_open());
+        let transition = arbiter.and_then(|arbiter| {
+            arbiter
+                .transition()
+                .map(|transition| (transition.kind, transition.phase))
+        });
+        let conductor_state = backend.admission_conductors.get(&device).map(|conductor| {
+            (
+                conductor.lifecycle_admission_closed,
+                conductor.recovery_stopped,
+                conductor.composed.clone(),
+                conductor.last_readiness_for_tests.clone(),
+                conductor.last_decision_for_tests.clone(),
+            )
+        });
+        let transport_gate_state = backend
+            .platform
+            .transport_gate(&device)
+            .map(|gate| gate.state());
+        let owner_state = backend.platform.owner_ref(device).map(|owner| {
+            let clock_context = owner.clock_context();
+            let clock_key = owner.clock_key_for_hardware_crtc(crtc);
+            let clock = clock_key.and_then(|key| owner.clock(key));
+            let live_record = owner
+                .live_record()
+                .map(|record| (record.commit_id(), *record.milestones()));
+            let clock_state = clock.map(|clock| {
+                (
+                    clock.source,
+                    clock.probe,
+                    clock.probe_outcome,
+                    clock.lifecycle_epoch,
+                    clock.topology_generation,
+                    clock.reference,
+                    clock.queue_failed,
+                )
+            });
+            (
+                clock_context,
+                clock_key,
+                clock_state,
+                live_record,
+                owner.is_poisoned(),
+            )
+        });
+        let scene_prepared = backend.scene.owner_prepared_for_tests(output_idx);
+        let newest_generation = scene_prepared.map(|(_, generation, _)| generation);
+        let owner_composed_ready = newest_generation
+            .map(|generation| backend.scene.owner_composed_ready(output_idx, generation));
+        let damage_state = backend.scene.damage_state_for_tests(output_idx);
+        let damage_signature = backend.scene.scanout_damage_signature_for_tests(output_idx);
+        let scanout_bos = backend
+            .platform
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref)
+            .map(|scanout| {
+                scanout
+                    .display_pool()
+                    .bos
+                    .iter()
+                    .enumerate()
+                    .map(|(bo_idx, bo)| {
+                        (
+                            bo_idx,
+                            format!("{:?}", bo.state),
+                            backend.platform.owner_bo_phase(output_idx, bo_idx),
+                            backend.scene.owner_state_for_tests(output_idx, bo_idx),
+                            bo.managed_key(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let scanout_bos_with_service = scanout_bos
+            .iter()
+            .map(|(bo_idx, state, phase, owner_state, managed_key)| {
+                let service_holds = managed_key.is_some_and(|key| {
+                    backend
+                        .resource_service
+                        .as_ref()
+                        .is_some_and(|service| service.contains(&key))
+                });
+                (
+                    *bo_idx,
+                    state.clone(),
+                    *phase,
+                    *owner_state,
+                    *managed_key,
+                    service_holds,
+                )
+            })
+            .collect::<Vec<_>>();
+        let adopted_bos_held = scanout_bos_with_service
+            .iter()
+            .filter(|(_, _, _, _, _, held)| *held)
+            .count();
+        let resource_service_holds_adopted_bos = (
+            adopted_bos_held,
+            scanout_bos_with_service.len(),
+            backend.resource_service.is_some(),
+        );
+        let executor_counts = backend
+            .platform
+            .devices
+            .iter()
+            .find(|entry| entry.key == device)
+            .and_then(|entry| entry.executor.as_ref())
+            .map(|executor| executor.request_counts_for_tests());
+        let offers_len = backend.core_driver_composed_offers_for_tests.len();
+        let last_offers = backend
+            .core_driver_composed_offers_for_tests
+            .iter()
+            .skip(offers_len.saturating_sub(12))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        format!(
+            "vt_state={:?}; arbiter_state={:?}; transition={:?}; arbiter_admission_open={:?}; \
+             lifecycle_admission_closed={:?}; recovery_stopped={:?}; transport_gate_state={:?}; \
+             composed={:?}; admission_trace_tail={:?}; last_decision_by_tier={:?}; \
+             last_readiness_by_tier={:?}; composed_readiness={:?}; live_record={:?}; \
+             clock_context_and_hdmi_crtc_clock={:?}; \
+             owner_dpms_installed_active={:?}; poisoned={:?}; scene_composed_generation_exists={}; \
+             scene_newest_generation={:?}; damage_pending={:?}; damage_signature={:?}; \
+             scanout_bos={:?}; owner_composed_ready={:?}; executor_sent_requests={:?}; \
+             validation_sends={:?}; live_sends={:?}; replies={:?}; \
+             core_driver_composed_offers_len={}; last_offers={:?}; \
+             resource_service_holds_adopted_bos={:?} (bo_idx,state,phase,owner_state,key,held)={:?}",
+            backend.vt_state,
+            arbiter_state,
+            transition,
+            arbiter_admission_open,
+            conductor_state.as_ref().map(|(closed, _, _, _, _)| *closed),
+            conductor_state
+                .as_ref()
+                .map(|(_, recovery_stopped, _, _, _)| *recovery_stopped),
+            transport_gate_state,
+            conductor_state
+                .as_ref()
+                .map(|(_, _, composed, _, _)| composed),
+            trace_tail,
+            conductor_state
+                .as_ref()
+                .and_then(|(_, _, _, _, decision)| decision.as_ref()),
+            conductor_state
+                .as_ref()
+                .map(|(_, _, _, readiness, _)| readiness),
+            composed_readiness,
+            owner_state
+                .as_ref()
+                .and_then(|(_, _, _, live_record, _)| *live_record),
+            owner_state.map(|(clock_context, clock_key, clock, _, _)| {
+                (clock_context, clock_key, clock)
+            }),
+            backend.owner_dpms_installed_active.get(&device).copied(),
+            backend
+                .platform
+                .owner_ref(device)
+                .map(|owner| owner.is_poisoned()),
+            scene_prepared.is_some(),
+            newest_generation,
+            damage_state.map(|(owes_repaint, staged)| {
+                (
+                    owes_repaint,
+                    staged,
+                    damage_signature.as_ref().map(|(pending, _, _)| *pending),
+                )
+            }),
+            damage_signature,
+            scanout_bos_with_service
+                .iter()
+                .map(|(bo_idx, state, phase, owner_state, key, _)| {
+                    (*bo_idx, state.as_str(), phase, owner_state, key)
+                })
+                .collect::<Vec<_>>(),
+            owner_composed_ready,
+            executor_counts.map(|counts| counts.0),
+            executor_counts.map(|counts| counts.1),
+            executor_counts.map(|counts| counts.2),
+            executor_counts.map(|counts| counts.3),
+            offers_len,
+            last_offers,
+            resource_service_holds_adopted_bos,
+            scanout_bos_with_service,
+        )
+    }
+
+    fn c0_3cii_hotplug_initial_composed_commit(
+        backend: &mut super::KmsBackend,
+        device: DrmDeviceKey,
+        drm_fd: std::os::fd::RawFd,
+        output_key: &OutputKey,
+        label: &str,
+        hardware_complete: &std::rc::Rc<
+            std::cell::RefCell<std::collections::HashSet<crate::kms::owner::identity::CommitId>>,
+        >,
+    ) -> Result<crate::kms::owner::identity::CommitId, String> {
+        use crate::kms::render::admission::AdmissionTraceStep;
+
+        let output_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| &output.key == output_key)
+            .ok_or_else(|| format!("{label}: HDMI-2 output is absent"))?;
+        let output = &backend.platform.outputs[output_idx];
+        let crtc = output.output.crtc;
+        let crtc_key = crate::kms::render::platform::CrtcKey::new(device, crtc);
+        let primary_plane = u32::from(output.output.plane);
+        let output_instance = *backend
+            .platform
+            .output_instance_ids
+            .get(output_idx)
+            .ok_or_else(|| format!("{label}: HDMI-2 output has no instance identity"))?;
+        let damage_before = backend
+            .scene
+            .damage_history_latest_generation_for_tests(output_idx);
+        let offers_before = backend.core_driver_composed_offers_for_tests.len();
+        let dispatched_before = backend
+            .admission_trace_for_tests(device)
+            .into_iter()
+            .filter_map(|step| match step {
+                AdmissionTraceStep::Dispatched(commit) => Some(commit),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let current_before = backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .filter_map(|resources| resources.commit_id)
+            .collect::<std::collections::HashSet<_>>();
+
+        backend.scene.mark_scene_structure_dirty();
+        eprintln!(
+            "{label}: initial-frame baseline: {}",
+            c0_3cii_hotplug_diagnostics_for_tests(backend, device, output_idx, u32::from(crtc))
+        );
+        c0_hw_3b_drive_until(
+            backend,
+            device,
+            drm_fd,
+            label,
+            std::time::Duration::from_secs(20),
+            &|backend| {
+                let target_generation_was_offered = backend
+                    .core_driver_composed_offers_for_tests
+                    .iter()
+                    .skip(offers_before)
+                    .any(|(offer_device, offer_crtc, _, offer_instance)| {
+                        *offer_device == device
+                            && *offer_crtc == u32::from(crtc)
+                            && *offer_instance == output_instance
+                    });
+                let dispatched = backend
+                    .admission_trace_for_tests(device)
+                    .into_iter()
+                    .filter_map(|step| match step {
+                        AdmissionTraceStep::Dispatched(commit) => Some(commit),
+                        _ => None,
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                let completed = hardware_complete.borrow();
+                let target_commit_is_current = backend
+                    .commit_consumer
+                    .current_resources
+                    .iter()
+                    .filter(|resources| resources.direct_role.is_none())
+                    .filter(|resources| {
+                        resources.crtcs.iter().any(|member| member.crtc == crtc_key)
+                    })
+                    .filter_map(|resources| resources.commit_id)
+                    .any(|commit_key| {
+                        commit_key.device == device
+                            && !current_before.contains(&commit_key)
+                            && !dispatched_before.contains(&commit_key.commit)
+                            && dispatched.contains(&commit_key.commit)
+                            // The driver's set is the real HardwareComplete
+                            // evidence (out-fence observed through the core
+                            // entries). `hardware_completed_commits` is only
+                            // populated while a commit is still retiring, so
+                            // it is empty once the commit is current.
+                            && completed.contains(&commit_key.commit)
+                    });
+
+                target_generation_was_offered
+                    && target_commit_is_current
+                    && backend
+                        .scene
+                        .damage_history_latest_generation_for_tests(output_idx)
+                        > damage_before
+                    && backend
+                        .platform
+                        .owner_ref(device)
+                        .is_some_and(|owner| owner.live_record().is_none())
+            },
+            hardware_complete,
+        )?;
+
+        let commit_key = backend
+            .commit_consumer
+            .current_resources
+            .iter()
+            .filter(|resources| resources.direct_role.is_none())
+            .filter(|resources| resources.crtcs.iter().any(|member| member.crtc == crtc_key))
+            .filter_map(|resources| resources.commit_id)
+            .find(|commit_key| {
+                commit_key.device == device
+                    && !current_before.contains(commit_key)
+                    && !dispatched_before.contains(&commit_key.commit)
+                    && backend
+                        .admission_trace_for_tests(device)
+                        .contains(&AdmissionTraceStep::Dispatched(commit_key.commit))
+                    && hardware_complete.borrow().contains(&commit_key.commit)
+            })
+            .ok_or_else(|| {
+                format!("{label}: no fresh HDMI-2 composed commit reached HardwareComplete")
+            })?;
+
+        let current_framebuffer = c0_3aii_owner_current_framebuffer(backend, output_idx)
+            .ok_or_else(|| format!("{label}: HDMI-2 has no retained composed framebuffer"))?;
+        let dispatched_framebuffers = {
+            let (consumer, service) = (
+                &backend.commit_consumer,
+                backend.resource_service.as_mut().expect("resource service"),
+            );
+            let resources = consumer
+                .current_resources
+                .iter()
+                .find(|resources| resources.commit_id == Some(commit_key))
+                .ok_or_else(|| {
+                    format!(
+                        "{label}: completed commit {:?} is not current",
+                        commit_key.commit
+                    )
+                })?;
+            let mut framebuffers = Vec::new();
+            for allocation in &resources.allocations {
+                let framebuffer = service
+                    .with_scanout_read(allocation, |scanout| {
+                        scanout.file_owned().and_then(|backing| backing.fb_handle())
+                    })
+                    .map_err(|error| {
+                        format!(
+                            "{label}: read commit {:?} scanout framebuffer: {error:?}",
+                            commit_key.commit
+                        )
+                    })?;
+                if let Some(framebuffer) = framebuffer {
+                    framebuffers.push(framebuffer);
+                }
+            }
+            framebuffers
+        };
+        if !dispatched_framebuffers.contains(&current_framebuffer) {
+            return Err(format!(
+                "{label}: dispatched commit {:?} primary plane {} FBs {:?} do not include current HDMI-2 FB {:?}",
+                commit_key.commit, primary_plane, dispatched_framebuffers, current_framebuffer
+            ));
+        }
+
+        Ok(commit_key.commit)
     }
 
     fn c0_3ci_expected_end_state_with_acquire_preparation(

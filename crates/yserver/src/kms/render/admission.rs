@@ -998,6 +998,10 @@ pub(crate) struct AdmissionConductor {
     pub(crate) force_lock_mismatch: bool,
     #[cfg(test)]
     pub(crate) trace: Vec<AdmissionTraceStep>,
+    #[cfg(test)]
+    pub(crate) last_readiness_for_tests: Vec<(IntentKey, Readiness)>,
+    #[cfg(test)]
+    pub(crate) last_decision_for_tests: Option<AdmissionDecision>,
 }
 
 #[allow(dead_code)]
@@ -1024,6 +1028,10 @@ impl AdmissionConductor {
             force_lock_mismatch: false,
             #[cfg(test)]
             trace: Vec::new(),
+            #[cfg(test)]
+            last_readiness_for_tests: Vec::new(),
+            #[cfg(test)]
+            last_decision_for_tests: None,
         }
     }
 
@@ -1051,6 +1059,10 @@ impl AdmissionConductor {
             force_lock_mismatch: false,
             #[cfg(test)]
             trace: Vec::new(),
+            #[cfg(test)]
+            last_readiness_for_tests: Vec::new(),
+            #[cfg(test)]
+            last_decision_for_tests: None,
         }
     }
 }
@@ -7827,6 +7839,23 @@ impl KmsBackend {
         let Some(output_idx) = self.composed_output_index(device, crtc) else {
             return Readiness::Waiting(WaitReason::SourceWaits);
         };
+        let clock_ready = self.platform.owner_ref(device).is_some_and(|owner| {
+            let (lifecycle_epoch, topology_generation) = owner.clock_context();
+            owner
+                .clock_key_for_hardware_crtc(crtc)
+                .and_then(|key| owner.clock(key))
+                .is_some_and(|clock| {
+                    clock.lifecycle_epoch == lifecycle_epoch
+                        && clock.topology_generation == topology_generation
+                        && clock.source == crate::kms::owner::clock::ClockSource::KernelSequence
+                        && clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                        && clock.reference.is_some()
+                        && !clock.queue_failed
+                })
+        });
+        if !clock_ready {
+            return Readiness::Waiting(WaitReason::SourceWaits);
+        }
         if !self.scene.owner_composed_ready(output_idx, generation) {
             return Readiness::Waiting(WaitReason::SourceWaits);
         }
@@ -7840,6 +7869,22 @@ impl KmsBackend {
             // inconsistent property never reaches owner begin/IPC.
             Readiness::Waiting(WaitReason::SourceWaits)
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composed_readiness_for_tests(
+        &self,
+        device: DrmDeviceKey,
+        crtc: CrtcId,
+        generation: u64,
+    ) -> Option<Readiness> {
+        self.admission_conductors
+            .get(&device)?
+            .last_readiness_for_tests
+            .iter()
+            .find_map(|(key, readiness)| {
+                (*key == IntentKey::Composed { crtc, generation }).then_some(*readiness)
+            })
     }
 
     fn composed_description(
@@ -8218,6 +8263,8 @@ impl KmsBackend {
         let direct_eligibility = direct_source_generation
             .map(|generation| self.direct_successor_eligibility(device, generation));
         let mut invalidate = None;
+        #[cfg(test)]
+        let mut readiness_for_tests = Vec::new();
         let snapshot = {
             let conductor = self
                 .admission_conductors
@@ -8242,21 +8289,20 @@ impl KmsBackend {
                 .collect::<Vec<_>>();
 
             for (&crtc, &generation) in &conductor.composed {
-                snapshot.report(
-                    IntentKey::Composed { crtc, generation },
-                    if !outputs_powered_on {
-                        Readiness::Waiting(WaitReason::OutputPoweredOff)
-                    } else if backend_composed {
-                        backend_composed_readiness
-                            .get(&(crtc, generation))
-                            .copied()
-                            .unwrap_or(Readiness::Waiting(WaitReason::SourceWaits))
-                    } else {
-                        conductor
-                            .source
-                            .producer_readiness(IntentKey::Composed { crtc, generation })
-                    },
-                );
+                let key = IntentKey::Composed { crtc, generation };
+                let readiness = if !outputs_powered_on {
+                    Readiness::Waiting(WaitReason::OutputPoweredOff)
+                } else if backend_composed {
+                    backend_composed_readiness
+                        .get(&(crtc, generation))
+                        .copied()
+                        .unwrap_or(Readiness::Waiting(WaitReason::SourceWaits))
+                } else {
+                    conductor.source.producer_readiness(key)
+                };
+                snapshot.report(key, readiness);
+                #[cfg(test)]
+                readiness_for_tests.push((key, readiness));
             }
 
             if let Some(direct) = conductor.admission.direct() {
@@ -8280,6 +8326,8 @@ impl KmsBackend {
                     }
                 };
                 snapshot.report(key, readiness);
+                #[cfg(test)]
+                readiness_for_tests.push((key, readiness));
             }
 
             for (&key, payload) in &conductor.maintenance.desired {
@@ -8287,12 +8335,12 @@ impl KmsBackend {
                     key,
                     generation: payload.generation,
                 };
-                snapshot.report(
-                    maintenance,
-                    conductor
-                        .source
-                        .maintenance_readiness(key, payload.generation),
-                );
+                let readiness = conductor
+                    .source
+                    .maintenance_readiness(key, payload.generation);
+                snapshot.report(maintenance, readiness);
+                #[cfg(test)]
+                readiness_for_tests.push((maintenance, readiness));
                 for &primary in &primary_intents {
                     if conductor
                         .source
@@ -8313,7 +8361,10 @@ impl KmsBackend {
                 } else {
                     Readiness::Waiting(WaitReason::SourceWaits)
                 };
-                snapshot.report(IntentKey::CursorRecovery { crtc }, readiness);
+                let key = IntentKey::CursorRecovery { crtc };
+                snapshot.report(key, readiness);
+                #[cfg(test)]
+                readiness_for_tests.push((key, readiness));
             }
 
             if conductor.admission.unflip().is_some() {
@@ -8329,6 +8380,8 @@ impl KmsBackend {
                     Readiness::Ready
                 };
                 snapshot.report(IntentKey::Unflip, readiness);
+                #[cfg(test)]
+                readiness_for_tests.push((IntentKey::Unflip, readiness));
             }
             snapshot
         };
@@ -8348,6 +8401,10 @@ impl KmsBackend {
                     "ineligible descriptor must name its queued frame"
                 );
             }
+        }
+        #[cfg(test)]
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor.last_readiness_for_tests = readiness_for_tests;
         }
         Some(snapshot)
     }
@@ -8450,6 +8507,7 @@ impl KmsBackend {
                     Some(decision) => {
                         #[cfg(test)]
                         if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+                            conductor.last_decision_for_tests = Some(decision.clone());
                             conductor.trace.push(AdmissionTraceStep::Decided);
                         }
                         #[cfg(test)]

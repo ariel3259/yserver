@@ -471,6 +471,12 @@ pub struct KmsIoExecutor {
     helper_pid: Option<libc::pid_t>,
     #[cfg(test)]
     sent_requests_for_tests: usize,
+    #[cfg(test)]
+    validation_requests_for_tests: usize,
+    #[cfg(test)]
+    live_requests_for_tests: usize,
+    #[cfg(test)]
+    replies_for_tests: usize,
 }
 
 impl KmsIoExecutor {
@@ -481,6 +487,16 @@ impl KmsIoExecutor {
     #[cfg(test)]
     pub(crate) fn sent_requests_for_tests(&self) -> usize {
         self.sent_requests_for_tests
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_counts_for_tests(&self) -> (usize, usize, usize, usize) {
+        (
+            self.sent_requests_for_tests,
+            self.validation_requests_for_tests,
+            self.live_requests_for_tests,
+            self.replies_for_tests,
+        )
     }
 
     #[allow(dead_code)]
@@ -866,6 +882,18 @@ impl KmsIoExecutor {
             // Count every request frame that crossed the executor socket,
             // including probes and queued sequence work.
             self.sent_requests_for_tests = self.sent_requests_for_tests.saturating_add(1);
+            match request {
+                HostCallRequest::Atomic(atomic)
+                    if atomic.flags & self::protocol::DRM_MODE_ATOMIC_TEST_ONLY != 0 =>
+                {
+                    self.validation_requests_for_tests =
+                        self.validation_requests_for_tests.saturating_add(1);
+                }
+                HostCallRequest::Atomic(_) => {
+                    self.live_requests_for_tests = self.live_requests_for_tests.saturating_add(1);
+                }
+                HostCallRequest::ClockProbe(_) | HostCallRequest::SequenceQueue(_) => {}
+            }
         }
         Ok(())
     }
@@ -1016,6 +1044,11 @@ impl KmsIoExecutor {
                 }
             }
         };
+
+        #[cfg(test)]
+        {
+            self.replies_for_tests = self.replies_for_tests.saturating_add(1);
+        }
 
         if in_flight.terminalized.is_some() {
             Some(HostCallEvent::LateReply {
@@ -1537,6 +1570,12 @@ pub(crate) fn spawn_internal_full(
         helper_pid: None,
         #[cfg(test)]
         sent_requests_for_tests: 0,
+        #[cfg(test)]
+        validation_requests_for_tests: 0,
+        #[cfg(test)]
+        live_requests_for_tests: 0,
+        #[cfg(test)]
+        replies_for_tests: 0,
     })
 }
 
