@@ -353,7 +353,8 @@ and [round 3](../findings/2026-09-30-dynamic-xinput-adversarial-review-round-3.m
 with their correction dispositions.
 They preserve the approved registry topology, virtual 4/5 and absence of an
 exact selector. The keyboard/pointer plan contains 18 separate task boundaries;
-the touch plan follows with 10. Implementation has not started.
+the touch plan follows with 10. Implementation began 2026-09-30; progress is
+tracked in `docs/status.md`.
 
 ## Acceptance criteria for the implementation plan
 

@@ -33,12 +33,15 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-09-30 dynamic XI device registry, Task 1 staged (branch
+- **2026-09-30 dynamic XI device registry, Tasks 1–2 staged (branch
   `feat/xi-dynamic-registry-implementation`):** `XiRegistry` now owns the
   live XI device vector plus `InputSourceId` metadata and atomic lowest-free
   keyboard/pointer facet allocation in IDs 6..=127. `DeviceInfo` carries
-  source identity and capability bits; the producer currently reports
-  `touch = false` pending Task 2's capability collection. Server startup
+  source identity and independent keyboard/pointer/touch capability bits.
+  The libinput producer now allocates attachment IDs against `input::Device`
+  handle identity and tags physical `InputEvent`s; unknown/removed handles
+  are dropped without matching by node. Task 3 still needs to carry those IDs
+  through `HostInputEvent` and the inventory. Server startup
   seeds virtual devices 4/5 with the XTEST pointer/keyboard names and
   `XTEST Device` INTEGER/8 value 1; writes and direct
   deletes of that marker are guarded by atom identity even after a
@@ -47,8 +50,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   **not** fix the physical-mouse enumeration/configuration issue. The current
   GDK query comment in `core_loop/process_request.rs` still expects device 4
   to be the first generic attached pointer; revisit that compatibility point
-  when XI1/XI2 query behavior migrates. Behavioral tests were not run for
-  this staged implementation.
+  when XI1/XI2 query behavior migrates. Behavioral tests were not added or
+  run under the current authorization constraint.
 
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's

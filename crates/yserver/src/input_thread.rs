@@ -119,7 +119,7 @@ impl LibinputThreadState {
     /// the wall clock.
     pub(crate) fn map(&mut self, ev: InputEvent, time_ms: u32) -> HostInputEvent {
         match ev {
-            InputEvent::KeyPress { keycode } => HostInputEvent::Key(HostKeyEvent {
+            InputEvent::KeyPress { keycode, .. } => HostInputEvent::Key(HostKeyEvent {
                 pressed: true,
                 keycode: ((keycode + 8) & 0xff) as u8,
                 time: time_ms,
@@ -129,7 +129,7 @@ impl LibinputThreadState {
                 event_y: self.cursor_y as i16,
                 state: 0,
             }),
-            InputEvent::KeyRelease { keycode } => HostInputEvent::Key(HostKeyEvent {
+            InputEvent::KeyRelease { keycode, .. } => HostInputEvent::Key(HostKeyEvent {
                 pressed: false,
                 keycode: ((keycode + 8) & 0xff) as u8,
                 time: time_ms,
@@ -139,7 +139,7 @@ impl LibinputThreadState {
                 event_y: self.cursor_y as i16,
                 state: 0,
             }),
-            InputEvent::PointerMotion { dx, dy } => {
+            InputEvent::PointerMotion { dx, dy, .. } => {
                 self.cursor_x =
                     (self.cursor_x + dx).clamp(0.0, f64::from(self.fb_w).max(1.0) - 1.0);
                 self.cursor_y =
@@ -157,7 +157,7 @@ impl LibinputThreadState {
                     dy: dy.round() as i32,
                 }
             }
-            InputEvent::PointerMotionAbsolute { x_norm, y_norm } => {
+            InputEvent::PointerMotionAbsolute { x_norm, y_norm, .. } => {
                 let (old_cx, old_cy) = (self.cursor_x, self.cursor_y);
                 self.cursor_x = x_norm.clamp(0.0, 1.0) * (f64::from(self.fb_w).max(1.0) - 1.0);
                 self.cursor_y = y_norm.clamp(0.0, 1.0) * (f64::from(self.fb_h).max(1.0) - 1.0);
@@ -173,7 +173,7 @@ impl LibinputThreadState {
                     dy: (self.cursor_y - old_cy).round() as i32,
                 }
             }
-            InputEvent::Button { code, pressed } => HostInputEvent::PointerButton {
+            InputEvent::Button { code, pressed, .. } => HostInputEvent::PointerButton {
                 button: u16::try_from(code).unwrap_or(u16::MAX),
                 pressed,
                 time: time_ms,
@@ -189,7 +189,7 @@ impl LibinputThreadState {
             },
             // Handled in process_batch (flushes motion + resets the scroll
             // accumulator) before map() is reached.
-            InputEvent::PointerScrollStop => {
+            InputEvent::PointerScrollStop { .. } => {
                 unreachable!("PointerScrollStop is routed in process_batch before map()")
             }
             // DeviceAdded/Removed are forwarded by process_batch before
@@ -499,7 +499,7 @@ pub fn process_batch(
             sender.send(Message::HostInput(HostInputEvent::DeviceAdded(info)))?;
             continue;
         }
-        if let InputEvent::DeviceRemoved { device_node } = raw {
+        if let InputEvent::DeviceRemoved { device_node, .. } = raw {
             if let Some(m) = pending_motion.take() {
                 sender.send(Message::HostInput(m))?;
             }
@@ -510,7 +510,10 @@ pub fn process_batch(
         }
         // Scroll fans out separately because one InputEvent may map to
         // zero or many press+release pairs depending on accumulated v120.
-        if let InputEvent::PointerScroll { dx_v120, dy_v120 } = raw {
+        if let InputEvent::PointerScroll {
+            dx_v120, dy_v120, ..
+        } = raw
+        {
             scroll_buf.clear();
             state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
             if !scroll_buf.is_empty() {
@@ -528,7 +531,7 @@ pub fn process_batch(
         // forward the stop so the backend emits a delta-0 XI2 scroll motion.
         // GDK reads that as `scroll.is_stop`, which commits a Firefox
         // history-swipe (bug 1539730).
-        if matches!(raw, InputEvent::PointerScrollStop) {
+        if matches!(raw, InputEvent::PointerScrollStop { .. }) {
             state.scroll_accum_x_v120 = 0;
             state.scroll_accum_y_v120 = 0;
             if let Some(m) = pending_motion.take() {
@@ -904,7 +907,9 @@ mod tests {
         LINUX_KEY_BACKSPACE, LINUX_KEY_ENTER, LINUX_KEY_F12, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
         LINUX_KEY_RIGHTALT, LINUX_KEY_RIGHTCTRL,
     };
-    use yserver_core::core_loop::channel;
+    use yserver_core::{core_loop::channel, xinput::InputSourceId};
+
+    const TEST_SOURCE_ID: InputSourceId = InputSourceId(1);
 
     #[test]
     fn maps_relative_motion_to_clamped_absolute() {
@@ -913,6 +918,7 @@ mod tests {
         assert_eq!(s.cursor(), (400.0, 300.0));
         let ev = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: 50.0,
                 dy: -100.0,
             },
@@ -925,6 +931,7 @@ mod tests {
         // Walk past the right edge — clamps to fb_w-1.
         let _ = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: 1000.0,
                 dy: 0.0,
             },
@@ -946,6 +953,7 @@ mod tests {
         // Walk cursor to the right edge of the single-monitor boot extent.
         let _ = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: 10000.0,
                 dy: 0.0,
             },
@@ -963,6 +971,7 @@ mod tests {
         // Move right: must now cross 2560 and reach the new far edge.
         let ev = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: 1000.0,
                 dy: 0.0,
             },
@@ -985,6 +994,7 @@ mod tests {
         // Walk all the way to the new right edge.
         let _ = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: 10000.0,
                 dy: 0.0,
             },
@@ -1049,6 +1059,7 @@ mod tests {
         // stale position.
         let ev = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: -100.0,
                 dy: 0.0,
             },
@@ -1078,6 +1089,7 @@ mod tests {
         let mut s = LibinputThreadState::new(800, 600);
         let ev = s.map(
             InputEvent::PointerMotionAbsolute {
+                source_id: TEST_SOURCE_ID,
                 x_norm: 0.5,
                 y_norm: 0.25,
             },
@@ -1101,6 +1113,7 @@ mod tests {
         let before = s.cursor();
         let btn = s.map(
             InputEvent::Button {
+                source_id: TEST_SOURCE_ID,
                 code: 0x110,
                 pressed: true,
             },
@@ -1118,7 +1131,13 @@ mod tests {
             }
             other => panic!("expected PointerButton, got {other:?}"),
         }
-        let key = s.map(InputEvent::KeyPress { keycode: 30 }, 8);
+        let key = s.map(
+            InputEvent::KeyPress {
+                source_id: TEST_SOURCE_ID,
+                keycode: 30,
+            },
+            8,
+        );
         match key {
             HostInputEvent::Key(ev) => {
                 assert!(ev.pressed);
@@ -1139,18 +1158,51 @@ mod tests {
         let mut state = LibinputThreadState::new(800, 600);
         let mut pending: Option<HostInputEvent> = None;
         let batch = vec![
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
             InputEvent::Button {
+                source_id: TEST_SOURCE_ID,
                 code: 1,
                 pressed: true,
             },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
         ];
         process_batch(&mut state, &sender, &mut pending, batch, 100).unwrap();
         // End-of-batch flush (matches the production loop in `run`).
@@ -1211,7 +1263,11 @@ mod tests {
             &mut state,
             &sender,
             &mut pending,
-            [InputEvent::PointerMotion { dx: 5.0, dy: 0.0 }],
+            [InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 5.0,
+                dy: 0.0,
+            }],
             1,
         )
         .unwrap();
@@ -1226,8 +1282,13 @@ mod tests {
             &sender,
             &mut pending,
             [
-                InputEvent::PointerMotion { dx: 10.0, dy: 0.0 },
+                InputEvent::PointerMotion {
+                    source_id: TEST_SOURCE_ID,
+                    dx: 10.0,
+                    dy: 0.0,
+                },
                 InputEvent::Button {
+                    source_id: TEST_SOURCE_ID,
                     code: 1,
                     pressed: true,
                 },
@@ -1263,18 +1324,22 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_BACKSPACE,
                 },
                 // Anything after the zap is dropped — the server is
                 // already shutting down. This press must NOT reach
                 // the core.
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: 30, /* a */
                 },
             ],
@@ -1309,6 +1374,7 @@ mod tests {
             &sender,
             &mut pending,
             [InputEvent::KeyPress {
+                source_id: TEST_SOURCE_ID,
                 keycode: LINUX_KEY_BACKSPACE,
             }],
             0,
@@ -1333,15 +1399,19 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyRelease {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_BACKSPACE,
                 },
             ],
@@ -1367,12 +1437,15 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_RIGHTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_RIGHTALT,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_BACKSPACE,
                 },
             ],
@@ -1398,12 +1471,15 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_ENTER,
                 },
             ],
@@ -1439,12 +1515,15 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_F12,
                 },
             ],
@@ -1494,6 +1573,7 @@ mod tests {
             &sender,
             &mut pending,
             [InputEvent::KeyPress {
+                source_id: TEST_SOURCE_ID,
                 keycode: LINUX_KEY_ENTER,
             }],
             0,
@@ -1528,6 +1608,7 @@ mod tests {
             &sender,
             &mut pending,
             [InputEvent::PointerScroll {
+                source_id: TEST_SOURCE_ID,
                 dx_v120: 0,
                 dy_v120: 120,
             }],
