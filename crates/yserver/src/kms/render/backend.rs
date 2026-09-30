@@ -105623,7 +105623,6 @@ mod tests {
         });
         c0_3cii_dump_kernel_planes(backend, device, "after the initial composed commit");
         c0_3cii_report_pool_bos(backend, output_idx, "after initial composed commit");
-        Backend::dump_scanout(backend);
 
         // Keep startup composition on the same known-ready Owner path as 3b.
         // Hotplug observation and RANDR publication are needed only for the
