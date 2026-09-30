@@ -10,6 +10,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
+    hash::Hash,
     io,
     os::{
         fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
@@ -42,6 +43,76 @@ use crate::input::{event::InputEvent, libinput_config};
 
 struct Interface;
 
+/// Tracks the runtime source identity associated with each live backend
+/// handle. Descriptive device metadata such as an evdev node is deliberately
+/// not part of this mapping.
+#[derive(Debug)]
+struct SourceTracker<K> {
+    bindings: HashMap<K, InputSourceId>,
+    live_ids: HashSet<InputSourceId>,
+    next_id: Option<u64>,
+}
+
+impl<K: Eq + Hash> SourceTracker<K> {
+    fn new() -> Self {
+        Self {
+            bindings: HashMap::new(),
+            live_ids: HashSet::new(),
+            next_id: Some(1),
+        }
+    }
+
+    fn add(&mut self, key: K) -> io::Result<InputSourceId> {
+        if self.bindings.contains_key(&key) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "source handle is already bound",
+            ));
+        }
+
+        let next_id = self
+            .next_id
+            .ok_or_else(|| io::Error::other("input source identity exhausted"))?;
+        let source_id = InputSourceId(next_id);
+        self.next_id = next_id.checked_add(1);
+        self.bindings.insert(key, source_id);
+        self.live_ids.insert(source_id);
+        Ok(source_id)
+    }
+
+    fn get(&self, key: &K) -> Option<InputSourceId> {
+        self.bindings.get(key).copied()
+    }
+
+    fn remove(&mut self, key: &K) -> Option<InputSourceId> {
+        let source_id = self.bindings.remove(key)?;
+        self.live_ids.remove(&source_id);
+        Some(source_id)
+    }
+
+    /// Bind a replacement handle to an already allocated source after a
+    /// caller has independently proven a paused continuation.
+    #[allow(dead_code)] // Used by the later VT continuation task.
+    fn rebind(&mut self, key: K, source_id: InputSourceId) -> io::Result<()> {
+        if self.bindings.contains_key(&key) || self.live_ids.contains(&source_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "source handle or identity is already live",
+            ));
+        }
+        if source_id.0 == 0 || self.next_id.is_some_and(|next_id| source_id.0 >= next_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source identity was not previously allocated",
+            ));
+        }
+
+        self.bindings.insert(key, source_id);
+        self.live_ids.insert(source_id);
+        Ok(())
+    }
+}
+
 impl LibinputInterface for Interface {
     fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
         let result = OpenOptions::new()
@@ -71,42 +142,37 @@ impl LibinputInterface for Interface {
 
 pub struct Context {
     libinput: Libinput,
-    /// Live libinput device handles keyed by evdev devnode (e.g.
-    /// `/dev/input/event4`). Populated at `DeviceAdded` for any pointer
-    /// device (touchpad OR mouse — the ones whose libinput properties we
-    /// seed); cleared at `DeviceRemoved`. Consumed by
-    /// [`Context::apply_device_config`] so decoded `xinput set-prop`
-    /// writes (e.g. the KDE Mouse KCM setting `libinput Accel Speed`) can
-    /// be routed through to the matching `config_*_set_*` setter on the
-    /// live device.
+    /// Stable identity for each live libinput device handle. Device nodes are
+    /// metadata and can be reused after an attachment is removed.
+    sources: SourceTracker<Device>,
+    /// Live configurable pointer handles keyed by libinput handle identity.
+    /// The device-node string is retained only for the legacy config-write
+    /// API until the inventory migration replaces that selector.
     ///
     /// `input::Device` is refcounted at the C level (`libinput_device_ref`)
     /// and the Rust wrapper exposes that via `Clone` — stashing the handle
     /// here keeps the device alive even after libinput's own iterator
     /// drops its borrow, and the entry's eventual `remove(...)` drops
     /// the last ref.
-    pointer_devices: HashMap<String, Device>,
-    /// Live handles for keyboard-capability devices, same keying and
-    /// refcount semantics as `pointer_devices`. Consumed by
+    pointer_devices: HashMap<Device, (String, Device)>,
+    /// Live handles for keyboard-capability devices, keyed by libinput
+    /// handle identity. Consumed by
     /// [`Context::update_leds`] — the XKB lock state (Caps/Num/Scroll)
     /// lives in the server core, so the server must push LED changes
     /// down to the hardware via `libinput_device_led_update`; nothing
     /// else will (this is the KMS server, there is no other driver).
-    keyboard_devices: HashMap<String, Device>,
+    keyboard_devices: HashMap<Device, Device>,
     /// Last LED mask applied — re-applied to keyboards that appear
     /// later (hotplug, VT-switch re-acquire re-adds devices with their
     /// LEDs reset).
     last_leds: Led,
-    /// Device nodes of currently-open **keyboard- or pointer-capable**
+    /// Handles of currently-open **keyboard- or pointer-capable**
     /// devices. The startup guard requires this to be non-empty: a session
     /// whose only opened device is non-usable (e.g. a lone HID "System
     /// Control" collection that opened while the real keyboard/mouse were
     /// seat-denied) is dead on arrival and can't even be zapped. Add/remove
     /// tracked so the count stays accurate across hotplug.
-    usable_input_nodes: HashSet<String>,
-    /// Process-local source identity allocator. IDs are never reused during
-    /// this libinput context's lifetime, even when an evdev node is reused.
-    next_source_id: u64,
+    usable_input_devices: HashSet<Device>,
 }
 
 /// Newtype wrapper around `Context` that implements `Send`.
@@ -194,11 +260,11 @@ impl Context {
         })?;
         Ok(Self {
             libinput,
+            sources: SourceTracker::new(),
             pointer_devices: HashMap::new(),
             keyboard_devices: HashMap::new(),
             last_leds: Led::empty(),
-            usable_input_nodes: HashSet::new(),
-            next_source_id: 1,
+            usable_input_devices: HashSet::new(),
         })
     }
 
@@ -209,9 +275,9 @@ impl Context {
     /// Count of currently-open **keyboard- or pointer-capable** devices.
     /// The startup guard requires this to be ≥1 — a session with input
     /// devices that are none of keyboard/pointer (e.g. only a HID "System
-    /// Control" node) is unusable. See [`usable_input_nodes`](Self).
+    /// Control" node) is unusable. See [`usable_input_devices`](Self).
     pub fn usable_input_device_count(&self) -> usize {
-        self.usable_input_nodes.len()
+        self.usable_input_devices.len()
     }
 
     pub fn dispatch(&mut self) -> io::Result<Vec<InputEvent>> {
@@ -224,6 +290,7 @@ impl Context {
             match &event {
                 Event::Device(input::event::DeviceEvent::Added(d)) => {
                     let mut dev = d.device();
+                    let source_id = self.sources.add(dev.clone())?;
                     let name = dev.name().into_owned();
                     let tap_finger_count = dev.config_tap_finger_count();
                     let is_tp = is_touchpad(tap_finger_count);
@@ -257,6 +324,8 @@ impl Context {
                     // absent. Non-pointer devices (keyboards) keep the
                     // all-`false` default snapshot.
                     let is_pointer = dev.has_capability(DeviceCapability::Pointer);
+                    let is_keyboard = dev.has_capability(DeviceCapability::Keyboard);
+                    let is_touch = dev.has_capability(DeviceCapability::Touch);
                     let config = if is_tp || is_pointer {
                         libinput_config::gather(&dev)
                     } else {
@@ -280,7 +349,7 @@ impl Context {
                     // left-handed, …) would silently no-op.
                     if is_real_pointer {
                         self.pointer_devices
-                            .insert(device_node.clone(), dev.clone());
+                            .insert(dev.clone(), (device_node.clone(), dev.clone()));
                     }
                     // Keyboard-capability devices are stashed for LED
                     // writes (update_leds). Re-apply the current lock-
@@ -288,7 +357,7 @@ impl Context {
                     // and VT-switch re-acquire re-add devices with
                     // their LEDs reset, but the X-side lock state
                     // persists.
-                    if dev.has_capability(DeviceCapability::Keyboard) {
+                    if is_keyboard {
                         // Force the device to the current lock state
                         // unconditionally — including all-off — so a
                         // keyboard that appears with a stale firmware
@@ -296,32 +365,22 @@ impl Context {
                         // match the server, not just keyboards added
                         // while a lock happens to be active.
                         dev.led_update(self.last_leds);
-                        self.keyboard_devices
-                            .insert(device_node.clone(), dev.clone());
+                        self.keyboard_devices.insert(dev.clone(), dev.clone());
                     }
                     // Track keyboard/pointer-capable devices for the startup
                     // usable-input guard (`usable_input_device_count`). A lone
                     // non-usable device (e.g. a HID "System Control" collection
                     // that opens while the real keyboard/mouse are seat-denied)
                     // must NOT count as usable input.
-                    if dev.has_capability(DeviceCapability::Keyboard)
-                        || dev.has_capability(DeviceCapability::Pointer)
-                    {
-                        self.usable_input_nodes.insert(device_node.clone());
+                    if is_keyboard || is_pointer {
+                        self.usable_input_devices.insert(dev.clone());
                     }
-                    let source_id = InputSourceId(self.next_source_id);
-                    self.next_source_id = self
-                        .next_source_id
-                        .checked_add(1)
-                        .expect("libinput source identity exhausted");
                     let info = DeviceInfo {
                         source_id,
                         capabilities: InputCapabilities {
-                            keyboard: dev.has_capability(DeviceCapability::Keyboard),
-                            pointer: dev.has_capability(DeviceCapability::Pointer),
-                            // Task 2 gathers the touch capability from
-                            // libinput alongside the other source facts.
-                            touch: false,
+                            keyboard: is_keyboard,
+                            pointer: is_pointer,
+                            touch: is_touch,
                         },
                         name,
                         device_node,
@@ -343,16 +402,28 @@ impl Context {
                             .and_then(|ud| ud.devnode().map(|p| p.to_string_lossy().into_owned()));
                         node.unwrap_or_else(|| device_node_from_sysname(&sysname))
                     };
-                    // T4: drop the stashed handle (libinput unref via Drop).
-                    // No-op if the device wasn't a touchpad (never inserted).
-                    self.pointer_devices.remove(&device_node);
-                    self.keyboard_devices.remove(&device_node);
-                    self.usable_input_nodes.remove(&device_node);
-                    out.push(InputEvent::DeviceRemoved { device_node });
+                    let Some(source_id) = self.sources.remove(&dev) else {
+                        log::debug!(
+                            "libinput: ignoring removal for unknown device handle {name:?}"
+                        );
+                        continue;
+                    };
+                    // Drop any configuration/LED handles for this exact
+                    // attachment (libinput unrefs them via Drop).
+                    self.pointer_devices.remove(&dev);
+                    self.keyboard_devices.remove(&dev);
+                    self.usable_input_devices.remove(&dev);
+                    out.push(InputEvent::DeviceRemoved {
+                        source_id,
+                        device_node,
+                    });
                 }
                 _ => {}
             }
-            if let Some(translated) = translate(&event) {
+            let event_device = event.device();
+            if let Some(source_id) = self.sources.get(&event_device)
+                && let Some(translated) = translate(&event, source_id)
+            {
                 out.push(translated);
             }
         }
@@ -403,8 +474,9 @@ impl Context {
         change: DeviceConfigChange,
     ) -> Result<(), DeviceConfigError> {
         self.pointer_devices
-            .get_mut(device_node)
-            .map_or(Ok(()), |dev| libinput_config::apply(dev, change))
+            .values_mut()
+            .find(|(node, _)| node == device_node)
+            .map_or(Ok(()), |(_, dev)| libinput_config::apply(dev, change))
     }
 }
 
@@ -526,7 +598,7 @@ fn probe_input_devnodes() -> (usize, usize) {
 /// `has_axis(axis)` MUST be checked first: libinput emits a
 /// `client bug: value requested for unset axis` error if
 /// `scroll_value` is called for an axis the event doesn't carry.
-fn finger_or_continuous_to_event<E>(ev: &E) -> Option<InputEvent>
+fn finger_or_continuous_to_event<E>(ev: &E, source_id: InputSourceId) -> Option<InputEvent>
 where
     E: PointerScrollEvent,
 {
@@ -544,19 +616,24 @@ where
     if dx_v120 == 0 && dy_v120 == 0 {
         return None;
     }
-    Some(InputEvent::PointerScroll { dx_v120, dy_v120 })
+    Some(InputEvent::PointerScroll {
+        source_id,
+        dx_v120,
+        dy_v120,
+    })
 }
 
-fn translate(event: &Event) -> Option<InputEvent> {
+fn translate(event: &Event, source_id: InputSourceId) -> Option<InputEvent> {
     match event {
         Event::Keyboard(KeyboardEvent::Key(key)) => {
             let keycode = key.key();
             Some(match key.key_state() {
-                KeyState::Pressed => InputEvent::KeyPress { keycode },
-                KeyState::Released => InputEvent::KeyRelease { keycode },
+                KeyState::Pressed => InputEvent::KeyPress { source_id, keycode },
+                KeyState::Released => InputEvent::KeyRelease { source_id, keycode },
             })
         }
         Event::Pointer(PointerEvent::Motion(motion)) => Some(InputEvent::PointerMotion {
+            source_id,
             dx: motion.dx(),
             dy: motion.dy(),
         }),
@@ -566,11 +643,13 @@ fn translate(event: &Event) -> Option<InputEvent> {
             // normalised 0..1 coordinate; the backend scales to scanout size.
             const SCALE: u32 = 1_000_000;
             Some(InputEvent::PointerMotionAbsolute {
+                source_id,
                 x_norm: motion.absolute_x_transformed(SCALE) / SCALE as f64,
                 y_norm: motion.absolute_y_transformed(SCALE) / SCALE as f64,
             })
         }
         Event::Pointer(PointerEvent::Button(btn)) => Some(InputEvent::Button {
+            source_id,
             code: btn.button(),
             pressed: btn.button_state() == ButtonState::Pressed,
         }),
@@ -593,16 +672,23 @@ fn translate(event: &Event) -> Option<InputEvent> {
             if dx_v120 == 0 && dy_v120 == 0 {
                 return None;
             }
-            Some(InputEvent::PointerScroll { dx_v120, dy_v120 })
+            Some(InputEvent::PointerScroll {
+                source_id,
+                dx_v120,
+                dy_v120,
+            })
         }
         // ScrollFinger: a zero-delta event is libinput's fingers-lifted stop
         // (`finger_or_continuous_to_event` returns None only for all-zero
         // deltas), which we surface as PointerScrollStop. ScrollContinuous has
         // no finger-lift, so its zero deltas stay dropped.
-        Event::Pointer(PointerEvent::ScrollFinger(ev)) => {
-            Some(finger_or_continuous_to_event(ev).unwrap_or(InputEvent::PointerScrollStop))
+        Event::Pointer(PointerEvent::ScrollFinger(ev)) => Some(
+            finger_or_continuous_to_event(ev, source_id)
+                .unwrap_or(InputEvent::PointerScrollStop { source_id }),
+        ),
+        Event::Pointer(PointerEvent::ScrollContinuous(ev)) => {
+            finger_or_continuous_to_event(ev, source_id)
         }
-        Event::Pointer(PointerEvent::ScrollContinuous(ev)) => finger_or_continuous_to_event(ev),
         _ => None,
     }
 }

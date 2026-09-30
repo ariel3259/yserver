@@ -283,8 +283,9 @@ pub enum HostInputEvent {
     /// snapshot of its identity and touchpad configuration so the core can
     /// seed per-device state (Task 2: XI2 property registry).
     DeviceAdded(DeviceInfo),
-    /// An input device has been removed.  `device_node` is the evdev path
-    /// that was reported at add time and can be used to look up the device.
+    /// An input device has been removed. In this legacy host-input message,
+    /// `device_node` is descriptive compatibility metadata; Task 3 carries
+    /// the runtime source identity through this boundary.
     DeviceRemoved { device_node: String },
 }
 

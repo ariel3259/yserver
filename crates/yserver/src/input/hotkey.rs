@@ -60,7 +60,7 @@ impl HotkeyDetector {
     /// Only key *presses* fire; releases just update modifier state.
     pub fn check(&mut self, ev: &InputEvent) -> Option<Hotkey> {
         match *ev {
-            InputEvent::KeyPress { keycode } => match keycode {
+            InputEvent::KeyPress { keycode, .. } => match keycode {
                 LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => {
                     self.ctrl_pressed = true;
                     None
@@ -79,7 +79,7 @@ impl HotkeyDetector {
                 LINUX_KEY_F12 => Some(Hotkey::DumpDrawables),
                 _ => None,
             },
-            InputEvent::KeyRelease { keycode } => {
+            InputEvent::KeyRelease { keycode, .. } => {
                 match keycode {
                     LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => self.ctrl_pressed = false,
                     LINUX_KEY_LEFTALT | LINUX_KEY_RIGHTALT => self.alt_pressed = false,
@@ -95,12 +95,21 @@ impl HotkeyDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yserver_core::xinput::InputSourceId;
+
+    const TEST_SOURCE_ID: InputSourceId = InputSourceId(1);
 
     fn press(d: &mut HotkeyDetector, kc: u32) -> Option<Hotkey> {
-        d.check(&InputEvent::KeyPress { keycode: kc })
+        d.check(&InputEvent::KeyPress {
+            source_id: TEST_SOURCE_ID,
+            keycode: kc,
+        })
     }
     fn release(d: &mut HotkeyDetector, kc: u32) {
-        d.check(&InputEvent::KeyRelease { keycode: kc });
+        d.check(&InputEvent::KeyRelease {
+            source_id: TEST_SOURCE_ID,
+            keycode: kc,
+        });
     }
 
     #[test]
