@@ -59,10 +59,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   the requesting client's byte order. Device 4/5 remain named virtual XTEST
   pointer/keyboard devices; the shared generic pointer class shape remains
   for GDK compatibility without assigning physical ownership to 4. XI1
-  `XListInputDevices`, production physical add/remove publication and driver
-  property seeding remain later work, so physical sources are not yet
-  published by production. Behavioral tests were not added or run under the
-  current authorization constraint.
+  `XListInputDevices` now selects the same registry snapshot and order,
+  carrying each live ID, name, type, use, and class shape in XI1 wire format.
+  XI1 validation and class checks, including `XOpenDevice`, use registry
+  facets; Xorg-compatible `XOpenDevice` still rejects the master devices and
+  accepts live slaves. XI1's legacy attachment byte remains zero, matching
+  Xorg, while XI2 reports registry attachments. Production physical
+  add/remove publication and driver property seeding are Task 6, so physical
+  sources are not yet published in production. Behavioral tests were not
+  added or run under the current authorization constraint; the existing XI1
+  encoder fixtures were adapted to the descriptor API.
 
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
