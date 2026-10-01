@@ -16554,6 +16554,47 @@ impl KmsBackend {
         restore
     }
 
+    /// Release Owner reservations for connectors that returned without their
+    /// remembered mode. Legacy's rescan makes this decision while collecting
+    /// relight requests; Owner relights are already prepared by the topology
+    /// transaction, so its registry promotion must perform the same stale
+    /// reservation cleanup before layout packing.
+    fn clear_stale_hotplug_reservations(
+        &mut self,
+        device: DrmDeviceKey,
+        snapshots: &[ConnectorSnapshot],
+    ) {
+        let snapshots = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.key.device_key == device)
+            .map(|snapshot| (&snapshot.key, &snapshot.modes))
+            .collect::<HashMap<_, _>>();
+        let stale = self
+            .randr_id_alloc
+            .entries()
+            .filter_map(|(key, entry)| {
+                if key.device_key != device
+                    || !entry.connected
+                    || !matches!(entry.config, ConnectorConfig::Off)
+                {
+                    return None;
+                }
+                let route = entry.last_enabled?.restorable_route()?;
+                let still_supported = snapshots.get(key).is_some_and(|modes| {
+                    modes.iter().any(|mode| {
+                        mode.width == route.mode.width
+                            && mode.height == route.mode.height
+                            && mode.vrefresh == route.mode.vrefresh
+                    })
+                });
+                (!still_supported).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in stale {
+            self.randr_id_alloc.entry_mut(&key).last_enabled = None;
+        }
+    }
+
     /// Restore one remembered route through the ordinary enable path — the
     /// same `enable_connector` a client `SetCrtcConfig` drives, so pool
     /// allocation, the modeset and the `ActiveOutput` update are all handled.
@@ -25349,6 +25390,7 @@ impl KmsBackend {
             &rescan.dropped_keys,
             &rescan.dropped_layouts,
         );
+        self.clear_stale_hotplug_reservations(device, snapshots);
         if !delta.is_empty() {
             let _ = self.fire_randr_changes(
                 state,
@@ -25628,6 +25670,7 @@ impl KmsBackend {
             &rescan.dropped_keys,
             &rescan.dropped_layouts,
         );
+        self.clear_stale_hotplug_reservations(device, &snapshots);
         for key in &relit_keys {
             if !registry_delta.changed_keys.contains(key) {
                 // The route is a CRTC change even if the forced probe already
@@ -98543,8 +98586,9 @@ mod tests {
                 .and_then(|owner| owner.live_record())
                 .map(|record| record.commit_id())
             {
-                c0_3bi_complete_owner_commit_through_core_driver(
+                c0_3bi_complete_owner_commit_through_core_driver_with_state(
                     backend,
+                    state,
                     device,
                     commit,
                     &format!("{label}: settle composed frame"),
@@ -99134,8 +99178,9 @@ mod tests {
                 .and_then(|owner| owner.live_record())
                 .map(|record| record.commit_id())
             {
-                c0_3bi_complete_owner_commit_through_core_driver(
+                c0_3bi_complete_owner_commit_through_core_driver_with_state(
                     backend,
+                    state,
                     device,
                     commit,
                     &format!("{label}: complete follow-up topology commit {turn}"),
@@ -99181,8 +99226,9 @@ mod tests {
             })
             .map(|record| record.commit_id())
         {
-            c0_3bi_complete_owner_commit_through_core_driver(
+            c0_3bi_complete_owner_commit_through_core_driver_with_state(
                 backend,
+                state,
                 device,
                 commit,
                 &format!("{label}: finish prior composed frame"),
@@ -99242,6 +99288,941 @@ mod tests {
             edid: layout.output.edid.clone(),
             connector_type: layout.output.connector_type.clone(),
         }
+    }
+
+    fn c0_3cii_legacy_fixture_from_owner_snapshot(
+        owner_allocator: &super::RandrIdAllocator,
+        snapshot: &ConnectorSnapshot,
+        picked: &crate::platform::drm::Mode,
+        position: (i32, i32),
+    ) -> (super::KmsBackend, DrmDeviceKey, OutputKey, ServerState) {
+        let mut backend = super::KmsBackend::for_tests();
+        let device = backend.platform.devices[0].key;
+        let key = OutputKey::new(device, snapshot.key.connector_name.clone());
+        let layout = backend
+            .platform
+            .outputs
+            .first_mut()
+            .expect("headless Legacy fixture starts with one output");
+        layout.key = key.clone();
+        layout.output.connector_name.clone_from(&key.connector_name);
+        layout.output.picked.clone_from(picked);
+        layout.output.modes.clone_from(&snapshot.modes);
+        layout.output.mm_width = snapshot.mm_width;
+        layout.output.mm_height = snapshot.mm_height;
+        layout.output.edid.clone_from(&snapshot.edid);
+        layout
+            .output
+            .connector_type
+            .clone_from(&snapshot.connector_type);
+        layout.x = position.0;
+        layout.y = position.1;
+        layout.width = picked.width;
+        layout.height = picked.height;
+        backend.platform.fb_w = u16::try_from(position.0.max(0))
+            .unwrap_or(u16::MAX)
+            .saturating_add(picked.width);
+        backend.platform.fb_h = u16::try_from(position.1.max(0))
+            .unwrap_or(u16::MAX)
+            .saturating_add(picked.height);
+        // The live Owner fixture already allocated RandR XIDs for its
+        // boot-time synthetic inventory before discovering the real output.
+        // Mirror that inventory plus this Owner device's connector entries
+        // into the Legacy fixture, remapping only fixture-local DRM keys, so
+        // the wire comparison holds every output/CRTC/mode XID constant.
+        backend.randr_id_alloc = super::RandrIdAllocator {
+            next: owner_allocator.next,
+            providers: owner_allocator
+                .providers
+                .iter()
+                .map(|(endpoint, id)| {
+                    let endpoint = match endpoint {
+                        super::RandrProviderEndpoint::Kms(owner_device)
+                            if *owner_device == snapshot.key.device_key =>
+                        {
+                            super::RandrProviderEndpoint::Kms(device)
+                        }
+                        endpoint => *endpoint,
+                    };
+                    (endpoint, *id)
+                })
+                .collect(),
+            connectors: owner_allocator
+                .connectors
+                .iter()
+                .filter(|(key, _)| {
+                    key.device_key == snapshot.key.device_key || key.connector_name == "test"
+                })
+                .map(|(key, entry)| {
+                    (
+                        OutputKey::new(device, key.connector_name.clone()),
+                        entry.clone(),
+                    )
+                })
+                .collect(),
+            modes: owner_allocator.modes.clone(),
+            withdrawn_devices: owner_allocator
+                .withdrawn_devices
+                .iter()
+                .map(|_| device)
+                .collect(),
+        };
+        // The legacy fixture records the all-off step instead of issuing a
+        // DRM modeset. Connector additions in this differential have no
+        // remembered active route, so they also need no enable ioctl.
+        backend.platform.dpms_output_calls_for_tests = Some(Vec::new());
+        let state = c0_3ci_core_state(&mut backend);
+        (backend, device, key, state)
+    }
+
+    fn c0_3cii_remap_snapshot(snapshot: &ConnectorSnapshot, key: OutputKey) -> ConnectorSnapshot {
+        let mut snapshot = snapshot.clone();
+        snapshot.key = key;
+        snapshot
+    }
+
+    fn c0_3cii_set_publication_clock(state: &mut ServerState, tick_ms: u64) {
+        // The Owner samples lastConfigTime when its terminal publication
+        // reaches the core; Legacy samples it inside the synchronous rescan.
+        // Give each paired operation the same broad clock tick, while the
+        // differential normalizes only that protocol field if scheduling
+        // crosses a millisecond boundary.
+        state.start_instant = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(tick_ms))
+            .expect("fixture timestamp epoch is representable");
+    }
+
+    fn c0_3cii_normalize_event_config_timestamps(bytes: &[u8]) -> Vec<u8> {
+        assert_eq!(bytes.len() % 32, 0, "RANDR events are 32-byte records");
+        let mut normalized = bytes.to_vec();
+        for event in normalized.chunks_exact_mut(32) {
+            match event[0] {
+                89 => event[8..12].fill(0), // RRScreenChangeNotify.config_timestamp
+                90 if event[1] == yserver_protocol::x11::randr::NOTIFY_OUTPUT_CHANGE => {
+                    event[8..12].fill(0); // RROutputChangeNotify.config_timestamp
+                }
+                90 if event[1] == yserver_protocol::x11::randr::NOTIFY_CRTC_CHANGE => {}
+                event_type => panic!("unexpected RANDR notification event type {event_type}"),
+            }
+        }
+        normalized
+    }
+
+    fn c0_3cii_normalize_resources_config_timestamp(bytes: &[u8]) -> Vec<u8> {
+        assert!(bytes.len() >= 16, "GetScreenResourcesCurrent fixed reply");
+        let mut normalized = bytes.to_vec();
+        // Keep lastSetTime byte-exact; only lastConfigTime can legitimately
+        // differ because the two independent fixtures publish at different
+        // core-loop instants.
+        normalized[12..16].fill(0);
+        normalized
+    }
+
+    fn c0_3cii_randr_request_bytes(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        peer: &mut std::os::unix::net::UnixStream,
+        client: u32,
+        sequence: u16,
+        minor: u8,
+        body: &[u8],
+        label: &str,
+    ) -> Vec<u8> {
+        use yserver_core::core_loop::process_request::{RequestOutcome, process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        let outcome = process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 128,
+                data: minor,
+                length_units: u32::try_from(body.len() / 4 + 1)
+                    .expect("fixture RANDR request length fits"),
+            },
+            body,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: dispatch RANDR request: {error}"));
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "{label}: published-state RandR request completes synchronously: {outcome:?}"
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            label,
+            std::time::Duration::from_millis(100),
+            &|_| true,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: flush core reply: {error}"));
+        kbd_map_drain(peer)
+    }
+
+    fn c0_3cii_published_randr_replies(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        peer: &mut std::os::unix::net::UnixStream,
+        client: u32,
+        label: &str,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use yserver_protocol::x11::randr as rr;
+
+        let output = state
+            .randr
+            .outputs
+            .first()
+            .expect("differential keeps the original output resource");
+        let output_id = output.output_id;
+        let crtc_id = output.crtc_id;
+        let config_timestamp = state.randr.config_timestamp;
+        // Task 5 owns forced RR_GET_SCREEN_RESOURCES reprobe parity. Task 3
+        // compares its identical reply payload through the current-state
+        // request so this differential observes only the publication under
+        // test and does not add a later task's probe path.
+        let resources = c0_3cii_randr_request_bytes(
+            backend,
+            state,
+            peer,
+            client,
+            1,
+            rr::RR_GET_SCREEN_RESOURCES_CURRENT,
+            &yserver_core::resources::ROOT_WINDOW.0.to_le_bytes(),
+            &format!("{label}: GetScreenResourcesCurrent"),
+        );
+        let mut output_body = Vec::with_capacity(8);
+        output_body.extend_from_slice(&output_id.to_le_bytes());
+        output_body.extend_from_slice(&config_timestamp.to_le_bytes());
+        let output_info = c0_3cii_randr_request_bytes(
+            backend,
+            state,
+            peer,
+            client,
+            2,
+            rr::RR_GET_OUTPUT_INFO,
+            &output_body,
+            &format!("{label}: GetOutputInfo"),
+        );
+        let mut crtc_body = Vec::with_capacity(8);
+        crtc_body.extend_from_slice(&crtc_id.to_le_bytes());
+        crtc_body.extend_from_slice(&config_timestamp.to_le_bytes());
+        let crtc_info = c0_3cii_randr_request_bytes(
+            backend,
+            state,
+            peer,
+            client,
+            3,
+            rr::RR_GET_CRTC_INFO,
+            &crtc_body,
+            &format!("{label}: GetCrtcInfo"),
+        );
+        (resources, output_info, crtc_info)
+    }
+
+    fn c0_3cii_assert_matching_randr_replies(
+        owner: &(Vec<u8>, Vec<u8>, Vec<u8>),
+        legacy: &(Vec<u8>, Vec<u8>, Vec<u8>),
+        label: &str,
+    ) {
+        assert_eq!(
+            c0_3cii_normalize_resources_config_timestamp(&owner.0),
+            c0_3cii_normalize_resources_config_timestamp(&legacy.0),
+            "{label}: GetScreenResourcesCurrent bytes (only lastConfigTime is normalized)"
+        );
+        assert_eq!(owner.1, legacy.1, "{label}: GetOutputInfo bytes");
+        assert_eq!(owner.2, legacy.2, "{label}: GetCrtcInfo bytes");
+    }
+
+    fn c0_3cii_assert_matching_backend_projection(
+        owner: &super::KmsBackend,
+        legacy: &super::KmsBackend,
+        label: &str,
+    ) {
+        let layout_projection = |backend: &super::KmsBackend| {
+            let mut outputs = backend
+                .platform
+                .outputs
+                .iter()
+                .map(|layout| {
+                    (
+                        layout.key.connector_name.clone(),
+                        layout.x,
+                        layout.y,
+                        layout.width,
+                        layout.height,
+                        layout.output.picked.width,
+                        layout.output.picked.height,
+                        layout.output.picked.vrefresh,
+                    )
+                })
+                .collect::<Vec<_>>();
+            outputs.sort_unstable();
+            outputs
+        };
+        let registry_projection = |backend: &super::KmsBackend| {
+            let mut entries = backend
+                .randr_id_alloc
+                .entries()
+                .map(|(key, entry)| {
+                    (
+                        key.connector_name.clone(),
+                        entry.ids,
+                        entry.connected,
+                        entry.config,
+                        entry.crtc_associated,
+                        entry.client_configured,
+                        entry.last_enabled,
+                        entry
+                            .modes
+                            .iter()
+                            .map(|mode| (mode.width, mode.height, mode.vrefresh, mode.preferred))
+                            .collect::<Vec<_>>(),
+                        entry.edid.clone(),
+                        entry.mm_width,
+                        entry.mm_height,
+                        entry.connector_type.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            entries
+        };
+        assert_eq!(
+            layout_projection(owner),
+            layout_projection(legacy),
+            "{label}: installed outputs and layout"
+        );
+        assert_eq!(
+            (owner.platform.fb_w, owner.platform.fb_h),
+            (legacy.platform.fb_w, legacy.platform.fb_h),
+            "{label}: framebuffer extent"
+        );
+        assert_eq!(
+            registry_projection(owner),
+            registry_projection(legacy),
+            "{label}: connector registry (fixture device keys are intentionally normalized)"
+        );
+        let mut owner_provider_ids = owner
+            .randr_id_alloc
+            .providers
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut legacy_provider_ids = legacy
+            .randr_id_alloc
+            .providers
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        owner_provider_ids.sort_unstable();
+        legacy_provider_ids.sort_unstable();
+        assert_eq!(
+            owner_provider_ids, legacy_provider_ids,
+            "{label}: provider XID allocation (fixture-local DRM keys normalized)"
+        );
+        assert_eq!(
+            owner.randr_id_alloc.modes, legacy.randr_id_alloc.modes,
+            "{label}: mode identity to XID allocation"
+        );
+        assert_eq!(
+            owner.randr_id_alloc.next, legacy.randr_id_alloc.next,
+            "{label}: next RandR XID allocation"
+        );
+    }
+
+    fn c0_3cii_run_legacy_hotplug(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        watched_key: &OutputKey,
+        snapshots: Vec<ConnectorSnapshot>,
+        label: &str,
+    ) {
+        let mut snapshots = snapshots;
+        // The live Owner fixture carries one boot-time synthetic connector
+        // outside the Owner device's hotplug episode. Keep that unrelated
+        // inventory stable in the Legacy fixture's global rescan so this
+        // differential changes only the connector under test.
+        for (key, entry) in backend.randr_id_alloc.entries() {
+            if key.device_key == device
+                && key != watched_key
+                && entry.connected
+                && !snapshots.iter().any(|snapshot| snapshot.key == *key)
+            {
+                snapshots.push(ConnectorSnapshot {
+                    key: key.clone(),
+                    modes: entry.modes.clone(),
+                    mm_width: entry.mm_width,
+                    mm_height: entry.mm_height,
+                    edid: entry.edid.clone(),
+                    connector_type: entry.connector_type.clone(),
+                });
+            }
+        }
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend
+            .platform
+            .queue_connector_probe_for_tests(device, Ok(snapshots));
+        super::KmsBackend::record_display_hotplug_edge(backend);
+        backend.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            label,
+            std::time::Duration::from_secs(3),
+            &|backend| backend.hotplug_rescan_deadline.is_none(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: Legacy rescan: {error}"));
+    }
+
+    fn c0_3cii_run_owner_hotplug(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        device: DrmDeviceKey,
+        snapshots: Vec<ConnectorSnapshot>,
+        label: &str,
+    ) {
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        let sends_before = backend.lifecycle_drivers[&device]
+            .topology_test_stats()
+            .1
+            .len();
+        c0_3cii_arm_hotplug_probe(backend, state, device, Ok(snapshots), label);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            &format!("{label}: grant the topology episode"),
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                let deliveries = &backend.core_entry_deliveries_for_tests[delivery_start..];
+                deliveries.iter().any(|delivery| {
+                    matches!(
+                        delivery,
+                        yserver_core::core_loop::run::CoreEntryDelivery::TopologyEpisodeBegin(_)
+                    )
+                })
+                    && (backend
+                        .acquire_episode
+                        .as_ref()
+                        .is_some_and(|episode| episode.granted)
+                        || deliveries.iter().any(|delivery| {
+                            matches!(
+                            delivery,
+                            yserver_core::core_loop::run::CoreEntryDelivery::TopologyEpisodeEnd {
+                                ..
+                            }
+                        )
+                        }))
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: grant topology episode: {error}"));
+
+        if backend.acquire_episode.is_some() {
+            let commit = c0_3cii_wait_hotplug_commit(
+                backend,
+                state,
+                device,
+                sends_before,
+                &format!("{label}: dispatch topology transaction"),
+            );
+            c0_3bi_complete_owner_commit_through_core_driver_with_state(
+                backend,
+                state,
+                device,
+                commit,
+                &format!("{label}: complete topology transaction"),
+            );
+            c0_3cii_finish_hotplug_episode(backend, state, device, label);
+        }
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            &format!("{label}: deliver EpisodeEnd publication"),
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.acquire_episode.is_none()
+                    && backend.core_entry_deliveries_for_tests[delivery_start..]
+                        .iter()
+                        .any(|delivery| {
+                            matches!(
+                                delivery,
+                                yserver_core::core_loop::run::CoreEntryDelivery::TopologyEpisodeEnd {
+                                    ..
+                                }
+                            )
+                        })
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: publish topology episode: {error}"));
+        c0_3cii_settle_owner_fixture(backend, state, device, &format!("{label}: settle Owner"));
+        assert!(
+            backend.core_entry_deliveries_for_tests[delivery_start..]
+                .iter()
+                .all(|delivery| !matches!(
+                    delivery,
+                    yserver_core::core_loop::run::CoreEntryDelivery::UrgentWithdrawal { .. }
+                )),
+            "{label}: a successful hotplug publication must not withdraw the Owner device"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .map(|arbiter| arbiter.state()),
+            Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Ready),
+            "{label}: the successful hotplug leaves the Owner lifecycle ready"
+        );
+    }
+
+    fn c0_3cii_assert_hotplug_publication_differential(
+        test_name: &str,
+        compare_replies_and_backend: bool,
+    ) {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_protocol::x11::randr as rr;
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        assert_eq!(
+            outputs.len(),
+            1,
+            "the Owner fixture starts with one lit output"
+        );
+        let backend = &mut fixture.backend;
+        // This differential drives hotplug through the scripted prober and
+        // the core-entry edge path. Ignore unrelated host udev edges from
+        // the live DRM fixture while those scripted episodes are open.
+        backend.platform.hotplug_monitor = None;
+        let mut owner_state = c0_3ci_core_state(backend);
+        c0_3cii_settle_owner_fixture(
+            backend,
+            &mut owner_state,
+            device,
+            "publication parity setup",
+        );
+        let owner_key = outputs[0].clone();
+        let owner_layout = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == owner_key)
+            .expect("Owner output layout");
+        let initial_snapshot = c0_3cii_snapshot_from_layout(backend, &owner_key);
+        let initial_mode = owner_layout.output.picked.clone();
+        let initial_position = (owner_layout.x, owner_layout.y);
+
+        let (mut legacy, legacy_device, legacy_key, mut legacy_state) =
+            c0_3cii_legacy_fixture_from_owner_snapshot(
+                &backend.randr_id_alloc,
+                &initial_snapshot,
+                &initial_mode,
+                initial_position,
+            );
+        let output_projection = |state: &ServerState| {
+            state
+                .randr
+                .outputs
+                .iter()
+                .map(|output| {
+                    (
+                        (
+                            output.name.clone(),
+                            output.output_id,
+                            output.crtc_id,
+                            output.mode_id,
+                            output.connected,
+                            output.x,
+                            output.y,
+                            output.width,
+                            output.height,
+                            output.vrefresh,
+                            output.timing,
+                        ),
+                        (
+                            output.mm_width,
+                            output.mm_height,
+                            output.mode_ids.clone(),
+                            output.num_preferred,
+                            output.rotation,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            output_projection(&owner_state),
+            output_projection(&legacy_state),
+            "the two fixtures start from the same connector snapshot and RandR IDs"
+        );
+
+        let mut owner_query = c0_3aii_install_dpms_core_client(&mut owner_state, 74);
+        let mut legacy_query = c0_3aii_install_dpms_core_client(&mut legacy_state, 74);
+        let mut owner_all_events = c0_3aii_install_dpms_core_client(&mut owner_state, 72);
+        let mut legacy_all_events = c0_3aii_install_dpms_core_client(&mut legacy_state, 72);
+        let mut owner_output_events = c0_3aii_install_dpms_core_client(&mut owner_state, 73);
+        let mut legacy_output_events = c0_3aii_install_dpms_core_client(&mut legacy_state, 73);
+        let all_masks = rr::NOTIFY_MASK_SCREEN_CHANGE
+            | rr::NOTIFY_MASK_CRTC_CHANGE
+            | rr::NOTIFY_MASK_OUTPUT_CHANGE;
+        owner_state
+            .randr_select_masks
+            .insert((72, yserver_core::resources::ROOT_WINDOW), all_masks);
+        legacy_state
+            .randr_select_masks
+            .insert((72, yserver_core::resources::ROOT_WINDOW), all_masks);
+        owner_state.randr_select_masks.insert(
+            (73, yserver_core::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        legacy_state.randr_select_masks.insert(
+            (73, yserver_core::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        for state in [&mut owner_state, &mut legacy_state] {
+            state.randr.timestamp = 1_234;
+            state.randr.config_timestamp = 500;
+        }
+        c0_3cii_set_publication_clock(&mut owner_state, 8_000);
+        c0_3cii_set_publication_clock(&mut legacy_state, 8_000);
+
+        let compare_notifications = |owner_all: &[u8],
+                                     legacy_all: &[u8],
+                                     owner_output: &[u8],
+                                     legacy_output: &[u8],
+                                     expected_all_events: usize,
+                                     expected_output_events: usize,
+                                     label: &str| {
+            assert_eq!(
+                owner_all.len(),
+                expected_all_events * 32,
+                "{label}: Owner all-mask event count; events={owner_all:?}"
+            );
+            assert_eq!(
+                legacy_all.len(),
+                expected_all_events * 32,
+                "{label}: Legacy all-mask event count"
+            );
+            assert_eq!(
+                owner_output.len(),
+                expected_output_events * 32,
+                "{label}: Owner output-mask event count"
+            );
+            assert_eq!(
+                legacy_output.len(),
+                expected_output_events * 32,
+                "{label}: Legacy output-mask event count"
+            );
+            assert_eq!(
+                c0_3cii_normalize_event_config_timestamps(owner_all),
+                c0_3cii_normalize_event_config_timestamps(legacy_all),
+                "{label}: exact event contents and order, normalizing only lastConfigTime"
+            );
+            assert_eq!(
+                c0_3cii_normalize_event_config_timestamps(owner_output),
+                c0_3cii_normalize_event_config_timestamps(legacy_output),
+                "{label}: exact output-selected event bytes"
+            );
+            if expected_all_events > 0 {
+                assert_eq!(
+                    owner_all[0], 89,
+                    "{label}: RRScreenChangeNotify comes first"
+                );
+                assert_eq!(
+                    legacy_all[0], 89,
+                    "{label}: Legacy screen notification comes first"
+                );
+            }
+            for (events, expected, side) in [
+                (owner_all, expected_all_events, "Owner"),
+                (legacy_all, expected_all_events, "Legacy"),
+            ] {
+                for (index, event) in events.chunks_exact(32).enumerate() {
+                    if event[0] == 90 {
+                        assert_eq!(
+                            event[1],
+                            if expected == 3 && index == 1 {
+                                rr::NOTIFY_CRTC_CHANGE
+                            } else {
+                                rr::NOTIFY_OUTPUT_CHANGE
+                            },
+                            "{label}: {side} notification order at event {index}"
+                        );
+                    }
+                }
+            }
+            if expected_output_events == 1 {
+                assert_eq!(
+                    owner_output[0], 90,
+                    "{label}: output mask receives RRNotify"
+                );
+                assert_eq!(owner_output[1], rr::NOTIFY_OUTPUT_CHANGE);
+            }
+        };
+
+        let assert_timestamps = |owner_state: &ServerState,
+                                 legacy_state: &ServerState,
+                                 previous_config: u32,
+                                 config_changed: bool,
+                                 label: &str| {
+            assert_eq!(
+                owner_state.randr.timestamp, 1_234,
+                "{label}: Owner lastSetTime preserved"
+            );
+            assert_eq!(
+                legacy_state.randr.timestamp, 1_234,
+                "{label}: Legacy lastSetTime preserved"
+            );
+            if config_changed {
+                assert_ne!(
+                    owner_state.randr.config_timestamp, previous_config,
+                    "{label}: Owner lastConfigTime advances"
+                );
+                assert_ne!(
+                    legacy_state.randr.config_timestamp, previous_config,
+                    "{label}: Legacy lastConfigTime advances"
+                );
+            } else {
+                assert_eq!(
+                    owner_state.randr.config_timestamp, previous_config,
+                    "{label}: metadata-only Owner change preserves lastConfigTime"
+                );
+                assert_eq!(
+                    legacy_state.randr.config_timestamp, previous_config,
+                    "{label}: metadata-only Legacy change preserves lastConfigTime"
+                );
+            }
+        };
+
+        // Monitor dimensions are Output metadata, not the available mode
+        // configuration. Both paths emit OutputChangeNotify but preserve
+        // lastConfigTime for this change.
+        let config_before_metadata = owner_state.randr.config_timestamp;
+        let mut metadata = initial_snapshot.clone();
+        metadata.mm_width = metadata.mm_width.saturating_add(1);
+        c0_3cii_run_owner_hotplug(
+            backend,
+            &mut owner_state,
+            device,
+            vec![metadata.clone()],
+            "Owner metadata-only hotplug",
+        );
+        c0_3cii_run_legacy_hotplug(
+            &mut legacy,
+            &mut legacy_state,
+            legacy_device,
+            &legacy_key,
+            vec![c0_3cii_remap_snapshot(&metadata, legacy_key.clone())],
+            "Legacy metadata-only hotplug",
+        );
+        assert_timestamps(
+            &owner_state,
+            &legacy_state,
+            config_before_metadata,
+            false,
+            "metadata-only hotplug",
+        );
+        compare_notifications(
+            &kbd_map_drain(&mut owner_all_events),
+            &kbd_map_drain(&mut legacy_all_events),
+            &kbd_map_drain(&mut owner_output_events),
+            &kbd_map_drain(&mut legacy_output_events),
+            2,
+            1,
+            "metadata-only hotplug",
+        );
+        if compare_replies_and_backend {
+            let owner_replies = c0_3cii_published_randr_replies(
+                backend,
+                &mut owner_state,
+                &mut owner_query,
+                74,
+                "Owner metadata-only published resources",
+            );
+            let legacy_replies = c0_3cii_published_randr_replies(
+                &mut legacy,
+                &mut legacy_state,
+                &mut legacy_query,
+                74,
+                "Legacy metadata-only published resources",
+            );
+            c0_3cii_assert_matching_randr_replies(
+                &owner_replies,
+                &legacy_replies,
+                "metadata-only hotplug",
+            );
+            c0_3cii_assert_matching_backend_projection(backend, &legacy, "metadata-only hotplug");
+        }
+
+        // The physical unplug is the stateful publication under review: the
+        // Owner sends its KMS disable through the executor fixture, while the
+        // Legacy fixture records its synchronous all-off step instead of
+        // issuing a DRM modeset.
+        let config_before_unplug = owner_state.randr.config_timestamp;
+        c0_3cii_set_publication_clock(&mut owner_state, 16_000);
+        c0_3cii_set_publication_clock(&mut legacy_state, 16_000);
+        c0_3cii_run_owner_hotplug(
+            backend,
+            &mut owner_state,
+            device,
+            Vec::new(),
+            "Owner connector unplug",
+        );
+        c0_3cii_run_legacy_hotplug(
+            &mut legacy,
+            &mut legacy_state,
+            legacy_device,
+            &legacy_key,
+            Vec::new(),
+            "Legacy connector unplug",
+        );
+        assert_timestamps(
+            &owner_state,
+            &legacy_state,
+            config_before_unplug,
+            true,
+            "connector unplug",
+        );
+        let owner_unplug_events = kbd_map_drain(&mut owner_all_events);
+        let legacy_unplug_events = kbd_map_drain(&mut legacy_all_events);
+        let owner_unplug_output = kbd_map_drain(&mut owner_output_events);
+        let legacy_unplug_output = kbd_map_drain(&mut legacy_output_events);
+        compare_notifications(
+            &owner_unplug_events,
+            &legacy_unplug_events,
+            &owner_unplug_output,
+            &legacy_unplug_output,
+            3,
+            1,
+            "connector unplug",
+        );
+        assert_eq!(
+            &owner_unplug_events[36..40],
+            &1_234_u32.to_le_bytes(),
+            "RRNotify CrtcChange carries preserved lastSetTime"
+        );
+        if compare_replies_and_backend {
+            let owner_replies = c0_3cii_published_randr_replies(
+                backend,
+                &mut owner_state,
+                &mut owner_query,
+                74,
+                "Owner unplug published resources",
+            );
+            let legacy_replies = c0_3cii_published_randr_replies(
+                &mut legacy,
+                &mut legacy_state,
+                &mut legacy_query,
+                74,
+                "Legacy unplug published resources",
+            );
+            c0_3cii_assert_matching_randr_replies(
+                &owner_replies,
+                &legacy_replies,
+                "connector unplug",
+            );
+            c0_3cii_assert_matching_backend_projection(backend, &legacy, "connector unplug");
+        }
+
+        // Return the connector with a new mode list that no longer contains
+        // the remembered active mode. This exercises the same published
+        // replug state on both paths without asking the Legacy fixture to
+        // issue a modeset; Task 2 separately proves compatible-route relight.
+        let config_before_replug = owner_state.randr.config_timestamp;
+        let mut replug = initial_snapshot.clone();
+        let mut replacement_mode = replug
+            .modes
+            .first()
+            .expect("the connector advertises a baseline mode")
+            .clone();
+        replacement_mode.width = replacement_mode
+            .width
+            .checked_add(8)
+            .expect("fixture mode width has room for a replacement mode");
+        replacement_mode.name.push_str("-replacement");
+        replug.modes = vec![replacement_mode];
+        c0_3cii_set_publication_clock(&mut owner_state, 24_000);
+        c0_3cii_set_publication_clock(&mut legacy_state, 24_000);
+        c0_3cii_run_owner_hotplug(
+            backend,
+            &mut owner_state,
+            device,
+            vec![replug.clone()],
+            "Owner incompatible-mode replug",
+        );
+        c0_3cii_run_legacy_hotplug(
+            &mut legacy,
+            &mut legacy_state,
+            legacy_device,
+            &legacy_key,
+            vec![c0_3cii_remap_snapshot(&replug, legacy_key.clone())],
+            "Legacy incompatible-mode replug",
+        );
+        assert_timestamps(
+            &owner_state,
+            &legacy_state,
+            config_before_replug,
+            true,
+            "connector replug",
+        );
+        let owner_replug_events = kbd_map_drain(&mut owner_all_events);
+        let legacy_replug_events = kbd_map_drain(&mut legacy_all_events);
+        let owner_replug_output = kbd_map_drain(&mut owner_output_events);
+        let legacy_replug_output = kbd_map_drain(&mut legacy_output_events);
+        compare_notifications(
+            &owner_replug_events,
+            &legacy_replug_events,
+            &owner_replug_output,
+            &legacy_replug_output,
+            2,
+            1,
+            "connector replug",
+        );
+        if compare_replies_and_backend {
+            let owner_replies = c0_3cii_published_randr_replies(
+                backend,
+                &mut owner_state,
+                &mut owner_query,
+                74,
+                "Owner replug published resources",
+            );
+            let legacy_replies = c0_3cii_published_randr_replies(
+                &mut legacy,
+                &mut legacy_state,
+                &mut legacy_query,
+                74,
+                "Legacy replug published resources",
+            );
+            c0_3cii_assert_matching_randr_replies(
+                &owner_replies,
+                &legacy_replies,
+                "connector replug",
+            );
+            c0_3cii_assert_matching_backend_projection(backend, &legacy, "connector replug");
+        }
+
+        let expected = c0_3bi_expected_end_state(Vec::<OutputKey>::new());
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut owner_state,
+            "drain the unplugged Owner pool retirement",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!("{test_name}: retired Owner output did not settle: {error}")
+        });
+        c0_3bi_assert_end_state(backend, &format!("{test_name} Owner"), &expected);
+        c0_3bi_assert_end_state(&legacy, &format!("{test_name} Legacy"), &expected);
     }
 
     #[test]
@@ -99959,24 +100940,73 @@ mod tests {
             target_device,
             "finish hotplug after client modeset",
         );
-        for device in [device_a, device_b] {
-            c0_3bi_complete_owner_followups(
-                backend,
-                device,
-                8,
-                "finish ordinary frames after hotplug",
-            );
-        }
         let expected = c0_3bi_expected_end_state([kept_output.clone()]);
-        c0_3bi_core_driver_until_with_state(
-            backend,
-            &mut state,
-            "drain pool retirement after modeset-gated hotplug",
-            std::time::Duration::from_secs(5),
-            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
-            None,
-        )
-        .unwrap_or_else(|error| {
+        let owner_devices = [device_a, device_b];
+        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut completed_followups = 0;
+        loop {
+            if c0_3bi_end_state_errors(backend, &expected).is_empty() {
+                break;
+            }
+            if let Some((device, commit)) = owner_devices.iter().find_map(|device| {
+                backend
+                    .platform
+                    .owner_ref(*device)
+                    .and_then(|owner| {
+                        owner.live_record().filter(|record| {
+                            matches!(
+                                record.state(),
+                                crate::kms::owner::record::RecordState::Submitting
+                            )
+                        })
+                    })
+                    .map(|record| (*device, record.commit_id()))
+            }) {
+                assert!(
+                    completed_followups < 16,
+                    "{test_name}: ordinary Owner follow-ups exceeded the existing combined 8-per-Owner limit"
+                );
+                completed_followups += 1;
+                c0_3bi_complete_owner_commit_through_core_driver_with_state(
+                    backend,
+                    &mut state,
+                    device,
+                    commit,
+                    "complete ordinary frame during hotplug pool retirement",
+                );
+                continue;
+            }
+            let terminal_live = owner_devices.iter().find_map(|device| {
+                backend
+                    .platform
+                    .owner_ref(*device)
+                    .and_then(|owner| owner.live_record())
+                    .map(|record| (*device, record.commit_id(), *record.state()))
+            });
+            if let Some((device, commit, state)) = terminal_live {
+                panic!(
+                    "{test_name}: Owner {device} commit {commit:?} became terminal before the fixture supplied its kernel completion: {state:?}"
+                );
+            }
+            let remaining = drain_deadline.saturating_duration_since(std::time::Instant::now());
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "drain pool retirement after modeset-gated hotplug",
+                remaining,
+                &|backend| {
+                    c0_3bi_end_state_errors(backend, &expected).is_empty()
+                        || owner_devices.iter().any(|device| {
+                            backend
+                                .platform
+                                .owner_ref(*device)
+                                .and_then(|owner| owner.live_record())
+                                .is_some()
+                        })
+                },
+                None,
+            )
+            .unwrap_or_else(|error| {
             let live = [device_a, device_b].map(|device| {
                 (
                     device,
@@ -100000,7 +101030,8 @@ mod tests {
                 backend.scene.retired_output_end_states_for_tests(),
                 backend.topology_episode_events.len()
             )
-        });
+            });
+        }
         assert!(
             !backend
                 .randr_id_alloc
@@ -100844,7 +101875,16 @@ mod tests {
             sends_b,
             "dispatch B's hotplug transaction",
         );
-        assert_ne!(commit_a, commit_b);
+        assert_ne!(
+            crate::kms::render::resources::CommitKey::new(device_a, commit_a),
+            crate::kms::render::resources::CommitKey::new(device_b, commit_b),
+            "the two in-flight topology commits have distinct device-qualified identities"
+        );
+        assert!(backend.platform.owner_ref(device_a).is_some_and(|owner| {
+            owner
+                .live_record()
+                .is_some_and(|record| record.commit_id() == commit_a)
+        }));
         assert!(backend.platform.owner_ref(device_b).is_some_and(|owner| {
             owner
                 .live_record()
@@ -101011,6 +102051,41 @@ mod tests {
             &[device_a, device_b],
             "partial hotplug Owner fixture readiness",
         );
+        let partial_snapshot_a = c0_3cii_snapshot_from_layout(backend, &outputs_a[0]);
+        let (partial_mode_a, partial_position_a) = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == outputs_a[0])
+            .map(|layout| (layout.output.picked.clone(), (layout.x, layout.y)))
+            .expect("partial baseline Owner layout");
+        let (mut legacy_partial, legacy_device, legacy_key, mut legacy_partial_state) =
+            c0_3cii_legacy_fixture_from_owner_snapshot(
+                &backend.randr_id_alloc,
+                &partial_snapshot_a,
+                &partial_mode_a,
+                partial_position_a,
+            );
+        // Pin the publication clock away from its initial configuration
+        // timestamp so both the urgent withdrawal and the remaining partial
+        // EpisodeEnd have to advance lastConfigTime while preserving
+        // lastSetTime.
+        state.randr.timestamp = 1_234;
+        state.randr.config_timestamp = 500;
+        c0_3cii_set_publication_clock(&mut state, 30_000);
+        legacy_partial_state.randr.timestamp = 1_234;
+        legacy_partial_state.randr.config_timestamp = 500;
+        c0_3cii_set_publication_clock(&mut legacy_partial_state, 30_000);
+        c0_3cii_run_legacy_hotplug(
+            &mut legacy_partial,
+            &mut legacy_partial_state,
+            legacy_device,
+            &legacy_key,
+            Vec::new(),
+            "Legacy partial-outcome unplug baseline",
+        );
+        let partial_last_set_before = state.randr.timestamp;
+        let partial_config_before = state.randr.config_timestamp;
         let mut listener = c0_3aii_install_dpms_core_client(&mut state, 77);
         state.randr_select_masks.insert(
             (77, yserver_core::resources::ROOT_WINDOW),
@@ -101196,6 +102271,33 @@ mod tests {
                 backend.pending_hotplug_terminals.len(),
             )
         });
+        assert_eq!(
+            state.randr.timestamp, partial_last_set_before,
+            "partial hotplug and its urgent withdrawal preserve lastSetTime"
+        );
+        assert_ne!(
+            state.randr.config_timestamp, partial_config_before,
+            "the partial EpisodeEnd / unknown-completion withdrawal advances lastConfigTime"
+        );
+        assert_eq!(
+            legacy_partial_state.randr.timestamp, partial_last_set_before,
+            "the matching Legacy unplug preserves lastSetTime"
+        );
+        assert_ne!(
+            legacy_partial_state.randr.config_timestamp, partial_config_before,
+            "the matching Legacy unplug advances lastConfigTime"
+        );
+        assert_eq!(
+            (
+                state.randr.timestamp == partial_last_set_before,
+                state.randr.config_timestamp != partial_config_before,
+            ),
+            (
+                legacy_partial_state.randr.timestamp == partial_last_set_before,
+                legacy_partial_state.randr.config_timestamp != partial_config_before,
+            ),
+            "Owner's partial outcome follows Legacy's lastSet/lastConfig timestamp rules; exact config timestamp values are sampled at different publication instants"
+        );
         assert!(
             backend
                 .platform
@@ -101277,6 +102379,11 @@ mod tests {
             backend,
             "c0_3cii_episode_partial_commit_failure_vulkan",
             &expected,
+        );
+        c0_3bi_assert_end_state(
+            &legacy_partial,
+            "c0_3cii_episode_partial_commit_failure_vulkan Legacy baseline",
+            &c0_3bi_expected_end_state(Vec::<OutputKey>::new()),
         );
     }
 
@@ -102563,6 +103670,26 @@ mod tests {
             backend,
             "c0_3cii_replug_relights_remembered_route_vulkan",
             &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_hotplug_timestamps_match_legacy_vulkan() {
+        c0_3cii_assert_hotplug_publication_differential(
+            "c0_3cii_hotplug_timestamps_match_legacy_vulkan",
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_unplug_replug_differential_vulkan() {
+        c0_3cii_assert_hotplug_publication_differential(
+            "c0_3cii_unplug_replug_differential_vulkan",
+            true,
         );
     }
 
@@ -104123,14 +105250,26 @@ mod tests {
             "apply A after stale probe answers",
         );
         assert!(backend.probe_workers.workers.is_empty());
-        c0_3bi_assert_end_state(
+        let expected = c0_3ci_expected_end_state_with_acquire_preparation(
             backend,
-            "c0_3cii_stale_probe_discarded_vulkan",
-            &c0_3ci_expected_end_state_with_acquire_preparation(
-                backend,
-                outputs_a.into_iter().chain(_outputs_b),
-            ),
+            outputs_a.into_iter().chain(_outputs_b),
         );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "drain the displaced scene instance after stale probe discard",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "c0_3cii_stale_probe_discarded_vulkan: displaced scene instance did not drain: {error}; end_errors={:?}; retired={:?}",
+                c0_3bi_end_state_errors(backend, &expected),
+                backend.scene.retired_output_end_states_for_tests()
+            )
+        });
+        c0_3bi_assert_end_state(backend, "c0_3cii_stale_probe_discarded_vulkan", &expected);
     }
 
     #[test]
