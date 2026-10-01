@@ -410,11 +410,11 @@ pub(crate) fn reset_generation(
     // go backwards: a client reconnecting a millisecond after a reset
     // would otherwise see the server clock jump.
     fresh.start_instant = state.start_instant;
-    // The inventory loop remains for the legacy seed hook, which now leaves
-    // virtual XTEST devices untouched. Rebuilding physical facets and their
-    // property atoms belongs to the later registry reset migration.
+    // Rebuild physical facets from the process-lifetime inventory. Disabled
+    // continuation facts remain registered but disabled, matching their live
+    // state before the server-generation reset.
     for info in inventory.devices_by_source() {
-        fresh.xi_seed_touchpad(info);
+        fresh.xi_register_source(info);
     }
     *state = fresh;
 
@@ -861,7 +861,7 @@ mod tests {
     }
 
     /// Mirrors `xinput::tests::touchpad_info`: tap must be *available*
-    /// for `seed_touchpad` to intern `libinput Tapping Enabled`, which
+    /// for source registration to intern `libinput Tapping Enabled`, which
     /// is the property this module's atom assertion turns on.
     fn touchpad(node: &str, name: &str) -> DeviceInfo {
         DeviceInfo {

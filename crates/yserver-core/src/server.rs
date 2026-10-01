@@ -1588,6 +1588,8 @@ impl ServerState {
                         type_atom: crate::xinput::XA_INTEGER,
                         format: 8,
                         data: vec![1],
+                        read_only: true,
+                        deletable: false,
                     },
                 );
         }
@@ -1762,32 +1764,48 @@ impl ServerState {
         generation
     }
 
-    /// Temporary compatibility hook for the old add path. Physical property
-    /// and query migration is staged separately; registry devices 4/5 are
-    /// virtual XTEST devices and must never receive physical metadata or
-    /// libinput properties here.
-    pub fn xi_seed_touchpad(&mut self, info: &crate::core_loop::DeviceInfo) {
-        if self
-            .xi_devices
-            .device(crate::xinput::DEVICEID_SLAVE_POINTER)
-            .is_some_and(|device| device.name == crate::xinput::registry::NAME_XTEST_POINTER)
-        {
-            return;
+    /// Register one physical input source and seed properties on each of its
+    /// independent XI facets. Existing sources retain their facet IDs and
+    /// property maps; continuation refreshes only values whose entries remain.
+    pub fn xi_register_source(&mut self, info: &crate::core_loop::DeviceInfo) -> Vec<u16> {
+        let continuation = self.xi_devices.source(info.source_id).is_some();
+        let ids = self.xi_devices.register(info);
+        for &id in &ids {
+            if continuation {
+                let Some(mut seeded) = self.xi_devices.device(id).cloned() else {
+                    continue;
+                };
+                seeded.properties.clear();
+                crate::xinput::seed_pointer_properties(
+                    &mut seeded,
+                    &mut self.atoms,
+                    self.float_atom,
+                    info,
+                );
+                if let Some(device) = self.xi_devices.device_mut(id) {
+                    for (atom, fresh) in seeded.properties {
+                        if let Some(existing) = device.properties.get_mut(&atom) {
+                            existing.type_atom = fresh.type_atom;
+                            existing.format = fresh.format;
+                            existing.data = fresh.data;
+                        }
+                    }
+                }
+            } else if let Some(device) = self.xi_devices.device_mut(id) {
+                crate::xinput::seed_pointer_properties(
+                    device,
+                    &mut self.atoms,
+                    self.float_atom,
+                    info,
+                );
+            }
         }
-        if !info.is_touchpad && !info.config.accel.available {
-            return;
-        }
-        crate::xinput::seed_touchpad(&mut self.xi_devices, &mut self.atoms, self.float_atom, info);
+        ids
     }
 
-    /// Revert the slave-pointer XI2 device entry to its generic defaults
-    /// and clear all touchpad properties.
-    ///
-    /// Called from `on_host_input(DeviceRemoved)`.  `device_node` is
-    /// used for logging; no node→device mapping is maintained today
-    /// (one touchpad assumed).
-    pub fn xi_clear_touchpad(&mut self, device_node: &str) {
-        crate::xinput::clear_touchpad(&mut self.xi_devices, device_node);
+    /// Remove one physical source and every facet it currently owns.
+    pub fn xi_unregister_source(&mut self, source: crate::xinput::InputSourceId) -> Vec<u16> {
+        self.xi_devices.remove(source)
     }
 
     #[must_use]

@@ -567,12 +567,6 @@ impl Context {
                     let dev = d.device();
                     let name = dev.name();
                     log::info!("libinput: device removed: {name:?}");
-                    let sysname = dev.sysname().to_owned();
-                    let device_node = {
-                        let node = unsafe { dev.udev_device() }
-                            .and_then(|ud| ud.devnode().map(|p| p.to_string_lossy().into_owned()));
-                        node.unwrap_or_else(|| device_node_from_sysname(&sysname))
-                    };
                     let Some(source_id) = self.sources.remove(&dev) else {
                         log::debug!(
                             "libinput: ignoring removal for unknown device handle {name:?}"
@@ -586,10 +580,7 @@ impl Context {
                     self.usable_input_devices.remove(&dev);
                     self.source_facts.remove(&source_id);
                     self.resume_tracker.paused.remove(&source_id);
-                    out.push(InputEvent::DeviceRemoved {
-                        source_id,
-                        device_node,
-                    });
+                    out.push(InputEvent::DeviceRemoved { source_id });
                 }
                 _ => {}
             }
@@ -788,10 +779,7 @@ impl Context {
             info.enabled = false;
             self.source_facts.insert(source_id, info.clone());
             self.resume_tracker.paused.insert(source_id, info.clone());
-            out.push(InputEvent::DeviceSuspended {
-                source_id,
-                device_node: info.device_node,
-            });
+            out.push(InputEvent::DeviceSuspended { source_id });
         }
 
         // Clear only live handle bindings. The source allocator and paused
@@ -856,10 +844,7 @@ impl Context {
                     info.device_node
                 );
                 self.source_facts.remove(&source_id);
-                removals.push(InputEvent::DeviceRemoved {
-                    source_id,
-                    device_node: info.device_node,
-                });
+                removals.push(InputEvent::DeviceRemoved { source_id });
             }
         }
         removals.append(&mut out);
@@ -887,12 +872,9 @@ impl Context {
         sources
             .into_iter()
             .filter_map(|source_id| {
-                let info = self.resume_tracker.paused.remove(&source_id)?;
+                self.resume_tracker.paused.remove(&source_id)?;
                 self.source_facts.remove(&source_id);
-                Some(InputEvent::DeviceRemoved {
-                    source_id,
-                    device_node: info.device_node,
-                })
+                Some(InputEvent::DeviceRemoved { source_id })
             })
             .collect()
     }

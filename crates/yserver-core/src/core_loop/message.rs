@@ -309,19 +309,15 @@ pub enum HostInputEvent {
     /// of its physical source identity, capabilities, and configuration.
     DeviceAdded(DeviceInfo),
     /// A physical source was suspended for VT release. Its identity and
-    /// properties remain live, while the legacy device-node bridge is kept
-    /// until the source-aware XI registry migration.
+    /// properties remain live while its facets become disabled.
     DeviceSuspended {
         source_id: crate::xinput::InputSourceId,
-        device_node: String,
     },
     /// A suspended physical source continued on the same kernel endpoint.
     DeviceResumed(DeviceInfo),
-    /// An input device has been removed. `device_node` remains descriptive
-    /// compatibility metadata for the legacy KMS bridge.
+    /// An input device has been removed by runtime source identity.
     DeviceRemoved {
         source_id: crate::xinput::InputSourceId,
-        device_node: String,
     },
 }
 
@@ -446,11 +442,10 @@ mod tests {
         ));
         let removed = HostInputEvent::DeviceRemoved {
             source_id: crate::xinput::InputSourceId(1),
-            device_node: "/dev/input/event1".into(),
         };
         match removed {
-            HostInputEvent::DeviceRemoved { device_node, .. } => {
-                assert_eq!(device_node, "/dev/input/event1");
+            HostInputEvent::DeviceRemoved { source_id } => {
+                assert_eq!(source_id, crate::xinput::InputSourceId(1));
             }
             other => panic!("expected DeviceRemoved, got {other:?}"),
         }

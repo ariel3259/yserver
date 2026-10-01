@@ -17790,10 +17790,7 @@ fn handle_xi2_request(
                 client_id.0, sequence.0, deviceid, property.0
             );
             // T3: BadAtom guard (xserver ProcXIDeleteProperty,
-            // xiproperty.c). We intentionally do NOT BadAccess on
-            // attempting to delete a libinput descriptor — the driver
-            // re-seeds those on every device add, so a delete is a no-op
-            // race the client recovers from on its own.
+            // xiproperty.c).
             if !state.atoms.exists(property) {
                 return emit_x11_error_with_minor(
                     state,
@@ -17822,6 +17819,20 @@ fn handle_xi2_request(
                     client_id,
                     sequence,
                     10, // BadAccess: XTEST Device is protected by atom identity.
+                    property.0,
+                    58,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            if crate::xinput::find_device(&state.xi_devices, deviceid)
+                .and_then(|device| device.properties.get(&property))
+                .is_some_and(|property| !property.deletable)
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    10, // BadAccess: seeded driver properties are non-deletable.
                     property.0,
                     58,
                     XI2_MAJOR_OPCODE,
@@ -17905,16 +17916,15 @@ fn handle_xi2_request(
             // Re-acquire mutably now that both validations passed.
             let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
                 .expect("device existence verified above");
-            // Snapshot pre-existence so we can detect an inline delete
-            // and emit `XI_PropertyEvent(Deleted)` after the reply is
-            // queued. `encode_get_property_reply` removes the property
-            // iff `delete && bytes_after == 0` — re-checking
-            // `contains_key` post-call is the simplest oracle.
-            let pre_existed = delete && device.properties.contains_key(&property);
-            match crate::xinput::encode_get_property_reply(
+            let send_deleted = match crate::xinput::encode_get_property_reply(
                 byte_order, sequence, device, property, req_type, offset, len, delete,
             ) {
-                Ok(reply) => buf.extend_from_slice(&reply),
+                Ok(reply) => {
+                    let returned = x11::read_u32(byte_order, &reply[4..8]);
+                    let bytes_after = x11::read_u32(byte_order, &reply[12..16]);
+                    buf.extend_from_slice(&reply);
+                    delete && returned != 0 && bytes_after == 0
+                }
                 Err(crate::xinput::XiPropError::BadValue) => {
                     return emit_x11_error_with_minor(
                         state,
@@ -17937,18 +17947,14 @@ fn handle_xi2_request(
                         XI2_MAJOR_OPCODE,
                     );
                 }
-            }
-            if pre_existed {
-                let device = crate::xinput::find_device(&state.xi_devices, deviceid)
-                    .expect("device existence verified above");
-                if !device.properties.contains_key(&property) {
-                    let _ = emit_property_change(
-                        state,
-                        deviceid,
-                        property,
-                        crate::xinput::PropWhat::Deleted,
-                    );
-                }
+            };
+            if send_deleted {
+                let _ = emit_property_change(
+                    state,
+                    deviceid,
+                    property,
+                    crate::xinput::PropWhat::Deleted,
+                );
             }
         }
         60 => {
@@ -19183,9 +19189,7 @@ fn handle_xi2_request(
                 "client {} #{} XDeleteDeviceProperty deviceid={} property={}",
                 client_id.0, sequence.0, deviceid, property.0
             );
-            // T3: BadAtom guard (mirror of XI2 minor 58). Same policy:
-            // libinput descriptor deletes are tolerated as no-ops; the
-            // driver re-seeds on the next device add.
+            // T3: BadAtom guard (mirror of XI2 minor 58).
             if !state.atoms.exists(property) {
                 return emit_x11_error_with_minor(
                     state,
@@ -19214,6 +19218,20 @@ fn handle_xi2_request(
                     client_id,
                     sequence,
                     10, // BadAccess: XTEST Device is protected by atom identity.
+                    property.0,
+                    38,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            if crate::xinput::find_device(&state.xi_devices, deviceid)
+                .and_then(|device| device.properties.get(&property))
+                .is_some_and(|property| !property.deletable)
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    10, // BadAccess: seeded driver properties are non-deletable.
                     property.0,
                     38,
                     XI2_MAJOR_OPCODE,
@@ -19288,13 +19306,14 @@ fn handle_xi2_request(
             let delete = delete_raw != 0;
             let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
                 .expect("device existence verified above");
-            // Same delete-detection oracle as the XI2 minor-59 arm:
-            // snapshot pre-existence and emit when the encoder removed it.
-            let pre_existed = delete && device.properties.contains_key(&property);
-            match crate::xinput::encode_xi1_get_property_reply(
+            let send_deleted = match crate::xinput::encode_xi1_get_property_reply(
                 byte_order, sequence, device, property, req_type, offset, len, delete,
             ) {
-                Ok(reply) => buf.extend_from_slice(&reply),
+                Ok(reply) => {
+                    let bytes_after = x11::read_u32(byte_order, &reply[12..16]);
+                    buf.extend_from_slice(&reply);
+                    delete && bytes_after == 0
+                }
                 Err(_) => {
                     return emit_x11_error_with_minor(
                         state,
@@ -19306,18 +19325,14 @@ fn handle_xi2_request(
                         XI2_MAJOR_OPCODE,
                     );
                 }
-            }
-            if pre_existed {
-                let device = crate::xinput::find_device(&state.xi_devices, deviceid)
-                    .expect("device existence verified above");
-                if !device.properties.contains_key(&property) {
-                    let _ = emit_property_change(
-                        state,
-                        deviceid,
-                        property,
-                        crate::xinput::PropWhat::Deleted,
-                    );
-                }
+            };
+            if send_deleted {
+                let _ = emit_property_change(
+                    state,
+                    deviceid,
+                    property,
+                    crate::xinput::PropWhat::Deleted,
+                );
             }
         }
         // XI1 OpenDevice (minor 3). Xlib's `DevicePropertyNotify(dev, type,
@@ -24349,11 +24364,43 @@ fn dispatch_change_property(
     if is_xtest_marker_property(state, deviceid, property) {
         return Err(PropertyDispatchError::BadAccess { atom: property.0 });
     }
-    // 2. Descriptor lookup. Borrow the name as `&str` from the atom
-    //    table, copy it out before any `find_device_mut` reborrow.
-    let dev_node =
-        crate::xinput::find_device(&state.xi_devices, deviceid).and_then(|d| d.device_node.clone());
+    // 2. Resolve source/facet identity before descriptor lookup. Names and
+    //    node paths are metadata only; virtual devices with client-created
+    //    libinput-named properties keep ordinary Xorg property behavior.
+    let device = crate::xinput::find_device(&state.xi_devices, deviceid)
+        .expect("caller verified device exists");
+    let source_id = device.source_id;
+    let facet = device.facet;
+    let current_property_read_only = device
+        .properties
+        .get(&property)
+        .is_some_and(|existing| existing.read_only);
+    let source_info = source_id
+        .and_then(|source| state.xi_devices.source(source))
+        .cloned();
+    let physical_pointer =
+        source_info.is_some() && facet == Some(crate::xinput::XiFacetKind::PointerTouch);
+    let dev_node = source_info
+        .as_ref()
+        .map(|info| info.device_node.clone())
+        .or_else(|| device.device_node.clone());
     let prop_name = state.atoms.name(property).map(str::to_owned);
+    if current_property_read_only
+        || (source_info.is_some()
+            && matches!(
+                prop_name.as_deref(),
+                Some("Device Node" | "Device Product ID")
+            ))
+    {
+        return Err(PropertyDispatchError::BadAccess { atom: property.0 });
+    }
+    let descriptor = if physical_pointer {
+        prop_name
+            .as_deref()
+            .and_then(crate::xinput::libinput_props::descriptor_by_name)
+    } else {
+        None
+    };
 
     // Hoisted above the `if let` (review round S5): `validate_value` /
     // `decode_change` live inside the descriptor branch below, but the
@@ -24368,9 +24415,7 @@ fn dispatch_change_property(
     let mut value: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
     let mut merged_replace = false;
 
-    if let Some(name) = prop_name.as_deref()
-        && let Some(desc) = crate::xinput::libinput_props::descriptor_by_name(name)
-    {
+    if let Some(desc) = descriptor {
         // 3. ReadOnly → BadAccess.
         if desc.access == crate::xinput::libinput_props::Access::ReadOnly {
             return Err(PropertyDispatchError::BadAccess { atom: property.0 });
@@ -42815,7 +42860,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        state.xi_seed_touchpad(&touchpad_info);
+        let touchpad_source = touchpad_info.source_id;
+        state.xi_register_source(&touchpad_info);
         let types = list_input_devices_type_atoms(&mut state, &mut peer);
         assert_eq!(types[2], mouse_atom, "device 4 remains the XTEST pointer");
         assert_eq!(
@@ -42836,7 +42882,7 @@ mod tests {
         );
 
         // Removal still leaves the virtual device intact.
-        state.xi_clear_touchpad("/dev/input/event4");
+        state.xi_unregister_source(touchpad_source);
         let types = list_input_devices_type_atoms(&mut state, &mut peer);
         assert_eq!(types[2], mouse_atom, "device 4 remains MOUSE after clear");
         assert_ne!(touchpad_atom, mouse_atom);
@@ -43163,6 +43209,8 @@ mod tests {
                 type_atom: crate::xinput::XA_INTEGER,
                 format,
                 data,
+                read_only: false,
+                deletable: true,
             },
         );
     }
@@ -43882,44 +43930,26 @@ mod tests {
 
     const TEST_PHYSICAL_POINTER_ID: u16 = 6;
 
-    /// Seed the legacy property fixture, then copy its values onto a real
-    /// registry-owned physical facet so property dispatch tests do not
-    /// assign libinput metadata to virtual XTEST device 4.
+    /// Register a source and return its registry-owned pointer facet for
+    /// property dispatch fixtures.
     fn seed_physical_pointer_fixture(
         state: &mut ServerState,
         info: &crate::core_loop::DeviceInfo,
     ) -> u16 {
-        state.xi_devices.register(info);
-        let device_id = state
-            .xi_devices
-            .facet(info.source_id, crate::xinput::XiFacetKind::PointerTouch)
-            .expect("test source publishes a pointer facet");
-        let mut legacy_devices = crate::xinput::initial_xi_devices();
-        crate::xinput::seed_touchpad(
-            &mut legacy_devices,
-            &mut state.atoms,
-            state.float_atom,
-            info,
-        );
-        let seeded = legacy_devices
-            .iter()
-            .find(|device| device.id == crate::xinput::DEVICEID_SLAVE_POINTER)
-            .expect("legacy property fixture has a pointer slot")
-            .clone();
-        let physical = state
-            .xi_devices
-            .device_mut(device_id)
-            .expect("registered physical pointer exists");
-        physical.name = seeded.name;
-        physical.is_touchpad = seeded.is_touchpad;
-        physical.device_node = seeded.device_node;
-        physical.properties = seeded.properties;
-        device_id
+        state
+            .xi_register_source(info)
+            .into_iter()
+            .find(|id| {
+                state.xi_devices.device(*id).is_some_and(|device| {
+                    device.facet == Some(crate::xinput::XiFacetKind::PointerTouch)
+                })
+            })
+            .expect("test source publishes a pointer facet")
     }
 
     /// Seed a touchpad on physical XI ID 6 with tap available+current+default.
     /// Mirrors the MATE test fixture without using virtual XTEST device 4.
-    fn seed_touchpad_for_t3(state: &mut ServerState) -> u16 {
+    fn seed_pointer_for_t3(state: &mut ServerState) -> u16 {
         let info = crate::core_loop::DeviceInfo {
             source_id: crate::xinput::InputSourceId(u64::from(line!())),
             enabled: true,
@@ -43967,7 +43997,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -44290,7 +44320,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         let atom = state
             .atoms
             .intern("libinput Accel Profile Enabled", false)
@@ -44350,7 +44380,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         let atom = state
             .atoms
             .intern("libinput Accel Profile Enabled", false)
@@ -44414,7 +44444,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         let atom = state
             .atoms
             .intern("libinput Accel Profile Enabled", false)
@@ -44496,7 +44526,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         let atom = state
             .atoms
             .intern("libinput Accel Profile Enabled", false)
@@ -44575,11 +44605,11 @@ mod tests {
         // Selecting client receives an XI2 XI_PropertyEvent with
         // what=Modified after a successful XIChangeProperty against an
         // already-seeded libinput property ("libinput Tapping Enabled"
-        // is set by `seed_touchpad`, so the write is a Modify).
+        // is set by `seed_pointer_properties`, so the write is a Modify).
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
         let tap_atom = state
             .atoms
@@ -44830,7 +44860,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         // Selecting `XI_DeviceChanged` only — the
         // `XI2_PROPERTY_EVENT_MASK` bit is NOT set, so this client
         // must be skipped.
@@ -44878,7 +44908,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         // Client subscribes to property events on device 3, not the physical pointer.
         state
             .clients
@@ -44928,7 +44958,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         // Select on the wildcard, NOT on the physical pointer directly.
         state
             .clients
@@ -44975,7 +45005,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
         let tap_atom = state
             .atoms
@@ -45021,7 +45051,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         // Subscribe via a non-root window — anything keyed by the
         // device id wins.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
@@ -45356,7 +45386,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         let physical_class = (u32::from(TEST_PHYSICAL_POINTER_ID) << 8) | 82;
         // Subscribe via SelectExtensionEvent only (no XI2 mask), so the
         // ONLY event on the wire is the XI1 one.
@@ -45474,7 +45504,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         // No SelectExtensionEvent, no XI2 mask.
         let tap_atom = state
             .atoms
@@ -45513,7 +45543,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         let class_dev5: u32 = (5 << 8) | 82;
         let select_body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[class_dev5]);
         handle_xi2_request(
@@ -45621,7 +45651,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         let physical_class = (u32::from(TEST_PHYSICAL_POINTER_ID) << 8) | 82;
         // XI2 selection.
         select_xi2_property_event_on_root(&mut state, 1, TEST_PHYSICAL_POINTER_ID);
@@ -45690,7 +45720,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         // `…Enabled Default` is the ReadOnly companion (Access::ReadOnly).
         let default_atom = state
             .atoms
@@ -46044,7 +46074,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         // Atom 0xdeadbeef has never been interned → BadAtom.
         let bogus_atom = 0xdead_beefu32;
         assert!(!state.atoms.exists(AtomId(bogus_atom)), "precondition");
@@ -46085,7 +46115,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        seed_touchpad_for_t3(&mut state);
+        seed_pointer_for_t3(&mut state);
         // Scroll Method Enabled is `OneHotOrNone { n: 3 }` — two bits set is illegal.
         let scroll_atom = state
             .atoms

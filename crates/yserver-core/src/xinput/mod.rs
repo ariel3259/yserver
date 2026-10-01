@@ -109,6 +109,10 @@ pub struct XiProperty {
     pub type_atom: AtomId,
     pub format: u8,
     pub data: Vec<u8>,
+    /// Whether clients may replace or append to this property.
+    pub read_only: bool,
+    /// Whether direct XI1/XI2 DeleteProperty requests may unlink it.
+    pub deletable: bool,
 }
 
 /// One entry in the XI2 device registry.
@@ -420,62 +424,51 @@ pub fn type_atom_for(val: libinput_props::XiValType, float_atom: AtomId) -> Atom
     }
 }
 
-/// Seed touchpad properties onto the slave-pointer device entry.
+/// Seed the source metadata and supported pointer properties on one physical facet.
 ///
-/// Called from `on_host_input(DeviceAdded)` when `info.is_touchpad`. If
-/// a second touchpad is added later, its data overwrites the first
-/// (latest-wins).
-///
-/// Drives off [`libinput_props::DESCRIPTORS`]: every row whose
-/// availability predicate holds in `info.config` is emitted as one
-/// `XiProperty` keyed by its interned name-atom. The fixed `Device
-/// Node` (STRING/8) and `Device Product ID` (INTEGER/32) entries are
-/// also written. `float_atom` must be the server-wide FLOAT atom
-/// (`ServerState::float_atom`).
-pub fn seed_touchpad(
-    devices: &mut [XiDevice],
+/// Every physical facet receives its own Device Node and Device Product ID.
+/// Only pointer/touch facets receive the available libinput descriptors from
+/// their source's own configuration snapshot. `float_atom` is the server-wide
+/// FLOAT atom (`ServerState::float_atom`).
+pub fn seed_pointer_properties(
+    device: &mut XiDevice,
     atoms: &mut crate::server::AtomTable,
     float_atom: AtomId,
     info: &DeviceInfo,
 ) {
-    let Some(dev) = devices.iter_mut().find(|d| d.id == DEVICEID_SLAVE_POINTER) else {
+    if device.source_id != Some(info.source_id) {
         return;
-    };
+    }
 
-    // Rebuild the slot from scratch. The single slave-pointer entry is
-    // shared across whatever pointer libinput last reported (latest-wins),
-    // so a previous device's properties must not survive: reseeding a mouse
-    // over a touchpad would otherwise leave the touchpad's `Tapping` (etc.)
-    // advertised on the mouse. Only availability-gated rows are re-inserted
-    // below, so clearing first is what enforces the correct per-device set.
-    dev.properties.clear();
-
-    dev.name = info.name.clone();
-    // Reflect the real device kind. A mouse is a pointer, not a touchpad,
-    // even though it now carries libinput props (accel etc.); flagging it
-    // as a touchpad would misroute the T3 write-validation path.
-    dev.is_touchpad = info.is_touchpad;
-    dev.device_node = Some(info.device_node.clone());
+    device.name = info.name.clone();
+    device.is_touchpad = device.facet == Some(XiFacetKind::PointerTouch) && info.is_touchpad;
+    device.device_node = Some(info.device_node.clone());
 
     // Fixed identity properties: Device Node + Device Product ID.
     let node_atom = atoms.intern(PROP_DEVICE_NODE, false);
-    dev.properties.insert(
+    set_seeded_property(
+        device,
         node_atom,
-        XiProperty {
-            type_atom: XA_STRING,
-            format: 8,
-            data: info.device_node.as_bytes().to_vec(),
-        },
+        XA_STRING,
+        8,
+        info.device_node.as_bytes().to_vec(),
+        true,
+        true,
     );
     let pid_atom = atoms.intern(PROP_DEVICE_PRODUCT_ID, false);
-    dev.properties.insert(
+    set_seeded_property(
+        device,
         pid_atom,
-        XiProperty {
-            type_atom: XA_INTEGER,
-            format: 32,
-            data: encode_product_id(info.vendor_id, info.product_id),
-        },
+        XA_INTEGER,
+        32,
+        encode_product_id(info.vendor_id, info.product_id),
+        true,
+        true,
     );
+
+    if device.facet != Some(XiFacetKind::PointerTouch) || !info.capabilities.pointer {
+        return;
+    }
 
     // Table-driven libinput properties.
     for desc in libinput_props::DESCRIPTORS {
@@ -510,41 +503,45 @@ pub fn seed_touchpad(
             }
         };
         let atom = atoms.intern(desc.name, false);
-        dev.properties.insert(
+        set_seeded_property(
+            device,
             atom,
-            XiProperty {
-                type_atom: type_atom_for(desc.val, float_atom),
-                format: desc.format,
-                data,
-            },
+            type_atom_for(desc.val, float_atom),
+            desc.format,
+            data,
+            desc.access == libinput_props::Access::ReadOnly,
+            false,
         );
     }
 }
 
-/// Remove the seeded properties from the slave-pointer device entry when
-/// the device that currently owns the slot is removed.
-///
-/// The backend forwards EVERY `DeviceRemoved` here (keyboards included),
-/// so this must only reset the slot when `device_node` matches the device
-/// that last seeded it — otherwise unplugging an unrelated device (a
-/// keyboard, or an older mouse while a touchpad now owns id 4) would wipe
-/// the live pointer's properties, e.g. stranding the Mouse KCM without
-/// `libinput Accel Speed` again. A removal for a non-owning node is a
-/// no-op.
-pub fn clear_touchpad(devices: &mut [XiDevice], device_node: &str) {
-    let Some(dev) = devices.iter_mut().find(|d| d.id == DEVICEID_SLAVE_POINTER) else {
-        log::debug!("xi_clear_touchpad: slave pointer device not found (node={device_node})");
-        return;
-    };
-    if dev.device_node.as_deref() != Some(device_node) {
-        // Some other device was removed; the pointer slot is owned by a
-        // different (still-present) device. Leave it intact.
-        return;
+fn set_seeded_property(
+    device: &mut XiDevice,
+    atom: AtomId,
+    type_atom: AtomId,
+    format: u8,
+    data: Vec<u8>,
+    read_only: bool,
+    deletable: bool,
+) {
+    if let Some(property) = device.properties.get_mut(&atom) {
+        property.type_atom = type_atom;
+        property.format = format;
+        property.data = data;
+        // Continuation refresh changes values only; ownership and client
+        // deletion state belong to the existing property record.
+    } else {
+        device.properties.insert(
+            atom,
+            XiProperty {
+                type_atom,
+                format,
+                data,
+                read_only,
+                deletable,
+            },
+        );
     }
-    dev.name = NAME_SLAVE_POINTER.to_owned();
-    dev.is_touchpad = false;
-    dev.device_node = None;
-    dev.properties.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -916,6 +913,8 @@ pub fn apply_change_property(
                     type_atom,
                     format,
                     data: data.to_vec(),
+                    read_only: false,
+                    deletable: true,
                 },
             );
             Ok(PropWhat::Created)
@@ -1604,17 +1603,12 @@ mod tests {
     }
 
     #[test]
-    fn seed_touchpad_sets_name_and_properties() {
-        let mut devs = initial_xi_devices();
+    fn seed_pointer_properties_sets_name_and_properties() {
         let mut atoms = AtomTable::new();
         let float_atom = atoms.intern("FLOAT", false);
         let info = touchpad_info(true);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &info);
-
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
         assert_eq!(slave.name, "SynPS/2 Synaptics TouchPad");
 
         // Tap enabled — INTEGER/8/[1]
@@ -1668,141 +1662,115 @@ mod tests {
     }
 
     #[test]
-    fn seed_touchpad_tap_disabled_encodes_zero() {
-        let mut devs = initial_xi_devices();
+    fn seed_pointer_tap_disabled_encodes_zero() {
         let mut atoms = AtomTable::new();
         let float_atom = atoms.intern("FLOAT", false);
         let info = touchpad_info(false);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &info);
-
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
         let tap_atom = atoms.intern(PROP_TAPPING_ENABLED, false);
         assert_eq!(slave.properties[&tap_atom].data, vec![0u8]);
     }
 
     #[test]
-    fn other_devices_unaffected_by_seed_touchpad() {
-        let mut devs = initial_xi_devices();
-        let mut atoms = AtomTable::new();
-        let float_atom = atoms.intern("FLOAT", false);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &touchpad_info(true));
-
-        // Master pointer/keyboard and slave keyboard must be unchanged.
+    fn other_devices_unaffected_by_source_registration() {
+        let mut state = crate::server::ServerState::new();
+        state.xi_register_source(&touchpad_info(true));
+        // Master pointer/keyboard, XTEST pointer/keyboard each keep their
+        // independent ordinary property maps.
         for id in [
             DEVICEID_MASTER_POINTER,
             DEVICEID_MASTER_KEYBOARD,
+            DEVICEID_SLAVE_POINTER,
             DEVICEID_SLAVE_KEYBOARD,
         ] {
-            let dev = devs.iter().find(|d| d.id == id).unwrap();
-            assert!(
-                dev.properties.is_empty(),
-                "device {id} got properties unexpectedly"
-            );
+            let dev = state.xi_devices.device(id).unwrap();
+            if id == DEVICEID_SLAVE_POINTER || id == DEVICEID_SLAVE_KEYBOARD {
+                assert_eq!(dev.properties.len(), 1, "XTEST marker remains on {id}");
+                assert!(dev.properties.contains_key(&state.xtest_device_atom));
+            } else {
+                assert!(dev.properties.is_empty(), "device {id} got properties");
+            }
         }
     }
 
     #[test]
-    fn clear_touchpad_reverts_name_and_drops_properties() {
-        let mut devs = initial_xi_devices();
-        let mut atoms = AtomTable::new();
-        let float_atom = atoms.intern("FLOAT", false);
+    fn unregister_source_removes_its_facets_and_properties() {
+        let mut state = crate::server::ServerState::new();
         let info = touchpad_info(true);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &info);
-
-        // Verify seeded.
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let id = state.xi_register_source(&info)[0];
+        let slave = state.xi_devices.device(id).unwrap();
         assert!(!slave.properties.is_empty());
         assert_eq!(slave.device_node.as_deref(), Some("/dev/input/event4"));
 
-        clear_touchpad(&mut devs, "/dev/input/event4");
-
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert_eq!(slave.name, NAME_SLAVE_POINTER);
-        assert!(slave.properties.is_empty());
-        assert!(slave.device_node.is_none());
+        state.xi_unregister_source(info.source_id);
+        assert!(state.xi_devices.device(id).is_none());
+        assert_eq!(
+            state
+                .xi_devices
+                .device(DEVICEID_SLAVE_POINTER)
+                .unwrap()
+                .name,
+            registry::NAME_XTEST_POINTER
+        );
     }
 
     #[test]
-    fn clear_touchpad_is_idempotent() {
-        let mut devs = initial_xi_devices();
-        // Double-clear must not panic or corrupt state.
-        clear_touchpad(&mut devs, "/dev/input/event4");
-        clear_touchpad(&mut devs, "/dev/input/event4");
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert_eq!(slave.name, NAME_SLAVE_POINTER);
+    fn unregister_source_is_idempotent() {
+        let mut state = crate::server::ServerState::new();
+        let info = touchpad_info(true);
+        let id = state.xi_register_source(&info)[0];
+        state.xi_unregister_source(info.source_id);
+        assert!(state.xi_unregister_source(info.source_id).is_empty());
+        assert!(state.xi_devices.device(id).is_none());
     }
 
     #[test]
-    fn seed_second_touchpad_overwrites_first() {
-        let mut devs = initial_xi_devices();
-        let mut atoms = AtomTable::new();
-        let float_atom = atoms.intern("FLOAT", false);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &touchpad_info(true));
-
+    fn seed_second_touchpad_keeps_first_source_independent() {
+        let mut state = crate::server::ServerState::new();
+        let info1 = touchpad_info(true);
         let mut info2 = touchpad_info(false);
+        info2.source_id = InputSourceId(info1.source_id.0 + 1);
         info2.name = "ETPS/2 Elantech Touchpad".into();
         info2.device_node = "/dev/input/event5".into();
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &info2);
-
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert_eq!(slave.name, "ETPS/2 Elantech Touchpad");
-        assert_eq!(slave.device_node.as_deref(), Some("/dev/input/event5"));
-        let node_atom = atoms.intern(PROP_DEVICE_NODE, false);
+        let id1 = state.xi_register_source(&info1)[0];
+        let id2 = state.xi_register_source(&info2)[0];
+        let first = state.xi_devices.device(id1).unwrap();
+        let second = state.xi_devices.device(id2).unwrap();
+        assert_eq!(first.name, "SynPS/2 Synaptics TouchPad");
+        assert_eq!(first.device_node.as_deref(), Some("/dev/input/event4"));
+        assert_eq!(second.name, "ETPS/2 Elantech Touchpad");
+        assert_eq!(second.device_node.as_deref(), Some("/dev/input/event5"));
+        let node_atom = state.atoms.intern(PROP_DEVICE_NODE, false);
         assert_eq!(
-            slave.properties[&node_atom].data,
+            first.properties[&node_atom].data,
+            b"/dev/input/event4".to_vec()
+        );
+        assert_eq!(
+            second.properties[&node_atom].data,
             b"/dev/input/event5".to_vec()
         );
     }
 
     #[test]
-    fn bare_seed_touchpad_ignores_is_touchpad_flag() {
-        // `seed_touchpad` itself has no `is_touchpad` guard — the gate lives
-        // in `ServerState::xi_seed_touchpad` (see the gated test below).
-        // This test documents that the bare function seeds unconditionally
-        // and doesn't panic or corrupt state when handed a non-touchpad
-        // DeviceInfo.
-        let mut devs = initial_xi_devices();
+    fn seed_pointer_properties_uses_source_capability_not_touchpad_flag() {
         let mut atoms = AtomTable::new();
         let float_atom = atoms.intern("FLOAT", false);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info());
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        // Bare seed DOES write — name (and Device Node / Device Product
-        // ID) get set regardless of the flag. Libinput-table props are
-        // gated by availability, so a mouse snapshot only carries the
-        // identity pair.
+        let info = mouse_info();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
         assert_eq!(slave.name, "USB Mouse");
-        assert!(!slave.properties.is_empty());
+        assert_eq!(slave.properties.len(), 2);
     }
 
     #[test]
-    fn xi_seed_touchpad_gate_skips_non_touchpad() {
-        // Device 4 stays virtual even when the legacy add hook sees a
-        // non-touchpad source.
+    fn source_registration_publishes_mouse_without_accel_settings() {
         let mut state = crate::server::ServerState::new();
-        state.xi_seed_touchpad(&mouse_info());
-        let slave = state
-            .xi_devices
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let info = mouse_info();
+        let ids = state.xi_register_source(&info);
+        assert_eq!(ids.len(), 1, "pointer capability publishes a facet");
+        assert!(state.xi_devices.device(ids[0]).is_some());
+        let slave = state.xi_devices.device(DEVICEID_SLAVE_POINTER).unwrap();
         assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
         let marker = state.xtest_device_atom;
         assert_eq!(
@@ -1811,6 +1779,8 @@ mod tests {
                 type_atom: XA_INTEGER,
                 format: 8,
                 data: vec![1],
+                read_only: true,
+                deletable: false,
             })
         );
     }
@@ -1823,14 +1793,11 @@ mod tests {
     /// `libinput Accel Speed` atom → InternAtom None → client null-deref).
     #[test]
     fn seed_pointer_mouse_seeds_accel_and_keeps_mouse_flag() {
-        let mut devs = initial_xi_devices();
         let mut atoms = AtomTable::new();
         let float_atom = atoms.intern("FLOAT", false);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let info = mouse_info_with_accel();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
         // A mouse is not a touchpad, even though it now carries libinput props.
         assert!(!slave.is_touchpad, "mouse must not be flagged is_touchpad");
         // The accel property the Mouse KCM reads must be present.
@@ -1859,14 +1826,11 @@ mod tests {
     /// actually depends on.
     #[test]
     fn seed_accel_profile_enabled_is_three_bytes() {
-        let mut devs = initial_xi_devices();
         let mut atoms = AtomTable::new();
         let float_atom = atoms.intern("FLOAT", false);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let info = mouse_info_with_accel();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
         let atom = atoms.intern("libinput Accel Profile Enabled", true);
         let prop = slave
             .properties
@@ -1875,17 +1839,13 @@ mod tests {
         assert_eq!(prop.data.len(), 3, "seeded width is 3 bytes");
     }
 
-    /// The legacy `ServerState` hook must not turn virtual XTEST device 4
-    /// into a physical mouse, even for a configurable mouse source.
+    /// Physical pointer seeding must leave virtual XTEST device 4 alone.
     #[test]
-    fn xi_seed_touchpad_preserves_xtest_for_configurable_mouse() {
+    fn source_registration_preserves_xtest_for_configurable_mouse() {
         let mut state = crate::server::ServerState::new();
-        state.xi_seed_touchpad(&mouse_info_with_accel());
-        let slave = state
-            .xi_devices
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let ids = state.xi_register_source(&mouse_info_with_accel());
+        assert_eq!(ids, vec![6]);
+        let slave = state.xi_devices.device(DEVICEID_SLAVE_POINTER).unwrap();
         assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
         assert!(
             !slave
@@ -1896,9 +1856,9 @@ mod tests {
         assert!(!slave.is_touchpad);
     }
 
-    /// A phantom HID pointer collection must not alter XTEST device 4 either.
+    /// A pointer source publishes its facet even without available accel settings.
     #[test]
-    fn xi_seed_touchpad_gate_skips_phantom_pointer_without_accel() {
+    fn source_registration_publishes_pointer_without_accel_property() {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
         // Has a scroll knob but is NOT a real relative pointer (no accel).
         let config = LibinputConfigSnapshot {
@@ -1927,14 +1887,16 @@ mod tests {
             config,
         };
         let mut state = crate::server::ServerState::new();
-        // Neither source may be represented by virtual device 4.
-        state.xi_seed_touchpad(&mouse_info_with_accel());
-        state.xi_seed_touchpad(&phantom);
-        let slave = state
-            .xi_devices
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let first = mouse_info_with_accel();
+        let first_id = state.xi_register_source(&first)[0];
+        let phantom_id = state.xi_register_source(&phantom)[0];
+        assert_ne!(first_id, phantom_id);
+        let physical = state.xi_devices.device(phantom_id).unwrap();
+        let natural_scroll = state
+            .atoms
+            .intern("libinput Natural Scrolling Enabled", true);
+        assert!(physical.properties.contains_key(&natural_scroll));
+        let slave = state.xi_devices.device(DEVICEID_SLAVE_POINTER).unwrap();
         assert_eq!(
             slave.name,
             registry::NAME_XTEST_POINTER,
@@ -1947,91 +1909,50 @@ mod tests {
         );
     }
 
-    /// Reseeding the shared slave-pointer slot from a touchpad to a mouse
-    /// must NOT leave the touchpad's props behind. Regression for the
-    /// stale-property bug: `seed_touchpad` clears the map before re-seeding
-    /// the availability-gated subset, so a mouse never advertises `Tapping`.
+    /// Two physical sources keep separate descriptor sets and identity values.
     #[test]
-    fn reseed_touchpad_to_mouse_drops_stale_touchpad_props() {
-        let mut devs = initial_xi_devices();
-        let mut atoms = AtomTable::new();
-        let float_atom = atoms.intern("FLOAT", false);
-        // First a touchpad (tap available → Tapping seeded).
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &touchpad_info(true));
-        let tap = atoms.intern("libinput Tapping Enabled", false);
+    fn independent_touchpad_and_mouse_facets_have_independent_properties() {
+        let mut state = crate::server::ServerState::new();
+        let info1 = touchpad_info(true);
+        let mut info2 = mouse_info_with_accel();
+        info2.source_id = InputSourceId(info1.source_id.0 + 1);
+        let touchpad_id = state.xi_register_source(&info1)[0];
+        let mouse_id = state.xi_register_source(&info2)[0];
+        let tap = state.atoms.intern("libinput Tapping Enabled", true);
+        let accel = state.atoms.intern("libinput Accel Speed", true);
         assert!(
-            devs.iter()
-                .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            state
+                .xi_devices
+                .device(touchpad_id)
                 .unwrap()
                 .properties
-                .contains_key(&tap),
-            "touchpad should have Tapping seeded"
-        );
-        // Then a mouse replaces it on the same slot.
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert!(!slave.is_touchpad, "now a mouse");
-        let accel = atoms.intern("libinput Accel Speed", true);
-        assert!(
-            slave.properties.contains_key(&accel),
-            "mouse has Accel Speed"
+                .contains_key(&tap)
         );
         assert!(
-            !slave.properties.contains_key(&tap),
-            "stale touchpad Tapping must be gone after reseeding a mouse"
+            state
+                .xi_devices
+                .device(mouse_id)
+                .unwrap()
+                .properties
+                .contains_key(&accel)
+        );
+        assert!(
+            !state
+                .xi_devices
+                .device(mouse_id)
+                .unwrap()
+                .properties
+                .contains_key(&tap)
         );
     }
 
-    /// A `DeviceRemoved` for a device that does NOT own the slave-pointer
-    /// slot must be a no-op — otherwise unplugging a keyboard (or an older
-    /// mouse while another device owns id 4) would wipe the live pointer's
-    /// `libinput Accel Speed` and re-strand the Mouse KCM.
     #[test]
-    fn clear_touchpad_ignores_non_owning_node() {
-        let mut devs = initial_xi_devices();
-        let mut atoms = AtomTable::new();
-        let float_atom = atoms.intern("FLOAT", false);
-        // event4 owns the slot now.
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
-        let accel = atoms.intern("libinput Accel Speed", true);
-        // Some other device (a keyboard at event9) is unplugged → no-op.
-        clear_touchpad(&mut devs, "/dev/input/event9");
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert!(
-            slave.properties.contains_key(&accel),
-            "unrelated removal must not wipe the live pointer's props"
-        );
-        assert_eq!(slave.name, "USB Mouse");
-        // The owning device is unplugged → slot reset.
-        clear_touchpad(&mut devs, "/dev/input/event1");
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert!(
-            slave.properties.is_empty(),
-            "owning removal resets the slot"
-        );
-        assert_eq!(slave.name, NAME_SLAVE_POINTER);
-    }
-
-    #[test]
-    fn xi_seed_touchpad_preserves_xtest_for_touchpad() {
-        // The later source-property migration will publish this touchpad on
-        // its own pointer facet; Task 1 keeps virtual ID 4 untouched.
+    fn source_registration_preserves_xtest_for_touchpad() {
         let mut state = crate::server::ServerState::new();
-        state.xi_seed_touchpad(&touchpad_info(true));
-        let slave = state
-            .xi_devices
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let info = touchpad_info(true);
+        let id = state.xi_register_source(&info)[0];
+        assert_ne!(id, DEVICEID_SLAVE_POINTER);
+        let slave = state.xi_devices.device(DEVICEID_SLAVE_POINTER).unwrap();
         assert_eq!(slave.name, registry::NAME_XTEST_POINTER);
         assert_eq!(slave.properties.len(), 1);
         assert!(slave.properties.contains_key(&state.xtest_device_atom));
@@ -2044,7 +1965,6 @@ mod tests {
     #[test]
     fn seed_then_table_matches() {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
-        let mut devs = initial_xi_devices();
         let mut atoms = AtomTable::new();
         // Force a known FLOAT atom for the test; the production path
         // uses `state.float_atom`.
@@ -2073,12 +1993,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &info);
-
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
 
         // device_node mirrors the snapshot.
         assert_eq!(slave.device_node.as_deref(), Some("/dev/input/event4"));
@@ -2125,7 +2041,6 @@ mod tests {
     #[test]
     fn seed_emits_available_mask_for_groups() {
         use crate::core_loop::message::{LibinputConfigSnapshot, OneHot3};
-        let mut devs = initial_xi_devices();
         let mut atoms = AtomTable::new();
         let float_atom = atoms.intern("FLOAT", false);
         let config = LibinputConfigSnapshot {
@@ -2153,12 +2068,8 @@ mod tests {
             is_touchpad: true,
             config,
         };
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &info);
-
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
         let avail = atoms.intern("libinput Scroll Methods Available", false);
         let p = slave.properties.get(&avail).expect("avail seeded");
         // 3-wide BitFlags, bit0+bit1 set ⇒ [1, 1, 0].
@@ -2175,7 +2086,6 @@ mod tests {
     #[test]
     fn seed_tap_button_map_default_is_correctly_paired() {
         use crate::core_loop::message::{LibinputConfigSnapshot, OneHot2};
-        let mut devs = initial_xi_devices();
         let mut atoms = AtomTable::new();
         let float_atom = atoms.intern("FLOAT", false);
         let config = LibinputConfigSnapshot {
@@ -2203,11 +2113,8 @@ mod tests {
             is_touchpad: true,
             config,
         };
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &info);
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
 
         // Writable seeded with `current = Some(0)` → [1, 0].
         let cur = atoms.intern("libinput Tapping Button Mapping Enabled", false);
@@ -2228,7 +2135,6 @@ mod tests {
     #[test]
     fn seed_accel_speed_uses_float_atom() {
         use crate::core_loop::message::{FloatSetting, LibinputConfigSnapshot};
-        let mut devs = initial_xi_devices();
         let mut atoms = AtomTable::new();
         let float_atom = atoms.intern("FLOAT", false);
         let config = LibinputConfigSnapshot {
@@ -2256,12 +2162,8 @@ mod tests {
             is_touchpad: true,
             config,
         };
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &info);
-
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
         let speed = atoms.intern("libinput Accel Speed", false);
         let p = slave.properties.get(&speed).expect("accel speed seeded");
         assert_eq!(p.type_atom, float_atom);
@@ -2295,6 +2197,8 @@ mod tests {
                 type_atom: XA_INTEGER,
                 format: 8,
                 data: vec![1],
+                read_only: false,
+                deletable: true,
             },
         );
         dev.properties.insert(
@@ -2303,6 +2207,8 @@ mod tests {
                 type_atom: XA_STRING,
                 format: 8,
                 data: b"abcde".to_vec(),
+                read_only: false,
+                deletable: true,
             },
         );
         let mut pid = Vec::new();
@@ -2314,6 +2220,8 @@ mod tests {
                 type_atom: XA_INTEGER,
                 format: 32,
                 data: pid,
+                read_only: false,
+                deletable: true,
             },
         );
         dev
@@ -2867,15 +2775,12 @@ mod tests {
 
     #[test]
     fn property_atoms_are_stable_across_calls() {
-        let mut devs = initial_xi_devices();
-        let mut atoms = AtomTable::new();
-        let float_atom = atoms.intern("FLOAT", false);
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &touchpad_info(true));
-        let atom_first = atoms.intern(PROP_TAPPING_ENABLED, false);
-
-        clear_touchpad(&mut devs, "/dev/input/event4");
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &touchpad_info(false));
-        let atom_second = atoms.intern(PROP_TAPPING_ENABLED, false);
+        let mut state = crate::server::ServerState::new();
+        let info = touchpad_info(true);
+        state.xi_register_source(&info);
+        let atom_first = state.atoms.intern(PROP_TAPPING_ENABLED, false);
+        state.xi_unregister_source(info.source_id);
+        let atom_second = state.atoms.intern(PROP_TAPPING_ENABLED, false);
 
         // Same atom id across re-seed.
         assert_eq!(atom_first, atom_second);
@@ -2919,67 +2824,40 @@ mod tests {
         }
     }
 
-    /// `seed_touchpad` sets `is_touchpad=true`; `clear_touchpad` resets it.
+    /// Registering and unregistering a source adds and removes its touchpad facet.
     #[test]
     fn seed_and_clear_flip_is_touchpad_flag() {
-        let mut devs = initial_xi_devices();
-        let mut atoms = AtomTable::new();
-        let float_atom = atoms.intern("FLOAT", false);
-
-        // Before seeding: slave pointer is not a touchpad.
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert!(!slave.is_touchpad, "initially not a touchpad");
-
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &touchpad_info(true));
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert!(slave.is_touchpad, "is_touchpad=true after seed");
-
-        clear_touchpad(&mut devs, "/dev/input/event4");
-        let slave = devs
-            .iter()
-            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
-            .unwrap();
-        assert!(!slave.is_touchpad, "is_touchpad=false after clear");
+        let mut state = crate::server::ServerState::new();
+        let info = touchpad_info(true);
+        let id = state.xi_register_source(&info)[0];
+        assert!(state.xi_devices.device(id).unwrap().is_touchpad);
+        state.xi_unregister_source(info.source_id);
+        assert!(state.xi_devices.device(id).is_none());
     }
 
     /// `device_is_touchpad` reflects the registry state.
     #[test]
     fn device_is_touchpad_helper_reflects_registry() {
-        let mut devs = initial_xi_devices();
-        let mut atoms = AtomTable::new();
-        let float_atom = atoms.intern("FLOAT", false);
-
+        let mut state = crate::server::ServerState::new();
+        let info = touchpad_info(true);
+        let id = state.xi_register_source(&info)[0];
         assert!(
-            !device_is_touchpad(&devs, DEVICEID_SLAVE_POINTER),
-            "false before seed"
+            device_is_touchpad(&state.xi_devices, id),
+            "true for the physical touchpad facet"
         );
-        seed_touchpad(&mut devs, &mut atoms, float_atom, &touchpad_info(true));
-        assert!(
-            device_is_touchpad(&devs, DEVICEID_SLAVE_POINTER),
-            "true after seed"
-        );
-        clear_touchpad(&mut devs, "/dev/input/event4");
-        assert!(
-            !device_is_touchpad(&devs, DEVICEID_SLAVE_POINTER),
-            "false after clear"
-        );
+        state.xi_unregister_source(info.source_id);
+        assert!(!device_is_touchpad(&state.xi_devices, id));
         // Non-touchpad devices always return false.
         assert!(
-            !device_is_touchpad(&devs, DEVICEID_MASTER_POINTER),
+            !device_is_touchpad(&state.xi_devices, DEVICEID_MASTER_POINTER),
             "master pointer is never touchpad"
         );
         assert!(
-            !device_is_touchpad(&devs, DEVICEID_MASTER_KEYBOARD),
+            !device_is_touchpad(&state.xi_devices, DEVICEID_MASTER_KEYBOARD),
             "master keyboard is never touchpad"
         );
         assert!(
-            !device_is_touchpad(&devs, DEVICEID_SLAVE_KEYBOARD),
+            !device_is_touchpad(&state.xi_devices, DEVICEID_SLAVE_KEYBOARD),
             "slave keyboard is never touchpad"
         );
     }
