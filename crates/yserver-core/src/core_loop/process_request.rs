@@ -446,7 +446,7 @@ pub fn process_request(
         94 => handle_create_glyph_cursor(state, backend, origin, client_id, sequence, body),
         // ── window queries / circulation ──
         3 => handle_get_window_attributes(state, client_id, sequence, body),
-        13 => handle_circulate_window(state, client_id, sequence, header, body),
+        13 => handle_circulate_window(state, backend, client_id, sequence, header, body),
         // ── extension extension-protocol arms (standalone, not full
         //    extension dispatchers) ──
         138 => handle_ge_request(state, client_id, sequence, header), // GE
@@ -1171,6 +1171,31 @@ fn flip_redirect_target_mode(
     }
 }
 
+/// Xorg `compCheckRedirect` after `window`'s redirect records changed from
+/// effective mode `before`: allocate, flip or drop its backing to match.
+/// Allocation and the flip need `supports_redirect_activation()`; a
+/// teardown is a no-op for a window that never got a backing.
+pub(crate) fn sync_redirect_backing(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    window: ResourceId,
+    before: Option<crate::server::CompositeRedirectMode>,
+) {
+    let after = state.composite_redirects.window_mode(window);
+    if before == after {
+        return;
+    }
+    match (before, after) {
+        (_, None) => crate::core_loop::process_disconnect::teardown_redirect_for_window(
+            state, backend, origin, window,
+        ),
+        _ if !backend.supports_redirect_activation() => {}
+        (None, Some(mode)) => activate_redirect_backing_for(state, backend, origin, window, mode),
+        (Some(_), Some(mode)) => flip_redirect_target_mode(state, backend, origin, window, mode),
+    }
+}
+
 /// Point GLX pixmap `glx_xid` at `new_host`, moving its export-lifetime ref along (acquire NEW, release OLD).
 fn retarget_glx_pixmap_export(
     state: &mut ServerState,
@@ -1711,14 +1736,7 @@ fn effective_redirect_mode_for_window(
     state: &ServerState,
     window: ResourceId,
 ) -> Option<crate::server::CompositeRedirectMode> {
-    if let Some(record) = state.composite_redirects.get(&(window, false)) {
-        return Some(record.mode);
-    }
-    let parent = state.resources.window(window)?.parent;
-    state
-        .composite_redirects
-        .get(&(parent, true))
-        .map(|record| record.mode)
+    state.composite_redirects.window_mode(window)
 }
 
 /// One window's worth of identity captured *before* destroy_window
@@ -1742,23 +1760,18 @@ fn collect_destroy_order(
     let Some(w) = table.window(root) else {
         return;
     };
-    for child in w.children.clone() {
+    // Xorg CrushTree (`dix/window.c:1023`): inferiors first, topmost first.
+    for child in w.children.clone().into_iter().rev() {
         collect_destroy_order(table, child, out);
     }
     out.push(root);
 }
 
+/// DestroyNotify only: the destroyed window's UnmapNotify went out before the
+/// teardown, and its inferiors get none (Xorg CrushTree).
 fn fanout_destroy_sequence_to_state(state: &mut ServerState, pending: &PendingDestroy) {
     let window = pending.window;
     let parent = pending.parent;
-    if pending.was_mapped {
-        let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
-        });
-        let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
-        });
-    }
     let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
         x11::encode_destroy_notify_event(buf, seq, order, window, window);
     });
@@ -1912,9 +1925,7 @@ pub(crate) fn release_redirects_on_destroyed_windows(
             state, backend, origin, *window,
         );
     }
-    state
-        .composite_redirects
-        .retain(|(window, _), _| !windows.contains(window));
+    state.composite_redirects.forget_windows(windows);
 }
 
 fn destroy_window_subtree(
@@ -1961,6 +1972,23 @@ fn destroy_window_subtree(
             on_window,
             on_parent,
         });
+    }
+    // Xorg DeleteWindow unmaps the window first (`dix/window.c:1075`):
+    // UnmapNotify, then WindowsRestructured while the subtree still exists,
+    // so the pointer's Leave reaches the dying windows before any
+    // DestroyNotify. `order` ends with `root`.
+    if let Some(top) = pending.last()
+        && top.was_mapped
+    {
+        let (window, parent) = (top.window, top.parent);
+        let _dropped = fanout_event_to_clients(state, &top.on_window, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+        });
+        let _dropped = fanout_event_to_clients(state, &top.on_parent, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
+        });
+        let _ = state.resources.unmap_window(window);
+        backend.windows_restructured(state);
     }
     let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
     free_pictures_on_destroyed_windows(state, backend, origin, &order);
@@ -7124,6 +7152,9 @@ fn handle_shape_request(
                 let changed =
                     crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                // Xorg miSetShape re-evaluates the pointer before ShapeNotify
+                // goes out (`mi/miwindow.c:680`); so do the other SHAPE ops.
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, window, req.dest_kind);
                 }
@@ -7139,6 +7170,7 @@ fn handle_shape_request(
                 if req.src == 0 {
                     let changed = crate::nested::clear_shape_rects(state, window, req.dest_kind);
                     mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                    backend.windows_restructured(state);
                     if changed {
                         emit_shape_notify(state, window, req.dest_kind);
                     }
@@ -7210,6 +7242,7 @@ fn handle_shape_request(
                 let changed =
                     crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, window, req.dest_kind);
                 }
@@ -7251,6 +7284,7 @@ fn handle_shape_request(
                 );
                 let changed = crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, dest, req.dest_kind);
                 }
@@ -7269,6 +7303,7 @@ fn handle_shape_request(
                 }
                 if translated {
                     mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                    backend.windows_restructured(state);
                     emit_shape_notify(state, dest, req.dest_kind);
                 }
             }
@@ -8333,6 +8368,8 @@ fn handle_xfixes_request(
                     crate::nested::set_shape_rects(state, window, req.dest_kind, source);
                 }
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                // Xorg SetWindowShapeRegion goes through miSetShape too.
+                backend.windows_restructured(state);
             }
         }
         x11xfixes::SET_PICTURE_CLIP_REGION => {
@@ -8669,212 +8706,115 @@ fn handle_composite_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
-        x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS => {
-            if let Some((window, update)) = x11composite::parse_window_update(body) {
-                let subwindows = minor == x11composite::REDIRECT_SUBWINDOWS;
-                // Xorg compRedirectWindow (composite/compalloc.c:145-147): a
-                // client request to redirect the overlay window returns
-                // Success without installing any redirect. The COW reaches
-                // scanout via the normal paint path; it is never itself
-                // redirected. Match that exactly — NOT BadMatch (which would
-                // be a yserver-invented error). Scoped to RedirectWindow;
-                // RedirectSubwindows(COW) is benign (COW has no children to
-                // redirect) and Xorg doesn't special-case it either.
-                if !subwindows && ResourceId(window) == COMPOSITE_OVERLAY_WINDOW {
+        x11composite::REDIRECT_WINDOW
+        | x11composite::REDIRECT_SUBWINDOWS
+        | x11composite::UNREDIRECT_WINDOW
+        | x11composite::UNREDIRECT_SUBWINDOWS => {
+            let Some((window_raw, update)) = x11composite::parse_window_update(body) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let window = ResourceId(window_raw);
+            let subwindows = matches!(
+                minor,
+                x11composite::REDIRECT_SUBWINDOWS | x11composite::UNREDIRECT_SUBWINDOWS
+            );
+            let redirect = matches!(
+                minor,
+                x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS
+            );
+            let error = |state: &mut ServerState, code: u8| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    window_raw,
+                    u16::from(minor),
+                    COMPOSITE_MAJOR_OPCODE,
+                )
+            };
+            let Some(parent) = state.resources.window(window).map(|w| w.parent) else {
+                return error(state, x11::error::BAD_WINDOW);
+            };
+            // compositeproto: update=0 → Automatic, update=1 → Manual. An
+            // unredirect with any other value matches no record (BadValue
+            // below, as Xorg).
+            let mode = match update {
+                0 => crate::server::CompositeRedirectMode::Automatic,
+                1 => crate::server::CompositeRedirectMode::Manual,
+                _ => return error(state, x11::error::BAD_VALUE),
+            };
+            // Xorg compRedirectWindow (composite/compalloc.c:145-150): the
+            // overlay window is never redirected and asking succeeds; the
+            // root has no parent to redirect into (BadMatch). Unredirect has
+            // no such checks: neither ever holds a record, so it BadValues.
+            if redirect && !subwindows {
+                if window == COMPOSITE_OVERLAY_WINDOW {
                     return Ok(RequestOutcome::Handled);
                 }
-                // compositeproto: update=0 → Automatic, update=1 → Manual.
-                // Both wire constants are spec-legal; reject anything else
-                // with BadValue. We don't yet have a compositor consumer
-                // for the redirected-backing pixmap, so registering the
-                // record is enough — NameWindowPixmap consults the record
-                // and that's the part real compositing WMs need to make
-                // progress (xfwm4, picom, xcompmgr, mate-panel's
-                // notification-area-applet for its tray window).
-                let mode = match update {
-                    0 => crate::server::CompositeRedirectMode::Automatic,
-                    1 => crate::server::CompositeRedirectMode::Manual,
-                    _ => {
-                        return emit_x11_error_with_minor(
-                            state,
-                            client_id,
-                            sequence,
-                            x11::error::BAD_VALUE,
-                            u32::from(update),
-                            u16::from(minor),
-                            COMPOSITE_MAJOR_OPCODE,
-                        );
-                    }
-                };
-                let key = (ResourceId(window), subwindows);
-                let prev = state.composite_redirects.get(&key).copied();
-                // Xorg compRedirectWindow (composite/compalloc.c:155-158)
-                // permits only one Manual redirect on a window, regardless
-                // of whether the existing redirect came from RedirectWindow
-                // or was inherited from RedirectSubwindows(parent). Muffin
-                // deliberately probes with RedirectWindow(frame, Manual)
-                // after root RedirectSubwindows(Manual); Xorg returns
-                // BadAccess even though both requests are from Muffin.
-                //
-                // Treating the two key shapes as independent is not merely
-                // an error-code mismatch: a root child can inherit Manual,
-                // receive the redundant direct record, and later be
-                // reparented below a frame. The direct record then makes
-                // reparent reconciliation preserve a stale inner backing,
-                // so the application paints frames that the compositor
-                // never samples (Warframe fullscreen -> windowed: black).
-                let inherited_manual = !subwindows
-                    && state
-                        .resources
-                        .window(ResourceId(window))
-                        .and_then(|w| state.composite_redirects.get(&(w.parent, true)))
-                        .is_some_and(|record| {
-                            matches!(record.mode, crate::server::CompositeRedirectMode::Manual)
-                        });
-                let same_key_manual = prev.is_some_and(|record| {
-                    matches!(record.mode, crate::server::CompositeRedirectMode::Manual)
-                });
-                if matches!(mode, crate::server::CompositeRedirectMode::Manual)
-                    && (same_key_manual || inherited_manual)
-                {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_ACCESS,
-                        window,
-                        u16::from(minor),
-                        COMPOSITE_MAJOR_OPCODE,
-                    );
-                }
-                if let Some(existing) = prev
-                    && existing.owner != client_id
-                {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_ACCESS,
-                        window,
-                        u16::from(minor),
-                        COMPOSITE_MAJOR_OPCODE,
-                    );
-                }
-                let mode_flip = matches!(prev, Some(p) if p.mode != mode);
-                let mode_flip_suffix = if mode_flip {
-                    match prev {
-                        Some(p) => format!(" [mode-flip from {:?}]", p.mode),
-                        None => String::new(),
-                    }
-                } else {
-                    String::new()
-                };
-                debug!(
-                    "client {} #{} COMPOSITE::Redirect{}(0x{:x}, mode={:?}{})",
-                    client_id.0,
-                    sequence.0,
-                    if subwindows { "Subwindows" } else { "Window" },
-                    window,
-                    mode,
-                    mode_flip_suffix,
-                );
-                state.composite_redirects.insert(
-                    key,
-                    crate::server::RedirectRecord {
-                        mode,
-                        owner: client_id,
-                    },
-                );
-                // Stage 4b: backing activation + scene-participation
-                // flip, gated on `Backend::supports_redirect_activation()`.
-                // v1 returns `false` (keeping the post-`3751c11`
-                // MATE-fix shape: record only, no backing routing);
-                // v2 returns `true` and the helper allocates + flips
-                // participation.
-                if backend.supports_redirect_activation() {
-                    // Stage 4b.8: same-owner mode-flip is preserved
-                    // across the flip per Xorg's compCheckRedirect
-                    // (`xserver/composite/compwindow.c:172` +
-                    // `compositeproto.txt:80`). Backing pixmap +
-                    // NameWindowPixmap aliases survive; only the
-                    // window's + backing's `scene_participating`
-                    // flags flip. No re-seed (B's content is
-                    // preserved as-is — re-running the seed-copy
-                    // would clobber the compositor's in-flight
-                    // paint per the plan's codex-round-6 decision).
-                    let targets: Vec<ResourceId> = if subwindows {
-                        // Snapshot children to a Vec — the helper takes
-                        // `&mut state`, so the borrow on `state.resources`
-                        // from `children(..)` can't be held across calls.
-                        state.resources.children(ResourceId(window)).to_vec()
-                    } else {
-                        vec![ResourceId(window)]
-                    };
-                    for target in targets {
-                        if mode_flip {
-                            flip_redirect_target_mode(state, backend, origin, target, mode);
-                        } else {
-                            activate_redirect_backing_for(state, backend, origin, target, mode);
-                        }
-                    }
+                if parent == window {
+                    return error(state, x11::error::BAD_MATCH);
                 }
             }
-        }
-        x11composite::UNREDIRECT_WINDOW | x11composite::UNREDIRECT_SUBWINDOWS => {
-            if let Some((window, _update)) = x11composite::parse_window_update(body) {
-                let subwindows = minor == x11composite::UNREDIRECT_SUBWINDOWS;
+            // Xorg's order is lastChild first, ours bottom first. The COW
+            // gets no record from a subwindows redirect (compRedirectWindow
+            // returns Success for it).
+            let targets: Vec<ResourceId> = if subwindows {
                 state
-                    .composite_redirects
-                    .remove(&(ResourceId(window), subwindows));
-                // L2 plan B.6c + Stage 4b: release each affected
-                // backing's reason-1 hold. Single-window: just the
-                // named window. Subtree: walk children of the
-                // parent symmetric to the RedirectSubwindows arm
-                // above. Backing-side participation drop happens
-                // inside `release_redirected_backing` per the
-                // Stage-4 round-3 finding; the window-side
-                // participation restore happens below, gated on
-                // `supports_redirect_activation()`.
-                let targets: Vec<ResourceId> = if subwindows {
-                    state.resources.children(ResourceId(window)).to_vec()
-                } else {
-                    vec![ResourceId(window)]
-                };
-                debug!(
-                    "client {} #{} COMPOSITE::Unredirect{}(0x{:x}) targets={}",
-                    client_id.0,
-                    sequence.0,
-                    if subwindows { "Subwindows" } else { "Window" },
-                    window,
-                    targets.len(),
+                    .resources
+                    .children(window)
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|child| *child != COMPOSITE_OVERLAY_WINDOW)
+                    .collect()
+            } else {
+                vec![window]
+            };
+            let before: Vec<_> = targets
+                .iter()
+                .map(|t| state.composite_redirects.window_mode(*t))
+                .collect();
+            let record = crate::server::RedirectRecord {
+                mode,
+                owner: client_id,
+            };
+            let redirects = &mut state.composite_redirects;
+            let ok = match (redirect, subwindows) {
+                // Only one Manual redirect per window or subwindows list,
+                // whichever client holds it (compalloc.c:155-158, :336-339):
+                // muffin probes RedirectWindow(frame, Manual) after its own
+                // RedirectSubwindows(root, Manual) and expects BadAccess.
+                (true, false) => redirects.redirect_window(window, record).is_ok(),
+                (true, true) => redirects
+                    .redirect_subwindows(window, &targets, record)
+                    .is_ok(),
+                (false, false) => redirects.unredirect_window(window, client_id, mode),
+                (false, true) => redirects.unredirect_subwindows(window, &targets, client_id, mode),
+            };
+            debug!(
+                "client {} #{} COMPOSITE::{}Redirect{}(0x{:x}, mode={:?}) -> {} targets={}",
+                client_id.0,
+                sequence.0,
+                if redirect { "" } else { "Un" },
+                if subwindows { "Subwindows" } else { "Window" },
+                window_raw,
+                mode,
+                if ok { "ok" } else { "refused" },
+                targets.len(),
+            );
+            if !ok {
+                return error(
+                    state,
+                    if redirect {
+                        x11::error::BAD_ACCESS
+                    } else {
+                        x11::error::BAD_VALUE
+                    },
                 );
-                for target in &targets {
-                    crate::core_loop::process_disconnect::teardown_redirect_for_window(
-                        state, backend, None, *target,
-                    );
-                }
-                if backend.supports_redirect_activation() {
-                    // Restore window scene-participation to the
-                    // window's `mapped` state. Spec §285+360 —
-                    // redirect-state change as scene-structure
-                    // damage source; the v2 setter fires that
-                    // damage internally.
-                    for target in &targets {
-                        let snap = state
-                            .resources
-                            .window(*target)
-                            .map(|w| (w.host_xid, w.map_state != MapState::Unmapped));
-                        if let Some((Some(host), participating)) = snap
-                            && let Err(err) =
-                                backend.set_window_scene_participation(origin, host, participating)
-                        {
-                            log::warn!(
-                                "unredirect: set_window_scene_participation(0x{:x}, {participating}) failed: {err}",
-                                target.0
-                            );
-                        }
-                    }
-                }
+            }
+            for (target, before) in targets.into_iter().zip(before) {
+                sync_redirect_backing(state, backend, origin, target, before);
             }
         }
         x11composite::CREATE_REGION_FROM_BORDER_CLIP => {
@@ -8900,11 +8840,8 @@ fn handle_composite_request(
                 client_id.0, sequence.0, window_raw, pixmap_raw,
             );
             let snapshot = state.resources.window(window).map(|w| {
-                let parent_redirected = state
-                    .composite_redirects
-                    .keys()
-                    .any(|(rwid, sub)| *sub && *rwid == w.parent);
-                let self_redirected = state.composite_redirects.contains_key(&(window, false));
+                // Xorg compext.c:246 `if (!cw) return BadMatch;`.
+                let redirected = state.composite_redirects.window_mode(window).is_some();
                 let (pixmap_width, pixmap_height) = w
                     .redirected_backing
                     .as_ref()
@@ -8916,7 +8853,7 @@ fn handle_composite_request(
                     pixmap_width,
                     pixmap_height,
                     w.depth,
-                    parent_redirected || self_redirected,
+                    redirected,
                     w.map_state,
                 )
             });
@@ -18807,6 +18744,8 @@ fn handle_xi2_request(
                         .unwrap_or(i16::MAX);
                     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
                         .unwrap_or(i16::MAX);
+                    let focus =
+                        !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
                     let _dropped =
                         fanout_event_to_clients(state, &[client_id], |out, seq, order| {
                             x11::encode_xi2_crossing_event(
@@ -18827,6 +18766,7 @@ fn handle_xi2_request(
                                 1, // mode = NotifyGrab
                                 detail,
                                 deviceid,
+                                focus,
                             );
                         });
                 };
@@ -18968,6 +18908,8 @@ fn handle_xi2_request(
                         .unwrap_or(i16::MAX);
                     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
                         .unwrap_or(i16::MAX);
+                    let focus =
+                        !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
                     let _dropped =
                         fanout_event_to_clients(state, &[client_id], |out, seq, order| {
                             x11::encode_xi2_crossing_event(
@@ -18988,6 +18930,7 @@ fn handle_xi2_request(
                                 2, // mode = NotifyUngrab
                                 detail,
                                 deviceid,
+                                focus,
                             );
                         });
                 };
@@ -22951,6 +22894,39 @@ fn handle_reparent_window(
     let Some(request) = x11::reparent_window_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    // Xorg ReparentWindow unmaps a mapped window first (`dix/window.c:2519`):
+    // UnmapNotify, and the pointer leaves it while it is still in the old
+    // place. Its map state is only hidden for that hit-test; the reparent
+    // below keeps the window mapped, and the MapNotify after ReparentNotify
+    // stands for Xorg's MapWindow.
+    let unmapped = if state.resources.check_reparent_window(request).is_ok() {
+        state.resources.window(request.window).and_then(|w| {
+            (w.map_state != MapState::Unmapped).then_some((
+                w.parent,
+                w.map_state,
+                w.override_redirect,
+            ))
+        })
+    } else {
+        None
+    };
+    if let Some((old_parent, map_state, _)) = unmapped {
+        let window = request.window;
+        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+        });
+        let _dropped =
+            emit_window_event_to_state(state, old_parent, 0x0008_0000, |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, old_parent, window, false);
+            });
+        if let Some(w) = state.resources.window_mut(window) {
+            w.map_state = MapState::Unmapped;
+        }
+        backend.windows_restructured(state);
+        if let Some(w) = state.resources.window_mut(window) {
+            w.map_state = map_state;
+        }
+    }
     let result = match state.resources.reparent_window(request) {
         Ok(result) => result,
         Err(crate::resources::ReparentWindowError::BadWindow) => {
@@ -23063,113 +23039,27 @@ fn handle_reparent_window(
     let rx = result.x;
     let ry = result.y;
     let override_redirect = result.override_redirect;
-    // Phase 2: Xorg-style redirect reconciliation on reparent.
-    // Mirrors compUnredirectOneSubwindow + compRedirectOneSubwindow
-    // at /home/jos/Projects/xserver/composite/compwindow.c:453-454.
-    // The window's redirect state under RedirectSubwindows is
-    // inherited from its parent — when the parent changes, the
-    // inheritance changes too. RedirectWindow(W) is per-window
-    // and not affected.
-    //
-    // Without this, a window created under
-    // RedirectSubwindows(root, Manual) and reparented into a
-    // non-redirected ancestor (e.g. an XEMBED tray client like
-    // nm-applet reparenting into mate-panel's notification
-    // socket) keeps a stale backing. Paints land in that stale
-    // backing; the compositor reads the new ancestor's pixmap
-    // (which never received them) when building COW.
-    //
-    // Gated on `supports_redirect_activation()` for the same
-    // reason as `activate_redirect_backing_for` at
-    // process_request.rs:3289 — backends that don't opt in
-    // (v1, host-X11, and RecordingBackend in its default
-    // configuration) don't manage redirect state, so the
-    // redirect helpers would panic / silently misbehave there.
-    // Phase 2 tests opt in via
-    // `RecordingBackend::with_redirect_activation()` (see
-    // Task 6) and `KmsBackend::for_tests()` (which already
-    // returns `true`).
+    // Xorg compReparentWindow (composite/compwindow.c:453-454): the old
+    // parent's subwindows records leave the window, the new parent's join
+    // it; its own RedirectWindow records stay. A root child that leaves
+    // muffin's RedirectSubwindows(root, Manual) for a frame is no longer
+    // redirected, so no stale inner backing keeps its paints from the
+    // compositor (nm-applet into mate-panel's tray socket; Warframe
+    // fullscreen -> windowed: black).
+    let before = state.composite_redirects.window_mode(window);
+    state
+        .composite_redirects
+        .reparent_subwindow(old_parent, new_parent, window);
+    log::debug!(
+        "reparent reconcile: window=0x{:x} old_parent=0x{:x} new_parent=0x{:x} \
+         mode {before:?} -> {:?}",
+        window.0,
+        old_parent.0,
+        new_parent.0,
+        state.composite_redirects.window_mode(window),
+    );
     if backend.supports_redirect_activation() {
-        let old_parent_redirects_subwindows =
-            state.composite_redirects.contains_key(&(old_parent, true));
-        let new_parent_redirects_subwindows =
-            state.composite_redirects.contains_key(&(new_parent, true));
-        let directly_redirected = state.composite_redirects.contains_key(&(window, false));
-        let had_backing = state
-            .resources
-            .window(window)
-            .is_some_and(|w| w.redirected_backing.is_some());
-
-        log::debug!(
-            "reparent reconcile: window=0x{:x} old_parent=0x{:x} new_parent=0x{:x} \
-             old_redirects_sub={old_parent_redirects_subwindows} \
-             new_redirects_sub={new_parent_redirects_subwindows} \
-             directly_redirected={directly_redirected} had_backing={had_backing}",
-            window.0,
-            old_parent.0,
-            new_parent.0,
-        );
-        if !directly_redirected {
-            if old_parent_redirects_subwindows && !new_parent_redirects_subwindows {
-                log::debug!(
-                    "reparent reconcile: REVOKE window=0x{:x} (left redirected subtree)",
-                    window.0,
-                );
-                crate::core_loop::process_disconnect::teardown_redirect_for_window(
-                    state, backend, origin, window,
-                );
-            } else if !old_parent_redirects_subwindows
-                && new_parent_redirects_subwindows
-                && !had_backing
-            {
-                let new_mode = state
-                    .composite_redirects
-                    .get(&(new_parent, true))
-                    .expect("just checked contains_key")
-                    .mode;
-                log::debug!(
-                    "reparent reconcile: GRANT window=0x{:x} new_mode={new_mode:?} \
-                     (entered redirected subtree)",
-                    window.0,
-                );
-                activate_redirect_backing_for(state, backend, origin, window, new_mode);
-            } else if old_parent_redirects_subwindows && new_parent_redirects_subwindows {
-                let old_mode = state
-                    .composite_redirects
-                    .get(&(old_parent, true))
-                    .map(|r| r.mode);
-                let new_mode = state
-                    .composite_redirects
-                    .get(&(new_parent, true))
-                    .map(|r| r.mode);
-                if old_mode != new_mode
-                    && let Some(new_mode) = new_mode
-                {
-                    log::debug!(
-                        "reparent reconcile: FLIP window=0x{:x} old_mode={old_mode:?} \
-                         new_mode={new_mode:?}",
-                        window.0,
-                    );
-                    flip_redirect_target_mode(state, backend, origin, window, new_mode);
-                } else {
-                    log::debug!(
-                        "reparent reconcile: no-op (both redirected, mode unchanged) \
-                         window=0x{:x} mode={old_mode:?}",
-                        window.0,
-                    );
-                }
-            } else {
-                log::debug!(
-                    "reparent reconcile: no-op (state already consistent) window=0x{:x}",
-                    window.0,
-                );
-            }
-        } else {
-            log::debug!(
-                "reparent reconcile: skipped window=0x{:x} has direct RedirectWindow",
-                window.0,
-            );
-        }
+        sync_redirect_backing(state, backend, origin, window, before);
     }
     // After the reconcile, so a revoke still sees the backing it tears down.
     apply_viewability_delta_to_redirects(state, backend, origin, &result.delta);
@@ -23213,6 +23103,25 @@ fn handle_reparent_window(
             override_redirect,
         );
     });
+    if let Some((_, _, override_redirect)) = unmapped {
+        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
+            x11::encode_map_notify_event(buf, seq, order, window, window, override_redirect);
+        });
+        let _dropped =
+            emit_window_event_to_state(state, new_parent, 0x0008_0000, |buf, seq, order| {
+                x11::encode_map_notify_event(
+                    buf,
+                    seq,
+                    order,
+                    new_parent,
+                    window,
+                    override_redirect,
+                );
+            });
+    }
+    // The window moved in the tree; Xorg's ReparentWindow re-evaluates the
+    // pointer through its MapWindow (`dix/window.c:2695`).
+    backend.windows_restructured(state);
     Ok(RequestOutcome::Handled)
 }
 
@@ -23531,14 +23440,14 @@ fn handle_create_window(
                 // window lands where core put it (e.g. below the COW).
                 backend.sync_top_level_order(state);
             }
-            // L2 plan B.6b future-child hook: under spec, a freshly
-            // created child of a REDIRECT_SUBWINDOWS parent inherits
-            // the redirect. NameWindowPixmap's check at the top of
-            // NAME_WINDOW_PIXMAP already consults `composite_redirects`
-            // for the parent, so no per-child bookkeeping is needed
-            // until the backing-pixmap path lands.
         }
     }
+    // Xorg compCreateWindow (composite/compwindow.c:579-589): a child of a
+    // RedirectSubwindows parent gets that client's record. It is unmapped,
+    // so the backing waits for realize.
+    state
+        .composite_redirects
+        .redirect_new_subwindow(parent, window_id);
     // CreateNotify on parent (SubstructureNotify subscribers).
     let create_notify_targets = subscribers_by_id(state, parent, 0x0008_0000);
     if !create_notify_targets.is_empty() {
@@ -24428,6 +24337,9 @@ fn handle_configure_window(
             }
         }
     }
+    // Xorg miMoveWindow / miResizeWindow / ReflectStackChange end in
+    // WindowsRestructured (`mi/miwindow.c:302,620`, `dix/window.c:2179`).
+    backend.windows_restructured(state);
     // A confined pointer follows its confine window — re-clamp after
     // any geometry change (Xorg ConfineCursorToWindow on configure;
     // XGrabButton-25 moves confine_to and expects the pointer pulled
@@ -26771,7 +26683,13 @@ fn handle_query_tree(
     } else {
         window_state.parent
     };
-    let children = window_state.children.clone();
+    // Xorg's QueryTree stops at RealChildHead (dix/dispatch.c:1078), which
+    // Composite points at the overlay window while it tops the root
+    // (composite/compwindow.c:762): the COW is a root child nobody lists.
+    let mut children = window_state.children.clone();
+    if window == ROOT_WINDOW {
+        children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
+    }
     debug!(
         "client {} #{} QueryTree reply 0x{:x}: parent=0x{:x} children={}",
         client_id.0,
@@ -27472,6 +27390,9 @@ fn handle_map_window(
         }
         accumulate_damage_viewable_descendants_to_state(state, window);
     }
+    // Xorg MapWindow ends in WindowsRestructured (`dix/window.c:2695`): the
+    // pointer's crossings follow MapNotify and Expose within the request.
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} MapWindow 0x{:x} viewable+{}",
         client_id.0,
@@ -27595,6 +27516,9 @@ fn map_subwindows_with_delta(
             let _dropped = emit_expose_subtree_to_state(state, child);
         }
     }
+    // Xorg MapSubwindows: one WindowsRestructured after the batch
+    // (`dix/window.c:2775`).
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} MapSubwindows viewable+{}",
         client_id.0,
@@ -27686,6 +27610,8 @@ fn handle_unmap_window(
             // Active grabs on a window that just became unviewable
             // deactivate too (same Xorg path).
             release_core_grabs_for_unviewable(state, backend);
+            // Then WindowsRestructured (`dix/window.c:2871`).
+            backend.windows_restructured(state);
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -27721,7 +27647,7 @@ fn unmap_subwindows_with_delta(
         child: ResourceId,
         host_xid: Option<crate::backend::WindowHandle>,
     }
-    let Some(children) = state.resources.mapped_children_bottom_to_top(parent) else {
+    let Some(mut children) = state.resources.mapped_children_bottom_to_top(parent) else {
         return emit_x11_error(
             state,
             client_id,
@@ -27732,6 +27658,11 @@ fn unmap_subwindows_with_delta(
         )
         .map(|outcome| (outcome, delta));
     };
+    // UnmapSubwindows stops at RealChildHead too (dix/window.c:2897): the
+    // overlay window stays mapped.
+    if parent == ROOT_WINDOW {
+        children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
+    }
     // Snapshot mapping order + collect host xids; unmap each in the
     // resource table.
     let mut pending: Vec<PendingUnmap> = Vec::new();
@@ -27761,6 +27692,8 @@ fn unmap_subwindows_with_delta(
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
+    // Xorg UnmapSubwindows: one WindowsRestructured (`dix/window.c:2939`).
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} UnmapSubwindows viewable-{}",
         client_id.0,
@@ -27924,6 +27857,7 @@ fn window_attributes(
 
 fn handle_circulate_window(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -27951,41 +27885,51 @@ fn handle_circulate_window(
             13,
         );
     }
-    let chosen_child = {
-        let kids = state.resources.children(container);
-        match (direction, kids.first(), kids.last()) {
-            (0, _, Some(&back)) => Some(back),
-            (1, Some(&front), _) => Some(front),
-            _ => None,
-        }
-    };
-    let Some(child) = chosen_child else {
+    let Some(child) = state.circulate_candidate(container, direction) else {
         return Ok(RequestOutcome::Handled);
     };
-    // SubstructureRedirect on container takes priority — redirect the
-    // request to the first subscriber instead of performing the
-    // circulate.
+    // SubstructureRedirect on the container by another client turns it into
+    // a CirculateRequest (Xorg MaybeDeliverEventsToClient skips the
+    // requester).
     let redirect_target = subscribers_by_id(state, container, 0x0010_0000)
         .into_iter()
-        .next();
+        .find(|c| *c != client_id);
     if let Some(target) = redirect_target {
         let _dropped = fanout_event_to_clients(state, &[target], |buf, seq, order| {
             let _ =
                 x11::write_circulate_request_event(buf, order, seq, container, child, direction);
         });
     } else {
-        let _ = state.resources.circulate_window(container, direction);
-        let on_child = subscribers_by_id(state, child, 0x0002_0000);
-        let on_container = subscribers_by_id(state, container, 0x0008_0000);
-        let mut targets = on_child;
-        for cid in on_container {
-            if !targets.contains(&cid) {
-                targets.push(cid);
-            }
+        state.resources.circulate_child(child, direction == 0);
+        if let Some(xid) = state.resources.window(child).and_then(|w| w.host_xid) {
+            let _ = backend.configure_subwindow(
+                None,
+                xid.as_raw(),
+                crate::host_x11::HostSubwindowConfig {
+                    x: None,
+                    y: None,
+                    width: None,
+                    height: None,
+                    border_width: None,
+                    sibling: None,
+                    stack_mode: Some(if direction == 0 { 0 } else { 1 }),
+                },
+            );
         }
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        backend.sync_top_level_order(state);
+        // CirculateNotify to the window's StructureNotify and the parent's
+        // SubstructureNotify selectors, each with its own event window; the
+        // place (OnTop 0 / OnBottom 1) equals the direction.
+        let _dropped = emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
             let _ = x11::write_circulate_notify_event(buf, order, seq, child, child, direction);
         });
+        let _dropped =
+            emit_window_event_to_state(state, container, 0x0008_0000, |buf, seq, order| {
+                let _ =
+                    x11::write_circulate_notify_event(buf, order, seq, container, child, direction);
+            });
+        // Xorg ReflectStackChange (`dix/window.c:2179`).
+        backend.windows_restructured(state);
     }
     debug!("client {} #{} CirculateWindow", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -28812,8 +28756,11 @@ pub(crate) fn emit_core_focus_transition(
                     buf, seq, order, e.focus_in, e.window, mode, e.detail,
                 );
             });
-        // XI2 mirrors only the real FocusIn/FocusOut pairs (evtype
-        // 9/10) on the windows the core chain touches.
+    }
+    // Xorg DoFocusEvents: the whole core sequence, then the XI2 one
+    // (DeviceFocusEvents), which has its own windows.
+    for e in crate::crossings::device_focus_transition_events(state, from_raw, to_raw, pointer_win)
+    {
         let evtype = if e.focus_in { 9 } else { 10 };
         let _dropped = emit_xi2_focus_event_to_state(
             state,
@@ -32969,7 +32916,8 @@ pub(crate) fn confine_pointer_now(state: &mut ServerState, backend: &mut dyn Bac
 /// Xorg `ActivatePointerGrab`/`DeactivatePointerGrab` →
 /// `DoEnterLeaveEvents(sprite.win ↔ grab window, NotifyGrab/Ungrab)`.
 /// Events flow through the normal per-window mask filter (EnterWindow
-/// 0x10 / LeaveWindow 0x20) to every selecting client.
+/// 0x10 / LeaveWindow 0x20) to every selecting client, then the same chain
+/// in XI2 form (`DeviceEnterLeaveEvents`), from the master pointer.
 pub(crate) fn emit_core_pointer_grab_chain(
     state: &mut ServerState,
     from_win: ResourceId,
@@ -32982,7 +32930,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
     let chain = crate::crossings::normal_mode_crossings(state, from_win, to_win);
     let (root_x, root_y) = state.pointer_root;
     let server_time = state.timestamp_now();
-    for e in chain {
+    for e in &chain {
         let (mask, enter) = match e.kind {
             crate::crossings::CrossingKind::Enter => (0x10u32, true),
             crate::crossings::CrossingKind::Leave => (0x20u32, false),
@@ -32990,6 +32938,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
         let (ox, oy) = state.resources.window_absolute_position(e.window);
         let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let focus = state.crossing_has_focus(e.window);
         let _dropped = emit_window_event_to_state(state, e.window, mask, |buf, seq, order| {
             let crossing = yserver_protocol::x11::CrossingEvent {
                 sequence: seq,
@@ -33004,12 +32953,52 @@ pub(crate) fn emit_core_pointer_grab_chain(
                 state: 0,
                 detail: e.detail,
                 mode,
+                focus,
             };
             if enter {
                 x11::encode_enter_notify_event(buf, order, crossing);
             } else {
                 x11::encode_leave_notify_event(buf, order, crossing);
             }
+        });
+    }
+    for e in chain {
+        let evtype: u16 = match e.kind {
+            crate::crossings::CrossingKind::Enter => 7,
+            crate::crossings::CrossingKind::Leave => 8,
+        };
+        // Xorg sends these before the grab is installed and after it is
+        // gone, so the window's selections get them, whatever the grab.
+        let targets =
+            crate::core_loop::pointer_fanout::xi2_master_selectors(state, e.window, evtype);
+        if targets.is_empty() {
+            continue;
+        }
+        let (ox, oy) = state.resources.window_absolute_position(e.window);
+        let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
+        let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let focus = state.crossing_has_focus(e.window);
+        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+            x11::encode_xi2_crossing_event(
+                buf,
+                order,
+                seq,
+                XI2_MAJOR_OPCODE,
+                evtype,
+                2,
+                server_time,
+                ROOT_WINDOW,
+                e.window,
+                root_x,
+                root_y,
+                event_x,
+                event_y,
+                0,
+                mode,
+                e.detail,
+                2,
+                focus,
+            );
         });
     }
 }
@@ -35210,8 +35199,10 @@ mod tests {
     }
 
     /// ProcTranslateCoords applies child input shapes. The Composite Overlay
-    /// Window is the top root child but has an empty input shape by default,
-    /// so a mapped popup below it must be returned as `child`, as on Xorg.
+    /// Window is the top root child and, like Xorg's, starts unshaped, so it
+    /// is the `child` over a popup until the compositor empties its input
+    /// region; then the popup below it is (measured on Xvfb 21.1,
+    /// tools/vng-scenarios/cow-input-shape).
     #[test]
     fn translate_coordinates_skips_empty_input_shaped_cow() {
         use crate::{backend::WindowHandle, resources::COMPOSITE_OVERLAY_WINDOW};
@@ -35236,27 +35227,38 @@ mod tests {
         state
             .resources
             .materialize_cow_resource(WindowHandle::from_raw_for_test(COMPOSITE_OVERLAY_WINDOW.0));
-        state.materialize_cow_input_shape();
         let _ = read_all_available(&mut peer);
 
-        let mut body = Vec::with_capacity(12);
-        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
-        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
-        body.extend_from_slice(&715i16.to_le_bytes());
-        body.extend_from_slice(&327i16.to_le_bytes());
-        handle_translate_coordinates(&mut state, ClientId(1), SequenceNumber(1), &body)
-            .expect("handle_translate_coordinates");
-
-        let bytes = read_all_available(&mut peer);
-        assert_eq!(bytes.len(), 32);
-        assert_eq!(bytes[0], 1, "reply");
+        let mut translate = |state: &mut ServerState| {
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&715i16.to_le_bytes());
+            body.extend_from_slice(&327i16.to_le_bytes());
+            handle_translate_coordinates(state, ClientId(1), SequenceNumber(1), &body)
+                .expect("handle_translate_coordinates");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32);
+            assert_eq!(bytes[0], 1, "reply");
+            assert_eq!(i16::from_le_bytes(bytes[12..14].try_into().unwrap()), 715);
+            assert_eq!(i16::from_le_bytes(bytes[14..16].try_into().unwrap()), 327);
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+        };
         assert_eq!(
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            translate(&mut state),
+            COMPOSITE_OVERLAY_WINDOW.0,
+            "an unshaped COW is the child over the popup",
+        );
+        state
+            .shape_windows
+            .entry(COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::new());
+        assert_eq!(
+            translate(&mut state),
             popup.0,
             "empty-input COW must not hide the popup child",
         );
-        assert_eq!(i16::from_le_bytes(bytes[12..14].try_into().unwrap()), 715);
-        assert_eq!(i16::from_le_bytes(bytes[14..16].try_into().unwrap()), 327);
     }
 
     #[test]
@@ -46792,40 +46794,23 @@ mod tests {
         let bytes = read_all_available(&mut peer);
 
         assert_eq!(bytes.len(), 216, "expected core + XI2 focus out/in");
+        // Xorg DoFocusEvents: the core sequence first, then the XI2 one.
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let half = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
         assert_eq!(bytes[0], 10, "first event should be core FocusOut");
         assert_eq!(bytes[1], 2, "parent FocusOut should be NotifyInferior");
-        assert_eq!(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            TOP
-        );
-        assert_eq!(bytes[32], 35, "second event should be XI2 GenericEvent");
-        assert_eq!(
-            u16::from_le_bytes([bytes[40], bytes[41]]),
-            10,
-            "XI2 FocusOut evtype"
-        );
-        assert_eq!(bytes[51], 2, "XI2 parent FocusOut should be NotifyInferior");
-        assert_eq!(
-            u32::from_le_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]),
-            TOP
-        );
-        assert_eq!(bytes[108], 9, "third event should be core FocusIn");
-        assert_eq!(bytes[109], 0, "child FocusIn should be NotifyAncestor");
-        assert_eq!(
-            u32::from_le_bytes([bytes[112], bytes[113], bytes[114], bytes[115]]),
-            CHILD
-        );
+        assert_eq!(word(4), TOP);
+        assert_eq!(bytes[32], 9, "second event should be core FocusIn");
+        assert_eq!(bytes[33], 0, "child FocusIn should be NotifyAncestor");
+        assert_eq!(word(36), CHILD);
+        assert_eq!(bytes[64], 35, "third event should be XI2 GenericEvent");
+        assert_eq!(half(72), 10, "XI2 FocusOut evtype");
+        assert_eq!(bytes[83], 2, "XI2 parent FocusOut should be NotifyInferior");
+        assert_eq!(word(88), TOP);
         assert_eq!(bytes[140], 35, "fourth event should be XI2 GenericEvent");
-        assert_eq!(
-            u16::from_le_bytes([bytes[148], bytes[149]]),
-            9,
-            "XI2 FocusIn evtype"
-        );
+        assert_eq!(half(148), 9, "XI2 FocusIn evtype");
         assert_eq!(bytes[159], 0, "XI2 child FocusIn should be NotifyAncestor");
-        assert_eq!(
-            u32::from_le_bytes([bytes[164], bytes[165], bytes[166], bytes[167]]),
-            CHILD
-        );
+        assert_eq!(word(164), CHILD);
         assert_eq!(
             state.core_focus.raw, CHILD,
             "keyboard focus should track child"
@@ -49465,6 +49450,18 @@ mod tests {
         window: u32,
         mode: u8,
     ) -> RequestOutcome {
+        dispatch_composite_window_update(state, backend, client_id, 1, window, mode)
+    }
+
+    /// Any of Redirect/UnredirectWindow/Subwindows (minor 1-4).
+    fn dispatch_composite_window_update(
+        state: &mut ServerState,
+        backend: &mut dyn crate::backend::Backend,
+        client_id: ClientId,
+        minor: u8,
+        window: u32,
+        mode: u8,
+    ) -> RequestOutcome {
         let body = composite_redirect_request_body(window, mode);
         process_request(
             state,
@@ -49473,7 +49470,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 144,
-                data: 1, // REDIRECT_WINDOW
+                data: minor,
                 length_units: 3,
             },
             &body,
@@ -49482,53 +49479,127 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn redirect_window_conflict_from_different_client_returns_bad_access() {
-        let mut state = ServerState::new();
-        let _peer_a = install_client(&mut state, 1);
-        let mut peer_b = install_client(&mut state, 2);
-        let mut backend = RecordingBackend::new();
-        // Client A redirects window 0xCAFE first (succeeds).
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xCAFE, 0);
-        // Client B tries the same redirect — must get BadAccess.
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0xCAFE, 0);
-        peer_b.set_nonblocking(true).unwrap();
+    fn create_root_child(state: &mut ServerState, window: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window),
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The error code a client got, or `None` when nothing was written.
+    fn read_error_code(peer: &mut std::os::unix::net::UnixStream) -> Option<u8> {
+        peer.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 32];
-        peer_b.read_exact(&mut buf).expect("error delivered to B");
-        assert_eq!(buf[0], 0, "expected X11 Error, got opcode {}", buf[0]);
-        // BAD_ACCESS = 10
-        assert_eq!(buf[1], 10, "expected BadAccess (10), got {}", buf[1]);
+        match peer.read(&mut buf) {
+            Ok(32) if buf[0] == 0 => Some(buf[1]),
+            Ok(0) | Err(_) => None,
+            Ok(n) => panic!("unexpected {n} bytes: {buf:02x?}"),
+        }
     }
 
     #[test]
-    fn redirect_window_same_client_idempotent() {
+    fn second_manual_redirect_from_another_client_is_bad_access() {
         let mut state = ServerState::new();
         let mut peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
         let mut backend = RecordingBackend::new();
-        // Two REDIRECT_WINDOW from the same client on the same window:
-        // both should succeed with no error event written.
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xBEEF, 0);
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xBEEF, 0);
-        peer_a.set_nonblocking(true).unwrap();
-        let mut buf = [0u8; 32];
-        let n = peer_a.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
-        assert_eq!(state.composite_redirects.len(), 1);
+        create_root_child(&mut state, 0x0010_0001);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0x0010_0001, 1);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0x0010_0001, 1);
+        assert_eq!(read_error_code(&mut peer_a), None);
+        assert_eq!(read_error_code(&mut peer_b), Some(x11::error::BAD_ACCESS));
     }
 
     #[test]
-    fn redirect_manual_mode_is_accepted() {
+    fn automatic_redirects_from_several_clients_coexist() {
+        // Xorg compRedirectWindow refuses only a second Manual redirect.
+        let mut state = ServerState::new();
+        let mut peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        create_root_child(&mut state, 0x0010_0001);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0x0010_0001, 0);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0x0010_0001, 1);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0x0010_0001, 0);
+        assert_eq!(read_error_code(&mut peer_a), None);
+        assert_eq!(read_error_code(&mut peer_b), None);
+        assert_eq!(
+            state
+                .composite_redirects
+                .window_records(ResourceId(0x0010_0001))
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn redirect_of_an_unknown_window_is_bad_window() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // compositeproto: update=1 → Manual. xfwm4, picom, xcompmgr,
-        // and mate-panel's notification-area-applet all request Manual.
         dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 1);
-        peer.set_nonblocking(true).unwrap();
-        let mut buf = [0u8; 32];
-        let n = peer.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
-        assert_eq!(state.composite_redirects.len(), 1);
+        assert_eq!(read_error_code(&mut peer), Some(x11::error::BAD_WINDOW));
+        assert!(state.composite_redirects.is_empty());
+    }
+
+    #[test]
+    fn redirect_window_of_the_root_is_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), ROOT_WINDOW.0, 1);
+        assert_eq!(read_error_code(&mut peer), Some(x11::error::BAD_MATCH));
+    }
+
+    #[test]
+    fn fullscreen_unredirect_and_re_redirect_under_root_subwindows_redirect() {
+        // Measured on Xvfb 21.1 (tools/vng-scenarios/composite-reredirect).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let w = 0x0010_0001;
+        dispatch_composite_window_update(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            ROOT_WINDOW.0,
+            1,
+        );
+        create_root_child(&mut state, w);
+        state
+            .composite_redirects
+            .redirect_new_subwindow(ROOT_WINDOW, ResourceId(w));
+        let codes = [
+            (3, None),                         // UnredirectWindow(W)
+            (3, Some(x11::error::BAD_VALUE)),  // again
+            (1, None),                         // RedirectWindow(W, Manual)
+            (1, Some(x11::error::BAD_ACCESS)), // again
+            (4, None),                         // UnredirectSubwindows(root)
+            (3, Some(x11::error::BAD_VALUE)),  // its free took W's record too
+        ];
+        for (minor, want) in codes {
+            let target = if minor == 4 { ROOT_WINDOW.0 } else { w };
+            dispatch_composite_window_update(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                minor,
+                target,
+                1,
+            );
+            assert_eq!(read_error_code(&mut peer), want, "minor {minor}");
+        }
+        assert!(state.composite_redirects.is_empty());
     }
 
     #[test]
@@ -49553,13 +49624,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        state.composite_redirects.insert(
-            (ROOT_WINDOW, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                state.resources.children(ROOT_WINDOW),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
 
         // Muffin issues this redundant request for a root child that
         // already inherited root RedirectSubwindows(Manual). Xorg's
@@ -49571,9 +49646,10 @@ mod tests {
         peer.read_exact(&mut buf).expect("BadAccess delivered");
         assert_eq!(buf[0], 0);
         assert_eq!(buf[1], x11::error::BAD_ACCESS);
-        assert!(
-            !state.composite_redirects.contains_key(&(window, false)),
-            "rejected probe must not install a persistent direct redirect",
+        assert_eq!(
+            state.composite_redirects.window_records(window).len(),
+            1,
+            "rejected probe must not install a second redirect",
         );
     }
 
@@ -49584,6 +49660,9 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(0xC0C0));
 
         dispatch_composite_redirect(
             &mut state,
@@ -56308,7 +56387,8 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         // Anything outside {0, 1} is a spec violation → BadValue.
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 2);
+        create_root_child(&mut state, 0x0010_0001);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0x0010_0001, 2);
         peer.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 32];
         peer.read_exact(&mut buf).expect("error delivered");
@@ -56409,13 +56489,16 @@ mod tests {
             height: 505,
             depth: 32,
         });
-        state.composite_redirects.insert(
-            (WINDOW, false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                WINDOW,
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
 
         let mut body = Vec::with_capacity(8);
         body.extend_from_slice(&WINDOW.0.to_le_bytes());
@@ -56559,6 +56642,170 @@ mod tests {
             vec![ClientId(1), ClientId(1)],
             "each GET records its own claim — what moved to the core claim \
              list is exactly what the backend refcount used to count",
+        );
+    }
+
+    /// Xorg `compCreateOverlayWindow` (`composite/compoverlay.c:149`) gives the
+    /// overlay no input shape, so it takes the pointer over the whole screen
+    /// until the compositor empties its input region, and again after a reset
+    /// to None (measured on Xvfb 21.1, tools/vng-scenarios/cow-input-shape).
+    #[test]
+    fn overlay_window_takes_the_pointer_until_its_input_region_is_emptied() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes as x11xfixes};
+
+        const APP: ResourceId = ResourceId(0x0020_0001);
+        const REGION: u32 = 0x0010_0042;
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: APP,
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 200,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(APP);
+        let hit = |state: &ServerState| state.root_pointer_target_at(150, 150).map(|h| h.0);
+        assert_eq!(hit(&state), Some(APP));
+
+        let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_eq!(hit(&state), Some(cow), "an unshaped COW takes the pointer");
+
+        let mut xfixes = |state: &mut ServerState, minor: u8, body: Vec<u8>| {
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            };
+            handle_xfixes_request(
+                state,
+                &mut backend,
+                None,
+                ClientId(1),
+                SequenceNumber(2),
+                header,
+                &body,
+            )
+            .expect("XFIXES request");
+        };
+        let input_region = |region: u32| {
+            let mut body = cow.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[x11shape::KIND_INPUT, 0, 0, 0, 0, 0, 0, 0]);
+            body.extend_from_slice(&region.to_le_bytes());
+            body
+        };
+        xfixes(
+            &mut state,
+            x11xfixes::CREATE_REGION,
+            REGION.to_le_bytes().to_vec(),
+        );
+        xfixes(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            input_region(REGION),
+        );
+        assert_eq!(
+            hit(&state),
+            Some(APP),
+            "an empty input region passes through"
+        );
+        xfixes(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            input_region(0),
+        );
+        assert_eq!(hit(&state), Some(cow), "None restores the default region");
+
+        body[0..4].copy_from_slice(&cow.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            3,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_eq!(hit(&state), Some(APP));
+    }
+
+    #[test]
+    fn overlay_window_create_and_release_notify_root_substructure_listeners() {
+        // Xorg compCreateOverlayWindow / DeleteWindow, measured on Xvfb 21.1
+        // (tools/vng-scenarios/composite-reredirect): CreateNotify, MapNotify;
+        // then UnmapNotify, DestroyNotify after the last release.
+        const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
+        const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+        let mut state = ServerState::new();
+        let _compositor = install_client(&mut state, 1);
+        let mut listener = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        state
+            .clients
+            .get_mut(&2)
+            .expect("listener")
+            .event_masks
+            .insert(ROOT_WINDOW, SUBSTRUCTURE_NOTIFY);
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let events = |bytes: &[u8]| -> Vec<(u8, u32, u32)> {
+            let word =
+                |e: &[u8], at: usize| u32::from_le_bytes([e[at], e[at + 1], e[at + 2], e[at + 3]]);
+            bytes
+                .chunks_exact(32)
+                .map(|e| (e[0], word(e, 4), word(e, 8)))
+                .collect()
+        };
+        let root_body = ROOT_WINDOW.0.to_le_bytes();
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &root_body,
+        );
+        assert_eq!(
+            events(&read_all_available(&mut listener)),
+            vec![(16, ROOT_WINDOW.0, cow.0), (19, ROOT_WINDOW.0, cow.0)],
+            "CreateNotify(parent=root, window=COW), MapNotify(event=root)"
+        );
+        state
+            .clients
+            .get_mut(&2)
+            .expect("listener")
+            .event_masks
+            .insert(cow, STRUCTURE_NOTIFY);
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &root_body,
+        );
+        assert_eq!(
+            events(&read_all_available(&mut listener)),
+            vec![
+                (18, cow.0, cow.0),
+                (18, ROOT_WINDOW.0, cow.0),
+                (17, cow.0, cow.0),
+                (17, ROOT_WINDOW.0, cow.0),
+            ],
         );
     }
 
@@ -58266,13 +58513,16 @@ mod tests {
         }
         // Viewable: Xorg allocates a redirect backing only for a realized window.
         let _ = state.resources.map_window(ResourceId(WINDOW_XID));
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(1),
+                },
+            )
+            .unwrap();
 
         activate_redirect_backing_for(
             &mut state,
@@ -58418,13 +58668,16 @@ mod tests {
         }
         // Viewable: Xorg allocates a redirect backing only for a realized window.
         let _ = state.resources.map_window(ResourceId(WINDOW_XID));
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(1),
+                },
+            )
+            .unwrap();
 
         activate_redirect_backing_for(
             &mut state,
@@ -58491,13 +58744,16 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+                },
+            )
+            .unwrap();
         state.damage_objects.insert(
             DAMAGE_XID,
             DamageObject {
@@ -58684,13 +58940,16 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+                },
+            )
+            .unwrap();
 
         activate_redirect_backing_for(
             &mut state,
@@ -60229,6 +60488,7 @@ mod tests {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 },
             ));
         }
@@ -60407,6 +60667,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _ =
@@ -60544,6 +60805,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -60770,6 +61032,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -61051,6 +61314,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }),
         });
 
@@ -61169,6 +61433,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }),
         });
 
@@ -61290,6 +61555,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
             &mut state,
@@ -61432,6 +61698,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -61585,6 +61852,7 @@ mod tests {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 },
             ));
         }
@@ -61700,6 +61968,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -61827,6 +62096,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -62003,6 +62273,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -62155,6 +62426,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -62273,6 +62545,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -66607,6 +66880,64 @@ mod tests {
     }
 
     #[test]
+    fn query_tree_of_the_root_hides_the_overlay_window() {
+        // Xorg CompositeRealChildHead (composite/compwindow.c:762), measured
+        // on Xvfb 21.1 (tools/vng-scenarios/composite-reredirect).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let child = ResourceId(0x0010_0001);
+        create_root_child(&mut state, child.0);
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(0xC0C0));
+        handle_query_tree(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            &ROOT_WINDOW.0.to_le_bytes(),
+        )
+        .expect("QueryTree");
+        let reply = read_all_available(&mut peer);
+        let listed: Vec<u32> = reply[32..]
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(u16::from_le_bytes([reply[16], reply[17]]), 1);
+        assert_eq!(listed, vec![child.0]);
+    }
+
+    #[test]
+    fn unmap_subwindows_of_the_root_leaves_the_overlay_window_mapped() {
+        // dix/window.c:2897 stops at RealChildHead; measured on Xvfb 21.1.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let child = ResourceId(0x0010_0001);
+        create_root_child(&mut state, child.0);
+        let _ = state.resources.map_window(child);
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(0xC0C0));
+        let (_, delta) = unmap_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &ROOT_WINDOW.0.to_le_bytes(),
+        )
+        .expect("UnmapSubwindows");
+        assert_eq!(delta.became_unviewable, vec![child]);
+        assert_eq!(
+            state
+                .resources
+                .window(COMPOSITE_OVERLAY_WINDOW)
+                .map(|w| w.map_state),
+            Some(MapState::Viewable)
+        );
+    }
+
+    #[test]
     fn map_and_unmap_under_unmapped_parent_still_send_notify() {
         const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
         let mut state = ServerState::new();
@@ -67125,13 +67456,16 @@ mod tests {
                 depth: 32,
             });
         }
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+                },
+            )
+            .unwrap();
 
         rotate_redirected_backing_on_resize(
             &mut state,
@@ -67635,13 +67969,16 @@ mod tests {
             },
         );
         let _ = state.resources.map_window(ResourceId(FRAME_XID));
-        state.composite_redirects.insert(
-            (ResourceId(FRAME_XID), false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(MARCO),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(FRAME_XID),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(MARCO),
+                },
+            )
+            .unwrap();
         // Mark the frame as redirected (Manual-redirect activated
         // state). `host_pixmap` value is opaque to the damage path.
         if let Some(w) = state.resources.window_mut(ResourceId(FRAME_XID)) {
@@ -67770,13 +68107,17 @@ mod tests {
         let mut backend = RecordingBackend::new();
         let mut peer = install_client(&mut state, MARCO);
 
-        state.composite_redirects.insert(
-            (ROOT_WINDOW, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(MARCO),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                state.resources.children(ROOT_WINDOW),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(MARCO),
+                },
+            )
+            .unwrap();
 
         state.resources.create_window(
             ClientId(MARCO),
@@ -67794,6 +68135,9 @@ mod tests {
                 ..Default::default()
             },
         );
+        state
+            .composite_redirects
+            .redirect_new_subwindow(ROOT_WINDOW, ResourceId(CHILD_XID));
         let _ = state.resources.map_window(ResourceId(CHILD_XID));
 
         state.damage_objects.insert(
@@ -67875,13 +68219,17 @@ mod tests {
         let mut backend = RecordingBackend::new();
         let mut peer = install_client(&mut state, FASTCOMPMGR);
 
-        state.composite_redirects.insert(
-            (ROOT_WINDOW, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(FASTCOMPMGR),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                state.resources.children(ROOT_WINDOW),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(FASTCOMPMGR),
+                },
+            )
+            .unwrap();
 
         state.resources.create_window(
             ClientId(FASTCOMPMGR),
@@ -67992,13 +68340,16 @@ mod tests {
                 },
             );
             let _ = state.resources.map_window(ResourceId(xid));
-            state.composite_redirects.insert(
-                (ResourceId(xid), false),
-                RedirectRecord {
-                    mode: CompositeRedirectMode::Manual,
-                    owner: ClientId(MARCO),
-                },
-            );
+            state
+                .composite_redirects
+                .redirect_window(
+                    ResourceId(xid),
+                    RedirectRecord {
+                        mode: CompositeRedirectMode::Manual,
+                        owner: ClientId(MARCO),
+                    },
+                )
+                .unwrap();
             if let Some(w) = state.resources.window_mut(ResourceId(xid)) {
                 w.host_xid = crate::backend::WindowHandle::from_raw(0xD000_0000 | xid);
                 w.redirected_backing = Some(RedirectedBacking {
@@ -70900,13 +71251,16 @@ mod tests {
         // `(window, subwindows=false)` for per-window
         // RedirectWindow (vs `(parent, true)` for the inherited
         // RedirectSubwindows form).
-        state.composite_redirects.insert(
-            (child_xid, false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                child_xid,
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
 
         let rect = yserver_protocol::x11::CopyAreaRequest {
             src: ResourceId(0x1),
@@ -70993,13 +71347,16 @@ mod tests {
             child.map_state = MapState::Viewable;
             assert_eq!(child.class, WindowClass::InputOutput);
         }
-        state.composite_redirects.insert(
-            (child_xid, false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Automatic,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                child_xid,
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Automatic,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
 
         let rect = yserver_protocol::x11::CopyAreaRequest {
             src: ResourceId(0x1),
@@ -71486,6 +71843,10 @@ mod tests {
             // out of the backend; tests just need stable values.
             w.host_xid = crate::backend::WindowHandle::from_raw(0x8000_0000 | xid.0);
         }
+        // As CreateWindow does.
+        state
+            .composite_redirects
+            .redirect_new_subwindow(parent, xid);
     }
 
     /// Attach a `RedirectedBacking` to an already-seeded window.
@@ -71569,13 +71930,17 @@ mod tests {
         let nm_applet_xid = ResourceId(0x180_000b);
 
         // root has RedirectSubwindows(Manual); socket does not.
-        state.composite_redirects.insert(
-            (root_xid, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                root_xid,
+                state.resources.children(root_xid),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
         seed_redirected_window(&mut state, &mut backend, mate_panel_xid);
@@ -71626,21 +71991,26 @@ mod tests {
         let frame = ResourceId(0x510_0040);
         let window = ResourceId(0x530_0003);
 
-        state.composite_redirects.insert(
-            (root, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                root,
+                state.resources.children(root),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
         seed_window(&mut state, frame, root, 1024, 768);
         seed_window(&mut state, window, root, 1024, 768);
         seed_redirected_window(&mut state, &mut backend, window);
 
         dispatch_composite_redirect(&mut state, &mut backend, ClientId(14), window.0, 1);
-        assert!(
-            !state.composite_redirects.contains_key(&(window, false)),
-            "BadAccess probe must not create a direct redirect",
+        assert_eq!(
+            state.composite_redirects.window_records(window).len(),
+            1,
+            "BadAccess probe must not add a redirect",
         );
 
         dispatch_reparent_window(&mut state, &mut backend, window, frame, 0, 0);
@@ -71671,13 +72041,17 @@ mod tests {
         let unredirected_parent_xid = ResourceId(0x300_0001);
         let target_xid = ResourceId(0x300_0010);
 
-        state.composite_redirects.insert(
-            (mate_panel_xid, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Automatic,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                mate_panel_xid,
+                state.resources.children(mate_panel_xid),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Automatic,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
         seed_window(&mut state, unredirected_parent_xid, root_xid, 100, 100);
@@ -71728,13 +72102,16 @@ mod tests {
         let socket_xid = ResourceId(0x210_0013);
         let directly_redirected_xid = ResourceId(0x400_0001);
 
-        state.composite_redirects.insert(
-            (directly_redirected_xid, false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                directly_redirected_xid,
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
         seed_window(&mut state, socket_xid, mate_panel_xid, 26, 27);
@@ -71912,7 +72289,7 @@ mod tests {
         );
         assert_eq!(backing_of(&state, window), None);
         assert!(
-            state.composite_redirects.contains_key(&(window, false)),
+            state.composite_redirects.window_mode(window).is_some(),
             "redirect record kept"
         );
         assert!(
@@ -71975,7 +72352,7 @@ mod tests {
         let calls = drain_calls(&backend);
         assert!(released(&calls, backing));
         assert_eq!(backing_of(&state, window), None);
-        assert!(state.composite_redirects.contains_key(&(window, false)));
+        assert!(state.composite_redirects.window_mode(window).is_some());
         assert!(!participation_restored(&calls, window));
 
         storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
@@ -72020,7 +72397,7 @@ mod tests {
         let calls = drain_calls(&backend);
         assert!(released(&calls, shown_backing));
         assert_eq!(backing_of(&state, shown), None);
-        assert!(state.composite_redirects.contains_key(&(parent, true)));
+        assert!(state.composite_redirects.subwindows_mode(parent).is_some());
         assert!(!participation_restored(&calls, shown));
 
         storage_window_req(&mut state, &mut backend, MAP_SUBWINDOWS, parent);
@@ -72054,7 +72431,7 @@ mod tests {
         let calls = drain_calls(&backend);
         assert!(released(&calls, backing));
         assert_eq!(backing_of(&state, window), None);
-        assert!(!state.composite_redirects.contains_key(&(window, false)));
+        assert!(state.composite_redirects.window_mode(window).is_none());
         assert_eq!(last_participation(&calls, window), Some(true));
         storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
         storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
@@ -72097,7 +72474,7 @@ mod tests {
         storage_window_req(&mut state, &mut backend, 4, window); // DestroyWindow
         let calls = drain_calls(&backend);
         assert!(released(&calls, backing));
-        assert!(!state.composite_redirects.contains_key(&(window, false)));
+        assert!(state.composite_redirects.window_mode(window).is_none());
     }
 
     #[test]
@@ -72105,7 +72482,7 @@ mod tests {
         let (mut state, mut backend, window, _backing) = storage_redirected_top_level();
         storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
         storage_window_req(&mut state, &mut backend, 4, window);
-        assert!(!state.composite_redirects.contains_key(&(window, false)));
+        assert!(state.composite_redirects.window_mode(window).is_none());
     }
 
     #[test]
@@ -72123,7 +72500,7 @@ mod tests {
         dispatch_reparent_window(&mut state, &mut backend, window, hidden_parent, 0, 0);
         assert!(released(&drain_calls(&backend), backing));
         assert_eq!(backing_of(&state, window), None);
-        assert!(state.composite_redirects.contains_key(&(window, false)));
+        assert!(state.composite_redirects.window_mode(window).is_some());
         storage_window_req(&mut state, &mut backend, MAP_WINDOW, hidden_parent);
         assert_eq!(allocations_for(&drain_calls(&backend), window), 1);
     }
@@ -72176,20 +72553,28 @@ mod tests {
         let parent_automatic_xid = ResourceId(0x500_0002);
         let target_xid = ResourceId(0x500_0010);
 
-        state.composite_redirects.insert(
-            (parent_manual_xid, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
-        state.composite_redirects.insert(
-            (parent_automatic_xid, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Automatic,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                parent_manual_xid,
+                state.resources.children(parent_manual_xid),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                parent_automatic_xid,
+                state.resources.children(parent_automatic_xid),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Automatic,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_window(&mut state, parent_manual_xid, root_xid, 100, 100);
         seed_window(&mut state, parent_automatic_xid, root_xid, 100, 100);
@@ -75146,13 +75531,16 @@ mod tests {
                 state.resources.map_window(win).mapping_changed,
                 "window must map"
             );
-            state.composite_redirects.insert(
-                (win, false),
-                RedirectRecord {
-                    mode: CompositeRedirectMode::Manual,
-                    owner: ClientId(1),
-                },
-            );
+            state
+                .composite_redirects
+                .redirect_window(
+                    win,
+                    RedirectRecord {
+                        mode: CompositeRedirectMode::Manual,
+                        owner: ClientId(1),
+                    },
+                )
+                .unwrap();
             // ReportLevel Raw, so `rects` keeps the real strips instead
             // of the NonEmpty full-extent substitute.
             state.damage_objects.insert(
@@ -75288,13 +75676,16 @@ mod tests {
                     "window must map"
                 );
             }
-            state.composite_redirects.insert(
-                (win, false),
-                RedirectRecord {
-                    mode: CompositeRedirectMode::Manual,
-                    owner: ClientId(1),
-                },
-            );
+            state
+                .composite_redirects
+                .redirect_window(
+                    win,
+                    RedirectRecord {
+                        mode: CompositeRedirectMode::Manual,
+                        owner: ClientId(1),
+                    },
+                )
+                .unwrap();
             state.damage_objects.insert(
                 DAMAGE_XID,
                 DamageObject {
@@ -78699,7 +79090,6 @@ mod tests {
         state
             .resources
             .materialize_cow_resource(WindowHandle::from_raw_for_test(COMPOSITE_OVERLAY_WINDOW.0));
-        state.materialize_cow_input_shape();
         state
             .clients
             .get_mut(&CLIENT_ID)
@@ -79494,6 +79884,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -79800,6 +80191,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -79992,6 +80384,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -80185,6 +80578,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             };
             let _ = pointer_event_fanout_to_state(
                 &mut state,
@@ -80407,6 +80801,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -80542,6 +80937,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -80800,6 +81196,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);

@@ -37,7 +37,8 @@ fn collect_destroy_order(
     let Some(w) = table.window(root) else {
         return;
     };
-    for child in w.children.clone() {
+    // Xorg CrushTree (`dix/window.c:1023`): inferiors first, topmost first.
+    for child in w.children.clone().into_iter().rev() {
         collect_destroy_order(table, child, out);
     }
     out.push(root);
@@ -292,7 +293,9 @@ pub fn process_disconnect_reporting(
                     .map_or((ROOT_WINDOW, false, None), |win| {
                         (
                             win.parent,
-                            win.map_state != MapState::Unmapped,
+                            // Xorg DeleteWindow unmaps only the window it
+                            // deletes; CrushTree sends its inferiors none.
+                            *w == root && win.map_state != MapState::Unmapped,
                             win.host_xid,
                         )
                     });
@@ -306,6 +309,16 @@ pub fn process_disconnect_reporting(
                 on_window,
                 on_parent,
             });
+        }
+        // Xorg DeleteWindow unmaps first (`dix/window.c:1075`): the pointer
+        // leaves the dying subtree while it still exists.
+        if state
+            .resources
+            .window(root)
+            .is_some_and(|w| w.map_state != MapState::Unmapped)
+        {
+            let _ = state.resources.unmap_window(root);
+            backend.windows_restructured(state);
         }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
         crate::core_loop::process_request::free_pictures_on_destroyed_windows(
@@ -415,37 +428,18 @@ pub fn process_disconnect_reporting(
     state
         .damage_objects
         .retain(|_, damage| damage.owner != client_id && !dead_windows.contains(&damage.drawable));
-    // L2 plan B.1b: walk redirects owned by the departing client and
-    // tear each one down (the helper handles `Window.redirected_backing`
-    // reset + alias_registry refcount decrement when B.6c lands; for
-    // now it's a logged no-op so the wiring is in place when the
-    // backing-allocation tasks land). Then filter by both ownership
-    // and dead-window so any leftovers caught by the previous rule
-    // are still removed.
-    let owned_redirects: Vec<(ResourceId, bool)> = state
-        .composite_redirects
-        .iter()
-        .filter(|(_, rec)| rec.owner == client_id)
-        .map(|((win, sub), _)| (*win, *sub))
-        .collect();
-    // Stage 4b: symmetric to the COMPOSITE `UnredirectSubwindows`
-    // dispatch arm in `process_request.rs` — a subtree entry tears
-    // down each *child*, not the parent itself (the parent's own
-    // `redirected_backing` belongs to a separate `(parent, false)`
-    // entry, if any).
-    for (window, subwindows) in &owned_redirects {
-        if *subwindows {
-            let kids: Vec<ResourceId> = state.resources.children(*window).to_vec();
-            for child in kids {
-                teardown_redirect_for_window(state, backend, None, child);
-            }
-        } else {
-            teardown_redirect_for_window(state, backend, None, *window);
-        }
+    // The departing client's redirect records go with its resources (Xorg
+    // frees each CompClientWindowRec / CompSubwindowsRec resource); every
+    // window that lost one is re-checked, so one left unredirected gets its
+    // scene participation back (an abnormal compositor exit would otherwise
+    // leave every Manual window invisible).
+    let dead: Vec<ResourceId> = dead_windows.iter().copied().collect();
+    state.composite_redirects.forget_windows(&dead);
+    for (window, before) in state.composite_redirects.forget_client(client_id) {
+        crate::core_loop::process_request::sync_redirect_backing(
+            state, backend, None, window, before,
+        );
     }
-    state
-        .composite_redirects
-        .retain(|(window, _), rec| rec.owner != client_id && !dead_windows.contains(window));
     state.present_event_selections.retain(|_, selection| {
         selection.owner != client_id && !dead_windows.contains(&selection.window)
     });
@@ -813,7 +807,9 @@ pub fn destroy_zombie_resources_reporting(
                     .map_or((ROOT_WINDOW, false, None), |win| {
                         (
                             win.parent,
-                            win.map_state != MapState::Unmapped,
+                            // Xorg DeleteWindow unmaps only the window it
+                            // deletes; CrushTree sends its inferiors none.
+                            *w == root && win.map_state != MapState::Unmapped,
                             win.host_xid,
                         )
                     });
@@ -827,6 +823,16 @@ pub fn destroy_zombie_resources_reporting(
                 on_window,
                 on_parent,
             });
+        }
+        // Xorg DeleteWindow unmaps first (`dix/window.c:1075`): the pointer
+        // leaves the dying subtree while it still exists.
+        if state
+            .resources
+            .window(root)
+            .is_some_and(|w| w.map_state != MapState::Unmapped)
+        {
+            let _ = state.resources.unmap_window(root);
+            backend.windows_restructured(state);
         }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
         crate::core_loop::process_request::free_pictures_on_destroyed_windows(
@@ -975,19 +981,23 @@ mod tests {
         install_client(&mut state, 1);
         install_client(&mut state, 2);
         // Client A redirects window W.
-        state.composite_redirects.insert(
-            (ResourceId(0x1234), false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(0x1234),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
         let mut backend = RecordingBackend::new();
         process_disconnect(&mut state, &mut backend, ClientId(2));
         assert!(
             state
                 .composite_redirects
-                .contains_key(&(ResourceId(0x1234), false))
+                .window_mode(ResourceId(0x1234))
+                .is_some()
         );
     }
 
@@ -1009,13 +1019,16 @@ mod tests {
     fn disconnect_tears_down_owned_redirect() {
         let mut state = ServerState::new();
         install_client(&mut state, 1);
-        state.composite_redirects.insert(
-            (ResourceId(0x5678), false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(0x5678),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
         let mut backend = RecordingBackend::new();
         process_disconnect(&mut state, &mut backend, ClientId(1));
         assert!(state.composite_redirects.is_empty());
@@ -1736,13 +1749,17 @@ mod tests {
             });
         }
         // The compositor owns `RedirectSubwindows(root, Manual)`.
-        state.composite_redirects.insert(
-            (ROOT_WINDOW, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(compositor),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                state.resources.children(ROOT_WINDOW),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(compositor),
+                },
+            )
+            .unwrap();
 
         let mut backend = RecordingBackend::new();
         process_disconnect(&mut state, &mut backend, ClientId(compositor));
@@ -1817,8 +1834,8 @@ mod tests {
         };
         state
             .composite_redirects
-            .insert((ROOT_WINDOW, true), record);
-        state.composite_redirects.insert((window_id, false), record);
+            .redirect_subwindows(ROOT_WINDOW, &[window_id], record)
+            .unwrap();
 
         let mut backend = RecordingBackend::new();
         process_disconnect(&mut state, &mut backend, ClientId(app));
@@ -1830,9 +1847,12 @@ mod tests {
             .count();
         assert_eq!(releases, 1, "calls={:#?}", backend.calls());
         assert!(state.resources.window(window_id).is_none());
-        assert!(!state.composite_redirects.contains_key(&(window_id, false)));
+        assert!(state.composite_redirects.window_mode(window_id).is_none());
         assert!(
-            state.composite_redirects.contains_key(&(ROOT_WINDOW, true)),
+            state
+                .composite_redirects
+                .subwindows_mode(ROOT_WINDOW)
+                .is_some(),
             "the compositor's root redirect outlives the app"
         );
     }
