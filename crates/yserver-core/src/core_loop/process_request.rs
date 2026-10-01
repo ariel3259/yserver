@@ -24492,7 +24492,6 @@ pub(super) fn validate_xi_change(
                 | crate::xinput::libinput_props::Binding::TapDragLock
                 | crate::xinput::libinput_props::Binding::NaturalScroll
                 | crate::xinput::libinput_props::Binding::Dwt
-                | crate::xinput::libinput_props::Binding::LeftHanded
                 | crate::xinput::libinput_props::Binding::MiddleEmulation
                 | crate::xinput::libinput_props::Binding::ScrollButtonLock
         )

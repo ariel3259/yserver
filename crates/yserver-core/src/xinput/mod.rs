@@ -1133,7 +1133,21 @@ pub fn encode_xi1_get_property_reply(
     reply.extend_from_slice(&[0u8; 10]); // bytes 22-31: pad1..pad3
     debug_assert_eq!(reply.len(), 32);
 
-    reply.extend_from_slice(&result.data);
+    match (byte_order, result.format) {
+        (ClientByteOrder::BigEndian, 16) => {
+            for value in result.data.chunks_exact(2) {
+                reply.extend_from_slice(&[value[1], value[0]]);
+            }
+            reply.extend_from_slice(result.data.chunks_exact(2).remainder());
+        }
+        (ClientByteOrder::BigEndian, 32) => {
+            for value in result.data.chunks_exact(4) {
+                reply.extend_from_slice(&[value[3], value[2], value[1], value[0]]);
+            }
+            reply.extend_from_slice(result.data.chunks_exact(4).remainder());
+        }
+        _ => reply.extend_from_slice(&result.data),
+    }
     pad_to_4(&mut reply);
 
     if delete && result.bytes_after == 0 {
