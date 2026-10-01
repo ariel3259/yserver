@@ -612,12 +612,19 @@ after this task.
 ## Task 6 — the forced-reprobe differential, coverage and the final hardware run (spec §6.3, §6.5)
 
 **Deliver:** the Legacy/Owner differential for the forced reprobe; the
-`topology` writer coverage flips to proven, citing this plan's tests and naming
-the deferred rows (claiming nothing for them); `docs/phase-c0-deferred-real-server-tests.md`
-gains the 3c-ii rows: `DeviceRemoved` and `DeviceAddedOrReplaced` on real
-hardware (a card unbound/removed and added; vkms is the intended instrument),
-the real udev monitor delivering a card node `remove`/`add`, and hotplug and
-forced reprobe through the assembled server on Owner (stage 5).
+`topology` writer coverage cites this plan's fixture tests and names the
+stage-5 rows without claiming them; and
+`docs/phase-c0-deferred-real-server-tests.md` gains only the hotplug and forced
+reprobe cases that need the assembled Owner server. A real vkms device
+remove/re-add is an acceptance gate for this stage, not a deferred row.
+
+**Real-device acceptance gate (user, 2026-10-01):** stage 3c-ii is not
+accepted until `c0_hw_3cii_vkms_device_hotplug_drm` observes the kernel/udev
+card-node remove and add on a configfs-created vkms device. The test is written
+and compiled here, never run by the implementer. `docs/vkms-device.sh` is its
+root-only, idempotent `destroy`/`create` helper. The topology coverage evidence
+must retain the exact note **"pending vkms hardware run (acceptance gate)"**
+until the coordinator completes that run.
 
 | Test | Scenario | Must fail under |
 | --- | --- | --- |
@@ -634,6 +641,7 @@ forced reprobe through the assembled server on Owner (stage 5).
 | Task 4 | `c0_hw_3c_hotplug_on_card1_drm` × 3 (with the real-monitor assertion) | coordinator + cable |
 | Task 5 | `c0_hw_3cii_forced_reprobe_on_card1_drm` × 3 | coordinator |
 | Task 6 | every run above × 3 | as above |
+| Task 6 acceptance gate | `c0_hw_3cii_vkms_device_hotplug_drm`: one real configfs vkms destroy/add cycle, with real kernel/udev delivery | coordinator |
 
 The final run reports the measured probe durations against the 2 s deadline.
 

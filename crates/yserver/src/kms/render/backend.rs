@@ -101508,8 +101508,8 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         backend.platform.connector_prober = prober.clone();
-        let mut state = c0_3ci_core_state(&mut backend);
         let core_thread = std::thread::current().id();
+        let mut state = c0_3ci_core_state(&mut backend);
         super::KmsBackend::record_display_hotplug_edge(&mut backend);
         backend.hotplug_rescan_deadline =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
@@ -101524,7 +101524,11 @@ mod tests {
             None,
         )
         .expect("Legacy-only debounced edge completes its synchronous rescan");
-        assert_eq!(*prober.calls.lock().unwrap(), vec![core_thread]);
+        assert_eq!(
+            prober.calls.lock().unwrap().as_slice(),
+            &[core_thread],
+            "Legacy synchronous rescan probes through ConnectorProber on the core thread"
+        );
         assert!(backend.probe_episode.is_none());
         assert!(backend.probe_workers.workers.is_empty());
         assert!(backend.acquire_episode.is_none());
@@ -110924,7 +110928,7 @@ mod tests {
             .outputs
             .iter()
             .position(|output| &output.key == output_key)
-            .ok_or_else(|| format!("{label}: HDMI-2 output is absent"))?;
+            .ok_or_else(|| format!("{label}: output {output_key:?} is absent"))?;
         let output = &backend.platform.outputs[output_idx];
         let crtc = output.output.crtc;
         let crtc_key = crate::kms::render::platform::CrtcKey::new(device, crtc);
@@ -110933,7 +110937,7 @@ mod tests {
             .platform
             .output_instance_ids
             .get(output_idx)
-            .ok_or_else(|| format!("{label}: HDMI-2 output has no instance identity"))?;
+            .ok_or_else(|| format!("{label}: output {output_key:?} has no instance identity"))?;
         let damage_before = backend
             .scene
             .damage_history_latest_generation_for_tests(output_idx);
@@ -111035,12 +111039,10 @@ mod tests {
                         .contains(&AdmissionTraceStep::Dispatched(commit_key.commit))
                     && hardware_complete.borrow().contains(&commit_key.commit)
             })
-            .ok_or_else(|| {
-                format!("{label}: no fresh HDMI-2 composed commit reached HardwareComplete")
-            })?;
+            .ok_or_else(|| format!("{label}: no fresh composed commit reached HardwareComplete"))?;
 
         let current_framebuffer = c0_3aii_owner_current_framebuffer(backend, output_idx)
-            .ok_or_else(|| format!("{label}: HDMI-2 has no retained composed framebuffer"))?;
+            .ok_or_else(|| format!("{label}: output has no retained composed framebuffer"))?;
         let dispatched_framebuffers = {
             let (consumer, service) = (
                 &backend.commit_consumer,
@@ -111076,7 +111078,7 @@ mod tests {
         };
         if !dispatched_framebuffers.contains(&current_framebuffer) {
             return Err(format!(
-                "{label}: dispatched commit {:?} primary plane {} FBs {:?} do not include current HDMI-2 FB {:?}",
+                "{label}: dispatched commit {:?} primary plane {} FBs {:?} do not include current output FB {:?}",
                 commit_key.commit, primary_plane, dispatched_framebuffers, current_framebuffer
             ));
         }
@@ -118074,14 +118076,10 @@ mod tests {
             .map(|mode| (mode.width, mode.height, mode.vrefresh))
             .collect::<Vec<_>>();
 
-        // Legacy's synchronous `reprobe_connectors` applies its connector
-        // probe with this same publication helper. Invoke the scripted prober
-        // synchronously here so the test needs no DRM device, then compare the
-        // client-facing replies produced by that publication.
+        // The test constructor installs ScriptedConnectorProber. Legacy's
+        // synchronous `reprobe_connectors` and Owner's worker both use that
+        // runtime seam with a duplicated master fd.
         let (mut legacy, legacy_device, legacy_key, mut legacy_state) = make_fixture();
-        legacy
-            .platform
-            .install_scripted_connector_prober_for_tests();
         legacy.platform.script_connector_probes_for_tests(
             legacy_device,
             Ok(vec![crate::platform::drm::ConnectorProbe {
@@ -118090,23 +118088,8 @@ mod tests {
                 modes: probed_modes.clone(),
             }]),
         );
-        let legacy_fd = crate::kms::render::platform::duplicate_connector_probe_fd(
-            legacy
-                .platform
-                .device_for_key(legacy_device)
-                .expect("Legacy fixture device")
-                .device
-                .as_ref(),
-        )
-        .expect("duplicate synthetic Legacy probe fd");
-        let legacy_probes = crate::kms::render::platform::ConnectorProber::probe_connectors(
-            legacy.platform.connector_prober.as_ref(),
-            legacy_device,
-            legacy_fd,
-        )
-        .expect("scripted synchronous Legacy connector probe");
-        assert_eq!(legacy_probes[0].modes, probed_modes);
-        legacy.publish_connector_probes(&mut legacy_state, &[(legacy_device, legacy_probes)]);
+        Backend::reprobe_connectors(&mut legacy, &mut legacy_state)
+            .expect("synthetic synchronous Legacy connector reprobe");
         let legacy_output_id = legacy.randr_id_alloc.ids_for(&legacy_key).output_id;
         let mut legacy_peer = c0_3aii_install_dpms_core_client(&mut legacy_state, 81);
         let legacy_modes = c0_3cii_client_output_modes(
@@ -118213,6 +118196,452 @@ mod tests {
         assert_eq!(
             owner_modes, legacy_modes,
             "Owner forced reprobe matches Legacy in GetScreenResources/GetOutputInfo"
+        );
+    }
+
+    #[test]
+    fn c0_3cii_legacy_sync_reprobe_uses_connector_prober() {
+        use std::{
+            os::fd::{AsFd, AsRawFd},
+            sync::mpsc,
+            time::Duration,
+        };
+        use yserver_core::backend::Backend;
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut backend = super::KmsBackend::for_tests();
+            let device = backend.platform.primary_device().unwrap().key;
+            let source_fd = backend
+                .platform
+                .device_for_key(device)
+                .unwrap()
+                .device
+                .as_fd()
+                .as_raw_fd();
+            backend.platform.script_connector_probes_for_tests(
+                device,
+                Ok(vec![crate::platform::drm::ConnectorProbe {
+                    connector_name: "test".to_owned(),
+                    connected: true,
+                    modes: Vec::new(),
+                }]),
+            );
+            let mut state = ServerState::new();
+            let reprobe_succeeded = Backend::reprobe_connectors(&mut backend, &mut state).is_ok();
+            let observations = backend.platform.connector_probe_observations_for_tests();
+            sender
+                .send((
+                    reprobe_succeeded,
+                    source_fd,
+                    observations,
+                    std::thread::current().id(),
+                ))
+                .expect("return the bounded synchronous reprobe result");
+        });
+
+        let (reprobe_succeeded, source_fd, observations, worker_thread) = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Legacy synchronous reprobe returns through the connector prober");
+        worker
+            .join()
+            .expect("synchronous reprobe fixture thread does not panic");
+
+        assert!(reprobe_succeeded, "the scripted Legacy probe is published");
+        assert_eq!(observations.len(), 1, "Legacy invokes one connector probe");
+        assert_eq!(observations[0].key, DrmDeviceKey { major: 0, minor: 0 });
+        assert_ne!(
+            observations[0].fd, source_fd,
+            "Legacy passes a duplicated fd"
+        );
+        assert_eq!(observations[0].thread, worker_thread);
+        assert!(
+            observations[0]
+                .fd_closed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the scripted prober closes the duplicated fd"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_forced_reprobe_differential_vulkan() {
+        use crate::kms::executor::test_support::StubBehaviour;
+        use yserver_core::core_loop::process_request::{RequestOutcome, process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber, randr as rr};
+
+        const QUERY_CLIENT: u32 = 74;
+        const LISTENER_A: u32 = 72;
+        const LISTENER_B: u32 = 73;
+        const SEQUENCE: u16 = 1;
+
+        fn dispatch(
+            backend: &mut super::KmsBackend,
+            state: &mut ServerState,
+            client: u32,
+            sequence: u16,
+            minor: u8,
+            label: &str,
+        ) -> RequestOutcome {
+            process_request(
+                state,
+                backend,
+                ClientId(client),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: 2,
+                },
+                &yserver_core::resources::ROOT_WINDOW.0.to_le_bytes(),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{label}: dispatch RANDR request: {error}"))
+        }
+
+        fn split_events_and_reply(bytes: &[u8], label: &str) -> (Vec<u8>, Vec<u8>) {
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let remaining = &bytes[offset..];
+                if remaining[0] == 1 {
+                    assert!(remaining.len() >= 32, "{label}: fixed reply header");
+                    let extra_words = u32::from_le_bytes(
+                        remaining[4..8]
+                            .try_into()
+                            .expect("four-byte X11 reply length"),
+                    );
+                    let reply_len = 32 + usize::try_from(extra_words).unwrap() * 4;
+                    assert_eq!(remaining.len(), reply_len, "{label}: complete reply body");
+                    return (bytes[..offset].to_vec(), remaining.to_vec());
+                }
+                assert!(remaining.len() >= 32, "{label}: complete X11 event");
+                offset += 32;
+            }
+            panic!("{label}: GetScreenResources reply is present");
+        }
+
+        fn output_ids_from_resources_reply(reply: &[u8], label: &str) -> Vec<u32> {
+            let crtc_count = usize::from(u16::from_le_bytes([reply[16], reply[17]]));
+            let output_count = usize::from(u16::from_le_bytes([reply[18], reply[19]]));
+            let outputs_start = 32 + crtc_count * 4;
+            (0..output_count)
+                .map(|index| {
+                    let offset = outputs_start + index * 4;
+                    u32::from_le_bytes(
+                        reply[offset..offset + 4]
+                            .try_into()
+                            .unwrap_or_else(|_| panic!("{label}: output XID is four bytes")),
+                    )
+                })
+                .collect()
+        }
+
+        fn normalize_event_sequences(bytes: &[u8], label: &str) -> Vec<u8> {
+            assert_eq!(bytes.len() % 32, 0, "{label}: complete X11 event records");
+            let mut normalized = bytes.to_vec();
+            for event in normalized.chunks_exact_mut(32) {
+                event[2..4].fill(0);
+            }
+            normalized
+        }
+
+        let (mut fixture, device, outputs, _) =
+            c0_3ci_live_release_fixture(StubBehaviour::AcceptKernelCalls(1_000), false);
+        assert_eq!(outputs.len(), 1, "the differential starts with one output");
+        let backend = &mut fixture.backend;
+        backend.platform.hotplug_monitor = None;
+        let owner_key = outputs[0].clone();
+        let initial_snapshot = c0_3cii_snapshot_from_layout(backend, &owner_key);
+        let initial_layout = backend
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == owner_key)
+            .expect("Owner output layout");
+        let initial_mode = initial_layout.output.picked.clone();
+        let initial_position = (initial_layout.x, initial_layout.y);
+        let (mut legacy, legacy_device, legacy_key, mut legacy_state) =
+            c0_3cii_legacy_fixture_from_owner_snapshot(
+                &backend.randr_id_alloc,
+                &initial_snapshot,
+                &initial_mode,
+                initial_position,
+            );
+        legacy.platform.hotplug_monitor = None;
+        let mut owner_state = c0_3ci_core_state(backend);
+        c0_3cii_settle_owner_fixture(
+            backend,
+            &mut owner_state,
+            device,
+            "forced-reprobe differential Owner readiness",
+        );
+
+        let mut changed_modes = initial_snapshot.modes.clone();
+        changed_modes.push(test_advertised_mode(777, 555, 47, false));
+        let new_connector = "c0-3cii-probe-added";
+        let appeared_modes = vec![test_advertised_mode(1023, 767, 59, true)];
+        let owner_probes = vec![
+            crate::platform::drm::ConnectorProbe {
+                connector_name: owner_key.connector_name.clone(),
+                connected: true,
+                modes: changed_modes.clone(),
+            },
+            crate::platform::drm::ConnectorProbe {
+                connector_name: new_connector.to_owned(),
+                connected: true,
+                modes: appeared_modes.clone(),
+            },
+        ];
+        let mut legacy_probes = vec![
+            crate::platform::drm::ConnectorProbe {
+                connector_name: legacy_key.connector_name.clone(),
+                connected: true,
+                modes: changed_modes.clone(),
+            },
+            crate::platform::drm::ConnectorProbe {
+                connector_name: new_connector.to_owned(),
+                connected: true,
+                modes: appeared_modes.clone(),
+            },
+        ];
+        // The live Owner fixture can retain a connected synthetic `test`
+        // connector under its fixture-local DRM identity. It is outside the
+        // real card's probe, so preserve that same unchanged inventory in the
+        // single-device Legacy projection instead of spuriously disconnecting
+        // it during this differential.
+        legacy_probes.extend(
+            legacy
+                .randr_id_alloc
+                .entries()
+                .filter(|(key, entry)| {
+                    key.device_key == legacy_device && *key != &legacy_key && entry.connected
+                })
+                .map(|(key, entry)| crate::platform::drm::ConnectorProbe {
+                    connector_name: key.connector_name.clone(),
+                    connected: true,
+                    modes: entry.modes.clone(),
+                }),
+        );
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend
+            .platform
+            .script_connector_probes_for_tests(device, Ok(owner_probes));
+        legacy
+            .platform
+            .script_connector_probes_for_tests(legacy_device, Ok(legacy_probes));
+
+        let all_events = rr::NOTIFY_MASK_SCREEN_CHANGE
+            | rr::NOTIFY_MASK_CRTC_CHANGE
+            | rr::NOTIFY_MASK_OUTPUT_CHANGE;
+        let initial_projection = |state: &ServerState| {
+            state
+                .randr
+                .outputs
+                .iter()
+                .map(|output| {
+                    (
+                        output.name.clone(),
+                        output.output_id,
+                        output.crtc_id,
+                        output.mode_id,
+                        output.connected,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            initial_projection(&owner_state),
+            initial_projection(&legacy_state),
+            "Owner and Legacy start from the same published output projection"
+        );
+        let mut owner_query = c0_3aii_install_dpms_core_client(&mut owner_state, QUERY_CLIENT);
+        let mut legacy_query = c0_3aii_install_dpms_core_client(&mut legacy_state, QUERY_CLIENT);
+        let mut owner_listener_a = c0_3aii_install_dpms_core_client(&mut owner_state, LISTENER_A);
+        let mut legacy_listener_a = c0_3aii_install_dpms_core_client(&mut legacy_state, LISTENER_A);
+        let mut owner_listener_b = c0_3aii_install_dpms_core_client(&mut owner_state, LISTENER_B);
+        let mut legacy_listener_b = c0_3aii_install_dpms_core_client(&mut legacy_state, LISTENER_B);
+        for state in [&mut owner_state, &mut legacy_state] {
+            state.randr.timestamp = 1_234;
+            state.randr.config_timestamp = 500;
+            for client in [QUERY_CLIENT, LISTENER_A, LISTENER_B] {
+                state
+                    .randr_select_masks
+                    .insert((client, yserver_core::resources::ROOT_WINDOW), all_events);
+            }
+        }
+        c0_3cii_set_publication_clock(&mut owner_state, 30_000);
+
+        let owner_pending = match dispatch(
+            backend,
+            &mut owner_state,
+            QUERY_CLIENT,
+            SEQUENCE,
+            rr::RR_GET_SCREEN_RESOURCES,
+            "Owner RRGetScreenResources",
+        ) {
+            RequestOutcome::PendingForcedReprobe(pending) => pending,
+            outcome => panic!("Owner RRGetScreenResources must park on its worker: {outcome:?}"),
+        };
+        assert_eq!(
+            c0_3cii_finish_forced_reprobe(
+                backend,
+                &mut owner_state,
+                owner_pending.token,
+                "complete Owner RRGetScreenResources reprobe",
+            ),
+            Ok(yserver_core::backend::ForcedReprobeResult::Applied)
+        );
+        let owner_config_time = owner_state.randr.config_timestamp;
+
+        // Legacy's forced request is synchronous. Align its fixture clock to
+        // the Owner publication tick so the protocol timestamp remains an
+        // exact differential field rather than a normalized field.
+        legacy_state.start_instant = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(u64::from(
+                owner_config_time,
+            )))
+            .expect("Legacy differential clock is representable");
+        assert!(matches!(
+            dispatch(
+                &mut legacy,
+                &mut legacy_state,
+                QUERY_CLIENT,
+                SEQUENCE,
+                rr::RR_GET_SCREEN_RESOURCES,
+                "Legacy RRGetScreenResources",
+            ),
+            RequestOutcome::Handled
+        ));
+        assert_eq!(
+            owner_state.randr.config_timestamp, legacy_state.randr.config_timestamp,
+            "forced reprobe preserves exact lastConfigTime parity"
+        );
+        assert_eq!(owner_state.randr.timestamp, legacy_state.randr.timestamp);
+        assert_eq!(owner_state.randr.config_timestamp, owner_config_time);
+
+        // The Owner's parked GetScreenResources result and the ordinary
+        // GetScreenResourcesCurrent query share the same published-state
+        // reply encoder. Query the latter after the worker is completed to
+        // capture the exact bytes that the parked continuation returns.
+        assert!(matches!(
+            dispatch(
+                backend,
+                &mut owner_state,
+                QUERY_CLIENT,
+                SEQUENCE,
+                rr::RR_GET_SCREEN_RESOURCES_CURRENT,
+                "Owner published GetScreenResources reply",
+            ),
+            RequestOutcome::Handled
+        ));
+        for (kms_backend, state, label) in [
+            (
+                &mut *backend,
+                &mut owner_state,
+                "Owner forced-reprobe request drain",
+            ),
+            (
+                &mut legacy,
+                &mut legacy_state,
+                "Legacy forced-reprobe request drain",
+            ),
+        ] {
+            c0_3bi_core_driver_until_with_state(
+                kms_backend,
+                state,
+                label,
+                std::time::Duration::from_millis(100),
+                &|_| true,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+
+        let owner_events_a = kbd_map_drain(&mut owner_listener_a);
+        let legacy_events_a = kbd_map_drain(&mut legacy_listener_a);
+        let owner_events_b = kbd_map_drain(&mut owner_listener_b);
+        let legacy_events_b = kbd_map_drain(&mut legacy_listener_b);
+        let owner_query_stream = kbd_map_drain(&mut owner_query);
+        let legacy_query_stream = kbd_map_drain(&mut legacy_query);
+        let (owner_query_events, owner_reply) =
+            split_events_and_reply(&owner_query_stream, "Owner query client");
+        let (legacy_query_events, legacy_reply) =
+            split_events_and_reply(&legacy_query_stream, "Legacy query client");
+        assert!(
+            !owner_events_a.is_empty(),
+            "Owner listener A receives events"
+        );
+        assert!(
+            !owner_events_b.is_empty(),
+            "Owner listener B receives events"
+        );
+        assert_eq!(owner_events_a, legacy_events_a, "listener A event bytes");
+        assert_eq!(owner_events_b, legacy_events_b, "listener B event bytes");
+        assert_eq!(
+            owner_query_events, legacy_query_events,
+            "query client event bytes"
+        );
+        assert_eq!(
+            normalize_event_sequences(&owner_query_events, "Owner query client"),
+            normalize_event_sequences(&owner_events_a, "Owner listener A"),
+            "query client receives the same notifications; only client sequence differs"
+        );
+        assert_eq!(owner_reply, legacy_reply, "GetScreenResources reply bytes");
+        assert_eq!(
+            u32::from_le_bytes(owner_reply[12..16].try_into().unwrap()),
+            owner_config_time,
+            "GetScreenResources carries the exact shared lastConfigTime"
+        );
+
+        let appeared_owner_key = OutputKey::new(device, new_connector);
+        let appeared_legacy_key = OutputKey::new(legacy_device, new_connector);
+        let appeared_owner_id = backend
+            .randr_id_alloc
+            .ids_for(&appeared_owner_key)
+            .output_id;
+        let appeared_legacy_id = legacy
+            .randr_id_alloc
+            .ids_for(&appeared_legacy_key)
+            .output_id;
+        assert_eq!(appeared_owner_id, appeared_legacy_id);
+        assert!(
+            output_ids_from_resources_reply(&owner_reply, "Owner").contains(&appeared_owner_id),
+            "the reply contains the connector that appeared in the forced probe"
+        );
+        assert_eq!(
+            backend
+                .randr_id_alloc
+                .entry(&owner_key)
+                .expect("Owner registry entry")
+                .modes,
+            changed_modes
+        );
+        assert_eq!(
+            legacy
+                .randr_id_alloc
+                .entry(&legacy_key)
+                .expect("Legacy registry entry")
+                .modes,
+            changed_modes
+        );
+        assert!(backend.topology_episode_events.is_empty());
+        assert!(
+            backend.administrative_reprobe_records.contains_key(&device),
+            "Owner records an administrative reprobe without a hotplug episode"
+        );
+
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_forced_reprobe_differential_vulkan Owner",
+            &c0_3bi_expected_end_state(outputs.clone()),
+        );
+        c0_3bi_assert_end_state(
+            &legacy,
+            "c0_3cii_forced_reprobe_differential_vulkan Legacy",
+            &c0_3bi_expected_end_state([legacy_key]),
         );
     }
 
@@ -119330,7 +119759,7 @@ mod tests {
         use yserver_core::backend::Backend;
 
         struct TimedProductionConnectorProber {
-            durations: Arc<Mutex<Vec<Duration>>>,
+            durations: Arc<Mutex<Vec<(std::thread::ThreadId, Duration)>>>,
         }
 
         impl crate::kms::render::platform::ConnectorProber for TimedProductionConnectorProber {
@@ -119353,7 +119782,7 @@ mod tests {
                 self.durations
                     .lock()
                     .expect("record forced-reprobe connector probe duration")
-                    .push(started.elapsed());
+                    .push((std::thread::current().id(), started.elapsed()));
                 result
             }
         }
@@ -119578,15 +120007,17 @@ mod tests {
         let elapsed = started.elapsed();
         eprintln!("c0_hw_3cii_forced_reprobe_on_card1_drm probe duration: {elapsed:?}");
         assert!(elapsed < super::PROBE_EPISODE_DEADLINE);
-        let worker_durations = probe_durations
-            .lock()
-            .expect("read forced-reprobe worker duration");
-        assert_eq!(
-            worker_durations.len(),
-            1,
-            "the forced request records exactly one production connector probe"
-        );
-        let worker_duration = worker_durations[0];
+        let (worker_thread, worker_duration) = {
+            let worker_durations = probe_durations
+                .lock()
+                .expect("read forced-reprobe worker duration");
+            assert_eq!(
+                worker_durations.len(),
+                1,
+                "the forced request records exactly one production connector probe"
+            );
+            worker_durations[0]
+        };
         eprintln!(
             "c0_hw_3cii_forced_reprobe_on_card1_drm DrmConnectorProber duration: {worker_duration:?}"
         );
@@ -119634,6 +120065,32 @@ mod tests {
             actual_modes, legacy_published_modes,
             "Owner and Legacy published HDMI-2 mode lists match on the card1 fixture"
         );
+        let core_thread = std::thread::current().id();
+        let recorded_probes = probe_durations
+            .lock()
+            .expect("read forced-reprobe and Legacy probe durations")
+            .clone();
+        assert_eq!(
+            recorded_probes.len(),
+            2,
+            "the production wrapper records both the Owner worker and Legacy core probes"
+        );
+        assert_ne!(
+            worker_thread, core_thread,
+            "Owner's forced reprobe runs on a worker thread"
+        );
+        assert_eq!(
+            recorded_probes[0].0, worker_thread,
+            "the first timed probe runs on the Owner worker"
+        );
+        assert_eq!(
+            recorded_probes[1].0, core_thread,
+            "Legacy's synchronous reprobe runs on the core thread"
+        );
+        assert!(
+            recorded_probes[1].1 < super::PROBE_EPISODE_DEADLINE,
+            "Legacy's synchronous probe duration is bounded"
+        );
         assert_eq!(
             sends_now(backend),
             before_sends,
@@ -119650,6 +120107,1093 @@ mod tests {
                     .map(|output| output.key.clone()),
             ),
         );
+    }
+
+    #[test]
+    #[ignore = "real vkms device hotplug acceptance gate; coordinator only; NEVER run by the implementer"]
+    #[cfg(target_os = "linux")]
+    fn c0_hw_3cii_vkms_device_hotplug_drm() {
+        use std::{
+            cell::RefCell,
+            collections::HashSet,
+            env, fs,
+            os::fd::{AsFd, AsRawFd},
+            path::{Path, PathBuf},
+            process::Command,
+            rc::Rc,
+            time::Duration,
+        };
+
+        use crate::kms::render::resources::{DrmCleanupRegistry, ResourceService};
+        use yserver_core::{backend::Backend, core_loop::Message};
+
+        const VKMS_CONFIGFS_NAME: &str = "yserver-c0-3cii";
+
+        fn drm_card_entries() -> Vec<(PathBuf, String)> {
+            let entries = fs::read_dir("/sys/class/drm")
+                .unwrap_or_else(|error| panic!("read /sys/class/drm: {error}"));
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let suffix = name.strip_prefix("card")?;
+                    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return None;
+                    }
+                    Some((entry.path(), name))
+                })
+                .collect()
+        }
+
+        fn card_is_vkms(sysfs_card: &Path) -> bool {
+            let device = sysfs_card.join("device");
+            let driver_is_vkms = fs::read_link(device.join("driver"))
+                .ok()
+                .and_then(|path| path.file_name().map(|name| name.to_owned()))
+                .is_some_and(|name| name == "vkms");
+            let uevent_is_vkms = fs::read_to_string(device.join("uevent"))
+                .ok()
+                .is_some_and(|uevent| uevent.lines().any(|line| line == "DRIVER=vkms"));
+            let sysfs_path_is_vkms = fs::canonicalize(&device)
+                .ok()
+                .is_some_and(|path| path.to_string_lossy().contains("/vkms/"));
+            driver_is_vkms || uevent_is_vkms || sysfs_path_is_vkms
+        }
+
+        fn vkms_card_paths() -> Vec<PathBuf> {
+            drm_card_entries()
+                .into_iter()
+                .filter(|(sysfs_card, _)| card_is_vkms(sysfs_card))
+                .map(|(_, name)| PathBuf::from("/dev/dri").join(name))
+                .collect()
+        }
+
+        fn configfs_card_path() -> Option<PathBuf> {
+            drm_card_entries()
+                .into_iter()
+                .find_map(|(sysfs_card, name)| {
+                    let device = fs::canonicalize(sysfs_card.join("device")).ok()?;
+                    device
+                        .to_string_lossy()
+                        .contains(VKMS_CONFIGFS_NAME)
+                        .then(|| PathBuf::from("/dev/dri").join(name))
+                })
+        }
+
+        fn invoke_helper(helper_override: Option<&Path>, operation: &str) {
+            const INSTALLED_HELPER: &str = "/usr/local/sbin/yserver-vkms-device";
+
+            let (program, prefix_args, uses_sudo) = if let Some(helper) = helper_override {
+                (helper.to_path_buf(), Vec::new(), false)
+            } else {
+                (
+                    PathBuf::from("sudo"),
+                    vec!["-n".to_owned(), INSTALLED_HELPER.to_owned()],
+                    true,
+                )
+            };
+            let output = Command::new(&program)
+                .args(&prefix_args)
+                .arg(operation)
+                .output()
+                .unwrap_or_else(|error| {
+                    if uses_sudo {
+                        panic!(
+                            "cannot run the non-interactive vkms helper via sudo -n: {error}; install the root-owned helper at {INSTALLED_HELPER} and permit create/destroy in sudoers"
+                        )
+                    }
+                    panic!(
+                        "cannot run YSERVER_VKMS_HELPER {} {operation}: {error}",
+                        program.display()
+                    )
+                });
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.stdout.is_empty() {
+                eprint!("{stdout}");
+            }
+            if !output.stderr.is_empty() {
+                eprint!("{stderr}");
+            }
+            if !output.status.success() {
+                if uses_sudo {
+                    panic!(
+                        "sudo -n could not run {INSTALLED_HELPER} {operation} ({}); if sudo reports a password requirement or permission denial, install the root-owned helper and this sudoers rule: ariel_santangelo ALL=(root) NOPASSWD: {INSTALLED_HELPER} create, {INSTALLED_HELPER} destroy; stdout={stdout:?}; stderr={stderr:?}",
+                        output.status
+                    );
+                }
+                panic!(
+                    "YSERVER_VKMS_HELPER {} {operation} failed with {}; stdout={stdout:?}; stderr={stderr:?}",
+                    program.display(),
+                    output.status
+                );
+            }
+        }
+
+        let card1 = PathBuf::from("/dev/dri/card1");
+        assert!(
+            Path::new("/sys/module/vkms").exists(),
+            "vkms Owner qualification failed: the kernel vkms module is not loaded"
+        );
+        fs::metadata(&card1).unwrap_or_else(|error| {
+            panic!(
+                "vkms hotplug acceptance requires card1 as the other composing Owner; /dev/dri/card1 is unavailable: {error}"
+            )
+        });
+
+        let helper_override = env::var_os("YSERVER_VKMS_HELPER").map(PathBuf::from);
+        // Recreate the test-owned configfs instance before installing udev
+        // monitoring. This starts with an inactive CRTC, and keeps the
+        // measured events limited to the later Owner remove/add cycle.
+        invoke_helper(helper_override.as_deref(), "destroy");
+        invoke_helper(helper_override.as_deref(), "create");
+        let vkms_path = configfs_card_path()
+            .unwrap_or_else(|| panic!("vkms Owner qualification failed: configfs {VKMS_CONFIGFS_NAME} did not create a DRM card"));
+        assert!(
+            vkms_card_paths().contains(&vkms_path),
+            "vkms Owner qualification failed: {} is not registered by the vkms DRM driver",
+            vkms_path.display()
+        );
+        assert_ne!(
+            vkms_path, card1,
+            "vkms Owner qualification failed: a second DRM card distinct from card1 is required"
+        );
+
+        let preflight = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .unwrap_or_else(|error| panic!("card1 vkms-hotplug preflight failed: {error}"));
+        let primary = preflight
+            .platform
+            .vk
+            .as_ref()
+            .and_then(|vk| vk.selected_drm_identity)
+            .and_then(|identity| identity.primary)
+            .expect("Vulkan reports the primary DRM identity");
+        let primary_path = super::card_path_for_key(primary)
+            .unwrap_or_else(|error| panic!("cannot map Vulkan primary to card1: {error}"));
+        assert_eq!(
+            primary_path, card1,
+            "the hardware test must open card1 as its composing Owner"
+        );
+        drop(preflight);
+
+        let mut base = super::KmsBackend::for_tests_with_vk_live_scene_real_drm()
+            .unwrap_or_else(|error| panic!("card1 Vulkan base fixture failed: {error}"));
+        base.core.bg_pixel = Some(0x0010_50E0);
+        let mut fixture =
+            super::KmsBackend::for_tests_with_live_kms_from_backend(base, Some("HDMI-2"))
+                .unwrap_or_else(|error| panic!("card1 HDMI-2 live fixture failed: {error}"));
+        let backend = &mut fixture.backend;
+        backend.resource_cleanup_on_drop_for_tests = true;
+        let card1_device = backend
+            .platform
+            .primary_device()
+            .expect("live-KMS fixture retains card1")
+            .key;
+        assert_eq!(
+            super::card_path_for_key(card1_device).expect("map card1 device identity"),
+            card1
+        );
+        let card1_device_rc = Rc::clone(
+            &backend
+                .platform
+                .device_for_key(card1_device)
+                .expect("card1 KMS device")
+                .device,
+        );
+        let executor = crate::kms::executor::KmsIoExecutor::spawn(
+            card1_device_rc.as_fd(),
+            crate::kms::owner::identity::IncarnationId::first(),
+        )
+        .unwrap_or_else(|error| panic!("spawn card1 Owner executor: {error}"));
+        let (card1_incarnation, lifecycle) = executor.owner_identity();
+        let card1_entry = backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == card1_device)
+            .expect("card1 device entry");
+        card1_entry.executor = Some(executor);
+        card1_entry.owner = Some(crate::kms::owner::device::DeviceCommitOwner::new(
+            card1_incarnation,
+            lifecycle,
+            1,
+        ));
+        let mut cleanup_registry =
+            DrmCleanupRegistry::new(Rc::clone(&card1_device_rc), card1_device, card1_incarnation);
+        let mut resource_service = ResourceService::new(card1_device, card1_incarnation);
+        for output_index in 0..backend.platform.scanout_pools.len() {
+            let bo_count = backend.platform.scanout_pools[output_index]
+                .as_ref()
+                .map_or(0, |scanout| scanout.display_pool().bos.len());
+            for bo_index in 0..bo_count {
+                backend
+                    .platform
+                    .register_managed_scanout_bo(
+                        &mut resource_service,
+                        &mut cleanup_registry,
+                        output_index,
+                        bo_index,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "register card1 scanout output {output_index} BO {bo_index}: {error:?}"
+                        )
+                    });
+            }
+        }
+        backend.install_resource_service_with_registry(resource_service, cleanup_registry);
+        install_admission_owner_gate(backend, card1_device);
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            card1_device,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend
+            .lifecycle_register_owner_device(card1_device)
+            .expect("register card1 Owner lifecycle");
+
+        use ::drm::{ClientCapability, Device as DrmDeviceTrait};
+
+        backend
+            .platform
+            .use_production_connector_prober_for_live_drm_fixture();
+        let vkms_device =
+            crate::drm::Device::open(vkms_path.to_str().expect("vkms DRM card path is UTF-8"))
+                .unwrap_or_else(|error| {
+                    panic!("vkms Owner qualification failed: open {vkms_path:?}: {error}")
+                });
+        crate::drm::Device::set_and_verify_nonblocking_for_tests(vkms_device.as_fd().as_raw_fd())
+            .unwrap_or_else(|error| {
+                panic!("vkms Owner qualification failed: nonblocking DRM fd: {error}")
+            });
+        let vkms_key = crate::platform::drm::primary_device_key_from_fd(vkms_device.as_fd())
+            .unwrap_or_else(|error| {
+                panic!("identify vkms DRM card for Owner qualification: {error}")
+            });
+        assert_ne!(
+            vkms_key, card1_device,
+            "vkms Owner qualification failed: vkms must be a second DRM device distinct from card1"
+        );
+        for (capability, label) in [
+            (
+                ClientCapability::UniversalPlanes,
+                "DRM_CLIENT_CAP_UNIVERSAL_PLANES",
+            ),
+            (ClientCapability::Atomic, "DRM_CLIENT_CAP_ATOMIC"),
+        ] {
+            vkms_device
+                .set_client_capability(capability, true)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "vkms Owner qualification failed: required {label} capability was rejected: {error}"
+                    )
+                });
+        }
+        vkms_device
+            .acquire_master_lock()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "vkms Owner qualification failed: DRM master is required to modeset its virtual connector: {error}"
+                )
+            });
+        let vkms_executor = crate::kms::executor::KmsIoExecutor::spawn(
+            vkms_device.as_fd(),
+            crate::kms::owner::identity::IncarnationId::first(),
+        )
+        .unwrap_or_else(|error| {
+            panic!("vkms Owner qualification failed: spawn KMS executor: {error}")
+        });
+        let (vkms_incarnation, vkms_lifecycle) = vkms_executor.owner_identity();
+        backend.platform.add_test_device_with_owner(
+            vkms_key,
+            vkms_device,
+            crate::kms::owner::device::DeviceCommitOwner::new(vkms_incarnation, vkms_lifecycle, 1),
+        );
+        backend
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == vkms_key)
+            .expect("inserted vkms Owner device")
+            .executor = Some(vkms_executor);
+        let vkms_snapshot = crate::kms::render::platform::ConnectorProber::probe_snapshot(
+            &crate::kms::render::platform::DrmConnectorProber,
+            vkms_key,
+            crate::kms::render::platform::duplicate_connector_probe_fd(
+                backend
+                    .platform
+                    .device_for_key(vkms_key)
+                    .expect("vkms Legacy device")
+                    .device
+                    .as_ref(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("vkms Owner qualification failed: duplicate connector-probe fd: {error}")
+            }),
+        )
+        .unwrap_or_else(|error| {
+            panic!("vkms Owner qualification failed: production DRM connector probe: {error}")
+        });
+        let vkms_connector = vkms_snapshot
+            .into_iter()
+            .find(|snapshot| !snapshot.modes.is_empty())
+            .unwrap_or_else(|| {
+                panic!(
+                    "vkms Owner qualification failed: no connected vkms connector advertises a usable mode"
+                )
+            });
+        let vkms_device_rc = Rc::clone(
+            &backend
+                .platform
+                .device_for_key(vkms_key)
+                .expect("inserted vkms Owner device")
+                .device,
+        );
+        let vkms_output = crate::drm::modeset::discover_output_for_connector(
+            vkms_device_rc.as_ref(),
+            &vkms_connector.key.connector_name,
+            &[],
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "vkms Owner qualification failed: production connector/encoder/CRTC/primary-plane assignment for {}: {error}",
+                vkms_connector.key.connector_name
+            )
+        });
+        assert!(
+            !vkms_output.modes.is_empty(),
+            "vkms Owner qualification failed: the production modeset assignment returned no modes"
+        );
+        let vkms_x = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.x.saturating_add(i32::from(output.width)))
+            .max()
+            .unwrap_or(0);
+        let vkms_route = backend
+            .platform
+            .scanout_route_for_kms(vkms_key)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "vkms Owner qualification failed: selected Vulkan renderer has no production scanout route to vkms: {error}"
+                )
+            });
+        let vkms_output_index = backend.platform.outputs.len();
+        backend
+            .platform
+            .outputs
+            .push(crate::kms::backend::ActiveOutput::new(
+                vkms_route,
+                vkms_output,
+                crate::drm::Swapchain::empty_for_tests(),
+                vkms_x,
+                0,
+            ));
+        let vkms_scanout_pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
+            std::sync::Arc::clone(
+                backend
+                    .platform
+                    .vk
+                    .as_ref()
+                    .expect("card1 live fixture retains its Vulkan renderer"),
+            ),
+            Rc::clone(&vkms_device_rc),
+            vkms_route,
+            u32::from(backend.platform.outputs[vkms_output_index].width),
+            u32::from(backend.platform.outputs[vkms_output_index].height),
+            crate::kms::render::platform::SCANOUT_POOL_DEPTH,
+            &backend.platform.outputs[vkms_output_index]
+                .output
+                .scanout_modifiers,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "vkms Owner qualification failed: selected renderer cannot allocate/import a production DMA-BUF scanout pool on vkms: {error}"
+            )
+        });
+        let vkms_pool_depth = vkms_scanout_pool.bos.len();
+        let (vkms_front_index, vkms_front_framebuffer) = vkms_scanout_pool
+            .bos
+            .iter()
+            .enumerate()
+            .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "vkms Owner qualification failed: the DMA-BUF scanout pool has no registered framebuffer"
+                )
+            });
+        backend
+            .platform
+            .scanout_pools
+            .push(Some(crate::kms::vk::scanout::OutputScanout::Shared(
+                vkms_scanout_pool,
+            )));
+        backend.platform.bo_generations.push(vec![
+            crate::kms::render::platform::BoGenerationEntry::default();
+            vkms_pool_depth
+        ]);
+        backend.platform.first_pageflip_logged.push(false);
+        backend
+            .platform
+            .rebuild_output_instance_ids_for_tests()
+            .unwrap_or_else(|error| {
+                panic!("vkms Owner qualification failed: output identity: {error}")
+            });
+        let (fb_w, fb_h) = crate::kms::render::platform::recompute_fb_extent_from(
+            &backend
+                .platform
+                .outputs
+                .iter()
+                .map(|output| (output.x, output.y, output.width, output.height))
+                .collect::<Vec<_>>(),
+        );
+        backend
+            .apply_virtual_screen_extent(fb_w.max(1), fb_h.max(1))
+            .unwrap_or_else(|error| {
+                panic!("vkms Owner qualification failed: extend the composed screen: {error}")
+            });
+        backend
+            .scene
+            .rebuild_outputs(&backend.platform)
+            .unwrap_or_else(|error| {
+                panic!("vkms Owner qualification failed: rebuild composed outputs: {error:?}")
+            });
+        let vkms_legacy_write_permitted = backend.platform.allows_legacy(
+            &vkms_key,
+            crate::kms::render::resources::WriterClass::Modeset,
+        );
+        crate::drm::modeset::commit_modeset(
+            vkms_device_rc.as_ref(),
+            &backend.platform.outputs[vkms_output_index].output,
+            vkms_front_framebuffer,
+            vkms_legacy_write_permitted,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "vkms Owner qualification failed: modeset the connected virtual connector to {}x{}@{}: {error}",
+                backend.platform.outputs[vkms_output_index].width,
+                backend.platform.outputs[vkms_output_index].height,
+                backend.platform.outputs[vkms_output_index].output.picked.vrefresh
+            )
+        });
+        backend.platform.scanout_pools[vkms_output_index]
+            .as_mut()
+            .expect("vkms scanout pool")
+            .display_pool_mut()
+            .bos[vkms_front_index]
+            .state
+            .mark_on_screen_after_modeset();
+        crate::kms::render::composed_commit::discover_composed_property_ids(
+            vkms_device_rc.as_ref(),
+            &[crate::kms::render::composed_commit::ComposedPlane {
+                output: &backend.platform.outputs[vkms_output_index].output,
+                framebuffer: vkms_front_framebuffer,
+            }],
+            &mut backend
+                .platform
+                .devices
+                .iter_mut()
+                .find(|entry| entry.key == vkms_key)
+                .expect("vkms Owner device")
+                .active_property_cache,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "vkms Owner qualification failed: required CRTC ACTIVE/OUT_FENCE_PTR completion properties are unavailable: {error}"
+            )
+        });
+        let vkms_output_key = backend.platform.outputs[vkms_output_index].key.clone();
+        let vkms_output_ids = backend.randr_id_alloc.ids_for(&vkms_output_key);
+        let vkms_config = {
+            let output = &backend.platform.outputs[vkms_output_index];
+            super::ConnectorConfig::Enabled {
+                mode_w: output.width,
+                mode_h: output.height,
+                vrefresh: output.output.picked.vrefresh,
+                x: output.x,
+                y: output.y,
+            }
+        };
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&vkms_output_key);
+            entry.connected = true;
+            entry.config = vkms_config;
+            entry.last_enabled = Some(vkms_config);
+            entry.crtc_associated = true;
+            entry.modes = vkms_connector.modes;
+            entry.edid = vkms_connector.edid;
+            entry.mm_width = vkms_connector.mm_width;
+            entry.mm_height = vkms_connector.mm_height;
+            entry.connector_type = vkms_connector.connector_type;
+        }
+        backend
+            .output_key_by_id
+            .insert(vkms_output_ids.output_id, vkms_output_key.clone());
+        let mut vkms_resource_pair = {
+            let mut registry =
+                DrmCleanupRegistry::new(Rc::clone(&vkms_device_rc), vkms_key, vkms_incarnation);
+            let mut service = ResourceService::new(vkms_key, vkms_incarnation);
+            for bo_index in 0..vkms_pool_depth {
+                backend
+                    .platform
+                    .register_managed_scanout_bo(
+                        &mut service,
+                        &mut registry,
+                        vkms_output_index,
+                        bo_index,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "vkms Owner qualification failed: adopt scanout BO {bo_index} into its DRM resource service: {error:?}"
+                        )
+                    });
+            }
+            Some((service, registry))
+        };
+        let vkms_gate =
+            crate::kms::render::resources::tests::owner_gate_for_tests(vkms_key, vkms_incarnation);
+        backend
+            .platform
+            .try_install_transport_gate(vkms_gate)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "vkms Owner qualification failed: transport gate rejected the managed scanout route: {error:?}"
+                )
+            });
+        assert!(
+            backend.platform.output_uses_owner_route(vkms_output_index),
+            "vkms Owner qualification failed: the real connector did not enter the Owner scanout route"
+        );
+        backend.install_admission_conductor_with_backend_composed_for_tests(
+            vkms_key,
+            AdmissionSourceFixture::new_source().0,
+        );
+        backend
+            .lifecycle_register_owner_device(vkms_key)
+            .unwrap_or_else(|error| {
+                panic!("vkms Owner qualification failed: lifecycle registration: {error:?}")
+            });
+
+        let card1_output_index = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|output| output.key.device_key == card1_device)
+            .expect("live card1 HDMI-2 output");
+        let card1_output_key = backend.platform.outputs[card1_output_index].key.clone();
+        assert_eq!(card1_output_key.connector_name, "HDMI-2");
+        let card1_output_id = backend.randr_id_alloc.ids_for(&card1_output_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(card1_output_id, card1_output_key.clone());
+        let card1_config = {
+            let output = &backend.platform.outputs[card1_output_index];
+            super::ConnectorConfig::Enabled {
+                mode_w: output.width,
+                mode_h: output.height,
+                vrefresh: output.output.picked.vrefresh,
+                x: output.x,
+                y: output.y,
+            }
+        };
+        {
+            let output = &backend.platform.outputs[card1_output_index];
+            let entry = backend.randr_id_alloc.entry_mut(&card1_output_key);
+            entry.connected = true;
+            entry.config = card1_config;
+            entry.modes = output.output.modes.clone();
+            entry.edid = output.output.edid.clone();
+            entry.mm_width = output.output.mm_width;
+            entry.mm_height = output.output.mm_height;
+            entry.connector_type = output.output.connector_type.clone();
+        }
+        assert!(
+            backend.platform.output_uses_owner_route(card1_output_index)
+                && backend.platform.output_uses_owner_route(vkms_output_index),
+            "card1 and vkms are both live Owner scanout routes before the hotplug cycle"
+        );
+        let card1_fd = card1_device_rc.as_fd().as_raw_fd();
+        let hardware_complete = Rc::new(RefCell::new(HashSet::new()));
+        let hardware_crtc =
+            u32::from(CrtcKey::for_output(&backend.platform.outputs[card1_output_index]).crtc);
+        let clock_key = backend
+            .platform
+            .owner_ref(card1_device)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(hardware_crtc))
+            .expect("card1 CRTC has a production clock record");
+        c0_hw_3b_drive_until(
+            backend,
+            card1_device,
+            card1_fd,
+            "card1 Owner KernelSequence clock probe",
+            Duration::from_secs(20),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(card1_device)
+                    .and_then(|owner| owner.clock(clock_key))
+                    .is_some_and(|clock| {
+                        clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                            && clock.source == crate::kms::owner::clock::ClockSource::KernelSequence
+                    })
+            },
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("card1 Owner clock probe failed: {error}"));
+        c0_3cii_hotplug_initial_composed_commit(
+            backend,
+            card1_device,
+            card1_fd,
+            &card1_output_key,
+            "compose card1 before vkms device removal",
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("initial card1 composition failed: {error}"));
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&card1_output_key);
+            entry.last_enabled = Some(card1_config);
+            entry.crtc_associated = true;
+        }
+
+        let vkms_hardware_crtc =
+            u32::from(CrtcKey::for_output(&backend.platform.outputs[vkms_output_index]).crtc);
+        backend.activate_admission_clock_probes(vkms_key);
+        let vkms_clock_key = backend
+            .platform
+            .owner_ref(vkms_key)
+            .and_then(|owner| owner.clock_key_for_hardware_crtc(vkms_hardware_crtc))
+            .unwrap_or_else(|| {
+                panic!(
+                    "vkms Owner qualification failed: active CRTC {vkms_hardware_crtc} has no production clock record"
+                )
+            });
+        let vkms_clock_probe = c0_hw_3b_drive_until(
+            backend,
+            vkms_key,
+            vkms_device_rc.as_fd().as_raw_fd(),
+            "vkms Owner DRM_IOCTL_MODE_GET_SEQUENCE clock probe",
+            Duration::from_secs(20),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(vkms_key)
+                    .and_then(|owner| owner.clock(vkms_clock_key))
+                    .is_some_and(|clock| {
+                        clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                            && clock.source == crate::kms::owner::clock::ClockSource::KernelSequence
+                    })
+            },
+            &hardware_complete,
+        );
+        let vkms_clock_state = backend
+            .platform
+            .owner_ref(vkms_key)
+            .and_then(|owner| owner.clock(vkms_clock_key));
+        if vkms_clock_probe.is_err()
+            || !vkms_clock_state.is_some_and(|clock| {
+                clock.probe == crate::kms::owner::clock::ProbeState::Succeeded
+                    && clock.source == crate::kms::owner::clock::ClockSource::KernelSequence
+            })
+        {
+            panic!(
+                "vkms Owner qualification failed: DRM_IOCTL_MODE_GET_SEQUENCE did not establish KernelSequence on active CRTC {vkms_hardware_crtc}; probe_state={:?}; outcome={:?}; driver vblank must advance the CRTC after modeset; driver error={:?}",
+                vkms_clock_state.map(|clock| clock.probe),
+                vkms_clock_state.and_then(|clock| clock.probe_outcome),
+                vkms_clock_probe.err()
+            );
+        }
+
+        let mut card1_resource_pair = Some((
+            backend
+                .resource_service
+                .take()
+                .expect("card1 resource service"),
+            backend
+                .drm_cleanup_registry
+                .take()
+                .expect("card1 DRM cleanup registry"),
+        ));
+        let (vkms_service, vkms_registry) = vkms_resource_pair
+            .take()
+            .expect("vkms Owner resources were prepared");
+        backend.install_resource_service_with_registry(vkms_service, vkms_registry);
+        if let Err(error) = c0_3cii_hotplug_initial_composed_commit(
+            backend,
+            vkms_key,
+            vkms_device_rc.as_fd().as_raw_fd(),
+            &vkms_output_key,
+            "compose vkms Owner frame before device removal",
+            &hardware_complete,
+        ) {
+            let diagnostic = c0_3cii_hotplug_diagnostics_for_tests(
+                backend,
+                vkms_key,
+                vkms_output_index,
+                vkms_hardware_crtc,
+            );
+            panic!(
+                "vkms Owner qualification failed: composed frame did not complete: {error}; {diagnostic}"
+            );
+        }
+        vkms_resource_pair = Some((
+            backend
+                .resource_service
+                .take()
+                .expect("vkms resource service after its composed frame"),
+            backend
+                .drm_cleanup_registry
+                .take()
+                .expect("vkms cleanup registry after its composed frame"),
+        ));
+        let (card1_service, card1_registry) = card1_resource_pair
+            .take()
+            .expect("card1 Owner resources were retained while vkms composed");
+        backend.install_resource_service_with_registry(card1_service, card1_registry);
+
+        let mut state = c0_3ci_core_state(backend);
+        let shutdown_receiver = c0_3cii_install_core_shutdown_channel(backend);
+        backend.platform.hotplug_monitor = Some(
+            crate::kms::hotplug::DrmHotplugMonitor::new()
+                .expect("create production udev monitor")
+                .expect("production udev monitor is available"),
+        );
+        assert!(
+            Backend::poll_fds(backend)
+                .iter()
+                .any(|(_, kind)| *kind == yserver_core::backend::BackendFdKind::DrmHotplug),
+            "production udev monitor is installed in the core poll set"
+        );
+        let classifier_incarnation = backend
+            .platform
+            .owner_ref(vkms_key)
+            .expect("vkms Owner incarnation")
+            .incarnation();
+        assert_eq!(
+            classifier_incarnation, vkms_incarnation,
+            "the production classifier retains the real vkms Owner incarnation"
+        );
+        assert_eq!(
+            backend
+                .open_drm_cards_for_hotplug_classifier()
+                .get(&vkms_key),
+            Some(&Some(vkms_incarnation)),
+            "the real vkms Owner card has an incarnation for typed device removal"
+        );
+        let mut query_client = c0_3aii_install_dpms_core_client(&mut state, 82);
+        state.randr_select_masks.insert(
+            (82, yserver_core::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_SCREEN_CHANGE
+                | yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE
+                | yserver_protocol::x11::randr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        assert!(
+            state
+                .randr
+                .screen_resources_current()
+                .outputs
+                .contains(&vkms_output_ids.output_id),
+            "the real vkms connector is present in the initial RANDR route"
+        );
+        assert!(
+            state
+                .randr
+                .screen_resources_current()
+                .outputs
+                .contains(&card1_output_id),
+            "card1 remains present as the other composing Owner"
+        );
+
+        c0_3cii_hotplug_initial_composed_commit(
+            backend,
+            card1_device,
+            card1_fd,
+            &card1_output_key,
+            "card1 composes before vkms removal",
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("pre-removal card1 composition failed: {error}"));
+
+        let initial_device_count = backend.platform.devices.len();
+        let remove_record_start = backend.drm_hotplug_records_for_tests.len();
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        let (card1_service, card1_registry) = (
+            backend
+                .resource_service
+                .take()
+                .expect("card1 resource service before vkms removal"),
+            backend
+                .drm_cleanup_registry
+                .take()
+                .expect("card1 cleanup registry before vkms removal"),
+        );
+        card1_resource_pair = Some((card1_service, card1_registry));
+        let (vkms_service, vkms_registry) = vkms_resource_pair
+            .take()
+            .expect("vkms Owner resource pair before removal");
+        backend.install_resource_service_with_registry(vkms_service, vkms_registry);
+        let vkms_requests_before_remove = backend
+            .platform
+            .device_for_key(vkms_key)
+            .and_then(|device| device.executor.as_ref())
+            .expect("vkms Owner executor before device removal")
+            .sent_requests_for_tests();
+        eprintln!("destroy vkms device at {}", vkms_path.display());
+        invoke_helper(helper_override.as_deref(), "destroy");
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "real vkms udev remove to DeviceRemoved",
+            Duration::from_secs(20),
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&vkms_key)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    })
+                    && backend.drm_hotplug_records_for_tests[remove_record_start..]
+                        .iter()
+                        .any(|record| {
+                            record.action == crate::kms::hotplug::DrmHotplugAction::Remove
+                                && record.dev_t == Some(vkms_key)
+                                && record.is_card_node
+                        })
+                    && backend
+                        .platform
+                        .device_for_key(vkms_key)
+                        .and_then(|device| device.executor.as_ref())
+                        .is_some_and(|executor| {
+                            executor.state() == crate::kms::executor::ExecutorState::Reaped
+                        })
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("real vkms remove did not reach DeviceRemoved: {error}"));
+        let remove_records = &backend.drm_hotplug_records_for_tests[remove_record_start..];
+        let removed_card_records = remove_records
+            .iter()
+            .filter(|record| {
+                record.action == crate::kms::hotplug::DrmHotplugAction::Remove
+                    && record.dev_t == Some(vkms_key)
+                    && record.is_card_node
+                    && record.subsystem.as_deref() == Some("drm")
+                    && record.devnode.as_deref() == Some(vkms_path.as_path())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            removed_card_records.len(),
+            1,
+            "one real vkms card remove record"
+        );
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            backend,
+            &state,
+            delivery_start,
+            vkms_output_ids.output_id,
+            vkms_output_ids.crtc_id,
+            "real vkms card removal",
+        );
+        assert_eq!(backend.platform.devices.len(), initial_device_count);
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&vkms_key)
+                .map(|arbiter| arbiter.state()),
+            Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Removed),
+            "the real vkms Owner arbiter reaches Removed after udev delivery"
+        );
+        let removed_executor = backend
+            .platform
+            .device_for_key(vkms_key)
+            .and_then(|device| device.executor.as_ref())
+            .expect("removed vkms Owner executor remains supervised through teardown");
+        assert_eq!(
+            removed_executor.state(),
+            crate::kms::executor::ExecutorState::Reaped,
+            "DeviceRemoved terminates and reaps the vkms Owner executor"
+        );
+        assert_eq!(
+            removed_executor.sent_requests_for_tests(),
+            vkms_requests_before_remove,
+            "no KMS request is sent to vkms after DeviceRemoved"
+        );
+        assert!(
+            backend
+                .platform
+                .device_for_key(vkms_key)
+                .is_some_and(|device| {
+                    device.owner.as_ref().is_some_and(|owner| {
+                        owner.live_record().is_none() && !owner.has_legacy_drain_permit()
+                    })
+                }),
+            "the vkms Owner has no live commit or Legacy drain permit after removal"
+        );
+        assert!(
+            !backend
+                .open_drm_cards_for_hotplug_classifier()
+                .contains_key(&vkms_key),
+            "the removed vkms card is no longer an open classifier target"
+        );
+        assert!(
+            backend
+                .platform
+                .owner_ref(vkms_key)
+                .is_some_and(|owner| owner.live_record().is_none())
+        );
+        assert!(
+            !state
+                .randr
+                .screen_resources_current()
+                .outputs
+                .contains(&vkms_output_ids.output_id),
+            "the removed vkms output is absent from the live RANDR route"
+        );
+        vkms_resource_pair = Some((
+            backend
+                .resource_service
+                .take()
+                .expect("vkms resource service after removal"),
+            backend
+                .drm_cleanup_registry
+                .take()
+                .expect("vkms cleanup registry after removal"),
+        ));
+        let (card1_service, card1_registry) = card1_resource_pair
+            .take()
+            .expect("card1 Owner resources after vkms removal");
+        backend.install_resource_service_with_registry(card1_service, card1_registry);
+        assert!(
+            shutdown_receiver
+                .try_recv_all_tagged()
+                .into_iter()
+                .all(|(_, message)| !matches!(message, Message::Shutdown)),
+            "removing the non-renderer vkms Owner does not exit the server"
+        );
+
+        c0_3cii_hotplug_initial_composed_commit(
+            backend,
+            card1_device,
+            card1_fd,
+            &card1_output_key,
+            "card1 composes after vkms removal",
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("card1 stopped composing after vkms removal: {error}"));
+        assert!(
+            !kbd_map_drain(&mut query_client).is_empty(),
+            "the client remains connected and received card1 RandR state"
+        );
+
+        let add_record_start = backend.drm_hotplug_records_for_tests.len();
+        let add_log_start = backend.drm_hotplug_add_log_records_for_tests.len();
+        eprintln!("re-create vkms device at {}", vkms_path.display());
+        invoke_helper(helper_override.as_deref(), "create");
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "real vkms udev add to DeviceAddedOrReplaced",
+            Duration::from_secs(20),
+            &|backend| {
+                backend.drm_hotplug_add_log_records_for_tests.len() > add_log_start
+                    && backend.drm_hotplug_records_for_tests[add_record_start..]
+                        .iter()
+                        .any(|record| {
+                            record.action == crate::kms::hotplug::DrmHotplugAction::Add
+                                && record.is_card_node
+                                && record.subsystem.as_deref() == Some("drm")
+                        })
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("real vkms add was not logged: {error}"));
+        let added_records = &backend.drm_hotplug_records_for_tests[add_record_start..];
+        let added_card_records = added_records
+            .iter()
+            .filter(|record| {
+                record.action == crate::kms::hotplug::DrmHotplugAction::Add
+                    && record.is_card_node
+                    && record.subsystem.as_deref() == Some("drm")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(added_card_records.len(), 1, "one real vkms card add record");
+        assert_eq!(
+            backend.drm_hotplug_add_log_records_for_tests[add_log_start..],
+            [(*added_card_records[0]).clone()],
+            "the card add becomes one DeviceAddedOrReplaced log record"
+        );
+        let readded_vkms_path = configfs_card_path()
+            .unwrap_or_else(|| panic!("vkms {VKMS_CONFIGFS_NAME} has no re-added DRM card"));
+        assert_eq!(
+            added_card_records[0].devnode.as_deref(),
+            Some(readded_vkms_path.as_path()),
+            "the real add record names the re-created configfs vkms card"
+        );
+        let readded_key = added_card_records[0]
+            .dev_t
+            .expect("real vkms card add record has dev_t");
+        assert_eq!(
+            backend.platform.devices.len(),
+            initial_device_count,
+            "DeviceAddedOrReplaced leaves the new card unopened"
+        );
+        assert!(
+            backend
+                .platform
+                .devices
+                .iter()
+                .filter(|entry| entry.key == readded_key)
+                .all(|entry| Rc::ptr_eq(&entry.device, &vkms_device_rc))
+        );
+        assert!(
+            backend
+                .open_drm_cards_for_hotplug_classifier()
+                .get(&readded_key)
+                .is_none_or(|incarnation| incarnation.is_none()),
+            "the re-added node has no live incarnation and remains unopened"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&vkms_key)
+                .map(|arbiter| arbiter.state()),
+            Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Removed),
+            "DeviceAddedOrReplaced does not revive the removed device"
+        );
+        assert!(
+            shutdown_receiver
+                .try_recv_all_tagged()
+                .into_iter()
+                .all(|(_, message)| !matches!(message, Message::Shutdown)),
+            "re-adding an unopened non-renderer card does not exit the server"
+        );
+        c0_3cii_hotplug_initial_composed_commit(
+            backend,
+            card1_device,
+            card1_fd,
+            &card1_output_key,
+            "card1 composes after vkms re-add",
+            &hardware_complete,
+        )
+        .unwrap_or_else(|error| panic!("card1 stopped composing after vkms re-add: {error}"));
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_hw_3cii_vkms_device_hotplug_drm",
+            &c0_3bi_expected_end_state([card1_output_key]),
+        );
+        let (_, vkms_registry) = vkms_resource_pair
+            .as_mut()
+            .expect("vkms resource pair remains quarantined after removal");
+        backend.platform.scanout_pools[vkms_output_index]
+            .as_mut()
+            .expect("removed vkms scanout pool remains retained until teardown")
+            .detach_managed_entries(Some(vkms_registry));
+        backend.platform.scanout_pools[vkms_output_index] = None;
+        // The vkms device has been physically removed. Drop the card1 fixture
+        // while its matching service is installed; the detached vkms pool and
+        // its resource pair then close through fd teardown without another
+        // Owner KMS request to the removed device.
+        drop(fixture);
     }
 }
 

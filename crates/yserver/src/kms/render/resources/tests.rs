@@ -2813,7 +2813,10 @@ fn c0_2ci_completion_waiter_registration_and_recheck() {
 /// parity case in `docs/phase-c0-deferred-real-server-tests.md`.
 ///
 /// Every class is an owner-mediated mock here; a test that needs one disabled
-/// builds its own evidence.
+/// builds its own evidence. For `Topology`, the 3c-ii fixture evidence is the
+/// hotplug transaction/publication tests and the forced-reprobe differential.
+/// The real vkms card remove/re-add remains the pending acceptance gate and is
+/// not part of this proof.
 pub(crate) fn writer_coverage_evidence_for_tests() -> super::transport::TestWriterCoverageEvidence {
     use super::transport::{TestWriterCoverage::OwnerMediatedMock, TestWriterCoverageEvidence};
     TestWriterCoverageEvidence {
@@ -2822,6 +2825,8 @@ pub(crate) fn writer_coverage_evidence_for_tests() -> super::transport::TestWrit
         modeset: OwnerMediatedMock,
         dpms: OwnerMediatedMock,
         vt: OwnerMediatedMock,
+        // Proven by the 3c-ii topology transaction and forced-reprobe tests;
+        // the vkms hardware acceptance gate remains explicitly pending.
         topology: OwnerMediatedMock,
         cursor: OwnerMediatedMock,
         gamma: OwnerMediatedMock,
@@ -2856,6 +2861,18 @@ fn c0_3ci_vt_writer_coverage_proven() {
         evidence.coverage(WriterClass::Vt),
         OwnerMediatedMock,
         "3c-i release, acquire, and rapid-switch tests prove VT writer coverage; the deferred 3b-ii Task 5 VT-released real-server wire-parity row remains unclaimed"
+    );
+}
+
+#[test]
+fn c0_3cii_topology_writer_coverage_proven() {
+    use super::transport::TestWriterCoverage::OwnerMediatedMock;
+
+    let evidence = writer_coverage_evidence_for_tests();
+    assert_eq!(
+        evidence.coverage(WriterClass::Topology),
+        OwnerMediatedMock,
+        "c0_3cii_unplug_retires_and_publishes_vulkan, c0_3cii_replug_relights_remembered_route_vulkan, and c0_3cii_forced_reprobe_differential_vulkan prove the topology writer; stage-5 assembled-server hotplug and forced-reprobe rows remain deferred; pending vkms hardware run (acceptance gate) remains unclaimed"
     );
 }
 

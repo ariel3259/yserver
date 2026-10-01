@@ -5448,13 +5448,8 @@ impl PlatformBackend {
     > {
         let mut all = Vec::with_capacity(self.devices.len());
         for device in &self.devices {
-            let probes =
-                crate::platform::drm::probe_connectors(&device.device).map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("probe connectors on DRM device {}: {error}", device.key),
-                    )
-                })?;
+            let fd = duplicate_connector_probe_fd(device.device.as_ref())?;
+            let probes = self.connector_prober.probe_connectors(device.key, fd)?;
             all.push((device.key, probes));
         }
         Ok(all)
