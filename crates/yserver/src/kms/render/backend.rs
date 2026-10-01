@@ -111011,7 +111011,7 @@ mod tests {
     fn c0_3cii_hotplug_initial_composed_commit(
         backend: &mut super::KmsBackend,
         device: DrmDeviceKey,
-        drm_fd: std::os::fd::RawFd,
+        _drm_fd: std::os::fd::RawFd,
         output_key: &OutputKey,
         label: &str,
         hardware_complete: &std::rc::Rc<
@@ -111059,10 +111059,12 @@ mod tests {
             "{label}: initial-frame baseline: {}",
             c0_3cii_hotplug_diagnostics_for_tests(backend, device, output_idx, u32::from(crtc))
         );
-        c0_hw_3b_drive_until(
+        // Stop as soon as the target commit is current: one more iteration
+        // can dispatch the next frame, and a commit with a successor in
+        // flight is no longer in current_resources.
+        c0_3bi_core_driver_until_mode(
             backend,
-            device,
-            drm_fd,
+            &mut ServerState::new(),
             label,
             std::time::Duration::from_secs(20),
             &|backend| {
@@ -111117,7 +111119,9 @@ mod tests {
                         .owner_ref(device)
                         .is_some_and(|owner| owner.live_record().is_none())
             },
-            hardware_complete,
+            Some(hardware_complete),
+            false,
+            true,
         )?;
 
         let commit_key = backend
@@ -111136,7 +111140,27 @@ mod tests {
                         .contains(&AdmissionTraceStep::Dispatched(commit_key.commit))
                     && hardware_complete.borrow().contains(&commit_key.commit)
             })
-            .ok_or_else(|| format!("{label}: no fresh composed commit reached HardwareComplete"))?;
+            .ok_or_else(|| {
+                format!(
+                    "{label}: no fresh composed commit reached HardwareComplete; current={:?}; current_before={current_before:?}; dispatched_before={dispatched_before:?}; trace={:?}; hardware_complete={:?}; live={:?}",
+                    backend
+                        .commit_consumer
+                        .current_resources
+                        .iter()
+                        .map(|resources| (
+                            resources.commit_id,
+                            resources.direct_role.is_some(),
+                            resources.crtcs.iter().map(|member| member.crtc).collect::<Vec<_>>()
+                        ))
+                        .collect::<Vec<_>>(),
+                    backend.admission_trace_for_tests(device),
+                    hardware_complete.borrow(),
+                    backend
+                        .platform
+                        .owner_ref(device)
+                        .and_then(|owner| owner.live_record().map(|record| record.commit_id())),
+                )
+            })?;
 
         let current_framebuffer = c0_3aii_owner_current_framebuffer(backend, output_idx)
             .ok_or_else(|| format!("{label}: output has no retained composed framebuffer"))?;
@@ -120242,27 +120266,30 @@ mod tests {
                 .collect()
         }
 
-        fn card_is_vkms(sysfs_card: &Path) -> bool {
-            let device = sysfs_card.join("device");
-            let driver_is_vkms = fs::read_link(device.join("driver"))
-                .ok()
-                .and_then(|path| path.file_name().map(|name| name.to_owned()))
-                .is_some_and(|name| name == "vkms");
-            let uevent_is_vkms = fs::read_to_string(device.join("uevent"))
-                .ok()
-                .is_some_and(|uevent| uevent.lines().any(|line| line == "DRIVER=vkms"));
-            let sysfs_path_is_vkms = fs::canonicalize(&device)
-                .ok()
-                .is_some_and(|path| path.to_string_lossy().contains("/vkms/"));
-            driver_is_vkms || uevent_is_vkms || sysfs_path_is_vkms
-        }
+        // vkms registers under the faux bus on recent kernels, so sysfs names
+        // no vkms driver; the DRM version ioctl reports it on every kernel.
+        // The node appears root-only until udev applies its permissions, so
+        // opening waits for udev, bounded.
+        fn card_driver_name(card: &Path) -> Result<String, String> {
+            use ::drm::Device as _;
 
-        fn vkms_card_paths() -> Vec<PathBuf> {
-            drm_card_entries()
-                .into_iter()
-                .filter(|(sysfs_card, _)| card_is_vkms(sysfs_card))
-                .map(|(_, name)| PathBuf::from("/dev/dri").join(name))
-                .collect()
+            let path = card
+                .to_str()
+                .ok_or_else(|| format!("{} is not UTF-8", card.display()))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let device = loop {
+                match crate::drm::Device::open(path) {
+                    Ok(device) => break device,
+                    Err(error) if std::time::Instant::now() >= deadline => {
+                        return Err(format!("open {path} within 5 s: {error}"));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            };
+            device
+                .get_driver()
+                .map(|driver| driver.name().to_string_lossy().into_owned())
+                .map_err(|error| format!("DRM version of {path}: {error}"))
         }
 
         fn configfs_card_path() -> Option<PathBuf> {
@@ -120327,11 +120354,10 @@ mod tests {
             }
         }
 
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .is_test(true)
+            .try_init();
         let card1 = PathBuf::from("/dev/dri/card1");
-        assert!(
-            Path::new("/sys/module/vkms").exists(),
-            "vkms Owner qualification failed: the kernel vkms module is not loaded"
-        );
         fs::metadata(&card1).unwrap_or_else(|error| {
             panic!(
                 "vkms hotplug acceptance requires card1 as the other composing Owner; /dev/dri/card1 is unavailable: {error}"
@@ -120344,10 +120370,19 @@ mod tests {
         // measured events limited to the later Owner remove/add cycle.
         invoke_helper(helper_override.as_deref(), "destroy");
         invoke_helper(helper_override.as_deref(), "create");
+        // The helper loads vkms on first use, so the module is checked only
+        // after it ran.
+        assert!(
+            Path::new("/sys/module/vkms").exists(),
+            "vkms Owner qualification failed: the kernel vkms module is not loaded"
+        );
         let vkms_path = configfs_card_path()
             .unwrap_or_else(|| panic!("vkms Owner qualification failed: configfs {VKMS_CONFIGFS_NAME} did not create a DRM card"));
-        assert!(
-            vkms_card_paths().contains(&vkms_path),
+        let vkms_driver = card_driver_name(&vkms_path)
+            .unwrap_or_else(|error| panic!("vkms Owner qualification failed: {error}"));
+        assert_eq!(
+            vkms_driver,
+            "vkms",
             "vkms Owner qualification failed: {} is not registered by the vkms DRM driver",
             vkms_path.display()
         );
@@ -120900,52 +120935,11 @@ mod tests {
             );
         }
 
-        let mut card1_resource_pair = Some((
-            backend
-                .resource_service
-                .take()
-                .expect("card1 resource service"),
-            backend
-                .drm_cleanup_registry
-                .take()
-                .expect("card1 DRM cleanup registry"),
-        ));
-        let (vkms_service, vkms_registry) = vkms_resource_pair
-            .take()
-            .expect("vkms Owner resources were prepared");
-        backend.install_resource_service_with_registry(vkms_service, vkms_registry);
-        if let Err(error) = c0_3cii_hotplug_initial_composed_commit(
-            backend,
-            vkms_key,
-            vkms_device_rc.as_fd().as_raw_fd(),
-            &vkms_output_key,
-            "compose vkms Owner frame before device removal",
-            &hardware_complete,
-        ) {
-            let diagnostic = c0_3cii_hotplug_diagnostics_for_tests(
-                backend,
-                vkms_key,
-                vkms_output_index,
-                vkms_hardware_crtc,
-            );
-            panic!(
-                "vkms Owner qualification failed: composed frame did not complete: {error}; {diagnostic}"
-            );
-        }
-        vkms_resource_pair = Some((
-            backend
-                .resource_service
-                .take()
-                .expect("vkms resource service after its composed frame"),
-            backend
-                .drm_cleanup_registry
-                .take()
-                .expect("vkms cleanup registry after its composed frame"),
-        ));
-        let (card1_service, card1_registry) = card1_resource_pair
-            .take()
-            .expect("card1 Owner resources were retained while vkms composed");
-        backend.install_resource_service_with_registry(card1_service, card1_registry);
+        // One ResourceService per Owner device is activation's (stages 4/5),
+        // so card1 keeps the installed service for the whole test and the
+        // vkms pair stays quarantined: a composed vkms frame would need it
+        // installed while card1 keeps composing. vkms is still a live Owner
+        // device with a real modeset, clock and executor.
 
         let mut state = c0_3ci_core_state(backend);
         let shutdown_receiver = c0_3cii_install_core_shutdown_channel(backend);
@@ -121013,21 +121007,6 @@ mod tests {
         let initial_device_count = backend.platform.devices.len();
         let remove_record_start = backend.drm_hotplug_records_for_tests.len();
         let delivery_start = backend.core_entry_deliveries_for_tests.len();
-        let (card1_service, card1_registry) = (
-            backend
-                .resource_service
-                .take()
-                .expect("card1 resource service before vkms removal"),
-            backend
-                .drm_cleanup_registry
-                .take()
-                .expect("card1 cleanup registry before vkms removal"),
-        );
-        card1_resource_pair = Some((card1_service, card1_registry));
-        let (vkms_service, vkms_registry) = vkms_resource_pair
-            .take()
-            .expect("vkms Owner resource pair before removal");
-        backend.install_resource_service_with_registry(vkms_service, vkms_registry);
         let vkms_requests_before_remove = backend
             .platform
             .device_for_key(vkms_key)
@@ -121146,20 +121125,6 @@ mod tests {
                 .contains(&vkms_output_ids.output_id),
             "the removed vkms output is absent from the live RANDR route"
         );
-        vkms_resource_pair = Some((
-            backend
-                .resource_service
-                .take()
-                .expect("vkms resource service after removal"),
-            backend
-                .drm_cleanup_registry
-                .take()
-                .expect("vkms cleanup registry after removal"),
-        ));
-        let (card1_service, card1_registry) = card1_resource_pair
-            .take()
-            .expect("card1 Owner resources after vkms removal");
-        backend.install_resource_service_with_registry(card1_service, card1_registry);
         assert!(
             shutdown_receiver
                 .try_recv_all_tagged()
@@ -121273,10 +121238,45 @@ mod tests {
             &hardware_complete,
         )
         .unwrap_or_else(|error| panic!("card1 stopped composing after vkms re-add: {error}"));
-        c0_3bi_assert_end_state(
+        // Removal withdraws vkms logically (asserted absent from RANDR
+        // above); its output stays installed until 3d's teardown, as in
+        // c0_3cii_device_removed_withdraws_and_continues_vulkan.
+        let expected = c0_3cii_removed_end_state(
             backend,
-            "c0_hw_3cii_vkms_device_hotplug_drm",
-            &c0_3bi_expected_end_state([card1_output_key]),
+            [card1_output_key, vkms_output_key.clone()],
+            vkms_key,
+        );
+        // The vkms pool's allocations live in the quarantined vkms service
+        // (one installed service until activation), so those are checked
+        // there; every other end-state rule runs unchanged.
+        let vkms_held = vkms_resource_pair
+            .as_ref()
+            .expect("vkms resource pair remains quarantined after removal")
+            .0
+            .allocation_end_state_for_tests()
+            .into_iter()
+            .map(|allocation| allocation.key)
+            .collect::<HashSet<_>>();
+        let vkms_pool_keys = c0_hw_3b_pool_allocations(backend, &vkms_output_key);
+        assert!(
+            !vkms_pool_keys.is_empty() && vkms_pool_keys.iter().all(|key| vkms_held.contains(key)),
+            "the removed vkms pool's allocations stay held by its quarantined service: pool={vkms_pool_keys:?}; held={vkms_held:?}"
+        );
+        let errors = c0_3bi_end_state_errors(backend, &expected)
+            .into_iter()
+            .filter(|error| {
+                !vkms_pool_keys.iter().any(|key| {
+                    *error
+                        == format!(
+                            "expected live allocation {key:?} is absent from the resource service"
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "c0_hw_3cii_vkms_device_hotplug_drm end-state check failed:\n{}",
+            errors.join("\n")
         );
         let (_, vkms_registry) = vkms_resource_pair
             .as_mut()

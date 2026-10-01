@@ -2872,7 +2872,7 @@ fn c0_3cii_topology_writer_coverage_proven() {
     assert_eq!(
         evidence.coverage(WriterClass::Topology),
         OwnerMediatedMock,
-        "c0_3cii_unplug_retires_and_publishes_vulkan, c0_3cii_replug_relights_remembered_route_vulkan, and c0_3cii_forced_reprobe_differential_vulkan prove the topology writer; stage-5 assembled-server hotplug and forced-reprobe rows remain deferred; pending vkms hardware run (acceptance gate) remains unclaimed"
+        "c0_3cii_unplug_retires_and_publishes_vulkan, c0_3cii_replug_relights_remembered_route_vulkan, and c0_3cii_forced_reprobe_differential_vulkan prove the topology writer; stage-5 assembled-server hotplug and forced-reprobe rows remain deferred; the vkms device hotplug acceptance gate passed on hardware (c0_hw_3cii_vkms_device_hotplug_drm, 2026-10-01)"
     );
 }
 
