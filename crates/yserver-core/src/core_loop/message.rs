@@ -134,8 +134,32 @@ pub struct LibinputConfigSnapshot {
     pub click_method: OneHot2,
     /// Accel profiles: bit0=adaptive, bit1=flat (custom excluded — feature-gated).
     pub accel_profile: OneHot2,
+    /// Actual libinput acceleration profiles: bit0=adaptive, bit1=flat,
+    /// bit2=custom. This is kept separate from `accel_profile` so
+    /// availability is not inferred from the current/default profile slots.
+    pub accel_profile_available_mask: u8,
     /// Send-events: bitflags bit0=disabled, bit1=disabled-on-external-mouse.
     pub send_events: BitFlags2,
+}
+
+/// An owned recognized XI property write, suitable for validation after it
+/// crosses from request parsing into the core configuration lane.
+#[derive(Debug, Clone)]
+pub struct XiConfigRequest {
+    pub client: ClientId,
+    pub sequence: SequenceNumber,
+    pub minor_opcode: u16,
+    pub deviceid: u16,
+    /// Source identity captured when the request was received. This prevents
+    /// an XI ID reused after unplug from redirecting a queued write.
+    pub expected_source: crate::xinput::InputSourceId,
+    pub property: yserver_protocol::x11::AtomId,
+    pub type_atom: yserver_protocol::x11::AtomId,
+    pub format: u8,
+    pub mode: u8,
+    /// Canonical little-endian property value bytes, with format-8 payloads
+    /// unchanged.
+    pub data: Vec<u8>,
 }
 
 /// All inbound messages multiplexed onto the core thread.

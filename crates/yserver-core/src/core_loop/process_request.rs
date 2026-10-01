@@ -17761,12 +17761,13 @@ fn handle_xi2_request(
                     XI2_MAJOR_OPCODE,
                 );
             };
-            let data = data.to_vec();
+            let data = canonicalize_xi_property_data(byte_order, format, data);
             // T3 spec §D order is implemented by `dispatch_change_property`;
             // both write arms (XI2 minor 57 + XI1 minor 37) share the same
             // pipeline so T5/T6 only has to wire event emission in one place.
             match dispatch_change_property(
-                state, backend, deviceid, mode, format, property, type_atom, &data,
+                state, backend, client_id, sequence, 57, deviceid, mode, format, property,
+                type_atom, &data,
             ) {
                 Ok(what) => {
                     let _ = emit_property_change(state, deviceid, property, what);
@@ -19157,14 +19158,15 @@ fn handle_xi2_request(
                     XI2_MAJOR_OPCODE,
                 );
             };
-            let data = data.to_vec();
+            let data = canonicalize_xi_property_data(byte_order, format, data);
             // The T3 spec §D pipeline is shared with the XI2 arm
             // (minor 57) via `dispatch_change_property`; the same
             // `emit_property_change` helper fans out
             // `XI_PropertyEvent` here too — xserver's
             // `send_property_event` fires from both XI1 and XI2 paths.
             match dispatch_change_property(
-                state, backend, deviceid, mode, format, property, type_atom, &data,
+                state, backend, client_id, sequence, 37, deviceid, mode, format, property,
+                type_atom, &data,
             ) {
                 Ok(what) => {
                     let _ = emit_property_change(state, deviceid, property, what);
@@ -24301,7 +24303,7 @@ fn render_picture_damage_drawable(state: &ServerState, drawable: ResourceId) -> 
 /// constants (BadAtom = 5, BadAccess = 10, BadValue = 2, BadMatch = 8).
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)]
-enum PropertyDispatchError {
+pub(super) enum PropertyDispatchError {
     /// Atom is not interned → X error code 5 (BadAtom). Echoes the atom.
     BadAtom { atom: u32 },
     /// Write targets a ReadOnly descriptor → X error code 10 (BadAccess).
@@ -24315,31 +24317,298 @@ enum PropertyDispatchError {
     /// Backend rejected the setting as `Unsupported` → X error code 8
     /// (BadMatch). error_value is always 0 here (matches xserver).
     BadMatch,
+    /// The requested XI id disappeared or now names a different source.
+    BadDevice { deviceid: u16 },
 }
 
-/// Run the T3 spec §D validate-before-commit pipeline shared by XI2
-/// XIChangeProperty (minor 57) and XI1 XChangeDeviceProperty (minor 37).
+/// A validated physical driver write, ready for Task 8's source-targeted
+/// backend submission and subsequent commit.
+#[derive(Debug, Clone)]
+pub(super) struct ValidatedXiChange {
+    pub request: crate::core_loop::message::XiConfigRequest,
+    pub source_id: crate::xinput::InputSourceId,
+    /// The live XI id for this physical facet.
+    pub facet_id: u16,
+    pub facet_kind: crate::xinput::XiFacetKind,
+    /// Fully merged, normalized value. Flags are retained for an existing
+    /// entry and default to the XICreateDeviceProperty flags for recreation.
+    pub merged_property: crate::xinput::XiProperty,
+    pub change: crate::xinput::libinput_props::DeviceConfigChange,
+}
+
+/// XI request headers are normalized by the reader, while the typed value
+/// tail remains opaque. Store 16/32-bit property items in the same LE form as
+/// the rest of the XI property registry and the libinput decoders.
+fn canonicalize_xi_property_data(
+    byte_order: x11::ClientByteOrder,
+    format: u8,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut canonical = data.to_vec();
+    if byte_order == x11::ClientByteOrder::BigEndian {
+        match format {
+            16 => canonical
+                .chunks_exact_mut(2)
+                .for_each(|value| value.reverse()),
+            32 => canonical
+                .chunks_exact_mut(4)
+                .for_each(|value| value.reverse()),
+            _ => {}
+        }
+    }
+    canonical
+}
+
+/// Validate and merge one recognized physical libinput property write.
 ///
-/// Order: BadAtom → descriptor lookup → ReadOnly→BadAccess →
-/// format/type vs descriptor→BadMatch → merge by mode (Append/Prepend
-/// against the existing stored value, absent → Replace) →
-/// validate_value→BadValue → normalize_value → decode_change→BadValue →
-/// `backend.apply_device_config`→Unsupported/Invalid → commit the
-/// normalised merged value via `apply_change_property` (Replace mode,
-/// since the merge already happened; atoms with no descriptor row skip
-/// straight to committing the request's raw `mode`/`data` unchanged).
-///
-/// Preconditions (already enforced by both arms before calling):
-///   * `find_device(deviceid)` returned Some.
-///   * `mode` is one of REPLACE/PREPEND/APPEND.
-///   * `format` is one of 8/16/32.
-///   * `data.len() == num_items * (format / 8)`.
-///
-/// On `Ok`, the per-device property registry has been mutated. The
-/// returned [`PropWhat`] is either `Created` (the property did not
-/// exist before this write) or `Modified` (it did) — the caller feeds
-/// it straight into the `XI_PropertyEvent` / `DevicePropertyNotify`
-/// `what` byte.
+/// Support comes from the live source/facet snapshot and descriptor table,
+/// never from whether the property happens to be present in the XI map.
+/// This lets deleted supported properties be recreated and prevents an
+/// ordinary client property from manufacturing driver support.
+pub(super) fn validate_xi_change(
+    state: &ServerState,
+    request: &crate::core_loop::message::XiConfigRequest,
+) -> Result<ValidatedXiChange, PropertyDispatchError> {
+    if !state.atoms.exists(request.property) {
+        return Err(PropertyDispatchError::BadAtom {
+            atom: request.property.0,
+        });
+    }
+    if is_xtest_marker_property(state, request.deviceid, request.property) {
+        return Err(PropertyDispatchError::BadAccess {
+            atom: request.property.0,
+        });
+    }
+
+    let device =
+        state
+            .xi_devices
+            .device(request.deviceid)
+            .ok_or(PropertyDispatchError::BadDevice {
+                deviceid: request.deviceid,
+            })?;
+    if device.source_id != Some(request.expected_source) {
+        return Err(PropertyDispatchError::BadDevice {
+            deviceid: request.deviceid,
+        });
+    }
+    let source = state.xi_devices.source(request.expected_source).ok_or(
+        PropertyDispatchError::BadDevice {
+            deviceid: request.deviceid,
+        },
+    )?;
+
+    let property_name =
+        state
+            .atoms
+            .name(request.property)
+            .ok_or(PropertyDispatchError::BadAtom {
+                atom: request.property.0,
+            })?;
+    let descriptor = crate::xinput::libinput_props::descriptor_by_name(property_name)
+        .ok_or(PropertyDispatchError::BadMatch)?;
+
+    // Every recognized libinput descriptor belongs to the pointer facet.
+    // A mixed physical source's keyboard facet cannot borrow its sibling's
+    // pointer support.
+    if device.facet != Some(crate::xinput::XiFacetKind::PointerTouch)
+        || !source.capabilities.pointer
+    {
+        return Err(PropertyDispatchError::BadMatch);
+    }
+
+    if descriptor.access == crate::xinput::libinput_props::Access::ReadOnly {
+        return Err(PropertyDispatchError::BadAccess {
+            atom: request.property.0,
+        });
+    }
+
+    let expected_type = crate::xinput::type_atom_for(descriptor.val, state.float_atom);
+    if request.format != descriptor.format || request.type_atom != expected_type {
+        return Err(PropertyDispatchError::BadMatch);
+    }
+
+    let existing = device.properties.get(&request.property);
+    let merged_data = match (request.mode, existing) {
+        (mode, Some(existing)) if mode == crate::xinput::XI_PROP_MODE_APPEND => {
+            if existing.format != request.format || existing.type_atom != request.type_atom {
+                return Err(PropertyDispatchError::BadMatch);
+            }
+            let mut data = existing.data.clone();
+            data.extend_from_slice(&request.data);
+            data
+        }
+        (mode, Some(existing)) if mode == crate::xinput::XI_PROP_MODE_PREPEND => {
+            if existing.format != request.format || existing.type_atom != request.type_atom {
+                return Err(PropertyDispatchError::BadMatch);
+            }
+            let mut data = request.data.clone();
+            data.extend_from_slice(&existing.data);
+            data
+        }
+        (mode, None)
+            if mode == crate::xinput::XI_PROP_MODE_APPEND
+                || mode == crate::xinput::XI_PROP_MODE_PREPEND =>
+        {
+            request.data.clone()
+        }
+        _ => request.data.clone(),
+    };
+
+    // Match xf86-input-libinput's setter shape checks before disabled-device
+    // and availability checks. Format/type mismatches were rejected above;
+    // a bad element count is also a BadMatch at the Xorg setter boundary.
+    let shape_matches = match descriptor.kind {
+        crate::xinput::libinput_props::ValueKind::Scalar => {
+            merged_data.len() == usize::from(descriptor.format / 8)
+        }
+        crate::xinput::libinput_props::ValueKind::OneHot { n }
+        | crate::xinput::libinput_props::ValueKind::BitFlags { n } => {
+            merged_data.len() == usize::from(n)
+        }
+        crate::xinput::libinput_props::ValueKind::OneHotOrNone { n, min } => {
+            merged_data.len() >= usize::from(min) && merged_data.len() <= usize::from(n)
+        }
+    };
+    if !shape_matches {
+        return Err(PropertyDispatchError::BadMatch);
+    }
+
+    if crate::xinput::libinput_props::validate_value(descriptor.kind, request.format, &merged_data)
+        .is_err()
+    {
+        return Err(PropertyDispatchError::BadValue {
+            error_value: u32::from(request.format),
+        });
+    }
+
+    // Scalar bool domains and accel-speed limits are checked by the Xorg
+    // setter before it tests whether the physical handle is enabled.
+    if matches!(
+        descriptor.binding,
+        Some(
+            crate::xinput::libinput_props::Binding::Tap
+                | crate::xinput::libinput_props::Binding::TapDrag
+                | crate::xinput::libinput_props::Binding::TapDragLock
+                | crate::xinput::libinput_props::Binding::NaturalScroll
+                | crate::xinput::libinput_props::Binding::Dwt
+                | crate::xinput::libinput_props::Binding::LeftHanded
+                | crate::xinput::libinput_props::Binding::MiddleEmulation
+                | crate::xinput::libinput_props::Binding::ScrollButtonLock
+        )
+    ) && merged_data[0] > 1
+    {
+        return Err(PropertyDispatchError::BadValue {
+            error_value: u32::from(request.format),
+        });
+    }
+    if descriptor.binding == Some(crate::xinput::libinput_props::Binding::AccelSpeed) {
+        let speed = f32::from_le_bytes(merged_data[..4].try_into().expect("scalar Float shape"));
+        if !(-1.0..=1.0).contains(&speed) && !speed.is_nan() {
+            return Err(PropertyDispatchError::BadValue {
+                error_value: u32::from(request.format),
+            });
+        }
+    }
+
+    if !source.enabled || !device.enabled {
+        return Err(PropertyDispatchError::BadMatch);
+    }
+    if !crate::xinput::descriptor_available(descriptor, &source.config) {
+        return Err(PropertyDispatchError::BadMatch);
+    }
+
+    let binding = descriptor
+        .binding
+        .expect("writable descriptor must have a config binding");
+    let normalized =
+        crate::xinput::libinput_props::normalize_value(descriptor.kind, &merged_data).into_owned();
+    let change =
+        crate::xinput::libinput_props::decode_change(binding, &normalized).map_err(|_| {
+            PropertyDispatchError::BadValue {
+                error_value: u32::from(request.format),
+            }
+        })?;
+
+    // A syntactically valid requested profile/mode can still be unavailable
+    // on this source. Xorg checks this after its disabled-device gate.
+    let requested_value_available = match change {
+        crate::xinput::libinput_props::DeviceConfigChange::AccelProfile(Some(profile)) => {
+            source.config.accel_profile_available_mask & (1 << profile) != 0
+        }
+        crate::xinput::libinput_props::DeviceConfigChange::ScrollMethod(Some(method)) => {
+            source.config.scroll_method.available_mask & (1 << method) != 0
+        }
+        crate::xinput::libinput_props::DeviceConfigChange::SendEvents(mask) => {
+            mask & !source.config.send_events.available_mask == 0
+        }
+        _ => true,
+    };
+    if !requested_value_available {
+        return Err(PropertyDispatchError::BadValue {
+            error_value: u32::from(request.format),
+        });
+    }
+
+    let (read_only, deletable) = existing.map_or((false, true), |property| {
+        (property.read_only, property.deletable)
+    });
+    Ok(ValidatedXiChange {
+        request: request.clone(),
+        source_id: request.expected_source,
+        facet_id: request.deviceid,
+        facet_kind: device.facet.expect("physical source has a facet"),
+        merged_property: crate::xinput::XiProperty {
+            type_atom: request.type_atom,
+            format: request.format,
+            data: normalized,
+            read_only,
+            deletable,
+        },
+        change,
+    })
+}
+
+/// Commit one previously validated property only after its source-targeted
+/// backend operation succeeds. A missing property is recreated with
+/// XICreateDeviceProperty's writable/deletable defaults.
+pub(super) fn commit_validated_xi_change(
+    state: &mut ServerState,
+    change: &ValidatedXiChange,
+) -> Result<crate::xinput::PropWhat, PropertyDispatchError> {
+    if state.xi_devices.source(change.source_id).is_none() {
+        return Err(PropertyDispatchError::BadDevice {
+            deviceid: change.facet_id,
+        });
+    }
+    let device = state
+        .xi_devices
+        .device_mut(change.facet_id)
+        .filter(|device| {
+            device.source_id == Some(change.source_id) && device.facet == Some(change.facet_kind)
+        })
+        .ok_or(PropertyDispatchError::BadDevice {
+            deviceid: change.facet_id,
+        })?;
+
+    let (what, read_only, deletable) = match device.properties.get(&change.request.property) {
+        Some(property) => (
+            crate::xinput::PropWhat::Modified,
+            property.read_only,
+            property.deletable,
+        ),
+        None => (crate::xinput::PropWhat::Created, false, true),
+    };
+    let mut property = change.merged_property.clone();
+    property.read_only = read_only;
+    property.deletable = deletable;
+    device.properties.insert(change.request.property, property);
+    Ok(what)
+}
+
+/// Apply a parsed XI property request. Recognized writes on physical sources
+/// use the facet-aware validator; unknown properties and virtual/master
+/// properties retain ordinary XI storage behavior.
 fn is_xtest_marker_property(state: &ServerState, deviceid: u16, property: AtomId) -> bool {
     matches!(
         deviceid,
@@ -24350,6 +24619,9 @@ fn is_xtest_marker_property(state: &ServerState, deviceid: u16, property: AtomId
 fn dispatch_change_property(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    client: ClientId,
+    sequence: SequenceNumber,
+    minor_opcode: u16,
     deviceid: u16,
     mode: u8,
     format: u8,
@@ -24369,155 +24641,59 @@ fn dispatch_change_property(
     //    libinput-named properties keep ordinary Xorg property behavior.
     let device = crate::xinput::find_device(&state.xi_devices, deviceid)
         .expect("caller verified device exists");
-    let source_id = device.source_id;
-    let facet = device.facet;
-    let current_property_read_only = device
-        .properties
-        .get(&property)
-        .is_some_and(|existing| existing.read_only);
-    let source_info = source_id
-        .and_then(|source| state.xi_devices.source(source))
-        .cloned();
-    let physical_pointer =
-        source_info.is_some() && facet == Some(crate::xinput::XiFacetKind::PointerTouch);
-    let dev_node = source_info
-        .as_ref()
-        .map(|info| info.device_node.clone())
-        .or_else(|| device.device_node.clone());
     let prop_name = state.atoms.name(property).map(str::to_owned);
-    if current_property_read_only
-        || (source_info.is_some()
-            && matches!(
-                prop_name.as_deref(),
-                Some("Device Node" | "Device Product ID")
-            ))
+    let source_id = device.source_id;
+    let source_info = source_id.and_then(|source| state.xi_devices.source(source));
+    if let Some(source_info) = source_info
+        && let Some(name) = prop_name.as_deref()
+        && crate::xinput::libinput_props::descriptor_by_name(name).is_some()
+    {
+        let request = crate::core_loop::message::XiConfigRequest {
+            client,
+            sequence,
+            minor_opcode,
+            deviceid,
+            expected_source: source_info.source_id,
+            property,
+            type_atom,
+            format,
+            mode,
+            data: data.to_vec(),
+        };
+        let validated = validate_xi_change(state, &request)?;
+        let node = source_info.device_node.clone();
+        match backend.apply_device_config(&node, validated.change) {
+            Ok(()) => {}
+            Err(crate::xinput::libinput_props::DeviceConfigError::Unsupported) => {
+                return Err(PropertyDispatchError::BadMatch);
+            }
+            Err(crate::xinput::libinput_props::DeviceConfigError::Invalid) => {
+                return Err(PropertyDispatchError::BadValue {
+                    error_value: u32::from(format),
+                });
+            }
+        }
+        return commit_validated_xi_change(state, &validated);
+    }
+
+    if source_info.is_some()
+        && matches!(
+            prop_name.as_deref(),
+            Some("Device Node" | "Device Product ID")
+        )
     {
         return Err(PropertyDispatchError::BadAccess { atom: property.0 });
     }
-    let descriptor = if physical_pointer {
-        prop_name
-            .as_deref()
-            .and_then(crate::xinput::libinput_props::descriptor_by_name)
-    } else {
-        None
-    };
-
-    // Hoisted above the `if let` (review round S5): `validate_value` /
-    // `decode_change` live inside the descriptor branch below, but the
-    // final commit at the bottom of this function is outside it and
-    // must commit the SAME bytes those two just validated/decoded — a
-    // naive in-block `normalize_value` compiles but decodes normalised
-    // bytes while committing raw ones. `merged_replace` tracks whether
-    // the descriptor branch already computed the final value (merge +
-    // normalise), in which case the commit below must use Replace
-    // rather than the request's original `mode` (the merge already
-    // performed the Append/Prepend).
-    let mut value: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
-    let mut merged_replace = false;
-
-    if let Some(desc) = descriptor {
-        // 3. ReadOnly → BadAccess.
-        if desc.access == crate::xinput::libinput_props::Access::ReadOnly {
-            return Err(PropertyDispatchError::BadAccess { atom: property.0 });
-        }
-        // 3b. format/type vs descriptor → BadMatch (review round B1 —
-        // server crash). `validate_value`'s `Scalar` arm derives its
-        // expected byte count from the wire `format`, not `desc.format`;
-        // without this gate a request lying about `format` (e.g.
-        // `format=8` against a Scalar/Float descriptor whose real
-        // format is 32) passes validation with too few bytes and then
-        // panics on out-of-bounds indexing in `decode_change`'s
-        // fixed-width decoders (`float32`, `card32`). Matches
-        // `xf86-input-libinput`, which answers BadMatch for a
-        // format/size/type mismatch.
-        let expected_type = crate::xinput::type_atom_for(desc.val, state.float_atom);
-        if format != desc.format || type_atom != expected_type {
-            return Err(PropertyDispatchError::BadMatch);
-        }
-        // 3c. Merge by mode BEFORE validating (review round B2). Task
-        // 1's `len <= n` relaxation makes a short *fragment* pass
-        // `validate_value` on its own, so an Append/Prepend must
-        // validate/decode the bytes that will actually be stored, not
-        // just the incoming fragment — otherwise `Append [1]` onto
-        // `Accel Profile Enabled` would decode as `AccelProfile(Some(0))`
-        // and silently reprogram libinput. An absent property has
-        // nothing to merge against, so it degrades to Replace, matching
-        // `apply_change_property`'s own "new property is always a
-        // Replace" rule (xiproperty.c:700-706).
-        let existing = crate::xinput::find_device(&state.xi_devices, deviceid)
-            .and_then(|d| d.properties.get(&property))
-            .map(|p| p.data.clone());
-        let merged: Vec<u8> = match (mode, existing) {
-            (m, Some(existing)) if m == crate::xinput::XI_PROP_MODE_APPEND => {
-                let mut v = existing;
-                v.extend_from_slice(data);
-                v
-            }
-            (m, Some(existing)) if m == crate::xinput::XI_PROP_MODE_PREPEND => {
-                let mut v = data.to_vec();
-                v.extend_from_slice(&existing);
-                v
-            }
-            _ => data.to_vec(),
-        };
-        // 4. validate_value → BadValue.
-        if crate::xinput::libinput_props::validate_value(desc.kind, format, &merged).is_err() {
-            return Err(PropertyDispatchError::BadValue {
-                error_value: u32::from(format),
-            });
-        }
-        // Normalise (zero-pad a short multi-slot write to the
-        // descriptor's declared width) so the decoder below and the
-        // stored property agree on exactly `n` bytes.
-        let normalized =
-            crate::xinput::libinput_props::normalize_value(desc.kind, &merged).into_owned();
-        // 5. decode_change → BadValue (covers AccelProfile-custom).
-        if let Some(binding) = desc.binding {
-            let change = crate::xinput::libinput_props::decode_change(binding, &normalized)
-                .map_err(|_| PropertyDispatchError::BadValue {
-                    error_value: u32::from(format),
-                })?;
-            // 6. Backend apply → Unsupported/Invalid.
-            if let Some(node) = dev_node.as_deref() {
-                match backend.apply_device_config(node, change) {
-                    Ok(()) => {}
-                    Err(crate::xinput::libinput_props::DeviceConfigError::Unsupported) => {
-                        return Err(PropertyDispatchError::BadMatch);
-                    }
-                    Err(crate::xinput::libinput_props::DeviceConfigError::Invalid) => {
-                        return Err(PropertyDispatchError::BadValue {
-                            error_value: u32::from(format),
-                        });
-                    }
-                }
-            }
-        }
-        value = std::borrow::Cow::Owned(normalized);
-        merged_replace = true;
+    if crate::xinput::find_device(&state.xi_devices, deviceid)
+        .and_then(|device| device.properties.get(&property))
+        .is_some_and(|property| property.read_only)
+    {
+        return Err(PropertyDispatchError::BadAccess { atom: property.0 });
     }
-    // 7. Commit. `apply_change_property` itself reports whether the
-    //    property pre-existed (Modified vs Created), so the dispatch
-    //    layer can fan-out the matching `XI_PropertyEvent.what` byte
-    //    without re-querying the registry. Descriptor rows always
-    //    commit as Replace (the merge above already folded in
-    //    Append/Prepend against the existing value); atoms with no
-    //    descriptor row keep the request's original `mode` and raw
-    //    `data`, unchanged from before this pipeline existed.
-    let commit_mode = if merged_replace {
-        crate::xinput::XI_PROP_MODE_REPLACE
-    } else {
-        mode
-    };
+
     let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
         .expect("caller verified device exists");
-    match crate::xinput::apply_change_property(
-        device,
-        commit_mode,
-        format,
-        property,
-        type_atom,
-        &value,
-    ) {
+    match crate::xinput::apply_change_property(device, mode, format, property, type_atom, data) {
         Ok(what) => Ok(what),
         Err(crate::xinput::XiPropError::BadValue) => Err(PropertyDispatchError::BadValue {
             error_value: u32::from(format),
@@ -24546,6 +24722,7 @@ fn emit_property_dispatch_error(
         PropertyDispatchError::BadAccess { atom } => (10u8, atom),
         PropertyDispatchError::BadValue { error_value } => (2u8, error_value),
         PropertyDispatchError::BadMatch => (8u8, 0u32),
+        PropertyDispatchError::BadDevice { deviceid } => (XI2_FIRST_ERROR, u32::from(deviceid)),
     };
     emit_x11_error_with_minor(
         state,
@@ -43986,6 +44163,22 @@ mod tests {
                     current: Some(0),
                     default: Some(0),
                 },
+                accel: crate::core_loop::message::FloatSetting {
+                    available: true,
+                    current: 0.0,
+                    default: 0.0,
+                },
+                scroll_button: crate::core_loop::message::U32Setting {
+                    available: true,
+                    current: 0,
+                    default: 0,
+                },
+                accel_profile: crate::core_loop::message::OneHot2 {
+                    available: true,
+                    current: Some(0),
+                    default: Some(0),
+                },
+                accel_profile_available_mask: 0b011,
                 ..Default::default()
             },
         };
@@ -44092,10 +44285,11 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
         let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             accel_speed_atom,
@@ -44124,10 +44318,11 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
         let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             16,
             accel_speed_atom,
@@ -44157,13 +44352,14 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
         let scroll_button_atom = state
             .atoms
             .intern("libinput Button Scrolling Button", false)
             .0;
 
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             scroll_button_atom,
@@ -44203,14 +44399,15 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
         let scroll_atom = state
             .atoms
             .intern("libinput Scroll Method Enabled", false)
             .0;
 
-        // Two bytes against a 3-wide exact descriptor → BadValue.
+        // Two bytes against a 3-wide exact descriptor → BadMatch.
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             scroll_atom,
@@ -44232,7 +44429,7 @@ mod tests {
         assert_eq!(wire[0], 0, "error packet");
         assert_eq!(
             wire[1],
-            x11::error::BAD_VALUE,
+            x11::error::BAD_MATCH,
             "short Scroll Method write must not be zero-padded into a real config",
         );
 
@@ -44243,7 +44440,7 @@ mod tests {
             .intern("libinput Accel Profile Enabled", false)
             .0;
         let body = xi2_change_property_body(
-            4,
+            TEST_PHYSICAL_POINTER_ID,
             crate::xinput::XI_PROP_MODE_REPLACE,
             8,
             accel_atom,
@@ -44273,12 +44470,13 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
+        seed_pointer_for_t3(&mut state);
         let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
 
         let body = xi1_change_property_body(
             accel_speed_atom,
             crate::xinput::XA_INTEGER.0,
-            4,
+            u8::try_from(TEST_PHYSICAL_POINTER_ID).unwrap(),
             8,
             crate::xinput::XI_PROP_MODE_REPLACE,
             &[7],
@@ -44520,9 +44718,8 @@ mod tests {
 
     #[test]
     fn t3_b2_append_onto_absent_accel_profile_behaves_like_replace() {
-        // Append [0, 1, 0] onto a property that was never seeded (no
-        // existing value to merge against) behaves exactly like
-        // Replace and stores exactly 3 bytes.
+        // Model a client-deleted supported property. Append [0, 1, 0]
+        // then behaves exactly like Replace and stores three bytes.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -44531,6 +44728,12 @@ mod tests {
             .atoms
             .intern("libinput Accel Profile Enabled", false)
             .0;
+        state
+            .xi_devices
+            .device_mut(TEST_PHYSICAL_POINTER_ID)
+            .unwrap()
+            .properties
+            .remove(&AtomId(atom));
         let integer_atom = crate::xinput::XA_INTEGER.0;
 
         let body = xi2_change_property_body(

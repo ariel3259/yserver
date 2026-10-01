@@ -58,8 +58,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   GetProperty(delete) still unlinks them, with XI1/XI2 Deleted notifications
   following Xorg's separate rules. Descriptor/metadata write protection
   survives inline deletion, while ordinary client properties remain
-  writable/deletable. Task 7 config validation/application completion, Task 8
-  acknowledgments, Task 11 coordinate authority, Task 14 guarded per-source
+  writable/deletable. Task 7 now validates recognized physical driver writes
+  against the live source/facet snapshot, captures the expected source
+  identity, and separates merge/validation from commit. The existing immediate
+  backend hook remains in place pending Task 8's source-targeted submission and
+  acknowledgment path; its three-slot Accel Profile availability mask comes
+  from libinput's existing raw getter while custom writes remain unsupported.
+  Task 8 acknowledgments, Task 11 coordinate authority,
+  Task 14 guarded per-source
   held-state releases, and Tasks 15–16 hierarchy/presence notifications remain
   later work. Server startup
   seeds virtual devices 4/5 with the XTEST pointer/keyboard names and
