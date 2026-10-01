@@ -232,7 +232,7 @@ fn encode_product_id(vendor: u32, product: u32) -> Vec<u8> {
 /// writable sibling (looked up by stripping the suffix); a `…Default`
 /// row with no sibling is treated as always-on (defensive — every
 /// Default in `DESCRIPTORS` has one).
-fn descriptor_available(
+pub(crate) fn descriptor_available(
     desc: &libinput_props::PropDescriptor,
     config: &crate::core_loop::message::LibinputConfigSnapshot,
 ) -> bool {
@@ -246,7 +246,7 @@ fn descriptor_available(
         "libinput Scroll Methods Available" => config.scroll_method.available_mask != 0,
         "libinput Click Methods Available" => config.click_method.available,
         "libinput Send Events Modes Available" => config.send_events.available_mask != 0,
-        "libinput Accel Profiles Available" => config.accel_profile.available,
+        "libinput Accel Profiles Available" => config.accel_profile_available_mask != 0,
         _ => default_companion_available(desc.name, config),
     }
 }
@@ -278,7 +278,7 @@ fn writable_sibling_for_default(name: &str) -> Option<&'static libinput_props::P
 }
 
 /// Per-`Binding` availability predicate.
-fn binding_available(
+pub(crate) fn binding_available(
     binding: libinput_props::Binding,
     config: &crate::core_loop::message::LibinputConfigSnapshot,
 ) -> bool {
@@ -296,7 +296,7 @@ fn binding_available(
         Binding::ClickMethod => config.click_method.available,
         Binding::SendEvents => config.send_events.available_mask != 0,
         Binding::AccelSpeed => config.accel.available,
-        Binding::AccelProfile => config.accel_profile.available,
+        Binding::AccelProfile => config.accel_profile_available_mask != 0,
         Binding::ScrollButton => config.scroll_button.available,
         Binding::ScrollButtonLock => config.scroll_button_lock.available,
     }
@@ -391,17 +391,10 @@ fn descriptor_available_data(
         "libinput Send Events Modes Available" => {
             encode_bitflags(config.send_events.available_mask, 2)
         }
-        // Accel Profile snapshot is OneHot2 (adaptive+flat only) — widen
-        // to 3 bits at the wire boundary with the (always-zero) custom
-        // slot. When `.available` is true, both adaptive and flat are
-        // supported.
+        // Keep the Xorg 3-slot wire value even though the current build
+        // only exposes adaptive/flat setters.
         "libinput Accel Profiles Available" => {
-            let mask = if config.accel_profile.available {
-                0b011
-            } else {
-                0
-            };
-            encode_bitflags(mask, 3)
+            encode_bitflags(config.accel_profile_available_mask, 3)
         }
         _ => return None,
     })
@@ -852,7 +845,21 @@ pub fn encode_get_property_reply(
     reply.extend_from_slice(&[0u8; 11]); // bytes 21-31: pad0..pad3
     debug_assert_eq!(reply.len(), 32);
 
-    reply.extend_from_slice(&result.data);
+    match (byte_order, result.format) {
+        (ClientByteOrder::BigEndian, 16) => {
+            for value in result.data.chunks_exact(2) {
+                reply.extend_from_slice(&[value[1], value[0]]);
+            }
+            reply.extend_from_slice(result.data.chunks_exact(2).remainder());
+        }
+        (ClientByteOrder::BigEndian, 32) => {
+            for value in result.data.chunks_exact(4) {
+                reply.extend_from_slice(&[value[3], value[2], value[1], value[0]]);
+            }
+            reply.extend_from_slice(result.data.chunks_exact(4).remainder());
+        }
+        _ => reply.extend_from_slice(&result.data),
+    }
     pad_to_4(&mut reply);
 
     // Delete-after-read gate, exactly as xserver's ProcXIGetProperty
@@ -1541,6 +1548,7 @@ mod tests {
                 current: Some(0),
                 default: Some(0),
             },
+            accel_profile_available_mask: 0b011,
             left_handed: avail_bool,
             natural_scroll: avail_bool,
             middle_emulation: avail_bool,
