@@ -4891,6 +4891,14 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
+            // RRScreenSizeNotify (rrscreen.c) returns before any event when
+            // pixel size and mm both equal the last notified ones.
+            let unchanged = (
+                state.randr.screen_width,
+                state.randr.screen_height,
+                state.randr.width_mm,
+                state.randr.height_mm,
+            ) == (req.width, req.height, req.mm_width, req.mm_height);
             state
                 .randr
                 .set_logical_size(req.width, req.height, req.mm_width, req.mm_height);
@@ -4898,7 +4906,15 @@ fn handle_randr_request(
             // ScreenChangeNotify ONLY — no per-CRTC/Output change
             // (CRTC positions are unchanged). Pass an empty changed
             // list so only ScreenChangeNotify + root ConfigureNotify fire.
-            super::run::apply_screen_size_side_effects(state, backend, req.width, req.height, &[]);
+            if !unchanged {
+                super::run::apply_screen_size_side_effects(
+                    state,
+                    backend,
+                    req.width,
+                    req.height,
+                    &[],
+                );
+            }
             backend.randr_layout_changed(state);
             // RRSetScreenSize has NO reply (it is a void request).
             return Ok(RequestOutcome::Handled);
@@ -78921,6 +78937,97 @@ mod tests {
         assert_eq!(bytes[1], x11::error::BAD_VALUE, "mm_width=0 → BadValue");
     }
 
+    /// `RRSetScreenSize` sends ScreenChangeNotify only when pixel size or mm
+    /// differ from the current ones (`RRScreenSizeNotify`, rrscreen.c); a
+    /// repeated size and a rejected crop send nothing, as measured on Xorg
+    /// 21.1.24 by the xrandr-rotate vng scenario.
+    #[test]
+    fn screen_set_size_notifies_only_on_change() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "Virtual-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(0, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        state.randr_select_masks.insert(
+            (CLIENT_ID, ROOT_WINDOW),
+            x11randr::NOTIFY_MASK_SCREEN_CHANGE,
+        );
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_SCREEN_SIZE,
+            length_units: 5,
+        };
+        let mut set = |state: &mut ServerState, seq: u16, w: u16, h: u16, mm_w: u32, mm_h: u32| {
+            let mut b = Vec::with_capacity(16);
+            b.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            b.extend_from_slice(&w.to_le_bytes());
+            b.extend_from_slice(&h.to_le_bytes());
+            b.extend_from_slice(&mm_w.to_le_bytes());
+            b.extend_from_slice(&mm_h.to_le_bytes());
+            handle_randr_request(
+                state,
+                &mut backend,
+                ClientId(CLIENT_ID),
+                SequenceNumber(seq),
+                header,
+                &b,
+            )
+            .unwrap();
+        };
+        // RRScreenChangeNotify is RANDR event base 89 + 0.
+        let screen_changes =
+            |bytes: &[u8]| bytes.chunks_exact(32).filter(|e| e[0] & 0x7f == 89).count();
+
+        set(&mut state, 1, 1280, 800, 300, 200);
+        assert_eq!(
+            screen_changes(&read_all_available(&mut peer)),
+            1,
+            "mm changed"
+        );
+        set(&mut state, 2, 1280, 800, 300, 200);
+        assert_eq!(
+            screen_changes(&read_all_available(&mut peer)),
+            0,
+            "unchanged"
+        );
+        set(&mut state, 3, 1279, 800, 300, 200);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_MATCH, "crop → BadMatch");
+        assert_eq!(screen_changes(&bytes), 0, "rejected crop");
+        set(&mut state, 4, 4000, 4000, 300, 200);
+        assert_eq!(screen_changes(&read_all_available(&mut peer)), 1, "grown");
+        set(&mut state, 5, 1280, 800, 300, 200);
+        assert_eq!(
+            screen_changes(&read_all_available(&mut peer)),
+            1,
+            "restored"
+        );
+    }
+
     // DRIFT 1 + Multi-monitor Bug A regression: the Bounding-shape mirror
     // must distinguish three states via the Option API —
     //   unset    → None    (drop the entry; scene tracks live geometry —
@@ -79042,6 +79149,98 @@ mod tests {
             ),
             "explicitly-set Bounding shape must mirror the concrete rect",
         );
+    }
+
+    /// Cinnamon's lock screen, as muffin sends it: an XFIXES region that
+    /// `InvertRegion` empties, set as the COW's Bounding shape, must reach the
+    /// backend as an explicit EMPTY region, and region None as unset — the
+    /// two stay distinct (`ProcXFixesSetWindowShapeRegion`, `xfixes/region.c`:
+    /// a NULL region pointer unshapes, a copied empty region shapes to
+    /// nothing).
+    #[test]
+    fn xfixes_set_window_shape_region_keeps_empty_distinct_from_none() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes as x11xfixes};
+
+        const REGION: u32 = 0x0010_0042;
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(cow.0));
+
+        let mut send = |state: &mut ServerState, minor: u8, body: Vec<u8>| {
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            };
+            handle_xfixes_request(
+                state,
+                &mut backend,
+                None,
+                ClientId(1),
+                SequenceNumber(1),
+                header,
+                &body,
+            )
+            .expect("XFIXES request");
+        };
+        let full = [0_i16, 0, 5120, 1440]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let shape_body = |region: u32| {
+            let mut body = cow.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[x11shape::KIND_BOUNDING, 0, 0, 0, 0, 0, 0, 0]);
+            body.extend_from_slice(&region.to_le_bytes());
+            body
+        };
+
+        let mut create = REGION.to_le_bytes().to_vec();
+        create.extend_from_slice(&full);
+        send(&mut state, x11xfixes::CREATE_REGION, create);
+        let mut invert = REGION.to_le_bytes().to_vec();
+        invert.extend_from_slice(&full);
+        invert.extend_from_slice(&REGION.to_le_bytes());
+        send(&mut state, x11xfixes::INVERT_REGION, invert);
+        send(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            shape_body(REGION),
+        );
+        assert!(crate::nested::shape_kind_is_set(
+            &state,
+            cow,
+            x11shape::KIND_BOUNDING
+        ));
+        assert!(crate::nested::shape_rects_for(&state, cow, x11shape::KIND_BOUNDING).is_empty());
+
+        send(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            shape_body(0),
+        );
+        assert!(!crate::nested::shape_kind_is_set(
+            &state,
+            cow,
+            x11shape::KIND_BOUNDING
+        ));
+
+        let mirrored: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid,
+                    kind: x11shape::KIND_BOUNDING,
+                    rects,
+                } if host_xid == cow.0 => Some(rects),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mirrored, vec![Some(0), None]);
     }
 
     // #133: the CLIP mirror must make the same unset/empty/concrete
