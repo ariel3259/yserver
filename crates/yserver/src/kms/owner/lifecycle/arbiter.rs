@@ -399,6 +399,29 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         self.desired.observe_device_present();
     }
 
+    /// Finish an already-projected device removal after the driver has
+    /// withdrawn protocol state and terminalized any in-flight Owner work.
+    /// Removal has no physical commit: the kernel node is gone, so the
+    /// coordinator records REC-6 and closes this incarnation directly.
+    pub(crate) fn terminalize_device_removed(&mut self) -> Vec<LifecycleAction<I>> {
+        self.transition = None;
+        self.admission_open = false;
+        self.state = DeviceLifecycleState::Removed;
+        let mut actions = Vec::new();
+        if let Some(representative) = self
+            .desired
+            .representative(DesiredField::Presence)
+            .filter(|representative| representative.kind == LifecycleKind::DeviceRemoved)
+        {
+            self.set_disposition(
+                representative.event_id,
+                Disposition::Invalidated(super::InvalidationReason::DeviceRemoved),
+                &mut actions,
+            );
+        }
+        actions
+    }
+
     /// Remove one stable protocol output projection from this device.
     pub fn remove_protocol_output(&mut self, output: &O) -> Option<super::OutputProjectionRemoval> {
         self.desired.remove_protocol_output(output)
@@ -1104,6 +1127,8 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
                 // still belongs to C.0's VT-release row.
                 if self.desired.seat_target() == Some(super::SeatTarget::Released) {
                     LifecycleKind::VTRelease
+                } else if self.desired.device_presence() == Some(false) {
+                    LifecycleKind::DeviceRemoved
                 } else {
                     LifecycleKind::NormalRecovery
                 }
@@ -1193,6 +1218,10 @@ impl<O: Ord, I: Clone + Eq> LifecycleArbiter<O, I> {
         }
         if row == CompletionUnknownRow::VTRelease {
             self.state = DeviceLifecycleState::ExecutorStalled;
+            self.admission_open = false;
+        }
+        if row == CompletionUnknownRow::DeviceRemoved {
+            self.state = DeviceLifecycleState::Removed;
             self.admission_open = false;
         }
         actions.push(LifecycleAction::CompletionLossTableU { row, outcome });

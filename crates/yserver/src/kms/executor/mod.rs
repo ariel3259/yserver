@@ -490,6 +490,11 @@ impl KmsIoExecutor {
     }
 
     #[cfg(test)]
+    pub(crate) fn termination_requested_for_tests(&self) -> bool {
+        self.termination_requested
+    }
+
+    #[cfg(test)]
     pub(crate) fn request_counts_for_tests(&self) -> (usize, usize, usize, usize) {
         (
             self.sent_requests_for_tests,

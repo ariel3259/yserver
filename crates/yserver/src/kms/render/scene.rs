@@ -497,6 +497,9 @@ struct OutputSceneState {
     output_idx: usize,
     output_key: OutputKey,
     output_instance_id: OutputInstanceId,
+    /// Keep scene and pool ownership available for resource quarantine after
+    /// terminal device removal, but stop scheduling this output for compose.
+    withdrawn: bool,
     damage_audit: Option<OutputDamageAudit>,
     pool_ring: CompositePoolRing,
     /// Slots map: pending_ack[i] is using descriptor-pool slot
@@ -1801,6 +1804,7 @@ impl SceneCompositor {
             output_idx,
             output_key: output_key.clone(),
             output_instance_id,
+            withdrawn: false,
             damage_audit: build_output_damage_audit(vk, scene_extent)?,
             pool_ring: ring,
             pool_slots: VecDeque::with_capacity(4),
@@ -2491,6 +2495,21 @@ impl SceneCompositor {
             .as_mut()
             .map(|inner| inner.owner_offers.drain(..).collect())
             .unwrap_or_default()
+    }
+
+    /// Keep terminally removed devices' scene and pool state attached so
+    /// their allocations remain quarantinable, while excluding their outputs
+    /// from future composition and scene-wide repaint scheduling.
+    pub(crate) fn withdraw_device_outputs(&mut self, device: crate::platform::drm::DrmDeviceKey) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        for output in &mut inner.outputs {
+            if output.output_key.device_key == device {
+                output.withdrawn = true;
+            }
+        }
+        inner.owner_offers.retain(|offer| offer.device != device);
     }
 
     pub(crate) fn queued_owner_offers_for_outputs(
@@ -4194,6 +4213,43 @@ impl SceneCompositor {
     }
 
     #[cfg(test)]
+    pub(crate) fn output_damage_states_for_tests(
+        &self,
+    ) -> Vec<(OutputKey, bool, bool, bool, u64, u64, usize)> {
+        self.inner
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .outputs
+                    .iter()
+                    .map(|state| {
+                        (
+                            state.output_key.clone(),
+                            state.withdrawn,
+                            state.damage.owes_repaint(),
+                            state.damage.has_staged_frame(),
+                            state.damage.pending_area(),
+                            state.current_generation,
+                            state
+                                .owner_buffers
+                                .iter()
+                                .filter(|buffer| {
+                                    !matches!(
+                                        buffer.state(),
+                                        OwnerBufferState::Displaced
+                                            | OwnerBufferState::Releasing
+                                            | OwnerBufferState::Quarantined
+                                    )
+                                })
+                                .count(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     pub(crate) fn scene_structure_damage_for_tests(
         &self,
         output_idx: usize,
@@ -4415,6 +4471,9 @@ impl SceneCompositor {
         if let Some(inner) = self.inner.as_mut() {
             let mut contributed = Vec::with_capacity(inner.outputs.len());
             for o in &mut inner.outputs {
+                if o.withdrawn {
+                    continue;
+                }
                 let extent = o.output_extent;
                 o.scene_structure_damage.add(vk::Rect2D {
                     offset: vk::Offset2D::default(),
@@ -4475,6 +4534,9 @@ impl SceneCompositor {
         let mut contributed = Vec::new();
         for output_idx in 0..inner.outputs.len() {
             let output = &mut inner.outputs[output_idx];
+            if output.withdrawn {
+                continue;
+            }
             let before = output.scene_structure_damage.rects().len();
             dispatch_clip_rects_to_outputs(
                 std::iter::once((
@@ -4558,6 +4620,7 @@ impl SceneCompositor {
             .as_ref()?
             .outputs
             .iter()
+            .filter(|output| !output.withdrawn)
             .filter_map(|o| o.next_submit_retry_at)
             .min()
     }
@@ -4575,7 +4638,8 @@ impl SceneCompositor {
         };
         let now = std::time::Instant::now();
         inner.outputs.iter().any(|o| {
-            o.pending_acks.is_empty()
+            !o.withdrawn
+                && o.pending_acks.is_empty()
                 && o.next_submit_retry_at
                     .is_none_or(|deadline| now >= deadline)
         })
@@ -4586,9 +4650,12 @@ impl SceneCompositor {
     /// reached the screen. The backend's compose-wanted predicate must include
     /// this, or an invalidated output waits for unrelated damage to be repaired.
     pub(crate) fn owes_repaint(&self) -> bool {
-        self.inner
-            .as_ref()
-            .is_some_and(|inner| inner.outputs.iter().any(|o| o.damage.owes_repaint()))
+        self.inner.as_ref().is_some_and(|inner| {
+            inner
+                .outputs
+                .iter()
+                .any(|o| !o.withdrawn && o.damage.owes_repaint())
+        })
     }
 
     #[cfg(test)]
@@ -4604,9 +4671,12 @@ impl SceneCompositor {
         if let Some(v) = self.test_flip_in_flight_override {
             return v;
         }
-        self.inner
-            .as_ref()
-            .is_some_and(|inner| inner.outputs.iter().any(|o| !o.pending_acks.is_empty()))
+        self.inner.as_ref().is_some_and(|inner| {
+            inner
+                .outputs
+                .iter()
+                .any(|o| !o.withdrawn && !o.pending_acks.is_empty())
+        })
     }
 
     /// Retired bundles remain owned until teardown, but only fence-gated work
@@ -4716,7 +4786,7 @@ impl SceneCompositor {
         self.inner
             .as_ref()
             .and_then(|inner| inner.outputs.get(output_idx))
-            .is_some_and(|output| !output.pending_acks.is_empty())
+            .is_some_and(|output| !output.withdrawn && !output.pending_acks.is_empty())
     }
 
     /// Test-only: force [`has_pending_page_flips`](Self::has_pending_page_flips)
@@ -4748,7 +4818,7 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_ref() else {
             return CursorPlaneMode::Sw;
         };
-        for output in &inner.outputs {
+        for output in inner.outputs.iter().filter(|output| !output.withdrawn) {
             // Any pending transition on any output forces Mixed —
             // the fast path must not move the plane until every
             // ShowOnRetire / HideOnRetire has applied.
@@ -4763,7 +4833,13 @@ impl SceneCompositor {
                 return CursorPlaneMode::Mixed;
             }
         }
-        classify_cursor_mode_from_per_output(inner.outputs.iter().map(|o| o.last_frame_cursor_mode))
+        classify_cursor_mode_from_per_output(
+            inner
+                .outputs
+                .iter()
+                .filter(|output| !output.withdrawn)
+                .map(|o| o.last_frame_cursor_mode),
+        )
     }
 
     /// Stage 5 Phase D — steady-state HW sprite-change path. Called
@@ -4796,6 +4872,9 @@ impl SceneCompositor {
         // machine an exact success/failure point for metadata commitment.
         let mut refreshes_hw_binding = false;
         for output in &mut inner.outputs {
+            if output.withdrawn {
+                continue;
+            }
             if cursor_output_needs_sprite_retry(
                 output.last_frame_cursor_mode,
                 output.pending_acks.iter().map(|ack| ack.cursor_transition),
@@ -5151,12 +5230,18 @@ impl SceneCompositor {
         // front because the loop below borrows `inner` mutably.
         let pending_presentation_per_output: Vec<bool> = {
             let armed = store.armed_damaged_ids();
-            let all: Vec<&std::collections::HashSet<super::store::DrawableId>> =
-                inner.outputs.iter().map(|o| &o.last_pieces).collect();
+            let all: Vec<&std::collections::HashSet<super::store::DrawableId>> = inner
+                .outputs
+                .iter()
+                .filter(|o| !o.withdrawn)
+                .map(|o| &o.last_pieces)
+                .collect();
             inner
                 .outputs
                 .iter()
-                .map(|o| pending_presentation_for_output(&armed, &o.last_pieces, &all))
+                .map(|o| {
+                    !o.withdrawn && pending_presentation_for_output(&armed, &o.last_pieces, &all)
+                })
                 .collect()
         };
         for (output_idx, &pending_presentation) in
@@ -5169,9 +5254,12 @@ impl SceneCompositor {
                 .outputs
                 .iter()
                 .enumerate()
-                .filter(|(j, _)| *j != output_idx)
+                .filter(|(j, output)| *j != output_idx && !output.withdrawn)
                 .flat_map(|(_, o)| o.last_pieces.iter().copied())
                 .collect();
+            if inner.outputs[output_idx].withdrawn {
+                continue;
+            }
             match tick_one_output(
                 inner,
                 output_idx,
@@ -5227,7 +5315,7 @@ impl SceneCompositor {
                     // union `dormancy_inputs` takes, attributing it to each
                     // walked output is equivalent.
                     presented: if walked { &drawn } else { &none },
-                    last_pieces: &o.last_pieces,
+                    last_pieces: if o.withdrawn { &none } else { &o.last_pieces },
                 })
                 .collect();
             let (keep_armed, pieces_anywhere) = dormancy_inputs(&reports);
@@ -5801,12 +5889,14 @@ fn handle_scanout_render_completion_inner(
             platform.renderer_failed = true;
             return false;
         }
-        inner.owner_offers.push_back(ComposedOffer {
-            device: output_key.device_key,
-            crtc: u32::from(platform.outputs[output_idx].output.crtc),
-            generation,
-            output_instance_id: state.output_instance_id,
-        });
+        if !state.withdrawn {
+            inner.owner_offers.push_back(ComposedOffer {
+                device: output_key.device_key,
+                crtc: u32::from(platform.outputs[output_idx].output.crtc),
+                generation,
+                output_instance_id: state.output_instance_id,
+            });
+        }
         // `fd` is intentionally dropped here. Owner carries no producer fd
         // through an ioctl; the drain owns and closes the notification.
         drop(fd);
@@ -5932,12 +6022,14 @@ fn handle_scanout_render_completion_inner(
                 drop(fd);
                 return false;
             }
-            inner.owner_offers.push_back(ComposedOffer {
-                device: output_key.device_key,
-                crtc: u32::from(platform.outputs[output_idx].output.crtc),
-                generation,
-                output_instance_id: state.output_instance_id,
-            });
+            if !state.withdrawn {
+                inner.owner_offers.push_back(ComposedOffer {
+                    device: output_key.device_key,
+                    crtc: u32::from(platform.outputs[output_idx].output.crtc),
+                    generation,
+                    output_instance_id: state.output_instance_id,
+                });
+            }
             drop(fd);
             return true;
         }
@@ -12201,7 +12293,7 @@ fn fan_out_carried_damage(
 ) -> bool {
     let mut took = false;
     for (idx, o) in inner.outputs.iter_mut().enumerate() {
-        if idx != from {
+        if idx != from && !o.withdrawn {
             took |= fan_out_to_output(
                 o.output_origin,
                 o.output_extent,

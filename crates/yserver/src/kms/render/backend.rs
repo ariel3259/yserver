@@ -1759,6 +1759,10 @@ pub struct KmsBackend {
     pub(crate) core_entry_deliveries_for_tests:
         Vec<yserver_core::core_loop::run::CoreEntryDelivery>,
     #[cfg(test)]
+    pub(crate) drm_hotplug_records_for_tests: Vec<crate::kms::hotplug::DrmHotplugRecord>,
+    #[cfg(test)]
+    pub(crate) drm_hotplug_add_log_records_for_tests: Vec<crate::kms::hotplug::DrmHotplugRecord>,
+    #[cfg(test)]
     pub(crate) core_driver_composed_offers_for_tests: Vec<(
         DrmDeviceKey,
         u32,
@@ -2124,6 +2128,8 @@ pub struct KmsBackend {
     pub(super) vt_call_trace_for_tests: Vec<&'static str>,
     #[cfg(test)]
     vt_skip_master_ioctls_for_tests: bool,
+    #[cfg(test)]
+    vt_master_attempts_for_tests: Vec<DrmDeviceKey>,
     /// Controlling console TTY guard. Present in direct mode when the
     /// process is launched on a real VT; `None` when no controlling
     /// console exists (pty / graphical terminal / test harness).
@@ -7538,6 +7544,10 @@ impl KmsBackend {
             #[cfg(test)]
             core_entry_deliveries_for_tests: Vec::new(),
             #[cfg(test)]
+            drm_hotplug_records_for_tests: Vec::new(),
+            #[cfg(test)]
+            drm_hotplug_add_log_records_for_tests: Vec::new(),
+            #[cfg(test)]
             core_driver_composed_offers_for_tests: Vec::new(),
             #[cfg(test)]
             acquire_uses_live_kms_discovery_for_tests: false,
@@ -7612,6 +7622,8 @@ impl KmsBackend {
             vt_call_trace_for_tests: Vec::new(),
             #[cfg(test)]
             vt_skip_master_ioctls_for_tests: false,
+            #[cfg(test)]
+            vt_master_attempts_for_tests: Vec::new(),
             console_guard,
             vt_switching_armed: false,
             led_relay: None,
@@ -9042,6 +9054,10 @@ impl KmsBackend {
             #[cfg(test)]
             core_entry_deliveries_for_tests: Vec::new(),
             #[cfg(test)]
+            drm_hotplug_records_for_tests: Vec::new(),
+            #[cfg(test)]
+            drm_hotplug_add_log_records_for_tests: Vec::new(),
+            #[cfg(test)]
             core_driver_composed_offers_for_tests: Vec::new(),
             #[cfg(test)]
             acquire_uses_live_kms_discovery_for_tests: false,
@@ -9115,6 +9131,8 @@ impl KmsBackend {
             vt_call_trace_for_tests: Vec::new(),
             #[cfg(test)]
             vt_skip_master_ioctls_for_tests: false,
+            #[cfg(test)]
+            vt_master_attempts_for_tests: Vec::new(),
             console_guard: None,
             vt_switching_armed: false,
             led_relay: None,
@@ -11922,6 +11940,16 @@ impl KmsBackend {
     }
 
     pub(super) fn withdraw_outputs_for_device(&mut self, device: DrmDeviceKey) {
+        if self
+            .lifecycle_coordinator
+            .device(&device)
+            .is_some_and(|arbiter| {
+                arbiter.state() == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    || arbiter.desired().device_presence() == Some(false)
+            })
+        {
+            self.scene.withdraw_device_outputs(device);
+        }
         let Some((output_ids, crtc_ids)) = self.randr_id_alloc.withdraw_device(device) else {
             return;
         };
@@ -25276,6 +25304,150 @@ impl KmsBackend {
         self.update_resource_service_activity();
     }
 
+    fn open_drm_cards_for_hotplug_classifier(
+        &self,
+    ) -> std::collections::HashMap<DrmDeviceKey, Option<IncarnationId>> {
+        self.platform
+            .devices
+            .iter()
+            .filter_map(|entry| {
+                let removed =
+                    self.lifecycle_coordinator
+                        .device(&entry.key)
+                        .is_some_and(|arbiter| {
+                            arbiter.state()
+                                == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                                || arbiter.desired().device_presence() == Some(false)
+                        });
+                if removed {
+                    return None;
+                }
+                Some((entry.key, self.probe_incarnation(entry.key)))
+            })
+            .collect()
+    }
+
+    fn selected_renderer_drm_nodes(&self) -> HashSet<DrmDeviceKey> {
+        let Some(renderer) = self.platform.selected_render_device() else {
+            return HashSet::new();
+        };
+        let mut nodes = HashSet::new();
+        if let Some(primary) = renderer.advertised_primary_node {
+            nodes.insert(primary);
+        }
+        if let Some(render) = renderer.advertised_render_node {
+            nodes.insert(render);
+        }
+        if let crate::kms::scanout_route::RenderDeviceId::DrmRender(render) = renderer.id {
+            nodes.insert(render);
+        }
+        if let Some(render_node) = renderer.render_node.as_ref() {
+            nodes.insert(render_node.key());
+        }
+        nodes
+    }
+
+    fn remove_owner_device(&mut self, device: DrmDeviceKey, incarnation: IncarnationId) {
+        if self.probe_incarnation(device) != Some(incarnation)
+            || self
+                .lifecycle_coordinator
+                .device(&device)
+                .is_some_and(|arbiter| {
+                    arbiter.state() == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                })
+        {
+            return;
+        }
+        if let Err(error) = self.lifecycle_register_owner_device(device) {
+            log::error!("kms: cannot register removed Owner device {device}: {error:?}");
+            return;
+        }
+
+        let probe_epoch = self.probe_episode.as_mut().and_then(|episode| {
+            if episode.owner_devices.contains(&device)
+                && episode.participants.get(&device) == Some(&Some(incarnation))
+            {
+                episode.remaining.remove(&device);
+                episode.results.remove(&device);
+                Some(episode.epoch)
+            } else {
+                None
+            }
+        });
+        if let Some(epoch) = probe_epoch {
+            self.probe_workers.mark_stuck(device, epoch);
+        }
+
+        if let Some(episode) = self.hotplug_episode.as_mut() {
+            episode.participants.remove(&device);
+        }
+        if self
+            .acquire_episode
+            .as_ref()
+            .is_some_and(|episode| episode.remaining.contains(&device))
+        {
+            // The removal is terminal for this participant. The episode's
+            // publication remains owned by the other participants.
+            self.topology_episode_participant_terminal(device);
+        }
+
+        if let Some(conductor) = self.admission_conductors.get_mut(&device) {
+            conductor.lifecycle_admission_closed = true;
+            conductor.recovery_stopped = true;
+        }
+        if let Some(gate) = self.platform.transport_gate_mut(&device) {
+            gate.force_close();
+        }
+        if let Some(executor) = self
+            .platform
+            .devices
+            .iter_mut()
+            .find(|entry| entry.key == device)
+            .and_then(|entry| entry.executor.as_mut())
+        {
+            executor.request_termination();
+            let _ = executor.try_reap();
+        }
+
+        // Withdraw before resolving any lifecycle or executor state. This is
+        // deliberately independent of the topology gate and the helper reap.
+        self.scene.withdraw_device_outputs(device);
+        self.withdraw_outputs_for_device(device);
+        match self.lifecycle_coordinator.project_device_intent(
+            &device,
+            crate::kms::owner::lifecycle::DesiredIntent::DevicePresence {
+                present: false,
+                identity_epoch: incarnation.get(),
+            },
+        ) {
+            Ok(dispatch) => self.lifecycle_queue_actions(
+                device,
+                dispatch.actions,
+                self.lifecycle_current_tag(device),
+            ),
+            Err(error) => log::error!("kms: DeviceRemoved projection for {device}: {error:?}"),
+        }
+
+        let events = self
+            .platform
+            .owner_for(device)
+            .map(|owner| owner.quarantine_live())
+            .unwrap_or_default();
+        if !events.is_empty() {
+            let _ = self.route_owner_event_batch(device, events, std::time::Instant::now());
+        }
+        match self
+            .lifecycle_coordinator
+            .terminalize_device_removed(&device)
+        {
+            Ok(actions) => self.lifecycle_queue_actions(device, actions, None),
+            Err(error) => log::error!("kms: DeviceRemoved terminalization for {device}: {error:?}"),
+        }
+        self.update_resource_service_activity();
+        self.wake_crtc_config_ready();
+        log::info!("kms: Owner DRM device {device} removed; outputs withdrawn");
+    }
+
     fn probe_incarnation(&self, device: DrmDeviceKey) -> Option<IncarnationId> {
         self.platform.device_for_key(device).and_then(|entry| {
             entry
@@ -25307,11 +25479,25 @@ impl KmsBackend {
             self.hotplug_rescan_deferred = true;
             return;
         }
-        let owner_devices = self
+        let owner_incarnations = self
             .lifecycle_owner_incarnation_devices()
             .into_iter()
             .collect::<HashSet<_>>();
-        if owner_devices.is_empty() {
+        let owner_devices = owner_incarnations
+            .iter()
+            .copied()
+            .filter(|device| {
+                !self
+                    .lifecycle_coordinator
+                    .device(device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                            || arbiter.desired().device_presence() == Some(false)
+                    })
+            })
+            .collect::<HashSet<_>>();
+        if owner_incarnations.is_empty() {
             self.run_display_rescan(state);
             return;
         }
@@ -25322,7 +25508,7 @@ impl KmsBackend {
             .map(|entry| entry.key)
             .collect::<HashSet<_>>();
         let legacy_devices = all_devices
-            .difference(&owner_devices)
+            .difference(&owner_incarnations)
             .copied()
             .collect::<HashSet<_>>();
         self.start_probe_episode(
@@ -25334,20 +25520,12 @@ impl KmsBackend {
     }
 
     fn resolve_hotplug_probe_episode(&mut self, episode: ProbeEpisode) {
-        if episode.results.values().any(|result| {
-            result
-                .as_ref()
-                .is_err_and(|error| error.raw_os_error() != Some(libc::ENODEV))
-        }) {
+        if episode.results.values().any(Result::is_err) {
             return;
         }
         let mut participants = std::collections::BTreeMap::new();
         for (device, result) in episode.results {
-            let Ok(snapshots) = result else {
-                // ENODEV is withdrawn when its result is consumed; until
-                // Task 4 this follows the failed-acquire closure.
-                continue;
-            };
+            let Ok(snapshots) = result else { continue };
             let classification = self.classify_hotplug_for_device(device, &snapshots);
             if classification.change_class.is_some() {
                 participants.insert(
@@ -26145,20 +26323,14 @@ impl KmsBackend {
                 }
                 false
             }
-            Err(error)
-                if cause == ProbeEpisodeCause::Hotplug
-                    && is_owner
-                    && error.raw_os_error() == Some(libc::ENODEV) =>
-            {
+            Err(error) if is_owner && error.raw_os_error() == Some(libc::ENODEV) => {
                 log::error!(
-                    "kms: Owner hotplug connector probe reports {} removed; closing incarnation",
+                    "kms: Owner connector probe reports {} removed; applying DeviceRemoved",
                     result.device
                 );
-                if let Some(episode) = self.probe_episode.as_mut() {
-                    episode.remaining.remove(&result.device);
-                    episode.results.insert(result.device, Err(error));
-                }
-                self.close_owner_after_acquire_probe_failure(result.device);
+                let device = result.device;
+                let incarnation = result.incarnation.expect("Owner probe has an incarnation");
+                self.remove_owner_device(device, incarnation);
                 true
             }
             Err(error) if cause == ProbeEpisodeCause::Hotplug => {
@@ -26417,6 +26589,8 @@ impl KmsBackend {
                 continue;
             }
             #[cfg(test)]
+            self.vt_master_attempts_for_tests.push(device.key);
+            #[cfg(test)]
             if self.vt_skip_master_ioctls_for_tests {
                 continue;
             }
@@ -26504,6 +26678,18 @@ impl KmsBackend {
         let mut failed_owner_devices = Vec::new();
         let mut already_withdrawn_owner_devices = Vec::new();
         for device in owner_devices.iter().copied() {
+            if self
+                .lifecycle_coordinator
+                .device(&device)
+                .is_some_and(|arbiter| {
+                    arbiter.desired().device_presence() == Some(false)
+                        || arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                })
+            {
+                already_withdrawn_owner_devices.push(device);
+                continue;
+            }
             match probes.get(&device) {
                 Some(Ok(snapshot)) => {
                     let explicitly_removed = self
@@ -28586,13 +28772,66 @@ impl Backend for KmsBackend {
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {
         #[cfg(target_os = "linux")]
         {
-            let saw_change = self
+            let records = self
                 .platform
                 .hotplug_monitor
                 .as_mut()
                 .map(|monitor| monitor.drain())
-                .unwrap_or(false);
-            if saw_change {
+                .unwrap_or_default();
+            #[cfg(test)]
+            self.drm_hotplug_records_for_tests
+                .extend(records.iter().cloned());
+
+            // Keep the all-Legacy path's historical edge boolean exactly as
+            // before. Owner servers classify each typed event against current
+            // card incarnations and renderer-node identities.
+            if self.lifecycle_owner_incarnation_devices().is_empty() {
+                if records.iter().any(|record| record.action.is_legacy_edge()) {
+                    KmsBackend::record_display_hotplug_edge(self);
+                }
+                return;
+            }
+
+            let open_cards = self.open_drm_cards_for_hotplug_classifier();
+            let renderer_nodes = self.selected_renderer_drm_nodes();
+            let events = crate::kms::hotplug::classify_drm_hotplug_records(
+                records,
+                &open_cards,
+                &renderer_nodes,
+            );
+            let mut saw_connector_edge = false;
+            for event in events {
+                if event.renderer_removed {
+                    log::error!(
+                        "kms: selected Vulkan renderer node {:?} was removed; exiting",
+                        event.record.dev_t
+                    );
+                    self.request_exit();
+                }
+                match event.disposition {
+                    crate::kms::hotplug::DrmHotplugDisposition::DeviceRemoved => {
+                        if let (Some(device), Some(incarnation)) = (event.device, event.incarnation)
+                        {
+                            self.remove_owner_device(device, incarnation);
+                        }
+                    }
+                    crate::kms::hotplug::DrmHotplugDisposition::DeviceAddedOrReplaced => {
+                        #[cfg(test)]
+                        self.drm_hotplug_add_log_records_for_tests
+                            .push(event.record.clone());
+                        log::info!(
+                            "kms: DeviceAddedOrReplaced dev_t={:?} devnode={:?}; card left unopened",
+                            event.record.dev_t,
+                            event.record.devnode
+                        );
+                    }
+                    crate::kms::hotplug::DrmHotplugDisposition::ConnectorEdge => {
+                        saw_connector_edge = true;
+                    }
+                    crate::kms::hotplug::DrmHotplugDisposition::Ignored => {}
+                }
+            }
+            if saw_connector_edge {
                 KmsBackend::record_display_hotplug_edge(self);
             }
         }
@@ -98612,7 +98851,12 @@ mod tests {
                 },
                 None,
             )
-            .unwrap_or_else(|error| panic!("{label}, frame {frame}: {error}"));
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{label}, frame {frame}: {error}; diagnostics: {}",
+                    c0_3cii_owner_route_diagnostics_for_tests(backend, device)
+                )
+            });
         }
         assert!(
             backend
@@ -98635,6 +98879,107 @@ mod tests {
             Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Ready),
             "{label}: Owner lifecycle is ready"
         );
+    }
+
+    fn c0_3cii_owner_route_diagnostics_for_tests(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+    ) -> String {
+        let conductor = backend.admission_conductors.get(&device).map(|conductor| {
+            (
+                conductor.lifecycle_admission_closed,
+                conductor.recovery_stopped,
+                conductor.composed.clone(),
+                conductor.last_readiness_for_tests.clone(),
+                conductor.last_decision_for_tests.clone(),
+            )
+        });
+        let live_record = backend
+            .platform
+            .owner_ref(device)
+            .and_then(|owner| owner.live_record())
+            .map(|record| {
+                (
+                    record.commit_id(),
+                    record.state(),
+                    record.milestones(),
+                    record.completion_context().class,
+                )
+            });
+        let outputs = backend
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| output.key.device_key == device)
+            .map(|(output_idx, output)| {
+                (
+                    output.key.clone(),
+                    backend.scene.damage_state_for_tests(output_idx),
+                    backend.scene.scanout_damage_signature_for_tests(output_idx),
+                    backend
+                        .scene
+                        .damage_history_latest_generation_for_tests(output_idx),
+                    backend.scene.owner_prepared_for_tests(output_idx),
+                )
+            })
+            .collect::<Vec<_>>();
+        let armed_damaged_ids = backend.store.armed_damaged_ids();
+        let offers = backend
+            .core_driver_composed_offers_for_tests
+            .iter()
+            .filter(|(offer_device, _, _, _)| *offer_device == device)
+            .cloned()
+            .collect::<Vec<_>>();
+        let executors = backend
+            .platform
+            .devices
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key,
+                    entry.executor.as_ref().map(|executor| {
+                        (
+                            executor.request_counts_for_tests(),
+                            executor.termination_requested_for_tests(),
+                        )
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "device={device}; scene_wants_compose={}; scene_structure_dirty={}; scene_owes_repaint={}; \
+             store_pending_damage={}; armed_damaged_ids={armed_damaged_ids:?}; \
+             active_scene_output_damage={:?}; retired_scene_outputs={:?}; \
+             admission_trace={:?}; live_record={live_record:?}; composed_offers={offers:?}; \
+             output_damage={outputs:?}; executor_(key,(sent,validation,live,replies),terminated)={executors:?}; \
+             admission_gate={:?}; lifecycle={:?}; conductor={conductor:?}; \
+             pending_ready_render_completions={:?}; queued_core=(crtc_announcements={}, script_notifications={}, owner_events={}, drm_events={}, readiness_script={})",
+            backend.scene_wants_compose(),
+            backend.scene.scene_structure_dirty,
+            backend.scene.owes_repaint(),
+            backend.store.has_pending_presentation_damage(),
+            backend.scene.output_damage_states_for_tests(),
+            backend.scene.retired_output_end_states_for_tests(),
+            backend.admission_trace_for_tests(device),
+            backend
+                .platform
+                .transport_gate(&device)
+                .map(|gate| gate.state()),
+            backend
+                .lifecycle_coordinator
+                .device(&device)
+                .map(|arbiter| (arbiter.state(), arbiter.admission_open())),
+            backend
+                .platform
+                .ready_scanout_render_completions_for_tests
+                .len(),
+            backend.ready_crtc_config_announcements.len(),
+            backend.core_driver_script_notification_count_for_tests,
+            backend.core_driver_owner_events_for_tests.len(),
+            backend.core_driver_drm_events_for_tests.len(),
+            backend.core_driver_readiness_script_for_tests.len(),
+        )
     }
 
     fn c0_3cii_settle_owner_fixtures(
@@ -98734,9 +99079,24 @@ mod tests {
             .get_mut(&device)
             .expect("Owner conductor")
             .lifecycle_admission_closed = true;
-        backend.scene.mark_scene_structure_dirty();
         let mut state = ServerState::new();
         c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "resolve the startup Owner clock before preparing the composed generation",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .platform
+                    .owner_ref(device)
+                    .and_then(|owner| owner.clock(clock_key))
+                    .is_some_and(|clock| matches!(clock.probe, ProbeState::Succeeded))
+            },
+            None,
+        )
+        .expect("the test starts from a resolved Owner clock epoch");
+        backend.scene.mark_scene_structure_dirty();
+        c0_3bi_core_driver_until_mode(
             backend,
             &mut state,
             "prepare composed generation behind the Owner startup gate",
@@ -98751,14 +99111,25 @@ mod tests {
                         .scene
                         .owner_state_for_generation_for_tests(0, generation)
                         == Some(crate::kms::render::owner_buffer::OwnerBufferState::Desired)
+                    && backend.scene.owner_composed_ready(0, generation)
                     && backend
                         .admission_conductors
                         .get(&device)
-                        .is_some_and(|conductor| conductor.composed.contains_key(&crtc))
+                        .is_some_and(|conductor| conductor.composed.get(&crtc) == Some(&generation))
             },
             None,
+            false,
+            true,
         )
         .expect("the composed Owner generation is offered while admission is closed");
+        let queued_generation = backend
+            .admission_conductors
+            .get(&device)
+            .and_then(|conductor| conductor.composed.get(&crtc))
+            .copied()
+            .expect("queued composed generation");
+        let scene_ready_before_probe_failure =
+            backend.scene.owner_composed_ready(0, queued_generation);
         let clock_state = {
             let clock = backend
                 .platform
@@ -98818,8 +99189,11 @@ mod tests {
             .get_mut(&device)
             .expect("Owner conductor")
             .lifecycle_admission_closed = false;
+        let blocked_outcome = backend.admission_wake(device, false);
+        let scene_ready_after_blocked_wake =
+            backend.scene.owner_composed_ready(0, queued_generation);
         assert_eq!(
-            backend.admission_wake(device, false),
+            blocked_outcome,
             crate::kms::render::admission::AdmissionOutcome::NothingAdmissible,
             "the queued generation stays in the conductor until its clock probe succeeds"
         );
@@ -98856,10 +99230,50 @@ mod tests {
                 clock.queue_failed,
             ) = clock_state;
         }
-        assert!(matches!(
-            backend.admission_wake(device, false),
-            crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
-        ));
+        let outcome = backend.admission_wake(device, false);
+        let composed_generation = backend
+            .admission_conductors
+            .get(&device)
+            .and_then(|conductor| conductor.composed.get(&crtc))
+            .copied();
+        let scene_ready = composed_generation
+            .is_some_and(|generation| backend.scene.owner_composed_ready(0, generation));
+        let readiness_after_retry = composed_generation.and_then(|generation| {
+            backend
+                .admission_snapshot(device, false)
+                .and_then(|snapshot| snapshot.readiness(IntentKey::Composed { crtc, generation }))
+        });
+        assert!(
+            matches!(
+                &outcome,
+                crate::kms::render::admission::AdmissionOutcome::Dispatched(_)
+            ),
+            "a successful Owner clock probe dispatches the retained generation; \
+             outcome={outcome:?}; clock={:?}; scene_ready={scene_ready}; \
+             scene_ready_before_probe_failure={scene_ready_before_probe_failure}; \
+             scene_ready_after_blocked_wake={scene_ready_after_blocked_wake}; \
+             readiness_after_retry={readiness_after_retry:?}; conductor={:?}; live={:?}",
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.clock(clock_key))
+                .map(|clock| (
+                    clock.source,
+                    clock.probe,
+                    clock.reference,
+                    clock.queue_failed
+                )),
+            backend.admission_conductors.get(&device).map(|conductor| (
+                conductor.composed.clone(),
+                conductor.last_readiness_for_tests.clone(),
+                conductor.last_decision_for_tests.clone(),
+            )),
+            backend
+                .platform
+                .owner_ref(device)
+                .and_then(|owner| owner.live_record())
+                .map(|record| (record.commit_id(), record.state(), record.milestones()))
+        );
     }
 
     /// Keep the unrelated Owner's accepted repaint from reaching its watchdog
@@ -101667,7 +102081,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     #[cfg(target_os = "linux")]
-    fn c0_3cii_hotplug_enodev_withdraws_on_receipt_vulkan() {
+    fn c0_3cii_removal_via_enodev_vulkan() {
         use crate::kms::render::platform::ProbeBarrier;
 
         // The fixture executor accepts IPC only; it does not perform DRM
@@ -101682,14 +102096,13 @@ mod tests {
             yserver_protocol::x11::randr::NOTIFY_MASK_OUTPUT_CHANGE,
         );
         let ids_b = backend.randr_id_alloc.ids_for(&outputs_b[0]);
-        let snapshot_a = c0_3cii_snapshot_from_layout(backend, &outputs_a[0]);
         backend
             .platform
             .install_scripted_connector_prober_for_tests();
         let barrier_a = ProbeBarrier::new();
         backend.platform.script_blocked_connector_probe_for_tests(
             device_a,
-            Ok(vec![snapshot_a]),
+            Ok(Vec::new()),
             barrier_a.clone(),
         );
         backend.platform.script_connector_probe_for_tests(
@@ -101708,13 +102121,6 @@ mod tests {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let original_live = state
-            .randr
-            .outputs
-            .iter()
-            .map(|output| (output.output_id, output.connected, output.mode_id))
-            .collect::<Vec<_>>();
-
         super::KmsBackend::record_display_hotplug_edge(backend);
         backend.hotplug_rescan_deadline =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
@@ -101753,10 +102159,16 @@ mod tests {
         .expect("B is closed and urgently withdrawn on ENODEV receipt");
         assert!(backend.probe_episode.as_ref().is_some_and(|episode| {
             episode.remaining == std::collections::BTreeSet::from([device_a])
-                && episode.results[&device_b]
-                    .as_ref()
-                    .is_err_and(|error| error.raw_os_error() == Some(libc::ENODEV))
+                && !episode.results.contains_key(&device_b)
         }));
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .map(|arbiter| arbiter.state()),
+            Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Removed),
+            "ENODEV records a terminal DeviceRemoved disposition on receipt"
+        );
         assert!(
             state
                 .randr
@@ -101788,45 +102200,148 @@ mod tests {
         assert!(!kbd_map_drain(&mut listener).is_empty());
 
         barrier_a.release();
+        c0_3cii_wait_hotplug_grant(backend, &mut state, "grant A's change after B removal");
+        let commit = c0_3cii_wait_hotplug_commit(
+            backend,
+            &mut state,
+            device_a,
+            sends_before[&device_a],
+            "dispatch A's change after B removal",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver_with_state(
+            backend,
+            &mut state,
+            device_a,
+            commit,
+            "apply A's unplug after B removal",
+        );
+        c0_3cii_finish_hotplug_episode(
+            backend,
+            &mut state,
+            device_a,
+            "publish A's change without removed B",
+        );
+        c0_3bi_complete_owner_followups(
+            backend,
+            device_a,
+            8,
+            "complete A's post-hotplug repaint work",
+        );
+        assert!(
+            backend
+                .platform
+                .outputs
+                .iter()
+                .all(|output| output.key.device_key == device_b)
+        );
+        assert!(
+            backend.randr_id_alloc.device_is_withdrawn(device_b),
+            "B stays withdrawn after A's hotplug publication"
+        );
+        let expected = c0_3cii_removed_end_state(backend, outputs_b, device_b);
         c0_3bi_core_driver_until_with_state(
             backend,
             &mut state,
-            "join A after B's hotplug ENODEV",
+            "drain A's retired pool after B removal",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .expect("A's retired scanout resources reach their end state");
+        c0_3bi_assert_end_state(backend, "c0_3cii_removal_via_enodev_vulkan", &expected);
+
+        // An unrelated failed answer from A must not undo B's terminal removal
+        // or create another topology publication.
+        let (
+            mut failed_fixture,
+            failed_a,
+            failed_b,
+            failed_outputs_a,
+            failed_outputs_b,
+            mut failed_state,
+        ) = c0_3cii_live_two_owner_fixture();
+        let failed_backend = &mut failed_fixture.backend;
+        let failed_ids_b = failed_backend.randr_id_alloc.ids_for(&failed_outputs_b[0]);
+        let mut listener = c0_3aii_install_dpms_core_client(&mut failed_state, 76);
+        let failed_barrier_a = ProbeBarrier::new();
+        failed_backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        failed_backend
+            .platform
+            .script_blocked_connector_probe_for_tests(
+                failed_a,
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                failed_barrier_a.clone(),
+            );
+        failed_backend.platform.script_connector_probe_for_tests(
+            failed_b,
+            Err(io::Error::from_raw_os_error(libc::ENODEV)),
+        );
+        let failed_delivery_start = failed_backend.core_entry_deliveries_for_tests.len();
+        super::KmsBackend::record_display_hotplug_edge(failed_backend);
+        failed_backend.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        c0_3bi_core_driver_until_with_state(
+            failed_backend,
+            &mut failed_state,
+            "start second probe with B ENODEV and A EIO blocked",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.probe_episode.is_some()
+                    && failed_barrier_a.wait_started(std::time::Duration::ZERO)
+            },
+            None,
+        )
+        .expect("second A probe worker starts");
+        c0_3bi_core_driver_until_with_state(
+            failed_backend,
+            &mut failed_state,
+            "withdraw B before A's EIO answer",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&failed_b)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    })
+            },
+            None,
+        )
+        .expect("B's ENODEV is terminal before A answers");
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            failed_backend,
+            &failed_state,
+            failed_delivery_start,
+            failed_ids_b.output_id,
+            failed_ids_b.crtc_id,
+            "B ENODEV while A's probe is blocked",
+        );
+        assert!(kbd_map_drain(&mut listener).is_empty());
+        failed_barrier_a.release();
+        c0_3bi_core_driver_until_with_state(
+            failed_backend,
+            &mut failed_state,
+            "consume A's unrelated EIO",
             std::time::Duration::from_secs(3),
             &|backend| backend.probe_episode.is_none(),
             None,
         )
-        .expect("healthy A answer joins the failed combined probe");
-        assert!(backend.acquire_episode.is_none());
-        assert!(backend.hotplug_episode.is_none());
-        assert!(backend.topology_episode_events.is_empty());
-        assert_eq!(backend.platform.outputs.len(), 2);
-        assert_eq!(
-            state
-                .randr
-                .outputs
-                .iter()
-                .map(|output| (output.output_id, output.connected, output.mode_id))
-                .collect::<Vec<_>>(),
-            original_live
-                .into_iter()
-                .filter(|(output_id, _, _)| *output_id != ids_b.output_id)
-                .collect::<Vec<_>>(),
-            "A's same-state answer does not change the remaining published RandR projection"
+        .expect("A's EIO resolves the remaining probe episode without topology");
+        assert!(failed_backend.acquire_episode.is_none());
+        assert!(failed_backend.hotplug_episode.is_none());
+        assert!(kbd_map_drain(&mut listener).is_empty());
+        let failed_expected = c0_3cii_removed_end_state(
+            failed_backend,
+            failed_outputs_a.into_iter().chain(failed_outputs_b),
+            failed_b,
         );
-        for device in [device_a, device_b] {
-            assert_eq!(
-                backend.lifecycle_drivers[&device]
-                    .topology_test_stats()
-                    .1
-                    .len(),
-                sends_before[&device]
-            );
-        }
         c0_3bi_assert_end_state(
-            backend,
-            "c0_3cii_hotplug_enodev_withdraws_on_receipt_vulkan",
-            &c0_3bi_expected_end_state(outputs_a.into_iter().chain(outputs_b)),
+            failed_backend,
+            "c0_3cii_removal_via_enodev_vulkan A failure",
+            &failed_expected,
         );
     }
 
@@ -102093,6 +102608,10 @@ mod tests {
         );
         let ids_a = backend.randr_id_alloc.ids_for(&outputs_a[0]);
         let ids_b = backend.randr_id_alloc.ids_for(&outputs_b[0]);
+        assert!(
+            !backend.randr_id_alloc.device_is_withdrawn(device_b),
+            "B begins in the published live set"
+        );
         let original_projection = state
             .randr
             .outputs
@@ -104626,10 +105145,26 @@ mod tests {
             delivery_start,
             "released-seat hotplug acquire",
         );
+        let expected = c0_3bi_expected_end_state([preserved]);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "drain released-seat acquire retirement resources",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; end_state_errors={:?}; retired={:?}",
+                c0_3bi_end_state_errors(backend, &expected),
+                backend.scene.retired_output_end_states_for_tests(),
+            )
+        });
         c0_3bi_assert_end_state(
             backend,
             "c0_3cii_hotplug_while_released_waits_for_acquire_vulkan",
-            &c0_3bi_expected_end_state([preserved]),
+            &expected,
         );
     }
 
@@ -105059,20 +105594,78 @@ mod tests {
             backend,
             outputs_a.into_iter().chain(_outputs_b),
         );
-        c0_3bi_core_driver_until_with_state(
-            backend,
-            &mut state,
-            "retire A's displaced scene instance and release its resources after the second acquire",
-            std::time::Duration::from_secs(5),
-            &|backend| {
-                !backend
-                    .scene
-                    .retired_output_has_instance_for_tests(instance_after_first_acquire)
-                    && c0_3bi_end_state_errors(backend, &expected).is_empty()
-            },
-            None,
-        )
-        .expect("A's previous scene instance and allocations drain after the second acquire");
+        let retirement_drained = |backend: &super::KmsBackend| {
+            !backend
+                .scene
+                .retired_output_has_instance_for_tests(instance_after_first_acquire)
+                && c0_3bi_end_state_errors(backend, &expected).is_empty()
+        };
+        let retirement_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for frame in 0..8 {
+            if retirement_drained(backend) {
+                break;
+            }
+            if let Some(commit) = backend
+                .platform
+                .owner_ref(device_a)
+                .and_then(|owner| owner.live_record())
+                .map(|record| record.commit_id())
+            {
+                // Acquisition can compose a follow-up A frame while the old
+                // pool is retiring. The executor stub does not emit its DRM
+                // completion, so supply the same core-entry completion used
+                // for the two reinstall commits above.
+                c0_3bi_complete_owner_commit_through_core_driver_with_state(
+                    backend,
+                    &mut state,
+                    device_a,
+                    commit,
+                    "complete A's follow-up while draining acquire retirement",
+                );
+                continue;
+            }
+            let remaining =
+                retirement_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "A's displaced scene instance did not drain within the existing 5-second bound; diagnostics: {}; end_state_errors={:?}; retired={:?}",
+                    c0_3cii_owner_route_diagnostics_for_tests(backend, device_a),
+                    c0_3bi_end_state_errors(backend, &expected),
+                    backend.scene.retired_output_end_states_for_tests(),
+                );
+            }
+            c0_3bi_core_driver_until_with_state(
+                backend,
+                &mut state,
+                "retire A's displaced scene instance after the second acquire",
+                remaining,
+                &|backend| {
+                    retirement_drained(backend)
+                        || backend
+                            .platform
+                            .owner_ref(device_a)
+                            .and_then(|owner| owner.live_record())
+                            .is_some()
+                },
+                None,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}; A diagnostics: {}; end_state_errors={:?}; retired={:?}",
+                    c0_3cii_owner_route_diagnostics_for_tests(backend, device_a),
+                    c0_3bi_end_state_errors(backend, &expected),
+                    backend.scene.retired_output_end_states_for_tests(),
+                )
+            });
+            if frame == 7 && !retirement_drained(backend) {
+                panic!(
+                    "A's acquire retirement did not settle after 8 accepted frames; diagnostics: {}; end_state_errors={:?}; retired={:?}",
+                    c0_3cii_owner_route_diagnostics_for_tests(backend, device_a),
+                    c0_3bi_end_state_errors(backend, &expected),
+                    backend.scene.retired_output_end_states_for_tests(),
+                );
+            }
+        }
         c0_3bi_assert_end_state(
             backend,
             "c0_3cii_stuck_acquire_worker_closes_and_is_reaped_vulkan",
@@ -105336,14 +105929,36 @@ mod tests {
             assert!(backend.probe_episode.as_ref().is_some_and(|episode| {
                 episode.remaining.contains(&device_a) && !episode.remaining.contains(&device_b)
             }));
-            assert_eq!(
-                backend.probe_episode.as_ref().unwrap().results[&device_b]
-                    .as_ref()
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(errno),
-                "{case}: the original probe errno stays attached to B's result"
-            );
+            let b_is_removed =
+                backend
+                    .lifecycle_coordinator
+                    .device(&device_b)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    });
+            if errno == libc::ENODEV {
+                assert!(b_is_removed, "{case}: ENODEV is DeviceRemoved at receipt");
+                assert!(
+                    !backend
+                        .probe_episode
+                        .as_ref()
+                        .unwrap()
+                        .results
+                        .contains_key(&device_b),
+                    "{case}: a removed participant has no failed probe result"
+                );
+            } else {
+                assert!(!b_is_removed, "{case}: EIO is not DeviceRemoved");
+                assert_eq!(
+                    backend.probe_episode.as_ref().unwrap().results[&device_b]
+                        .as_ref()
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(errno),
+                    "{case}: the ordinary probe failure preserves its errno"
+                );
+            }
             let ids = backend.randr_id_alloc.ids_for(&outputs_b[0]);
             c0_3bi_assert_one_urgent_withdrawal_delivered(
                 backend,
@@ -105374,6 +105989,18 @@ mod tests {
             c0_3bi_complete_owner_commit_through_core_driver_with_state(
                 backend, &mut state, device_a, reinstall, case,
             );
+            let expected = if errno == libc::ENODEV {
+                c0_3cii_removed_end_state(
+                    backend,
+                    outputs_a.iter().chain(&outputs_b).cloned(),
+                    device_b,
+                )
+            } else {
+                c0_3ci_expected_end_state_with_acquire_preparation(
+                    backend,
+                    outputs_a.iter().chain(&outputs_b).cloned(),
+                )
+            };
             c0_3bi_core_driver_until_with_state(
                 backend,
                 &mut state,
@@ -105383,18 +106010,19 @@ mod tests {
                     !backend
                         .scene
                         .retired_output_has_instance_for_tests(retired_instance_a)
+                        && c0_3bi_end_state_errors(backend, &expected).is_empty()
                 },
                 None,
             )
-            .unwrap_or_else(|error| panic!("{case}: retired A output drains: {error}"));
-            c0_3bi_assert_end_state(
-                backend,
-                case,
-                &c0_3ci_expected_end_state_with_acquire_preparation(
-                    backend,
-                    outputs_a.into_iter().chain(outputs_b),
-                ),
-            );
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{case}: retired A output and resource service drain: {error}; \
+                     end_state_errors={:?}; retired={:?}",
+                    c0_3bi_end_state_errors(backend, &expected),
+                    backend.scene.retired_output_end_states_for_tests(),
+                )
+            });
+            c0_3bi_assert_end_state(backend, case, &expected);
         }
 
         run_case(libc::ENODEV, "ENODEV withdraws B before A answers");
@@ -106372,6 +107000,1625 @@ mod tests {
         (fixture, device_a, device_b, outputs_a, outputs_b, state)
     }
 
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_udev_record(
+        action: crate::kms::hotplug::DrmHotplugAction,
+        device: DrmDeviceKey,
+        card_node: bool,
+        connector_subdevice: bool,
+        hotplug: bool,
+    ) -> crate::kms::hotplug::DrmHotplugRecord {
+        crate::kms::hotplug::DrmHotplugRecord {
+            action,
+            dev_t: Some(device),
+            devnode: Some(std::path::PathBuf::from(format!(
+                "/dev/dri/{}{}",
+                if card_node { "card" } else { "renderD" },
+                device.minor
+            ))),
+            subsystem: Some("drm".to_owned()),
+            is_card_node: card_node,
+            is_render_node: !card_node && !connector_subdevice,
+            is_connector_subdevice: connector_subdevice,
+            hotplug,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_script_udev_records(
+        backend: &mut super::KmsBackend,
+        records: Vec<crate::kms::hotplug::DrmHotplugRecord>,
+    ) {
+        backend.platform.hotplug_monitor = Some(
+            crate::kms::hotplug::DrmHotplugMonitor::from_records(records),
+        );
+        backend
+            .core_driver_readiness_script_for_tests
+            .push_back((yserver_core::backend::BackendFdKind::DrmHotplug, -1));
+    }
+
+    fn c0_3cii_removed_end_state(
+        backend: &super::KmsBackend,
+        live_layout: impl IntoIterator<Item = OutputKey>,
+        removed_device: DrmDeviceKey,
+    ) -> C0EndStateExpectation {
+        let mut expected = c0_3bi_expected_end_state(live_layout);
+        expected.quarantined_allocations = backend
+            .resource_service()
+            .map(|service| {
+                service
+                    .allocation_end_state_for_tests()
+                    .into_iter()
+                    .filter(|allocation| {
+                        allocation.key.device == removed_device && allocation.frozen
+                    })
+                    .map(|allocation| allocation.key)
+                    .collect()
+            })
+            .unwrap_or_default();
+        expected
+    }
+
+    fn c0_3cii_install_core_shutdown_channel(
+        backend: &mut super::KmsBackend,
+    ) -> yserver_core::core_loop::CoreReceiver {
+        let (_poll, sender, receiver) =
+            yserver_core::core_loop::channel().expect("core shutdown channel");
+        Backend::set_input_sender(backend, sender);
+        receiver
+    }
+
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_deliver_hotplug_once(
+        backend: &mut super::KmsBackend,
+        state: &mut ServerState,
+        label: &str,
+        done: &dyn Fn(&super::KmsBackend) -> bool,
+    ) {
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            state,
+            label,
+            std::time::Duration::from_secs(3),
+            done,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert!(
+            backend
+                .core_entry_trace_for_tests
+                .borrow()
+                .contains(&"poll_fds"),
+            "{label}: the core-entry driver queried backend readiness"
+        );
+    }
+
+    fn c0_3cii_make_device_a_the_only_test_renderer(
+        backend: &mut super::KmsBackend,
+        device_a: DrmDeviceKey,
+    ) {
+        let Some(renderer) = backend.platform.selected_render_device_mut() else {
+            return;
+        };
+        renderer.advertised_primary_node = Some(device_a);
+        if let crate::kms::scanout_route::RenderDeviceId::DrmRender(render) = renderer.id
+            && render != device_a
+        {
+            renderer.advertised_render_node = Some(render);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_assert_remove_b_while_a_modeset_is_unpublished(test_name: &str) {
+        use yserver_protocol::x11::randr as rr;
+
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_make_device_a_the_only_test_renderer(backend, device_a);
+        c0_3cii_settle_owner_fixtures(
+            backend,
+            &mut state,
+            &[device_a, device_b],
+            "remove-during-modeset readiness",
+        );
+        c0_3aii_replace_owner_executor(
+            backend,
+            crate::kms::executor::test_support::StubBehaviour::AcceptKernelCallsAfterValidation(
+                std::time::Duration::from_millis(250),
+            ),
+        );
+        let output = &outputs_a[0];
+        let ids_a = backend.randr_id_alloc.ids_for(output);
+        let ids_b = backend.randr_id_alloc.ids_for(&outputs_b[0]);
+        let layout_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|layout| layout.key == *output)
+            .unwrap();
+        let old_mode_id = state
+            .randr
+            .outputs
+            .iter()
+            .find(|randr| randr.output_id == ids_a.output_id)
+            .expect("A is present in the client projection")
+            .mode_id;
+        let mode = backend.platform.outputs[layout_idx]
+            .output
+            .modes
+            .iter()
+            .map(|mode| ModeSpec {
+                width: mode.width,
+                height: mode.height,
+                vrefresh: mode.vrefresh,
+            })
+            .find(|mode| {
+                let current = c0_3bi_current_mode(backend, layout_idx);
+                *mode != current
+            })
+            .expect("A exposes an alternate mode");
+        let mut listener = c0_3aii_install_dpms_core_client(&mut state, 74);
+        state.randr_select_masks.insert(
+            (74, yserver_core::resources::ROOT_WINDOW),
+            rr::NOTIFY_MASK_OUTPUT_CHANGE | rr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let token = c0_3bi_begin_client_modeset(
+            backend,
+            ids_a.output_id,
+            &output.connector_name,
+            Some(mode),
+        );
+        let commit = c0_3cii_wait_client_modeset_live_with_state(
+            backend,
+            &mut state,
+            device_a,
+            token,
+            "dispatch A's modeset before B removal",
+        );
+        assert!(backend.platform.owner_ref(device_a).is_some_and(|owner| {
+            owner.live_record().is_some_and(|record| {
+                record.commit_id() == commit
+                    && record.milestones().dispatched
+                    && !record.milestones().accepted
+            })
+        }));
+
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Remove,
+                device_b,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(backend, &mut state, test_name, &|backend| {
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .is_some_and(|arbiter| {
+                    arbiter.state() == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                })
+        });
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            backend,
+            &state,
+            delivery_start,
+            ids_b.output_id,
+            ids_b.crtc_id,
+            test_name,
+        );
+        assert!(
+            backend.platform.owner_ref(device_a).is_some_and(|owner| {
+                owner.live_record().is_some_and(|record| {
+                    record.commit_id() == commit
+                        && record.milestones().dispatched
+                        && !record.milestones().accepted
+                })
+            }),
+            "B's urgent withdrawal is delivered before A's dispatched modeset reply"
+        );
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .any(|randr| randr.output_id == ids_a.output_id && randr.mode_id == old_mode_id),
+            "the unpublished modeset leaves A's old client configuration visible"
+        );
+        assert!(
+            !kbd_map_drain(&mut listener).is_empty(),
+            "B's withdrawal notifies the client before A replies"
+        );
+
+        c0_3bi_complete_owner_commit_through_core_driver_with_state(
+            backend,
+            &mut state,
+            device_a,
+            commit,
+            "complete A's held modeset after the urgent withdrawal",
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "queue the ordinary A modeset result",
+            std::time::Duration::from_secs(3),
+            &|backend| c0_3bi_has_crtc_config_result(backend, token),
+            None,
+        )
+        .expect("A's ready token is delivered after its completion");
+        assert!(c0_3bi_take_crtc_config_result(backend, token).expect("A modeset result"));
+        assert!(
+            backend.platform.outputs.iter().any(|layout| {
+                layout.key == *output && layout.width == mode.width && layout.height == mode.height
+            }),
+            "A's modeset is promoted in the backend after its ready result"
+        );
+        assert!(
+            !state
+                .randr
+                .screen_resources_current()
+                .outputs
+                .contains(&ids_b.output_id),
+            "A's later publication leaves B absent from the client projection"
+        );
+        let mut expected = c0_3cii_removed_end_state(
+            backend,
+            outputs_a.iter().chain(&outputs_b).cloned(),
+            device_b,
+        );
+        expected.other_live_allocations = backend
+            .resource_service()
+            .map(|service| {
+                service
+                    .allocation_end_state_for_tests()
+                    .into_iter()
+                    .filter(|allocation| allocation.key.device == device_a && !allocation.frozen)
+                    .map(|allocation| allocation.key)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_a)
+                .map(|arbiter| arbiter.state()),
+            Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Ready),
+            "the unrelated Owner remains ready after A's modeset publication"
+        );
+        c0_3bi_assert_end_state(backend, test_name, &expected);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_removal_during_unrelated_modeset_publishes_at_once_vulkan() {
+        c0_3cii_assert_remove_b_while_a_modeset_is_unpublished(
+            "c0_3cii_removal_during_unrelated_modeset_publishes_at_once_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_urgent_withdrawal_hides_unpublished_modeset_vulkan() {
+        c0_3cii_assert_remove_b_while_a_modeset_is_unpublished(
+            "c0_3cii_urgent_withdrawal_hides_unpublished_modeset_vulkan",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_later_publication_does_not_restore_withdrawn_outputs_vulkan() {
+        let (mut fixture, device_a, device_b, _outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_make_device_a_the_only_test_renderer(backend, device_a);
+        c0_3cii_settle_owner_fixtures(
+            backend,
+            &mut state,
+            &[device_a, device_b],
+            "later-publication fixture readiness",
+        );
+        c0_3aii_replace_owner_executor(
+            backend,
+            crate::kms::executor::test_support::StubBehaviour::AcceptKernelCallsAfterValidation(
+                std::time::Duration::from_millis(250),
+            ),
+        );
+        let ids_b = backend.randr_id_alloc.ids_for(&outputs_b[0]);
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Remove,
+                device_b,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(
+            backend,
+            &mut state,
+            "withdraw B before A's later publication",
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device_b)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    })
+            },
+        );
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            backend,
+            &state,
+            delivery_start,
+            ids_b.output_id,
+            ids_b.crtc_id,
+            "B removal before A's publication",
+        );
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend
+            .platform
+            .script_connector_probe_for_tests(device_a, Ok(Vec::new()));
+        let sends_before = backend.lifecycle_drivers[&device_a]
+            .topology_test_stats()
+            .1
+            .len();
+        let record_start = backend.drm_hotplug_records_for_tests.len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Change,
+                device_a,
+                true,
+                false,
+                true,
+            )],
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "start A's later topology episode",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == super::ProbeEpisodeCause::Hotplug)
+            },
+            None,
+        )
+        .expect("A change record enters the hotplug probe path");
+        c0_3cii_wait_hotplug_grant(backend, &mut state, "grant A's later unplug publication");
+        let commit = c0_3cii_wait_hotplug_commit(
+            backend,
+            &mut state,
+            device_a,
+            sends_before,
+            "dispatch A's later unplug",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver_with_state(
+            backend,
+            &mut state,
+            device_a,
+            commit,
+            "apply A's later unplug",
+        );
+        c0_3cii_finish_hotplug_episode(backend, &mut state, device_a, "publish A's later unplug");
+        c0_3bi_complete_owner_followups(
+            backend,
+            device_a,
+            8,
+            "complete A's later-unplug repaint work",
+        );
+        assert!(
+            backend.drm_hotplug_records_for_tests[record_start..]
+                .iter()
+                .any(|record| record.action == crate::kms::hotplug::DrmHotplugAction::Change)
+        );
+        let backend_output_ids = backend
+            .randr_outputs_and_modes()
+            .0
+            .into_iter()
+            .map(|output| output.output_id)
+            .collect::<HashSet<_>>();
+        assert!(
+            !backend_output_ids.contains(&ids_b.output_id),
+            "the backend model also filters B after its withdrawal"
+        );
+        let resources = state.randr.screen_resources_current();
+        assert!(
+            !resources.outputs.contains(&ids_b.output_id),
+            "B stays absent after a later publication"
+        );
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .all(|randr| randr.output_id != ids_b.output_id)
+        );
+        assert!(backend.randr_id_alloc.device_is_withdrawn(device_b));
+        let expected = c0_3cii_removed_end_state(backend, outputs_b, device_b);
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "drain A's later-unplug pool retirement",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .expect("A's later-unplug retirement reaches the end state");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_later_publication_does_not_restore_withdrawn_outputs_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_removal_interrupts_episode_vulkan() {
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_make_device_a_the_only_test_renderer(backend, device_a);
+        c0_3cii_settle_owner_fixtures(
+            backend,
+            &mut state,
+            &[device_a, device_b],
+            "episode-removal fixture",
+        );
+
+        let ids_a = backend.randr_id_alloc.ids_for(&outputs_a[0]);
+        let ids_b = backend.randr_id_alloc.ids_for(&outputs_b[0]);
+        let layout_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|layout| layout.key == outputs_a[0])
+            .unwrap();
+        let current = c0_3bi_current_mode(backend, layout_idx);
+        let alternate = backend.platform.outputs[layout_idx]
+            .output
+            .modes
+            .iter()
+            .map(|mode| ModeSpec {
+                width: mode.width,
+                height: mode.height,
+                vrefresh: mode.vrefresh,
+            })
+            .find(|mode| *mode != current)
+            .expect("A has an alternate mode");
+        let token = c0_3bi_begin_client_modeset(
+            backend,
+            ids_a.output_id,
+            &outputs_a[0].connector_name,
+            Some(alternate),
+        );
+        let client_commit = c0_3cii_wait_client_modeset_live_with_state(
+            backend,
+            &mut state,
+            device_a,
+            token,
+            "hold A's client modeset across a topology episode",
+        );
+
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend
+            .platform
+            .script_connector_probe_for_tests(device_a, Ok(Vec::new()));
+        let mut snapshot_b = c0_3cii_snapshot_from_layout(backend, &outputs_b[0]);
+        snapshot_b.edid.push(0x42);
+        backend
+            .platform
+            .script_connector_probe_for_tests(device_b, Ok(vec![snapshot_b]));
+        let a_sends_before = backend.lifecycle_drivers[&device_a]
+            .topology_test_stats()
+            .1
+            .len();
+        let episode_delivery_start = backend.core_entry_deliveries_for_tests.len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Change,
+                device_a,
+                true,
+                false,
+                true,
+            )],
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "collect both changes while A's client gate is held",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend.acquire_episode.as_ref().is_some_and(|episode| {
+                    episode.cause == super::TopologyEpisodeCause::Hotplug
+                        && episode.remaining.contains(&device_a)
+                        && backend.hotplug_episode.as_ref().is_some_and(|hotplug| {
+                            hotplug.participants.contains_key(&device_b)
+                        })
+                })
+            },
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "both hotplug participants wait for the client modeset gate: {error}; probe={:?}; episode={:?}; hotplug={:?}; observations={:?}; live_a={:?}; mode_slot={:?}",
+                backend.probe_episode.as_ref().map(|episode| (episode.epoch, episode.remaining.clone(), episode.results.keys().copied().collect::<Vec<_>>())),
+                backend.acquire_episode.as_ref().map(|episode| (episode.id, episode.granted, episode.remaining.clone())),
+                backend.hotplug_episode.as_ref().map(|episode| episode.participants.keys().copied().collect::<Vec<_>>()),
+                backend.platform.connector_probe_observations_for_tests(),
+                backend.platform.owner_ref(device_a).and_then(|owner| owner.live_record()).map(|record| (record.commit_id(), record.state(), record.milestones())),
+                backend.lifecycle_drivers.get(&device_a).and_then(|driver| driver.client_modeset.as_ref()).map(|slot| (slot.token, slot.phase)),
+            )
+        });
+        assert!(
+            backend
+                .hotplug_episode
+                .as_ref()
+                .is_some_and(|episode| episode.participants.contains_key(&device_b))
+        );
+        let delivery_start = episode_delivery_start;
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Remove,
+                device_b,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(
+            backend,
+            &mut state,
+            "remove B from an open topology episode",
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device_b)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    })
+                    && backend
+                        .acquire_episode
+                        .as_ref()
+                        .is_none_or(|episode| !episode.remaining.contains(&device_b))
+            },
+        );
+        assert!(
+            backend
+                .hotplug_episode
+                .as_ref()
+                .is_none_or(|episode| !episode.participants.contains_key(&device_b))
+        );
+        assert!(
+            backend.randr_id_alloc.device_is_withdrawn(device_b),
+            "B's IDs are withdrawn while its topology episode is open"
+        );
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            backend,
+            &state,
+            delivery_start,
+            ids_b.output_id,
+            ids_b.crtc_id,
+            "B leaves the open topology episode",
+        );
+        assert!(backend.platform.owner_ref(device_a).is_some_and(|owner| {
+            owner
+                .live_record()
+                .is_some_and(|record| record.commit_id() == client_commit)
+        }));
+
+        c0_3bi_complete_owner_commit_through_core_driver_with_state(
+            backend,
+            &mut state,
+            device_a,
+            client_commit,
+            "finish A's client modeset",
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "finish the A client token before the remaining episode",
+            std::time::Duration::from_secs(3),
+            &|backend| c0_3bi_has_crtc_config_result(backend, token),
+            None,
+        )
+        .expect("A's ordinary modeset token reaches its ready path");
+        assert!(c0_3bi_take_crtc_config_result(backend, token).expect("A modeset result"));
+        c0_3cii_wait_hotplug_grant(
+            backend,
+            &mut state,
+            "grant the remaining A topology participant",
+        );
+        let commit = c0_3cii_wait_hotplug_commit(
+            backend,
+            &mut state,
+            device_a,
+            a_sends_before,
+            "dispatch A after B leaves",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver_with_state(
+            backend,
+            &mut state,
+            device_a,
+            commit,
+            "apply A after B leaves",
+        );
+        c0_3cii_finish_hotplug_episode(
+            backend,
+            &mut state,
+            device_a,
+            "publish only A's topology change",
+        );
+        assert!(
+            backend
+                .platform
+                .outputs
+                .iter()
+                .all(|output| output.key.device_key == device_b)
+        );
+        assert!(
+            state
+                .randr
+                .outputs
+                .iter()
+                .all(|output| output.output_id != ids_b.output_id),
+            "B stays withdrawn after EpisodeEnd"
+        );
+        let expected = c0_3cii_removed_end_state(backend, outputs_b, device_b);
+        c0_3bi_complete_owner_followups(
+            backend,
+            device_a,
+            8,
+            "complete A's post-episode repaint work",
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "drain A's retired output pool after B leaves the episode",
+            std::time::Duration::from_secs(5),
+            &|backend| c0_3bi_end_state_errors(backend, &expected).is_empty(),
+            None,
+        )
+        .expect("A's retired pool obligations reach the end state");
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_removal_interrupts_episode_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_unknown_release_withdrawal_during_unrelated_modeset_vulkan() {
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_settle_owner_fixtures(
+            backend,
+            &mut state,
+            &[device_a, device_b],
+            "unknown-release cross-device gate readiness",
+        );
+        let ids_release = backend.randr_id_alloc.ids_for(&outputs_b[0]);
+        let ids_modeset = backend.randr_id_alloc.ids_for(&outputs_a[0]);
+        let layout_idx = backend
+            .platform
+            .outputs
+            .iter()
+            .position(|layout| layout.key == outputs_a[0])
+            .unwrap();
+        let current = c0_3bi_current_mode(backend, layout_idx);
+        let alternate = backend.platform.outputs[layout_idx]
+            .output
+            .modes
+            .iter()
+            .map(|mode| ModeSpec {
+                width: mode.width,
+                height: mode.height,
+                vrefresh: mode.vrefresh,
+            })
+            .find(|mode| *mode != current)
+            .expect("the held client modeset has an alternate mode");
+
+        // The two helper executors accept IPC only. A's client commit is
+        // dispatched and deliberately receives no synthetic kernel result;
+        // B's release commit likewise remains unanswered until the deadline.
+
+        let token = c0_3bi_begin_client_modeset(
+            backend,
+            ids_modeset.output_id,
+            &outputs_a[0].connector_name,
+            Some(alternate),
+        );
+        let client_commit = c0_3cii_wait_client_modeset_live_with_state(
+            backend,
+            &mut state,
+            device_a,
+            token,
+            "hold the client modeset on A",
+        );
+        assert!(backend.platform.owner_ref(device_a).is_some_and(|owner| {
+            owner.live_record().is_some_and(|record| {
+                record.commit_id() == client_commit && record.milestones().dispatched
+            })
+        }));
+
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        backend.core_driver_vt_releases_for_tests += 1;
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "publish unknown release withdrawals while A's client gate is occupied",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend.owner_vt_release.is_none()
+                    && backend.core_entry_deliveries_for_tests[delivery_start..].iter().any(|delivery| {
+                        matches!(delivery, yserver_core::core_loop::run::CoreEntryDelivery::UrgentWithdrawal { output_ids, .. } if output_ids.contains(&ids_release.output_id))
+                    })
+            },
+            None,
+        ).expect("release deadline publishes B's unknown withdrawal without A's modeset reply");
+        assert!(
+            backend
+                .platform
+                .owner_ref(device_a)
+                .is_some_and(|owner| owner.live_record().is_some_and(|record| {
+                    record.commit_id() == client_commit
+                        && matches!(
+                            record.state(),
+                            crate::kms::owner::record::RecordState::Terminal(
+                                crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                            )
+                        )
+                })),
+            "A's held client commit remains CompletionUnknown until the ordinary result path"
+        );
+        let withdrawals = backend.core_entry_deliveries_for_tests[delivery_start..]
+            .iter()
+            .filter_map(|delivery| match delivery {
+                yserver_core::core_loop::run::CoreEntryDelivery::UrgentWithdrawal {
+                    output_ids,
+                    crtc_ids,
+                } => Some((output_ids.clone(), crtc_ids.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            withdrawals.iter().any(|(output_ids, crtc_ids)| output_ids
+                .contains(&ids_release.output_id)
+                && crtc_ids.contains(&ids_release.crtc_id)),
+            "B's urgent withdrawal is delivered despite A's unanswered modeset"
+        );
+
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "resolve the unanswered A modeset token through the ready path",
+            std::time::Duration::from_secs(3),
+            &|backend| c0_3bi_has_crtc_config_result(backend, token),
+            None,
+        )
+        .expect("the held token becomes ready after unknown completion");
+        assert!(c0_3bi_take_crtc_config_result(backend, token).is_err());
+        assert!(!backend.dispatched_client_modeset_tokens.contains(&token));
+        let expected = c0_3ci_expected_end_state_with_pending_client_modeset(
+            backend,
+            outputs_a.iter().chain(&outputs_b).cloned(),
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_unknown_release_withdrawal_during_unrelated_modeset_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_device_removed_withdraws_and_continues_vulkan() {
+        use yserver_core::core_loop::Message;
+
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_make_device_a_the_only_test_renderer(backend, device_a);
+        let receiver = c0_3cii_install_core_shutdown_channel(backend);
+        let id = backend.randr_id_alloc.ids_for(&outputs_b[0]);
+        let sent_before = backend
+            .platform
+            .device_for_key(device_b)
+            .and_then(|device| device.executor.as_ref())
+            .expect("B executor")
+            .sent_requests_for_tests();
+        let offers_before_removal = backend.core_driver_composed_offers_for_tests.len();
+        let admission_trace_before_removal = backend.admission_trace_for_tests(device_a).len();
+        let executor_counts_before_removal = backend
+            .platform
+            .device_for_key(device_a)
+            .and_then(|device| device.executor.as_ref())
+            .map(|executor| executor.request_counts_for_tests());
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        let record_start = backend.drm_hotplug_records_for_tests.len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Remove,
+                device_b,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(backend, &mut state, "classified B remove", &|backend| {
+            backend.drm_hotplug_records_for_tests.len() == record_start + 1
+                && backend
+                    .lifecycle_coordinator
+                    .device(&device_b)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    })
+        });
+        assert_eq!(
+            backend
+                .platform
+                .device_for_key(device_b)
+                .and_then(|device| device.executor.as_ref())
+                .map(|executor| executor.sent_requests_for_tests()),
+            Some(sent_before),
+            "no executor request is sent after B's removal"
+        );
+        assert!(
+            backend
+                .platform
+                .device_for_key(device_b)
+                .and_then(|device| device.executor.as_ref())
+                .is_some_and(|executor| executor.termination_requested_for_tests())
+        );
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            backend,
+            &state,
+            delivery_start,
+            id.output_id,
+            id.crtc_id,
+            "classified B remove",
+        );
+        assert!(
+            receiver
+                .try_recv_all_tagged()
+                .into_iter()
+                .all(|(_, message)| !matches!(message, Message::Shutdown)),
+            "removing a non-renderer does not request process exit"
+        );
+
+        eprintln!(
+            "device-removal A baseline: offers={offers_before_removal}; admission_trace_len={admission_trace_before_removal}; executor_counts={executor_counts_before_removal:?}"
+        );
+        backend.scene.mark_scene_structure_dirty();
+        backend.scene.wake_for_damage();
+        let has_fresh_offer = |backend: &super::KmsBackend| {
+            backend.core_driver_composed_offers_for_tests[offers_before_removal..]
+                .iter()
+                .any(|(device, _, _, _)| *device == device_a)
+        };
+        let has_fresh_dispatch = |backend: &super::KmsBackend| {
+            backend
+                .admission_trace_for_tests(device_a)
+                .into_iter()
+                .skip(admission_trace_before_removal)
+                .any(|step| {
+                    matches!(
+                        step,
+                        crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                    )
+                })
+        };
+        let has_post_removal_composition =
+            |backend: &super::KmsBackend| has_fresh_offer(backend) && has_fresh_dispatch(backend);
+        // An A offer composed before removal may already be waiting in
+        // admission. Complete that predecessor through the core-entry shim,
+        // then keep driving until a fresh post-removal offer is accepted.
+        // Waiting for the fresh offer while withholding the predecessor's
+        // synthetic page flip lets the real Owner timeout close A first.
+        loop {
+            c0_3bi_core_driver_until_mode(
+                backend,
+                &mut state,
+                "A composes after B removal",
+                std::time::Duration::from_secs(3),
+                &|backend| {
+                    has_post_removal_composition(backend)
+                        || backend
+                            .platform
+                            .owner_ref(device_a)
+                            .and_then(|owner| owner.live_record())
+                            .is_some()
+                },
+                None,
+                false,
+                true,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}; diagnostics: {}",
+                    c0_3cii_owner_route_diagnostics_for_tests(backend, device_a)
+                )
+            });
+            if has_post_removal_composition(backend) {
+                break;
+            }
+            let predecessor = backend
+                .platform
+                .owner_ref(device_a)
+                .and_then(|owner| owner.live_record())
+                .expect("core driver stopped for A's pending predecessor")
+                .commit_id();
+            c0_3bi_complete_owner_commit_through_core_driver_with_state(
+                backend,
+                &mut state,
+                device_a,
+                predecessor,
+                "complete A's pre-removal frame while proving continued composition",
+            );
+        }
+        let composed_commit = backend
+            .platform
+            .owner_ref(device_a)
+            .and_then(|owner| owner.live_record())
+            .map(|record| record.commit_id());
+        if let Some(composed_commit) = composed_commit {
+            c0_3bi_complete_owner_commit_through_core_driver_with_state(
+                backend,
+                &mut state,
+                device_a,
+                composed_commit,
+                "complete A's post-removal composition",
+            );
+        }
+        c0_3cii_settle_owner_fixture(backend, &mut state, device_a, "settle A after B removal");
+        assert!(
+            backend.core_driver_composed_offers_for_tests[offers_before_removal..]
+                .iter()
+                .any(|(device, _, _, _)| *device == device_a),
+            "A produces a fresh composed offer after B's removal"
+        );
+        assert!(
+            backend
+                .admission_trace_for_tests(device_a)
+                .into_iter()
+                .skip(admission_trace_before_removal)
+                .any(|step| matches!(
+                    step,
+                    crate::kms::render::admission::AdmissionTraceStep::Dispatched(_)
+                )),
+            "A dispatches a fresh Owner composition after B's removal"
+        );
+        let expected = c0_3cii_removed_end_state(
+            backend,
+            outputs_a.iter().chain(&outputs_b).cloned(),
+            device_b,
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_device_removed_withdraws_and_continues_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_removal_while_released_is_not_deferred_vulkan() {
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_released_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_make_device_a_the_only_test_renderer(backend, device_a);
+        let id = backend.randr_id_alloc.ids_for(&outputs_b[0]);
+        let delivery_start = backend.core_entry_deliveries_for_tests.len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Remove,
+                device_b,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(
+            backend,
+            &mut state,
+            "B removal while the seat is released",
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device_b)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    })
+            },
+        );
+        c0_3bi_assert_one_urgent_withdrawal_delivered(
+            backend,
+            &state,
+            delivery_start,
+            id.output_id,
+            id.crtc_id,
+            "released-seat B removal",
+        );
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .is_some_and(|arbiter| {
+                    arbiter
+                        .desired()
+                        .representative(crate::kms::owner::lifecycle::DesiredField::Presence)
+                        .is_some_and(|representative| {
+                            matches!(
+                                representative.disposition,
+                                Some(crate::kms::owner::lifecycle::Disposition::Invalidated(
+                                    crate::kms::owner::lifecycle::InvalidationReason::DeviceRemoved
+                                ))
+                            )
+                        })
+                })
+        );
+        let expected = c0_3cii_removed_end_state(
+            backend,
+            outputs_a.iter().chain(&outputs_b).cloned(),
+            device_b,
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_removal_while_released_is_not_deferred_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_device_added_is_ignored() {
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_make_device_a_the_only_test_renderer(backend, device_a);
+        let unopened = DrmDeviceKey {
+            major: 0x7fff_ff01,
+            minor: 200,
+        };
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let device_count = backend.platform.devices.len();
+        let probe_count = backend
+            .platform
+            .connector_probe_observations_for_tests()
+            .len();
+        let add_log_start = backend.drm_hotplug_add_log_records_for_tests.len();
+        let record_start = backend.drm_hotplug_records_for_tests.len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Add,
+                unopened,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(backend, &mut state, "unopened card add", &|backend| {
+            backend.drm_hotplug_records_for_tests.len() == record_start + 1
+        });
+        assert_eq!(
+            backend.platform.devices.len(),
+            device_count,
+            "new card nodes stay unopened"
+        );
+        assert_eq!(
+            backend.drm_hotplug_add_log_records_for_tests[add_log_start..],
+            [backend.drm_hotplug_records_for_tests[record_start].clone()],
+            "one add record produces one DeviceAddedOrReplaced log line"
+        );
+
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Remove,
+                device_b,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(backend, &mut state, "removed card reappears", &|backend| {
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .is_some_and(|arbiter| {
+                    arbiter.state() == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                })
+        });
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Add,
+                device_b,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(backend, &mut state, "removed card re-add", &|backend| {
+            backend.drm_hotplug_records_for_tests.len() == record_start + 3
+        });
+        assert_eq!(
+            backend.platform.devices.len(),
+            device_count,
+            "reappearing card stays unopened"
+        );
+        assert_eq!(
+            backend.drm_hotplug_add_log_records_for_tests[add_log_start..].len(),
+            2,
+            "the removed card's reappearance also logs exactly once"
+        );
+        assert_eq!(
+            backend
+                .platform
+                .connector_probe_observations_for_tests()
+                .len(),
+            probe_count,
+            "add records do not probe or open a card"
+        );
+        assert_eq!(
+            backend.drm_hotplug_records_for_tests.len(),
+            record_start + 3
+        );
+        let expected = c0_3cii_removed_end_state(
+            backend,
+            outputs_a.iter().chain(&outputs_b).cloned(),
+            device_b,
+        );
+        c0_3bi_assert_end_state(backend, "c0_3cii_device_added_is_ignored", &expected);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3ci_acquire_skips_a_removed_device_vulkan() {
+        use yserver_core::core_loop::Message;
+
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_released_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_make_device_a_the_only_test_renderer(backend, device_a);
+        let receiver = c0_3cii_install_core_shutdown_channel(backend);
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        let observations_before = backend
+            .platform
+            .connector_probe_observations_for_tests()
+            .len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Remove,
+                device_b,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(
+            backend,
+            &mut state,
+            "remove B while released before acquire",
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device_b)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    })
+            },
+        );
+        let master_attempt_start = backend.vt_master_attempts_for_tests.len();
+        c0_3ci_acquire_with_scripted_layout_through_core_driver(
+            backend,
+            &mut state,
+            "acquire while B is removed",
+        );
+        let reinstall = c0_3ci_wait_owner_acquire_accepted(
+            backend,
+            &mut state,
+            device_a,
+            "accept A reinstall after B removal",
+        );
+        c0_3bi_complete_owner_commit_through_core_driver_with_state(
+            backend,
+            &mut state,
+            device_a,
+            reinstall,
+            "complete A reinstall after B removal",
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "finish A lifecycle after acquire",
+            std::time::Duration::from_secs(3),
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device_a)
+                    .is_some_and(|arbiter| {
+                        arbiter.state() == crate::kms::owner::lifecycle::DeviceLifecycleState::Ready
+                    })
+            },
+            None,
+        )
+        .expect("healthy A returns to Ready");
+        let master_attempts = &backend.vt_master_attempts_for_tests[master_attempt_start..];
+        assert!(
+            master_attempts.contains(&device_a),
+            "the healthy device reaches the acquire master path"
+        );
+        assert!(
+            !master_attempts.contains(&device_b),
+            "the removed device is not asked for master"
+        );
+        let observations = backend.platform.connector_probe_observations_for_tests();
+        assert!(
+            observations[observations_before..]
+                .iter()
+                .all(|observation| observation.key != device_b),
+            "the acquire does not start a B probe"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_a)
+                .map(|arbiter| arbiter.state()),
+            Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Ready),
+            "healthy A reinstalls after acquire"
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .map(|arbiter| arbiter.state()),
+            Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Removed)
+        );
+        assert!(
+            receiver
+                .try_recv_all_tagged()
+                .into_iter()
+                .all(|(_, message)| !matches!(message, Message::Shutdown))
+        );
+        let expected = c0_3cii_removed_end_state(
+            backend,
+            outputs_a.iter().chain(&outputs_b).cloned(),
+            device_b,
+        );
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3ci_acquire_skips_a_removed_device_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_renderer_removal_exits_vulkan() {
+        use yserver_core::core_loop::Message;
+
+        let (mut fixture, device, outputs, target_mode) = c0_3ci_live_release_fixture(
+            crate::kms::executor::test_support::StubBehaviour::AcceptKernelCalls(1_000),
+            false,
+        );
+        let backend = &mut fixture.backend;
+        let mut state = c0_3ci_core_state(backend);
+        let receiver = c0_3cii_install_core_shutdown_channel(backend);
+        assert!(backend.selected_renderer_drm_nodes().contains(&device));
+        let id = backend.randr_id_alloc.ids_for(&outputs[0]);
+        let token = c0_3bi_begin_client_modeset(
+            backend,
+            id.output_id,
+            &outputs[0].connector_name,
+            Some(target_mode),
+        );
+        let commit = c0_3cii_wait_client_modeset_live_with_state(
+            backend,
+            &mut state,
+            device,
+            token,
+            "dispatch renderer-device client modeset before removal",
+        );
+        assert!(
+            backend.platform.owner_ref(device).is_some_and(|owner| {
+                owner.live_record().is_some_and(|record| {
+                    record.commit_id() == commit && record.milestones().dispatched
+                })
+            }),
+            "renderer-device modeset must cross the executor dispatch boundary before removal"
+        );
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Remove,
+                device,
+                true,
+                false,
+                false,
+            )],
+        );
+        c0_3cii_deliver_hotplug_once(
+            backend,
+            &mut state,
+            "remove the selected renderer card",
+            &|backend| {
+                backend
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .is_some_and(|arbiter| {
+                        arbiter.state()
+                            == crate::kms::owner::lifecycle::DeviceLifecycleState::Removed
+                    })
+            },
+        );
+        assert!(
+            receiver
+                .try_recv_all_tagged()
+                .into_iter()
+                .any(|(_, message)| matches!(message, Message::Shutdown))
+        );
+        let owner_after_remove = backend.platform.owner_ref(device).map(|owner| {
+            (
+                owner
+                    .live_record()
+                    .map(|record| (record.commit_id(), record.state())),
+                owner
+                    .tombstones()
+                    .iter()
+                    .map(|tombstone| (tombstone.commit, tombstone.terminal))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert!(
+            owner_after_remove
+                .as_ref()
+                .is_some_and(|(live, tombstones)| {
+                    live.is_some_and(|(live_commit, state)| {
+                        live_commit == commit
+                            && matches!(
+                                state,
+                                crate::kms::owner::record::RecordState::Terminal(
+                                    crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                                )
+                            )
+                    }) && tombstones.iter().any(|(terminal_commit, terminal)| {
+                        *terminal_commit == commit
+                            && matches!(
+                                terminal,
+                                crate::kms::owner::record::TerminalState::CompletionUnknown(_)
+                            )
+                    })
+                }),
+            "submitted renderer-device work is CompletionUnknown and quarantined; state={owner_after_remove:?}; expected={commit:?}"
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "route the removed renderer-device token through the ready path",
+            std::time::Duration::from_secs(3),
+            &|backend| c0_3bi_has_crtc_config_result(backend, token),
+            None,
+        )
+        .expect("removed device resolves its client token");
+        assert!(c0_3bi_take_crtc_config_result(backend, token).is_err());
+        assert!(!backend.dispatched_client_modeset_tokens.contains(&token));
+        let expected = c0_3cii_removed_end_state(backend, outputs, device);
+        c0_3bi_assert_end_state(backend, "c0_3cii_renderer_removal_exits_vulkan", &expected);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_separate_renderer_removal_exits_vulkan() {
+        use yserver_core::core_loop::Message;
+
+        let (mut fixture, _device_a, _device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        let primary = DrmDeviceKey {
+            major: 226,
+            minor: 250,
+        };
+        let render = DrmDeviceKey {
+            major: 226,
+            minor: 378,
+        };
+        let render_id = crate::kms::scanout_route::RenderDeviceId::DrmRender(render);
+        let renderer = backend
+            .platform
+            .selected_render_device_mut()
+            .expect("selected renderer");
+        renderer.id = render_id;
+        renderer.advertised_primary_node = Some(primary);
+        renderer.advertised_render_node = Some(render);
+        backend.platform.selected_render_device = Some(render_id);
+        let receiver = c0_3cii_install_core_shutdown_channel(backend);
+        assert!(
+            !backend
+                .open_drm_cards_for_hotplug_classifier()
+                .contains_key(&primary)
+        );
+        assert!(
+            !backend
+                .open_drm_cards_for_hotplug_classifier()
+                .contains_key(&render)
+        );
+
+        for (key, card_node, label) in [
+            (primary, true, "separate renderer primary removal"),
+            (render, false, "separate renderer node removal"),
+        ] {
+            let record_start = backend.drm_hotplug_records_for_tests.len();
+            c0_3cii_script_udev_records(
+                backend,
+                vec![c0_3cii_udev_record(
+                    crate::kms::hotplug::DrmHotplugAction::Remove,
+                    key,
+                    card_node,
+                    false,
+                    false,
+                )],
+            );
+            c0_3cii_deliver_hotplug_once(backend, &mut state, label, &|backend| {
+                backend.drm_hotplug_records_for_tests.len() == record_start + 1
+            });
+            assert!(
+                receiver
+                    .try_recv_all_tagged()
+                    .into_iter()
+                    .any(|(_, message)| matches!(message, Message::Shutdown)),
+                "each selected renderer identity requests process exit"
+            );
+        }
+        let expected = c0_3bi_expected_end_state(outputs_a.iter().chain(&outputs_b).cloned());
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_separate_renderer_removal_exits_vulkan",
+            &expected,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_probe_error_is_not_removal_vulkan() {
+        let (mut fixture, device_a, device_b, outputs_a, outputs_b, mut state) =
+            c0_3cii_live_two_owner_fixture();
+        let backend = &mut fixture.backend;
+        c0_3cii_make_device_a_the_only_test_renderer(backend, device_a);
+        c0_3cii_settle_owner_fixtures(
+            backend,
+            &mut state,
+            &[device_a, device_b],
+            "ordinary probe failure readiness",
+        );
+        assert_eq!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .map(|arbiter| arbiter.state()),
+            Some(crate::kms::owner::lifecycle::DeviceLifecycleState::Ready),
+            "B starts the ordinary probe-error scenario Ready"
+        );
+        assert!(
+            !backend.randr_id_alloc.device_is_withdrawn(device_b),
+            "B starts the ordinary probe-error scenario published"
+        );
+        backend
+            .platform
+            .install_scripted_connector_prober_for_tests();
+        backend.platform.script_connector_probe_for_tests(
+            device_a,
+            Ok(vec![c0_3cii_snapshot_from_layout(backend, &outputs_a[0])]),
+        );
+        backend.platform.script_connector_probe_for_tests(
+            device_b,
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        );
+        let record_start = backend.drm_hotplug_records_for_tests.len();
+        c0_3cii_script_udev_records(
+            backend,
+            vec![c0_3cii_udev_record(
+                crate::kms::hotplug::DrmHotplugAction::Change,
+                device_b,
+                true,
+                false,
+                true,
+            )],
+        );
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "typed card change starts its probe episode",
+            std::time::Duration::from_secs(5),
+            &|backend| {
+                backend
+                    .probe_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.cause == super::ProbeEpisodeCause::Hotplug)
+            },
+            None,
+        )
+        .expect("change is consumed through the core-entry driver");
+        c0_3bi_core_driver_until_with_state(
+            backend,
+            &mut state,
+            "consume the EIO probe result",
+            std::time::Duration::from_secs(5),
+            &|backend| backend.probe_episode.is_none(),
+            None,
+        )
+        .expect("EIO resolves as an ordinary failed hotplug probe");
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_a)
+                .is_none_or(|arbiter| arbiter.state()
+                    != crate::kms::owner::lifecycle::DeviceLifecycleState::Removed)
+        );
+        assert!(
+            backend
+                .lifecycle_coordinator
+                .device(&device_b)
+                .is_none_or(|arbiter| arbiter.state()
+                    != crate::kms::owner::lifecycle::DeviceLifecycleState::Removed)
+        );
+        assert!(
+            backend.drm_hotplug_records_for_tests[record_start..]
+                .iter()
+                .any(
+                    |record| record.action == crate::kms::hotplug::DrmHotplugAction::Change
+                        && record.hotplug
+                )
+        );
+        let expected = c0_3bi_expected_end_state(outputs_a.into_iter().chain(outputs_b));
+        c0_3bi_assert_end_state(
+            backend,
+            "c0_3cii_probe_error_is_not_removal_vulkan",
+            &expected,
+        );
+    }
+
     fn c0_3ci_release_owner_to_suspended(
         backend: &mut super::KmsBackend,
         state: &mut ServerState,
@@ -106547,6 +108794,84 @@ mod tests {
                 "missing {field} in {diagnostic}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_real_monitor_change_record(
+        records: &[crate::kms::hotplug::DrmHotplugRecord],
+        device: DrmDeviceKey,
+    ) -> Option<&crate::kms::hotplug::DrmHotplugRecord> {
+        records.iter().find(|record| {
+            record.action == crate::kms::hotplug::DrmHotplugAction::Change
+                && record.dev_t == Some(device)
+                && record.hotplug
+        })
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_real_monitor_match_requires_card_dev_t() {
+        let selected = DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        };
+        let other = DrmDeviceKey {
+            major: 226,
+            minor: 2,
+        };
+        let unrelated = c0_3cii_udev_record(
+            crate::kms::hotplug::DrmHotplugAction::Change,
+            other,
+            true,
+            false,
+            true,
+        );
+        let card = c0_3cii_udev_record(
+            crate::kms::hotplug::DrmHotplugAction::Change,
+            selected,
+            true,
+            false,
+            true,
+        );
+        assert!(
+            c0_3cii_real_monitor_change_record(std::slice::from_ref(&unrelated), selected)
+                .is_none()
+        );
+        assert_eq!(
+            c0_3cii_real_monitor_change_record(&[unrelated, card.clone()], selected),
+            Some(&card)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn c0_3cii_real_monitor_delivers_typed_events(
+        backend: &super::KmsBackend,
+        device: DrmDeviceKey,
+        record_start: usize,
+        label: &str,
+    ) {
+        let records = &backend.drm_hotplug_records_for_tests[record_start..];
+        let typed = c0_3cii_real_monitor_change_record(records, device)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: real udev monitor must deliver change with card dev_t {device} and HOTPLUG=1; records={records:?}"
+                )
+            });
+        let classified = crate::kms::hotplug::classify_drm_hotplug_records(
+            [typed.clone()],
+            &backend.open_drm_cards_for_hotplug_classifier(),
+            &backend.selected_renderer_drm_nodes(),
+        );
+        assert!(
+            classified.iter().any(|event| event.disposition
+                == crate::kms::hotplug::DrmHotplugDisposition::ConnectorEdge),
+            "{label}: the typed monitor record is classified as a connector edge"
+        );
+        assert!(
+            classified.iter().all(|event| event.disposition
+                != crate::kms::hotplug::DrmHotplugDisposition::DeviceRemoved),
+            "{label}: a connector edge is not DeviceRemoved"
+        );
     }
 
     #[test]
@@ -106813,6 +109138,7 @@ mod tests {
         for cycle in 1..=4 {
             eprintln!("UNPLUG HDMI-2 now (cycle {cycle}/4)");
             let probe_index = durations.lock().expect("read probe durations").len();
+            let typed_event_start = backend.drm_hotplug_records_for_tests.len();
             let old_instance = backend
                 .platform
                 .outputs
@@ -106848,6 +109174,12 @@ mod tests {
                 Some(&hardware_complete),
             )
             .unwrap_or_else(|error| panic!("cycle {cycle}: unplug route timed out: {error}"));
+            c0_3cii_real_monitor_delivers_typed_events(
+                backend,
+                device,
+                typed_event_start,
+                &format!("cycle {cycle} unplug"),
+            );
             let unplug_duration = durations
                 .lock()
                 .expect("read production probe duration")
@@ -106892,6 +109224,7 @@ mod tests {
 
             eprintln!("REPLUG HDMI-2 now (cycle {cycle}/4)");
             let probe_index = durations.lock().expect("read probe durations").len();
+            let typed_event_start = backend.drm_hotplug_records_for_tests.len();
             let sends_before = backend.lifecycle_drivers[&device]
                 .topology_test_stats()
                 .1
@@ -106917,6 +109250,12 @@ mod tests {
                 Some(&hardware_complete),
             )
             .unwrap_or_else(|error| panic!("cycle {cycle}: replug route timed out: {error}"));
+            c0_3cii_real_monitor_delivers_typed_events(
+                backend,
+                device,
+                typed_event_start,
+                &format!("cycle {cycle} replug"),
+            );
             let relight_duration = durations
                 .lock()
                 .expect("read production probe duration")

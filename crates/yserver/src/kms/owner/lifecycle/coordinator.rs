@@ -453,6 +453,21 @@ impl<D: Ord + Clone, O: Ord + Clone, I: Clone + Eq> LifecycleCoordinator<D, O, I
         self.project_with_new_id(device.clone(), intent)
     }
 
+    /// Record the terminal boundary for an already-projected DeviceRemoved
+    /// intent. The driver calls this only after the output withdrawal and any
+    /// in-flight Owner completion have crossed their ordinary paths.
+    pub fn terminalize_device_removed(
+        &mut self,
+        device: &D,
+    ) -> Result<Vec<LifecycleAction<I>>, CoordinatorError> {
+        Ok(self
+            .devices
+            .get_mut(device)
+            .ok_or(CoordinatorError::UnknownDevice)?
+            .arbiter
+            .terminalize_device_removed())
+    }
+
     /// Route a driver-reported completion loss through Table U. The loss gets
     /// exactly one new event id here and reaches only its reported device.
     pub fn report_completion_loss(

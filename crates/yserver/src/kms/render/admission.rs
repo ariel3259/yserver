@@ -1758,6 +1758,28 @@ impl KmsBackend {
                 if !self.lifecycle_tag_current(device, tag) {
                     return;
                 }
+                let transition_kind = self
+                    .lifecycle_coordinator
+                    .device(&device)
+                    .and_then(|arbiter| arbiter.transition())
+                    .map(|transition| transition.kind);
+                if transition_kind
+                    == Some(crate::kms::owner::lifecycle::LifecycleKind::DeviceRemoved)
+                {
+                    // Device removal is a logical lifecycle terminal. The
+                    // device has no remaining KMS authority, so advancing it
+                    // must never submit a topology or DPMS commit.
+                    match self
+                        .lifecycle_coordinator
+                        .terminalize_device_removed(&device)
+                    {
+                        Ok(actions) => self.lifecycle_queue_actions(device, actions, None),
+                        Err(error) => log::error!(
+                            "lifecycle DeviceRemoved terminalization for {device:?}: {error:?}"
+                        ),
+                    }
+                    return;
+                }
                 if self
                     .lifecycle_coordinator
                     .device(&device)
