@@ -453,7 +453,7 @@ pub fn seed_pointer_properties(
         8,
         info.device_node.as_bytes().to_vec(),
         true,
-        true,
+        false,
     );
     let pid_atom = atoms.intern(PROP_DEVICE_PRODUCT_ID, false);
     set_seeded_property(
@@ -463,7 +463,7 @@ pub fn seed_pointer_properties(
         32,
         encode_product_id(info.vendor_id, info.product_id),
         true,
-        true,
+        false,
     );
 
     if device.facet != Some(XiFacetKind::PointerTouch) || !info.capabilities.pointer {
