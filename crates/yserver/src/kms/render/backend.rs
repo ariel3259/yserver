@@ -20958,65 +20958,37 @@ impl Backend for KmsBackend {
             }
             HostInputEvent::DeviceAdded(info) => {
                 log::info!(
-                    "xi-device: added {:?} node={} touchpad={}",
+                    "xi-device: added source={} {:?} node={} touchpad={}",
+                    info.source_id.0,
                     info.name,
                     info.device_node,
                     info.is_touchpad,
                 );
-                state.xi_seed_touchpad(&info);
-                // Notify clients selecting XI_DeviceChanged on the slave
-                // pointer (device 4) so a running desktop re-reads the
-                // device's new name + properties. No-op if none selected.
-                // 137 = the XI extension's runtime major opcode (mirrors
-                // nested.rs / process_request.rs XI2_MAJOR_OPCODE).
-                let _dropped =
-                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
-                        state, 137,
-                    );
+                state.xi_register_source(&info);
                 return;
             }
             HostInputEvent::DeviceResumed(info) => {
                 log::info!(
-                    "xi-device: resumed {:?} node={} touchpad={}",
+                    "xi-device: resumed source={} {:?} node={} touchpad={}",
+                    info.source_id.0,
                     info.name,
                     info.device_node,
                     info.is_touchpad,
                 );
-                state.xi_seed_touchpad(&info);
-                let _dropped =
-                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
-                        state, 137,
-                    );
+                state.xi_register_source(&info);
                 return;
             }
-            HostInputEvent::DeviceSuspended {
-                source_id,
-                device_node,
-            } => {
-                log::info!(
-                    "xi-device: suspended source={} node={device_node}",
-                    source_id.0
-                );
-                state.xi_clear_touchpad(&device_node);
-                let _dropped =
-                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
-                        state, 137,
-                    );
+            HostInputEvent::DeviceSuspended { source_id } => {
+                log::info!("xi-device: suspended source={}", source_id.0);
+                if let Some(mut info) = state.xi_devices.source(source_id).cloned() {
+                    info.enabled = false;
+                    let _ = state.xi_devices.register(&info);
+                }
                 return;
             }
-            HostInputEvent::DeviceRemoved {
-                source_id,
-                device_node,
-            } => {
-                log::info!(
-                    "xi-device: removed source={} node={device_node}",
-                    source_id.0
-                );
-                state.xi_clear_touchpad(&device_node);
-                let _dropped =
-                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
-                        state, 137,
-                    );
+            HostInputEvent::DeviceRemoved { source_id } => {
+                log::info!("xi-device: removed source={}", source_id.0);
+                state.xi_unregister_source(source_id);
                 return;
             }
         }

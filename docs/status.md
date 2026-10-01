@@ -33,7 +33,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
-- **2026-09-30 dynamic XI device registry, Tasks 1–4 staged (branch
+- **2026-09-30 dynamic XI device registry, Tasks 1–6 staged (branch
   `feat/xi-dynamic-registry-implementation`):** `XiRegistry` now owns the
   live XI device vector plus `InputSourceId` metadata and atomic lowest-free
   keyboard/pointer facet allocation in IDs 6..=127. `DeviceInfo` carries
@@ -47,9 +47,21 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   settings, proves continuation only by canonical sysfs endpoint-instance
   paths within one token-checked 2500 ms window, and expires unmatched sources
   before forwarding late dispatch input. Pause/resume commands use a FIFO
-  queue. Task 6 facet enable/disable and driver-property refresh, Task 8
-  config completion, Task 11 coordinate authority, and Task 14 guarded
-  per-source held-state releases remain later work. Server startup
+  queue. Task 6 now publishes physical keyboard/pointer facets through
+  `InputSourceId`, seeds each facet's Device Node/Product ID and each pointer
+  facet's own available libinput descriptors, preserves independent property
+  maps, and keeps unpublished sources unpublished during VT continuation.
+  Suspend disables the source's existing facets; resume refreshes actual
+  metadata/config on those same IDs and only updates property entries that
+  remain present. Reset rebuilds enabled and suspended inventory records.
+  Direct deletion rejects non-deletable seeded driver properties; full
+  GetProperty(delete) still unlinks them, with XI1/XI2 Deleted notifications
+  following Xorg's separate rules. Descriptor/metadata write protection
+  survives inline deletion, while ordinary client properties remain
+  writable/deletable. Task 7 config validation/application completion, Task 8
+  acknowledgments, Task 11 coordinate authority, Task 14 guarded per-source
+  held-state releases, and Tasks 15–16 hierarchy/presence notifications remain
+  later work. Server startup
   seeds virtual devices 4/5 with the XTEST pointer/keyboard names and
   `XTEST Device` INTEGER/8 value 1; writes and direct
   deletes of that marker are guarded by atom identity even after a
@@ -65,10 +77,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   facets; Xorg-compatible `XOpenDevice` still rejects the master devices and
   accepts live slaves. XI1's legacy attachment byte remains zero, matching
   Xorg, while XI2 reports registry attachments. Production physical
-  add/remove publication and driver property seeding are Task 6, so physical
-  sources are not yet published in production. Behavioral tests were not
-  added or run under the current authorization constraint; the existing XI1
-  encoder fixtures were adapted to the descriptor API.
+  KMS add/remove and VT lifecycle now register, disable, refresh, and unregister
+  source-owned physical facets; dynamic hierarchy/presence notifications are
+  still pending Tasks 15–16. Behavioral tests were not added or run under the
+  current authorization constraint; existing source-property and lifecycle
+  fixtures were adapted to the per-facet registry and property ownership API.
 
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's

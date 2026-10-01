@@ -98,10 +98,9 @@ mod tests {
     use crate::core_loop::message::HostInputEvent;
     use yserver_protocol::x11::ClientId;
 
-    fn device_removed(node: &str) -> Message {
+    fn device_removed() -> Message {
         Message::HostInput(HostInputEvent::DeviceRemoved {
             source_id: crate::xinput::InputSourceId(1),
-            device_node: node.into(),
         })
     }
 
@@ -173,7 +172,7 @@ mod tests {
         let old = Generation::default();
         let current = GenerationCounter::new();
         current.bump();
-        let msg = device_removed("/dev/input/event3");
+        let msg = device_removed();
         assert!(should_dispatch(current.current(), old, &msg));
     }
 
@@ -192,7 +191,7 @@ mod tests {
             Message::SwitchVt(1),
             Message::DumpScanout,
             Message::DumpDrawables,
-            device_removed("/dev/input/event0"),
+            device_removed(),
             Message::ClientDisconnected {
                 id: ClientId(1),
                 reason: std::io::Error::other("gone"),

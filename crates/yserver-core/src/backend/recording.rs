@@ -1336,7 +1336,7 @@ impl Backend for RecordingBackend {
             empty_rounds = 0;
             for info in batch {
                 seeded += 1;
-                state.xi_seed_touchpad(&info);
+                state.xi_register_source(&info);
             }
         }
         self.probe_rounds_run.set(rounds_run);

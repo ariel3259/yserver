@@ -536,31 +536,23 @@ pub fn process_batch(
                 sender.send(Message::HostInput(HostInputEvent::DeviceResumed(info)))?;
                 continue;
             }
-            InputEvent::DeviceSuspended {
-                source_id,
-                device_node,
-            } => {
+            InputEvent::DeviceSuspended { source_id } => {
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
                 }
                 state.scroll_accum_by_source.remove(&source_id);
                 sender.send(Message::HostInput(HostInputEvent::DeviceSuspended {
                     source_id,
-                    device_node,
                 }))?;
                 continue;
             }
-            InputEvent::DeviceRemoved {
-                source_id,
-                device_node,
-            } => {
+            InputEvent::DeviceRemoved { source_id } => {
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
                 }
                 state.scroll_accum_by_source.remove(&source_id);
                 sender.send(Message::HostInput(HostInputEvent::DeviceRemoved {
                     source_id,
-                    device_node,
                 }))?;
                 continue;
             }

@@ -79,27 +79,22 @@ impl XiRegistry {
     /// never publishes only part of a mixed source. Its metadata is still
     /// retained for core delivery and later lookup.
     pub fn register(&mut self, info: &DeviceInfo) -> Vec<u16> {
-        if let Some(ids) = self
-            .sources
-            .get(&info.source_id)
-            .map(|record| sorted_facet_ids(&record.facets))
-        {
-            if !ids.is_empty() {
-                self.sources
-                    .get_mut(&info.source_id)
-                    .expect("source record observed above")
-                    .info = info.clone();
-                for id in &ids {
-                    if let Some(device) = self.device_mut(*id) {
-                        device.enabled = info.enabled;
-                    }
+        if let Some(record) = self.sources.get_mut(&info.source_id) {
+            record.info = info.clone();
+            let ids = sorted_facet_ids(&record.facets);
+            for id in &ids {
+                if let Some(device) = self.device_mut(*id) {
+                    device.enabled = info.enabled;
+                    device.name.clone_from(&info.name);
+                    device.is_touchpad =
+                        device.facet == Some(XiFacetKind::PointerTouch) && info.is_touchpad;
+                    device.device_node = Some(info.device_node.clone());
                 }
-                return ids;
             }
-            // A prior registration may have retained metadata without facets
-            // because capacity was exhausted. Retry when this source is
-            // observed again after another source has been removed.
-            self.sources.remove(&info.source_id);
+            // A source retained without facets at its first registration
+            // stays unpublished during VT continuation. Only a new source
+            // attachment may claim newly freed XI IDs.
+            return ids;
         }
 
         let required = facets_for(info.capabilities);

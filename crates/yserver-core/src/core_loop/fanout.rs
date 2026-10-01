@@ -396,10 +396,10 @@ const XI_REASON_DEVICE_CHANGE: u8 = 2;
 /// every client that selected `XI_DeviceChanged` on it.
 ///
 /// This retained device-4 emitter is part of the legacy fixed-topology
-/// path. The current `ServerState::xi_seed_touchpad` hook leaves virtual
-/// XTEST device 4 untouched; production physical add/remove publication is
-/// handled by the later registry-lifecycle task. The carried class set keeps
-/// the query-compatible button + 4 valuator + 2 scroll shape.
+/// path. Physical source registration now leaves virtual XTEST device 4
+/// untouched; dynamic hierarchy and presence publication is handled by
+/// the later registry-lifecycle tasks. The carried class set keeps the
+/// query-compatible button + 4 valuator + 2 scroll shape.
 ///
 /// Selection matches device 4 explicitly, plus the `XIAllDevices` (0)
 /// and `XIAllMasterDevices` (1) wildcards a client may have used. If no

@@ -8,8 +8,8 @@
 //! the [`Binding`] that maps to a libinput setter.
 //!
 //! Used by:
-//!   * `xinput::seed_touchpad` — iterates the table to populate the XI2
-//!     property registry from a [`LibinputConfigSnapshot`] (T2).
+//!   * `xinput::seed_pointer_properties` — iterates the table to populate
+//!     each pointer facet from a [`LibinputConfigSnapshot`] (T2/T6).
 //!   * `core_loop::process_request` XI2 / XI1 property dispatch arms —
 //!     validates incoming writes ([`validate_value`]) and decodes them
 //!     to [`DeviceConfigChange`] ([`decode_change`]) for the backend's
